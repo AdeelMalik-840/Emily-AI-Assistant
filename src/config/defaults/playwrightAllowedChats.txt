@@ -1,0 +1,6 @@
+# WhatsApp Web sidebar chat titles (one per line) that the Playwright listener may open for AI.
+# Matching is case-insensitive after trim. Lines starting with # are ignored.
+# Override entirely with env PLAYWRIGHT_ALLOWED_CHAT_TITLES (comma-separated).
+#
+leads
+car rental queries

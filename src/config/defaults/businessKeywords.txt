@@ -1,0 +1,11 @@
+# One keyword per line (used for Playwright “business chat” learning hint). Edit or override PLAYWRIGHT_BUSINESS_KEYWORDS in .env.
+civic
+corolla
+car
+rent
+rental
+available
+price
+booking
+per day
+per month

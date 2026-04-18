@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>You're almost signed in</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 20px 32px;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+      color: #1e293b;
+      background: linear-gradient(180deg, #faf5ff 0%, #f8fafc 100%);
+    }
+    @media (prefers-color-scheme: dark) {
+      body {
+        color: #f1f5f9;
+        background: linear-gradient(180deg, #1e1b2e 0%, #0f172a 100%);
+      }
+      .card {
+        background: #1e293b;
+        border-color: #334155;
+      }
+      .btn {
+        background: #7c3aed;
+      }
+      .btn:active {
+        background: #6d28d9;
+      }
+    }
+    .card {
+      width: 100%;
+      max-width: 400px;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      padding: 28px 22px 26px;
+      text-align: center;
+      box-shadow: 0 10px 40px rgba(15, 23, 42, 0.08);
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .lead {
+      margin: 0 0 24px;
+      color: #64748b;
+      font-size: 0.95rem;
+    }
+    @media (prefers-color-scheme: dark) {
+      .lead {
+        color: #94a3b8;
+      }
+    }
+    .btn {
+      display: inline-block;
+      width: 100%;
+      padding: 14px 20px;
+      margin: 0 0 20px;
+      font-size: 1rem;
+      font-weight: 600;
+      color: #fff;
+      background: #7c3aed;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      box-shadow: 0 4px 14px rgba(124, 58, 237, 0.35);
+    }
+    .btn:active {
+      background: #6d28d9;
+      transform: scale(0.98);
+    }
+    .hint {
+      margin: 0;
+      font-size: 0.875rem;
+      color: #64748b;
+      line-height: 1.45;
+    }
+    @media (prefers-color-scheme: dark) {
+      .hint {
+        color: #94a3b8;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>You're almost signed in 👋</h1>
+    <p class="lead">Tap the button below to return to the app</p>
+    <button type="button" class="btn" id="openApp">Open Emily App</button>
+    <p class="hint">
+      If nothing happens, go back to the app and tap &quot;Continue login&quot;
+    </p>
+  </div>
+  <script>
+    (function () {
+      function buildAppUrl() {
+        var q = window.location.search || "";
+        if (window.location.hash && window.location.hash.length > 1) {
+          var h = window.location.hash.substring(1);
+          q = q ? q + "&" + h : "?" + h;
+        }
+        return "emily://auth" + (q || "");
+      }
+
+      var btn = document.getElementById("openApp");
+      if (btn) {
+        btn.addEventListener("click", function () {
+          window.location.href = buildAppUrl();
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+node_modules/
+
+# env
+.env
+.env.*
+
+# system
+.DS_Store
+**/__MACOSX/
+**/._*
+
+# firebase
+firebase-key.json
+.firebase/
+firebase-debug.log
+
+# playwright
+playwright-session.json
+playwrightGuaranteeKeys.json
+playwright-report/
+test-results/
+
+# app data
+knownChats.json
+data/
+
+# build
+dist/
+build/
+mobile-app/build/
+mobile-app/dist/
+
+# logs
+logs/
+*.log

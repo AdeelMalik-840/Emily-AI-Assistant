@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Business profile — Emily</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9aab;
+      --accent: #3d8bfd;
+      --border: #2a3a4d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1.5rem;
+      line-height: 1.45;
+      max-width: 42rem;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem; }
+    p.sub { color: var(--muted); font-size: 0.9rem; margin-top: 0; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, textarea, select {
+      width: 100%;
+      padding: 0.5rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.95rem;
+    }
+    textarea { min-height: 5rem; resize: vertical; }
+    .field { margin-bottom: 1rem; }
+    .row { display: flex; gap: 0.5rem; align-items: flex-start; flex-wrap: wrap; }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 0.45rem 0.85rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    button.danger { background: #c44; }
+    .array-block { border: 1px dashed var(--border); padding: 0.75rem; border-radius: 8px; margin-bottom: 0.75rem; }
+    .array-row { border: 1px solid var(--border); padding: 0.5rem; border-radius: 6px; margin-bottom: 0.5rem; }
+    #status { margin-top: 1rem; font-size: 0.9rem; color: var(--muted); }
+    #status.ok { color: #6c8; }
+    #status.err { color: #e88; }
+    hr { border: none; border-top: 1px solid var(--border); margin: 1.25rem 0; }
+    code { font-size: 0.85em; background: var(--card); padding: 0.1rem 0.35rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Business profile</h1>
+  <p class="sub">Choose a category, fill fields, save to <code>businesses/{userId}</code>. Same <code>userId</code> as WhatsApp phone (digits only, country code).</p>
+
+  <div class="field">
+    <label for="userId">userId</label>
+    <input id="userId" type="text" placeholder="923001234567" autocomplete="off" />
+  </div>
+
+  <div class="field">
+    <label for="category">Category</label>
+    <select id="category"></select>
+  </div>
+
+  <hr />
+
+  <div id="dynamic-fields"></div>
+
+  <div class="row" style="margin-top: 1rem;">
+    <button type="button" id="btn-load">Load saved</button>
+    <button type="button" id="btn-save">Save</button>
+  </div>
+  <p id="status"></p>
+
+  <script>
+    const API = "";
+    let catalog = { categories: [], schemas: {} };
+
+    function headers() {
+      const h = { "Content-Type": "application/json" };
+      const secret = new URLSearchParams(location.search).get("key");
+      if (secret) h["x-api-key"] = secret;
+      return h;
+    }
+
+    async function loadCatalog() {
+      const res = await fetch(API + "/api/business-catalog");
+      if (!res.ok) throw new Error("catalog");
+      catalog = await res.json();
+      const sel = document.getElementById("category");
+      sel.innerHTML = "";
+      for (const c of catalog.categories) {
+        const o = document.createElement("option");
+        o.value = c.id;
+        o.textContent = c.label;
+        sel.appendChild(o);
+      }
+      sel.addEventListener("change", () => renderFields());
+      renderFields();
+    }
+
+    function renderFields() {
+      const cat = document.getElementById("category").value;
+      const schema = catalog.schemas[cat];
+      const root = document.getElementById("dynamic-fields");
+      root.innerHTML = "";
+      if (!schema || !schema.fields) return;
+
+      for (const f of schema.fields) {
+        const wrap = document.createElement("div");
+        wrap.className = "field";
+        if (f.type === "array") {
+          const lab = document.createElement("label");
+          lab.textContent = f.label + (f.required ? " *" : "");
+          wrap.appendChild(lab);
+          const holder = document.createElement("div");
+          holder.dataset.arrayHolder = f.key;
+          holder.dataset.arrayType = f.itemType || "text";
+          if (f.itemType === "object" && f.itemFields) {
+            holder.dataset.itemFields = JSON.stringify(f.itemFields);
+          }
+          wrap.appendChild(holder);
+          const addBtn = document.createElement("button");
+          addBtn.type = "button";
+          addBtn.className = "secondary";
+          addBtn.textContent = "Add " + f.label;
+          addBtn.addEventListener("click", () => addArrayRow(f, holder));
+          wrap.appendChild(addBtn);
+          addArrayRow(f, holder);
+          root.appendChild(wrap);
+          continue;
+        }
+        const lab = document.createElement("label");
+        lab.textContent = f.label + (f.required ? " *" : "");
+        wrap.appendChild(lab);
+        if (f.type === "textarea") {
+          const ta = document.createElement("textarea");
+          ta.dataset.scalar = f.key;
+          ta.placeholder = f.placeholder || "";
+          wrap.appendChild(ta);
+        } else {
+          const inp = document.createElement("input");
+          inp.dataset.scalar = f.key;
+          inp.type = f.type === "number" ? "number" : "text";
+          inp.placeholder = f.placeholder || "";
+          wrap.appendChild(inp);
+        }
+        root.appendChild(wrap);
+      }
+    }
+
+    function addArrayRow(fieldDef, holder) {
+      const itemType = holder.dataset.arrayType;
+      const row = document.createElement("div");
+      row.className = "array-row";
+      row.setAttribute("data-array-row", fieldDef.key);
+
+      if (itemType === "text") {
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.dataset.arrayText = fieldDef.key;
+        row.appendChild(inp);
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "danger";
+        rm.textContent = "Remove";
+        rm.style.marginTop = "0.35rem";
+        rm.addEventListener("click", () => row.remove());
+        row.appendChild(rm);
+      } else {
+        const fields = JSON.parse(holder.dataset.itemFields || "[]");
+        for (const sub of fields) {
+          const l = document.createElement("label");
+          l.textContent = sub.label;
+          const inp = document.createElement(sub.type === "textarea" ? "textarea" : "input");
+          if (sub.type !== "textarea") inp.type = sub.type === "number" ? "number" : "text";
+          inp.dataset.sub = sub.key;
+          const fw = document.createElement("div");
+          fw.className = "field";
+          fw.appendChild(l);
+          fw.appendChild(inp);
+          row.appendChild(fw);
+        }
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "danger secondary";
+        rm.textContent = "Remove row";
+        rm.addEventListener("click", () => row.remove());
+        row.appendChild(rm);
+      }
+      holder.appendChild(row);
+    }
+
+    function collectProfileData() {
+      const cat = document.getElementById("category").value;
+      const schema = catalog.schemas[cat];
+      if (!schema) return {};
+      const out = {};
+      for (const f of schema.fields) {
+        if (f.type === "array") {
+          const rows = document.querySelectorAll('[data-array-row="' + f.key + '"]');
+          if (f.itemType === "text") {
+            out[f.key] = Array.from(rows).map((row) => {
+              const inp = row.querySelector("[data-array-text]");
+              return inp ? inp.value.trim() : "";
+            }).filter(Boolean);
+          } else {
+            out[f.key] = Array.from(rows).map((row) => {
+              const o = {};
+              for (const sub of f.itemFields || []) {
+                const el = row.querySelector('[data-sub="' + sub.key + '"]');
+                o[sub.key] = el ? String(el.value) : "";
+              }
+              return o;
+            });
+          }
+          continue;
+        }
+        const el = document.querySelector('[data-scalar="' + f.key + '"]');
+        if (!el) {
+          out[f.key] = f.type === "number" ? "" : "";
+          continue;
+        }
+        out[f.key] = f.type === "number" ? el.value : String(el.value);
+      }
+      return out;
+    }
+
+    function setStatus(msg, cls) {
+      const s = document.getElementById("status");
+      s.textContent = msg;
+      s.className = cls || "";
+    }
+
+    document.getElementById("btn-save").addEventListener("click", async () => {
+      const userId = document.getElementById("userId").value.trim();
+      if (!userId) {
+        setStatus("Enter userId.", "err");
+        return;
+      }
+      const category = document.getElementById("category").value;
+      const profileData = collectProfileData();
+      setStatus("Saving…", "");
+      try {
+        const res = await fetch(API + "/save-business-profile", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify({ userId, category, profileData }),
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(j.error || res.statusText);
+        setStatus("Saved.", "ok");
+      } catch (e) {
+        setStatus(String(e.message || e), "err");
+      }
+    });
+
+    document.getElementById("btn-load").addEventListener("click", async () => {
+      const userId = document.getElementById("userId").value.trim();
+      if (!userId) {
+        setStatus("Enter userId.", "err");
+        return;
+      }
+      setStatus("Loading…", "");
+      try {
+        const res = await fetch(
+          API + "/api/business-profile?" + new URLSearchParams({ userId }),
+          { headers: headers() }
+        );
+        const j = await res.json();
+        if (!res.ok) throw new Error(j.error || res.statusText);
+        document.getElementById("category").value = j.category || "general";
+        renderFields();
+        const pd = j.profileData || {};
+        const cat = document.getElementById("category").value;
+        const schema = catalog.schemas[cat];
+        if (!schema) {
+          setStatus("Loaded.", "ok");
+          return;
+        }
+        for (const [key, val] of Object.entries(pd)) {
+          const el = document.querySelector('[data-scalar="' + key + '"]');
+          if (el) {
+            el.value = val != null ? String(val) : "";
+            continue;
+          }
+          const fieldDef = schema.fields.find((x) => x.key === key);
+          if (!fieldDef || fieldDef.type !== "array") continue;
+          const holder = document.querySelector('[data-array-holder="' + key + '"]');
+          if (!holder) continue;
+          holder.innerHTML = "";
+          const arr = Array.isArray(val) ? val : [];
+          if (fieldDef.itemType === "text") {
+            if (arr.length === 0) addArrayRow(fieldDef, holder);
+            else {
+              for (const item of arr) {
+                addArrayRow(fieldDef, holder);
+                const rows = holder.querySelectorAll('[data-array-row="' + key + '"]');
+                const last = rows[rows.length - 1];
+                const inp = last && last.querySelector("[data-array-text]");
+                if (inp) inp.value = String(item);
+              }
+            }
+          } else {
+            if (arr.length === 0) addArrayRow(fieldDef, holder);
+            else {
+              for (const item of arr) {
+                addArrayRow(fieldDef, holder);
+                const rows = holder.querySelectorAll('[data-array-row="' + key + '"]');
+                const last = rows[rows.length - 1];
+                if (last && item && typeof item === "object") {
+                  for (const sub of fieldDef.itemFields || []) {
+                    const inp = last.querySelector('[data-sub="' + sub.key + '"]');
+                    if (inp) inp.value = item[sub.key] != null ? String(item[sub.key]) : "";
+                  }
+                }
+              }
+            }
+          }
+        }
+        setStatus("Loaded.", "ok");
+      } catch (e) {
+        setStatus(String(e.message || e), "err");
+      }
+    });
+
+    loadCatalog().catch((e) => setStatus(String(e), "err"));
+  </script>
+</body>
+</html>

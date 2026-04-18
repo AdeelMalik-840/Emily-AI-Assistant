@@ -1,0 +1,550 @@
+import { getWhatsAppEnv } from "../utils/env.js";
+
+/** WhatsApp Cloud API image messages: max links per assistant turn (product requirement: ~3–5). */
+const MAX_WHATSAPP_MEDIA_IMAGES = 5;
+
+const HTTPS_URL_IN_TEXT_RE = /https:\/\/[^\s<>"{}|\\^`[\])]+/gi;
+
+/**
+ * @param {string} u
+ * @returns {boolean}
+ */
+export function isPlausibleImageUrl(u) {
+  try {
+    const parsed = new URL(u);
+    if (parsed.protocol !== "https:") return false;
+    const h = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(path)) return true;
+    if (h === "firebasestorage.googleapis.com") return true;
+    if (h.endsWith(".googleapis.com") && path.includes("/o/")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function extractWhatsAppImageUrlsFromText(text) {
+  const s = String(text ?? "");
+  const raw = s.match(HTTPS_URL_IN_TEXT_RE) ?? [];
+  const seen = new Set();
+  const out = [];
+  for (let u of raw) {
+    u = u.replace(/[),.;!?]+$/g, "");
+    if (!isPlausibleImageUrl(u)) continue;
+    if (seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+    if (out.length >= MAX_WHATSAPP_MEDIA_IMAGES) break;
+  }
+  return out;
+}
+
+/**
+ * @param {string} text
+ * @param {string[]} urls
+ * @returns {string}
+ */
+export function stripImageUrlsForWhatsAppDelivery(text, urls) {
+  let t = String(text ?? "");
+  const byLen = [...urls].sort((a, b) => b.length - a.length);
+  for (const u of byLen) {
+    t = t.split(u).join(" ");
+  }
+  t = t.replace(/Image URLs\s*\(WhatsApp\/media\)\s*:\s*/gi, " ");
+  t = t.replace(/\s*\|\s*/g, " ");
+  t = t.replace(/\s+/g, " ").trim();
+  t = t.replace(/^—\s*|\s*—$/g, "").trim();
+  t = t.replace(/\s*—\s*—+\s*/g, " — ").trim();
+  return t;
+}
+
+/**
+ * After removing URLs, drop orphan connectors and broken fragments for a single clean sentence.
+ * @param {string} text
+ * @returns {string}
+ */
+export function cleanTextAfterUrlRemoval(text) {
+  let t = String(text ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*[|]\s*/g, " ")
+    .trim();
+  t = t.replace(/\s*—\s*—+/g, " — ").trim();
+  t = t.replace(/^(and|or|also|aur|phir)\s+/i, "").trim();
+  t = t.replace(/\s+(and|or|also|aur)\s*$/i, "").trim();
+  t = t.replace(/\(\s*\)/g, "").trim();
+  t = t.replace(/\s+(and|or|also)\s+(and|or|also)\b/gi, " ").trim();
+  return t.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isWeakOrEmptyCaption(text) {
+  const t = String(text ?? "").trim();
+  if (t.length < 3) return true;
+  if (/^[,;:|—\s]+$/.test(t)) return true;
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length <= 1 && /^here|yeh|ye|the|a$/i.test(words[0] ?? "")) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @param {{ phoneNumberId?: string, accessToken?: string } | null} credentials
+ * @returns {{ token: string, phoneNumberId: string } | null}
+ */
+function resolveWhatsAppCredentials(credentials) {
+  const env = getWhatsAppEnv();
+  const token = String(
+    credentials?.accessToken || env.accessToken || ""
+  ).trim();
+  const phoneNumberId = String(
+    credentials?.phoneNumberId || env.phoneNumberId || ""
+  ).trim();
+  if (!phoneNumberId || !token) return null;
+  return { token, phoneNumberId };
+}
+
+/**
+ * @param {"individual"|"group"} recipientType
+ * @param {string} to - E.164 digits for individual; opaque `group_id` for groups
+ */
+function resolveWhatsAppToField(to, recipientType) {
+  const rt = recipientType === "group" ? "group" : "individual";
+  const raw = String(to ?? "").trim();
+  if (!raw) return { recipientType: rt, toField: "" };
+  if (rt === "group") return { recipientType: rt, toField: raw };
+  return { recipientType: rt, toField: raw.replace(/\D/g, "") };
+}
+
+const DEFAULT_GROUP_DM_NOTICE = "I've sent details in your DM 👋";
+
+function groupDmNoticeDisabled() {
+  return (
+    process.env.WHATSAPP_GROUP_DM_NOTICE_DISABLED === "1" ||
+    /^true$/i.test(String(process.env.WHATSAPP_GROUP_DM_NOTICE_DISABLED ?? ""))
+  );
+}
+
+/**
+ * @param {string} toField
+ * @param {"individual"|"group"} recipientType
+ * @param {string} body
+ */
+function buildTextPayload(toField, recipientType, body) {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: recipientType,
+    to: toField,
+    type: "text",
+    text: { body: String(body).trim() },
+  };
+}
+
+/**
+ * @param {string} toField
+ * @param {"individual"|"group"} recipientType
+ * @param {string} link
+ */
+function buildImagePayload(toField, recipientType, link) {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: recipientType,
+    to: toField,
+    type: "image",
+    image: { link: String(link).trim() },
+  };
+}
+
+/**
+ * @param {string} phoneNumberId
+ * @param {string} token
+ * @param {Record<string, unknown>} payload
+ * @returns {Promise<{ ok: boolean, status: number, data: Record<string, unknown> }>}
+ */
+async function postWhatsAppMessagesResult(phoneNumberId, token, payload) {
+  const url = `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { _raw: text?.slice(0, 500) };
+  }
+  const body =
+    data && typeof data === "object" && !Array.isArray(data)
+      ? /** @type {Record<string, unknown>} */ (data)
+      : {};
+  if (!res.ok) {
+    console.error(
+      "[whatsappCloud] Send failed — status:",
+      res.status,
+      "body:",
+      JSON.stringify(body)
+    );
+    return { ok: false, status: res.status, data: body };
+  }
+  console.log("[whatsappCloud] WhatsApp API response:", JSON.stringify(body));
+  return { ok: true, status: res.status, data: body };
+}
+
+/**
+ * WhatsApp Cloud API — outbound text messages (Graph API).
+ * Group send failure → optional DM to `fallbackDmTo` + optional short notice back to group.
+ *
+ * @param {string} to - user digits, or `group_id` when opts.recipientType === "group"
+ * @param {string} text
+ * @param {{ phoneNumberId?: string, accessToken?: string } | null} [credentials]
+ * @param {{
+ *   recipientType?: "individual"|"group",
+ *   fallbackDmTo?: string,
+ *   includeGroupDmNotice?: boolean,
+ *   groupDmNoticeBody?: string,
+ * }} [opts]
+ * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
+ */
+export async function sendWhatsAppMessage(to, text, credentials = null, opts = {}) {
+  let groupSendFailed = false;
+  try {
+    const resolved = resolveWhatsAppCredentials(credentials);
+    console.log(
+      "[whatsappCloud] Using per-user token:",
+      !!credentials?.accessToken
+    );
+    console.log(
+      "[whatsappCloud] hasEnvToken:",
+      Boolean(getWhatsAppEnv().accessToken)
+    );
+
+    if (!resolved) {
+      console.error(
+        "[whatsappCloud] Missing phoneNumberId/accessToken (or env WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN) — cannot send"
+      );
+      return { ok: false, groupSendFailed: false };
+    }
+
+    const { token, phoneNumberId } = resolved;
+    const reply = String(text ?? "").trim();
+    if (!reply) {
+      console.warn("[whatsappCloud] Empty text body, skipping send");
+      return { ok: false, groupSendFailed: false };
+    }
+
+    console.log("[whatsappCloud] outbound text chars:", reply.length);
+
+    const recipientType =
+      opts.recipientType === "group" ? "group" : "individual";
+    const { toField } = resolveWhatsAppToField(to, recipientType);
+    if (!toField) {
+      console.error("[whatsappCloud] Invalid recipient:", to);
+      return { ok: false, groupSendFailed: false };
+    }
+
+    console.log("📤 Sending reply to:", toField);
+
+    const payload = buildTextPayload(toField, recipientType, reply);
+    const result = await postWhatsAppMessagesResult(
+      phoneNumberId,
+      token,
+      payload
+    );
+
+    if (result.ok) {
+      console.log(
+        "[whatsappCloud] Message sent OK →",
+        recipientType,
+        String(toField).slice(0, 48)
+      );
+      return { ok: true, groupSendFailed: false };
+    }
+
+    if (recipientType !== "group") {
+      return { ok: false, groupSendFailed: false };
+    }
+
+    groupSendFailed = true;
+    console.warn(
+      "[whatsappCloud] group text send failed; trying DM fallback",
+      result.status
+    );
+
+    const fallbackDigits = String(opts.fallbackDmTo ?? "").replace(/\D/g, "");
+    if (!fallbackDigits) {
+      console.error(
+        "[whatsappCloud] group send failed and no fallbackDmTo — cannot DM user"
+      );
+      return { ok: false, groupSendFailed: true };
+    }
+
+    const dmPayload = buildTextPayload(fallbackDigits, "individual", reply);
+    const dmResult = await postWhatsAppMessagesResult(
+      phoneNumberId,
+      token,
+      dmPayload
+    );
+    if (dmResult.ok) {
+      console.log("[whatsappCloud] DM fallback after group failure: OK");
+    } else {
+      console.error(
+        "[whatsappCloud] DM fallback failed:",
+        dmResult.status,
+        JSON.stringify(dmResult.data).slice(0, 300)
+      );
+    }
+
+    if (
+      dmResult.ok &&
+      opts.includeGroupDmNotice === true &&
+      !groupDmNoticeDisabled() &&
+      toField
+    ) {
+      const notice = String(
+        opts.groupDmNoticeBody ?? DEFAULT_GROUP_DM_NOTICE
+      ).trim();
+      const noticePayload = buildTextPayload(toField, "group", notice);
+      const nRes = await postWhatsAppMessagesResult(
+        phoneNumberId,
+        token,
+        noticePayload
+      );
+      if (!nRes.ok) {
+        console.warn(
+          "[whatsappCloud] group DM notice failed (non-fatal):",
+          nRes.status,
+          JSON.stringify(nRes.data).slice(0, 200)
+        );
+      }
+    }
+
+    return { ok: dmResult.ok, groupSendFailed: true };
+  } catch (err) {
+    console.error(
+      "[whatsappCloud] Send error (non-fatal, server continues):",
+      err
+    );
+    return { ok: false, groupSendFailed };
+  }
+}
+
+/**
+ * Single image message (public HTTPS link). Separate API call per image.
+ * @param {string} to
+ * @param {string} imageLink - https URL
+ * @param {{ phoneNumberId?: string, accessToken?: string } | null} [credentials]
+ * @param {{
+ *   recipientType?: "individual"|"group",
+ *   fallbackDmTo?: string,
+ * }} [opts]
+ * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
+ */
+export async function sendWhatsAppImage(
+  to,
+  imageLink,
+  credentials = null,
+  opts = {}
+) {
+  let groupSendFailed = false;
+  try {
+    const resolved = resolveWhatsAppCredentials(credentials);
+    if (!resolved) {
+      console.error("[whatsappCloud] sendWhatsAppImage: missing credentials");
+      return { ok: false, groupSendFailed: false };
+    }
+    const { token, phoneNumberId } = resolved;
+    const link = String(imageLink ?? "").trim();
+    if (!link || !isPlausibleImageUrl(link)) {
+      console.warn("[whatsappCloud] sendWhatsAppImage: skip invalid URL");
+      return { ok: false, groupSendFailed: false };
+    }
+    const recipientType =
+      opts.recipientType === "group" ? "group" : "individual";
+    const { toField } = resolveWhatsAppToField(to, recipientType);
+    if (!toField) {
+      console.error("[whatsappCloud] sendWhatsAppImage: invalid recipient:", to);
+      return { ok: false, groupSendFailed: false };
+    }
+    const payload = buildImagePayload(toField, recipientType, link);
+    try {
+      console.log(
+        "[whatsappCloud] outbound image (host):",
+        new URL(link).hostname
+      );
+    } catch {
+      console.log("[whatsappCloud] outbound image: (unparseable host)");
+    }
+    const result = await postWhatsAppMessagesResult(
+      phoneNumberId,
+      token,
+      payload
+    );
+    if (result.ok) {
+      console.log("[whatsappCloud] Image sent OK →", String(toField).slice(0, 48));
+      return { ok: true, groupSendFailed: false };
+    }
+
+    if (recipientType !== "group") {
+      return { ok: false, groupSendFailed: false };
+    }
+
+    groupSendFailed = true;
+    console.warn(
+      "[whatsappCloud] group image send failed; trying DM fallback",
+      result.status
+    );
+    const fallbackDigits = String(opts.fallbackDmTo ?? "").replace(/\D/g, "");
+    if (!fallbackDigits) {
+      return { ok: false, groupSendFailed: true };
+    }
+    const dmPayload = buildImagePayload(fallbackDigits, "individual", link);
+    const dmResult = await postWhatsAppMessagesResult(
+      phoneNumberId,
+      token,
+      dmPayload
+    );
+    if (dmResult.ok) {
+      console.log("[whatsappCloud] image DM fallback after group failure: OK");
+    } else {
+      console.error(
+        "[whatsappCloud] image DM fallback failed:",
+        dmResult.status
+      );
+    }
+    return { ok: dmResult.ok, groupSendFailed: true };
+  } catch (err) {
+    console.error("[whatsappCloud] sendWhatsAppImage error:", err);
+    return { ok: false, groupSendFailed };
+  }
+}
+
+const WHATSAPP_IMAGE_INTRO_FALLBACK = "Here are the images 👇";
+
+/**
+ * Delivery layer: for channel `whatsapp`, strips embedded image URLs from the text body,
+ * sends the text once, then sends each image as its own Cloud API image message.
+ * Other channels: single text send only (unchanged behavior).
+ *
+ * @param {string} to
+ * @param {string} text - full assistant reply (unchanged upstream)
+ * @param {{ phoneNumberId?: string, accessToken?: string } | null} [credentials]
+ * @param {{
+ *   channel?: string,
+ *   deliveryIntent?: string,
+ *   explicitImageUrls?: string[],
+ *   recipientType?: "individual"|"group",
+ *   fallbackDmTo?: string,
+ *   groupDmNoticeBody?: string,
+ * }} [opts]
+ * @returns {Promise<{ groupSendFailed: boolean }>}
+ */
+export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) {
+  let groupSendFailed = false;
+  const recipientType = opts.recipientType === "group" ? "group" : "individual";
+  let includeGroupDmNotice = recipientType === "group";
+
+  const track = async (p) => {
+    const r = await p;
+    if (r?.groupSendFailed) groupSendFailed = true;
+  };
+
+  const nextTextOpts = () => {
+    const o = {
+      recipientType,
+      fallbackDmTo: opts.fallbackDmTo,
+      includeGroupDmNotice: includeGroupDmNotice === true,
+      groupDmNoticeBody: opts.groupDmNoticeBody,
+    };
+    includeGroupDmNotice = false;
+    return o;
+  };
+
+  const imageOpts = () => ({
+    recipientType,
+    fallbackDmTo: opts.fallbackDmTo,
+  });
+
+  const channel =
+    typeof opts.channel === "string" && opts.channel.trim() !== ""
+      ? opts.channel.trim().toLowerCase()
+      : "whatsapp";
+
+  if (channel !== "whatsapp") {
+    await track(sendWhatsAppMessage(to, text, credentials, nextTextOpts()));
+    return { groupSendFailed };
+  }
+
+  const raw = String(text ?? "").trim();
+  if (raw === "") return { groupSendFailed: false };
+
+  const deliveryIntent = String(opts.deliveryIntent ?? "")
+    .trim()
+    .toLowerCase();
+  const explicitRaw = Array.isArray(opts.explicitImageUrls)
+    ? opts.explicitImageUrls
+    : [];
+  const explicitUrls = explicitRaw
+    .map((u) => String(u ?? "").trim())
+    .filter((u) => u && isPlausibleImageUrl(u))
+    .filter((u, i, a) => a.indexOf(u) === i)
+    .slice(0, MAX_WHATSAPP_MEDIA_IMAGES);
+
+  /** show_images: text is already clean; images from catalog meta only */
+  if (deliveryIntent === "show_images" && explicitUrls.length > 0) {
+    let intro = cleanTextAfterUrlRemoval(
+      stripImageUrlsForWhatsAppDelivery(raw, extractWhatsAppImageUrlsFromText(raw))
+    );
+    if (isWeakOrEmptyCaption(intro)) {
+      intro = WHATSAPP_IMAGE_INTRO_FALLBACK;
+    }
+    console.log(
+      "[whatsappCloud] deliverWhatsAppOutbound show_images:",
+      explicitUrls.length,
+      "image(s)"
+    );
+    await track(sendWhatsAppMessage(to, intro, credentials, nextTextOpts()));
+    for (const imageUrl of explicitUrls) {
+      await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()));
+    }
+    return { groupSendFailed };
+  }
+
+  const imageUrls = extractWhatsAppImageUrlsFromText(raw);
+  if (imageUrls.length === 0) {
+    await track(sendWhatsAppMessage(to, raw, credentials, nextTextOpts()));
+    return { groupSendFailed };
+  }
+
+  let textWithoutUrls = cleanTextAfterUrlRemoval(
+    stripImageUrlsForWhatsAppDelivery(raw, imageUrls)
+  );
+  if (isWeakOrEmptyCaption(textWithoutUrls)) {
+    textWithoutUrls = WHATSAPP_IMAGE_INTRO_FALLBACK;
+  }
+
+  console.log(
+    "[whatsappCloud] deliverWhatsAppOutbound: text +",
+    imageUrls.length,
+    "image(s); intro chars:",
+    textWithoutUrls.length
+  );
+
+  await track(sendWhatsAppMessage(to, textWithoutUrls, credentials, nextTextOpts()));
+  for (const imageUrl of imageUrls) {
+    await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()));
+  }
+  return { groupSendFailed };
+}

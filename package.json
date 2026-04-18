@@ -1,0 +1,22 @@
+{
+  "name": "emily-smart-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "firebase": "^12.11.0",
+    "firebase-admin": "^13.7.0",
+    "openai": "^4.77.0",
+    "playwright": "^1.59.1",
+    "twilio": "^5.4.2"
+  }
+}
