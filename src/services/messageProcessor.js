@@ -402,6 +402,10 @@ function extractDurationFromMessage(message) {
  * @param {boolean} [opts.playwrightWebInbound] - Playwright Web tab inbound from pipeline bridge (group or individual)
  * @param {string} [opts.participantPhoneForDm] - E.164 digits when known (Cloud API DM from group)
  * @param {string[]} [opts.contextMessages] - recent inbound user lines before latest
+ * @param {string | null} [opts.inboundIntent] - classifier intent (Playwright bridge)
+ * @param {string | null} [opts.inboundEntity] - classifier entity pin (Playwright bridge)
+ * @param {boolean} [opts.resetTopicContext] - clear sticky thread focus (topic switch)
+ * @param {string | null} [opts.playwrightChatKey] - normalized WA chat key (Playwright); clears listener anchor on reset
  */
 export async function processMessage({
   userId,
@@ -416,6 +420,10 @@ export async function processMessage({
   playwrightWebInbound = false,
   participantPhoneForDm,
   contextMessages = [],
+  inboundIntent = null,
+  inboundEntity = null,
+  resetTopicContext = false,
+  playwrightChatKey = null,
 }) {
   const selectedForAi = selectLatestInboundForAi(inboundRaw);
   if (!selectedForAi) {
@@ -456,6 +464,35 @@ export async function processMessage({
   const chatContextKey =
     String(sessionKey ?? "").trim() ||
     String(userId ?? "").trim();
+  if (resetTopicContext) {
+    if (globalThis.__chatContext[chatContextKey]) {
+      delete globalThis.__chatContext[chatContextKey];
+    }
+    const pwKey = String(playwrightChatKey ?? "").trim();
+    if (pwKey && globalThis.__lastProcessedUserMsg) {
+      delete globalThis.__lastProcessedUserMsg[pwKey];
+    }
+  }
+
+  globalThis.__topicEntityBySession =
+    globalThis.__topicEntityBySession || Object.create(null);
+  if (!resetTopicContext) {
+    const prevTopicEntity =
+      globalThis.__topicEntityBySession[chatContextKey] ?? null;
+    const entityProbe = extractEntity(message);
+    const confTh = getEntityConfidenceThreshold(entityProbe.name);
+    const newTopicEntity =
+      entityProbe.name != null && entityProbe.confidence >= confTh
+        ? String(entityProbe.name).trim()
+        : null;
+    if (newTopicEntity && newTopicEntity !== prevTopicEntity) {
+      if (globalThis.__chatContext[chatContextKey]) {
+        delete globalThis.__chatContext[chatContextKey];
+      }
+      globalThis.__topicEntityBySession[chatContextKey] = newTopicEntity;
+    }
+  }
+
   const rawCtx = globalThis.__chatContext[chatContextKey];
   const existingChatContext =
     rawCtx && typeof rawCtx === "object"
@@ -599,7 +636,17 @@ export async function processMessage({
     });
   }
 
-  const entityResult = extractEntity(message);
+  const pinnedEntityName =
+    inboundEntity != null && String(inboundEntity).trim() !== ""
+      ? String(inboundEntity).trim()
+      : null;
+  const entityResult = pinnedEntityName
+    ? {
+        name: pinnedEntityName,
+        confidence: 1,
+        entityType: "item",
+      }
+    : extractEntity(message);
   const confThreshold = getEntityConfidenceThreshold(entityResult.name);
   const extractedEntity =
     entityResult.name != null && entityResult.confidence >= confThreshold
@@ -716,7 +763,36 @@ export async function processMessage({
       ? { name: extractedEntity, type: entityType }
       : null;
 
-  const detectedIntent = detectIntent(message);
+  /** Maps classifier labels to detectIntent() union (+ confirmation_followup) */
+  const classifierToDetectedIntent = {
+    availability: "availability",
+    pricing: "pricing",
+    booking: "general",
+    list: "list",
+    comparison: "general",
+    greeting: "general",
+    general: "general",
+    other: "general",
+    confirmation_followup: "confirmation_followup",
+  };
+  let detectedIntent = detectIntent(message);
+  const classifierIntentKey =
+    inboundIntent != null && String(inboundIntent).trim() !== ""
+      ? String(inboundIntent).trim().toLowerCase()
+      : "";
+  if (
+    classifierIntentKey &&
+    Object.prototype.hasOwnProperty.call(
+      classifierToDetectedIntent,
+      classifierIntentKey
+    )
+  ) {
+    detectedIntent = classifierToDetectedIntent[classifierIntentKey];
+  }
+  const shortConfirm = String(message ?? "").trim().toLowerCase();
+  if (shortConfirm === "yes" || shortConfirm === "ok") {
+    detectedIntent = "confirmation_followup";
+  }
   const durationValue = extractDurationFromMessage(message);
   const nextChatContext = {
     lastFocusedItem:
@@ -820,6 +896,9 @@ export async function processMessage({
     emilyTurn.pricingHint
   );
   const contextData = await contextDataPromise;
+  if (pinnedEntityName) {
+    contextData.classifierPinnedEntity = pinnedEntityName;
+  }
   const fc =
     typeof fragmentCount === "number" && Number.isFinite(fragmentCount) && fragmentCount >= 1
       ? Math.min(99, Math.floor(fragmentCount))
@@ -834,8 +913,12 @@ export async function processMessage({
   }
 
   const matchedItemLabel = labelFromMatchedItem(emilyTurn.match.matchedItem);
+  const skipReferentialContinuity =
+    Boolean(resetTopicContext) ||
+    Boolean(pinnedEntityName);
   if (
     matchedItemLabel &&
+    !skipReferentialContinuity &&
     isEntityEstablishedInRecentThread(history, matchedItemLabel)
   ) {
     contextData.entityEstablishedInRecentThread = true;

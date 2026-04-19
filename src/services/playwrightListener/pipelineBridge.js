@@ -6,7 +6,12 @@
 import { createHash } from "node:crypto";
 
 import db from "../../config/firebase.js";
+import { normalizeTitle } from "../playwrightTitleNormalize.js";
 import { getBusinessWhatsAppCredentials } from "../businessWhatsApp.js";
+import {
+  applyPlaywrightClassifierToSession,
+  classifyIntentWithAI,
+} from "../intentEntityClassifier.js";
 import {
   executeWhatsAppAiPipeline,
   scheduleBufferedWhatsAppInbound,
@@ -36,7 +41,18 @@ function sessionKeyForGroup(ownerUserId, groupName) {
 
 /**
  * Build schedule payload; returns null if forwarding cannot run.
- * @param {{ text: string, sender?: string, senderName?: string, timestamp: string | null, groupName: string, messageId?: string | number, playwrightWebTitleIdentity?: boolean }} adapted
+ * @param {{
+ *   text: string,
+ *   sender?: string,
+ *   senderName?: string,
+ *   timestamp: string | null,
+ *   groupName: string,
+ *   messageId?: string | number,
+ *   playwrightWebTitleIdentity?: boolean,
+ *   recentMessages?: string[],
+ *   contextMessages?: string[],
+ *   playwrightChatKey?: string,
+ * }} adapted
  * @returns {Promise<object | null>}
  */
 async function buildPlaywrightSchedulePayload(adapted) {
@@ -90,8 +106,23 @@ async function buildPlaywrightSchedulePayload(adapted) {
     String(process.env.PLAYWRIGHT_SESSION_KEY ?? "").trim() ||
     sessionKeyForGroup(ownerUserId, groupName);
 
+  const recentForClassifier = Array.isArray(adapted?.recentMessages)
+    ? adapted.recentMessages
+    : Array.isArray(adapted?.contextMessages)
+      ? adapted.contextMessages
+      : [];
+  const classified = await classifyIntentWithAI({
+    message: String(adapted?.text ?? "").trim(),
+    context: recentForClassifier,
+  });
+  const { resetTopicContext, inboundEntity, inboundIntent } =
+    applyPlaywrightClassifierToSession(sessionKey, classified);
+
   const conversationCustomerNumber = `group::${groupName}`;
   const line = `[${senderName}] ${adapted.text}`.trim();
+  const playwrightChatKey =
+    String(adapted?.playwrightChatKey ?? "").trim() ||
+    normalizeTitle(groupName);
 
   return {
     payload: {
@@ -118,6 +149,10 @@ async function buildPlaywrightSchedulePayload(adapted) {
       messageId,
       messageTimestamp: adapted?.timestamp ?? null,
       messageSender: "user",
+      inboundIntent,
+      inboundEntity,
+      resetTopicContext,
+      playwrightChatKey,
     },
     line,
     groupName,
@@ -129,7 +164,18 @@ async function buildPlaywrightSchedulePayload(adapted) {
 }
 
 /**
- * @param {{ text: string, sender?: string, senderName?: string, timestamp: string | null, groupName: string, messageId?: string | number, playwrightWebTitleIdentity?: boolean }} adapted
+ * @param {{
+ *   text: string,
+ *   sender?: string,
+ *   senderName?: string,
+ *   timestamp: string | null,
+ *   groupName: string,
+ *   messageId?: string | number,
+ *   playwrightWebTitleIdentity?: boolean,
+ *   recentMessages?: string[],
+ *   contextMessages?: string[],
+ *   playwrightChatKey?: string,
+ * }} adapted
  */
 export async function forwardPlaywrightGroupToPipeline(adapted) {
   const built = await buildPlaywrightSchedulePayload(adapted);
@@ -137,11 +183,20 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
     return false;
   }
 
+  const targetId = `${String(built.payload.playwrightChatKey ?? "").trim()}::${String(built.payload.messageId ?? "").trim()}`;
+  globalThis.__processed = globalThis.__processed || new Set();
+  if (globalThis.__processed.has(targetId)) {
+    console.log("[Playwright] pipeline dedupe — skip:", targetId);
+    return false;
+  }
+  globalThis.__processed.add(targetId);
+
   try {
     scheduleBufferedWhatsAppInbound(built.payload);
     console.log("[Playwright] Forwarded to pipeline");
     return true;
   } catch (err) {
+    globalThis.__processed.delete(targetId);
     console.error("[Playwright] pipeline bridge error:", err?.message || err);
     console.log("⚠️ Direct pipeline fallback");
     try {
@@ -169,10 +224,15 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
         trackingKey: built.payload.trackingKey,
         chatName: built.payload.chatName,
         groupName: built.payload.groupName,
+        inboundIntent: built.payload.inboundIntent,
+        inboundEntity: built.payload.inboundEntity,
+        resetTopicContext: built.payload.resetTopicContext,
+        playwrightChatKey: built.payload.playwrightChatKey,
       });
       console.log("[Playwright] Fallback executeWhatsAppAiPipeline completed");
       return true;
     } catch (fallbackErr) {
+      globalThis.__processed.delete(targetId);
       console.error(
         "[Playwright] Fallback pipeline error:",
         fallbackErr?.message || fallbackErr

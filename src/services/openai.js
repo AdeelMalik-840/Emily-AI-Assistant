@@ -98,6 +98,15 @@ function formatContextDataForPrompt(ctx) {
       "Booking: duration (days) not in message — ask for how many days before confirming a booking"
     );
   }
+  if (
+    typeof ctx.classifierPinnedEntity === "string" &&
+    ctx.classifierPinnedEntity.trim() !== ""
+  ) {
+    const pin = ctx.classifierPinnedEntity.trim();
+    parts.push(
+      `Topic lock: the user is asking about "${pin}" in this turn. Respond about this offering only — do not default to a different product or service from earlier turns unless they ask for alternatives.`
+    );
+  }
   const item = ctx.item;
   if (item && typeof item === "object" && typeof item.name === "string") {
     const avail =

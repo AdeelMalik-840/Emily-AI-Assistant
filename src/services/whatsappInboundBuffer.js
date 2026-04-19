@@ -386,6 +386,10 @@ export async function executeWhatsAppAiPipeline(p) {
     playwrightWebTitleIdentity: playwrightWebTitleIdentityRaw = false,
     groupName: groupNameRaw,
     chatName: chatNameRaw,
+    inboundIntent: inboundIntentRaw = null,
+    inboundEntity: inboundEntityRaw = null,
+    resetTopicContext: resetTopicContextRaw = false,
+    playwrightChatKey: playwrightChatKeyRaw = null,
   } = p;
 
   const playwrightWebInbound = Boolean(playwrightWebInboundRaw);
@@ -600,6 +604,19 @@ export async function executeWhatsAppAiPipeline(p) {
     playwrightWebInbound,
     participantPhoneForDm:
       String(participantPhoneForDmRaw ?? "").trim() || undefined,
+    inboundIntent:
+      inboundIntentRaw != null && String(inboundIntentRaw).trim() !== ""
+        ? String(inboundIntentRaw).trim().toLowerCase()
+        : null,
+    inboundEntity:
+      inboundEntityRaw != null && String(inboundEntityRaw).trim() !== ""
+        ? String(inboundEntityRaw).trim()
+        : null,
+    resetTopicContext: Boolean(resetTopicContextRaw),
+    playwrightChatKey:
+      playwrightChatKeyRaw != null && String(playwrightChatKeyRaw).trim() !== ""
+        ? String(playwrightChatKeyRaw).trim()
+        : null,
   });
 
   const optionalLogFields = buildMessagesOptionalFields({
@@ -967,6 +984,36 @@ export async function executeWhatsAppAiPipeline(p) {
 }
 
 /**
+ * @param {string} promptBlock
+ * @returns {Array<{ sender: "user" | "me", text: string }>}
+ */
+function parseConversationBlockToMessages(promptBlock) {
+  const out = [];
+  for (const line of String(promptBlock ?? "").split("\n")) {
+    const t = line.trim();
+    const u = /^User:\s*(.*)$/i.exec(t);
+    if (u) {
+      out.push({ sender: "user", text: String(u[1] ?? "") });
+      continue;
+    }
+    const a = /^Assistant:\s*(.*)$/i.exec(t);
+    if (a) {
+      out.push({ sender: "me", text: String(a[1] ?? "") });
+    }
+  }
+  return out;
+}
+
+/** Release listener chat lock when group gate blocks inbound (Playwright). */
+function releasePlaywrightChatLockFromGate(ctx) {
+  const title = String(ctx.groupName ?? ctx.chatName ?? "").trim();
+  if (!title) return;
+  const chatKey = normalizeTitle(title);
+  globalThis.__chatResponding = globalThis.__chatResponding || Object.create(null);
+  globalThis.__chatResponding[chatKey] = false;
+}
+
+/**
  * @param {string} bufferKey
  */
 async function flushBufferedWhatsAppInbound(bufferKey) {
@@ -1114,14 +1161,36 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
     const isQuestionLike =
       gate.hasQuestionOrRequest ||
       /\b(kya|ky|kon|kaun|konsi|which|what|any|aur|or)\b/.test(text);
-    const fallbackIntent =
-      /available|options|price|rent|book|chahiye|mil|hai|aur|or|kya|koi|another|else/i.test(
-        text
+
+    let historyBlock = "";
+    try {
+      historyBlock = await getRecentConversationForPrompt(
+        ctx.db,
+        ctx.ownerUserId,
+        ctx.conversationCustomerNumber,
+        40
       );
+    } catch {
+      historyBlock = "";
+    }
+    const threadMessages = parseConversationBlockToMessages(historyBlock);
+    const lastAI = [...threadMessages]
+      .reverse()
+      .find((m) => m.sender === "me");
+    const aiAsked = Boolean(lastAI && /\?\s*$/.test(lastAI.text || ""));
+    const rawLatest = String(latestMessage ?? combined ?? "").trim();
+    const gateTextNorm = rawLatest
+      .replace(/^\[[^\]]+\]\s*/i, "")
+      .trim()
+      .toLowerCase();
+    const isConfirmation = ["yes", "yess", "haan", "ji", "sure"].includes(
+      gateTextNorm
+    );
+
     const shouldReply =
       isQuestionLike ||
       gate.matchScore > 0 ||
-      fallbackIntent;
+      (aiAsked && isConfirmation);
     if (!shouldReply) {
       const gk =
         ctx.playwrightWebInbound && ctx.messageId
@@ -1133,10 +1202,12 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
       console.log("[group gate] blocked", {
         matchScore: gate.matchScore,
         isQuestionLike,
-        fallbackIntent,
+        aiAsked,
+        isConfirmation,
         phraseCount: gate.phraseCount,
         preview: combined.slice(0, 96),
       });
+      releasePlaywrightChatLockFromGate(ctx);
       if (gk) {
         markPlaywrightGroupGateBlockedProcessed(gk);
       }
@@ -1157,7 +1228,8 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
             phraseCount: gate.phraseCount,
             hasQuestionOrRequest: gate.hasQuestionOrRequest,
             isQuestionLike,
-            fallbackIntent,
+            aiAsked,
+            isConfirmation,
           },
           is_group: true,
           is_auto_triggered: true,
@@ -1273,6 +1345,10 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     playwrightWebTitleIdentity: playwrightWebTitleIdentityPayload = false,
     groupName: groupNamePayload,
     chatName: chatNamePayload,
+    inboundIntent: inboundIntentPayload = null,
+    inboundEntity: inboundEntityPayload = null,
+    resetTopicContext: resetTopicContextPayload = false,
+    playwrightChatKey: playwrightChatKeyPayload = null,
   } = payload;
 
   const sessionKeyResolved =
@@ -1375,6 +1451,33 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     chatName:
       String(chatNamePayload ?? entry.context?.chatName ?? "").trim() ||
       undefined,
+    inboundIntent:
+      inboundIntentPayload != null &&
+      String(inboundIntentPayload).trim() !== ""
+        ? String(inboundIntentPayload).trim().toLowerCase()
+        : entry.context?.inboundIntent != null &&
+            String(entry.context.inboundIntent).trim() !== ""
+          ? String(entry.context.inboundIntent).trim().toLowerCase()
+          : null,
+    inboundEntity:
+      inboundEntityPayload != null &&
+      String(inboundEntityPayload).trim() !== ""
+        ? String(inboundEntityPayload).trim()
+        : entry.context?.inboundEntity != null &&
+            String(entry.context.inboundEntity).trim() !== ""
+          ? String(entry.context.inboundEntity).trim()
+          : null,
+    resetTopicContext:
+      Boolean(resetTopicContextPayload) ||
+      Boolean(entry.context?.resetTopicContext),
+    playwrightChatKey:
+      playwrightChatKeyPayload != null &&
+      String(playwrightChatKeyPayload).trim() !== ""
+        ? String(playwrightChatKeyPayload).trim()
+        : entry.context?.playwrightChatKey != null &&
+            String(entry.context.playwrightChatKey).trim() !== ""
+          ? String(entry.context.playwrightChatKey).trim()
+          : null,
   };
 
   if (isPlaywrightImmediate) {

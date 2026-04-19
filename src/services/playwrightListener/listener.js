@@ -321,6 +321,12 @@ globalThis.__processingMessageIds =
   globalThis.__processingMessageIds instanceof Map
     ? globalThis.__processingMessageIds
     : new Map();
+/** Hard message-level idempotency (lock immediately on forward selection; not after pipeline success). */
+globalThis.__processedMessages =
+  globalThis.__processedMessages || new Set();
+/** Last time this chat began a forward (debounces rapid chat-loop ticks). */
+globalThis.__playwrightChatLastProcessedAt =
+  globalThis.__playwrightChatLastProcessedAt || Object.create(null);
 /** Normalized chat key currently running the forward pipeline (blocks rotation / interrupt picks). */
 globalThis.__ACTIVE_PROCESSING_CHAT ??= null;
 /**
@@ -2218,19 +2224,21 @@ async function runListenerBody() {
             .sort((a, b) => a.__ts - b.__ts);
 
           const duplicateRowKeyCounts = new Map();
-          const userMessages = sorted
-            .filter((m) => m.sender === "user")
-            .map((m, idx) => {
-              const baseRowKey = buildRowKey(m);
-              const seen = duplicateRowKeyCounts.get(baseRowKey) ?? 0;
-              const nextSeen = seen + 1;
-              duplicateRowKeyCounts.set(baseRowKey, nextSeen);
-              return {
-                ...m,
-                __position: idx,
-                __rowKey: `${baseRowKey}#${nextSeen}`,
-              };
+          /** Index in full `sorted` thread (needed for “reply after this bubble?” checks). */
+          const userMessages = [];
+          for (let sortedIdx = 0; sortedIdx < sorted.length; sortedIdx++) {
+            const m = sorted[sortedIdx];
+            if (m.sender !== "user") continue;
+            const baseRowKey = buildRowKey(m);
+            const seen = duplicateRowKeyCounts.get(baseRowKey) ?? 0;
+            const nextSeen = seen + 1;
+            duplicateRowKeyCounts.set(baseRowKey, nextSeen);
+            userMessages.push({
+              ...m,
+              __position: sortedIdx,
+              __rowKey: `${baseRowKey}#${nextSeen}`,
             });
+          }
           const totalUserMessages = userMessages.length;
           console.log("📥 Total user messages:", totalUserMessages);
 
@@ -2267,6 +2275,19 @@ async function runListenerBody() {
               chatKey,
               remainingMs: cooldownUntil - Date.now(),
             });
+            return;
+          }
+
+          globalThis.__playwrightChatLastProcessedAt =
+            globalThis.__playwrightChatLastProcessedAt || Object.create(null);
+          const lastProcAt = Number(
+            globalThis.__playwrightChatLastProcessedAt[chatKey] ?? 0
+          );
+          if (lastProcAt && Date.now() - lastProcAt < 1500) {
+            console.log(
+              "⏳ Chat recently processed — skipping rapid re-tick:",
+              chatKey
+            );
             return;
           }
 
@@ -2336,6 +2357,23 @@ async function runListenerBody() {
               lastUserMsgId,
               selectedCount: 1,
             });
+            const pos = lastUserMsg.__position;
+            if (typeof pos === "number" && pos >= 0) {
+              const replied = sorted
+                .slice(pos + 1)
+                .some((m) => m.sender === "me");
+              if (replied) {
+                console.log(
+                  "⛔ Already replied after selected message — skipping"
+                );
+                globalThis.__chatState[chatKey] = {
+                  snapshot: snapshotHash,
+                  seenRowKeys: currentSeen,
+                  lastUpdatedAt: Date.now(),
+                };
+                return;
+              }
+            }
           }
 
           console.log("🆕 New user msgs:", newUserMessages.length);
@@ -2478,8 +2516,25 @@ async function runListenerBody() {
           globalThis.__ACTIVE_PROCESSING_CHAT = chatKey;
           try {
             for (const [index, msg] of messagesToForward.entries()) {
+            const msgTargetId = `${chatKey}::${getMessageIdFromExtracted(
+              msg,
+              extractedMessages
+            )}`;
+            globalThis.__processedMessages =
+              globalThis.__processedMessages || new Set();
+            if (globalThis.__processedMessages.has(msgTargetId)) {
+              console.log("⛔ Already processed message:", msgTargetId);
+              continue;
+            }
+            globalThis.__processedMessages.add(msgTargetId);
+            globalThis.__playwrightChatLastProcessedAt =
+              globalThis.__playwrightChatLastProcessedAt ||
+              Object.create(null);
+            globalThis.__playwrightChatLastProcessedAt[chatKey] = Date.now();
+
             const lastUserText = String(msg?.text ?? "").trim();
             if (!lastUserText) {
+              globalThis.__processedMessages.delete(msgTargetId);
               continue;
             }
             /** Every `messagesToForward` entry is from the user-delta batch. */
@@ -2510,6 +2565,7 @@ async function runListenerBody() {
               console.log(
                 "⏭ Skipping — pipeline already running for this message"
               );
+              globalThis.__processedMessages.delete(msgTargetId);
               continue;
             }
 
@@ -2517,6 +2573,7 @@ async function runListenerBody() {
               console.log(
                 "⏭ Skipping — guarantee already settled (delivered or group gate handled)"
               );
+              globalThis.__processedMessages.delete(msgTargetId);
               continue;
             }
 
@@ -2526,6 +2583,7 @@ async function runListenerBody() {
               chatKey
             );
             if (!activeChatOk) {
+              globalThis.__processedMessages.delete(msgTargetId);
               continue;
             }
 
@@ -2544,6 +2602,7 @@ async function runListenerBody() {
                   globalThis.__currentOpenChatTitle ?? activeChat ?? ""
                 ).trim(),
                 playwrightWebTitleIdentity: true,
+                playwrightChatKey: chatKey,
               });
               if (forwarded) {
                 if (
@@ -2560,10 +2619,12 @@ async function runListenerBody() {
                   rowKey: String(msg.__rowKey ?? "").trim(),
                 });
               } else {
+                globalThis.__processedMessages.delete(msgTargetId);
                 globalThis.__chatResponding[chatKey] = false;
                 notifyPlaywrightGuaranteeReleased(guaranteeKey);
               }
             } catch (fwdErr) {
+              globalThis.__processedMessages.delete(msgTargetId);
               globalThis.__chatResponding[chatKey] = false;
               notifyPlaywrightGuaranteeReleased(guaranteeKey);
               console.error(
