@@ -4,8 +4,6 @@
  */
 
 import { createHash } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { processMessage } from "./messageProcessor.js";
 import {
   appendConversationMessage,
@@ -30,6 +28,7 @@ import {
   notifyPlaywrightGuaranteeDelivered,
   notifyPlaywrightGuaranteeReleased,
 } from "./playwrightGuaranteeBridge.js";
+import { setMessageState } from "./messageState.js";
 
 /** Pauses Playwright chat loop during group text + image outbound (see listener `runChatLoop`). */
 globalThis.__OUTBOUND_BUSY__ = false;
@@ -191,46 +190,6 @@ function releaseStaleActiveJobIfNeeded() {
     globalThis.__forceProcessing = true;
   }
 }
-
-globalThis.__processedMessages = globalThis.__processedMessages || new Set();
-const PROCESSED_STORE_PATH = path.join(
-  process.cwd(),
-  "data",
-  "processedMessages.json"
-);
-
-function loadProcessedMessages() {
-  try {
-    if (!fs.existsSync(PROCESSED_STORE_PATH)) return;
-    const raw = fs.readFileSync(PROCESSED_STORE_PATH, "utf-8");
-    const arr = JSON.parse(raw);
-    globalThis.__processedMessages = new Set(
-      Array.isArray(arr) ? arr.map(String) : []
-    );
-    console.log("📦 Loaded processed messages:", globalThis.__processedMessages.size);
-  } catch (err) {
-    console.warn("⚠️ Failed to load processed messages:", err);
-  }
-}
-
-function saveProcessedMessages() {
-  try {
-    const arr = Array.from(globalThis.__processedMessages || []);
-    const dir = path.dirname(PROCESSED_STORE_PATH);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(
-      PROCESSED_STORE_PATH,
-      JSON.stringify(arr.slice(-500)),
-      "utf-8"
-    );
-  } catch (err) {
-    console.warn("⚠️ Failed to save processed messages:", err);
-  }
-}
-
-loadProcessedMessages();
 
 /**
  * @param {string} combinedMessage
@@ -471,16 +430,6 @@ export async function executeWhatsAppAiPipeline(p) {
   }
   globalThis.__forceProcessing = false;
 
-  if (globalThis.__processedMessages.has(fingerprint)) {
-    console.log("⏭ Already processed — skipping");
-    if (isPlaywrightWebTabInbound(p)) {
-      notifyPlaywrightGuaranteeReleased(
-        buildPlaywrightGuaranteeKey(groupNameResolved, messageId)
-      );
-    }
-    return;
-  }
-
   let processingSuccess = false;
   /** Hoisted for guarantee bridge (Playwright deliver vs release). */
   let outboundReplyDelivered = false;
@@ -517,13 +466,18 @@ export async function executeWhatsAppAiPipeline(p) {
 
   let pipelineTimeoutId = null;
   if (isPlaywrightWebTabInbound(p)) {
+    /** Text + model + image download + WA Web attach/preview often exceeds 15s; releasing locks mid-send breaks uploads. */
     pipelineTimeoutId = setTimeout(() => {
       console.log("⚠️ Pipeline timeout — force release");
       globalThis.__ACTIVE_PIPELINE__ = false;
       globalThis.__UI_HARD_LOCK = false;
       releasePlaywrightListenerProcessingLocks();
-    }, 15_000);
+    }, 120_000);
   }
+
+  const guaranteeKey = isPlaywrightWebTabInbound(p)
+    ? String(buildPlaywrightGuaranteeKey(groupNameResolved, messageId) ?? "").trim()
+    : "";
 
   console.time("TOTAL_RESPONSE");
   try {
@@ -532,9 +486,6 @@ export async function executeWhatsAppAiPipeline(p) {
       globalThis.__UI_HARD_LOCK = true;
       console.log("🔒 UI HARD LOCK + active pipeline (Playwright tab inbound)");
     }
-    globalThis.__processedMessages.add(fingerprint);
-    saveProcessedMessages();
-    console.log("📦 Store size:", globalThis.__processedMessages.size);
     console.log("🚀 Pipeline started");
     const { customerId, channel } = normalizeWhatsAppInboundContext(userPhone);
 
@@ -695,6 +646,10 @@ export async function executeWhatsAppAiPipeline(p) {
                 Date.now() - textSentRecord.timestamp < REPLY_DEDUPE_WINDOW_MS;
 
               let ok = Boolean(textAlreadySentRecently);
+              const wantsImages =
+                Array.isArray(messageMeta?.whatsappImageUrls) &&
+                messageMeta.whatsappImageUrls.length > 0;
+              let imagesDelivered = !wantsImages;
               if (textAlreadySentRecently) {
                 console.log(
                   "[whatsappInboundBuffer] text already sent for this inbound; skipping text resend"
@@ -714,8 +669,7 @@ export async function executeWhatsAppAiPipeline(p) {
 
               if (
                 ok &&
-                Array.isArray(messageMeta?.whatsappImageUrls) &&
-                messageMeta.whatsappImageUrls.length > 0
+                wantsImages
               ) {
                 try {
                   console.log("📸 Starting image send after text");
@@ -728,11 +682,14 @@ export async function executeWhatsAppAiPipeline(p) {
                     }
                   );
                   if (imgOk) {
+                    imagesDelivered = true;
                     console.log("✅ Image send complete");
                   } else {
+                    imagesDelivered = false;
                     console.error("❌ Image send failed");
                   }
                 } catch (imgErr) {
+                  imagesDelivered = false;
                   console.error(
                     "[whatsappInboundBuffer] Playwright image send error (non-fatal):",
                     imgErr?.message || imgErr
@@ -740,11 +697,13 @@ export async function executeWhatsAppAiPipeline(p) {
                 }
               }
 
-              if (ok) {
+              if (ok && imagesDelivered) {
                 outboundReplyDelivered = true;
               } else {
                 console.error(
-                  "[whatsappInboundBuffer] Playwright send failed — not falling back to Cloud API for this path"
+                  wantsImages && ok && !imagesDelivered
+                    ? "[whatsappInboundBuffer] Playwright send incomplete — text delivered but image delivery failed"
+                    : "[whatsappInboundBuffer] Playwright send failed — not falling back to Cloud API for this path"
                 );
               }
             } finally {
@@ -829,7 +788,11 @@ export async function executeWhatsAppAiPipeline(p) {
         console.error("[whatsappInboundBuffer] WhatsApp send error:", sendErr);
       }
 
-      console.log("✅ Reply sent");
+      if (outboundReplyDelivered) {
+        console.log("✅ Reply sent");
+      } else {
+        console.log("⚠️ Reply not fully delivered");
+      }
 
       try {
         await appendConversationMessage(db, {
@@ -898,12 +861,19 @@ export async function executeWhatsAppAiPipeline(p) {
   processingSuccess = true;
   } catch (err) {
     console.error("❌ Processing error:", err);
-    if (!processingSuccess && globalThis.__processedMessages.has(fingerprint)) {
-      globalThis.__processedMessages.delete(fingerprint);
-      saveProcessedMessages();
-      console.log("↩️ Rolled back fingerprint:", fingerprint);
+    if (guaranteeKey) {
+      setMessageState(guaranteeKey, "failed");
     }
   } finally {
+    if (
+      guaranteeKey &&
+      processingSuccess &&
+      (!isPlaywrightWebTabInbound(p) || outboundReplyDelivered)
+    ) {
+      setMessageState(guaranteeKey, "done");
+    } else if (guaranteeKey && !outboundReplyDelivered) {
+      console.log("⚠️ Not marking processed — no reply sent");
+    }
     if (isPlaywrightWebTabInbound(p) && messageId) {
       const gk = buildPlaywrightGuaranteeKey(groupNameResolved, messageId);
       if (gk) {
@@ -1002,6 +972,26 @@ function parseConversationBlockToMessages(promptBlock) {
     }
   }
   return out;
+}
+
+/**
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isPoliteClosingMessage(text) {
+  if (!text) return false;
+  const normalized = String(text).toLowerCase().trim();
+  const phrases = [
+    "no thanks",
+    "no thank you",
+    "thanks",
+    "thank you",
+    "ok",
+    "okay",
+    "thx",
+    "ty",
+  ];
+  return phrases.includes(normalized);
 }
 
 /** Release listener chat lock when group gate blocks inbound (Playwright). */
@@ -1155,43 +1145,10 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
       db: ctx.db,
       ownerUserId: ctx.ownerUserId,
       combinedMessage: combined,
+      messageTimestamp: ctx.messageTimestamp ?? null,
       isGroupMessage: true,
     });
-    const text = String(combined ?? "").toLowerCase();
-    const isQuestionLike =
-      gate.hasQuestionOrRequest ||
-      /\b(kya|ky|kon|kaun|konsi|which|what|any|aur|or)\b/.test(text);
-
-    let historyBlock = "";
-    try {
-      historyBlock = await getRecentConversationForPrompt(
-        ctx.db,
-        ctx.ownerUserId,
-        ctx.conversationCustomerNumber,
-        40
-      );
-    } catch {
-      historyBlock = "";
-    }
-    const threadMessages = parseConversationBlockToMessages(historyBlock);
-    const lastAI = [...threadMessages]
-      .reverse()
-      .find((m) => m.sender === "me");
-    const aiAsked = Boolean(lastAI && /\?\s*$/.test(lastAI.text || ""));
-    const rawLatest = String(latestMessage ?? combined ?? "").trim();
-    const gateTextNorm = rawLatest
-      .replace(/^\[[^\]]+\]\s*/i, "")
-      .trim()
-      .toLowerCase();
-    const isConfirmation = ["yes", "yess", "haan", "ji", "sure"].includes(
-      gateTextNorm
-    );
-
-    const shouldReply =
-      isQuestionLike ||
-      gate.matchScore > 0 ||
-      (aiAsked && isConfirmation);
-    if (!shouldReply) {
+    if (!gate.allow) {
       const gk =
         ctx.playwrightWebInbound && ctx.messageId
           ? buildPlaywrightGuaranteeKey(
@@ -1199,12 +1156,8 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
               ctx.messageId
             )
           : "";
-      console.log("[group gate] blocked", {
-        matchScore: gate.matchScore,
-        isQuestionLike,
-        aiAsked,
-        isConfirmation,
-        phraseCount: gate.phraseCount,
+      console.log("🚫 Blocked garbage message", {
+        reason: gate.reason ?? "unknown",
         preview: combined.slice(0, 96),
       });
       releasePlaywrightChatLockFromGate(ctx);
@@ -1224,12 +1177,10 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
           isGreetingFirst,
           skippedReason: "group_gate",
           groupGate: {
+            reason: gate.reason ?? "unknown",
             matchScore: gate.matchScore,
             phraseCount: gate.phraseCount,
             hasQuestionOrRequest: gate.hasQuestionOrRequest,
-            isQuestionLike,
-            aiAsked,
-            isConfirmation,
           },
           is_group: true,
           is_auto_triggered: true,
@@ -1241,6 +1192,7 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
       }
       return;
     }
+    console.log("✅ Message allowed to pipeline");
   } else if (
     ctx.isGroupMessage &&
     (WHATSAPP_GROUP_GATE_DISABLED || WHATSAPP_GROUP_DEBUG)

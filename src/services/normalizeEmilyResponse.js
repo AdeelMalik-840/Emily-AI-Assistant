@@ -910,10 +910,20 @@ function replyMentionsLocationSemantic(text, location) {
 
 /**
  * @param {string} text
- * @param {string} pref
+ * @param {unknown} pref
  */
 function replyMentionsDurationSemantic(text, pref) {
   const t = String(text ?? "").toLowerCase();
+  if (
+    pref &&
+    typeof pref === "object" &&
+    pref.value != null &&
+    pref.unit != null
+  ) {
+    const v = String(pref.value);
+    const u = String(pref.unit).toLowerCase();
+    return t.includes(v) && t.includes(u);
+  }
   if (pref === "daily") {
     return /\b(daily|din\b|per\s*day|\/day|day\s+rate|day\b)/i.test(t);
   }
@@ -1158,6 +1168,17 @@ function formatLocationEcho(memory, english, echoOpts) {
  */
 function formatDurationEcho(memory, english) {
   const d = memory?.durationPreference;
+  if (
+    d &&
+    typeof d === "object" &&
+    typeof d.value === "number" &&
+    d.unit != null
+  ) {
+    const line = `${d.value} ${d.unit}`;
+    return english
+      ? pickRandom([`Got it — ${line}`, `${line} noted`])
+      : pickRandom([`${line} note kar liya`, `${line} theek hai`]);
+  }
   if (d === "daily") {
     return english
       ? pickRandom(["Daily works", "Got it — daily"])
@@ -1571,6 +1592,15 @@ function pickNaturalForwardQuestion(
   }
   if (m.durationPreference) {
     pool = pool.filter((q) => !/daily|monthly|din/i.test(q));
+    if (
+      typeof m.durationPreference === "object" &&
+      m.durationPreference != null &&
+      typeof m.durationPreference.value === "number"
+    ) {
+      pool = pool.filter(
+        (q) => !/kitne din|how many days|how many hours|ghante/i.test(q)
+      );
+    }
   }
   if (pool.length === 0) {
     if (!m.dateOrTimeMention) return "Kab chahiye aapko?";
@@ -2271,7 +2301,19 @@ export function normalizeEmilyResponse(rawResponse, context) {
   void context;
   const response = rawResponse;
   const text = String(response ?? "");
-  const normalized = text.replace(/\s+/g, " ").trim();
+  const withoutMarkdownImageLinks = text.replace(
+    /!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/gi,
+    "check image here"
+  );
+  const withoutRawUrls = withoutMarkdownImageLinks.replace(
+    /https?:\/\/[^\s)]+/gi,
+    "check image here"
+  );
+  const dedupedImageMarkers = withoutRawUrls.replace(
+    /(check image here(?:\s*[|,]\s*check image here)+)/gi,
+    "check image here"
+  );
+  const normalized = dedupedImageMarkers.replace(/\s+/g, " ").trim();
   console.log("🧼 Normalization input:", response);
   console.log("🧼 Normalization output:", normalized);
   return normalized;

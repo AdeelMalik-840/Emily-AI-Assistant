@@ -12,6 +12,7 @@ import {
   isEnglishOnlyGreetingMessage,
   isIslamicOrUrduGreetingMessage,
 } from "./greetingLanguage.js";
+import { extractDurationSafe } from "../utils/extractDurationSafe.js";
 
 /** @typedef {"greeting"|"inquiry"|"pricing"|"booking"|"general_question"|"delayed_commitment"} EmilyIntent */
 /** @typedef {"START"|"INQUIRY"|"PRICING"|"BOOKING"} ConversationStage */
@@ -365,10 +366,29 @@ export function collectCatalogItemImageUrls(rawBusinessProfile, matchedItem) {
       : Array.isArray(rawBusinessProfile.vehicles)
         ? rawBusinessProfile.vehicles
         : [];
+  /**
+   * Strict row match first (name + color), then safe fallback by name-only when color
+   * is missing from matched context. This avoids false "no image" on follow-up turns.
+   */
+  const exactRows = [];
+  const nameOnlyRows = [];
+  const matchedName = String(matchedItem.name ?? "").trim().toLowerCase();
+  const matchedColor = String(matchedItem.color ?? "").trim().toLowerCase();
   for (const it of itemRows) {
     if (!it || typeof it !== "object" || Array.isArray(it)) continue;
     const vo = /** @type {Record<string, unknown>} */ (it);
-    if (!matchedItemMatchesRow(matchedItem, vo)) continue;
+    const rowName = String(vo.name ?? "").trim().toLowerCase();
+    const rowColor = String(vo.color ?? "").trim().toLowerCase();
+    if (matchedItemMatchesRow(matchedItem, vo)) {
+      exactRows.push(vo);
+      continue;
+    }
+    if (matchedName && rowName === matchedName && !matchedColor) {
+      nameOnlyRows.push(vo);
+    }
+  }
+  const candidates = exactRows.length > 0 ? exactRows : nameOnlyRows;
+  for (const vo of candidates) {
     const rawImgs = vo.images;
     if (!Array.isArray(rawImgs)) return [];
     const out = [];
@@ -384,7 +404,89 @@ export function collectCatalogItemImageUrls(rawBusinessProfile, matchedItem) {
     }
     return out;
   }
+  /** Only when strict matching found no row: generic normalized overlap (image retrieval only). */
+  if (exactRows.length === 0 && nameOnlyRows.length === 0) {
+    for (const it of itemRows) {
+      if (!it || typeof it !== "object" || Array.isArray(it)) continue;
+      const vo = /** @type {Record<string, unknown>} */ (it);
+      if (!flexibleCatalogRowMatchesForImages(matchedItem, vo)) continue;
+      const rawImgs = vo.images;
+      if (!Array.isArray(rawImgs)) continue;
+      const out = [];
+      const seen = new Set();
+      for (const x of rawImgs) {
+        if (typeof x !== "string") continue;
+        const u = x.trim();
+        if (!u || !isPlausibleImageUrl(u)) continue;
+        if (seen.has(u)) continue;
+        seen.add(u);
+        out.push(u);
+        if (out.length >= MAX_CATALOG_IMAGES_PER_WHATSAPP_SEND) break;
+      }
+      if (out.length > 0) return out;
+    }
+  }
   return [];
+}
+
+/** Min normalized length for flexible image match (avoids trivial substring hits). */
+const CATALOG_IMAGE_FLEX_MIN_LEN = 4;
+/** When one bundle includes the other, require shorter/longer ≥ this (reduces unrelated hits). */
+const CATALOG_IMAGE_FLEX_MIN_SUBSTRING_RATIO = 0.38;
+
+/**
+ * Strip parenthetical / bracketed segments, lowercase, collapse whitespace.
+ * Used only for catalog image URL fallback matching (not classifier / pricing).
+ * @param {unknown} s
+ * @returns {string}
+ */
+function normalizeCatalogImageLabelForMatch(s) {
+  let t = stripParentheticalAndBracketed(String(s ?? ""));
+  return t.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function stripParentheticalAndBracketed(s) {
+  let t = s;
+  for (let i = 0; i < 8; i++) {
+    const next = t
+      .replace(/\([^)]*\)/g, " ")
+      .replace(/\[[^\]]*\]/g, " ")
+      .replace(/\{[^}]*\}/g, " ");
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+}
+
+/**
+ * @param {unknown} name
+ * @param {unknown} color
+ */
+function catalogImageBundleFromNameColor(name, color) {
+  const parts = [String(name ?? "").trim(), String(color ?? "").trim()].filter(Boolean);
+  return normalizeCatalogImageLabelForMatch(parts.join(" "));
+}
+
+/**
+ * Generic overlap: normalized name+color bundles, includes either way with a length ratio guard.
+ * @param {{ name?: string, color?: string } | null | undefined} matchedItem
+ * @param {Record<string, unknown>} vo
+ */
+function flexibleCatalogRowMatchesForImages(matchedItem, vo) {
+  if (!matchedItem || !vo) return false;
+  const a = catalogImageBundleFromNameColor(matchedItem.name, matchedItem.color);
+  const b = catalogImageBundleFromNameColor(vo.name, vo.color);
+  if (a.length < CATALOG_IMAGE_FLEX_MIN_LEN || b.length < CATALOG_IMAGE_FLEX_MIN_LEN) {
+    return false;
+  }
+  if (a === b) return true;
+  if (a.includes(b)) {
+    return b.length / a.length >= CATALOG_IMAGE_FLEX_MIN_SUBSTRING_RATIO;
+  }
+  if (b.includes(a)) {
+    return a.length / b.length >= CATALOG_IMAGE_FLEX_MIN_SUBSTRING_RATIO;
+  }
+  return false;
 }
 
 function normalizeForMatch(s) {
@@ -577,7 +679,15 @@ export function formatMemoryForPrompt(state) {
     lines.push(`Location / pickup area (already shared): ${state.location}`);
   }
   if (state.durationPreference) {
-    lines.push(`Duration preference: ${state.durationPreference}`);
+    const dp = state.durationPreference;
+    const durLine =
+      dp != null &&
+      typeof dp === "object" &&
+      typeof dp.value === "number" &&
+      dp.unit != null
+        ? `${dp.value} ${dp.unit}`
+        : String(dp);
+    lines.push(`Duration preference: ${durLine}`);
   }
   if (state.dateOrTimeMention) {
     lines.push(`Date / time mentioned: ${state.dateOrTimeMention}`);
@@ -661,6 +771,17 @@ export function applyEmilyTurn({
   const match = matchCatalogAgainstMessage(message, rawBusinessProfile);
   const supplemental = inferSupplementalEntities(message, state, match);
 
+  let resolvedDurationPreference = supplemental.durationPreference ?? null;
+  if (
+    resolvedDurationPreference == null &&
+    (state.durationPreference == null || state.durationPreference === "")
+  ) {
+    const extractedForSession = extractDurationSafe(message);
+    if (extractedForSession) {
+      resolvedDurationPreference = extractedForSession;
+    }
+  }
+
   const hasCatalogMatch = Boolean(match.matchedItem || match.matchedService);
   const pricingHint = resolvePricingHint(rawBusinessProfile, match.matchedItem);
 
@@ -724,9 +845,19 @@ export function applyEmilyTurn({
     String(supplemental.location).trim() !== "" &&
     String(supplemental.location).trim() !== prevLoc;
 
+  const durKey = (d) =>
+    d == null || d === ""
+      ? ""
+      : typeof d === "object" &&
+          d !== null &&
+          typeof d.value === "number" &&
+          d.unit != null
+        ? `${d.value}:${String(d.unit)}`
+        : String(d);
+
   const durationSetThisTurn =
-    supplemental.durationPreference != null &&
-    supplemental.durationPreference !== prevDur;
+    resolvedDurationPreference != null &&
+    durKey(resolvedDurationPreference) !== durKey(prevDur);
 
   const dateSetThisTurn =
     supplemental.dateOrTimeMention != null &&
@@ -747,8 +878,8 @@ export function applyEmilyTurn({
     stage,
     lastUserEmotionalTone: blendedEmotionalTone,
     ...(supplemental.location != null ? { location: supplemental.location } : {}),
-    ...(supplemental.durationPreference != null
-      ? { durationPreference: supplemental.durationPreference }
+    ...(resolvedDurationPreference != null
+      ? { durationPreference: resolvedDurationPreference }
       : {}),
     ...(supplemental.dateOrTimeMention != null
       ? { dateOrTimeMention: supplemental.dateOrTimeMention }

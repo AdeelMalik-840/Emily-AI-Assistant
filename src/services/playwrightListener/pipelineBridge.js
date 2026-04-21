@@ -101,6 +101,9 @@ async function buildPlaywrightSchedulePayload(adapted) {
   }
 
   const senderName = String(adapted?.sender ?? adapted?.senderName ?? "user").trim() || "user";
+  const playwrightChatKey =
+    String(adapted?.playwrightChatKey ?? "").trim() ||
+    normalizeTitle(groupName);
 
   const sessionKey =
     String(process.env.PLAYWRIGHT_SESSION_KEY ?? "").trim() ||
@@ -115,15 +118,12 @@ async function buildPlaywrightSchedulePayload(adapted) {
     message: String(adapted?.text ?? "").trim(),
     context: recentForClassifier,
   });
+  const classifierSessionKey = playwrightChatKey || sessionKey;
   const { resetTopicContext, inboundEntity, inboundIntent } =
-    applyPlaywrightClassifierToSession(sessionKey, classified);
+    applyPlaywrightClassifierToSession(classifierSessionKey, classified);
 
   const conversationCustomerNumber = `group::${groupName}`;
   const line = `[${senderName}] ${adapted.text}`.trim();
-  const playwrightChatKey =
-    String(adapted?.playwrightChatKey ?? "").trim() ||
-    normalizeTitle(groupName);
-
   return {
     payload: {
       db,
@@ -183,20 +183,11 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
     return false;
   }
 
-  const targetId = `${String(built.payload.playwrightChatKey ?? "").trim()}::${String(built.payload.messageId ?? "").trim()}`;
-  globalThis.__processed = globalThis.__processed || new Set();
-  if (globalThis.__processed.has(targetId)) {
-    console.log("[Playwright] pipeline dedupe — skip:", targetId);
-    return false;
-  }
-  globalThis.__processed.add(targetId);
-
   try {
     scheduleBufferedWhatsAppInbound(built.payload);
     console.log("[Playwright] Forwarded to pipeline");
     return true;
   } catch (err) {
-    globalThis.__processed.delete(targetId);
     console.error("[Playwright] pipeline bridge error:", err?.message || err);
     console.log("⚠️ Direct pipeline fallback");
     try {
@@ -232,7 +223,6 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
       console.log("[Playwright] Fallback executeWhatsAppAiPipeline completed");
       return true;
     } catch (fallbackErr) {
-      globalThis.__processed.delete(targetId);
       console.error(
         "[Playwright] Fallback pipeline error:",
         fallbackErr?.message || fallbackErr

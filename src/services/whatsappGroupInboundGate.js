@@ -1,7 +1,5 @@
 /**
- * WhatsApp group inbound gating: only reply when the message plausibly references
- * this business (lexicon from Firestore) and looks like a question or request.
- * No per-industry keyword lists — phrases come from profile + catalog only.
+ * WhatsApp group inbound gating (thin garbage filter only).
  */
 
 import { BUSINESS_CATEGORIES } from "../config/businessCategories.js";
@@ -12,8 +10,6 @@ import {
 import { metaCloudFromIsGroupThread } from "../utils/waMetaThreadMarkers.js";
 
 const MIN_LEXEME_LEN = 2;
-/** Below this match score, group replies are suppressed (noise control). */
-const GROUP_MATCH_SCORE_MIN = 56;
 
 /**
  * Group thread detection (Meta Cloud API).
@@ -212,39 +208,22 @@ export function scoreMessageAgainstBusinessLexicon(messageNorm, phrases) {
 }
 
 /**
- * Generic question / request detector (language-agnostic patterns, no product names).
- * @param {string} text
+ * @param {{ message: string, messageTimestamp?: string | number | null }} p
  * @returns {boolean}
  */
-export function isGenericQuestionOrRequest(text) {
-  const t = String(text ?? "").trim();
-  if (!t) return false;
-  if (t.includes("?")) return true;
-  const lower = t.toLowerCase();
-
-  const interrogativeWord =
-    /\b(what|when|where|who|why|how|which|whose|whom)\b/i.test(lower) ||
-    /\b(kya|kaun|kab|kahan|kahin|kitna|kitne|kisne|kaise|kyun|kyoon|konsa|kaunsa)\b/i.test(
-      lower
-    );
-
-  const interrogativeStart = /^(what|when|where|who|why|how|which|kya|kaun|kab)\b/i.test(
-    t.trim()
-  );
-
-  const requestLike =
-    /\b(show|send|share|tell|give|need|want|looking|order|book|quote|list)\b/i.test(
-      lower
-    ) ||
-    /\b(price|pricing|prices|cost|costs|rate|rates|available|availability|detail|details|info|information)\b/i.test(
-      lower
-    ) ||
-    /\b(photo|photos|pic|pics|picture|pictures|image|images)\b/i.test(lower) ||
-    /\b(bata|batao|bataiye|dikhao|dikha|bhej|bhejo|chahiye|milega|milta|mil\s+jaye)\b/i.test(
-      lower
-    );
-
-  return Boolean(interrogativeWord || interrogativeStart || requestLike);
+export function shouldBlockMessage({ message, messageTimestamp }) {
+  if (!message || !String(message).trim()) return true;
+  const text = String(message);
+  const isOnlyNoise = /^[\s\W]+$/.test(text);
+  if (isOnlyNoise) return true;
+  if (messageTimestamp != null && String(messageTimestamp).trim() !== "") {
+    const tsNum = Number(messageTimestamp);
+    if (Number.isFinite(tsNum) && tsNum > 0) {
+      const isVeryOld = Date.now() - tsNum > 5 * 60 * 1000;
+      if (isVeryOld) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -252,9 +231,10 @@ export function isGenericQuestionOrRequest(text) {
  *   db: import("firebase-admin/firestore").Firestore,
  *   ownerUserId: string,
  *   combinedMessage: string,
+ *   messageTimestamp?: string | number | null,
  *   isGroupMessage: boolean,
  * }} p
- * @returns {Promise<{ allow: boolean, matchScore: number, phraseCount: number, hasQuestionOrRequest: boolean }>}
+ * @returns {Promise<{ allow: boolean, matchScore: number, phraseCount: number, hasQuestionOrRequest: boolean, reason?: string }>}
  */
 export async function evaluateWhatsAppGroupInboundGate(p) {
   if (!p.isGroupMessage) {
@@ -273,21 +253,20 @@ export async function evaluateWhatsAppGroupInboundGate(p) {
     .replace(/\s+/g, " ")
     .trim();
   const msgNorm = normalizeForLexiconMatch(msg);
-
-  const profile = await getBusinessProfile(String(p.ownerUserId ?? "").trim());
-  const phrases = collectBusinessLexiconPhrases(profile);
-  const matchScore = scoreMessageAgainstBusinessLexicon(msgNorm, phrases);
-  const hasQuestionOrRequest = isGenericQuestionOrRequest(msg);
-
-  const allow =
-    phrases.length > 0 &&
-    matchScore >= GROUP_MATCH_SCORE_MIN &&
-    hasQuestionOrRequest;
+  if (shouldBlockMessage({ message: msgNorm, messageTimestamp: p.messageTimestamp })) {
+    return {
+      allow: false,
+      reason: "garbage_message",
+      matchScore: 0,
+      phraseCount: 0,
+      hasQuestionOrRequest: false,
+    };
+  }
 
   return {
-    allow,
-    matchScore,
-    phraseCount: phrases.length,
-    hasQuestionOrRequest,
+    allow: true,
+    matchScore: 100,
+    phraseCount: 0,
+    hasQuestionOrRequest: true,
   };
 }

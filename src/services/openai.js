@@ -46,6 +46,25 @@ export function parseStructuredReplyAndRoute(rawStr) {
 }
 
 /**
+ * @param {string} message
+ * @returns {boolean}
+ */
+function isClosingIntentMessage(message) {
+  if (!message) return false;
+  const text = String(message).toLowerCase().trim();
+  return [
+    "no thanks",
+    "no thank you",
+    "thanks",
+    "ok thanks",
+    "okay thanks",
+    "alright thanks",
+    "thx",
+    "ty",
+  ].includes(text);
+}
+
+/**
  * @param {unknown} matchedItem
  * @returns {string}
  */
@@ -93,9 +112,14 @@ function formatContextDataForPrompt(ctx) {
     const t = ent.type === "category" ? "category" : "item";
     parts.push(`Entity: ${String(ent.name).trim()} (type: ${t})`);
   }
-  if (ctx.requiresDuration === true) {
+  if (ctx.requiresDuration === true && ctx.avoidAskingDuration !== true) {
     parts.push(
       "Booking: duration (days) not in message — ask for how many days before confirming a booking"
+    );
+  }
+  if (ctx.avoidAskingDuration === true) {
+    parts.push(
+      "Duration is already recorded in thread memory — do not ask again how many days or hours; proceed with pricing or the next booking step."
     );
   }
   if (
@@ -327,6 +351,29 @@ export async function generateReply({
       ? lastDuration
       : null;
 
+  const memForDur =
+    conversationMemoryInput && typeof conversationMemoryInput === "object"
+      ? conversationMemoryInput
+      : {};
+  const rawDurPref = memForDur.durationPreference;
+  let durationFromMemoryStr = null;
+  if (
+    rawDurPref != null &&
+    typeof rawDurPref === "object" &&
+    Number.isFinite(Number(rawDurPref.value)) &&
+    rawDurPref.unit != null
+  ) {
+    durationFromMemoryStr = `${Number(rawDurPref.value)} ${String(
+      rawDurPref.unit
+    )}`;
+  } else if (typeof rawDurPref === "string" && String(rawDurPref).trim() !== "") {
+    durationFromMemoryStr = String(rawDurPref).trim();
+  }
+
+  const promptDurationDisplay =
+    durationFromMemoryStr ??
+    (normalizedLastDuration != null ? String(normalizedLastDuration) : "unknown");
+
   const matchedItemLabel = formatMatchedItemLabel(matchedItemInput);
   const matchedServiceStr =
     matchedServiceInput != null && String(matchedServiceInput).trim() !== ""
@@ -342,7 +389,7 @@ export async function generateReply({
   const knowledgeGapBlock =
     ctx.missingKnowledge && !hasMatchedCatalogEntry
       ? `
-Critical — **${bn}**: little or no business knowledge text is loaded, but the user asked about offerings. Ask **ONE** short clarifying question; do **not** invent products, prices, or services. Stay natural in Roman Urdu / simple English.
+Critical — **${bn}**: little or no business knowledge text is loaded, but the user asked about offerings. Give a short, human-sounding response that acknowledges the request, shares only what is known, and asks **ONE** practical follow-up. Do **not** invent products, prices, or services. Stay natural in Roman Urdu / simple English (no robotic wording).
 `
       : "";
 
@@ -642,7 +689,7 @@ Never say "I don't know", "I am not sure", "I'm not certain", or similar IF the 
 Behavior:
 - If the user asks about something that matches services, items, or offerings in the profile → respond as the business would: you provide it; be clear and helpful.
 - If only partial information exists → state what IS known, then ask one specific follow-up.
-- If something is NOT in the profile → then ask a clarifying question (do not invent).
+- If something is NOT in the profile → do not guess. Give a polite, natural fallback (not robotic), then ask one clarifying question tied to the user's intent.
 
 You behave like a business owner or front-line staff, not a generic assistant.
 
@@ -740,7 +787,7 @@ User message:
 
 Context:
 - Current ${contextLabel}: ${lastFocusedItemForPrompt || "unknown"}
-- Duration: ${normalizedLastDuration != null ? String(normalizedLastDuration) : "unknown"}
+- Duration: ${promptDurationDisplay}
 - Intent: ${detectedIntent}
 
 Context messages:
@@ -755,10 +802,19 @@ ${safeKnowledge || "(none)"}
     lastFocusedItem: lastFocusedItemForPrompt,
     lastFocusedItemRaw: normalizedLastFocusedItem,
     lastDuration: normalizedLastDuration,
+    promptDurationDisplay,
     detectedIntent,
   });
 
   try {
+    if (isClosingIntentMessage(safeMessage)) {
+      const text = safeMessage.toLowerCase().trim();
+      const closingReply = text.includes("thank")
+        ? "You're welcome 😊 Agar aur koi help chahiye ho toh bataiye!"
+        : "No problem 😊 Agar aapko future mein kisi car ki zaroorat ho, toh zaroor batayein!";
+      return { reply: closingReply, raw: closingReply, mode: undefined };
+    }
+
     console.log({
       matchedItem: matchedItemInput ?? null,
       intent: displayIntent,

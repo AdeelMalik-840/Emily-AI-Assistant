@@ -8,12 +8,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import { normalizeWhatsAppImage } from "../utils/normalizeWhatsAppImage.js";
 
 /** Align with catalog cap in conversationIntelligence (show_images). */
 const MAX_PLAYWRIGHT_GROUP_IMAGES = 5;
 
-/** Opens the native file picker (filechooser); do not use hidden input.setInputFiles — React does not update. */
-const ATTACH_TRIGGER_SELECTOR = '[title="Attach"], span[data-icon="clip"]';
 globalThis.__OUTBOUND_BUSY__ = globalThis.__OUTBOUND_BUSY__ || false;
 globalThis.__lockedChatTitle = globalThis.__lockedChatTitle || null;
 /** When true, listener must not switch/open chats (Playwright UI send in progress). */
@@ -23,6 +22,8 @@ globalThis.__UI_HARD_LOCK = globalThis.__UI_HARD_LOCK === true ? true : false;
 /** When true, inbound AI pipeline is holding the Playwright session (buffer). */
 globalThis.__ACTIVE_PIPELINE__ =
   globalThis.__ACTIVE_PIPELINE__ === true ? true : false;
+/** WhatsApp Web image upload/send in progress — listener defers switch_chat / interrupt only. */
+globalThis.__WA_MEDIA_SEND__ = globalThis.__WA_MEDIA_SEND__ === true;
 
 /** @param {number} minMs @param {number} maxMs */
 function randomBetweenMs(minMs, maxMs) {
@@ -552,7 +553,19 @@ function tempExtensionFromUrl(url, contentType) {
  * @returns {Promise<{ path: string, cleanup: () => Promise<void> }> }
  */
 async function downloadImageToTempFile(url) {
-  const res = await fetch(url, { redirect: "follow" });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
+  let res;
+  try {
+    res = await fetch(url, { redirect: "follow", signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`image_download_timeout for ${String(url).slice(0, 80)}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} for ${url.slice(0, 80)}`);
   }
@@ -575,38 +588,256 @@ async function downloadImageToTempFile(url) {
   };
 }
 
-/**
- * Primary upload attempt: set files on hidden image inputs when available.
- * Keeps fallback attach/filechooser path untouched when it fails.
- *
- * @param {import("playwright").Page} page
- * @param {string} filePath
- * @returns {Promise<boolean>}
- */
-async function uploadViaHiddenInput(page, filePath) {
-  try {
-    const inputs = await page.$$('input[type="file"]');
+/** WhatsApp Web media composer surface (scoped; do not use generic `[role="dialog"]` alone). */
+const MEDIA_PREVIEW_SELECTOR = '[data-testid="media-preview"]';
+/** WhatsApp may show this instead of media-preview for the same upload path. */
+const STICKER_CONTAINER_SELECTOR = '[data-testid="sticker-container"]';
+const MEDIA_PREVIEW_SELECTORS = [
+  '[data-testid="media-preview"]',
+  '[data-testid="media-attach-preview"]',
+  '[data-testid="media-gallery-preview"]',
+];
 
-    for (const input of inputs) {
-      const accept = await input.getAttribute("accept");
-      if (!accept || accept.includes("image")) {
-        console.log("🧭 Upload path: hidden_input");
-        await input.setInputFiles(filePath);
-        console.log("📸 Uploaded via hidden input");
-        return true;
-      }
+/** Combined locator string for the active media preview root (any variant). */
+const MEDIA_PREVIEW_ROOT_LOCATOR =
+  '[data-testid="media-preview"], [data-testid="media-attach-preview"], [data-testid="media-gallery-preview"]';
+
+/**
+ * Prefer `.last()` — targets the active media composer; scoped send avoids footer chat send.
+ * `[role="dialog"]` covers variants where preview is not only testid-based.
+ */
+const MEDIA_PREVIEW_COMPOSER_ROOT =
+  '[data-testid="media-preview"], [data-testid="media-attach-preview"], [role="dialog"]';
+
+/**
+ * Media send is often `div[role="button"][aria-label="Send"]`; React expects pointerdown/up, not Locator.click().
+ * @param {import("playwright").Page} page
+ * @param {import("playwright").Locator} sendBtn
+ */
+async function pointerClickMediaSend(page, sendBtn) {
+  await sendBtn.scrollIntoViewIfNeeded().catch(() => {});
+  const box = await sendBtn.boundingBox();
+  if (!box) {
+    throw new Error("media send: no bounding box for Send control");
+  }
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.waitForTimeout(50);
+  await page.mouse.up();
+}
+
+/**
+ * Resolves the best Send control for media preview (multi-image album UI often needs scoping).
+ * @param {import("playwright").Page} page
+ * @returns {Promise<{ locator: import("playwright").Locator, strategy: string }>}
+ */
+async function getActiveMediaSendButton(page) {
+  const previewScoped = page
+    .locator('[data-testid="media-preview"]')
+    .locator('[aria-label="Send"]')
+    .filter({ has: page.locator("svg") });
+
+  if ((await previewScoped.count()) > 0) {
+    return { locator: previewScoped.first(), strategy: "preview-scoped" };
+  }
+
+  const iconBased = page.locator('button:has(span[data-icon="send"])');
+
+  if ((await iconBased.count()) > 0) {
+    return { locator: iconBased.last(), strategy: "icon-based" };
+  }
+
+  return {
+    locator: page.locator('[aria-label="Send"]').last(),
+    strategy: "global-fallback",
+  };
+}
+
+/**
+ * Clears stuck preview and focuses the composer so attach/send does not hit pointer intercepts.
+ * @param {import("playwright").Page} page
+ */
+async function ensureChatReady(page) {
+  const preview = page.locator(MEDIA_PREVIEW_SELECTOR);
+  if (await preview.isVisible().catch(() => false)) {
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  const composer = page.locator(
+    '[data-testid="conversation-compose-box-input"]'
+  );
+  await composer.click({ timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(300);
+}
+
+/**
+ * Best-effort UI reset before another upload (escape, blur, short settle).
+ * @param {import("playwright").Page} page
+ */
+async function ensureWhatsAppIdle(page) {
+  await page.keyboard.press("Escape").catch(() => {});
+
+  await page.evaluate(() => {
+    if (document.activeElement) {
+      document.activeElement.blur();
+    }
+  });
+
+  await page.waitForTimeout(500);
+}
+
+/**
+ * WhatsApp sometimes leaves the attach / "Add" popover open on top of the media preview.
+ * That blocks hit-testing on the green send button — dismiss without closing preview first.
+ * @param {import("playwright").Page} page
+ */
+async function dismissAttachMenuOverlay(page) {
+  const maxPasses = 5;
+  for (let pass = 0; pass < maxPasses; pass++) {
+    const menuOpen = await page
+      .evaluate(() => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 40 && rect.height > 40;
+        };
+        const attach = document.querySelector('[data-testid="attach-menu"]');
+        if (attach && isVisible(attach)) return true;
+        const main = document.querySelector("#main");
+        if (!main) return false;
+        for (const m of main.querySelectorAll('[role="menu"]')) {
+          if (!isVisible(m)) continue;
+          const text = (m.innerText || "").slice(0, 500);
+          if (/Photos\s*&?\s*videos|Document|Camera|Contact|Location/i.test(text)) {
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+
+    if (!menuOpen) {
+      return;
     }
 
-    console.warn("⚠️ No suitable file input found");
-    return false;
-  } catch (err) {
-    console.warn("⚠️ Hidden input upload failed:", err?.message);
-    return false;
+    console.log("🧹 Dismissing attach menu overlay (blocking preview send)");
+
+    const previewLoc = page.locator(MEDIA_PREVIEW_ROOT_LOCATOR).first();
+    const previewVisible = await previewLoc.isVisible().catch(() => false);
+    if (previewVisible) {
+      await previewLoc
+        .click({
+          position: { x: 120, y: 100 },
+          timeout: 3000,
+        })
+        .catch(() => {});
+      await previewLoc
+        .click({
+          position: { x: 200, y: 160 },
+          force: true,
+          timeout: 2000,
+        })
+        .catch(() => {});
+    }
+
+    await page.waitForTimeout(220);
+
+    const stillOpen = await page
+      .evaluate(() => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 40 && rect.height > 40;
+        };
+        const attach = document.querySelector('[data-testid="attach-menu"]');
+        return attach ? isVisible(attach) : false;
+      })
+      .catch(() => false);
+
+    if (!stillOpen) {
+      return;
+    }
+
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(350);
   }
 }
 
-/** WhatsApp Web media composer surface (scoped; do not use generic `[role="dialog"]` alone). */
-const MEDIA_PREVIEW_SELECTOR = '[data-testid="media-preview"]';
+/**
+ * Hard reset a stuck media composer.
+ * @param {import("playwright").Page} page
+ */
+async function hardResetStuckComposer(page) {
+  const hasVisibleSend = await page
+    .evaluate((previewSelectors) => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      for (const sel of previewSelectors) {
+        const nodes = document.querySelectorAll(sel);
+        for (const node of nodes) {
+          if (!isVisible(node)) continue;
+          const icon = node.querySelector('span[data-icon="send"]');
+          if (icon && icon.offsetParent !== null) return true;
+        }
+      }
+      return false;
+    }, MEDIA_PREVIEW_SELECTORS)
+    .catch(() => false);
+
+  if (!hasVisibleSend) return;
+  console.warn("⚠️ Stuck preview — resetting");
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(500);
+}
+
+/**
+ * Single production send control while media preview is open (matches WhatsApp Web).
+ * @param {import("playwright").Page} page
+ * @returns {Promise<boolean>}
+ */
+async function clickVisibleMediaSendButton(page, opts = {}) {
+  const strictChatAssert = opts?.strictChatAssert === true;
+  const sendBtn = page.locator('[aria-label="Send"]').last();
+  try {
+    await sendBtn.waitFor({ state: "visible", timeout: 10_000 });
+    let beforeClickChat = null;
+    if (strictChatAssert) {
+      beforeClickChat = await readOpenConversationHeaderTitle(page).catch(
+        () => null
+      );
+    }
+    await pointerClickMediaSend(page, sendBtn);
+    if (strictChatAssert && beforeClickChat) {
+      const afterClickChat = await readOpenConversationHeaderTitle(page).catch(
+        () => null
+      );
+      if (
+        afterClickChat &&
+        normalizeTitle(beforeClickChat) !== normalizeTitle(afterClickChat)
+      ) {
+        throw Object.assign(new Error("❌ Chat changed during send click"), {
+          code: "CHAT_SWITCHED",
+        });
+      }
+    }
+    return true;
+  } catch (e) {
+    if (isIdentitySendBlockError(e)) throw e;
+    return false;
+  }
+}
 
 /**
  * If a stale media preview is open, complete send or dismiss so the next upload is not skipped.
@@ -614,28 +845,64 @@ const MEDIA_PREVIEW_SELECTOR = '[data-testid="media-preview"]';
  */
 async function dismissStaleMediaPreviewIfAny(page) {
   let stale = await page.$(MEDIA_PREVIEW_SELECTOR);
+  if (!stale) {
+    for (const sel of MEDIA_PREVIEW_SELECTORS.slice(1)) {
+      stale = await page.$(sel);
+      if (stale) break;
+    }
+  }
   if (!stale) return;
 
   console.log("📸 Stale media preview detected — clearing before upload");
   for (let i = 0; i < 5; i++) {
-    const sendLoc = page.locator('[role="dialog"] span[data-icon="send"]').first();
-    if ((await sendLoc.count()) > 0) {
-      const vis = await sendLoc.isVisible().catch(() => false);
-      if (vis) {
-        console.log("📤 Attempting to complete pending preview send");
-        await sendLoc.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(400);
-      }
+    const clicked = await clickVisibleMediaSendButton(page);
+    if (clicked) {
+      console.log("📤 Attempting to complete pending preview send");
+      await page.waitForTimeout(400);
     }
     try {
       await page.waitForFunction(
-        () => !document.querySelector('[data-testid="media-preview"]'),
+        (selectors) => {
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+          for (const sel of selectors) {
+            const nodes = document.querySelectorAll(sel);
+            for (const node of nodes) {
+              if (isVisible(node)) return false;
+            }
+          }
+          return true;
+        },
+        MEDIA_PREVIEW_SELECTORS,
         { timeout: 6000 }
       );
     } catch {
       /* still open */
     }
-    if (!(await page.$(MEDIA_PREVIEW_SELECTOR))) {
+    const stillOpen = await page
+      .evaluate((selectors) => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+        for (const sel of selectors) {
+          const nodes = document.querySelectorAll(sel);
+          for (const node of nodes) {
+            if (isVisible(node)) return true;
+          }
+        }
+        return false;
+      }, MEDIA_PREVIEW_SELECTORS)
+      .catch(() => false);
+    if (!stillOpen) {
       console.log("✅ Stale preview cleared");
       return;
     }
@@ -643,7 +910,25 @@ async function dismissStaleMediaPreviewIfAny(page) {
     await page.waitForTimeout(350);
   }
 
-  if (await page.$(MEDIA_PREVIEW_SELECTOR)) {
+  const previewStillOpen = await page
+    .evaluate((selectors) => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      for (const sel of selectors) {
+        const nodes = document.querySelectorAll(sel);
+        for (const node of nodes) {
+          if (isVisible(node)) return true;
+        }
+      }
+      return false;
+    }, MEDIA_PREVIEW_SELECTORS)
+    .catch(() => false);
+  if (previewStillOpen) {
     throw new Error(
       "[playwrightOutbound] stale media preview could not be dismissed — blocking upload"
     );
@@ -651,95 +936,160 @@ async function dismissStaleMediaPreviewIfAny(page) {
 }
 
 /**
- * Upload path:
- * Clip -> attach menu -> Photos & Videos -> filechooser.
- * Hidden input uploader remains in code but is intentionally not used as primary flow.
+ * Photos & videos (clip → file chooser) → optional caption → `[aria-label="Send"]` + pointerdown/up send.
+ * Third argument is optional — omit when no caption on the first image.
  *
  * @param {import("playwright").Page} page
  * @param {string} filePath
- * @throws {Error} When menu, Photos, file chooser, or preview dialog fails
+ * @param {string} [caption]
  */
-async function uploadImageViaCompose(page, filePath) {
-  await enforceStrictSendLock(page);
-
-  await page.waitForTimeout(randomBetweenMs(500, 800));
-
-  await dismissStaleMediaPreviewIfAny(page);
-
-  await enforceStrictSendLock(page);
-
-  console.log("🧭 Upload path: attach_fallback");
-  await page.click(ATTACH_TRIGGER_SELECTOR);
-
-  await page.waitForSelector(
-    '[role="menu"], [data-testid="attach-menu"]',
-    { timeout: 3000 }
-  );
-
-  let photosBtn =
-    (await page.$('span[title="Photos & Videos"]')) ||
-    (await page.$('[aria-label="Photos & Videos"]'));
-  if (!photosBtn) {
-    const menuBtn = page.getByRole("button", {
-      name: /Photos|Gallery|Videos/i,
-    }).first();
-    if ((await menuBtn.count()) > 0) {
-      photosBtn = await menuBtn.elementHandle();
-    }
+export async function sendImage(page, filePath, caption) {
+  let stuckReleaseTimer = null;
+  globalThis.__WA_MEDIA_SEND__ = true;
+  try {
+    stuckReleaseTimer = setTimeout(() => {
+      if (globalThis.__WA_MEDIA_SEND__) {
+        console.log("⚠️ Auto-releasing stuck WA media send guard");
+        globalThis.__WA_MEDIA_SEND__ = false;
+      }
+    }, 60_000);
+    await sendImageBody(page, filePath, caption);
+  } finally {
+    if (stuckReleaseTimer) clearTimeout(stuckReleaseTimer);
+    globalThis.__WA_MEDIA_SEND__ = false;
   }
-
-  if (!photosBtn) {
-    throw new Error("❌ Photos button not found in attach menu");
-  }
-
-  const [fileChooser] = await Promise.all([
-    page.waitForEvent("filechooser", { timeout: 10000 }),
-    photosBtn.click(),
-  ]);
-  await fileChooser.setFiles(filePath);
-
-  await page.waitForSelector(MEDIA_PREVIEW_SELECTOR, { timeout: 8000 });
-  await page.waitForTimeout(400);
-  console.log("🖼 Preview opened");
 }
 
 /**
  * @param {import("playwright").Page} page
- * @param {string} [caption] - only used when isFirst and non-empty
- * @param {boolean} isFirst
- * @throws {Error} When preview cannot be confirmed closed after send
+ * @param {string} filePath
+ * @param {string} [caption]
  */
-async function waitForMediaPreviewAndSend(page, caption, isFirst) {
-  await enforceStrictSendLock(page);
-  console.log("📸 Media preview detected (waiting on surface)");
-  await page.waitForSelector(MEDIA_PREVIEW_SELECTOR, { timeout: 8000 });
-  await page.waitForTimeout(400);
+async function sendImageBody(page, filePath, caption) {
+  console.log(
+    "📎 Upload: Photos & videos (clip) → preview → Send [aria-label] → pointer send"
+  );
 
-  const focusTarget =
-    (await page.$('[data-testid="media-caption-input"]')) ||
-    (await page.$('[role="dialog"] div[contenteditable="true"]')) ||
-    (await page.$('[role="dialog"] footer'));
+  let normalizedPath = null;
+  try {
+    normalizedPath = await normalizeWhatsAppImage(filePath);
+    console.log("📸 Uploading normalized image:", normalizedPath);
 
-  if (focusTarget) {
-    console.log("🎯 Focusing dialog input");
-    await focusTarget.click({ force: true });
-    await page.waitForTimeout(200);
-  }
+    const runPhotosAndVideosAttach = async () => {
+      await ensureChatReady(page);
 
-  await enforceStrictSendLock(page);
+      let clipBtn = page.locator('span[data-icon="clip"]').last();
+      try {
+        await clipBtn.waitFor({ state: "visible", timeout: 10_000 });
+      } catch {
+        clipBtn = page.locator('[aria-label="Attach"]').last();
+        await clipBtn.waitFor({ state: "visible", timeout: 10_000 });
+      }
+      await clipBtn.click();
 
-  if (isFirst && String(caption ?? "").trim()) {
+      const [fileChooser] = await Promise.all([
+        page.waitForEvent("filechooser", { timeout: 15_000 }),
+        page.getByText("Photos & videos").click(),
+      ]);
+
+      await fileChooser.setFiles(normalizedPath);
+
+      const mediaLoc = page.locator(MEDIA_PREVIEW_SELECTOR).first();
+      const stickerLoc = page.locator(STICKER_CONTAINER_SELECTOR).first();
+      const blobLoc = page.locator('img[src^="blob:"]').first();
+
+      let uiKind;
+      try {
+        uiKind = await Promise.race([
+          mediaLoc.waitFor({ state: "visible", timeout: 5000 }).then(() => "media"),
+          stickerLoc
+            .waitFor({ state: "visible", timeout: 5000 })
+            .then(() => "sticker"),
+          blobLoc.waitFor({ state: "visible", timeout: 5000 }).then(() => "blob"),
+        ]);
+      } catch {
+        const mediaOk = await mediaLoc.isVisible().catch(() => false);
+        const stickerOk = await stickerLoc.isVisible().catch(() => false);
+        const blobOk = await blobLoc.isVisible().catch(() => false);
+        if (mediaOk) uiKind = "media";
+        else if (stickerOk) uiKind = "sticker";
+        else if (blobOk) uiKind = "blob";
+        else throw new Error("UPLOAD_FAILED_NO_PREVIEW_STATE");
+      }
+
+      if (uiKind === "sticker") {
+        console.warn(
+          "⚠️ WhatsApp opened sticker UI (sticker-container) instead of media preview; continuing to send"
+        );
+      }
+
+      return uiKind;
+    };
+
+    let attached = false;
+    let lastAttachErr = null;
+    /** @type {"media" | "sticker" | "blob"} */
+    let uiKind = "media";
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(
+            "⚠️ Retrying Photos & videos attach (UI reset before retry)"
+          );
+          await ensureChatReady(page);
+          await dismissStaleMediaPreviewIfAny(page).catch(() => {});
+        }
+        uiKind = await runPhotosAndVideosAttach();
+        attached = true;
+        console.log(
+          uiKind === "sticker"
+            ? "✅ Photos & videos flow (sticker UI visible, proceeding to send)"
+            : uiKind === "blob"
+              ? "✅ Photos & videos flow (blob image visible, proceeding to send)"
+              : "✅ Photos & videos flow (media preview visible)"
+        );
+        break;
+      } catch (err) {
+        lastAttachErr = err;
+        console.log(
+          "⚠️ Photos & videos attach attempt failed:",
+          err?.message ?? String(err)
+        );
+      }
+    }
+
+    if (!attached) {
+      throw new Error(
+        `❌ Photos & videos upload failed after retry: ${lastAttachErr?.message ?? lastAttachErr}`
+      );
+    }
+
+  if (caption != null && String(caption).trim() !== "") {
     const cap = String(caption).trim();
+    await page
+      .locator('[data-testid="media-caption-input"]')
+      .first()
+      .waitFor({ state: "visible", timeout: 8000 })
+      .catch(() => {});
+
+    const previewRoot = page.locator(MEDIA_PREVIEW_COMPOSER_ROOT).last();
     const captionCandidates = [
-      '[data-testid="media-caption-input"]',
-      'div[contenteditable="true"][data-tab="10"]',
-      'div[role="dialog"] div[contenteditable="true"]',
+      previewRoot.locator('[data-testid="media-caption-input"]').first(),
+      previewRoot.locator('div[contenteditable="true"]').first(),
+      page
+        .locator(
+          `${MEDIA_PREVIEW_ROOT_LOCATOR} [data-testid="media-caption-input"]`
+        )
+        .first(),
+      page
+        .locator(`${MEDIA_PREVIEW_ROOT_LOCATOR} div[contenteditable="true"]`)
+        .first(),
     ];
     let captionApplied = false;
-    for (const sel of captionCandidates) {
-      const loc = page.locator(sel).first();
+    for (const loc of captionCandidates) {
       if (await loc.isVisible().catch(() => false)) {
-        await loc.click({ timeout: 3000 }).catch(() => {});
+        await loc.click({ timeout: 3000, force: true }).catch(() => {});
         await loc.fill("").catch(() => {});
         if (typeof loc.pressSequentially === "function") {
           await loc.pressSequentially(cap, { delay: 3 });
@@ -752,44 +1102,79 @@ async function waitForMediaPreviewAndSend(page, caption, isFirst) {
     }
     if (!captionApplied) {
       console.warn(
-        "⚠️ [playwrightOutbound] Caption field not found; first image will send without caption"
+        "⚠️ [playwrightOutbound] Caption field not found; image will send without caption"
       );
     }
   }
 
-  const sendButton = page.locator('[role="dialog"] span[data-icon="send"]');
-  let clicked = false;
-  for (let i = 0; i < 2; i++) {
-    if ((await sendButton.count()) > 0) {
-      const first = sendButton.first();
-      if (await first.isVisible().catch(() => false)) {
-        await enforceStrictSendLock(page);
-        console.log("📤 Attempting send click");
-        await first.click({ force: true });
-        clicked = true;
-        break;
-      }
-    }
-    await page.waitForTimeout(300);
-  }
+  console.log("📤 Wait media Send control (aria-label), not preview testid");
 
-  if (!clicked) {
-    console.warn("⚠️ Send button not found, attempting Enter fallback");
-    await enforceStrictSendLock(page);
-    await page.keyboard.press("Enter");
-  }
+  console.log(
+    "SEND [aria-label=Send] COUNT:",
+    await page.locator('[aria-label="Send"]').count()
+  );
 
-  const closed = await page
+  const sendBtn = page.locator('[aria-label="Send"]').last();
+  await sendBtn.waitFor({ state: "visible", timeout: 10_000 });
+
+  console.log("🖱 Pointer send (move → down → up)");
+
+  await pointerClickMediaSend(page, sendBtn);
+
+  console.log("⏳ Wait for preview / sticker UI to detach after send");
+
+  if (uiKind === "sticker") {
+    await page
+      .locator(STICKER_CONTAINER_SELECTOR)
+      .first()
+      .waitFor({ state: "detached", timeout: 10_000 })
+      .catch(() => {});
+  } else {
+    await page
+      .waitForSelector(MEDIA_PREVIEW_SELECTOR, {
+        state: "detached",
+        timeout: 10_000,
+      })
+      .catch(() => {});
+  }
+  await page.waitForTimeout(500);
+
+  console.log("⏳ STEP 9: Verify media preview closed");
+
+  await page
     .waitForFunction(
-      () => !document.querySelector('[data-testid="media-preview"]'),
+      (selectors) => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden")
+            return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+        for (const sel of selectors) {
+          for (const node of document.querySelectorAll(sel)) {
+            if (isVisible(node)) return false;
+          }
+        }
+        return true;
+      },
+      MEDIA_PREVIEW_SELECTORS,
       { timeout: 8000 }
     )
-    .then(() => true)
-    .catch(() => false);
-  if (!closed) {
-    throw new Error("❌ Image send not confirmed — preview still open");
+    .catch(() => {
+      throw new Error("❌ FAILED at STEP 9: send not confirmed");
+    });
+
+  console.log("✅ IMAGE SENT SUCCESSFULLY");
+  } finally {
+    if (normalizedPath) {
+      // Defer unlink: Playwright may read the path asynchronously after setInputFiles.
+      setTimeout(() => {
+        unlink(normalizedPath).catch(() => {});
+      }, 5000);
+    }
   }
-  console.log("✅ Preview closed — image send confirmed");
 }
 
 /**
@@ -800,16 +1185,92 @@ async function waitForMediaPreviewAndSend(page, caption, isFirst) {
  * @param {boolean} isFirst
  */
 async function uploadAndSendOneImage(page, filePath, captionForFirst, isFirst) {
-  await uploadImageViaCompose(page, filePath);
-  console.log("📤 Attempting to send media");
-  await waitForMediaPreviewAndSend(page, captionForFirst, isFirst);
+  await enforceStrictSendLock(page);
+
+  await page.waitForTimeout(randomBetweenMs(500, 800));
+
+  await dismissStaleMediaPreviewIfAny(page);
+
+  await enforceStrictSendLock(page);
+
+  await ensureChatReady(page);
+
+  const cap =
+    isFirst && String(captionForFirst ?? "").trim() !== ""
+      ? String(captionForFirst).trim()
+      : undefined;
+
+  await sendImage(page, filePath, cap);
+}
+
+/**
+ * Send each image with {@link sendImageBody} one at a time (caption on first only).
+ *
+ * @param {import("playwright").Page} page
+ * @param {string[]} imagePaths
+ * @param {{ caption?: string }} [options]
+ */
+async function sendImagesSequentially(page, imagePaths, options = {}) {
+  const paths = Array.isArray(imagePaths) ? imagePaths.filter(Boolean) : [];
+  if (paths.length === 0) {
+    return true;
+  }
+
+  for (let i = 0; i < paths.length; i++) {
+    console.log(`📸 Sending image ${i + 1}/${paths.length}`);
+
+    const cap =
+      i === 0 &&
+      options.caption != null &&
+      String(options.caption).trim() !== ""
+        ? String(options.caption).trim()
+        : undefined;
+
+    await sendImageBody(page, paths[i], cap);
+
+    console.log("⏳ Waiting for WhatsApp UI to reset...");
+
+    await page.waitForFunction(() => {
+      const input = document.querySelector('[contenteditable="true"]');
+      const preview = document.querySelector('[data-testid="media-preview"]');
+
+      if (!input || !input.isContentEditable) return false;
+      if (preview) return false;
+
+      const rect = input.getBoundingClientRect();
+      if (!rect || rect.width === 0 || rect.height === 0) return false;
+
+      const elAtPoint = document.elementFromPoint(
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2
+      );
+
+      return input.contains(elAtPoint);
+    }, { timeout: 20_000 });
+
+    // small buffer
+    await page.waitForTimeout(800);
+
+    // ensure input is actually usable (CRITICAL)
+    const inputBox = page.locator('[contenteditable="true"]').last();
+
+    await inputBox.click({ timeout: 3000 }).catch(() => {});
+    await page.keyboard.type(" ", { delay: 10 }).catch(() => {});
+    await page.keyboard.press("Backspace").catch(() => {});
+
+    await page.waitForTimeout(300);
+
+    console.log("✅ UI ready for next image");
+  }
+
+  console.log("✅ Sequential send completed");
+  return true;
 }
 
 /**
  * Core: upload images to the open WhatsApp Web chat.
  *
- * Upload: attach → attach menu → Photos & Videos → `filechooser.setFiles`; wait on `[data-testid="media-preview"]`.
- * Send: dialog-scoped `span[data-icon="send"]` with bounded retry; optional Enter once; confirm via `[data-testid="media-preview"]` removed from DOM.
+ * Images: {@link sendImage} (Photos & videos → `[aria-label="Send"]` + pointer send) after locks / stale-preview cleanup.
  *
  * @param {import("playwright").Page | null} page
  * @param {string[]} imageUrls
@@ -884,76 +1345,91 @@ async function sendPlaywrightGroupImagesWithPage(
         ? String(caption).trim()
         : undefined;
 
-    let anyOk = false;
-    for (let i = 0; i < urls.length; i++) {
-      const url = urls[i];
-      const index = i + 1;
-      const urlLog = url.length > 120 ? `${url.slice(0, 120)}…` : url;
-      console.log("📸 Image upload start", { index, url: urlLog });
-
-      let cleanup = async () => {};
-      try {
+    /** @type {{ path: string, cleanup: () => Promise<void> }[]} */
+    const downloads = [];
+    try {
+      for (let i = 0; i < urls.length; i++) {
+        const url = urls[i];
+        const index = i + 1;
+        const urlLog = url.length > 120 ? `${url.slice(0, 120)}…` : url;
+        console.log("📸 Image download", { index, url: urlLog });
         await enforceStrictSendLock(page);
         const { path: tmpPath, cleanup: cleanupFn } =
           await downloadImageToTempFile(url);
-        cleanup = cleanupFn;
+        downloads.push({ path: tmpPath, cleanup: cleanupFn });
+        console.log("📥 Image downloaded", { index });
+      }
 
-        const useCaption = i === 0 ? captionForFirstOnly : undefined;
+      const paths = downloads.map((d) => d.path);
+      let anyOk = false;
 
+      if (paths.length === 1) {
         let sent = false;
         /** @type {unknown} */
         let lastErr;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-            await enforceStrictSendLock(page);
-            await uploadAndSendOneImage(page, tmpPath, useCaption, i === 0);
-            sent = true;
-            break;
-          } catch (e) {
-            lastErr = e;
-            if (isIdentitySendBlockError(e)) {
-              return false;
-            }
-            if (attempt === 0) {
-              await page.waitForTimeout(randomBetweenMs(800, 1200));
-            }
+        try {
+          await enforceStrictSendLock(page);
+          await uploadAndSendOneImage(
+            page,
+            paths[0],
+            captionForFirstOnly,
+            true
+          );
+          sent = true;
+        } catch (e) {
+          lastErr = e;
+          if (isIdentitySendBlockError(e)) {
+            return false;
           }
         }
-
         if (sent) {
-          console.log("✅ Image sent", { index });
+          console.log("✅ Image sent", { index: 1 });
           anyOk = true;
         } else {
-          console.error("❌ Image failed after retry", {
-            index,
+          console.error("❌ Image send failed", {
+            index: 1,
             error:
               lastErr instanceof Error
                 ? lastErr.message
                 : String(lastErr ?? "unknown"),
           });
         }
+      }
 
-        if (i < urls.length - 1) {
-          await page.waitForTimeout(randomBetweenMs(1200, 1800));
-        }
-      } catch (err) {
-        if (isIdentitySendBlockError(err)) {
+      if (paths.length > 1) {
+        console.log("🔁 Using sequential image send (batch disabled)");
+        await enforceStrictSendLock(page);
+        let success = false;
+        try {
+          success = await sendImagesSequentially(page, paths, {
+            caption: captionForFirstOnly,
+          });
+        } catch (e) {
+          if (isIdentitySendBlockError(e)) {
+            return false;
+          }
+          console.warn("⚠️ Sequential image send incomplete", {
+            error: e instanceof Error ? e.message : String(e),
+          });
           return false;
         }
-        console.error("❌ [playwrightOutbound] image download or pipeline error", {
-          index,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      } finally {
+        if (!success) {
+          console.warn("⚠️ Sequential image send incomplete");
+          return false;
+        }
+        return true;
+      }
+
+      return anyOk;
+    } finally {
+      for (const d of downloads) {
         try {
-          await cleanup();
+          await d.cleanup();
         } catch {
           /* ignore */
         }
       }
     }
-
-    return anyOk;
   } finally {
     globalThis.__UI_SEND_LOCK = false;
     globalThis.__OUTBOUND_BUSY__ = false;

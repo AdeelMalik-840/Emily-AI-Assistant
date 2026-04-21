@@ -23,6 +23,11 @@ import {
   recordPlaywrightInboundScheduled,
   notifyPlaywrightGuaranteeReleased,
 } from "../playwrightGuaranteeBridge.js";
+import {
+  clearOldStates,
+  getMessageState,
+  setMessageState,
+} from "../messageState.js";
 
 /** Open chat identity: sidebar `span[title]` for the target row (not header text). */
 globalThis.__currentOpenChatTitle =
@@ -90,10 +95,6 @@ async function ensureWhatsAppConversationOpen(page) {
   let headerTitle = await readMainHeaderSpanTitle(page);
   if (headerTitle) return true;
 
-  const isEmptyState = await page.evaluate(() =>
-    document.body.innerText.includes("Download WhatsApp for Mac")
-  );
-
   const rowLocator = page.locator('#pane-side div[role="row"]');
   const rowCount = await rowLocator.count();
   if (rowCount === 0) {
@@ -101,27 +102,71 @@ async function ensureWhatsAppConversationOpen(page) {
     return false;
   }
 
-  if (isEmptyState) {
-    console.warn("⚠️ Empty state detected — opening first chat");
-  } else {
-    console.warn(
-      "⚠️ No conversation header — opening first sidebar chat"
+  const visibleChats = await getTopChats(page, 30);
+  const preferredChatKeys = [];
+  const pushKey = (value) => {
+    const key = normalizeTitle(String(value ?? "").trim());
+    if (!key || preferredChatKeys.includes(key)) return;
+    preferredChatKeys.push(key);
+  };
+
+  pushKey(globalThis.__activeChatLock);
+  pushKey(globalThis.__ACTIVE_PROCESSING_CHAT);
+  pushKey(globalThis.__forceNextChat);
+  if (globalThis.__pendingChats instanceof Set) {
+    for (const pendingKey of globalThis.__pendingChats) {
+      pushKey(pendingKey);
+    }
+  }
+  pushKey(globalThis.__activeChatInFocus);
+  pushKey(globalThis.__activeChatTitle);
+  pushKey(globalThis.__currentOpenChatTitle);
+
+  const recoveryTargets = preferredChatKeys
+    .map((key) => visibleChats.find((name) => normalizeTitle(name) === key))
+    .filter(Boolean);
+
+  if (recoveryTargets.length === 0) {
+    const fallbackAllowed = visibleChats.find(
+      (name) =>
+        isValidBusinessChat(name) &&
+        isAllowedChat(name)
     );
+    if (fallbackAllowed) {
+      recoveryTargets.push(fallbackAllowed);
+    }
   }
 
-  const maxAttempts = 3;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    await rowLocator.first().click({ force: true });
-    await page.waitForTimeout(800);
+  if (recoveryTargets.length === 0) {
+    console.error("🚫 Empty pane recovery failed — no valid target chat found");
+    return false;
+  }
 
+  const isEmptyState = await page.evaluate(() =>
+    document.body.innerText.includes("Download WhatsApp for Mac")
+  );
+  console.warn(
+    isEmptyState
+      ? "⚠️ Empty state detected — recovering target chat"
+      : "⚠️ No conversation header — recovering target chat"
+  );
+
+  for (const targetName of recoveryTargets) {
+    const target = String(targetName ?? "").trim();
+    if (!target) continue;
+    console.log("🧭 Recovery target:", target);
+    const reopened = await openChatAndConfirm(page, target);
+    if (!reopened) {
+      continue;
+    }
     headerTitle = await readMainHeaderSpanTitle(page);
     if (headerTitle) {
-      await captureOpenChatContext(page);
+      setCurrentOpenChatTitleFromSidebar(target);
       return true;
     }
-    console.error("🚫 Chat still not open — retrying");
   }
 
+  console.error("🚫 Chat still not open — all recovery targets failed");
   return false;
 }
 
@@ -301,6 +346,12 @@ const PLAYWRIGHT_CHAT_RESPONSE_COOLDOWN_MS = Math.max(
   )
 );
 globalThis.__OUTBOUND_BUSY__ = globalThis.__OUTBOUND_BUSY__ || false;
+globalThis.__WA_MEDIA_SEND__ = globalThis.__WA_MEDIA_SEND__ === true;
+globalThis.__loopRunning = globalThis.__loopRunning || false;
+globalThis.__visitedChatsThisCycle =
+  globalThis.__visitedChatsThisCycle || new Set();
+globalThis.__pendingChats = globalThis.__pendingChats || new Set();
+globalThis.__forceNextChat = globalThis.__forceNextChat || null;
 globalThis.__activeChatTitle = globalThis.__activeChatTitle || null;
 globalThis.__lastProcessedRowKeyByChat =
   globalThis.__lastProcessedRowKeyByChat || {};
@@ -314,16 +365,11 @@ globalThis.__playwrightListenerMsgIdByGuarantee =
   globalThis.__playwrightListenerMsgIdByGuarantee || new Map();
 globalThis.__INTERRUPT_PENDING__ =
   globalThis.__INTERRUPT_PENDING__ || false;
-/** Dedupe maps: initialized in {@link ../playwrightGuaranteeBridge.js}. */
-globalThis.__processedMessageIds =
-  globalThis.__processedMessageIds || new Map();
-globalThis.__processingMessageIds =
-  globalThis.__processingMessageIds instanceof Map
-    ? globalThis.__processingMessageIds
-    : new Map();
-/** Hard message-level idempotency (lock immediately on forward selection; not after pipeline success). */
-globalThis.__processedMessages =
-  globalThis.__processedMessages || new Set();
+/** Unified message lifecycle state map (new | processing | done | failed). */
+globalThis.__messageStateMap =
+  globalThis.__messageStateMap || new Map();
+globalThis.__processingChats =
+  globalThis.__processingChats || new Map();
 /** Last time this chat began a forward (debounces rapid chat-loop ticks). */
 globalThis.__playwrightChatLastProcessedAt =
   globalThis.__playwrightChatLastProcessedAt || Object.create(null);
@@ -667,7 +713,6 @@ async function forceReturnToChat(page) {
     .catch(() => {});
 
   await page.waitForTimeout(350);
-
   console.log("🔧 Forced return to chat view");
 }
 
@@ -1917,6 +1962,22 @@ async function runListenerBody() {
 
   const runChatLoop = async () => {
     let restartAfterInterrupt = false;
+    globalThis.__visitedChatsThisCycle = new Set();
+    if (globalThis.__WA_MEDIA_SEND__) {
+      console.log(
+        "⏸ Skip switching — WA media send in progress (action: switch_chat deferred)"
+      );
+      return;
+    }
+    const isBusy =
+      globalThis.__UI_SEND_LOCK ||
+      globalThis.__OUTBOUND_BUSY__ ||
+      globalThis.__loopRunning;
+    // Allow media send flow even when system is busy (batch sets __WA_MEDIA_SEND__).
+    if (isBusy && !globalThis.__WA_MEDIA_SEND__) {
+      console.log("⛔ Skip switching — system busy");
+      return;
+    }
     if (globalThis.__UI_SEND_LOCK) {
       console.log("⛔ UI SEND LOCK ACTIVE — blocking chat switch");
       return;
@@ -1939,10 +2000,16 @@ async function runListenerBody() {
       globalThis.__activeJobStart > 0 &&
       Date.now() - globalThis.__activeJobStart > MAX_ACTIVE_JOB_MS
     ) {
-      console.warn("⚠️ Force releasing stuck job (safe reset)");
-      globalThis.__activeJob = null;
-      globalThis.__activeJobStart = 0;
-      globalThis.__forceProcessing = true;
+      if (globalThis.__WA_MEDIA_SEND__) {
+        console.warn(
+          "⚠️ Defer stuck-job force reset — WA media send (action: force_reset skipped)"
+        );
+      } else {
+        console.warn("⚠️ Force releasing stuck job (safe reset)");
+        globalThis.__activeJob = null;
+        globalThis.__activeJobStart = 0;
+        globalThis.__forceProcessing = true;
+      }
     }
     if (globalThis.__activeJob) {
       console.log("⏳ Processing in progress — skip switching");
@@ -1951,8 +2018,10 @@ async function runListenerBody() {
     console.log("[Loop] Running chat loop");
     if (chatLoopRunning) return;
     chatLoopRunning = true;
+    globalThis.__loopRunning = true;
     try {
       try {
+        clearOldStates(10_000);
         usedFallbackRotationForThisLoop = false;
         if (globalThis.__INTERRUPT_PENDING__ && !restartAfterInterrupt) {
           console.log("⚡ INTERRUPT EXECUTION — breaking current flow");
@@ -1995,7 +2064,50 @@ async function runListenerBody() {
         let chatName = null;
         let skipRotation = false;
 
-        if (lockedChatName) {
+        if (globalThis.__forceNextChat) {
+          const forcedChatId = String(globalThis.__forceNextChat).trim();
+          const topChatsForForce = await getTopChats(page, 30);
+          const forcedChatName = topChatsForForce.find(
+            (name) => normalizeTitle(name) === forcedChatId
+          );
+          if (forcedChatName) {
+            chatName = forcedChatName;
+            globalThis.__activeChatTitle = chatName;
+            globalThis.__activeChatInFocus = chatName;
+            globalThis.__forceNextChat = null;
+            skipRotation = true;
+            console.log("🔁 Processing forced queued chat:", chatName);
+          } else {
+            console.log(
+              "⏳ Forced chat not visible in sidebar yet — keeping priority:",
+              forcedChatId
+            );
+          }
+        }
+
+        if (!chatName && globalThis.__pendingChats instanceof Set) {
+          const pendingIds = Array.from(globalThis.__pendingChats);
+          if (pendingIds.length > 0) {
+            const topChatsForPending = await getTopChats(page, 30);
+            for (const pendingId of pendingIds) {
+              const pendingName = topChatsForPending.find(
+                (name) => normalizeTitle(name) === pendingId
+              );
+              if (!pendingName) {
+                continue;
+              }
+              chatName = pendingName;
+              globalThis.__pendingChats.delete(pendingId);
+              globalThis.__activeChatTitle = chatName;
+              globalThis.__activeChatInFocus = chatName;
+              skipRotation = true;
+              console.log("🔁 Processing queued pending chat:", chatName);
+              break;
+            }
+          }
+        }
+
+        if (!chatName && lockedChatName) {
           chatName = lockedChatName;
           globalThis.__activeChatTitle = chatName;
           globalThis.__activeChatInFocus = chatName;
@@ -2051,6 +2163,15 @@ async function runListenerBody() {
               chatRowMatchesTargets(name, targetGroups) &&
               isAllowedChat(name)
           );
+          let currentHeaderChat = "";
+          try {
+            currentHeaderChat = String((await getActiveChatName(page)) ?? "").trim();
+          } catch {
+            currentHeaderChat = "";
+          }
+          const sidebarIdentityChat = String(
+            globalThis.__currentOpenChatTitle ?? ""
+          ).trim();
 
           if (interruptChat && !interruptIsSameActiveChat) {
             chatName = interruptChat;
@@ -2070,6 +2191,30 @@ async function runListenerBody() {
             chatName = globalThis.__activeChatInFocus;
             globalThis.__activeChatTitle = chatName;
             console.log("🎯 PRIORITY: active conversation (focus window)", chatName);
+          } else if (
+            String(activeNowForStickiness ?? "").trim() !== "" &&
+            isValidBusinessChat(String(activeNowForStickiness).trim()) &&
+            isAllowedChat(String(activeNowForStickiness).trim())
+          ) {
+            chatName = String(activeNowForStickiness).trim();
+            globalThis.__activeChatTitle = chatName;
+            console.log("🧷 PRIORITY: keep current active chat", chatName);
+          } else if (
+            currentHeaderChat &&
+            isValidBusinessChat(currentHeaderChat) &&
+            isAllowedChat(currentHeaderChat)
+          ) {
+            chatName = currentHeaderChat;
+            globalThis.__activeChatTitle = chatName;
+            console.log("🧷 PRIORITY: keep current header chat", chatName);
+          } else if (
+            sidebarIdentityChat &&
+            isValidBusinessChat(sidebarIdentityChat) &&
+            isAllowedChat(sidebarIdentityChat)
+          ) {
+            chatName = sidebarIdentityChat;
+            globalThis.__activeChatTitle = chatName;
+            console.log("🧷 PRIORITY: keep current sidebar identity chat", chatName);
           } else if (allowedForRotation.length > 0) {
             const n = allowedForRotation.length;
             globalThis.__lastAllowedRotationN = n;
@@ -2116,6 +2261,18 @@ async function runListenerBody() {
         if (!chatName) {
           console.log("⛔ SKIP: No chat selected this tick");
           return;
+        }
+
+        const pickedChatKey = normalizeTitle(String(chatName ?? "").trim());
+        if (
+          pickedChatKey &&
+          globalThis.__visitedChatsThisCycle.has(pickedChatKey)
+        ) {
+          console.log("⛔ Already visited this chat this cycle — skipping switch");
+          return;
+        }
+        if (pickedChatKey) {
+          globalThis.__visitedChatsThisCycle.add(pickedChatKey);
         }
 
         if (!usedFallbackRotationForThisLoop) {
@@ -2255,6 +2412,16 @@ async function runListenerBody() {
             lastActiveChat = currentChat;
           }
           const chatKey = normalizeTitle(openTitle);
+          const chatId = chatKey;
+          if (
+            globalThis.__activeChatLock &&
+            globalThis.__activeChatLock !== chatId
+          ) {
+            console.log("⏳ Chat queued due to active lock:", chatId);
+            globalThis.__pendingChats = globalThis.__pendingChats || new Set();
+            globalThis.__pendingChats.add(chatId);
+            return;
+          }
 
           if (globalThis.__ACTIVE_PROCESSING_CHAT === chatKey) {
             console.log(
@@ -2364,8 +2531,11 @@ async function runListenerBody() {
                 .some((m) => m.sender === "me");
               if (replied) {
                 console.log(
-                  "⛔ Already replied after selected message — skipping"
+                  "⛔ Already replied after selected message — syncing processed id (DOM has assistant below user)"
                 );
+                globalThis.__lastProcessedUserMsg =
+                  globalThis.__lastProcessedUserMsg || Object.create(null);
+                globalThis.__lastProcessedUserMsg[chatKey] = lastUserMsgId;
                 globalThis.__chatState[chatKey] = {
                   snapshot: snapshotHash,
                   seenRowKeys: currentSeen,
@@ -2422,15 +2592,9 @@ async function runListenerBody() {
             const { guaranteeKey } =
               resolvePlaywrightForwardIdentity(chatKey, msg, index);
 
-            const delivered =
-              globalThis.__processedMessageIds.has(guaranteeKey);
-
-            const inFlight =
-              globalThis.__processingMessageIds instanceof Map
-                ? globalThis.__processingMessageIds.has(guaranteeKey)
-                : Boolean(
-                    globalThis.__processingMessageIds?.has?.(guaranteeKey)
-                  );
+            const stateEntry = getMessageState(guaranteeKey);
+            const delivered = stateEntry?.state === "done";
+            const inFlight = stateEntry?.state === "processing";
 
             if (inFlight) hasInFlight = true;
 
@@ -2462,6 +2626,20 @@ async function runListenerBody() {
               lastUpdatedAt: Date.now(),
             };
 
+            if (usedFallbackRotationForThisLoop) {
+              const hasUnread = await page.evaluate(() => {
+                const unread = document.querySelectorAll(
+                  '#pane-side [aria-label*="unread"]'
+                );
+                return unread.length > 0;
+              });
+              if (!hasUnread) {
+                console.log("🛑 Stay — no unread chats");
+                return;
+              }
+              console.log("🔁 Safe switch — unread chat found");
+            }
+
             return;
           }
 
@@ -2470,40 +2648,25 @@ async function runListenerBody() {
           );
           const newMessages = messagesToForward;
 
-          /** True if at least one tail line still needs delivery confirmation or is in-flight. */
-          let hasPendingGuaranteeForward = false;
-          for (const [index, msg] of messagesToForward.entries()) {
-            const t = String(msg?.text ?? "").trim();
-            if (!t) continue;
-            const { guaranteeKey } = resolvePlaywrightForwardIdentity(
-              chatKey,
-              msg,
-              index
-            );
-            const delivered = globalThis.__processedMessageIds.has(guaranteeKey);
-            const inflightRot = Boolean(
-              globalThis.__processingMessageIds instanceof Map
-                ? globalThis.__processingMessageIds.has(guaranteeKey)
-                : globalThis.__processingMessageIds?.has?.(guaranteeKey)
-            );
-            if (!delivered || inflightRot) {
-              hasPendingGuaranteeForward = true;
-              break;
-            }
-          }
-
-          console.log("🔍 Pending check:", {
-            hasPendingGuaranteeForward,
-            newMessages: newMessages.length,
-          });
-
           if (usedFallbackRotationForThisLoop) {
-            if (hasPendingGuaranteeForward && newMessages.length > 0) {
+            const hasPendingWork = newMessages.length > 0;
+            if (hasPendingWork) {
               console.log(
-                "🔁 Staying — pending forward(s) (not yet in guarantee map)"
+                "🛑 Stay — current chat still has work"
               );
               rotationIdleCount = 0;
             } else {
+              const hasUnread = await page.evaluate(() => {
+                const unread = document.querySelectorAll(
+                  '#pane-side [aria-label*="unread"]'
+                );
+                return unread.length > 0;
+              });
+              if (!hasUnread) {
+                console.log("🛑 Stay — no unread chats");
+                return;
+              }
+              console.log("🔁 Safe switch — unread chat found");
               if (totalUserMessages > 0 && messagesToForward.length > 0) {
                 console.log(
                   "⏭ User lines visible but all candidates already in guarantee — no pipeline work; idle tick for rotation"
@@ -2513,28 +2676,12 @@ async function runListenerBody() {
             }
           }
 
+          globalThis.__activeChatLock = chatId;
           globalThis.__ACTIVE_PROCESSING_CHAT = chatKey;
           try {
             for (const [index, msg] of messagesToForward.entries()) {
-            const msgTargetId = `${chatKey}::${getMessageIdFromExtracted(
-              msg,
-              extractedMessages
-            )}`;
-            globalThis.__processedMessages =
-              globalThis.__processedMessages || new Set();
-            if (globalThis.__processedMessages.has(msgTargetId)) {
-              console.log("⛔ Already processed message:", msgTargetId);
-              continue;
-            }
-            globalThis.__processedMessages.add(msgTargetId);
-            globalThis.__playwrightChatLastProcessedAt =
-              globalThis.__playwrightChatLastProcessedAt ||
-              Object.create(null);
-            globalThis.__playwrightChatLastProcessedAt[chatKey] = Date.now();
-
             const lastUserText = String(msg?.text ?? "").trim();
             if (!lastUserText) {
-              globalThis.__processedMessages.delete(msgTargetId);
               continue;
             }
             /** Every `messagesToForward` entry is from the user-delta batch. */
@@ -2543,16 +2690,17 @@ async function runListenerBody() {
             const { messageId, guaranteeKey, source: idSource } =
               resolvePlaywrightForwardIdentity(chatKey, msg, index);
 
-            const inFlight = Boolean(
-              globalThis.__processingMessageIds instanceof Map
-                ? globalThis.__processingMessageIds.has(guaranteeKey)
-                : globalThis.__processingMessageIds?.has?.(guaranteeKey)
-            );
+            const stateEntry = getMessageState(guaranteeKey);
+            const inFlight = stateEntry?.state === "processing";
+            const done = stateEntry?.state === "done";
+            const failed = stateEntry?.state === "failed";
 
             console.log("🧠 Decision:", {
               isAfterAnchor,
               inFlight,
-              willProcess: !inFlight,
+              done,
+              failed,
+              willProcess: !inFlight && !done,
             });
 
             console.log("🧾 Message Identity:", {
@@ -2562,18 +2710,25 @@ async function runListenerBody() {
             });
 
             if (inFlight) {
-              console.log(
-                "⏭ Skipping — pipeline already running for this message"
-              );
-              globalThis.__processedMessages.delete(msgTargetId);
+              console.log("🔁 Already processing — skip");
               continue;
             }
 
-            if (globalThis.__processedMessageIds?.has?.(guaranteeKey)) {
-              console.log(
-                "⏭ Skipping — guarantee already settled (delivered or group gate handled)"
-              );
-              globalThis.__processedMessages.delete(msgTargetId);
+            if (done) {
+              console.log("⏭ Skipping message because already processed");
+              continue;
+            }
+            if (failed) {
+              console.log("♻️ Retrying failed message");
+            }
+            const chatLocked =
+              globalThis.__processingChats instanceof Map
+                ? globalThis.__processingChats.get(chatKey) === true
+                : false;
+            if (chatLocked) {
+              console.log("⏳ Chat processing lock active — skipping for retry:", {
+                chatKey,
+              });
               continue;
             }
 
@@ -2583,7 +2738,6 @@ async function runListenerBody() {
               chatKey
             );
             if (!activeChatOk) {
-              globalThis.__processedMessages.delete(msgTargetId);
               continue;
             }
 
@@ -2591,7 +2745,8 @@ async function runListenerBody() {
             globalThis.__chatResponding =
               globalThis.__chatResponding || Object.create(null);
             globalThis.__chatResponding[chatKey] = true;
-            globalThis.__processingMessageIds.set(guaranteeKey, true);
+            globalThis.__processingChats.set(chatKey, true);
+            setMessageState(guaranteeKey, "processing");
             try {
               const forwarded = await forwardPlaywrightGroupToPipeline({
                 messageId,
@@ -2605,6 +2760,11 @@ async function runListenerBody() {
                 playwrightChatKey: chatKey,
               });
               if (forwarded) {
+                globalThis.__playwrightChatLastProcessedAt =
+                  globalThis.__playwrightChatLastProcessedAt ||
+                  Object.create(null);
+                globalThis.__playwrightChatLastProcessedAt[chatKey] =
+                  Date.now();
                 if (
                   globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map
                 ) {
@@ -2619,13 +2779,13 @@ async function runListenerBody() {
                   rowKey: String(msg.__rowKey ?? "").trim(),
                 });
               } else {
-                globalThis.__processedMessages.delete(msgTargetId);
                 globalThis.__chatResponding[chatKey] = false;
+                globalThis.__processingChats.delete(chatKey);
                 notifyPlaywrightGuaranteeReleased(guaranteeKey);
               }
             } catch (fwdErr) {
-              globalThis.__processedMessages.delete(msgTargetId);
               globalThis.__chatResponding[chatKey] = false;
+              globalThis.__processingChats.delete(chatKey);
               notifyPlaywrightGuaranteeReleased(guaranteeKey);
               console.error(
                 "[Playwright] forwardPlaywrightGroupToPipeline error:",
@@ -2635,6 +2795,13 @@ async function runListenerBody() {
             }
           } finally {
             globalThis.__ACTIVE_PROCESSING_CHAT = null;
+            globalThis.__activeChatLock = null;
+            if (globalThis.__pendingChats && globalThis.__pendingChats.size > 0) {
+              const nextChat = globalThis.__pendingChats.values().next().value;
+              globalThis.__pendingChats.delete(nextChat);
+              console.log("🔁 Processing queued chat:", nextChat);
+              globalThis.__forceNextChat = nextChat;
+            }
           }
 
           const updatedSeen = new Set(prevSeenBase);
@@ -2665,6 +2832,7 @@ async function runListenerBody() {
       }
     } finally {
       chatLoopRunning = false;
+      globalThis.__loopRunning = false;
       if (restartAfterInterrupt && !isStopping) {
         console.log("🚀 Restarting loop after interrupt");
         globalThis.__INTERRUPT_PENDING__ = false;
@@ -2710,9 +2878,13 @@ async function runListenerBody() {
     const pollInterruptSafe = () => {
       void (async () => {
         if (isStopping) return;
+        /** Defer interrupt queue (switch_chat) while outbound media UI is active. */
+        if (globalThis.__WA_MEDIA_SEND__) return;
+        if (chatLoopRunning || globalThis.__loopRunning) return;
         if (globalThis.__UI_SEND_LOCK) return;
         if (globalThis.__UI_HARD_LOCK) return;
         if (globalThis.__ACTIVE_PIPELINE__) return;
+        if (globalThis.__activeChatLock) return;
         if (
           globalThis.__activeJob &&
           typeof globalThis.__activeJobStart === "number" &&
@@ -2738,15 +2910,11 @@ async function runListenerBody() {
           // Same chat inbound: keep current conversation continuity, no forced preemption.
           return;
         }
-        globalThis.__INTERRUPT_PENDING__ = true;
+        globalThis.__forceNextChat = normalizeTitle(String(interruptChat).trim());
         globalThis.__activeChatInFocus = interruptChat;
         globalThis.__activeChatTitle = interruptChat;
         globalThis.__activeChatFocusUntil = Date.now() + 15_000;
-        console.log("🚨 INTERRUPT: forcing immediate switch", interruptChat);
-        if (chatLoopRunning) {
-          return;
-        }
-        runChatLoopSafe();
+        console.log("🚨 INTERRUPT: queued priority switch", interruptChat);
       })().catch((err) => {
         if (!isStopping) {
           console.log("[Loop] Interrupt poll safe error:", err?.message || err);
@@ -2822,6 +2990,9 @@ export async function stopPlaywrightListener() {
   globalThis.__currentOpenChatTitle = null;
   globalThis.__currentOpenChatTitleTS = 0;
   globalThis.__ACTIVE_PROCESSING_CHAT = null;
+  if (globalThis.__processingChats instanceof Map) {
+    globalThis.__processingChats.clear();
+  }
   chatLoopRunning = false;
 
   if (browser) {

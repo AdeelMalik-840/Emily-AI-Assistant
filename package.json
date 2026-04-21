@@ -17,6 +17,7 @@
     "firebase-admin": "^13.7.0",
     "openai": "^4.77.0",
     "playwright": "^1.59.1",
+    "sharp": "^0.33.5",
     "twilio": "^5.4.2"
   }
 }

@@ -56,6 +56,7 @@ import {
   isGreeting,
   tryPreAiReply,
 } from "./preAiRouting.js";
+import { isEnglishOnlyGreetingMessage } from "./greetingLanguage.js";
 import {
   SOURCE_LIMITED_CONTEXT,
   SOURCE_NO_PROFILE_FALLBACK,
@@ -181,6 +182,88 @@ function selectLatestInboundForAi(rawMessage) {
     .join(" | ");
 }
 
+/** Max User/Assistant lines embedded into the model user payload (small window). */
+const MAX_AI_CONVERSATION_TAIL_LINES = 4;
+
+/**
+ * Last `User:` / `Assistant:` lines from a Firestore- or memory-style transcript block.
+ * Drops a trailing `User:` line that duplicates the current inbound text (avoids duplicate with `User: …` below).
+ *
+ * @param {string} block
+ * @param {string} currentUserMessage
+ * @returns {string[]}
+ */
+function extractTailConversationLinesForAi(block, currentUserMessage) {
+  const cur = String(currentUserMessage ?? "").trim();
+  const lines = String(block ?? "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((l) => /^User:\s*/i.test(l) || /^Assistant:\s*/i.test(l));
+  let tail = lines.slice(-MAX_AI_CONVERSATION_TAIL_LINES);
+  if (cur && tail.length > 0) {
+    const last = tail[tail.length - 1];
+    const um = /^User:\s*(.*)$/i.exec(last);
+    if (um && um[1].trim() === cur) {
+      tail = tail.slice(0, -1);
+    }
+  }
+  return tail;
+}
+
+/**
+ * Structured user payload: short recent thread + optional item line + current user + decision context.
+ * @param {{
+ *   historyText: string,
+ *   currentMessage: string,
+ *   lastItemMentioned: unknown,
+ *   contextLabel: string,
+ *   lastFocusedItemStr: string,
+ *   durationForEnriched: string,
+ *   detectedIntent: string,
+ *   missingContext: string,
+ * }} p
+ * @returns {{ payload: string, tailEmbedded: boolean }}
+ */
+function buildStructuredAiUserPayload(p) {
+  const cur = String(p.currentMessage ?? "").trim();
+  const tail = extractTailConversationLinesForAi(p.historyText, cur);
+
+  const conv =
+    tail.length > 0
+      ? `Conversation so far:\n${tail
+          .map((l) => {
+            const u = /^User:\s*(.*)$/i.exec(l);
+            if (u) return `user: ${u[1].trim()}`;
+            const a = /^Assistant:\s*(.*)$/i.exec(l);
+            if (a) return `assistant: ${a[1].trim()}`;
+            return l;
+          })
+          .join("\n")}\n\n`
+      : "";
+
+  const lastRaw =
+    p.lastItemMentioned != null ? String(p.lastItemMentioned).trim() : "";
+  const itemLine =
+    lastRaw.length > 0
+      ? `Current item being discussed: ${lastRaw}\n\n`
+      : "";
+
+  const ctx = `Context:
+- Current ${p.contextLabel}: ${p.lastFocusedItemStr || "unknown"}
+- Duration: ${p.durationForEnriched}
+- Intent: ${p.detectedIntent}
+- Missing: ${p.missingContext}`;
+
+  const payload = `${conv}${itemLine}User: ${cur}
+
+${ctx}
+
+Respond naturally and helpfully based on the conversation.`.trim();
+
+  return { payload, tailEmbedded: tail.length > 0 };
+}
+
 /**
  * User turns for lightweight guards: `User:` lines from history + current inbound.
  * @param {string} historyStr
@@ -242,6 +325,38 @@ function hasPricingAvailabilityDurationIntent(raw) {
     return true;
   }
   return false;
+}
+
+/**
+ * Pull image URLs from AI raw text (markdown or plain URL).
+ * @param {string | null | undefined} raw
+ * @returns {string[]}
+ */
+function extractImageUrlsFromAiReply(raw) {
+  const text = String(raw ?? "");
+  if (!text) return [];
+
+  const urls = [];
+  const mdRegex = /!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/gi;
+  const plainRegex = /https?:\/\/[^\s)]+/gi;
+
+  let match;
+  while ((match = mdRegex.exec(text)) !== null) {
+    const u = String(match[1] ?? "").trim();
+    if (u) urls.push(u);
+  }
+  while ((match = plainRegex.exec(text)) !== null) {
+    const u = String(match[0] ?? "").trim();
+    if (u) urls.push(u);
+  }
+
+  return Array.from(
+    new Set(
+      urls
+        .map((u) => u.replace(/[)>.,!?]+$/g, "").trim())
+        .filter((u) => /^https?:\/\//i.test(u))
+    )
+  ).slice(0, 5);
 }
 
 /**
@@ -325,6 +440,52 @@ function buildShowImagesCaption(displayLabel, userLanguageStyle) {
   }
 }
 
+/**
+ * Resolve most recently mentioned catalog item from conversation history.
+ * Uses dynamic catalog rows (no hardcoded item names).
+ * @param {string | null | undefined} history
+ * @param {Record<string, unknown> | null | undefined} rawBusinessProfile
+ * @returns {{ name?: string, color?: string, displayLabel?: string } | null}
+ */
+function resolveRecentCatalogItemFromHistory(history, rawBusinessProfile) {
+  const hist = normalizeText(String(history ?? ""));
+  if (!hist) return null;
+  if (!rawBusinessProfile || typeof rawBusinessProfile !== "object") return null;
+  const itemRows =
+    Array.isArray(rawBusinessProfile.items) && rawBusinessProfile.items.length > 0
+      ? rawBusinessProfile.items
+      : Array.isArray(rawBusinessProfile.vehicles)
+        ? rawBusinessProfile.vehicles
+        : [];
+  let best = null;
+  let bestIndex = -1;
+  for (const row of itemRows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const vo = /** @type {Record<string, unknown>} */ (row);
+    const name = String(vo.name ?? "").trim();
+    if (!name) continue;
+    const color = String(vo.color ?? "").trim();
+    const displayLabel = color ? `${name} (${color})` : name;
+    const aliases = [name, displayLabel]
+      .map((s) => normalizeText(s))
+      .filter(Boolean);
+    let rowIdx = -1;
+    for (const alias of aliases) {
+      const idx = hist.lastIndexOf(alias);
+      if (idx > rowIdx) rowIdx = idx;
+    }
+    if (rowIdx > bestIndex) {
+      bestIndex = rowIdx;
+      best = {
+        name,
+        ...(color ? { color } : {}),
+        displayLabel,
+      };
+    }
+  }
+  return bestIndex >= 0 ? best : null;
+}
+
 /** @param {Record<string, unknown> | null | undefined} profile */
 function resolveBusinessTone(profile) {
   const raw =
@@ -379,6 +540,46 @@ function extractDurationFromMessage(message) {
   const withUnit = /(\d+)\s*(day|days|din|dino|hour|hours|hr|hrs)\b/i.exec(raw);
   if (withUnit) {
     return Number.parseInt(withUnit[1], 10);
+  }
+  return null;
+}
+
+/**
+ * When there is no catalog match this turn, map `memory.lastItemMentioned` onto a profile
+ * row so `collectCatalogItemImageUrls` can resolve `name`/`color` like a real match.
+ * Read-only; does not mutate Emily state or matchers.
+ *
+ * @param {Record<string, unknown> | null | undefined} rawProfile
+ * @param {unknown} lastItemMentioned
+ * @returns {{ name: string, displayLabel: string, color?: string } | null}
+ */
+function resolveCatalogItemFromMemoryLabel(rawProfile, lastItemMentioned) {
+  if (!rawProfile || typeof rawProfile !== "object") return null;
+  const memRaw = String(lastItemMentioned ?? "").trim();
+  if (!memRaw) return null;
+  const mem = memRaw.toLowerCase();
+  const itemRows =
+    Array.isArray(rawProfile.items) && rawProfile.items.length > 0
+      ? rawProfile.items
+      : Array.isArray(rawProfile.vehicles)
+        ? rawProfile.vehicles
+        : [];
+  for (const it of itemRows) {
+    if (!it || typeof it !== "object" || Array.isArray(it)) continue;
+    const vo = /** @type {Record<string, unknown>} */ (it);
+    const n = String(vo.name ?? "").trim();
+    if (!n) continue;
+    const nl = n.toLowerCase();
+    if (nl.includes(mem) || mem.includes(nl)) {
+      const out = {
+        name: n,
+        displayLabel: n,
+      };
+      if (typeof vo.color === "string" && vo.color.trim() !== "") {
+        return { ...out, color: String(vo.color).trim() };
+      }
+      return out;
+    }
   }
   return null;
 }
@@ -461,37 +662,19 @@ export async function processMessage({
     playwrightWebInbound: Boolean(playwrightWebInbound),
   };
   globalThis.__chatContext = globalThis.__chatContext || {};
+  const normalizedPlaywrightChatKey = normalizeText(
+    String(playwrightChatKey ?? "")
+  );
+  const normalizedSessionKey = normalizeText(String(sessionKey ?? ""));
+  const normalizedUserId = normalizeText(String(userId ?? ""));
   const chatContextKey =
-    String(sessionKey ?? "").trim() ||
-    String(userId ?? "").trim();
-  if (resetTopicContext) {
-    if (globalThis.__chatContext[chatContextKey]) {
-      delete globalThis.__chatContext[chatContextKey];
-    }
-    const pwKey = String(playwrightChatKey ?? "").trim();
-    if (pwKey && globalThis.__lastProcessedUserMsg) {
-      delete globalThis.__lastProcessedUserMsg[pwKey];
-    }
-  }
+    normalizedPlaywrightChatKey ||
+    normalizedSessionKey ||
+    normalizedUserId;
+  const pendingTopicReset = Boolean(resetTopicContext);
 
   globalThis.__topicEntityBySession =
     globalThis.__topicEntityBySession || Object.create(null);
-  if (!resetTopicContext) {
-    const prevTopicEntity =
-      globalThis.__topicEntityBySession[chatContextKey] ?? null;
-    const entityProbe = extractEntity(message);
-    const confTh = getEntityConfidenceThreshold(entityProbe.name);
-    const newTopicEntity =
-      entityProbe.name != null && entityProbe.confidence >= confTh
-        ? String(entityProbe.name).trim()
-        : null;
-    if (newTopicEntity && newTopicEntity !== prevTopicEntity) {
-      if (globalThis.__chatContext[chatContextKey]) {
-        delete globalThis.__chatContext[chatContextKey];
-      }
-      globalThis.__topicEntityBySession[chatContextKey] = newTopicEntity;
-    }
-  }
 
   const rawCtx = globalThis.__chatContext[chatContextKey];
   const existingChatContext =
@@ -659,14 +842,8 @@ export async function processMessage({
   const { durationDays } = extractDuration(message);
   const hasDuration = durationDays != null;
 
-  if (extractedEntity) {
-    setLastEntityName(userId, extractedEntity, sessionKey);
-  }
-
-  const events = detectBookingEvent(message);
-  const nameForBooking =
-    (extractedEntity && entityType !== "category" ? extractedEntity : null) ??
-    (events.confirmationIntent ? getLastEntityName(userId, sessionKey) : null);
+  let resolvedItemEntityName = null;
+  let validatedPinnedEntityName = null;
 
   /** @type {{ itemId: string, name: string, isAvailable: boolean, nextAvailableAt?: string, alternativeItems?: Array<{ id: string, name: string }> } | null} */
   let itemContext = null;
@@ -674,6 +851,7 @@ export async function processMessage({
   if (extractedEntity && entityType !== "category") {
     const row = await findItemByName(userId, extractedEntity);
     if (row) {
+      resolvedItemEntityName = String(row.name ?? "").trim() || extractedEntity;
       const bookings = await getBookingsForItem(userId, row.id, row.name);
       const av = computeAvailabilityFromBookings(bookings);
       /** @type {Array<{ id: string, name: string }>} */
@@ -698,6 +876,32 @@ export async function processMessage({
       };
     }
   }
+  if (
+    pinnedEntityName != null &&
+    String(pinnedEntityName).trim() !== "" &&
+    entityType !== "category"
+  ) {
+    const pinnedRow = await findItemByName(userId, String(pinnedEntityName).trim());
+    if (pinnedRow) {
+      validatedPinnedEntityName =
+        String(pinnedRow.name ?? "").trim() || String(pinnedEntityName).trim();
+    }
+  }
+
+  const effectiveEntityForItemFlow =
+    resolvedItemEntityName ||
+    validatedPinnedEntityName;
+
+  if (effectiveEntityForItemFlow) {
+    setLastEntityName(userId, effectiveEntityForItemFlow, chatContextKey);
+  }
+
+  const events = detectBookingEvent(message);
+  const nameForBooking =
+    (effectiveEntityForItemFlow && entityType !== "category"
+      ? effectiveEntityForItemFlow
+      : null) ??
+    (events.confirmationIntent ? getLastEntityName(userId, chatContextKey) : null);
 
   /** @type {{ itemId: string, itemName?: string, durationDays: number } | null} */
   let bookingCreated = null;
@@ -730,7 +934,7 @@ export async function processMessage({
             itemName: row.name,
             durationDays: durationDays,
           };
-          if (extractedEntity && entityType !== "category") {
+          if (effectiveEntityForItemFlow && entityType !== "category") {
             const after = await getBookingsForItem(userId, row.id, row.name);
             const av2 = computeAvailabilityFromBookings(after);
             let alternativeItems = [];
@@ -759,8 +963,8 @@ export async function processMessage({
   }
 
   const entityMeta =
-    extractedEntity != null
-      ? { name: extractedEntity, type: entityType }
+    effectiveEntityForItemFlow != null
+      ? { name: effectiveEntityForItemFlow, type: entityType }
       : null;
 
   /** Maps classifier labels to detectIntent() union (+ confirmation_followup) */
@@ -794,20 +998,43 @@ export async function processMessage({
     detectedIntent = "confirmation_followup";
   }
   const durationValue = extractDurationFromMessage(message);
+  const existingFocusKey = normalizeText(
+    String(existingChatContext.lastFocusedItem ?? "")
+  );
+  const incomingFocusKey = normalizeText(String(effectiveEntityForItemFlow ?? ""));
+  const shouldResetTopicContext =
+    pendingTopicReset &&
+    Boolean(incomingFocusKey) &&
+    Boolean(existingFocusKey) &&
+    incomingFocusKey !== existingFocusKey;
+  if (shouldResetTopicContext) {
+    if (globalThis.__chatContext[chatContextKey]) {
+      delete globalThis.__chatContext[chatContextKey];
+    }
+    delete globalThis.__topicEntityBySession[chatContextKey];
+    const pwKey = String(playwrightChatKey ?? "").trim();
+    if (pwKey && globalThis.__lastProcessedUserMsg) {
+      delete globalThis.__lastProcessedUserMsg[pwKey];
+    }
+  }
   const nextChatContext = {
     lastFocusedItem:
-      extractedEntity != null && entityType !== "category"
-        ? String(extractedEntity).trim()
-        : existingChatContext.lastFocusedItem ?? null,
+      effectiveEntityForItemFlow != null && entityType !== "category"
+        ? String(effectiveEntityForItemFlow).trim()
+        : shouldResetTopicContext
+          ? null
+          : existingChatContext.lastFocusedItem ?? null,
     lastIntent: detectedIntent,
     lastDuration:
       detectedIntent === "duration" && durationValue != null
         ? durationValue
-        : existingChatContext.lastDuration ?? null,
+        : shouldResetTopicContext
+          ? null
+          : existingChatContext.lastDuration ?? null,
   };
   globalThis.__chatContext[chatContextKey] = nextChatContext;
 
-  const sid = chatSessionKey(userId, sessionKey);
+  const sid = chatSessionKey(userId, chatContextKey);
   const emilyTurn = applyEmilyTurn({
     sessionKey: sid,
     message,
@@ -822,9 +1049,81 @@ export async function processMessage({
       globalThis.__chatContext[chatContextKey] = nextChatContext;
     }
   }
+  const matchedItemLabelFromTurn = labelFromMatchedItem(emilyTurn.match.matchedItem);
+  const hasRawEntityCandidate =
+    entityResult?.name != null &&
+    String(entityResult.name).trim() !== "";
+  const wantsImages = detectShowImagesRequest(message);
+  const messageWordCount = String(message ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const canUseScopedFollowup =
+    !shouldResetTopicContext &&
+    detectedIntent !== "list" &&
+    detectedIntent !== "exclude" &&
+    (!hasRawEntityCandidate || wantsImages) &&
+    messageWordCount <= 6;
+  const fallbackScopedLabel =
+    !matchedItemLabelFromTurn &&
+    !pinnedEntityName &&
+    String(nextChatContext.lastFocusedItem ?? "").trim() !== "" &&
+    canUseScopedFollowup
+      ? String(nextChatContext.lastFocusedItem).trim()
+      : "";
+  const matchedItemForReply = fallbackScopedLabel
+    ? {
+        name: fallbackScopedLabel,
+        displayLabel: fallbackScopedLabel,
+      }
+    : emilyTurn.match.matchedItem;
+
+  const resolvedName =
+    matchedItemForReply && typeof matchedItemForReply.name === "string"
+      ? matchedItemForReply.name.trim()
+      : "";
+
+  const currentMemory =
+    emilyTurn.memory?.lastItemMentioned != null
+      ? String(emilyTurn.memory.lastItemMentioned).trim()
+      : "";
+
+  // Rule 1: Only proceed if we have a valid resolved item
+  const hasResolvedItem = resolvedName.length > 0;
+
+  // Rule 2: Memory is empty
+  const memoryEmpty = currentMemory.length === 0;
+
+  // Rule 3: Allow safe upgrade (more specific value)
+  const isUpgrade =
+    currentMemory &&
+    resolvedName &&
+    resolvedName.length > currentMemory.length &&
+    resolvedName.toLowerCase().includes(currentMemory.toLowerCase());
+
+  // FINAL DECISION:
+  if (hasResolvedItem && (memoryEmpty || isUpgrade)) {
+    emilyTurn.memory.lastItemMentioned = resolvedName;
+
+    console.log("🧠 Memory Sync Applied (final resolved):", {
+      stored: resolvedName,
+      previous: currentMemory || null,
+      reason: memoryEmpty ? "empty" : "upgrade",
+    });
+  }
+
   let intent = intentForContextLayer(emilyTurn.emilyIntent);
   if (forcedIntent) {
     intent = forcedIntent;
+  }
+  let resolvedEmilyIntent = emilyTurn.emilyIntent;
+  if (
+    emilyTurn.memory?.lastItemMentioned &&
+    emilyTurn.memory?.durationPreference &&
+    intent === "inquiry"
+  ) {
+    resolvedEmilyIntent = "booking";
+    intent = "order";
   }
 
   console.log({
@@ -833,27 +1132,105 @@ export async function processMessage({
     memory: emilyTurn.memory,
   });
 
+  const resolvedItem =
+    matchedItemForReply ??
+    resolveCatalogItemFromMemoryLabel(
+      businessProfile?.rawBusinessProfile ?? null,
+      emilyTurn.memory?.lastItemMentioned
+    );
+
+  console.log("🧠 Context Resolution:", {
+    matchedItem:
+      matchedItemForReply != null
+        ? labelFromMatchedItem(matchedItemForReply) ||
+          (typeof matchedItemForReply.name === "string"
+            ? matchedItemForReply.name
+            : null)
+        : null,
+    memoryItem: emilyTurn.memory?.lastItemMentioned ?? null,
+    resolvedItem:
+      resolvedItem != null
+        ? labelFromMatchedItem(resolvedItem) ||
+          (typeof resolvedItem.name === "string" ? resolvedItem.name : null)
+        : null,
+  });
+
   const isDelayedCommitment = emilyTurn.emilyIntent === "delayed_commitment";
 
-
-  const catalogImageUrlsForShow =
-    !isDelayedCommitment &&
-    detectShowImagesRequest(message) &&
-    emilyTurn.match.matchedItem &&
+  /** @type {Array<{ name?: string, displayLabel?: string }>} */
+  const imageTargetCandidates = [];
+  if (resolvedItem) {
+    imageTargetCandidates.push(resolvedItem);
+  }
+  const candidateLabels = [
+    nextChatContext.lastFocusedItem,
+    emilyTurn.memory?.lastItemMentioned ?? null,
+    getLastEntityName(userId, chatContextKey),
+  ];
+  for (const rawLabel of candidateLabels) {
+    const label = String(rawLabel ?? "").trim();
+    if (!label) continue;
+    imageTargetCandidates.push({
+      name: label,
+      displayLabel: label,
+    });
+  }
+  const seenImageTargets = new Set();
+  const uniqueImageTargetCandidates = imageTargetCandidates.filter((candidate) => {
+    const key = normalizeText(
+      String(candidate?.displayLabel ?? candidate?.name ?? "")
+    );
+    if (!key || seenImageTargets.has(key)) return false;
+    seenImageTargets.add(key);
+    return true;
+  });
+  if (
+    wantsImages &&
+    uniqueImageTargetCandidates.length === 0 &&
     hasUsefulBusinessData
-      ? collectCatalogItemImageUrls(
-          businessProfile?.rawBusinessProfile ?? null,
-          emilyTurn.match.matchedItem
-        )
-      : [];
+  ) {
+    const fromHistory = resolveRecentCatalogItemFromHistory(
+      conversationHistory,
+      businessProfile?.rawBusinessProfile ?? null
+    );
+    if (fromHistory) {
+      uniqueImageTargetCandidates.push(fromHistory);
+    }
+  }
+
+  /** @type {{ name?: string, displayLabel?: string } | null} */
+  let resolvedImageTarget = null;
+  /** @type {string[]} */
+  let catalogImageUrlsForShow = [];
+  if (!isDelayedCommitment && wantsImages && hasUsefulBusinessData) {
+    for (const candidate of uniqueImageTargetCandidates) {
+      const urls = collectCatalogItemImageUrls(
+        businessProfile?.rawBusinessProfile ?? null,
+        candidate
+      );
+      if (urls.length > 0) {
+        resolvedImageTarget = candidate;
+        catalogImageUrlsForShow = urls;
+        break;
+      }
+    }
+  }
+  if (!isDelayedCommitment && wantsImages && uniqueImageTargetCandidates.length > 0 && catalogImageUrlsForShow.length === 0) {
+    console.warn("[messageProcessor] show_images requested but no catalog images found", {
+      matchedItem: uniqueImageTargetCandidates[0],
+      triedTargets: uniqueImageTargetCandidates.map((c) =>
+        String(c?.displayLabel ?? c?.name ?? "")
+      ),
+    });
+  }
 
   if (
     !isDelayedCommitment &&
     catalogImageUrlsForShow.length > 0
   ) {
     const label =
-      emilyTurn.match.matchedItem?.displayLabel ??
-      emilyTurn.match.matchedItem?.name ??
+      resolvedImageTarget?.displayLabel ??
+      resolvedImageTarget?.name ??
       "";
     const finalReply = buildShowImagesCaption(
       label,
@@ -880,6 +1257,53 @@ export async function processMessage({
     return outImages;
   }
 
+  if (!isDelayedCommitment && wantsImages) {
+    if (!resolvedImageTarget) {
+      const clarifyReply = isEnglishOnlyGreetingMessage(message)
+        ? "Sure — which specific car images do you need?"
+        : "Ji bilkul — kis specific car ki images chahiye?";
+      const outClarify = applyHybridOutboundResult(
+        {
+          reply: clarifyReply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx
+      );
+      if (String(outClarify.reply ?? "").trim()) {
+        appendConversationTurn(
+          userId,
+          message,
+          String(outClarify.reply),
+          sessionKey
+        );
+      }
+      return outClarify;
+    }
+    if (resolvedImageTarget && catalogImageUrlsForShow.length === 0) {
+      const noImageReply = isEnglishOnlyGreetingMessage(message)
+        ? "I can share details for this car, but images are not available right now."
+        : "Is car ki details share kar sakta hoon, lekin images abhi available nahi hain.";
+      const outNoImage = applyHybridOutboundResult(
+        {
+          reply: noImageReply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx
+      );
+      if (String(outNoImage.reply ?? "").trim()) {
+        appendConversationTurn(
+          userId,
+          message,
+          String(outNoImage.reply),
+          sessionKey
+        );
+      }
+      return outNoImage;
+    }
+  }
+
   // Overlap async context build with sync catalog formatting (single-threaded overlap while context awaits I/O).
   const contextDataPromise = buildContextData({
     message,
@@ -896,8 +1320,17 @@ export async function processMessage({
     emilyTurn.pricingHint
   );
   const contextData = await contextDataPromise;
+  const shouldAvoidDurationQuestion =
+    Boolean(emilyTurn.memory?.durationPreference) &&
+    resolvedEmilyIntent === "booking";
+  contextData.avoidAskingDuration = shouldAvoidDurationQuestion;
   if (pinnedEntityName) {
     contextData.classifierPinnedEntity = pinnedEntityName;
+  } else if (fallbackScopedLabel) {
+    contextData.classifierPinnedEntity = fallbackScopedLabel;
+    console.log("[messageProcessor] Scoped follow-up pinned to last focused item", {
+      item: fallbackScopedLabel,
+    });
   }
   const fc =
     typeof fragmentCount === "number" && Number.isFinite(fragmentCount) && fragmentCount >= 1
@@ -914,7 +1347,7 @@ export async function processMessage({
 
   const matchedItemLabel = labelFromMatchedItem(emilyTurn.match.matchedItem);
   const skipReferentialContinuity =
-    Boolean(resetTopicContext) ||
+    Boolean(shouldResetTopicContext) ||
     Boolean(pinnedEntityName);
   if (
     matchedItemLabel &&
@@ -944,12 +1377,12 @@ export async function processMessage({
   });
 
   let aiReply = "";
+  let aiRawReply = "";
   /** @type {"GROUP" | "DM" | undefined} */
   let aiRouteModeFromModel;
   if (isDelayedCommitment) {
     aiReply = "";
   } else {
-    const isNumericOnlyInput = /^\d+$/.test(String(message ?? "").trim());
     const missingHint =
       String(businessType ?? "").trim() || "item";
     const missingContext =
@@ -957,28 +1390,40 @@ export async function processMessage({
         ? missingHint
         : "none";
     const contextLabel = resolveEmilyContextLabel();
-    const enrichedInputBase = `
-User message: "${message}"
-
-Context:
-- Current ${contextLabel}: ${nextChatContext.lastFocusedItem || "unknown"}
-- Duration: ${nextChatContext.lastDuration != null ? String(nextChatContext.lastDuration) : "unknown"}
-- Intent: ${detectedIntent}
-- Missing: ${missingContext}
-`.trim();
-    const enrichedInput =
-      isNumericOnlyInput && nextChatContext.lastFocusedItem
-        ? enrichedInputBase
-        : enrichedInputBase;
+    const memDur = emilyTurn.memory?.durationPreference;
+    const durationForEnriched =
+      memDur != null &&
+      typeof memDur === "object" &&
+      typeof memDur.value === "number" &&
+      memDur.unit != null
+        ? `${memDur.value} ${memDur.unit}`
+        : typeof memDur === "string" && String(memDur).trim() !== ""
+          ? String(memDur).trim()
+          : nextChatContext.lastDuration != null
+            ? String(nextChatContext.lastDuration)
+            : "unknown";
+    const historyForTail =
+      String(history ?? "").trim() ||
+      getRecentChatHistoryForPrompt(userId, 10, sid).trim();
+    const { payload: aiInput, tailEmbedded } = buildStructuredAiUserPayload({
+      historyText: historyForTail,
+      currentMessage: message,
+      lastItemMentioned: emilyTurn.memory?.lastItemMentioned,
+      contextLabel,
+      lastFocusedItemStr: String(nextChatContext.lastFocusedItem ?? "").trim(),
+      durationForEnriched,
+      detectedIntent,
+      missingContext,
+    });
     console.log("🧠 Intent:", detectedIntent);
     console.log("🧠 Context:", nextChatContext);
-    console.log("🧠 Final AI Input:", enrichedInput);
+    console.log("🧠 AI Context Input:", aiInput);
     const out = await generateReply({
-      message: enrichedInput,
+      message: aiInput,
       contextMessages,
       intent,
-      emilyIntent: emilyTurn.emilyIntent,
-      history,
+      emilyIntent: resolvedEmilyIntent,
+      history: tailEmbedded ? "" : history,
       knowledge: mergedKnowledge,
       hasKnowledge: hasKnowledgeForModel,
       contextData,
@@ -987,7 +1432,7 @@ Context:
       businessProfile: businessContext,
       conversationMemory: emilyTurn.memory,
       conversationMemorySummary: emilyTurn.memorySummary,
-      matchedItem: emilyTurn.match.matchedItem,
+      matchedItem: matchedItemForReply,
       matchedService: emilyTurn.match.matchedService,
       matchedCatalogLine,
       proactivePricingHint: emilyTurn.pricingHint,
@@ -1002,6 +1447,7 @@ Context:
       detectedIntent,
     });
     aiReply = out.reply ?? "";
+    aiRawReply = out.raw ?? out.reply ?? "";
     aiRouteModeFromModel =
       out.mode === "GROUP" || out.mode === "DM" ? out.mode : undefined;
   }
@@ -1017,9 +1463,9 @@ Context:
   );
 
   let finalReply = normalizeEmilyResponse(aiReply, {
-    matchedItem: emilyTurn.match.matchedItem,
+    matchedItem: matchedItemForReply,
     matchedService: emilyTurn.match.matchedService,
-    intent: emilyTurn.emilyIntent,
+    intent: resolvedEmilyIntent,
     memory: emilyTurn.memory,
     memoryDelta: emilyTurn.memoryDelta,
     userMessage: message,
@@ -1036,6 +1482,37 @@ Context:
       String(finalReply),
       extractRecentAssistantTextsFromPromptBlock(conversationHistory, 6)
     );
+  }
+
+  const aiReplyImageUrls = Array.from(
+    new Set([
+      ...extractImageUrlsFromAiReply(aiReply),
+      ...extractImageUrlsFromAiReply(aiRawReply),
+    ])
+  ).slice(0, 5);
+
+  const fallbackCatalogImagesForAiImageIntent =
+    aiReplyImageUrls.length === 0 &&
+    hasUsefulBusinessData &&
+    resolvedItem &&
+    (wantsImages || detectShowImagesRequest(aiReply))
+      ? collectCatalogItemImageUrls(
+          businessProfile?.rawBusinessProfile ?? null,
+          resolvedItem
+        )
+      : [];
+
+  const resolvedAiImageUrls =
+    aiReplyImageUrls.length > 0
+      ? aiReplyImageUrls
+      : fallbackCatalogImagesForAiImageIntent;
+  const hasAiReplyImages = resolvedAiImageUrls.length > 0;
+  if (hasAiReplyImages) {
+    console.log("[messageProcessor] resolved image URLs for outbound:", {
+      count: resolvedAiImageUrls.length,
+      source:
+        aiReplyImageUrls.length > 0 ? "ai_reply_urls" : "catalog_image_fallback",
+    });
   }
 
   if (!finalReply || !String(finalReply).trim()) {
@@ -1055,7 +1532,15 @@ Context:
   const baseFinal = {
     reply: finalReply,
     type: "AI_MESSAGE",
-    messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+    messageMeta: {
+      ...messageMetaForKnowledge(hasUsefulBusinessData),
+      ...(hasAiReplyImages
+        ? {
+            deliveryIntent: "show_images",
+            whatsappImageUrls: resolvedAiImageUrls,
+          }
+        : {}),
+    },
   };
   const outFinal = applyHybridOutboundResult(
     baseFinal,
