@@ -30,7 +30,7 @@ export function assistantReplySimilarity(a, b) {
  * If the reply largely repeats a recent assistant turn already in the thread, return a short follow-up instead of posting the same availability block again.
  * @param {string} reply
  * @param {string[]} priorAssistantTexts
- * @param {{ threshold?: number }} [opts]
+ * @param {{ threshold?: number, fallbackText?: string }} [opts]
  * @returns {string}
  */
 export function dedupeAgainstPriorAssistantReplies(
@@ -43,6 +43,14 @@ export function dedupeAgainstPriorAssistantReplies(
       ? opts.threshold
       : 0.78;
   const r = String(reply ?? "").trim().replace(/\s+/g, " ");
+  const hasValidAI = typeof reply === "string" && r.length > 0;
+  if (!hasValidAI) {
+    const fallbackText =
+      typeof opts.fallbackText === "string" && opts.fallbackText.trim().length > 0
+        ? opts.fallbackText.trim()
+        : "";
+    return fallbackText;
+  }
   if (r.length < 48) return reply;
   const prior = Array.isArray(priorAssistantTexts)
     ? priorAssistantTexts.filter((t) => String(t ?? "").trim().length > 24)
@@ -50,11 +58,7 @@ export function dedupeAgainstPriorAssistantReplies(
   if (prior.length === 0) return reply;
   for (const p of prior.slice(-4)) {
     if (assistantReplySimilarity(r, p) >= threshold) {
-      const fallbacks = [
-        "Yeh rental details main ne pehle share kar di hain — koi aur sawaal ya doosri gari ki info chahiye ho to bata dein.",
-        "Details upar share ho chuki hain — agar kisi aur vehicle ya booking ke baray mein poochna ho to likh dein.",
-      ];
-      return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+      return reply;
     }
   }
   return reply;

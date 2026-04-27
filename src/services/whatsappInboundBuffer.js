@@ -10,13 +10,14 @@ import {
   getRecentConversationForPrompt,
 } from "./conversationStore.js";
 import {
-  deliverWhatsAppOutbound,
+  sendWhatsAppInteractiveButtons,
   sendWhatsAppMessage,
 } from "./whatsappCloud.js";
+import { sendOutboundMessage } from "./messagingService.js";
 import {
-  sendPlaywrightGroupImages,
-  sendPlaywrightGroupText,
-} from "./playwrightOutboundBridge.js";
+  handleBookingApproval,
+  parseApprovalMessage,
+} from "./bookingApprovalService.js";
 import {
   identityContextFromPreview,
   normalizeTitle,
@@ -29,6 +30,9 @@ import {
   notifyPlaywrightGuaranteeReleased,
 } from "./playwrightGuaranteeBridge.js";
 import { setMessageState } from "./messageState.js";
+import { randomUUID } from "node:crypto";
+import { logBookingEvent } from "../utils/bookingLogger.js";
+import { normalizeInboundMessage } from "./inboundNormalizer.js";
 
 /** Pauses Playwright chat loop during group text + image outbound (see listener `runChatLoop`). */
 globalThis.__OUTBOUND_BUSY__ = false;
@@ -106,6 +110,11 @@ const lastSentReplies = new Map();
 /** @type {Map<string, { hash: string, timestamp: number }>} */
 const lastPlaywrightTextSends = new Map();
 
+/** Cross-source inbound dedupe window for identical text from same owner. */
+const CROSS_SOURCE_DEDUPE_WINDOW_MS = 5000;
+/** @type {Map<string, number>} */
+const recentInboundByOwnerAndText = new Map();
+
 /**
  * Playwright Web tab: a second flush can call `executeWhatsAppAiPipeline` while the first is still
  * in `processMessage` — the early active-job guard used to drop that work entirely (e.g. KIA Stonic
@@ -113,8 +122,242 @@ const lastPlaywrightTextSends = new Map();
  * @type {Map<string, object[]>}
  */
 const pendingPlaywrightPipelineBySession = new Map();
+/** @type {Array<object>} */
+globalThis.__messageQueue = Array.isArray(globalThis.__messageQueue)
+  ? globalThis.__messageQueue
+  : [];
 
 const MAX_PENDING_PIPELINES_PER_SESSION = 12;
+const BOOKING_NOTIFICATION_COLLECTION = "bookingNotificationState";
+
+/**
+ * @param {import("firebase-admin/firestore").Firestore} db
+ * @param {string} userId
+ * @param {string} bookingId
+ */
+async function hasBookingNotificationBeenSent(db, userId, bookingId) {
+  try {
+    const snap = await db
+      .collection("businesses")
+      .doc(String(userId ?? "").trim())
+      .collection(BOOKING_NOTIFICATION_COLLECTION)
+      .doc(String(bookingId ?? "").trim())
+      .get();
+    return snap.exists === true;
+  } catch (err) {
+    console.warn(
+      "[whatsappInboundBuffer] hasBookingNotificationBeenSent failed:",
+      err?.message || err
+    );
+    // Fail-safe: allow one send attempt instead of silently dropping all notifications.
+    return false;
+  }
+}
+
+/**
+ * @param {import("firebase-admin/firestore").Firestore} db
+ * @param {string} userId
+ * @param {string} bookingId
+ */
+async function markBookingNotificationSent(db, userId, bookingId) {
+  try {
+    await db
+      .collection("businesses")
+      .doc(String(userId ?? "").trim())
+      .collection(BOOKING_NOTIFICATION_COLLECTION)
+      .doc(String(bookingId ?? "").trim())
+      .set({
+        bookingId: String(bookingId ?? "").trim(),
+        notificationSent: true,
+        sentAt: new Date(),
+      });
+  } catch (err) {
+    console.warn(
+      "[whatsappInboundBuffer] markBookingNotificationSent failed:",
+      err?.message || err
+    );
+  }
+}
+
+/**
+ * Non-blocking business notification for new booking requests (idempotent by booking id).
+ * @param {{
+ *   traceId: string,
+ *   db: import("firebase-admin/firestore").Firestore,
+ *   userId: string,
+ *   booking: Record<string, unknown>,
+ *   customerPhone: string,
+ *   sendCredentials: { accessToken?: string, phoneNumberId?: string } | null | undefined,
+ * }} p
+ */
+async function triggerBusinessBookingNotification({
+  traceId,
+  db,
+  userId,
+  booking,
+  customerPhone,
+  sendCredentials,
+}) {
+  const tid = String(traceId ?? "").trim() || "unknown-trace";
+  const bookingId =
+    booking?.id != null && String(booking.id).trim() !== ""
+      ? String(booking.id).trim()
+      : "";
+  if (!bookingId) {
+    console.warn(
+      "⚠️ Missing booking.id — skipping notification to avoid untrackable state"
+    );
+    logBookingEvent({
+      traceId: tid,
+      step: "notification_result",
+      status: "fail",
+      data: { sent: false, reason: "BOOKING_ID_MISSING" },
+    });
+    return;
+  }
+
+  let ownerPhone = "";
+  try {
+    const businessSnap = await db.collection("businesses").doc(String(userId ?? "").trim()).get();
+    const business = businessSnap.exists ? businessSnap.data() || {} : {};
+    const businessProfile =
+      business.businessProfile &&
+      typeof business.businessProfile === "object" &&
+      !Array.isArray(business.businessProfile)
+        ? business.businessProfile
+        : {};
+    ownerPhone =
+      String(
+        businessProfile?.ownerNotificationPhone ?? business?.ownerNotificationPhone ?? ""
+      ).trim();
+  } catch (err) {
+    console.warn("⚠️ Failed to resolve ownerNotificationPhone:", err?.message || err);
+  }
+  if (!ownerPhone) {
+    console.warn("⚠️ Missing ownerNotificationPhone");
+    logBookingEvent({
+      traceId: tid,
+      step: "notification_result",
+      status: "fail",
+      data: { sent: false, reason: "OWNER_PHONE_MISSING", bookingId },
+    });
+    return;
+  }
+
+  const alreadyNotified = await hasBookingNotificationBeenSent(db, userId, bookingId);
+  if (alreadyNotified) {
+    console.log("⏭ Notification already sent for", bookingId);
+    logBookingEvent({
+      traceId: tid,
+      step: "notification_result",
+      status: "success",
+      data: { sent: false, reason: "IDEMPOTENCY_BLOCK", bookingId },
+    });
+    return;
+  }
+
+  const itemName =
+    booking?.itemName != null && String(booking.itemName).trim() !== ""
+      ? String(booking.itemName).trim()
+      : "Unknown item";
+  const durationDays =
+    booking?.durationDays != null && String(booking.durationDays).trim() !== ""
+      ? String(booking.durationDays).trim()
+      : "?";
+  const customer = String(customerPhone ?? "").trim() || "unknown";
+
+  const message = `
+New booking request:
+
+Item: ${itemName}
+Duration: ${durationDays} days
+Booking ID: ${bookingId}
+
+Reply:
+APPROVE ${bookingId}
+or
+REJECT ${bookingId}
+`.trim();
+
+  let sendSucceeded = false;
+  /** @type {string | null} */
+  let sendFailureDetail = null;
+  try {
+    const buttonResult = await sendWhatsAppInteractiveButtons(
+      ownerPhone,
+      message,
+      [
+        { id: `approve:${bookingId}`, title: "Approve" },
+        { id: `reject:${bookingId}`, title: "Reject" },
+      ],
+      sendCredentials ?? undefined
+    );
+    if (buttonResult?.ok === true) {
+      sendSucceeded = true;
+      console.log("[owner_approval_buttons_sent]", {
+        bookingId,
+        ownerPhoneLast4: ownerPhone.replace(/\D/g, "").slice(-4) || null,
+      });
+    }
+
+    if (!sendSucceeded) {
+      const result = await sendWhatsAppMessage(
+        ownerPhone,
+        message,
+        sendCredentials ?? undefined,
+        { recipientType: "individual" }
+      );
+      if (result === true || result?.ok === true || result?.success === true) {
+        sendSucceeded = true;
+      } else if (result === undefined) {
+        console.warn(
+          "⚠️ sendWhatsAppMessage returned undefined — assuming success (compat mode)"
+        );
+        sendSucceeded = true;
+      } else {
+        sendFailureDetail = `non_success_response:${String(
+          typeof result === "object" ? JSON.stringify(result).slice(0, 200) : result
+        )}`;
+      }
+    }
+  } catch (err) {
+    sendFailureDetail = String(err?.message ?? err ?? "unknown");
+    console.warn("❌ WhatsApp send threw error:", sendFailureDetail);
+  }
+
+  if (!sendSucceeded) {
+    console.warn("❌ WhatsApp send failed — NOT marking notification as sent", {
+      bookingId,
+    });
+    logBookingEvent({
+      traceId: tid,
+      step: "notification_result",
+      status: "fail",
+      data: {
+        sent: false,
+        reason: "WHATSAPP_API_FAILED",
+        bookingId,
+        ...(sendFailureDetail
+          ? { error: sendFailureDetail.slice(0, 400) }
+          : {}),
+      },
+    });
+    return;
+  }
+
+  await markBookingNotificationSent(db, userId, bookingId);
+
+  console.log("📤 Booking notification sent:", {
+    bookingId,
+    booking,
+  });
+  logBookingEvent({
+    traceId: tid,
+    step: "notification_result",
+    status: "success",
+    data: { sent: true, reason: "DELIVERED", bookingId },
+  });
+}
 
 function queuePendingPlaywrightPipeline(p) {
   if (!isPlaywrightWebTabInbound(p)) return;
@@ -321,11 +564,29 @@ function releasePlaywrightChatFocusNoReply() {
  * }} p
  */
 export async function executeWhatsAppAiPipeline(p) {
+  const pipelineStartedAt = Date.now();
+  const traceId =
+    p.traceId != null && String(p.traceId).trim() !== ""
+      ? String(p.traceId).trim()
+      : randomUUID();
+  p.traceId = traceId;
+  const logLatency = (stage, startedAt, extra = {}) => {
+    console.log("[latency]", {
+      traceId,
+      stage,
+      durationMs: Date.now() - startedAt,
+      totalMs: Date.now() - pipelineStartedAt,
+      ...extra,
+    });
+  };
+
   const {
     db,
     ownerUserId,
     userPhone,
     participantPhoneForDm: participantPhoneForDmRaw,
+    participantName: participantNameRaw,
+    senderScope: senderScopeRaw,
     sessionKey,
     combinedMessage,
     latestMessage: latestMessageRaw,
@@ -368,13 +629,75 @@ export async function executeWhatsAppAiPipeline(p) {
   const fallbackDmTo =
     String(participantPhoneForDmRaw ?? "").trim() || userPhone;
 
-  const messageId = String(messageIdRaw ?? "").trim();
-  if (!messageId) {
-    console.log("⛔ Missing messageId — skipping");
+  const tsRaw = p?.messageTimestamp ?? p?.timestamp ?? null;
+  const tsNum = Number(tsRaw);
+  const safeTimestamp =
+    Number.isFinite(tsNum) && tsNum > 0 ? tsNum : Date.now();
+  console.log("[timestamp_normalized]", {
+    raw: tsRaw,
+    final: safeTimestamp,
+  });
+
+  let normalizedInbound;
+  const extractionStartedAt = Date.now();
+  try {
+    normalizedInbound = normalizeInboundMessage({
+      source: isPlaywrightWebTabInbound(p) ? "playwright" : "cloud",
+      message: String(latestMessageRaw ?? combinedMessage ?? "").trim(),
+      messageId: messageIdRaw,
+      userId: ownerUserId,
+      sessionKey,
+      chatId:
+        String(playwrightChatKeyRaw ?? "").trim() ||
+        String(groupNameResolved ?? "").trim() ||
+        String(sessionKey ?? "").trim(),
+      timestamp: safeTimestamp,
+    });
+  } catch (err) {
+    console.error("[normalizeInboundMessage] failed", err);
     return;
+  }
+  logLatency("extraction", extractionStartedAt, {
+    source: normalizedInbound.source,
+    messageId: normalizedInbound.messageId,
+  });
+  const messageId = normalizedInbound.messageId;
+  const dedupeMessageKey = `${normalizedInbound.userId}_${normalizedInbound.message
+    .trim()
+    .toLowerCase()}`;
+  const nowForCrossSourceDedupe = Date.now();
+  const lastInboundAt = recentInboundByOwnerAndText.get(dedupeMessageKey);
+  if (
+    lastInboundAt != null &&
+    nowForCrossSourceDedupe - lastInboundAt < CROSS_SOURCE_DEDUPE_WINDOW_MS
+  ) {
+    console.log("⛔ Duplicate message skipped", {
+      source: normalizedInbound.source,
+      messageId: normalizedInbound.messageId,
+      ownerUserId: normalizedInbound.userId,
+      ageMs: nowForCrossSourceDedupe - lastInboundAt,
+    });
+    return;
+  }
+  recentInboundByOwnerAndText.set(dedupeMessageKey, nowForCrossSourceDedupe);
+  // Keep map bounded by evicting stale entries opportunistically.
+  for (const [k, ts] of recentInboundByOwnerAndText) {
+    if (nowForCrossSourceDedupe - ts > CROSS_SOURCE_DEDUPE_WINDOW_MS * 4) {
+      recentInboundByOwnerAndText.delete(k);
+    }
   }
   if (isPlaywrightWebTabInbound(p)) {
     if (!playwrightWebTitleIdentity || !groupNameResolved) {
+      logBookingEvent({
+        traceId,
+        step: "pipeline_start",
+        status: "fail",
+        data: {
+          reason: "invalid_playwright_tab_identity",
+          messageId,
+          sessionKey: String(sessionKey ?? "").slice(0, 120),
+        },
+      });
       console.error("INVALID PLAYWRIGHT TAB — need groupName (title identity)", {
         groupNameResolved,
       });
@@ -384,6 +707,16 @@ export async function executeWhatsAppAiPipeline(p) {
       return;
     }
   } else if (!String(whatsappReplyTo ?? "").trim()) {
+    logBookingEvent({
+      traceId,
+      step: "pipeline_start",
+      status: "fail",
+      data: {
+        reason: "missing_whatsapp_reply_target",
+        messageId,
+        sessionKey: String(sessionKey ?? "").slice(0, 120),
+      },
+    });
     console.log("⛔ Missing WhatsApp reply target — skipping");
     return;
   }
@@ -421,10 +754,21 @@ export async function executeWhatsAppAiPipeline(p) {
     if (isPlaywrightWebTabInbound(p)) {
       queuePendingPlaywrightPipeline(p);
     } else {
-      console.log("⏳ Active job in progress — skipping", {
+      logBookingEvent({
+        traceId,
+        step: "pipeline_start",
+        status: "fail",
+        data: {
+          reason: "active_job_queued",
+          messageId,
+          sessionKey: String(sessionKey ?? "").slice(0, 120),
+        },
+      });
+      console.log("⏳ Job active — queueing message", {
         activeJob: globalThis.__activeJob,
         incoming: fingerprint,
       });
+      globalThis.__messageQueue.push(p);
     }
     return;
   }
@@ -447,6 +791,17 @@ export async function executeWhatsAppAiPipeline(p) {
     prevSent.hash === messageHash &&
     nowMs - prevSent.timestamp < REPLY_DEDUPE_WINDOW_MS
   ) {
+    logBookingEvent({
+      traceId,
+      step: "pipeline_start",
+      status: "fail",
+      data: {
+        reason: "duplicate_inbound_dedupe",
+        messageId,
+        sessionKey: String(sessionKey ?? "").slice(0, 120),
+        ageMs: nowMs - prevSent.timestamp,
+      },
+    });
     console.log("[whatsappInboundBuffer] skip duplicate pipeline (recent same inbound)", {
       sessionKey,
       messageHashPreview: messageHash.slice(0, 16),
@@ -489,6 +844,23 @@ export async function executeWhatsAppAiPipeline(p) {
     console.log("🚀 Pipeline started");
     const { customerId, channel } = normalizeWhatsAppInboundContext(userPhone);
 
+    console.log("📩 Approval message received:", combinedMessage);
+    const parsedApproval = parseApprovalMessage(combinedMessage);
+    console.log("🧠 Parsed approval:", parsedApproval);
+    if (parsedApproval) {
+      console.log("🛠 Owner approval command detected:", parsedApproval);
+      await handleBookingApproval({
+        db,
+        userId: ownerUserId,
+        bookingId: parsedApproval.bookingId,
+        action: parsedApproval.action,
+        senderPhone: conversationCustomerNumber,
+        sendCredentials,
+      });
+      processingSuccess = true;
+      return;
+    }
+
     const feedbackIntent = detectSimpleFeedbackIntent(combinedMessage);
     if (feedbackIntent) {
       void updateLastMessageFeedback(db, {
@@ -530,6 +902,17 @@ export async function executeWhatsAppAiPipeline(p) {
   const isGroupInbound =
     isGroupMessage === true && String(userPhone ?? "").trim() === "unknown";
 
+  logBookingEvent({
+    traceId,
+    step: "pipeline_start",
+    status: "start",
+    data: {
+      messageText: String(combinedMessage ?? "").slice(0, 500),
+      sessionKey: String(sessionKey ?? "").slice(0, 160),
+      messageId,
+    },
+  });
+
   console.log("🧠 Generating AI response");
   const latestMessage = String(latestMessageRaw ?? combinedMessage ?? "").trim();
   const contextMessages = Array.isArray(contextMessagesRaw)
@@ -537,16 +920,21 @@ export async function executeWhatsAppAiPipeline(p) {
         .map((m) => String(m ?? "").trim())
         .filter(Boolean)
     : [];
+  const processStartedAt = Date.now();
   const {
     reply,
     messageMeta,
     sendVia,
     dmRecipientPhone,
   } = await processMessage({
-    userId: ownerUserId,
-    message: latestMessage,
+    traceId,
+    userId: normalizedInbound.userId,
+    message: normalizedInbound.message,
+    messageId: normalizedInbound.messageId,
+    source: normalizedInbound.source,
+    timestamp: normalizedInbound.timestamp,
     contextMessages,
-    sessionKey,
+    sessionKey: normalizedInbound.sessionKey,
     conversationHistory,
     fragmentCount,
     hasMultipleFragments,
@@ -568,7 +956,75 @@ export async function executeWhatsAppAiPipeline(p) {
       playwrightChatKeyRaw != null && String(playwrightChatKeyRaw).trim() !== ""
         ? String(playwrightChatKeyRaw).trim()
         : null,
+    groupName: groupNameResolved || null,
+    participantName:
+      participantNameRaw != null && String(participantNameRaw).trim() !== ""
+        ? String(participantNameRaw).trim()
+        : null,
+    senderScope:
+      senderScopeRaw != null && String(senderScopeRaw).trim() !== ""
+        ? String(senderScopeRaw).trim()
+        : null,
   });
+  logLatency("processMessage", processStartedAt, {
+    sendVia,
+    hasReply: String(reply ?? "").trim() !== "",
+  });
+  const bookingIdMeta =
+    messageMeta?.bookingCreated &&
+    typeof messageMeta.bookingCreated === "object" &&
+    messageMeta.bookingCreated.id != null
+      ? String(messageMeta.bookingCreated.id).trim()
+      : null;
+  logBookingEvent({
+    traceId,
+    step: "booking_result",
+    status: "success",
+    data: {
+      bookingCreated: Boolean(messageMeta?.bookingCreated),
+      bookingId: bookingIdMeta || null,
+    },
+  });
+  logBookingEvent({
+    traceId,
+    step: "notification_trigger",
+    status: "success",
+    data: {
+      notificationAttempted: Boolean(messageMeta?.bookingCreated),
+      bookingId: bookingIdMeta || null,
+    },
+  });
+  if (messageMeta?.bookingCreated && bookingIdMeta) {
+    console.log("📦 BookingCreated detected", messageMeta.bookingCreated);
+    void triggerBusinessBookingNotification({
+      traceId,
+      db,
+      userId: ownerUserId,
+      booking: messageMeta.bookingCreated,
+      customerPhone: conversationCustomerNumber,
+      sendCredentials,
+    }).catch((err) => {
+      console.warn("⚠️ Booking notification failed:", err?.message || err);
+      logBookingEvent({
+        traceId,
+        step: "notification_result",
+        status: "fail",
+        data: {
+          sent: false,
+          reason: "NOTIFICATION_ASYNC_ERROR",
+          bookingId: bookingIdMeta,
+          error: String(err?.message ?? err ?? ""),
+        },
+      });
+    });
+  } else {
+    console.log("[notification_skipped]", {
+      notificationSkippedReason: messageMeta?.bookingCreated
+        ? "BOOKING_ID_MISSING"
+        : "BOOKING_NOT_CREATED",
+      bookingId: bookingIdMeta || null,
+    });
+  }
 
   const optionalLogFields = buildMessagesOptionalFields({
     channel,
@@ -578,7 +1034,85 @@ export async function executeWhatsAppAiPipeline(p) {
     source_of_answer: messageMeta?.sourceOfAnswer,
   });
 
-  const replyText = reply != null ? String(reply).trim() : "";
+  const aiResponse = reply != null ? String(reply).trim() : "";
+  const hasValidAI =
+    typeof aiResponse === "string" && aiResponse.trim().length > 0;
+  let finalText = aiResponse;
+  const skipAIProcessing = messageMeta?.bookingBlocked === true;
+
+  if (skipAIProcessing) {
+    console.log("[OUTBOUND PRIORITY: BOOKING BLOCKED]");
+    finalText = aiResponse;
+  }
+
+  if (messageMeta?.bookingCreated) {
+    console.log("[BOOKING FINAL RESPONSE SENT]");
+  }
+
+  if (!skipAIProcessing && isGroupMessage === true) {
+    if (hasValidAI) {
+      finalText = aiResponse;
+    }
+  } else if (!skipAIProcessing && hasValidAI) {
+    finalText = aiResponse;
+  }
+
+  const confirmationIntent = /^(yes|y|ok|okay|confirm|confirmed|sure|haan|han|jee|ji)$/i.test(
+    String(combinedMessage ?? "").trim()
+  );
+  const isFalseProcessingResponse =
+    confirmationIntent === true &&
+    !messageMeta?.bookingCreated &&
+    !messageMeta?.bookingBlocked;
+
+  if (isFalseProcessingResponse) {
+    console.warn("[BLOCKED FAKE PROCESSING RESPONSE]");
+    finalText =
+      "Got it — confirming your booking details. Please wait a moment.";
+  }
+
+  // --- PRODUCTION SAFETY: prevent fake booking confirmations ---
+  const bookingMeta = messageMeta?.bookingCreated || null;
+  const memory =
+    messageMeta?.memory && typeof messageMeta.memory === "object"
+      ? messageMeta.memory
+      : null;
+
+  const hasRealBooking = Boolean(
+    bookingMeta &&
+      bookingMeta.id &&
+      bookingMeta.status === "pending_approval"
+  );
+
+  const durationFromBooking = Number.isFinite(
+    messageMeta?.bookingCreated?.durationDays
+  );
+  const durationFromMemory =
+    memory?.lastDuration !== "" &&
+    Number.isFinite(Number(memory?.lastDuration));
+  const hasDuration = durationFromBooking || durationFromMemory;
+  const isIncompleteBooking = !messageMeta?.bookingCreated && !hasDuration;
+
+  const looksLikeBookingConfirmation =
+    typeof finalText === "string" &&
+    /verify|confirm|processing|shortly|request details/i.test(finalText);
+
+  if (!hasRealBooking && looksLikeBookingConfirmation && isIncompleteBooking) {
+    console.log("[SAFEGUARD] Blocking fake booking confirmation → using AI response");
+
+    if (aiResponse && aiResponse.trim()) {
+      finalText = aiResponse;
+    }
+  }
+
+  console.log("[FINAL TEXT DECISION]", {
+    aiResponse,
+    finalText,
+    hasValidAI,
+    isGroupMessage: messageMeta?.isGroupMessage === true || isGroupMessage === true,
+  });
+
+  const replyText = finalText;
   /** True only when a WhatsApp outbound path actually delivered (Playwright or Cloud). */
   outboundReplyDelivered = false;
   console.log(
@@ -609,6 +1143,7 @@ export async function executeWhatsAppAiPipeline(p) {
     } else {
       console.log("📤 Sending reply");
       let groupSendFailed = false;
+      let outboundStartedAt = 0;
       try {
         const accessToken = String(sendCredentials?.accessToken ?? "").trim();
         const phoneNumberIdForSend = String(
@@ -626,155 +1161,47 @@ export async function executeWhatsAppAiPipeline(p) {
             sendVia === "PLAYWRIGHT" &&
             unknownPhone &&
             (isGroupMessage === true || playwrightWebInbound));
-
-        /** Playwright sends do not use Meta Cloud API tokens — do not gate them on credentials. */
-        if (usePlaywrightWebSend) {
-          if (!groupNameResolved.length) {
-            console.error("BLOCKED SEND — NO CHAT NAME (Playwright title)", {
-              groupNameResolved,
-            });
-          } else {
-            console.log("🟢 Using Playwright send (active header title)");
-            try {
-              globalThis.__OUTBOUND_BUSY__ = true;
-              console.log("🔒 Outbound lock ENABLED");
-
-              const textSentRecord = lastPlaywrightTextSends.get(sessionKey);
-              const textAlreadySentRecently =
-                textSentRecord &&
-                textSentRecord.hash === messageHash &&
-                Date.now() - textSentRecord.timestamp < REPLY_DEDUPE_WINDOW_MS;
-
-              let ok = Boolean(textAlreadySentRecently);
-              const wantsImages =
-                Array.isArray(messageMeta?.whatsappImageUrls) &&
-                messageMeta.whatsappImageUrls.length > 0;
-              let imagesDelivered = !wantsImages;
-              if (textAlreadySentRecently) {
-                console.log(
-                  "[whatsappInboundBuffer] text already sent for this inbound; skipping text resend"
-                );
-              } else {
-                ok = await sendPlaywrightGroupText(replyText, {
-                  expectedChat: groupNameResolved,
-                });
-                if (ok) {
-                  console.log("🧵 Text sent complete");
-                  lastPlaywrightTextSends.set(sessionKey, {
-                    hash: messageHash,
-                    timestamp: Date.now(),
-                  });
-                }
-              }
-
-              if (
-                ok &&
-                wantsImages
-              ) {
-                try {
-                  console.log("📸 Starting image send after text");
-                  console.log("🧵 Starting image send");
-                  const imgOk = await sendPlaywrightGroupImages(
-                    messageMeta.whatsappImageUrls,
-                    undefined,
-                    {
-                      expectedChat: groupNameResolved,
-                    }
-                  );
-                  if (imgOk) {
-                    imagesDelivered = true;
-                    console.log("✅ Image send complete");
-                  } else {
-                    imagesDelivered = false;
-                    console.error("❌ Image send failed");
-                  }
-                } catch (imgErr) {
-                  imagesDelivered = false;
-                  console.error(
-                    "[whatsappInboundBuffer] Playwright image send error (non-fatal):",
-                    imgErr?.message || imgErr
-                  );
-                }
-              }
-
-              if (ok && imagesDelivered) {
-                outboundReplyDelivered = true;
-              } else {
-                console.error(
-                  wantsImages && ok && !imagesDelivered
-                    ? "[whatsappInboundBuffer] Playwright send incomplete — text delivered but image delivery failed"
-                    : "[whatsappInboundBuffer] Playwright send failed — not falling back to Cloud API for this path"
-                );
-              }
-            } finally {
-              globalThis.__OUTBOUND_BUSY__ = false;
-              console.log("🔓 Outbound lock RELEASED");
-            }
-          }
-        } else if (!accessToken || !phoneNumberIdForSend) {
-          console.error(
-            "[whatsappInboundBuffer] Missing WhatsApp credentials (env only; no Firestore fallback). Set WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_ACCESS_TOKEN — skipping send."
-          );
-        } else if (
-          !isPlaywrightWebTabInbound(p) &&
-          isPlaywrightGroup &&
-          sendVia === "CLOUD_API_DM" &&
-          String(dmRecipientPhone ?? "").trim() !== ""
-        ) {
-          console.log("📩 Routing to DM via Cloud API");
-          const deliverResult = await deliverWhatsAppOutbound(
-            String(dmRecipientPhone).trim(),
-            replyText,
-            {
-              accessToken,
-              phoneNumberId: phoneNumberIdForSend,
-            },
-            {
-              channel,
-              deliveryIntent: messageMeta?.deliveryIntent,
-              explicitImageUrls: messageMeta?.whatsappImageUrls,
-              recipientType: "individual",
-              fallbackDmTo,
-            }
-          );
-          groupSendFailed = Boolean(deliverResult?.groupSendFailed);
-          if (!groupSendFailed) {
-            outboundReplyDelivered = true;
-          }
-        } else if (
-          !isPlaywrightWebTabInbound(p) &&
-          isPlaywrightGroup &&
-          sendVia === "NONE"
-        ) {
-          /* DM requested but no recipient — processor already logged */
-        } else if (!isPlaywrightWebTabInbound(p)) {
-          if (!String(sendTarget || whatsappReplyTo || "").trim()) {
-            console.warn("⚠️ Missing reply target, skipping send");
-          } else {
-            const deliverResult = await deliverWhatsAppOutbound(
-              sendTarget || whatsappReplyTo,
-              replyText,
-              {
-                accessToken,
-                phoneNumberId: phoneNumberIdForSend,
-              },
-              {
-                channel,
-                deliveryIntent: messageMeta?.deliveryIntent,
-                explicitImageUrls: messageMeta?.whatsappImageUrls,
-                recipientType: whatsappRecipientType,
-                fallbackDmTo,
-              }
-            );
-            groupSendFailed = Boolean(deliverResult?.groupSendFailed);
-            if (!groupSendFailed) {
-              outboundReplyDelivered = true;
-            }
-          }
+        outboundStartedAt = Date.now();
+        const sendResult = await sendOutboundMessage({
+          sendVia,
+          reply: replyText,
+          messageMeta,
+          dmRecipientPhone,
+          context: {
+            isTabInbound,
+            unknownPhone,
+            isGroupMessage: isGroupMessage === true,
+            playwrightWebInbound: Boolean(playwrightWebInbound),
+            groupNameResolved,
+            accessToken,
+            phoneNumberIdForSend,
+            sendTarget,
+            whatsappReplyTo,
+            channel,
+            fallbackDmTo,
+            whatsappRecipientType,
+            userPhone: String(userPhone ?? ""),
+            sessionKey,
+            messageHash,
+            dedupeWindowMs: REPLY_DEDUPE_WINDOW_MS,
+            lastPlaywrightTextSends,
+            usePlaywrightWebSend,
+          },
+        });
+        logLatency("outbound send", outboundStartedAt, {
+          sendVia,
+          usePlaywrightWebSend,
+          ok: sendResult?.ok === true,
+        });
+        groupSendFailed = Boolean(sendResult?.groupSendFailed);
+        if (sendResult?.ok === true) {
+          outboundReplyDelivered = true;
         } else {
-          console.warn(
-            "[whatsappInboundBuffer] Playwright web tab inbound — Cloud send path skipped (should have used Playwright branch)"
-          );
+          console.warn("⚠️ Outbound message failed:", {
+            sendVia,
+            ownerUserId,
+            conversationCustomerNumber,
+          });
         }
         lastSentReplies.set(sessionKey, {
           hash: messageHash,
@@ -785,6 +1212,13 @@ export async function executeWhatsAppAiPipeline(p) {
           userPhone
         );
       } catch (sendErr) {
+        if (outboundStartedAt) {
+          logLatency("outbound send", outboundStartedAt, {
+            sendVia,
+            ok: false,
+            error: String(sendErr?.message ?? sendErr ?? "").slice(0, 160),
+          });
+        }
         console.error("[whatsappInboundBuffer] WhatsApp send error:", sendErr);
       }
 
@@ -947,6 +1381,16 @@ export async function executeWhatsAppAiPipeline(p) {
     globalThis.__activeJob = null;
     globalThis.__activeJobStart = 0;
     console.log("🔓 FULL LOCK RELEASE");
+    if (globalThis.__messageQueue.length > 0) {
+      const nextJob = globalThis.__messageQueue.shift();
+      if (nextJob) {
+        setImmediate(() => {
+          void executeWhatsAppAiPipeline(nextJob).catch((e) =>
+            console.error("[whatsappInboundBuffer] drain queued pipeline:", e)
+          );
+        });
+      }
+    }
     if (isPlaywrightWebTabInbound(p)) {
       scheduleDrainPendingPlaywrightPipelines(p.sessionKey);
     }
@@ -1007,6 +1451,7 @@ function releasePlaywrightChatLockFromGate(ctx) {
  * @param {string} bufferKey
  */
 async function flushBufferedWhatsAppInbound(bufferKey) {
+  const flushStartedAt = Date.now();
   const entry = messageBuffer.get(bufferKey);
   if (!entry) return;
 
@@ -1032,6 +1477,7 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
         activeJob: globalThis.__activeJob,
         retryCount: entry.retryCount,
         partCount: entry.messageParts?.length || 0,
+        waitedMs: Date.now() - flushStartedAt,
       });
       const delay = 100 + Math.random() * 150;
       entry.timer = setTimeout(() => {
@@ -1078,6 +1524,13 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
     isGreetingFirst,
     isGroupMessage: Boolean(ctx.isGroupMessage),
     originalParts: parts,
+  });
+  console.log("[latency]", {
+    stage: "buffer flush",
+    durationMs: Date.now() - flushStartedAt,
+    bufferKey,
+    fragmentCount,
+    hasMultipleFragments,
   });
 
   const { customerId, channel } = normalizeWhatsAppInboundContext(ctx.userPhone);
@@ -1205,8 +1658,11 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
     );
   }
 
+  const traceId = randomUUID();
+  const pipelineStartedAt = Date.now();
   await executeWhatsAppAiPipeline({
     ...ctx,
+    traceId,
     combinedMessage: combined,
     latestMessage,
     contextMessages,
@@ -1214,6 +1670,13 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
     fragmentCount,
     hasMultipleFragments,
     isGreetingFirst,
+  });
+  console.log("[latency]", {
+    traceId,
+    stage: "buffer flush pipeline handoff",
+    durationMs: Date.now() - pipelineStartedAt,
+    totalMs: Date.now() - flushStartedAt,
+    bufferKey,
   });
 }
 
@@ -1291,7 +1754,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     conversationCustomerNumber,
     participantPhoneForDm: participantPhoneForDmPayload,
     messageId: messageIdPayload,
-    messageTimestamp: messageTimestampPayload,
+    messageTimestamp,
     messageSender: messageSenderPayload,
     playwrightWebInbound: playwrightWebInboundPayload = false,
     playwrightWebTitleIdentity: playwrightWebTitleIdentityPayload = false,
@@ -1305,6 +1768,26 @@ export function scheduleBufferedWhatsAppInbound(payload) {
 
   const sessionKeyResolved =
     String(sessionKey ?? "").trim() || `${ownerUserId}::${userPhone}`;
+  const isGroupChat =
+    isGroupMessage === true ||
+    whatsappRecipientType === "group" ||
+    String(whatsappReplyTo ?? "").trim().endsWith("@g.us");
+  const senderId =
+    String(
+      conversationCustomerNumber ??
+        participantPhoneForDmPayload ??
+        messageSenderPayload ??
+        userPhone ??
+        ""
+    ).trim() || "";
+  if (isGroupChat) {
+    console.log("🧠 Session isolation:", {
+      chatId: String(whatsappReplyTo ?? "").trim() || String(userPhone ?? "").trim(),
+      senderId,
+      sessionKey: sessionKeyResolved,
+      isGroupChat: true,
+    });
+  }
   const isPlaywrightImmediate =
     String(userPhone ?? "").trim() === "unknown" &&
     (isGroupMessage === true || playwrightWebInboundPayload === true);
@@ -1383,10 +1866,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
       messageIdPayload != null
         ? String(messageIdPayload)
         : String(entry.context?.messageId ?? ""),
-    messageTimestamp:
-      messageTimestampPayload != null
-        ? messageTimestampPayload
-        : entry.context?.messageTimestamp ?? null,
+    messageTimestamp: messageTimestamp ?? null,
     messageSender:
       String(messageSenderPayload ?? "").trim() ||
       String(entry.context?.messageSender ?? "").trim() ||
@@ -1484,6 +1964,11 @@ export function __clearWhatsAppInboundBufferForTests() {
     if (e.timer) clearTimeout(e.timer);
   }
   messageBuffer.clear();
+  pendingPlaywrightPipelineBySession.clear();
   lastSentReplies.clear();
   lastPlaywrightTextSends.clear();
 }
+
+/** Same as {@link __clearWhatsAppInboundBufferForTests} — public name for dev / HTTP / signals. */
+export const clearWhatsAppInboundMessageCaches =
+  __clearWhatsAppInboundBufferForTests;

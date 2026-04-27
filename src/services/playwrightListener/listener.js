@@ -28,6 +28,7 @@ import {
   getMessageState,
   setMessageState,
 } from "../messageState.js";
+import { clearWhatsAppInboundMessageCaches } from "../whatsappInboundBuffer.js";
 
 /** Open chat identity: sidebar `span[title]` for the target row (not header text). */
 globalThis.__currentOpenChatTitle =
@@ -1877,6 +1878,36 @@ async function pickInterruptChatFromSidebar(page, topChats, targetGroups) {
   return null;
 }
 
+/**
+ * Drop Playwright DOM-extraction dedupe state and pending inbound merges so old bubbles are not skipped.
+ * Call via `kill -USR2 <node-pid>` when Playwright is enabled, or POST `/internal/clear-extraction-state`.
+ */
+export function clearPlaywrightExtractedMessageState() {
+  globalThis.__chatState = Object.create(null);
+  globalThis.__lastProcessedUserMsg = Object.create(null);
+  globalThis.__lastProcessedRowKeyByChat = Object.create(null);
+  globalThis.__playwrightChatLastProcessedAt = Object.create(null);
+  globalThis.__ACTIVE_PROCESSING_CHAT = null;
+  if (globalThis.__pendingChats instanceof Set) {
+    globalThis.__pendingChats.clear();
+  }
+  if (globalThis.__visitedChatsThisCycle instanceof Set) {
+    globalThis.__visitedChatsThisCycle.clear();
+  }
+  lastMessagePerGroup.clear();
+  try {
+    clearWhatsAppInboundMessageCaches();
+  } catch (e) {
+    console.warn(
+      "[Playwright] clearWhatsAppInboundMessageCaches:",
+      e?.message || e
+    );
+  }
+  console.log(
+    "[Playwright] Cleared extraction dedupe state + inbound debounce buffers (old messages can be re-read once)"
+  );
+}
+
 async function runListenerBody() {
   const targetGroups = resolveTargetGroups();
 
@@ -1886,6 +1917,18 @@ async function runListenerBody() {
   globalThis.__chatRespondingCooldownUntil = Object.create(null);
   globalThis.__playwrightListenerMsgIdByGuarantee = new Map();
   console.log("[Playwright] Listener state reset");
+
+  if (!globalThis.__playwrightSigusr2Registered) {
+    globalThis.__playwrightSigusr2Registered = true;
+    try {
+      process.on("SIGUSR2", () => {
+        console.log("[Playwright] SIGUSR2 — clearing extraction / inbound caches");
+        clearPlaywrightExtractedMessageState();
+      });
+    } catch (e) {
+      console.warn("[Playwright] SIGUSR2 handler not registered:", e?.message || e);
+    }
+  }
 
   console.log("[Playwright] Starting listener...");
   const allowedTitles = resolvePlaywrightAllowedChatTitles();

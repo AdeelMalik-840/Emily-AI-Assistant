@@ -127,7 +127,7 @@ export async function buildContextData({
         typeof bg === "object" &&
         Array.isArray(bg.servicesList) &&
         bg.servicesList.length > 0,
-      itemsOrVehiclesCount:
+      catalogItemsCount:
         bg != null && typeof bg === "object"
           ? Array.isArray(bg.items)
             ? bg.items.length
@@ -206,7 +206,7 @@ export async function buildContextData({
       typeof b === "object" &&
       Array.isArray(b.servicesList) &&
       b.servicesList.length > 0,
-    itemsOrVehiclesCount:
+    catalogItemsCount:
       b != null && typeof b === "object"
         ? Array.isArray(b.items)
           ? b.items.length

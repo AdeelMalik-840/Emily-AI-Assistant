@@ -1,5 +1,6 @@
 import db from "../config/firebase.js";
 import admin from "firebase-admin";
+import { logBookingEvent } from "../utils/bookingLogger.js";
 
 const Timestamp = admin.firestore.Timestamp;
 const FieldValue = admin.firestore.FieldValue;
@@ -17,6 +18,40 @@ function toMillis(t) {
   }
   if (t instanceof Date) return t.getTime();
   return null;
+}
+
+/**
+ * Stable error label for booking_creation logs (triage / dashboards).
+ * @param {unknown} e
+ * @returns {string}
+ */
+function normalizeBookingCreationError(e) {
+  const msg = String(
+    e && typeof e === "object" && "message" in e
+      ? /** @type {{ message?: unknown }} */ (e).message ?? ""
+      : e ?? ""
+  );
+  if (msg === "ITEM_ALREADY_BOOKED") return "ITEM_ALREADY_BOOKED";
+
+  const codeRaw =
+    e && typeof e === "object" && "code" in e
+      ? /** @type {{ code?: unknown }} */ (e).code
+      : undefined;
+  const codeStr =
+    codeRaw != null && String(codeRaw).trim() !== "" ? String(codeRaw) : "";
+  const combined = `${codeStr} ${msg}`.toLowerCase();
+
+  if (
+    combined.includes("transaction") ||
+    combined.includes("aborted") ||
+    codeStr.toLowerCase() === "aborted" ||
+    codeStr === "10"
+  ) {
+    return "FIRESTORE_TRANSACTION_FAILED";
+  }
+
+  if (codeStr) return codeStr;
+  return msg || "UNKNOWN_ERROR";
 }
 
 function normalizeFuzzy(s) {
@@ -105,6 +140,67 @@ function lexicalScore(q, ln) {
 /** Fuzzy-only matches below this are rejected — avoids wrong-item substitution. */
 const FUZZY_MATCH_MIN = 0.82;
 const FUZZY_SCORE_SCALE = 85;
+const TOKEN_MATCH_MIN_TOKEN_LEN = 2;
+const TOKEN_MATCH_MIN_SCORE = 2;
+const ITEM_CACHE_TTL_MS = 30_000;
+const ITEM_CACHE = new Map();
+export const BLOCKING_BOOKING_STATUSES = [
+  "pending_approval",
+  "approved",
+  "confirmed",
+];
+export const NON_BLOCKING_BOOKING_STATUSES = [
+  "cancelled",
+  "completed",
+  "rejected",
+];
+const nonBlockingStatuses = NON_BLOCKING_BOOKING_STATUSES;
+const NO_DATE_BLOCK_MODE = String(process.env.NO_DATE_BLOCK_MODE || "conservative")
+  .trim()
+  .toLowerCase();
+let availabilityPolicyLogged = false;
+
+export function isBlockingBookingStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (NON_BLOCKING_BOOKING_STATUSES.includes(normalized)) return false;
+  return BLOCKING_BOOKING_STATUSES.includes(normalized) || !normalized;
+}
+
+function logAvailabilityPolicyOnce() {
+  if (availabilityPolicyLogged) return;
+  availabilityPolicyLogged = true;
+  console.log("[availability_policy]", {
+    blockingStatuses: BLOCKING_BOOKING_STATUSES,
+    nonBlockingStatuses: NON_BLOCKING_BOOKING_STATUSES,
+  });
+}
+
+/**
+ * Normalize inventory/catalog row so `id` is always a trimmed string (coerce number / loose DB shapes).
+ * Runtime contract: item ids are strings for matching, pre-commit, and commit.
+ * @param {Record<string, unknown>} row
+ * @returns {Record<string, unknown>}
+ */
+export function normalizeCatalogItem(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) {
+    return /** @type {Record<string, unknown>} */ (row);
+  }
+  const id =
+    typeof row.id === "string" && row.id.trim()
+      ? row.id.trim()
+      : row.id != null && String(row.id).trim()
+        ? String(row.id).trim()
+      : typeof row._id === "string" && row._id.trim()
+        ? row._id.trim()
+        : typeof row.docId === "string" && row.docId.trim()
+          ? row.docId.trim()
+          : typeof row.documentId === "string" && row.documentId.trim()
+            ? row.documentId.trim()
+            : typeof row.itemId === "string" && row.itemId.trim()
+              ? row.itemId.trim()
+              : "";
+  return { ...row, id };
+}
 
 /** Minimum combined relevance (string + tokens) for alternative suggestions. */
 const ALT_RELEVANCE_MIN = 0.26;
@@ -168,7 +264,7 @@ function alternativeRelevanceScore(referenceName, candidateName) {
  * Expects docs: { name: string, state?: object, attributes?: object }
  * @param {string} userId
  * @param {string} queryName
- * @returns {Promise<{ id: string, name: string, state?: object, attributes?: object } | null>}
+ * @returns {Promise<{ id: string, name: string, availability?: boolean | null, state?: object, attributes?: object } | null>}
  */
 export async function findItemByName(userId, queryName) {
   if (!userId || typeof userId !== "string") return null;
@@ -187,6 +283,8 @@ export async function findItemByName(userId, queryName) {
       const data = doc.data();
       const name =
         data && typeof data.name === "string" ? data.name.trim() : "";
+      const availability =
+        data && typeof data.availability === "boolean" ? data.availability : null;
       if (!name) continue;
       const ln = name.toLowerCase();
       let score = lexicalScore(q, ln);
@@ -201,6 +299,7 @@ export async function findItemByName(userId, queryName) {
           score,
           doc,
           name,
+          availability,
           state:
             data.state && typeof data.state === "object" ? data.state : {},
           attributes:
@@ -212,16 +311,226 @@ export async function findItemByName(userId, queryName) {
     }
 
     if (!best) return null;
-    return {
+    return normalizeCatalogItem({
       id: best.doc.id,
       name: best.name,
+      availability: best.availability,
       state: best.state,
       attributes: best.attributes,
-    };
+    });
   } catch (e) {
     console.error("[inventoryService] findItemByName:", e);
     return null;
   }
+}
+
+/**
+ * Lightweight item list for fallback matching.
+ * @param {string} userId
+ * @returns {Promise<Array<{ id: string, name: string, availability?: boolean | null, state?: object, attributes?: object }>>}
+ */
+export async function getAllItemsForUser(userId) {
+  return getItemsForBusiness(userId);
+}
+
+/**
+ * Single source of truth for catalog items: businesses/{userId}/items subcollection.
+ * @param {string} userId
+ * @returns {Promise<Array<Record<string, unknown>>>}
+ */
+export async function getItemsForBusiness(userId) {
+  if (!userId || typeof userId !== "string") return [];
+  try {
+    const snap = await db
+      .collection("businesses")
+      .doc(userId)
+      .collection("items")
+      .get();
+    const out = snap.docs.map((doc) =>
+      normalizeCatalogItem({
+        id: doc.id,
+        ...doc.data(),
+      })
+    );
+    console.log("📦 DB Items Loaded:", out.length);
+    return out;
+  } catch (e) {
+    console.error("[inventoryService] getItemsForBusiness:", e);
+    return [];
+  }
+}
+
+/**
+ * Strong commit lookup by Firestore doc id.
+ * @param {string} userId
+ * @param {string} itemId
+ * @returns {Promise<Record<string, unknown> | null>}
+ */
+export async function findItemById(userId, itemId) {
+  const uid = String(userId ?? "").trim();
+  const iid = String(itemId ?? "").trim();
+  if (!uid || !iid) return null;
+  try {
+    const doc = await db
+      .collection("businesses")
+      .doc(uid)
+      .collection("items")
+      .doc(iid)
+      .get();
+    const item = doc.exists ? normalizeCatalogItem({ id: doc.id, ...doc.data() }) : null;
+    console.log("🔎 Commit lookup:", {
+      itemId: iid,
+      found: Boolean(item),
+    });
+    return item;
+  } catch (e) {
+    console.error("[inventoryService] findItemById:", e);
+    return null;
+  }
+}
+
+/**
+ * Cached item list per user (short TTL to reduce repeated reads).
+ * @param {string} userId
+ * @returns {Promise<Array<{ id: string, name: string, availability?: boolean | null, state?: object, attributes?: object }>>}
+ */
+export async function getCachedItemsForUser(userId) {
+  if (!userId || typeof userId !== "string") return [];
+  const key = String(userId).trim();
+  if (!key) return [];
+  const cached = ITEM_CACHE.get(key);
+  if (cached && Date.now() - cached.ts < ITEM_CACHE_TTL_MS) {
+    return cached.items.map((it) =>
+      normalizeCatalogItem(/** @type {Record<string, unknown>} */ (it))
+    );
+  }
+  const items = await getAllItemsForUser(key);
+  ITEM_CACHE.set(key, {
+    items,
+    ts: Date.now(),
+  });
+  return items;
+}
+
+/**
+ * Drop cached rows for a business so the next read hits Firestore.
+ * @param {string} userId
+ */
+export function invalidateItemsCacheForUser(userId) {
+  const key = String(userId ?? "").trim();
+  if (key) ITEM_CACHE.delete(key);
+}
+
+/**
+ * Replace in-memory catalog snapshot (normalized rows).
+ * @param {string} userId
+ * @param {unknown[]} rawItems
+ */
+export async function setCachedItemsForUser(userId, rawItems) {
+  const key = String(userId ?? "").trim();
+  if (!key) return;
+  const items = Array.isArray(rawItems)
+    ? rawItems
+        .filter((it) => it && typeof it === "object")
+        .map((it) =>
+          normalizeCatalogItem(/** @type {Record<string, unknown>} */ (it))
+        )
+    : [];
+  ITEM_CACHE.set(key, { items, ts: Date.now() });
+}
+
+/**
+ * Fresh catalog rows from Firestore (same path as cache miss).
+ * @param {string} userId
+ */
+export async function fetchItemsFromDatabase(userId) {
+  return getAllItemsForUser(userId);
+}
+
+/**
+ * Resolver / matching: ensure we are not stuck on an empty TTL cache slice.
+ * Re-reads DB when the cached list is empty.
+ * @param {string} userId
+ */
+export async function ensureCatalogCache(userId) {
+  if (!userId || typeof userId !== "string") return [];
+  const key = String(userId).trim();
+  if (!key) return [];
+
+  let items = await getCachedItemsForUser(key);
+  if (items && items.length > 0) return items;
+
+  console.log("🔄 Reloading catalog from DB...");
+  invalidateItemsCacheForUser(key);
+  items = await fetchItemsFromDatabase(key);
+  await setCachedItemsForUser(key, items);
+  return items;
+}
+
+/**
+ * Scored token-prefix fallback for noisy entity text.
+ * @param {string} query
+ * @param {Array<{ id?: string, name?: string, availability?: boolean | null, state?: object, attributes?: object }>} items
+ * @returns {{ match: { id?: string, name: string, availability?: boolean | null, state?: object, attributes?: object } | null, score: number }}
+ */
+export function getBestTokenMatchWithScore(query, items) {
+  if (!query || !Array.isArray(items) || items.length === 0) {
+    return { match: null, score: 0 };
+  }
+
+  const tokens = String(query)
+    .toLowerCase()
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= TOKEN_MATCH_MIN_TOKEN_LEN);
+
+  if (tokens.length === 0) return { match: null, score: 0 };
+
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+
+    const name = String(item.name || "").toLowerCase();
+    if (!name) continue;
+
+    const words = name.split(/\s+/).filter(Boolean);
+
+    let score = 0;
+    for (const token of tokens) {
+      if (words.some((w) => w.startsWith(token))) {
+        score += token.length;
+      }
+    }
+
+    if (
+      score > bestScore ||
+      (score === bestScore &&
+        bestMatch &&
+        name.length < String(bestMatch.name || "").length)
+    ) {
+      bestScore = score;
+      bestMatch = item;
+    }
+  }
+
+  if (bestScore >= TOKEN_MATCH_MIN_SCORE) {
+    return { match: bestMatch, score: bestScore };
+  }
+
+  return { match: null, score: bestScore };
+}
+
+/**
+ * Generic token-overlap fallback for noisy entity text.
+ * Scores candidates by contained token length (longer token => stronger signal).
+ * @param {string} query
+ * @param {Array<{ id?: string, name?: string, availability?: boolean | null, state?: object, attributes?: object }>} items
+ * @returns {{ id?: string, name: string, availability?: boolean | null, state?: object, attributes?: object } | null}
+ */
+export function getBestTokenMatch(query, items) {
+  return getBestTokenMatchWithScore(query, items).match;
 }
 
 /**
@@ -270,41 +579,381 @@ export async function getBookingsForItem(userId, itemId, itemName = null) {
 }
 
 /**
- * If any booking covers `now`, item is unavailable; nextAvailableAt = end of active booking.
+ * If any booking for the same item covers `now`, item is unavailable.
  * @param {Array<Record<string, unknown>>} bookings
- * @param {Date} [now]
- * @returns {{ isAvailable: boolean, nextAvailableAt?: number }}
+ * @param {string} itemId
+ * @returns {{ isAvailable: boolean, nextAvailableAt?: number, blockingStatusesSeen?: string[] }}
  */
-export function computeAvailabilityFromBookings(bookings, now = new Date()) {
-  const nowMs = now.getTime();
-  let blockingEnd = null;
+export function computeAvailabilityFromBookings(bookings, itemId) {
+  logAvailabilityPolicyOnce();
+  const now = Date.now();
+  const normalizedItemId = String(itemId ?? "").trim();
+  const safeBookings = Array.isArray(bookings) ? bookings : [];
+  if (!normalizedItemId) {
+    return { isAvailable: true };
+  }
+  const currentStart = new Date(now);
+  const currentEnd = new Date(now + 86400000);
+  const relevantBookings = safeBookings.filter(
+    (b) => String(b?.itemId ?? "").trim() === normalizedItemId
+  );
+  const blockingBookings = relevantBookings.filter((b) =>
+    bookingBlocksWindow(b, normalizedItemId, currentStart, currentEnd)
+  );
+  const blockingStatusesSeen = Array.from(
+    new Set(
+      blockingBookings.map((b) =>
+        String(b?.status ?? "").trim().toLowerCase() || "(missing)"
+      )
+    )
+  );
+  console.log("[BOOKING CHECK]", {
+    now: Date.now(),
+    bookings: safeBookings.map((b) => ({
+      start: b?.startAt ?? null,
+      end: b?.endAt ?? null,
+      itemId: b?.itemId ?? null,
+    })),
+  });
+  console.log("[AVAILABILITY STATUS CHECK]", {
+    itemId: normalizedItemId,
+    totalBookings: safeBookings.length,
+    relevantBookings: relevantBookings.length,
+    statuses: safeBookings.map((b) => b?.status),
+  });
+  console.log("[AVAILABILITY CHECK]", {
+    itemId: normalizedItemId,
+    totalBookings: safeBookings.length,
+    relevantBookings: relevantBookings.length,
+    blockingStatusesSeen,
+    now,
+    result: blockingBookings.length > 0 ? "unavailable" : "available",
+  });
+  console.log("[availability_check]", {
+    itemId: normalizedItemId,
+    totalBookings: safeBookings.length,
+    relevantBookings: relevantBookings.length,
+    blockingStatusesSeen,
+    result: blockingBookings.length > 0 ? "unavailable" : "available",
+  });
 
-  for (const b of bookings) {
-    const start = toMillis(b.startAt);
+  for (const b of blockingBookings) {
     const end = toMillis(b.endAt);
-    if (start == null || end == null) continue;
-    if (nowMs >= start && nowMs < end) {
-      if (blockingEnd == null || end > blockingEnd) {
-        blockingEnd = end;
-      }
+    return {
+      isAvailable: false,
+      blockingStatusesSeen,
+      ...(end != null ? { nextAvailableAt: end } : {}),
+    };
+  }
+  return { isAvailable: true, blockingStatusesSeen };
+}
+
+function toValidDate(d) {
+  if (d == null) return null;
+  if (typeof d === "string" && d.trim() === "") return null;
+  const ms =
+    toMillis(d) ??
+    (d != null && Number.isFinite(Number(d)) ? Number(d) : null) ??
+    (() => {
+      const parsed = new Date(d);
+      return Number.isFinite(parsed.getTime()) ? parsed.getTime() : null;
+    })();
+  return ms != null ? new Date(ms) : null;
+}
+
+function normalizeDateOnly(date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function hasDateOverlap(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+function bookingBlocksWindow(booking, itemId, windowStart, windowEnd, opts = {}) {
+  const normalizedItemId = String(itemId ?? "").trim();
+  const bookingItemId = String(booking?.itemId ?? "").trim();
+  if (!normalizedItemId || bookingItemId !== normalizedItemId) return false;
+
+  const status = String(booking?.status ?? "").trim().toLowerCase();
+  if (!isBlockingBookingStatus(status)) return false;
+
+  const bStart = toValidDate(booking?.startDate ?? booking?.startAt ?? null);
+  const bEnd = toValidDate(booking?.endDate ?? booking?.endAt ?? null);
+  if (!bStart || !bEnd) {
+    if (status) {
+      console.log("[INVALID BOOKING DATE — BLOCKING]", booking);
+      return opts.conservativeInvalidDates !== false;
     }
+    return false;
   }
 
-  if (blockingEnd != null) {
-    return { isAvailable: false, nextAvailableAt: blockingEnd };
+  const wStart = toValidDate(windowStart);
+  const wEnd = toValidDate(windowEnd);
+  if (!wStart || !wEnd) {
+    return NO_DATE_BLOCK_MODE === "conservative";
   }
-  return { isAvailable: true };
+
+  return hasDateOverlap(
+    normalizeDateOnly(wStart),
+    normalizeDateOnly(wEnd),
+    normalizeDateOnly(bStart),
+    normalizeDateOnly(bEnd)
+  );
 }
 
 /**
- * @param {string} userId
- * @param {{ itemId: string, itemName?: string, durationDays: number }} opts
+ * User-facing availability evaluation (separate from booking commit safeguards).
+ * Conservative mode blocks on any blocking booking when user did not provide dates.
+ * @param {Array<Record<string, unknown>>} bookings
+ * @param {string} itemId
+ * @param {{ requestedStart?: unknown, requestedEnd?: unknown } | null} [opts]
+ * @returns {{ isAvailable: boolean, nextAvailableAt?: number, blockingStatusesSeen?: string[] }}
  */
-export async function createBooking(userId, { itemId, itemName, durationDays }) {
-  const id = String(itemId ?? "").trim();
-  if (!userId || !id) return { ok: false };
+export function computeUserFacingAvailability(bookings, itemId, opts = null) {
+  logAvailabilityPolicyOnce();
+  const normalizedItemId = String(itemId ?? "").trim();
+  const safeBookings = Array.isArray(bookings) ? bookings : [];
+  const requestedStart = opts?.requestedStart ?? null;
+  const requestedEnd = opts?.requestedEnd ?? null;
+  const hasRequestedStart =
+    requestedStart != null &&
+    !(typeof requestedStart === "string" && requestedStart.trim() === "");
+  const hasRequestedEnd =
+    requestedEnd != null &&
+    !(typeof requestedEnd === "string" && requestedEnd.trim() === "");
+  const reqStart = toValidDate(requestedStart);
+  const reqEnd = toValidDate(requestedEnd);
+  let blockingEnd = null;
 
-  const days = Math.max(1, Math.min(365, Number(durationDays) || 1));
+  if (!normalizedItemId) {
+    console.log("[AVAILABILITY CHECK]", {
+      itemId: normalizedItemId || null,
+      requestedStart,
+      requestedEnd,
+      parsedStart: reqStart,
+      parsedEnd: reqEnd,
+      blocking: false,
+      mode: NO_DATE_BLOCK_MODE,
+    });
+    return { isAvailable: true };
+  }
+
+  const relevantBookings = safeBookings.filter(
+    (b) => String(b?.itemId ?? "").trim() === normalizedItemId
+  );
+
+  if (!hasRequestedStart && !hasRequestedEnd) {
+    const blockingBookings = relevantBookings.filter((b) =>
+      isBlockingBookingStatus(String(b?.status ?? "").trim().toLowerCase())
+    );
+    for (const b of blockingBookings) {
+      const bEnd = toValidDate(b?.endDate ?? b?.endAt ?? null);
+      if (bEnd && (blockingEnd == null || bEnd.getTime() > blockingEnd)) {
+        blockingEnd = bEnd.getTime();
+      }
+    }
+    const blockingStatusesSeen = Array.from(
+      new Set(
+        blockingBookings.map((b) =>
+          String(b?.status ?? "").trim().toLowerCase() || "(missing)"
+        )
+      )
+    );
+    const result = blockingBookings.length > 0 ? "unavailable" : "available";
+    console.log("[availability_no_date_policy]", {
+      itemId: normalizedItemId,
+      activeBlockingBookings: blockingBookings.length,
+      blockingStatusesSeen,
+      result,
+    });
+    console.log("[AVAILABILITY CHECK]", {
+      itemId: normalizedItemId,
+      totalBookings: safeBookings.length,
+      relevantBookings: relevantBookings.length,
+      blockingStatusesSeen,
+      requestedStart,
+      requestedEnd,
+      parsedStart: reqStart,
+      parsedEnd: reqEnd,
+      result,
+      blocking: blockingBookings.length > 0,
+      mode: NO_DATE_BLOCK_MODE,
+    });
+    console.log("[availability_check]", {
+      itemId: normalizedItemId,
+      totalBookings: safeBookings.length,
+      relevantBookings: relevantBookings.length,
+      blockingStatusesSeen,
+      result,
+    });
+    if (blockingBookings.length > 0) {
+      return {
+        isAvailable: false,
+        blockingStatusesSeen,
+        ...(blockingEnd != null ? { nextAvailableAt: blockingEnd } : {}),
+      };
+    }
+    return { isAvailable: true, blockingStatusesSeen };
+  }
+
+  const blockingBookings = safeBookings.filter((b) => {
+    const bookingItemId = String(b?.itemId ?? "").trim();
+    if (bookingItemId !== normalizedItemId) return false;
+
+    const status = String(b?.status ?? "").trim().toLowerCase();
+    if (nonBlockingStatuses.includes(status)) return false;
+    if (!isBlockingBookingStatus(status)) return false;
+
+    const bStart = toValidDate(b?.startDate ?? b?.startAt ?? null);
+    const bEnd = toValidDate(b?.endDate ?? b?.endAt ?? null);
+    if (!bStart || !bEnd) {
+      console.log("[INVALID BOOKING DATE — BLOCKING]", b);
+      return Boolean(status);
+    }
+    if (blockingEnd == null || bEnd.getTime() > blockingEnd) {
+      blockingEnd = bEnd.getTime();
+    }
+
+    if (!reqStart || !reqEnd) {
+      if (!status) {
+        return hasDateOverlap(
+          normalizeDateOnly(new Date()),
+          normalizeDateOnly(new Date(Date.now() + 86400000)),
+          normalizeDateOnly(bStart),
+          normalizeDateOnly(bEnd)
+        );
+      }
+      return NO_DATE_BLOCK_MODE === "conservative";
+    }
+
+    return hasDateOverlap(
+      normalizeDateOnly(reqStart),
+      normalizeDateOnly(reqEnd),
+      normalizeDateOnly(bStart),
+      normalizeDateOnly(bEnd)
+    );
+  });
+  const hasBlockingBooking = blockingBookings.length > 0;
+  const blockingStatusesSeen = Array.from(
+    new Set(
+      blockingBookings.map((b) =>
+        String(b?.status ?? "").trim().toLowerCase() || "(missing)"
+      )
+    )
+  );
+
+  console.log("[AVAILABILITY CHECK]", {
+    itemId: normalizedItemId,
+    totalBookings: safeBookings.length,
+    relevantBookings: relevantBookings.length,
+    blockingStatusesSeen,
+    requestedStart,
+    requestedEnd,
+    parsedStart: reqStart,
+    parsedEnd: reqEnd,
+    result: hasBlockingBooking ? "unavailable" : "available",
+    blocking: hasBlockingBooking,
+    mode: NO_DATE_BLOCK_MODE,
+  });
+  console.log("[availability_check]", {
+    itemId: normalizedItemId,
+    totalBookings: safeBookings.length,
+    relevantBookings: relevantBookings.length,
+    blockingStatusesSeen,
+    result: hasBlockingBooking ? "unavailable" : "available",
+  });
+
+  if (hasBlockingBooking) {
+    return {
+      isAvailable: false,
+      blockingStatusesSeen,
+      ...(blockingEnd != null ? { nextAvailableAt: blockingEnd } : {}),
+    };
+  }
+  return { isAvailable: true, blockingStatusesSeen };
+}
+
+/**
+ * @param {string} traceId - Correlates with pipeline / processMessage logs
+ * @param {string} userId
+ * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string }} opts
+ */
+export async function createBooking(
+  traceId,
+  userId,
+  {
+    itemId,
+    itemName,
+    durationDays,
+    customerName,
+    customerPhone,
+    source,
+    groupName,
+    sessionKey,
+    messageId,
+    participantName,
+    senderScope,
+    playwrightChatKey,
+    dmTargetPhone,
+    dmTargetSource,
+    canDmCustomer,
+    approvalStage,
+  }
+) {
+  logAvailabilityPolicyOnce();
+  const tid = String(traceId ?? "").trim() || "unknown-trace";
+  const id = String(itemId ?? "").trim();
+  if (!userId || !id) {
+    logBookingEvent({
+      traceId: tid,
+      step: "booking_creation",
+      status: "fail",
+      data: {
+        result: "fail",
+        error: "MISSING_USER_OR_ITEM",
+        itemId: id || null,
+        durationDays: durationDays ?? null,
+      },
+    });
+    return {
+      ok: false,
+      error: "MISSING_USER_OR_ITEM",
+      code: "MISSING_USER_OR_ITEM",
+    };
+  }
+
+  const durationNumber = Number(durationDays);
+  if (!Number.isFinite(durationNumber) || durationNumber <= 0) {
+    logBookingEvent({
+      traceId: tid,
+      step: "booking_creation",
+      status: "fail",
+      data: {
+        result: "fail",
+        error: "INVALID_DURATION",
+        itemId: id,
+        durationDays: durationDays ?? null,
+      },
+    });
+    console.warn("[booking_creation_fail]", {
+      error: "INVALID_DURATION",
+      code: "INVALID_DURATION",
+      itemId: id,
+      durationDays: durationDays ?? null,
+      hasCustomerPhone: Boolean(String(customerPhone ?? "").trim()),
+    });
+    return { ok: false, error: "INVALID_DURATION", code: "INVALID_DURATION" };
+  }
+
+  const days = Math.max(1, Math.min(365, Math.floor(durationNumber)));
+  logBookingEvent({
+    traceId: tid,
+    step: "booking_creation",
+    status: "start",
+    data: { itemId: id, durationDays: days },
+  });
   const startAt = Timestamp.now();
   const endAt = Timestamp.fromMillis(
     startAt.toMillis() + days * 86400000
@@ -314,23 +963,171 @@ export async function createBooking(userId, { itemId, itemName, durationDays }) 
     itemName != null && String(itemName).trim() !== ""
       ? String(itemName).trim()
       : undefined;
+  const dmTargetRaw = String(dmTargetPhone ?? "").trim();
+  const dmTargetLooksSynthetic =
+    /^grp[0-9a-f]{8,}$/i.test(dmTargetRaw) ||
+    /^anon::/i.test(dmTargetRaw) ||
+    dmTargetRaw.toLowerCase() === "unknown";
+  const dmTargetDigits = dmTargetRaw.replace(/\D/g, "");
+  const dmTargetIsRoutable =
+    !dmTargetLooksSynthetic &&
+    ((dmTargetRaw.includes("@") && /@(c\.us|s\.whatsapp\.net)$/i.test(dmTargetRaw)) ||
+      (dmTargetDigits.length >= 10 && dmTargetDigits.length <= 15));
+  const safeCanDmCustomer = Boolean(canDmCustomer) && dmTargetIsRoutable;
+  console.log("[dm_capability]", {
+    canDmCustomer: safeCanDmCustomer,
+    dmTargetSource: String(dmTargetSource ?? "").trim() || null,
+    hasDmTarget: Boolean(dmTargetRaw),
+    syntheticTarget: dmTargetLooksSynthetic,
+  });
 
   try {
-    await db
+    const bookingsRef = db
       .collection("businesses")
       .doc(userId)
-      .collection("bookings")
-      .add({
+      .collection("bookings");
+    let createdBookingId = "";
+
+    await db.runTransaction(async (tx) => {
+      const existingSnap = await tx.get(bookingsRef.where("itemId", "==", id));
+      const hasActiveBooking = existingSnap.docs.some((docSnap) => {
+        const data = docSnap.data() || {};
+        return bookingBlocksWindow(data, id, startAt.toDate(), endAt.toDate());
+      });
+
+      if (hasActiveBooking) {
+        throw new Error("ITEM_ALREADY_BOOKED");
+      }
+
+      const bookingRef = bookingsRef.doc();
+      createdBookingId = String(bookingRef.id ?? "").trim();
+      tx.set(bookingRef, {
         itemId: id,
         ...(name ? { itemName: name } : {}),
+        durationDays: days,
+        ...(customerName != null && String(customerName).trim() !== ""
+          ? { customerName: String(customerName).trim() }
+          : {}),
+        ...(customerPhone != null && String(customerPhone).trim() !== ""
+          ? { customerPhone: String(customerPhone).trim() }
+          : {}),
+        ...(source != null && String(source).trim() !== ""
+          ? { source: String(source).trim() }
+          : {}),
+        ...(groupName != null && String(groupName).trim() !== ""
+          ? { groupName: String(groupName).trim() }
+          : {}),
+        ...(sessionKey != null && String(sessionKey).trim() !== ""
+          ? { sessionKey: String(sessionKey).trim() }
+          : {}),
+        ...(messageId != null && String(messageId).trim() !== ""
+          ? { messageId: String(messageId).trim() }
+          : {}),
+        ...(participantName != null && String(participantName).trim() !== ""
+          ? { participantName: String(participantName).trim() }
+          : {}),
+        ...(senderScope != null && String(senderScope).trim() !== ""
+          ? { senderScope: String(senderScope).trim() }
+          : {}),
+        ...(playwrightChatKey != null && String(playwrightChatKey).trim() !== ""
+          ? { playwrightChatKey: String(playwrightChatKey).trim() }
+          : {}),
+        ...(dmTargetRaw && dmTargetIsRoutable
+          ? { dmTargetPhone: dmTargetRaw }
+          : {}),
+        ...(dmTargetSource != null && String(dmTargetSource).trim() !== ""
+          ? { dmTargetSource: String(dmTargetSource).trim() }
+          : {}),
+        canDmCustomer: safeCanDmCustomer,
+        ...(approvalStage != null && String(approvalStage).trim() !== ""
+          ? { approvalStage: String(approvalStage).trim() }
+          : {}),
         startAt,
         endAt,
+        status: "pending_approval",
         createdAt: FieldValue.serverTimestamp(),
       });
-    return { ok: true };
+    });
+
+    logBookingEvent({
+      traceId: tid,
+      step: "booking_creation",
+      status: "success",
+      data: {
+        result: "success",
+        itemId: id,
+        durationDays: days,
+        bookingId: createdBookingId || null,
+      },
+    });
+    return { ok: true, id: createdBookingId || undefined };
   } catch (e) {
+    if (String(e?.message ?? "") === "ITEM_ALREADY_BOOKED") {
+      console.warn("[inventoryService] createBooking: item already booked", {
+        userId,
+        itemId: id,
+      });
+      logBookingEvent({
+        traceId: tid,
+        step: "booking_creation",
+        status: "fail",
+        data: {
+          result: "fail",
+          error: "ITEM_ALREADY_BOOKED",
+          errorDetail: String(e?.message ?? ""),
+          itemId: id,
+          durationDays: days,
+        },
+      });
+      console.warn("[booking_creation_fail]", {
+        error: "ITEM_ALREADY_BOOKED",
+        code: "ITEM_ALREADY_BOOKED",
+        itemId: id,
+        durationDays: days,
+        hasCustomerPhone: Boolean(String(customerPhone ?? "").trim()),
+      });
+      return {
+        ok: false,
+        error: "ITEM_ALREADY_BOOKED",
+        code: "ITEM_ALREADY_BOOKED",
+      };
+    }
     console.error("[inventoryService] createBooking:", e);
-    return { ok: false };
+    const normalized = normalizeBookingCreationError(e);
+    const errorDetail = [e?.code, e?.message]
+      .filter((x) => x != null && String(x).trim() !== "")
+      .map((x) => String(x))
+      .join(" | ");
+    logBookingEvent({
+      traceId: tid,
+      step: "booking_creation",
+      status: "fail",
+      data: {
+        result: "fail",
+        error: normalized,
+        ...(errorDetail ? { errorDetail: errorDetail.slice(0, 400) } : {}),
+        itemId: id,
+        durationDays: days,
+      },
+    });
+    console.warn("[booking_creation_fail]", {
+      error: normalized,
+      code: normalized,
+      itemId: id,
+      durationDays: days,
+      hasCustomerPhone: Boolean(String(customerPhone ?? "").trim()),
+    });
+    return {
+      ok: false,
+      error:
+        normalized === "FIRESTORE_TRANSACTION_FAILED"
+          ? "FIRESTORE_TRANSACTION_FAILED"
+          : normalized,
+      code:
+        normalized === "FIRESTORE_TRANSACTION_FAILED"
+          ? "FIRESTORE_TRANSACTION_FAILED"
+          : normalized,
+    };
   }
 }
 
@@ -376,20 +1173,126 @@ export async function getAlternativeAvailableItems(
       if (relevance < ALT_RELEVANCE_MIN) continue;
 
       const bookings = await getBookingsForItem(userId, doc.id, name);
-      const av = computeAvailabilityFromBookings(bookings);
+      const av = computeUserFacingAvailability(bookings, doc.id);
       if (!av.isAvailable) continue;
 
-      scored.push({ id: doc.id, name, relevance });
+      scored.push(
+        normalizeCatalogItem({
+          id: doc.id,
+          name,
+          relevance,
+        })
+      );
     }
 
     scored.sort((a, b) => b.relevance - a.relevance);
-    return scored.slice(0, cap).map(({ id, name, relevance }) => ({
-      id,
-      name,
-      relevance,
-    }));
+    return scored.slice(0, cap).map((row) =>
+      normalizeCatalogItem(/** @type {Record<string, unknown>} */ (row))
+    );
   } catch (e) {
     console.error("[inventoryService] getAlternativeAvailableItems:", e);
     return [];
+  }
+}
+
+/**
+ * Mark an item unavailable once a booking is approved.
+ * Safe to call repeatedly (idempotent), and safe when booking/item is missing.
+ * @param {{
+ *   db: import("firebase-admin/firestore").Firestore,
+ *   userId: string,
+ *   bookingId: string,
+ *   itemId: string,
+ * }} p
+ * @returns {Promise<void>}
+ */
+export async function markItemUnavailableOnApproval({
+  db: dbClient,
+  userId,
+  bookingId,
+  itemId,
+}) {
+  try {
+    if (!userId || !bookingId || !itemId) {
+      console.warn("⚠️ Missing params for availability update", {
+        userId,
+        bookingId,
+        itemId,
+      });
+      return;
+    }
+
+    if (!dbClient || typeof dbClient.runTransaction !== "function") {
+      console.warn("⚠️ Missing db client for availability update");
+      return;
+    }
+
+    const bookingRef = dbClient
+      .collection("businesses")
+      .doc(userId)
+      .collection("bookings")
+      .doc(bookingId);
+
+    const itemRef = dbClient
+      .collection("businesses")
+      .doc(userId)
+      .collection("items")
+      .doc(itemId);
+
+    await dbClient.runTransaction(async (tx) => {
+      const bookingSnap = await tx.get(bookingRef);
+
+      if (!bookingSnap.exists) {
+        console.warn("⚠️ Booking not found:", bookingId);
+        return;
+      }
+
+      const bookingData = bookingSnap.data() || {};
+
+      if (bookingData.status !== "approved") {
+        console.log("ℹ️ Booking not approved — skipping availability update", {
+          bookingId,
+          status: bookingData.status,
+        });
+        return;
+      }
+
+      if (bookingData.itemId !== itemId) {
+        console.warn("⚠️ Booking-item mismatch — skipping", {
+          bookingId,
+          itemId,
+          bookingItemId: bookingData.itemId,
+        });
+        return;
+      }
+
+      const itemSnap = await tx.get(itemRef);
+
+      if (!itemSnap.exists) {
+        console.warn("⚠️ Item not found:", itemId);
+        return;
+      }
+
+      const itemData = itemSnap.data() || {};
+
+      if (itemData.availability === false) {
+        console.log("ℹ️ Item already unavailable — skipping", {
+          itemId,
+        });
+        return;
+      }
+
+      tx.update(itemRef, {
+        availability: false,
+        updatedAt: new Date(),
+      });
+
+      console.log("🔒 Item marked unavailable after approval:", {
+        itemId,
+        bookingId,
+      });
+    });
+  } catch (err) {
+    console.error("❌ Failed to update availability:", err?.message || err);
   }
 }

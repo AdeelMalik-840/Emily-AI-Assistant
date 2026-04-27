@@ -150,6 +150,33 @@ function buildTextPayload(toField, recipientType, body) {
 
 /**
  * @param {string} toField
+ * @param {string} body
+ * @param {Array<{ id: string, title: string }>} buttons
+ */
+function buildInteractiveButtonPayload(toField, body, buttons) {
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: toField,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: String(body).trim() },
+      action: {
+        buttons: buttons.slice(0, 3).map((button) => ({
+          type: "reply",
+          reply: {
+            id: String(button.id ?? "").trim(),
+            title: String(button.title ?? "").trim().slice(0, 20),
+          },
+        })),
+      },
+    },
+  };
+}
+
+/**
+ * @param {string} toField
  * @param {"individual"|"group"} recipientType
  * @param {string} link
  */
@@ -204,6 +231,54 @@ async function postWhatsAppMessagesResult(phoneNumberId, token, payload) {
 }
 
 /**
+ * WhatsApp Cloud API — interactive reply buttons.
+ *
+ * @param {string} to - E.164 digits for individual recipient
+ * @param {string} body
+ * @param {Array<{ id: string, title: string }>} buttons
+ * @param {{ phoneNumberId?: string, accessToken?: string } | null} [credentials]
+ * @returns {Promise<{ ok: boolean }>}
+ */
+export async function sendWhatsAppInteractiveButtons(
+  to,
+  body,
+  buttons,
+  credentials = null
+) {
+  const resolved = resolveWhatsAppCredentials(credentials);
+  if (!resolved) {
+    console.error(
+      "[whatsappCloud] Missing phoneNumberId/accessToken — cannot send interactive buttons"
+    );
+    return { ok: false };
+  }
+
+  const safeBody = String(body ?? "").trim();
+  const safeButtons = Array.isArray(buttons)
+    ? buttons.filter((button) => {
+        const id = String(button?.id ?? "").trim();
+        const title = String(button?.title ?? "").trim();
+        return id && title;
+      })
+    : [];
+  if (!safeBody || safeButtons.length === 0) {
+    console.warn("[whatsappCloud] Empty interactive button payload");
+    return { ok: false };
+  }
+
+  const { token, phoneNumberId } = resolved;
+  const { toField } = resolveWhatsAppToField(to, "individual");
+  if (!toField) {
+    console.error("[whatsappCloud] Invalid interactive recipient:", to);
+    return { ok: false };
+  }
+
+  const payload = buildInteractiveButtonPayload(toField, safeBody, safeButtons);
+  const result = await postWhatsAppMessagesResult(phoneNumberId, token, payload);
+  return { ok: Boolean(result.ok) };
+}
+
+/**
  * WhatsApp Cloud API — outbound text messages (Graph API).
  * Group send failure → optional DM to `fallbackDmTo` + optional short notice back to group.
  *
@@ -221,6 +296,10 @@ async function postWhatsAppMessagesResult(phoneNumberId, token, payload) {
 export async function sendWhatsAppMessage(to, text, credentials = null, opts = {}) {
   let groupSendFailed = false;
   try {
+    const enforceSingleMessage = (value) =>
+      String(value ?? "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
     const resolved = resolveWhatsAppCredentials(credentials);
     console.log(
       "[whatsappCloud] Using per-user token:",
@@ -239,7 +318,7 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
     }
 
     const { token, phoneNumberId } = resolved;
-    const reply = String(text ?? "").trim();
+    const reply = enforceSingleMessage(text);
     if (!reply) {
       console.warn("[whatsappCloud] Empty text body, skipping send");
       return { ok: false, groupSendFailed: false };

@@ -1,6 +1,5 @@
 import "dotenv/config";
 import { createHash } from "node:crypto";
-import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -23,6 +22,10 @@ import { scheduleBufferedWhatsAppInbound } from "./services/whatsappInboundBuffe
 import { webhookPayloadIndicatesGroupMessage } from "./services/whatsappGroupInboundGate.js";
 import { sendWhatsAppMessage } from "./services/whatsappCloud.js";
 import {
+  handleBookingApproval,
+  parseApprovalButtonId,
+} from "./services/bookingApprovalService.js";
+import {
   normalizeKnowledgePayload,
   saveStructuredKnowledge,
   getBusinessProfile,
@@ -32,6 +35,8 @@ import { defaultMessageChannel } from "./services/messageFeedback.js";
 import { parseAndValidateManualWhatsAppPhone } from "./lib/validateManualWhatsAppPhone.js";
 import { getWhatsAppEnv, validateWhatsAppEnv } from "./utils/env.js";
 import { metaCloudFromIsGroupThread } from "./utils/waMetaThreadMarkers.js";
+
+console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 
 /** Debug only: verbose group logs, optional forced reply, bypasses group gate in buffer — keep off in production. */
 function isWhatsAppGroupDebugEnabled() {
@@ -63,6 +68,36 @@ console.log("[server] WhatsApp env:", {
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "..", "public")));
+
+/**
+ * Clears Playwright DOM extraction dedupe + WhatsApp inbound debounce (same process as listener).
+ * Requires `CLEAR_EXTRACTION_STATE_SECRET` in env and header `x-clear-secret: <same>`.
+ */
+app.post("/internal/clear-extraction-state", async (req, res) => {
+  const secret = String(process.env.CLEAR_EXTRACTION_STATE_SECRET ?? "").trim();
+  if (!secret) {
+    return res.status(503).json({
+      ok: false,
+      error:
+        "Set CLEAR_EXTRACTION_STATE_SECRET in .env to enable this endpoint",
+    });
+  }
+  const provided = String(req.headers["x-clear-secret"] ?? "").trim();
+  if (provided !== secret) {
+    return res.status(403).json({ ok: false, error: "invalid x-clear-secret" });
+  }
+  try {
+    const mod = await import("./services/playwrightListener/listener.js");
+    if (typeof mod.clearPlaywrightExtractedMessageState === "function") {
+      mod.clearPlaywrightExtractedMessageState();
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ ok: false, error: String(e?.message ?? e ?? "unknown") });
+  }
+});
 
 async function getUidFromBearer(req) {
   const raw = req.headers.authorization;
@@ -180,12 +215,27 @@ app.post("/webhook", async (req, res) => {
       (isGroup ? message.author : message.from) ?? ""
     ).trim();
 
+    const interactiveButtonId = String(
+      message.interactive?.button_reply?.id ?? ""
+    ).trim();
+    const parsedApprovalButton = parseApprovalButtonId(interactiveButtonId);
+    if (interactiveButtonId) {
+      console.log("[owner_button_reply_received]", {
+        buttonIdPreview: interactiveButtonId.slice(0, 80),
+        hasParsedAction: Boolean(parsedApprovalButton),
+      });
+      if (parsedApprovalButton) {
+        console.log("[owner_button_action_parsed]", parsedApprovalButton);
+      }
+    }
+
     const inboundText = String(
       message.text?.body ??
         message.button?.text ??
         message.interactive?.button_reply?.title ??
         ""
     ).trim();
+    const inboundMessageId = String(message.id ?? "").trim();
 
     console.log("WHATSAPP INCOMING:", {
       from: message.from,
@@ -436,14 +486,25 @@ app.post("/webhook", async (req, res) => {
       ? groupIdRaw || fromRaw
       : participantDigits || senderWaId;
 
+    const groupParticipantScope = isGroupMessage
+      ? String(participantDigits || senderWaId || "").trim()
+      : "";
     const conversationCustomerNumber = isGroupMessage
       ? `grp${createHash("sha256")
-          .update(groupIdRaw || fromRaw, "utf8")
+          .update(`${groupIdRaw || fromRaw}::${groupParticipantScope}`, "utf8")
           .digest("hex")
           .slice(0, 24)}`
       : participantDigits;
 
     const sessionKey = `${ownerUserId}::${conversationCustomerNumber}`;
+    if (isGroupMessage) {
+      console.log("🧠 Session isolation:", {
+        chatId: String(groupIdRaw || fromRaw).slice(0, 64),
+        senderId: String(groupParticipantScope).slice(0, 32),
+        sessionKey,
+        isGroupChat: true,
+      });
+    }
 
     console.log(
       "[webhook] inbound routing:",
@@ -462,6 +523,19 @@ app.post("/webhook", async (req, res) => {
         0
       )
     );
+
+    if (parsedApprovalButton) {
+      console.log("🛠 Owner approval button command detected:", parsedApprovalButton);
+      await handleBookingApproval({
+        db,
+        userId: ownerUserId,
+        bookingId: parsedApprovalButton.bookingId,
+        action: parsedApprovalButton.action,
+        senderPhone: conversationCustomerNumber,
+        sendCredentials,
+      });
+      return res.sendStatus(200);
+    }
 
     if (whatsappGroupDebug && isGroupMessage) {
       try {
@@ -504,6 +578,8 @@ app.post("/webhook", async (req, res) => {
       whatsappReplyTo,
       whatsappRecipientType,
       conversationCustomerNumber,
+      messageId: inboundMessageId,
+      messageTimestamp: message.timestamp ?? null,
       ...(participantPhoneForDm
         ? { participantPhoneForDm: participantPhoneForDm }
         : {}),
@@ -810,52 +886,24 @@ app.post("/api/connection-intents", async (req, res) => {
  * 🚀 SERVER START
  * ================================
  */
-const START_PORT = Number(process.env.PORT) || 3000;
-const MAX_PORT_ATTEMPTS = 25;
+const PORT = 3000;
 
-const httpServer = http.createServer(app);
-
-function listenWithPortFallback(port, attemptsLeft) {
-  if (attemptsLeft <= 0) {
-    console.error("[server] No free port found");
-    process.exit(1);
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  if (isWhatsAppGroupDebugEnabled()) {
+    console.warn(
+      "[server] WHATSAPP_GROUP_DEBUG is enabled — group inbound gate is bypassed (AI can reply to every group line). For production set WHATSAPP_GROUP_DEBUG=false or unset."
+    );
   }
-
-  function onError(err) {
-    if (err.code === "EADDRINUSE") {
-      console.warn(`[server] Port ${port} busy → trying ${port + 1}`);
-      httpServer.removeListener("error", onError);
-      httpServer.close(() => {
-        listenWithPortFallback(port + 1, attemptsLeft - 1);
-      });
-    } else {
-      console.error("[server] error:", err);
-      process.exit(1);
-    }
+  const gateOff =
+    process.env.WHATSAPP_GROUP_GATE_DISABLED === "1" ||
+    /^true$/i.test(String(process.env.WHATSAPP_GROUP_GATE_DISABLED ?? ""));
+  if (gateOff) {
+    console.warn(
+      "[server] WHATSAPP_GROUP_GATE_DISABLED is enabled — keyword gate off for group messages; use only for debugging."
+    );
   }
-
-  httpServer.once("error", onError);
-
-  httpServer.listen(port, () => {
-    httpServer.removeListener("error", onError);
-    console.log(`Server running on http://localhost:${port}`);
-    if (isWhatsAppGroupDebugEnabled()) {
-      console.warn(
-        "[server] WHATSAPP_GROUP_DEBUG is enabled — group inbound gate is bypassed (AI can reply to every group line). For production set WHATSAPP_GROUP_DEBUG=false or unset."
-      );
-    }
-    const gateOff =
-      process.env.WHATSAPP_GROUP_GATE_DISABLED === "1" ||
-      /^true$/i.test(String(process.env.WHATSAPP_GROUP_GATE_DISABLED ?? ""));
-    if (gateOff) {
-      console.warn(
-        "[server] WHATSAPP_GROUP_GATE_DISABLED is enabled — keyword gate off for group messages; use only for debugging."
-      );
-    }
-  });
-}
-
-listenWithPortFallback(START_PORT, MAX_PORT_ATTEMPTS);
+});
 
 if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true") {
   void import("./services/playwrightListener/index.js").then((mod) => {

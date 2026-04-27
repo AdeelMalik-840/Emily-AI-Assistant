@@ -25,6 +25,9 @@ const MATCH_THRESHOLD = 70;
 function defaultState() {
   return {
     lastIntent: null,
+    /** @type {{ id?: string, name?: string, displayLabel?: string } | null} */
+    lastItem: null,
+    hasBookingIntent: false,
     lastItemMentioned: null,
     lastServiceMentioned: null,
     location: null,
@@ -282,20 +285,14 @@ export function matchedItemMatchesRow(matchedItem, vo) {
 }
 
 /**
- * Per-item pricing from `businessProfile.items[].pricing` when catalog match hits that row.
- * @param {Record<string, unknown> | null | undefined} rawBusinessProfile
- * @param {{ name?: string, color?: string, displayLabel?: string } | null | undefined} matchedItem
+ * Per-item pricing from catalog rows when catalog match hits that row.
+ * @param {{ items?: unknown[], matchedItem?: { name?: string, color?: string, displayLabel?: string } | null | undefined }} opts
  */
-export function buildMatchedItemPricingHint(rawBusinessProfile, matchedItem) {
-  if (!matchedItem || !rawBusinessProfile || typeof rawBusinessProfile !== "object") {
+export function buildMatchedItemPricingHint({ items = [], matchedItem }) {
+  if (!matchedItem) {
     return "";
   }
-  const itemRows =
-    Array.isArray(rawBusinessProfile.items) && rawBusinessProfile.items.length > 0
-      ? rawBusinessProfile.items
-      : Array.isArray(rawBusinessProfile.vehicles)
-        ? rawBusinessProfile.vehicles
-        : [];
+  const itemRows = Array.isArray(items) ? items : [];
   for (const it of itemRows) {
     if (!it || typeof it !== "object" || Array.isArray(it)) continue;
     const vo = /** @type {Record<string, unknown>} */ (it);
@@ -309,11 +306,10 @@ export function buildMatchedItemPricingHint(rawBusinessProfile, matchedItem) {
 
 /**
  * Item-level pricing overrides global profile pricing for the active catalog match.
- * @param {Record<string, unknown> | null | undefined} rawBusinessProfile
- * @param {{ name?: string, color?: string } | null | undefined} matchedItem
+ * @param {{ rawBusinessProfile?: Record<string, unknown> | null | undefined, items?: unknown[], matchedItem?: { name?: string, color?: string } | null | undefined }} opts
  */
-export function resolvePricingHint(rawBusinessProfile, matchedItem) {
-  const itemHint = buildMatchedItemPricingHint(rawBusinessProfile, matchedItem);
+export function resolvePricingHint({ rawBusinessProfile, items = [], matchedItem }) {
+  const itemHint = buildMatchedItemPricingHint({ items, matchedItem });
   if (itemHint && String(itemHint).trim() !== "") return itemHint.trim();
   return buildGlobalPricingHint(rawBusinessProfile);
 }
@@ -352,20 +348,14 @@ export function detectShowImagesRequest(message) {
 
 /**
  * Image URLs from the catalog row that matches `matchedItem` (same as pricing hint).
- * @param {Record<string, unknown> | null | undefined} rawBusinessProfile
- * @param {{ name?: string, color?: string } | null | undefined} matchedItem
+ * @param {{ items?: unknown[], matchedItem?: { name?: string, color?: string } | null | undefined }} opts
  * @returns {string[]}
  */
-export function collectCatalogItemImageUrls(rawBusinessProfile, matchedItem) {
-  if (!matchedItem || !rawBusinessProfile || typeof rawBusinessProfile !== "object") {
+export function collectCatalogItemImageUrls({ items = [], matchedItem }) {
+  if (!matchedItem) {
     return [];
   }
-  const itemRows =
-    Array.isArray(rawBusinessProfile.items) && rawBusinessProfile.items.length > 0
-      ? rawBusinessProfile.items
-      : Array.isArray(rawBusinessProfile.vehicles)
-        ? rawBusinessProfile.vehicles
-        : [];
+  const itemRows = Array.isArray(items) ? items : [];
   /**
    * Strict row match first (name + color), then safe fallback by name-only when color
    * is missing from matched context. This avoids false "no image" on follow-up turns.
@@ -529,11 +519,10 @@ function scoreMatch(userMsg, candidate) {
 }
 
 /**
- * @param {string} message
- * @param {Record<string, unknown> | null | undefined} rawBusinessProfile
+ * @param {{ message: string, items?: unknown[], services?: unknown[] }} opts
  */
-export function matchCatalogAgainstMessage(message, rawBusinessProfile) {
-  if (!message || !rawBusinessProfile || typeof rawBusinessProfile !== "object") {
+export function matchCatalogAgainstMessage({ message, items = [], services = [] }) {
+  if (!message) {
     return {
       matchedItem: null,
       matchedService: null,
@@ -542,15 +531,8 @@ export function matchCatalogAgainstMessage(message, rawBusinessProfile) {
     };
   }
 
-  const services = Array.isArray(rawBusinessProfile.services)
-    ? rawBusinessProfile.services
-    : [];
-  const itemRows =
-    Array.isArray(rawBusinessProfile.items) && rawBusinessProfile.items.length > 0
-      ? rawBusinessProfile.items
-      : Array.isArray(rawBusinessProfile.vehicles)
-        ? rawBusinessProfile.vehicles
-        : [];
+  const svcRows = Array.isArray(services) ? services : [];
+  const itemRows = Array.isArray(items) ? items : [];
 
   let bestItem = null;
   let bestItemScore = 0;
@@ -574,7 +556,7 @@ export function matchCatalogAgainstMessage(message, rawBusinessProfile) {
 
   let bestSvc = null;
   let bestSvcScore = 0;
-  for (const s of services) {
+  for (const s of svcRows) {
     const str = serviceEntryToPlainString(s);
     if (!str) continue;
     const sc = scoreMatch(message, str);
@@ -755,6 +737,7 @@ export function intentForContextLayer(emilyIntent) {
  *   sessionKey: string,
  *   message: string,
  *   rawBusinessProfile: Record<string, unknown> | null | undefined,
+ *   catalogItems?: unknown[],
  *   entityMeta: { name: string, type?: string } | null,
  *   itemContext: { name?: string } | null,
  * }} opts
@@ -763,12 +746,22 @@ export function applyEmilyTurn({
   sessionKey,
   message,
   rawBusinessProfile,
+  catalogItems = [],
   entityMeta,
   itemContext,
 }) {
   const state = getEmilySessionState(sessionKey);
   const emilyIntent = classifyEmilyIntent(message);
-  const match = matchCatalogAgainstMessage(message, rawBusinessProfile);
+  const match = matchCatalogAgainstMessage({
+    message,
+    items: catalogItems,
+    services:
+      rawBusinessProfile && typeof rawBusinessProfile === "object"
+        ? Array.isArray(rawBusinessProfile.services)
+          ? rawBusinessProfile.services
+          : []
+        : [],
+  });
   const supplemental = inferSupplementalEntities(message, state, match);
 
   let resolvedDurationPreference = supplemental.durationPreference ?? null;
@@ -783,7 +776,11 @@ export function applyEmilyTurn({
   }
 
   const hasCatalogMatch = Boolean(match.matchedItem || match.matchedService);
-  const pricingHint = resolvePricingHint(rawBusinessProfile, match.matchedItem);
+  const pricingHint = resolvePricingHint({
+    rawBusinessProfile,
+    items: catalogItems,
+    matchedItem: match.matchedItem,
+  });
 
   const fromCatalogOrInventory =
     match.matchedItem?.displayLabel ??

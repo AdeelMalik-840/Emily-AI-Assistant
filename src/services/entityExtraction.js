@@ -101,6 +101,22 @@ const WEAK_EDGE = new Set(
     "bas",
     "yar",
     "dost",
+    // Roman Urdu pronouns / spellings (not catalog tokens)
+    "mujy",
+    "muje",
+    "mjhe",
+    "mje",
+    // Roman Urdu "for" / purpose — often glued to entity in short messages
+    "lye",
+    "liye",
+    "lie",
+    "keliye",
+    // Roman Urdu "want" — often captured as tail of entity span
+    "chahye",
+    "chahiye",
+    "chaiye",
+    "chaahiye",
+    "chaahie",
   ].map((w) => w.toLowerCase())
 );
 

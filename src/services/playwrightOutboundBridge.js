@@ -495,7 +495,11 @@ export async function sendPlaywrightGroupText(text, opts = {}) {
     return false;
   }
 
-  const body = String(text ?? "").trim();
+  const enforceSingleMessage = (value) =>
+    String(value ?? "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  const body = enforceSingleMessage(text);
   if (!body) {
     console.log("📤 Send result:", false);
     return false;

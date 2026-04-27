@@ -15,13 +15,23 @@ export function detectBookingEvent(message) {
   const raw = String(message ?? "");
   const lower = raw.toLowerCase().trim();
 
+  const romanUrduWant =
+    /\b(chahiye|chahye|chaiye|chaahiye|chaahie|chaahye)\b/i.test(lower);
+  /** "12 din k liye" / "3 din keliye" — rental duration + purpose (Roman Urdu). */
+  const romanUrduDurationFor =
+    /\d+\s*(?:din|deen|dino|day|days)\s+k\s*(?:lye|liye|lie|keliye|k\s*lye)\b/i.test(
+      lower.replace(/\s+/g, " ")
+    );
+
   const bookingIntent =
     /\b(book|booking|bookings|reserve|reservation|reservations|rent|rental|rentals|appointment|appointments|schedule|scheduled|slot)\b/.test(
       lower
     ) ||
     /book\s+kar|reserve\s+kar|rent\s+kar|kiraye|kara?ye|slot\s+mil/i.test(
       lower
-    );
+    ) ||
+    romanUrduWant ||
+    romanUrduDurationFor;
 
   const orderIntent =
     /\b(order|orders|purchase|purchases|cart|checkout|buy|buying)\b/.test(

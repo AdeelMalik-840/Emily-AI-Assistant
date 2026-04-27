@@ -16,11 +16,15 @@ import {
   executeWhatsAppAiPipeline,
   scheduleBufferedWhatsAppInbound,
 } from "../whatsappInboundBuffer.js";
+import { normalizeInboundMessage } from "../inboundNormalizer.js";
 
 /** Set PLAYWRIGHT_DISABLE_PIPELINE_FORWARD=true to no-op inbound forwarding (debug only; disables AI pipeline). */
 const PIPELINE_FORWARD_DISABLED = /^true$/i.test(
   String(process.env.PLAYWRIGHT_DISABLE_PIPELINE_FORWARD ?? "")
 );
+const WHATSAPP_MODE = String(process.env.WHATSAPP_MODE ?? "hybrid")
+  .trim()
+  .toLowerCase();
 
 function resolveOwnerUid() {
   return String(
@@ -39,6 +43,22 @@ function sessionKeyForGroup(ownerUserId, groupName) {
   return `${ownerUserId}::playwright-${slug}`;
 }
 
+function normalizeSenderId(id) {
+  return String(id ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/^\++/, "+")
+    .toLowerCase()
+    .slice(0, 128);
+}
+
+function groupParticipantScope(senderId) {
+  return createHash("sha256")
+    .update(normalizeSenderId(senderId) || "unknown-sender", "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
 /**
  * Build schedule payload; returns null if forwarding cannot run.
  * @param {{
@@ -52,6 +72,10 @@ function sessionKeyForGroup(ownerUserId, groupName) {
  *   recentMessages?: string[],
  *   contextMessages?: string[],
  *   playwrightChatKey?: string,
+ *   participantPhoneForDm?: string,
+ *   messageSender?: string,
+ *   userPhone?: string,
+ *   conversationCustomerNumber?: string,
  * }} adapted
  * @returns {Promise<object | null>}
  */
@@ -94,20 +118,40 @@ async function buildPlaywrightSchedulePayload(adapted) {
     return null;
   }
 
-  const messageId = String(adapted?.messageId ?? "").trim();
-  if (!messageId) {
-    console.log("⛔ Missing messageId in bridge — skipping");
-    return null;
-  }
-
   const senderName = String(adapted?.sender ?? adapted?.senderName ?? "user").trim() || "user";
+  const uniqueSenderIdRaw =
+    adapted?.participantPhoneForDm ||
+    adapted?.messageSender ||
+    adapted?.userPhone ||
+    adapted?.conversationCustomerNumber ||
+    adapted?.playwrightChatKey ||
+    "";
+  const anonBase = normalizeSenderId(adapted?.senderName || adapted?.sender || "unknown");
+  const anonId = createHash("sha256")
+    .update(`${anonBase}::${groupName}`, "utf8")
+    .digest("hex")
+    .slice(0, 6);
+  const uniqueSenderId =
+    normalizeSenderId(uniqueSenderIdRaw) ||
+    `anon::${anonBase}::${anonId}`;
+  const senderScope = groupParticipantScope(uniqueSenderId);
   const playwrightChatKey =
     String(adapted?.playwrightChatKey ?? "").trim() ||
     normalizeTitle(groupName);
 
-  const sessionKey =
+  const groupSessionKey =
     String(process.env.PLAYWRIGHT_SESSION_KEY ?? "").trim() ||
     sessionKeyForGroup(ownerUserId, groupName);
+  const sessionKey = `${groupSessionKey}::${senderScope}`;
+  const normalizedInbound = normalizeInboundMessage({
+    source: "playwright",
+    message: String(adapted?.text ?? "").trim(),
+    messageId: adapted?.messageId,
+    userId: ownerUserId,
+    sessionKey,
+    chatId: String(adapted?.playwrightChatKey ?? "").trim() || groupName,
+    timestamp: adapted?.timestamp,
+  });
 
   const recentForClassifier = Array.isArray(adapted?.recentMessages)
     ? adapted.recentMessages
@@ -122,14 +166,23 @@ async function buildPlaywrightSchedulePayload(adapted) {
   const { resetTopicContext, inboundEntity, inboundIntent } =
     applyPlaywrightClassifierToSession(classifierSessionKey, classified);
 
-  const conversationCustomerNumber = `group::${groupName}`;
+  const conversationCustomerNumber = `grp${createHash("sha256")
+    .update(`${groupName}::${senderScope}`, "utf8")
+    .digest("hex")
+    .slice(0, 24)}`;
   const line = `[${senderName}] ${adapted.text}`.trim();
+  console.log("🧠 Session isolation:", {
+    chatId: groupName,
+    senderScope,
+    isGroupChat: true,
+  });
   return {
     payload: {
       db,
       ownerUserId,
       userPhone: "unknown",
       participantName: senderName,
+      senderScope,
       sessionKey,
       sendCredentials: {
         accessToken: sendCredentials?.accessToken ?? "",
@@ -146,8 +199,8 @@ async function buildPlaywrightSchedulePayload(adapted) {
       groupName,
       trackingKey: sessionKey,
       chatName: groupName,
-      messageId,
-      messageTimestamp: adapted?.timestamp ?? null,
+      messageId: normalizedInbound.messageId,
+      messageTimestamp: normalizedInbound.timestamp,
       messageSender: "user",
       inboundIntent,
       inboundEntity,
@@ -178,6 +231,12 @@ async function buildPlaywrightSchedulePayload(adapted) {
  * }} adapted
  */
 export async function forwardPlaywrightGroupToPipeline(adapted) {
+  if (WHATSAPP_MODE === "cloud") {
+    console.log(
+      "[Playwright] forward skipped (WHATSAPP_MODE=cloud) — Cloud API is source of truth"
+    );
+    return false;
+  }
   const built = await buildPlaywrightSchedulePayload(adapted);
   if (!built) {
     return false;
@@ -196,6 +255,8 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
         ownerUserId: built.payload.ownerUserId,
         userPhone: built.payload.userPhone,
         participantPhoneForDm: undefined,
+        participantName: built.payload.participantName,
+        senderScope: built.payload.senderScope,
         sessionKey: built.payload.sessionKey,
         combinedMessage: built.line,
         structuredSnapshot: "",
