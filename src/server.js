@@ -25,6 +25,7 @@ import {
   handleBookingApproval,
   parseApprovalButtonId,
 } from "./services/bookingApprovalService.js";
+import { handleWhatsAppNotificationStatuses } from "./services/bookingNotificationState.js";
 import {
   normalizeKnowledgePayload,
   saveStructuredKnowledge,
@@ -177,9 +178,30 @@ app.post("/webhook", async (req, res) => {
     const phoneNumberId = value?.metadata?.phone_number_id
       ? String(value.metadata.phone_number_id).trim()
       : "";
+    const waEnv = getWhatsAppEnv();
 
     if (statuses != null) {
       console.log("📦 Status update:", statuses);
+      if (Array.isArray(statuses) && statuses.length > 0) {
+        let statusOwnerUserId = phoneNumberId
+          ? await findOwnerUidByPhoneNumberId(db, phoneNumberId)
+          : null;
+        if (
+          !statusOwnerUserId &&
+          phoneNumberId &&
+          waEnv.phoneNumberId === phoneNumberId &&
+          process.env.LEGACY_BUSINESS_FIREBASE_UID
+        ) {
+          statusOwnerUserId = String(process.env.LEGACY_BUSINESS_FIREBASE_UID).trim();
+        }
+        if (statusOwnerUserId) {
+          await handleWhatsAppNotificationStatuses({
+            db,
+            userId: statusOwnerUserId,
+            statuses,
+          });
+        }
+      }
     }
 
     if (!message) {
@@ -219,13 +241,27 @@ app.post("/webhook", async (req, res) => {
       message.interactive?.button_reply?.id ?? ""
     ).trim();
     const parsedApprovalButton = parseApprovalButtonId(interactiveButtonId);
-    if (interactiveButtonId) {
+    if (message.type === "interactive" && !interactiveButtonId) {
+      console.warn("[owner_button_reply_received]", {
+        parsed: false,
+        reason: "INTERACTIVE_WITHOUT_BUTTON_REPLY_ID",
+        interactiveType: message.interactive?.type ?? null,
+        hasButtonReply: Boolean(message.interactive?.button_reply),
+        hasListReply: Boolean(message.interactive?.list_reply),
+      });
+    } else if (interactiveButtonId) {
       console.log("[owner_button_reply_received]", {
         buttonIdPreview: interactiveButtonId.slice(0, 80),
         hasParsedAction: Boolean(parsedApprovalButton),
       });
       if (parsedApprovalButton) {
         console.log("[owner_button_action_parsed]", parsedApprovalButton);
+      } else {
+        console.warn("[owner_button_action_parsed]", {
+          parsed: false,
+          reason: "UNRECOGNIZED_BUTTON_ID",
+          buttonIdPreview: interactiveButtonId.slice(0, 80),
+        });
       }
     }
 
@@ -267,11 +303,9 @@ app.post("/webhook", async (req, res) => {
       )
     );
 
-    const waEnv = getWhatsAppEnv();
-
     console.log("📱 phone_number_id:", phoneNumberId || "(none)");
 
-    if (!inboundText) {
+    if (!inboundText && !parsedApprovalButton) {
       console.log("⚠️ Missing inbound text; skipping AI", {
         isGroupMessage,
         whatsappGroupDebug,

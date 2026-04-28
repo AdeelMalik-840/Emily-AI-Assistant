@@ -1590,7 +1590,7 @@ function trimSeenMapIfNeeded(seenMessages) {
  * (layout, focus rings, previews). Collapse **consecutive** rows with the same sender + normalized text here so
  * tail dedupe and logs are not flooded — fix at extraction source, not downstream.
  * @param {{ text: string; sender: string }[]} arr
- * @returns {{ text: string; sender: string }[]}
+ * @returns {Array<Record<string, unknown> & { text: string; sender: string }>}
  */
 function dedupeConsecutiveMirrorRows(arr) {
   const out = [];
@@ -1604,7 +1604,7 @@ function dedupeConsecutiveMirrorRows(arr) {
     if (out.length > 0 && key === prevKey) {
       continue;
     }
-    out.push({ text: t, sender: m.sender });
+    out.push({ ...m, text: t, sender: m.sender });
     prevKey = key;
   }
   return out;
@@ -1648,7 +1648,7 @@ async function extractIncomingMessages(page, opts = {}) {
   });
   await wait(1500);
 
-  /** @type {{ text: string; sender: string }[]} */
+  /** @type {Array<Record<string, unknown> & { text: string; sender: string }>} */
   let rawList = [];
   try {
     rawList = await page.$$eval(
@@ -1684,10 +1684,36 @@ async function extractIncomingMessages(page, opts = {}) {
               const isOutgoing = n.classList.contains("message-out");
               return isOutgoing ? "me" : "user";
             }
+            function participantMeta(n) {
+              const copyable = n.querySelector("div.copyable-text");
+              const plain = copyable?.getAttribute("data-pre-plain-text") || "";
+              const match = plain.match(/^\[([^\]]+)\]\s*([^:]+):\s*/);
+              const displayName = match ? match[2].trim() : "";
+              const haystack = `${displayName} ${plain} ${n.innerText || ""}`;
+              const phoneMatch = haystack.match(
+                /(?:\+?\d[\d\s().-]{8,}\d|0\d[\d\s().-]{8,}\d)/
+              );
+              const phone = phoneMatch
+                ? phoneMatch[0].replace(/[^\d+]/g, "").replace(/^\++/, "+")
+                : "";
+              return {
+                displayName,
+                participantPhone: phone,
+                prePlainText: plain,
+              };
+            }
 
             const text = getMessageText(node);
             if (!text) return null;
-            return { text, sender: getSender(node) };
+            const meta = participantMeta(node);
+            return {
+              text,
+              sender: getSender(node),
+              participantName: meta.displayName,
+              participantPhone: meta.participantPhone,
+              prePlainText: meta.prePlainText,
+              sourceMessageIndex: nodes.indexOf(node),
+            };
           })
           .filter(Boolean)
     );
@@ -1776,12 +1802,40 @@ async function extractIncomingMessages(page, opts = {}) {
 
   for (const m of newMessages) {
     console.log("[Playwright] ✅ New message:", m.text, `(${m.sender})`);
+    if (m.sender === "user" && (m.participantName || m.participantPhone)) {
+      console.log("[playwright_message_sender_metadata_extracted]", {
+        groupName,
+        participantName: m.participantName || null,
+        hasParticipantPhone: Boolean(m.participantPhone),
+        sourceMessageIndex:
+          m.sourceMessageIndex != null && Number.isFinite(Number(m.sourceMessageIndex))
+            ? Number(m.sourceMessageIndex)
+            : null,
+      });
+    } else if (m.sender === "user") {
+      console.warn("[playwright_message_sender_metadata_missing]", {
+        groupName,
+        textPreview: String(m.text ?? "").slice(0, 80),
+      });
+    }
   }
 
   return newMessages.map((m) => ({
     text: m.text,
     raw: m.text,
     sender: m.sender,
+    participantName:
+      m.participantName != null && String(m.participantName).trim() !== ""
+        ? String(m.participantName).trim()
+        : null,
+    participantPhone:
+      m.participantPhone != null && String(m.participantPhone).trim() !== ""
+        ? String(m.participantPhone).trim()
+        : null,
+    sourceMessageIndex:
+      m.sourceMessageIndex != null && Number.isFinite(Number(m.sourceMessageIndex))
+        ? Number(m.sourceMessageIndex)
+        : null,
     groupName,
   }));
 }
@@ -2795,12 +2849,20 @@ async function runListenerBody() {
                 messageId,
                 text: msg.text,
                 sender: msg.sender,
+                senderName: msg.participantName || msg.sender,
+                participantPhoneForDm: msg.participantPhone || undefined,
                 timestamp: msg.timestamp,
                 groupName: String(
                   globalThis.__currentOpenChatTitle ?? activeChat ?? ""
                 ).trim(),
                 playwrightWebTitleIdentity: true,
                 playwrightChatKey: chatKey,
+                sourceRowKey: String(msg.__rowKey ?? "").trim(),
+                sourceMessageIndex:
+                  msg.sourceMessageIndex != null &&
+                  Number.isFinite(Number(msg.sourceMessageIndex))
+                    ? Number(msg.sourceMessageIndex)
+                    : msg.__position,
               });
               if (forwarded) {
                 globalThis.__playwrightChatLastProcessedAt =

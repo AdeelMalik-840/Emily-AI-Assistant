@@ -72,6 +72,8 @@ function groupParticipantScope(senderId) {
  *   recentMessages?: string[],
  *   contextMessages?: string[],
  *   playwrightChatKey?: string,
+ *   sourceRowKey?: string,
+ *   sourceMessageIndex?: number,
  *   participantPhoneForDm?: string,
  *   messageSender?: string,
  *   userPhone?: string,
@@ -118,7 +120,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
     return null;
   }
 
-  const senderName = String(adapted?.sender ?? adapted?.senderName ?? "user").trim() || "user";
+  const senderName = String(adapted?.senderName ?? adapted?.sender ?? "user").trim() || "user";
   const uniqueSenderIdRaw =
     adapted?.participantPhoneForDm ||
     adapted?.messageSender ||
@@ -183,6 +185,9 @@ async function buildPlaywrightSchedulePayload(adapted) {
       userPhone: "unknown",
       participantName: senderName,
       senderScope,
+      ...(adapted?.participantPhoneForDm
+        ? { participantPhoneForDm: String(adapted.participantPhoneForDm).trim() }
+        : {}),
       sessionKey,
       sendCredentials: {
         accessToken: sendCredentials?.accessToken ?? "",
@@ -206,6 +211,15 @@ async function buildPlaywrightSchedulePayload(adapted) {
       inboundEntity,
       resetTopicContext,
       playwrightChatKey,
+      sourceRowKey:
+        adapted?.sourceRowKey != null && String(adapted.sourceRowKey).trim() !== ""
+          ? String(adapted.sourceRowKey).trim()
+          : null,
+      sourceMessageIndex:
+        adapted?.sourceMessageIndex != null &&
+        Number.isFinite(Number(adapted.sourceMessageIndex))
+          ? Number(adapted.sourceMessageIndex)
+          : null,
     },
     line,
     groupName,
@@ -228,6 +242,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
  *   recentMessages?: string[],
  *   contextMessages?: string[],
  *   playwrightChatKey?: string,
+ *   sourceRowKey?: string,
  * }} adapted
  */
 export async function forwardPlaywrightGroupToPipeline(adapted) {
@@ -254,7 +269,7 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
         db: built.payload.db,
         ownerUserId: built.payload.ownerUserId,
         userPhone: built.payload.userPhone,
-        participantPhoneForDm: undefined,
+        participantPhoneForDm: built.payload.participantPhoneForDm,
         participantName: built.payload.participantName,
         senderScope: built.payload.senderScope,
         sessionKey: built.payload.sessionKey,
@@ -280,6 +295,8 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
         inboundEntity: built.payload.inboundEntity,
         resetTopicContext: built.payload.resetTopicContext,
         playwrightChatKey: built.payload.playwrightChatKey,
+        sourceRowKey: built.payload.sourceRowKey,
+        sourceMessageIndex: built.payload.sourceMessageIndex,
       });
       console.log("[Playwright] Fallback executeWhatsAppAiPipeline completed");
       return true;

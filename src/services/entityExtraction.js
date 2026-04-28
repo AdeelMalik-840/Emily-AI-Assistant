@@ -3,7 +3,7 @@
  */
 
 /** Minimum confidence (0–1) to accept an entity downstream. */
-export const ENTITY_CONFIDENCE_MIN = 0.5;
+export const ENTITY_CONFIDENCE_MIN = 0.81;
 
 /** Stricter minimum when the phrase contains generic tokens (item, product, etc.). */
 export const ENTITY_CONFIDENCE_MIN_GENERIC = 0.82;
@@ -60,9 +60,13 @@ const CATEGORY_NAME_TOKENS = new Set(
 const CONF = {
   QUOTED: 0.96,
   PATTERN: 0.88,
+  STRONG_MENTION: 0.91,
   TAIL: 0.82,
   FALLBACK: 0.52,
 };
+
+const GENERIC_FOLLOWUP_ONLY =
+  /^(?:kis|konsa|kaunsa|which|what|kitna|kitni|kitne|mileage|condition|color|colour|model|rent|price|rate|charges?)(?:\s+(?:color|colour|model|rent|price|rate|mileage|condition|mai|mein|main|me|hai|hain|kya|kyaa|ka|ki|ke|kaunsa|konsa|kitna|kitni|kitne))*\??$/i;
 
 /** Filler / discourse tokens — stripped from edges of a candidate; never the sole entity. */
 const WEAK_EDGE = new Set(
@@ -433,6 +437,14 @@ export function extractEntity(message) {
     return { name: null, confidence: 0, entityType: "item" };
   }
 
+  const normalizedRaw = raw
+    .replace(/[^\p{L}\p{N}\s?]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (GENERIC_FOLLOWUP_ONLY.test(normalizedRaw)) {
+    return { name: null, confidence: 0, entityType: "item" };
+  }
+
   let text = raw.replace(
     /\d+\s*(?:din|deen|dino|day|days|dinos?)\b/gi,
     " "
@@ -463,6 +475,21 @@ export function extractEntity(message) {
     }
   }
 
+  const strongMentions = [
+    /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3}?)\s+(?:ka|ki|ke)\s+(?:kya\s+scene|scene|details?|detail|info|rate|price|rent|model|color|colour|mileage|condition)\b/i,
+    /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3})\s+(?:available|avail|milega|milegi|hai|hain)\??\s*$/i,
+  ];
+
+  for (const p of strongMentions) {
+    const m = text.match(p);
+    if (m) {
+      const name = trimEntityName(m[1]);
+      if (name && !isStopPhrase(name)) {
+        return finalizeEntityResult(entityOutcome(name, CONF.STRONG_MENTION), raw);
+      }
+    }
+  }
+
   const tail = text.match(
     /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3})\s+(?:chahiye|chahti|chahte|hain|hai|milega|milegi|mile\s+ga|mil\s+jye|mil\s+jaye|mill\s+jaye|milta|milti|dedo|de\s+do|lagao|lagwa|book|order)\b/i
   );
@@ -483,7 +510,7 @@ export function extractEntity(message) {
     (t) => !STOP_WORDS.has(t) && t.length > 1 && !/^\d+$/.test(t)
   );
 
-  if (meaningful.length >= 1 && meaningful.length <= 8) {
+  if (meaningful.length >= 2 && meaningful.length <= 8) {
     const chunk = [];
     for (let i = 0; i < meaningful.length && chunk.length < 3; i += 1) {
       chunk.push(meaningful[i]);

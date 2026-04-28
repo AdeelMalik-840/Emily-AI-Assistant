@@ -33,6 +33,12 @@ import { setMessageState } from "./messageState.js";
 import { randomUUID } from "node:crypto";
 import { logBookingEvent } from "../utils/bookingLogger.js";
 import { normalizeInboundMessage } from "./inboundNormalizer.js";
+import {
+  markBookingNotificationFailed,
+  markBookingNotificationProviderAccepted,
+  markBookingNotificationQueued,
+  markBookingNotificationSending,
+} from "./bookingNotificationState.js";
 
 /** Pauses Playwright chat loop during group text + image outbound (see listener `runChatLoop`). */
 globalThis.__OUTBOUND_BUSY__ = false;
@@ -179,6 +185,10 @@ async function markBookingNotificationSent(db, userId, bookingId) {
   }
 }
 
+async function markBookingNotificationQueuedForBooking(db, userId, bookingId) {
+  await markBookingNotificationQueued(db, userId, bookingId);
+}
+
 /**
  * Non-blocking business notification for new booking requests (idempotent by booking id).
  * @param {{
@@ -241,6 +251,12 @@ async function triggerBusinessBookingNotification({
       status: "fail",
       data: { sent: false, reason: "OWNER_PHONE_MISSING", bookingId },
     });
+    await markBookingNotificationFailed({
+      db,
+      userId,
+      bookingId,
+      notificationError: "OWNER_PHONE_MISSING",
+    });
     return;
   }
 
@@ -255,6 +271,16 @@ async function triggerBusinessBookingNotification({
     });
     return;
   }
+  await markBookingNotificationSending(db, userId, bookingId);
+  logBookingEvent({
+    traceId: tid,
+    step: "notification_trigger",
+    status: "success",
+    data: {
+      notificationAttempted: true,
+      bookingId,
+    },
+  });
 
   const itemName =
     booking?.itemName != null && String(booking.itemName).trim() !== ""
@@ -282,6 +308,7 @@ REJECT ${bookingId}
   let sendSucceeded = false;
   /** @type {string | null} */
   let sendFailureDetail = null;
+  let providerMessageId = "";
   try {
     const buttonResult = await sendWhatsAppInteractiveButtons(
       ownerPhone,
@@ -294,6 +321,7 @@ REJECT ${bookingId}
     );
     if (buttonResult?.ok === true) {
       sendSucceeded = true;
+      providerMessageId = String(buttonResult?.providerMessageId ?? "").trim();
       console.log("[owner_approval_buttons_sent]", {
         bookingId,
         ownerPhoneLast4: ownerPhone.replace(/\D/g, "").slice(-4) || null,
@@ -309,6 +337,7 @@ REJECT ${bookingId}
       );
       if (result === true || result?.ok === true || result?.success === true) {
         sendSucceeded = true;
+        providerMessageId = String(result?.providerMessageId ?? "").trim();
       } else if (result === undefined) {
         console.warn(
           "⚠️ sendWhatsAppMessage returned undefined — assuming success (compat mode)"
@@ -342,10 +371,22 @@ REJECT ${bookingId}
           : {}),
       },
     });
+    await markBookingNotificationFailed({
+      db,
+      userId,
+      bookingId,
+      notificationError: sendFailureDetail || "WHATSAPP_API_FAILED",
+    });
     return;
   }
 
   await markBookingNotificationSent(db, userId, bookingId);
+  await markBookingNotificationProviderAccepted({
+    db,
+    userId,
+    bookingId,
+    providerMessageId,
+  });
 
   console.log("📤 Booking notification sent:", {
     bookingId,
@@ -355,7 +396,12 @@ REJECT ${bookingId}
     traceId: tid,
     step: "notification_result",
     status: "success",
-    data: { sent: true, reason: "DELIVERED", bookingId },
+    data: {
+      sent: false,
+      providerAccepted: true,
+      reason: "SENT_TO_PROVIDER",
+      bookingId,
+    },
   });
 }
 
@@ -459,6 +505,7 @@ function hashCombinedInbound(combinedMessage, sessionKey) {
  *   whatsappRecipientType?: "individual"|"group",
  *   conversationCustomerNumber?: string,
  *   participantPhoneForDm?: string,
+ *   sourceMessageIndex?: number,
  *   messageId?: string | number,
  *   messageTimestamp?: string | number | null,
  *   messageSender?: string,
@@ -610,6 +657,8 @@ export async function executeWhatsAppAiPipeline(p) {
     inboundEntity: inboundEntityRaw = null,
     resetTopicContext: resetTopicContextRaw = false,
     playwrightChatKey: playwrightChatKeyRaw = null,
+    sourceRowKey: sourceRowKeyRaw = null,
+    sourceMessageIndex: sourceMessageIndexRaw = null,
   } = p;
 
   const playwrightWebInbound = Boolean(playwrightWebInboundRaw);
@@ -965,6 +1014,14 @@ export async function executeWhatsAppAiPipeline(p) {
       senderScopeRaw != null && String(senderScopeRaw).trim() !== ""
         ? String(senderScopeRaw).trim()
         : null,
+    sourceRowKey:
+      sourceRowKeyRaw != null && String(sourceRowKeyRaw).trim() !== ""
+        ? String(sourceRowKeyRaw).trim()
+        : null,
+    sourceMessageIndex:
+      sourceMessageIndexRaw != null && Number.isFinite(Number(sourceMessageIndexRaw))
+        ? Number(sourceMessageIndexRaw)
+        : null,
   });
   logLatency("processMessage", processStartedAt, {
     sendVia,
@@ -990,11 +1047,16 @@ export async function executeWhatsAppAiPipeline(p) {
     step: "notification_trigger",
     status: "success",
     data: {
-      notificationAttempted: Boolean(messageMeta?.bookingCreated),
+      notificationAttempted: false,
       bookingId: bookingIdMeta || null,
     },
   });
   if (messageMeta?.bookingCreated && bookingIdMeta) {
+    await markBookingNotificationQueuedForBooking(
+      db,
+      ownerUserId,
+      bookingIdMeta
+    );
     console.log("📦 BookingCreated detected", messageMeta.bookingCreated);
     void triggerBusinessBookingNotification({
       traceId,
@@ -1005,6 +1067,12 @@ export async function executeWhatsAppAiPipeline(p) {
       sendCredentials,
     }).catch((err) => {
       console.warn("⚠️ Booking notification failed:", err?.message || err);
+      void markBookingNotificationFailed({
+        db,
+        userId: ownerUserId,
+        bookingId: bookingIdMeta,
+        notificationError: err?.message || String(err),
+      });
       logBookingEvent({
         traceId,
         step: "notification_result",
@@ -1764,6 +1832,8 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     inboundEntity: inboundEntityPayload = null,
     resetTopicContext: resetTopicContextPayload = false,
     playwrightChatKey: playwrightChatKeyPayload = null,
+    sourceRowKey: sourceRowKeyPayload = null,
+    sourceMessageIndex: sourceMessageIndexPayload = null,
   } = payload;
 
   const sessionKeyResolved =
@@ -1909,6 +1979,21 @@ export function scheduleBufferedWhatsAppInbound(payload) {
         : entry.context?.playwrightChatKey != null &&
             String(entry.context.playwrightChatKey).trim() !== ""
           ? String(entry.context.playwrightChatKey).trim()
+          : null,
+    sourceRowKey:
+      sourceRowKeyPayload != null && String(sourceRowKeyPayload).trim() !== ""
+        ? String(sourceRowKeyPayload).trim()
+        : entry.context?.sourceRowKey != null &&
+            String(entry.context.sourceRowKey).trim() !== ""
+          ? String(entry.context.sourceRowKey).trim()
+          : null,
+    sourceMessageIndex:
+      sourceMessageIndexPayload != null &&
+      Number.isFinite(Number(sourceMessageIndexPayload))
+        ? Number(sourceMessageIndexPayload)
+        : entry.context?.sourceMessageIndex != null &&
+            Number.isFinite(Number(entry.context.sourceMessageIndex))
+          ? Number(entry.context.sourceMessageIndex)
           : null,
   };
 

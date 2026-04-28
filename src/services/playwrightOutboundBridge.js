@@ -240,7 +240,7 @@ const normalize = (s) =>
  * @param {string} chatTitle
  * @returns {Promise<boolean>}
  */
-async function refocusChatRowForTitle(page, chatTitle) {
+export async function refocusChatRowForTitle(page, chatTitle) {
   const name = String(chatTitle ?? "").trim();
   if (!name) return false;
   try {
@@ -430,6 +430,10 @@ export function clearPlaywrightOutboundPage() {
   outboundPage = null;
 }
 
+export function getPlaywrightOutboundPage() {
+  return outboundPage;
+}
+
 /**
  * @param {import("playwright").Page} page
  * @param {string} body
@@ -477,6 +481,30 @@ async function sendTextViaComposeBoxes(page, body) {
     console.warn("[playwrightOutbound] compose box not found");
   }
   return result;
+}
+
+export async function sendPlaywrightActiveChatText(text) {
+  const page = outboundPage;
+  if (!page || (typeof page.isClosed === "function" && page.isClosed())) {
+    console.warn("[playwrightOutbound] no active page");
+    return false;
+  }
+  const body = String(text ?? "").replace(/\n{3,}/g, "\n\n").trim();
+  if (!body) return false;
+  globalThis.__UI_SEND_LOCK = true;
+  try {
+    globalThis.__OUTBOUND_BUSY__ = true;
+    const activeTitle = await ensureChatView(page);
+    globalThis.__lockedChatTitle = activeTitle;
+    return await sendTextViaComposeBoxes(page, body);
+  } catch (e) {
+    console.error("[playwrightOutbound] active chat send error:", e?.message || e);
+    return false;
+  } finally {
+    globalThis.__UI_SEND_LOCK = false;
+    globalThis.__OUTBOUND_BUSY__ = false;
+    globalThis.__lockedChatTitle = null;
+  }
 }
 
 /**

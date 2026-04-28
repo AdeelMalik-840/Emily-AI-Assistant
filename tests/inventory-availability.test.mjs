@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { computeUserFacingAvailability } from "../src/services/inventoryService.js";
+import {
+  computeUserFacingAvailability,
+  isBlockingBookingStatus,
+} from "../src/services/inventoryService.js";
 
 const itemId = "item-1";
 
@@ -42,6 +45,35 @@ test("no-date availability ignores non-blocking booking statuses", () => {
   assert.deepEqual(out.blockingStatusesSeen, []);
 });
 
+test("booking status policy blocks everything except explicit non-blocking statuses", () => {
+  for (const status of ["pending_approval", "approved", "confirmed", null]) {
+    assert.equal(isBlockingBookingStatus(status), true);
+  }
+  for (const status of ["pending", "hold", "reserved"]) {
+    assert.equal(isBlockingBookingStatus(status), true);
+  }
+  for (const status of ["cancelled", "completed", "rejected"]) {
+    assert.equal(isBlockingBookingStatus(status), false);
+  }
+});
+
+test("no-date availability blocks unknown active booking statuses", () => {
+  const bookings = [
+    booking("pending"),
+    booking("hold"),
+    booking("reserved"),
+  ];
+  const out = computeUserFacingAvailability(bookings, itemId);
+  assert.equal(out.isAvailable, false);
+  assert.deepEqual(out.blockingStatusesSeen, ["pending", "hold", "reserved"]);
+});
+
+test("no-date availability blocks missing booking status", () => {
+  const out = computeUserFacingAvailability([booking(null)], itemId);
+  assert.equal(out.isAvailable, false);
+  assert.deepEqual(out.blockingStatusesSeen, ["(missing)"]);
+});
+
 test("valid date availability still blocks overlapping bookings", () => {
   const out = computeUserFacingAvailability([booking("pending_approval")], itemId, {
     requestedStart: "2026-05-03",
@@ -58,4 +90,13 @@ test("valid date availability allows non-overlapping bookings", () => {
   });
   assert.equal(out.isAvailable, true);
   assert.deepEqual(out.blockingStatusesSeen, []);
+});
+
+test("valid date availability blocks overlapping unknown statuses", () => {
+  const out = computeUserFacingAvailability([booking("hold")], itemId, {
+    requestedStart: "2026-05-03",
+    requestedEnd: "2026-05-06",
+  });
+  assert.equal(out.isAvailable, false);
+  assert.deepEqual(out.blockingStatusesSeen, ["hold"]);
 });

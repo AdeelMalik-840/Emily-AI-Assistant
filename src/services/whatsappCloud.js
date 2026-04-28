@@ -230,6 +230,18 @@ async function postWhatsAppMessagesResult(phoneNumberId, token, payload) {
   return { ok: true, status: res.status, data: body };
 }
 
+function extractProviderMessageId(data) {
+  const body =
+    data && typeof data === "object" && !Array.isArray(data) ? data : {};
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const first = messages[0];
+  const id =
+    first && typeof first === "object" && first.id != null
+      ? String(first.id).trim()
+      : "";
+  return id || null;
+}
+
 /**
  * WhatsApp Cloud API — interactive reply buttons.
  *
@@ -275,7 +287,10 @@ export async function sendWhatsAppInteractiveButtons(
 
   const payload = buildInteractiveButtonPayload(toField, safeBody, safeButtons);
   const result = await postWhatsAppMessagesResult(phoneNumberId, token, payload);
-  return { ok: Boolean(result.ok) };
+  return {
+    ok: Boolean(result.ok),
+    providerMessageId: result.ok ? extractProviderMessageId(result.data) : null,
+  };
 }
 
 /**
@@ -349,7 +364,11 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
         recipientType,
         String(toField).slice(0, 48)
       );
-      return { ok: true, groupSendFailed: false };
+      return {
+        ok: true,
+        groupSendFailed: false,
+        providerMessageId: extractProviderMessageId(result.data),
+      };
     }
 
     if (recipientType !== "group") {
@@ -367,7 +386,7 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       console.error(
         "[whatsappCloud] group send failed and no fallbackDmTo — cannot DM user"
       );
-      return { ok: false, groupSendFailed: true };
+      return { ok: false, groupSendFailed: true, providerMessageId: null };
     }
 
     const dmPayload = buildTextPayload(fallbackDigits, "individual", reply);
@@ -410,7 +429,11 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       }
     }
 
-    return { ok: dmResult.ok, groupSendFailed: true };
+    return {
+      ok: dmResult.ok,
+      groupSendFailed: true,
+      providerMessageId: dmResult.ok ? extractProviderMessageId(dmResult.data) : null,
+    };
   } catch (err) {
     console.error(
       "[whatsappCloud] Send error (non-fatal, server continues):",

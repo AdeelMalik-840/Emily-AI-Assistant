@@ -1,4 +1,7 @@
-import { generateReply } from "./openai.js";
+import {
+  classifyConversationIntentWithLLM,
+  generateReply,
+} from "./openai.js";
 import { buildContextData } from "./contextHelpers.js";
 import {
   getBusinessKnowledge,
@@ -52,6 +55,7 @@ import {
 import { extractRecentAssistantTextsFromPromptBlock } from "./conversationStore.js";
 import { normalizeEmilyResponse } from "./normalizeEmilyResponse.js";
 import {
+  assistantReplySimilarity,
   dedupeAgainstPriorAssistantReplies,
   polishWhatsAppBusinessTone,
 } from "./whatsappReplyTone.js";
@@ -73,9 +77,390 @@ import {
 import { planGroupHybridDelivery } from "./replyRouting.js";
 import { randomUUID } from "node:crypto";
 import { logBookingEvent } from "../utils/bookingLogger.js";
+import db from "../config/firebase.js";
+import {
+  buildDeliveryDetailReply,
+  buildBookingDetailsClarificationReply,
+  findApprovedBookingForDm,
+  findApprovedBookingForGroupDetails,
+  parseDeliveryDetails,
+} from "./bookingDmFlow.js";
+import {
+  decideConversationRoute,
+  applyIntentPriority,
+  isConversationAiRoute,
+  isInformationalRoute,
+} from "./conversationRouter.js";
+import {
+  applyToneGuard,
+  composeInformationalAnswer,
+} from "./answerComposer.js";
+import {
+  applyResponseStrategy,
+  decideResponseStrategy,
+} from "./responseStrategy.js";
+import { buildBookingWaitingEngagement } from "./customerApprovalContinuation.js";
 
 function bookingOwnerApprovalFirstEnabled() {
   return /^true$/i.test(String(process.env.BOOKING_OWNER_APPROVAL_FIRST ?? "").trim());
+}
+
+const ACTIVE_BOOKING_MEMORY_STATUSES = new Set([
+  "pending_approval",
+  "approved",
+  "confirmed",
+  "owner_approved_waiting_customer_details",
+]);
+const BOOKING_STATE_EXPIRY_MS = 60 * 60 * 1000;
+const BOOKING_DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
+
+function pendingEngagementStateIsActive(memory) {
+  return Boolean(
+    memory?.bookingState &&
+      String(memory.bookingState.approvalStage ?? "").trim() ===
+        "pending_owner_approval" &&
+      memory?.pendingEngagementState &&
+      typeof memory.pendingEngagementState === "object" &&
+      String(memory.pendingEngagementState.expectedReplyType ?? "").trim() ===
+        "qualifier"
+  );
+}
+
+function normalizeQualifierAnswer({ rawAnswer, qualifierKey, allowedValues }) {
+  const answer = String(rawAnswer ?? "").trim();
+  const normalized = answer.toLowerCase().replace(/\s+/g, " ");
+  const allowed = new Set(Array.isArray(allowedValues) ? allowedValues : []);
+  if (qualifierKey !== "usage_area") return null;
+  const outside =
+    /\b(outside|outstation|highway|intercity|inter-city|bahar|baahir|bahr)\b/i.test(
+      normalized
+    ) || /\bcity\s*(?:se\s*)?bahar\b/i.test(normalized);
+  const inside =
+    /\b(inside|within|local|local use|andar|shehar|shahar)\b/i.test(normalized) ||
+    /\bcity\s*(?:ke|kay|k)?\s*andar\b/i.test(normalized);
+  if (outside && allowed.has("outside_city")) return "outside_city";
+  if (inside && allowed.has("inside_city")) return "inside_city";
+  return null;
+}
+
+export function buildPendingQualifierState({
+  bookingId,
+  qualifierKey = "usage_area",
+  allowedValues = ["inside_city", "outside_city"],
+  rawAnswer = null,
+} = {}) {
+  return {
+    bookingId: String(bookingId ?? "").trim() || null,
+    expectedReplyType: "qualifier",
+    qualifierKey,
+    allowedValues,
+    rawAnswer,
+  };
+}
+
+export async function maybeHandlePendingEngagementQualifier({
+  db: dbInstance = db,
+  userId,
+  message,
+  memory,
+  routingCtx,
+  applyOutbound = applyHybridOutboundResult,
+  knowledgeMeta = messageMetaForKnowledge(true),
+} = {}) {
+  if (!pendingEngagementStateIsActive(memory)) return null;
+  const pending = memory.pendingEngagementState;
+  const bookingId =
+    String(pending.bookingId ?? "").trim() ||
+    String(memory.bookingState?.bookingId ?? "").trim();
+  const qualifierKey = String(pending.qualifierKey ?? "").trim();
+  const allowedValues = Array.isArray(pending.allowedValues)
+    ? pending.allowedValues.map((value) => String(value).trim()).filter(Boolean)
+    : [];
+  const matchedValue = normalizeQualifierAnswer({
+    rawAnswer: message,
+    qualifierKey,
+    allowedValues,
+  });
+  if (!matchedValue || !bookingId) return null;
+
+  const nextPendingState = buildPendingQualifierState({
+    bookingId,
+    qualifierKey,
+    allowedValues,
+    rawAnswer: String(message ?? "").trim(),
+  });
+  memory.pendingEngagementState = {
+    ...nextPendingState,
+    answeredAt: new Date().toISOString(),
+  };
+  memory.qualifiers = {
+    ...(memory.qualifiers && typeof memory.qualifiers === "object"
+      ? memory.qualifiers
+      : {}),
+    [qualifierKey]: matchedValue,
+  };
+  if (memory.bookingState && typeof memory.bookingState === "object") {
+    memory.bookingState.qualifiers = {
+      ...(memory.bookingState.qualifiers &&
+      typeof memory.bookingState.qualifiers === "object"
+        ? memory.bookingState.qualifiers
+        : {}),
+      [qualifierKey]: matchedValue,
+    };
+    memory.bookingState.updatedAt = new Date().toISOString();
+  }
+
+  await dbInstance
+    .collection("businesses")
+    .doc(String(userId))
+    .collection("bookings")
+    .doc(bookingId)
+    .update({
+      pendingEngagementState: {
+        ...nextPendingState,
+        matchedValue,
+      },
+      qualifiers: {
+        [qualifierKey]: matchedValue,
+      },
+      [qualifierKey]: matchedValue,
+      updatedAt: new Date(),
+    });
+  console.log("[pending_engagement_qualifier_stored]", {
+    bookingId,
+    qualifierKey,
+    matchedValue,
+  });
+
+  return applyOutbound(
+    {
+      reply: "Noted 👍",
+      text: "Noted 👍",
+      type: "AI_MESSAGE",
+      meta: {
+        pendingEngagementHandled: true,
+        bookingId,
+        qualifierKey,
+        qualifierValue: matchedValue,
+      },
+      messageMeta: knowledgeMeta,
+    },
+    routingCtx
+  );
+}
+
+function normalizedBookingStateStatus(bookingState) {
+  const status = String(bookingState?.status ?? "").trim().toLowerCase();
+  const approvalStage = String(bookingState?.approvalStage ?? "").trim().toLowerCase();
+  return approvalStage === "owner_approved_waiting_customer_details"
+    ? approvalStage
+    : status;
+}
+
+function bookingStateIsActive(bookingState) {
+  return ACTIVE_BOOKING_MEMORY_STATUSES.has(normalizedBookingStateStatus(bookingState));
+}
+
+function bookingStateAgeMs(bookingState, now = Date.now()) {
+  const ms = Date.parse(String(bookingState?.updatedAt ?? ""));
+  return Number.isFinite(ms) ? now - ms : 0;
+}
+
+function bookingStateIsExpired(bookingState, now = Date.now()) {
+  return bookingStateAgeMs(bookingState, now) > BOOKING_STATE_EXPIRY_MS;
+}
+
+function pruneExpiredBookingStates(memory, now = Date.now()) {
+  if (!memory || typeof memory !== "object") return;
+  if (memory.bookingState && bookingStateIsExpired(memory.bookingState, now)) {
+    console.log("[booking_state_expired]", {
+      bookingId: memory.bookingState.bookingId ?? null,
+      itemId: memory.bookingState.itemId ?? null,
+      status: memory.bookingState.status ?? null,
+    });
+    delete memory.bookingState;
+    delete memory.bookingCreated;
+  }
+  const byItem =
+    memory.bookingStatesByItemId &&
+    typeof memory.bookingStatesByItemId === "object" &&
+    !Array.isArray(memory.bookingStatesByItemId)
+      ? memory.bookingStatesByItemId
+      : null;
+  if (!byItem) return;
+  for (const [itemId, state] of Object.entries(byItem)) {
+    if (bookingStateIsExpired(state, now)) {
+      console.log("[booking_state_expired]", {
+        bookingId: state?.bookingId ?? null,
+        itemId,
+        status: state?.status ?? null,
+      });
+      delete byItem[itemId];
+    }
+  }
+}
+
+export function setStructuredBookingState(memory, booking) {
+  if (!memory || typeof memory !== "object") return null;
+  const bookingId = String(booking?.bookingId ?? booking?.id ?? "").trim();
+  const itemId = normalizeId(booking?.itemId);
+  pruneExpiredBookingStates(memory);
+  const status = String(booking?.status ?? "pending_approval").trim() || "pending_approval";
+  const approvalStage = String(booking?.approvalStage ?? "").trim();
+  const durationNumber = Number(booking?.durationDays);
+  const scopedSessionKey = String(booking?.sessionKey ?? "").trim();
+  const channel = String(booking?.channel ?? "").trim().toLowerCase();
+  const bookingState = {
+    bookingId: bookingId || null,
+    itemId: itemId || null,
+    status,
+    approvalStage: approvalStage || null,
+    durationDays: Number.isFinite(durationNumber)
+      ? Math.max(1, Math.floor(durationNumber))
+      : null,
+    sessionKey: scopedSessionKey || null,
+    channel: channel || null,
+    updatedAt: new Date().toISOString(),
+  };
+  memory.bookingState = bookingState;
+  if (itemId) {
+    const previous =
+      memory.bookingStatesByItemId &&
+      typeof memory.bookingStatesByItemId === "object" &&
+      !Array.isArray(memory.bookingStatesByItemId)
+        ? memory.bookingStatesByItemId
+        : {};
+    memory.bookingStatesByItemId = {
+      ...previous,
+      [itemId]: bookingState,
+    };
+  }
+  delete memory.bookingCreated;
+  console.log("[booking_state_set]", {
+    bookingId: bookingState.bookingId,
+    itemId: bookingState.itemId,
+    status: bookingState.status,
+    approvalStage: bookingState.approvalStage,
+    durationDays: bookingState.durationDays,
+    sessionKey: bookingState.sessionKey,
+    channel: bookingState.channel,
+  });
+  return bookingState;
+}
+
+export function clearStructuredBookingState(memory, reason = "UNKNOWN") {
+  if (!memory || typeof memory !== "object") return false;
+  const hadState = memory.bookingState != null || memory.bookingCreated != null;
+  if (!hadState) return false;
+  const previous =
+    memory.bookingState && typeof memory.bookingState === "object"
+      ? {
+          bookingId: memory.bookingState.bookingId ?? null,
+          itemId: memory.bookingState.itemId ?? null,
+          status: memory.bookingState.status ?? null,
+          approvalStage: memory.bookingState.approvalStage ?? null,
+        }
+      : null;
+  delete memory.bookingState;
+  delete memory.bookingCreated;
+  console.log("[booking_state_cleared]", {
+    reason,
+    previous,
+  });
+  return true;
+}
+
+export function isDuplicateActiveBookingState(memory, candidate = {}) {
+  pruneExpiredBookingStates(memory);
+  const candidateItemId = normalizeId(candidate.itemId);
+  const byItem =
+    memory?.bookingStatesByItemId &&
+    typeof memory.bookingStatesByItemId === "object" &&
+    !Array.isArray(memory.bookingStatesByItemId)
+      ? memory.bookingStatesByItemId
+      : {};
+  const state =
+    candidateItemId && byItem[candidateItemId] && typeof byItem[candidateItemId] === "object"
+      ? byItem[candidateItemId]
+      : memory?.bookingState && typeof memory.bookingState === "object"
+        ? memory.bookingState
+        : null;
+  const candidateDuration = Number(candidate.durationDays);
+  const stateDuration = Number(state?.durationDays);
+  const active = bookingStateIsActive(state);
+  const sameItem = Boolean(candidateItemId) && candidateItemId === normalizeId(state?.itemId);
+  const sameDuration =
+    Number.isFinite(candidateDuration) &&
+    Number.isFinite(stateDuration) &&
+    Math.max(1, Math.floor(candidateDuration)) === Math.max(1, Math.floor(stateDuration));
+  const candidateSessionKey = String(candidate.sessionKey ?? "").trim();
+  const stateSessionKey = String(state?.sessionKey ?? "").trim();
+  const sameSession =
+    !candidateSessionKey || !stateSessionKey || candidateSessionKey === stateSessionKey;
+  const candidateChannel = String(candidate.channel ?? "").trim().toLowerCase();
+  const stateChannel = String(state?.channel ?? "").trim().toLowerCase();
+  const sameChannel = !candidateChannel || !stateChannel || candidateChannel === stateChannel;
+  const recent = bookingStateAgeMs(state) <= BOOKING_DUPLICATE_WINDOW_MS;
+  const duplicate = Boolean(
+    active && sameItem && sameDuration && sameSession && sameChannel && recent
+  );
+  console.log("[booking_duplicate_guard]", {
+    duplicate,
+    active,
+    candidateItemId: candidateItemId || null,
+    stateItemId: normalizeId(state?.itemId) || null,
+    candidateDuration: Number.isFinite(candidateDuration)
+      ? Math.max(1, Math.floor(candidateDuration))
+      : null,
+    stateDuration: Number.isFinite(stateDuration)
+      ? Math.max(1, Math.floor(stateDuration))
+      : null,
+    status: state?.status ?? null,
+    approvalStage: state?.approvalStage ?? null,
+    sameSession,
+    sameChannel,
+    recent,
+  });
+  return duplicate;
+}
+
+function directInformationalReply(message, item) {
+  const raw = String(message ?? "").toLowerCase();
+  const src = item && typeof item === "object" ? item : {};
+  const label =
+    buildDisplayLabel(src) || String(src.displayLabel ?? src.name ?? "").trim();
+  const color =
+    src.color ??
+    src.colour ??
+    src.attributes?.color ??
+    src.attributes?.colour ??
+    src.state?.color ??
+    src.state?.colour ??
+    null;
+  if (/\b(colou?r)\b/i.test(raw) && color != null && String(color).trim()) {
+    return label
+      ? `${label} ${String(color).trim()} color mein hai.`
+      : `${String(color).trim()} color mein hai.`;
+  }
+  const price =
+    src.price ??
+    src.pricePerDay ??
+    src.dailyRate ??
+    src.rent ??
+    src.rate ??
+    src.attributes?.price ??
+    src.attributes?.rate ??
+    null;
+  if (
+    /\b(price|rate|cost|charges?|rent|kitna|kitni|kitne)\b/i.test(raw) &&
+    price != null &&
+    String(price).trim()
+  ) {
+    return label
+      ? `${label} ka rate ${String(price).trim()} hai.`
+      : `Rate ${String(price).trim()} hai.`;
+  }
+  return "";
 }
 
 /** @param {boolean} hasUsefulBusinessData */
@@ -722,7 +1107,7 @@ function detectIntent(message) {
   const lower = raw.toLowerCase();
   if (isBrowseOptionsIntent(raw)) return "browse_options";
   if (/^\d+$/.test(raw)) return "duration";
-  if (/\b(rent|price|kitna)\b/i.test(lower)) return "pricing";
+  if (/\b(price|rate|cost|charges?|kitna|kitni|kitne)\b/i.test(lower)) return "pricing";
   if (/\b(available|hai\?)\b/i.test(lower)) return "availability";
   if (/\b(kon|which|items|options|products|services)\b/i.test(lower)) return "list";
   if (/\b(ilawa|other than)\b/i.test(lower)) return "exclude";
@@ -879,6 +1264,198 @@ function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
     }
   }
   return { found: false, itemId: null, itemLabel: null };
+}
+
+function latestMessageMentionsEntity(message, entityName) {
+  const msg = normalizeCatalogMatchText(message);
+  const entity = normalizeCatalogMatchText(entityName);
+  if (!msg || !entity) return false;
+  if (msg.includes(entity)) return true;
+  const msgTokens = new Set(tokenizeCatalogMatch(message));
+  return tokenizeCatalogMatch(entityName).some(
+    (token) => token.length >= 3 && msgTokens.has(token)
+  );
+}
+
+function isDetailFollowupWithoutExplicitEntity(message) {
+  const text = String(message ?? "").trim();
+  if (!text) return false;
+  const extracted = extractEntity(text);
+  const hasAcceptedEntity =
+    extracted.name != null &&
+    extracted.confidence > 0.8 &&
+    extracted.confidence >= getEntityConfidenceThreshold(extracted.name);
+  if (hasAcceptedEntity) return false;
+  return /\b(?:kis|konsa|kaunsa|which|what|kitna|kitni|kitne|color|colour|model|mileage|condition|halat|rent|rate|price|chali|chli|driven)\b/i.test(
+    text
+  );
+}
+
+function detailFieldForEntityGuard(message) {
+  const text = String(message ?? "").trim().toLowerCase();
+  if (!text) return null;
+  if (/\b(colou?r)\b/.test(text)) return "color";
+  if (/\b(model|variant|version)\b/.test(text)) return "model";
+  if (/\b(price|rate|cost|charges?|rent|kitna|kitni|kitne)\b/.test(text)) {
+    return "price";
+  }
+  if (/\b(mileage|miles|km|kilometer|kilometre|used|usage|chali|chli|driven)\b/.test(text)) {
+    return "mileage";
+  }
+  if (/\b(condition|halat)\b/.test(text)) return "condition";
+  if (/\b(transmission|automatic|manual)\b/.test(text)) return "transmission";
+  return null;
+}
+
+function shouldSkipEntityExtractionForDetailQuestion(message, catalogItems) {
+  const field = detailFieldForEntityGuard(message);
+  if (!field) return { skip: false, field: null };
+  const explicitCatalogItem = hasExplicitNewItemMention(
+    message,
+    Array.isArray(catalogItems) ? catalogItems : [],
+    null
+  );
+  return {
+    skip: !explicitCatalogItem.found,
+    field,
+  };
+}
+
+export function shouldBlockPinnedEntityForFollowup({
+  message,
+  pinnedEntityName,
+  currentItem,
+} = {}) {
+  const pinned = String(pinnedEntityName ?? "").trim();
+  if (!pinned) return false;
+  const currentLabel =
+    buildDisplayLabel(currentItem && typeof currentItem === "object" ? currentItem : {}) ||
+    String(currentItem?.name ?? currentItem?.displayLabel ?? "").trim();
+  if (!currentLabel) return false;
+  if (!isDetailFollowupWithoutExplicitEntity(message)) return false;
+  return !latestMessageMentionsEntity(message, pinned);
+}
+
+function normalizeAuthorityItem(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  const id = normalizeId(item.id ?? item.itemId);
+  const name = String(item.name ?? item.itemLabel ?? item.displayLabel ?? "").trim();
+  const displayLabel = buildDisplayLabel(item) || String(item.displayLabel ?? name).trim();
+  if (!id && !name && !displayLabel) return null;
+  return {
+    ...item,
+    ...(id ? { id, itemId: id } : {}),
+    name: name || displayLabel,
+    displayLabel: displayLabel || name,
+  };
+}
+
+function mergeComposerCatalogItem(item, catalogItems = []) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+  const itemId = normalizeId(item.itemId ?? item.id);
+  if (!itemId) return item;
+  const catalogItem = Array.isArray(catalogItems)
+    ? catalogItems.find(
+        (row) =>
+          row &&
+          typeof row === "object" &&
+          normalizeId(row.itemId ?? row.id) === itemId
+      )
+    : null;
+  if (!catalogItem) return item;
+  const attrs =
+    catalogItem.attributes && typeof catalogItem.attributes === "object"
+      ? { ...catalogItem.attributes }
+      : {};
+  if (item.attributes && typeof item.attributes === "object") {
+    Object.assign(attrs, item.attributes);
+  }
+  const pricing =
+    catalogItem.pricing && typeof catalogItem.pricing === "object"
+      ? { ...catalogItem.pricing }
+      : {};
+  if (item.pricing && typeof item.pricing === "object") {
+    Object.assign(pricing, item.pricing);
+  }
+  return {
+    ...catalogItem,
+    ...item,
+    id: itemId,
+    itemId,
+    color: item.color ?? item.colour ?? catalogItem.color ?? catalogItem.colour,
+    colour: item.colour ?? item.color ?? catalogItem.colour ?? catalogItem.color,
+    pricing: Object.keys(pricing).length ? pricing : item.pricing ?? catalogItem.pricing,
+    images: item.images ?? catalogItem.images,
+    imageUrls: item.imageUrls ?? catalogItem.imageUrls,
+    attributes: Object.keys(attrs).length ? attrs : item.attributes ?? catalogItem.attributes,
+    displayLabel:
+      item.displayLabel ?? catalogItem.displayLabel ?? catalogItem.name ?? item.name,
+  };
+}
+
+export function resolveAuthoritativeItemForTurn({
+  userText,
+  explicitResolvedItem,
+  turnLockedItem,
+  memoryItem,
+  isFollowup,
+  catalogItems = [],
+} = {}) {
+  const explicitItem = normalizeAuthorityItem(explicitResolvedItem);
+  const lockedItem = normalizeAuthorityItem(turnLockedItem);
+  const focusedMemoryItem = normalizeAuthorityItem(memoryItem);
+  const extracted = extractEntity(userText);
+  const hasExplicitEntity =
+    extracted.name != null &&
+    extracted.confidence > 0.8 &&
+    extracted.confidence >= getEntityConfidenceThreshold(extracted.name);
+  const explicitCatalogMention = hasExplicitNewItemMention(
+    userText,
+    Array.isArray(catalogItems) ? catalogItems : [],
+    normalizeId(lockedItem?.id ?? focusedMemoryItem?.id)
+  );
+  const explicitMention =
+    Boolean(explicitItem) &&
+    (hasExplicitEntity ||
+      explicitCatalogMention.found ||
+      latestMessageMentionsEntity(
+        userText,
+        explicitItem?.displayLabel ?? explicitItem?.name
+      ));
+
+  let selected = null;
+  let source = "none";
+  if (explicitMention && explicitItem) {
+    selected = explicitItem;
+    source = "explicit";
+    const previousId = normalizeId(lockedItem?.id ?? focusedMemoryItem?.id);
+    const newId = normalizeId(explicitItem.id ?? explicitItem.itemId);
+    if (previousId && newId && previousId !== newId) {
+      console.log("[item_authority_switch]", {
+        previousItemId: previousId,
+        newItemId: newId,
+        reason: "EXPLICIT_CURRENT_USER_ITEM",
+      });
+    }
+  } else if (lockedItem) {
+    selected = lockedItem;
+    source = "turn_lock";
+  } else if (isFollowup && focusedMemoryItem) {
+    selected = focusedMemoryItem;
+    source = "memory_followup";
+  }
+
+  console.log("[item_authority_decision]", {
+    source,
+    selectedItemId: normalizeId(selected?.id ?? selected?.itemId) || null,
+    selectedItemLabel: selected?.displayLabel ?? selected?.name ?? null,
+    hasExplicitEntity,
+    explicitMention,
+    isFollowup: Boolean(isFollowup),
+    hasTurnLock: Boolean(lockedItem),
+    hasMemoryItem: Boolean(focusedMemoryItem),
+  });
+  return selected;
 }
 
 /**
@@ -1523,6 +2100,8 @@ function matchedItemForReplyFromCatalogState({
  * @param {string | null} [opts.groupName] - optional WhatsApp group/chat label for booking metadata
  * @param {string | null} [opts.participantName] - visible group participant name when available
  * @param {string | null} [opts.senderScope] - hashed per-group participant scope when available
+ * @param {string | null} [opts.sourceRowKey] - Playwright DOM row key for the triggering inbound message
+ * @param {number | null} [opts.sourceMessageIndex] - Playwright DOM message index for the triggering inbound message
  * @param {string} [opts.traceId] - booking-flow trace id (from executeWhatsAppAiPipeline)
  */
 export async function processMessage({
@@ -1549,6 +2128,8 @@ export async function processMessage({
   groupName = null,
   participantName = null,
   senderScope = null,
+  sourceRowKey = null,
+  sourceMessageIndex = null,
 }) {
   const traceId =
     traceIdIn != null && String(traceIdIn).trim() !== ""
@@ -1623,6 +2204,21 @@ export async function processMessage({
   const dmTargetSource = dmTargetPhone ? "participantPhoneForDm" : "";
   const canDmCustomer = Boolean(dmTargetPhone);
   const ownerApprovalFirst = bookingOwnerApprovalFirstEnabled();
+  const bookingSourceMessageMetadata = {
+    sourceGroupName: String(groupName ?? "").trim() || null,
+    sourcePlaywrightChatKey: String(playwrightChatKey ?? "").trim() || null,
+    sourceMessageId: String(messageId ?? "").trim() || null,
+    sourceText: String(message ?? "").trim() || null,
+    sourceTimestamp:
+      timestamp != null && Number.isFinite(Number(timestamp)) ? Number(timestamp) : null,
+    sourceSenderScope: String(senderScope ?? "").trim() || null,
+    sourceParticipantName: String(participantName ?? "").trim() || null,
+    sourceRowKey: String(sourceRowKey ?? "").trim() || null,
+    sourceMessageIndex:
+      sourceMessageIndex != null && Number.isFinite(Number(sourceMessageIndex))
+        ? Number(sourceMessageIndex)
+        : null,
+  };
   console.log("[dm_capability]", {
     canDmCustomer,
     dmTargetSource: dmTargetSource || null,
@@ -1633,6 +2229,186 @@ export async function processMessage({
     BOOKING_OWNER_APPROVAL_FIRST: ownerApprovalFirst,
     isGroupInbound: Boolean(isGroupInbound),
   });
+
+  const maybeHandleDeliveryDetails = async () => {
+    const customerPhoneForResume =
+      String(participantPhoneForDm ?? "").trim() ||
+      String(sessionKey ?? "").split("::").pop() ||
+      "";
+    if (!isGroupInbound) {
+      const resume = await findApprovedBookingForDm({
+        db,
+        userId,
+        message,
+        customerPhone: customerPhoneForResume,
+        sessionKey,
+      });
+      if (!resume.match) {
+        if (resume.reason === "multiple_candidates") {
+          console.log("[dm_resume_no_safe_match]", {
+            reason: resume.reason,
+            candidateCount: resume.candidates.length,
+          });
+          return applyHybridOutboundResult(
+            {
+              reply: buildBookingDetailsClarificationReply(resume.candidates),
+              type: "AI_MESSAGE",
+              messageMeta: messageMetaForKnowledge(true),
+            },
+            routingCtx
+          );
+        }
+        console.log("[dm_resume_no_safe_match]", { reason: resume.reason });
+        return null;
+      }
+
+      const booking = resume.match;
+      const details = parseDeliveryDetails(message);
+      const update = {
+        deliveryConversationStarted: true,
+        dmStartedAt: new Date(),
+        customerPhone: String(customerPhoneForResume ?? "").trim() || undefined,
+        updatedAt: new Date(),
+      };
+      if (details.address) update.deliveryAddress = details.address;
+      if (details.deliveryTime) update.deliveryTime = details.deliveryTime;
+      if (details.contactPhone && !booking.customerPhone) {
+        update.customerPhone = details.contactPhone;
+      }
+      Object.keys(update).forEach((key) => {
+        if (update[key] === undefined) delete update[key];
+      });
+      await db
+        .collection("businesses")
+        .doc(String(userId))
+        .collection("bookings")
+        .doc(String(booking.id))
+        .update(update);
+      console.log("[booking_details_attached]", {
+        bookingId: booking.id,
+        source: "dm",
+        matchReason: resume.reason,
+        hasAddress: Boolean(details.address),
+        hasDeliveryTime: Boolean(details.deliveryTime),
+        hasContactPhone: Boolean(details.contactPhone),
+      });
+      console.log("[dm_approved_booking_resume]", {
+        bookingId: booking.id,
+        matchReason: resume.reason,
+        hasAddress: Boolean(details.address || booking.deliveryAddress),
+        hasDeliveryTime: Boolean(details.deliveryTime || booking.deliveryTime),
+      });
+      const confirmed =
+        Boolean(details.address || booking.deliveryAddress) &&
+        Boolean(details.deliveryTime || booking.deliveryTime);
+      if (confirmed) {
+        await db
+          .collection("businesses")
+          .doc(String(userId))
+          .collection("bookings")
+          .doc(String(booking.id))
+          .update({
+            approvalStage: "delivery_details_collected",
+            deliveryDetailsCollectedAt: new Date(),
+            updatedAt: new Date(),
+          });
+        console.log("[delivery_details_collected]", { bookingId: booking.id });
+        console.log("[booking_delivery_confirmed]", { bookingId: booking.id });
+      }
+      const reply = buildDeliveryDetailReply({ booking, updated: details });
+      return applyHybridOutboundResult(
+        {
+          reply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(true),
+        },
+        routingCtx
+      );
+    }
+
+    const groupBooking = await findApprovedBookingForGroupDetails({
+      db,
+      userId,
+      sessionKey,
+      groupName,
+      message,
+    });
+    if (!groupBooking.match) {
+      if (groupBooking.reason === "multiple_candidates") {
+        return applyHybridOutboundResult(
+          {
+            reply: buildBookingDetailsClarificationReply(groupBooking.candidates),
+            type: "AI_MESSAGE",
+            messageMeta: messageMetaForKnowledge(true),
+          },
+          routingCtx
+        );
+      }
+      return null;
+    }
+    const groupBookingMatch = groupBooking.match;
+    const details = parseDeliveryDetails(message);
+    if (!details.address && !details.deliveryTime && !details.contactPhone) return null;
+    const update = { updatedAt: new Date() };
+    if (details.address) update.deliveryAddress = details.address;
+    if (details.deliveryTime) update.deliveryTime = details.deliveryTime;
+    if (details.contactPhone && !groupBookingMatch.customerPhone) {
+      update.customerPhone = details.contactPhone;
+    }
+    await db
+      .collection("businesses")
+      .doc(String(userId))
+      .collection("bookings")
+      .doc(String(groupBookingMatch.id))
+      .update(update);
+    console.log("[booking_details_attached]", {
+      bookingId: groupBookingMatch.id,
+      source: "group_fallback",
+      matchReason: groupBooking.reason,
+      hasAddress: Boolean(details.address),
+      hasDeliveryTime: Boolean(details.deliveryTime),
+      hasContactPhone: Boolean(details.contactPhone),
+    });
+    console.log("[delivery_details_collected]", {
+      bookingId: groupBookingMatch.id,
+      source: "group_fallback",
+      hasAddress: Boolean(details.address || groupBookingMatch.deliveryAddress),
+      hasDeliveryTime: Boolean(details.deliveryTime || groupBookingMatch.deliveryTime),
+    });
+    const confirmed =
+      Boolean(details.address || groupBookingMatch.deliveryAddress) &&
+      Boolean(details.deliveryTime || groupBookingMatch.deliveryTime);
+    if (confirmed) {
+      await db
+        .collection("businesses")
+        .doc(String(userId))
+        .collection("bookings")
+        .doc(String(groupBookingMatch.id))
+        .update({
+          approvalStage: "delivery_details_collected",
+          deliveryDetailsCollectedAt: new Date(),
+          updatedAt: new Date(),
+        });
+      console.log("[booking_delivery_confirmed]", {
+        bookingId: groupBookingMatch.id,
+        source: "group_fallback",
+      });
+    }
+    return applyHybridOutboundResult(
+      {
+        reply: buildDeliveryDetailReply({ booking: groupBookingMatch, updated: details }),
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(true),
+      },
+      routingCtx
+    );
+  };
+
+  const deliveryDetailsResult = await maybeHandleDeliveryDetails();
+  if (deliveryDetailsResult) {
+    return deliveryDetailsResult;
+  }
+
   let conversationStyle = detectConversationStyle([
     ...contextMessages.slice(-3),
     ...extractRecentAssistantTextsFromPromptBlock(conversationHistory, 1),
@@ -1644,6 +2420,7 @@ export async function processMessage({
     itemName,
     durationDays,
     ownerApprovalFirstRequest = false,
+    memory = null,
   }) {
     const safeBookingId = String(bookingId ?? "").trim();
     if (!safeBookingId) {
@@ -1660,11 +2437,37 @@ export async function processMessage({
     }
     const safeItemName = String(itemName ?? "").trim() || "your item";
     const safeDurationDays = Math.max(1, Number(durationDays) || 1);
-    const finalText = ownerApprovalFirstRequest
-      ? "Great, request owner ko bhej di hai. Main confirmation milte hi update kar dungi."
-      : conversationStyle === "casual_local"
+    let finalText;
+    if (ownerApprovalFirstRequest) {
+      const waitingEvent = {
+        eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
+        itemName: safeItemName,
+        durationDays: safeDurationDays,
+        privacyMode: "group_safe",
+        nextStep: "ask_qualifying_question_while_waiting",
+      };
+      console.log("[booking_waiting_event_built]", {
+        bookingId: safeBookingId,
+        event: waitingEvent,
+      });
+      finalText = buildBookingWaitingEngagement(waitingEvent, conversationStyle);
+      console.log("[booking_waiting_response_generated]", {
+        bookingId: safeBookingId,
+        eventType: waitingEvent.eventType,
+        responsePreview: finalText.slice(0, 160),
+      });
+      if (memory && typeof memory === "object") {
+        memory.pendingEngagementState = buildPendingQualifierState({
+          bookingId: safeBookingId,
+          qualifierKey: "usage_area",
+          allowedValues: ["inside_city", "outside_city"],
+        });
+      }
+    } else {
+      finalText = conversationStyle === "casual_local"
         ? `Great, ${safeItemName} ki booking request ${safeDurationDays} days ke liye create ho gayi hai. Hum shortly confirm kar denge.`
         : `Great! Your booking for ${safeItemName} for ${safeDurationDays} days has been created. We’ll confirm it shortly.`;
+    }
 
     console.log("[final_reply_source]", { source: "BOOKING_CREATED" });
     console.log("[BOOKING FINAL RESPONSE SENT]", {
@@ -1770,6 +2573,17 @@ export async function processMessage({
    */
   const emilySessionKey = chatSessionKey(userId, chatContextKey);
   const pendingTopicReset = Boolean(resetTopicContext);
+  const pendingEngagementMemory = getEmilySessionState(emilySessionKey);
+  const pendingEngagementResult = await maybeHandlePendingEngagementQualifier({
+    userId,
+    message,
+    memory: pendingEngagementMemory,
+    routingCtx,
+    knowledgeMeta: messageMetaForKnowledge(true),
+  });
+  if (pendingEngagementResult) {
+    return pendingEngagementResult;
+  }
 
   globalThis.__topicEntityBySession =
     globalThis.__topicEntityBySession || Object.create(null);
@@ -2077,27 +2891,98 @@ export async function processMessage({
   }
 
   const extractionStartedAt = Date.now();
-  const pinnedEntityName =
+  const memForCatalogInput = getEmilySessionState(emilySessionKey);
+  const currentFocusedItemForPinnedGuard =
+    memForCatalogInput?.lastItem && typeof memForCatalogInput.lastItem === "object"
+      ? memForCatalogInput.lastItem
+      : existingChatContext.lastFocusedItem
+        ? { name: existingChatContext.lastFocusedItem }
+        : null;
+  const rawPinnedEntityName =
     inboundEntity != null && String(inboundEntity).trim() !== ""
       ? String(inboundEntity).trim()
       : null;
-  const entityResult = pinnedEntityName
+  const blockPinnedEntity = shouldBlockPinnedEntityForFollowup({
+    message,
+    pinnedEntityName: rawPinnedEntityName,
+    currentItem: currentFocusedItemForPinnedGuard,
+  });
+  if (blockPinnedEntity) {
+    console.log("[stale_pinned_entity_blocked]", {
+      pinnedEntity: rawPinnedEntityName,
+      currentItem:
+        buildDisplayLabel(
+          currentFocusedItemForPinnedGuard &&
+            typeof currentFocusedItemForPinnedGuard === "object"
+            ? currentFocusedItemForPinnedGuard
+            : {}
+        ) || String(currentFocusedItemForPinnedGuard?.name ?? "").trim() || null,
+      reason: "FOLLOWUP_NO_EXPLICIT_ENTITY",
+    });
+  }
+  const pinnedEntityName = blockPinnedEntity ? null : rawPinnedEntityName;
+  const detailEntityGuard = shouldSkipEntityExtractionForDetailQuestion(
+    message,
+    normalizedCatalogForTurn
+  );
+  if (detailEntityGuard.skip) {
+    console.log("[entity_extraction_skipped_for_detail]", {
+      field: detailEntityGuard.field,
+      message,
+      reason: "DETAIL_FIELD_WITHOUT_ITEM",
+    });
+  }
+  const entityResult = detailEntityGuard.skip
+    ? {
+        name: null,
+        confidence: 0,
+        entityType: "item",
+        source: "detail_field_guard",
+      }
+    : pinnedEntityName
     ? {
         name: pinnedEntityName,
         confidence: 1,
         entityType: "item",
+        source: "pinned_inbound",
       }
-    : extractEntity(message);
+    : { ...extractEntity(message), source: "user_message" };
   const confThreshold = getEntityConfidenceThreshold(entityResult.name);
   const extractedEntity =
-    entityResult.name != null && entityResult.confidence >= confThreshold
+    entityResult.name != null &&
+    entityResult.confidence > 0.8 &&
+    entityResult.confidence >= confThreshold
       ? entityResult.name
       : null;
+  console.log("[entity_extraction]", {
+    extractedEntity: entityResult.name ?? null,
+    acceptedEntity: extractedEntity ?? null,
+    confidence: Number(entityResult.confidence ?? 0),
+    source: entityResult.source ?? "user_message",
+  });
+  if (!extractedEntity) {
+    console.log("[entity_override_blocked]", {
+      reason:
+        entityResult.name != null && String(entityResult.name).trim() !== ""
+          ? "LOW_CONFIDENCE"
+          : "NO_ENTITY_IN_MESSAGE",
+    });
+  }
   const entityType = extractedEntity
     ? entityResult.entityType ?? "item"
     : "item";
 
-  const memForCatalogInput = getEmilySessionState(emilySessionKey);
+  if (blockPinnedEntity && currentFocusedItemForPinnedGuard) {
+    console.log("[followup_context_lock_applied]", {
+      currentItem:
+        buildDisplayLabel(
+          currentFocusedItemForPinnedGuard &&
+            typeof currentFocusedItemForPinnedGuard === "object"
+            ? currentFocusedItemForPinnedGuard
+            : {}
+        ) || String(currentFocusedItemForPinnedGuard?.name ?? "").trim() || null,
+    });
+  }
   const extracted = extractDuration(message);
   let durationDays =
     extracted.durationDays ??
@@ -2377,6 +3262,10 @@ export async function processMessage({
       itemContext = {
         itemId: row.id,
         name: row.name,
+        displayLabel: buildDisplayLabel(row),
+        ...(row.color != null && String(row.color).trim() !== ""
+          ? { color: String(row.color).trim() }
+          : {}),
         availability:
           typeof row.availability === "boolean" ? row.availability : null,
         isAvailable: av.isAvailable,
@@ -2695,6 +3584,25 @@ export async function processMessage({
         hasDuration &&
         hasContactForBookingEarly
       ) {
+        if (
+          isDuplicateActiveBookingState(memForCatalogInput, {
+            itemId: row.id,
+            durationDays,
+            sessionKey: emilySessionKey,
+            channel: isGroupInbound ? "group" : "dm",
+          })
+        ) {
+          return applyHybridOutboundResult(
+            {
+              reply: "Your booking has already been received. We’ll confirm it shortly.",
+              type: "AI_MESSAGE",
+              messageMeta: {
+                ...messageMetaForKnowledge(hasUsefulBusinessData),
+              },
+            },
+            routingCtx
+          );
+        }
         const r = await createBooking(traceId, userId, {
           itemId: row.id,
           itemName: row.name,
@@ -2713,6 +3621,7 @@ export async function processMessage({
           dmTargetPhone: dmTargetPhone || undefined,
           dmTargetSource: dmTargetSource || undefined,
           canDmCustomer,
+          ...bookingSourceMessageMetadata,
         });
         if (!r?.ok && bookingErrorCode(r) === "ITEM_ALREADY_BOOKED") {
           console.log("[BOOKING BLOCKED - EARLY]", row.name);
@@ -2728,7 +3637,6 @@ export async function processMessage({
           });
         }
         if (r.ok && typeof r.id === "string" && r.id.trim() !== "") {
-          memForCatalogInput.bookingCreated = true;
           bookingCreated = {
             id: r.id.trim(),
             itemId: row.id,
@@ -2736,6 +3644,11 @@ export async function processMessage({
             durationDays: durationDays,
             status: "pending_approval",
           };
+          setStructuredBookingState(memForCatalogInput, {
+            ...bookingCreated,
+            sessionKey: emilySessionKey,
+            channel: isGroupInbound ? "group" : "dm",
+          });
           const bookingResult = buildBookingFinalOutbound({
             bookingId: bookingCreated.id,
             itemId: row.id,
@@ -2817,6 +3730,9 @@ export async function processMessage({
         itemId: rowId,
         name: rowName,
         displayLabel,
+        ...(row.color != null && String(row.color).trim() !== ""
+          ? { color: String(row.color).trim() }
+          : {}),
         availability:
           typeof row.availability === "boolean" ? row.availability : null,
         isAvailable: av.isAvailable,
@@ -2864,12 +3780,43 @@ export async function processMessage({
     other: "general",
     confirmation_followup: "confirmation_followup",
   };
+  const previousAssistantForIntent =
+    getRecentAssistantReplies(userId, 1, sessionKey)[0] ?? "";
+  const llmIntentClassification = await classifyConversationIntentWithLLM({
+    messageText: message,
+    selectedItem: itemContext ?? resolvedItemFromCatalog ?? memForCatalogInput?.lastItem ?? null,
+    memory: memForCatalogInput,
+    previousAssistantMessage: previousAssistantForIntent,
+    businessContext,
+  });
+  const prioritizedIntent = applyIntentPriority(llmIntentClassification, {
+    messageText: message,
+    hasDuration: durationDays != null,
+    hasContact: hasContactForBookingEarly,
+  });
+  console.log("[intent_priority_applied]", {
+    primaryIntent: llmIntentClassification.primaryIntent,
+    priorityIntent: prioritizedIntent.priorityIntent,
+    askedField: prioritizedIntent.askedField,
+    reason: prioritizedIntent.reason,
+  });
+
   let detectedIntent = detectIntent(message);
+  if (prioritizedIntent.priorityIntent === "availability") {
+    detectedIntent = "availability";
+  } else if (prioritizedIntent.priorityIntent === "price") {
+    detectedIntent = "pricing";
+  } else if (prioritizedIntent.priorityIntent === "booking") {
+    detectedIntent = "booking";
+  } else if (prioritizedIntent.priorityIntent === "delivery") {
+    detectedIntent = "general";
+  }
   const classifierIntentKey =
     inboundIntent != null && String(inboundIntent).trim() !== ""
       ? String(inboundIntent).trim().toLowerCase()
       : "";
   if (
+    prioritizedIntent.priorityIntent === "unclear" &&
     classifierIntentKey &&
     Object.prototype.hasOwnProperty.call(
       classifierToDetectedIntent,
@@ -2885,7 +3832,10 @@ export async function processMessage({
   if (shortConfirm === "yes" || shortConfirm === "ok") {
     detectedIntent = "confirmation_followup";
   }
-  if (events.bookingIntent === true) {
+  if (
+    events.bookingIntent === true &&
+    prioritizedIntent.priorityIntent !== "availability"
+  ) {
     detectedIntent = "booking";
   }
   if (turnLockedItem) {
@@ -3155,6 +4105,9 @@ export async function processMessage({
       displayLabel: buildDisplayLabel(
         rowLike && typeof rowLike === "object" ? rowLike : { name: nameStr }
       ),
+      ...(rowLike && typeof rowLike === "object" && rowLike.color != null
+        ? { color: String(rowLike.color).trim() }
+        : {}),
     };
     conversationMemory.askedContact = false;
     console.log("🧠 Stored item in memory:", {
@@ -3358,6 +4311,76 @@ export async function processMessage({
   }
   console.log("🧪 ITEM CONTEXT FULL:", itemContext);
 
+  const explicitResolvedItemForAuthority = extractedEntity
+    ? itemContext ?? resolvedItemFromCatalog ?? matchedItemForReply ?? null
+    : null;
+  const isItemFollowupForAuthority =
+    isDetailFollowupWithoutExplicitEntity(message) ||
+    (!extractedEntity && detectedIntent === "availability") ||
+    (wantsImages && !extractedEntity);
+  const authoritativeItemForTurn = resolveAuthoritativeItemForTurn({
+    userText: message,
+    explicitResolvedItem: explicitResolvedItemForAuthority,
+    turnLockedItem: lockedItemAsContext(),
+    memoryItem: conversationMemory?.lastItem ?? memForCatalogInput?.lastItem ?? null,
+    isFollowup: isItemFollowupForAuthority,
+    catalogItems: normalizedCatalogForTurn,
+  });
+  if (authoritativeItemForTurn) {
+    const authorityId = normalizeId(
+      authoritativeItemForTurn.id ?? authoritativeItemForTurn.itemId
+    );
+    const attemptedId = normalizeId(
+      matchedItemForReply && typeof matchedItemForReply === "object"
+        ? matchedItemForReply.id ?? matchedItemForReply.itemId
+        : null
+    );
+    if (attemptedId && authorityId && attemptedId !== authorityId) {
+      console.log("[item_authority_overwrite_blocked]", {
+        attemptedItemId: attemptedId,
+        authoritativeItemId: authorityId,
+        source: "matchedItemForReply",
+      });
+    }
+    matchedItemForReply = authoritativeItemForTurn;
+    const authorityContext = {
+      ...authoritativeItemForTurn,
+      itemId: authorityId,
+      id: authorityId,
+      name:
+        String(authoritativeItemForTurn.name ?? "").trim() ||
+        String(authoritativeItemForTurn.displayLabel ?? "").trim(),
+      displayLabel:
+        buildDisplayLabel(authoritativeItemForTurn) ||
+        String(authoritativeItemForTurn.displayLabel ?? authoritativeItemForTurn.name ?? "").trim(),
+    };
+    itemContext = await hydrateItemWithAvailability(
+      authorityContext,
+      extractedEntity
+        ? "initial"
+        : turnLockedItem
+          ? "duration"
+          : "memory"
+    );
+  } else {
+    if (matchedItemForReply || itemContext) {
+      console.log("[item_authority_overwrite_blocked]", {
+        attemptedItemId:
+          normalizeId(
+            itemContext?.itemId ??
+              itemContext?.id ??
+              (matchedItemForReply && typeof matchedItemForReply === "object"
+                ? matchedItemForReply.id ?? matchedItemForReply.itemId
+                : null)
+          ) || null,
+        authoritativeItemId: null,
+        source: "no_authoritative_item",
+      });
+    }
+    matchedItemForReply = null;
+    itemContext = null;
+  }
+
   const resolvedName =
     matchedItemForReply && typeof matchedItemForReply.name === "string"
       ? matchedItemForReply.name.trim()
@@ -3434,6 +4457,9 @@ export async function processMessage({
         allowed,
       });
       if (allowed) {
+        if (idChanged) {
+          clearStructuredBookingState(conversationMemory, "EXPLICIT_NEW_ITEM");
+        }
         conversationMemory.lastItem = {
           id: newId,
           name: newName,
@@ -4009,7 +5035,14 @@ export async function processMessage({
     bookingDurationDays != null &&
     (wasAwaitingContact || memory?.hasBookingIntent === true || resolvedEmilyIntent === "booking")
   ) {
-    if (memory?.bookingCreated) {
+    if (
+      isDuplicateActiveBookingState(memory, {
+        itemId: memoryBookingItemId,
+        durationDays: bookingDurationDays,
+        sessionKey: emilySessionKey,
+        channel: isGroupInbound ? "group" : "dm",
+      })
+    ) {
       console.log("[BOOKING SKIPPED - ALREADY CREATED]");
       return applyHybridOutboundResult(
         {
@@ -4044,6 +5077,7 @@ export async function processMessage({
       dmTargetPhone: dmTargetPhone || undefined,
       dmTargetSource: dmTargetSource || undefined,
       canDmCustomer,
+      ...bookingSourceMessageMetadata,
     });
     if (!bookingResult?.ok && bookingErrorCode(bookingResult) === "ITEM_ALREADY_BOOKED") {
       console.log("[BOOKING BLOCKED - CONTACT STEP]", memoryBookingItemName);
@@ -4053,7 +5087,6 @@ export async function processMessage({
       });
     }
     if (bookingResult?.ok && typeof bookingResult.id === "string" && bookingResult.id.trim() !== "") {
-      memory.bookingCreated = true;
       bookingCreated = {
         id: bookingResult.id.trim(),
         itemId: memoryBookingItemId,
@@ -4061,6 +5094,11 @@ export async function processMessage({
         durationDays: bookingDurationDays,
         status: "pending_approval",
       };
+      setStructuredBookingState(memory, {
+        ...bookingCreated,
+        sessionKey: emilySessionKey,
+        channel: isGroupInbound ? "group" : "dm",
+      });
       const bookingFinal = buildBookingFinalOutbound({
         bookingId: bookingCreated.id,
         itemId: memoryBookingItemId,
@@ -4162,6 +5200,15 @@ export async function processMessage({
     resolvedItem = lockedItemAsContext();
   }
   const safeItemCandidate = itemContext ?? resolvedItem ?? memory?.lastItem ?? null;
+  if (
+    safeItemCandidate === memory?.lastItem &&
+    isDetailFollowupWithoutExplicitEntity(message)
+  ) {
+    console.log("[resolved_item_from_memory_followup]", {
+      itemId: normalizeId(memory?.lastItem?.id),
+      itemName: String(memory?.lastItem?.name ?? "").trim() || null,
+    });
+  }
   safeItem =
     safeItemCandidate && typeof safeItemCandidate === "object"
       ? {
@@ -4231,6 +5278,282 @@ export async function processMessage({
     });
   }
 
+  const conversationRoute = decideConversationRoute({
+    message,
+    selectedItem: safeItem,
+    memory,
+    activeStage: stage,
+    isDeliveryDetailsActive: false,
+    isApprovalAction: false,
+    intentClassification: prioritizedIntent,
+  });
+  console.log("[conversation_route_decided]", {
+    routeType: conversationRoute.routeType,
+    shouldBypassPhraseEngine: conversationRoute.shouldBypassPhraseEngine,
+    shouldContinueFlow: conversationRoute.shouldContinueFlow,
+    reason: conversationRoute.reason,
+    selectedItem:
+      String(safeItem?.itemId ?? safeItem?.id ?? "").trim() ||
+      String(safeItem?.name ?? "").trim() ||
+      null,
+  });
+  console.log("[route_after_intent_priority]", {
+    priorityIntent: prioritizedIntent.priorityIntent,
+    routeType: conversationRoute.routeType,
+    askedField: conversationRoute.askedField ?? prioritizedIntent.askedField,
+    reason: conversationRoute.reason,
+  });
+
+  if (isConversationAiRoute(conversationRoute)) {
+    console.log("[phrase_engine_bypassed]", {
+      routeType: conversationRoute.routeType,
+      reason: conversationRoute.reason,
+    });
+    const routerContextData = {
+      ...contextData,
+      requiresDuration: false,
+      conversationRouterInstruction:
+        "You are replying as the business on WhatsApp. Sound human, short, and natural. Answer the latest user question first. Use business catalog, selected item context, memory.lastItem, and previous assistant message. Do not mention AI, assistant, process, workflow, system, or owner approval. Do not repeat the previous question. If a booking flow is active, continue only if natural.",
+    };
+    const directReply = isInformationalRoute(conversationRoute)
+      ? directInformationalReply(message, safeItem)
+      : "";
+    let routedReply = directReply;
+    let routedMode;
+    if (!routedReply) {
+      const routedOut = await timeAsync(
+        "AI/phrase decision",
+        () =>
+          generateReply({
+            message,
+            contextMessages,
+            intent,
+            emilyIntent: "inquiry",
+            history,
+            knowledge: mergedKnowledge,
+            hasKnowledge: hasKnowledgeForModel,
+            contextData: routerContextData,
+            businessName,
+            businessType,
+            businessProfile: businessContext,
+            catalogItems: normalizedCatalogForTurn,
+            selectedItem: selectedItemForAi,
+            conversationMemory,
+            conversationMemorySummary: emilyTurn.memorySummary,
+            matchedItem: matchedItemForReply,
+            matchedService: emilyTurn.match.matchedService,
+            matchedCatalogLine,
+            proactivePricingHint: emilyTurn.pricingHint,
+            conversationStage: conversationMemory.stage,
+            userLanguageStyle: emilyTurn.userLanguageStyle,
+            tone,
+            fragmentCount: fc,
+            hasMultipleFragments: Boolean(hasMultipleFragments) || fc > 1,
+            isGreetingFirst: Boolean(isGreetingFirst),
+            lastFocusedItem: nextChatContext.lastFocusedItem ?? null,
+            lastDuration: nextChatContext.lastDuration ?? null,
+            detectedIntent,
+          }),
+        { source: "AI_CONVERSATION_ROUTER" }
+      );
+      routedReply = routedOut.reply ?? "";
+      console.log("[llm_draft_generated]", {
+        routeType: conversationRoute.routeType,
+        chars: String(routedReply ?? "").length,
+      });
+      routedMode =
+        routedOut.mode === "GROUP" || routedOut.mode === "DM"
+          ? routedOut.mode
+          : undefined;
+    } else {
+      console.log("[llm_draft_generated]", {
+        routeType: conversationRoute.routeType,
+        source: "direct_field",
+        chars: String(routedReply ?? "").length,
+      });
+    }
+    const assistantFromHistoryForRoute = extractRecentAssistantTextsFromPromptBlock(
+      conversationHistory,
+      6
+    );
+    const recentAssistantForRoute = mergeAssistantReplyListsForNorm(
+      assistantFromHistoryForRoute,
+      getRecentAssistantReplies(userId, 3, sessionKey),
+      8
+    );
+    let finalRoutedReply = normalizeEmilyResponse(routedReply, {
+      matchedItem: matchedItemForReply,
+      matchedService: emilyTurn.match.matchedService,
+      intent: "inquiry",
+      memory: conversationMemory,
+      memoryDelta: emilyTurn.memoryDelta,
+      userMessage: message,
+      pricingHint: emilyTurn.pricingHint,
+      userLanguageStyle: emilyTurn.userLanguageStyle,
+      recentAssistantReplies: recentAssistantForRoute,
+      sessionKey: emilySessionKey,
+    });
+    if (replyChannel === "whatsapp" && finalRoutedReply) {
+      finalRoutedReply = polishWhatsAppBusinessTone(String(finalRoutedReply));
+    }
+    let composedAnswer = null;
+    const replyBeforeComposer = finalRoutedReply;
+    if (isInformationalRoute(conversationRoute)) {
+      const composerItem = mergeComposerCatalogItem(safeItem, normalizedCatalogForTurn);
+      composedAnswer = composeInformationalAnswer({
+        message,
+        draftReply: finalRoutedReply,
+        item: composerItem,
+        businessContext,
+        askedField: conversationRoute.askedField ?? prioritizedIntent.askedField,
+      });
+      finalRoutedReply = composedAnswer.reply;
+      console.log("[answer_composer_applied]", {
+        field: composedAnswer.field,
+        source: composedAnswer.source,
+      });
+      if (
+        composedAnswer.finalAuthority === true &&
+        composedAnswer.source !== "llm_draft" &&
+        String(replyBeforeComposer ?? "").trim() !== "" &&
+        String(replyBeforeComposer ?? "").trim() !== String(finalRoutedReply ?? "").trim()
+      ) {
+        console.log("[llm_draft_discarded_for_verified_answer]", {
+          field: composedAnswer.field,
+          source: composedAnswer.source,
+        });
+      }
+      if (composedAnswer.fieldMismatchBlocked) {
+        console.log("[field_mismatch_blocked]", {
+          field: composedAnswer.field,
+        });
+      }
+      if (composedAnswer.unknownHumanized) {
+        console.log("[unknown_answer_humanized]", {
+          field: composedAnswer.field,
+        });
+      }
+    }
+    const guardedReply = applyToneGuard(finalRoutedReply);
+    if (guardedReply !== finalRoutedReply) {
+      console.log("[tone_guard_applied]", {
+        changed: true,
+        routeType: conversationRoute.routeType,
+      });
+    } else {
+      console.log("[tone_guard_applied]", {
+        changed: false,
+        routeType: conversationRoute.routeType,
+      });
+    }
+    finalRoutedReply = guardedReply;
+    const lastAssistantForStrategy = recentAssistantForRoute[0] ?? "";
+    const responseStrategy = decideResponseStrategy({
+      userMessage: message,
+      lastAssistantMessage: lastAssistantForStrategy,
+      conversationState: {
+        lastAskedQuestionType:
+          /\b(kitne time|kitne din|for how long|how many days|duration)\b/i.test(
+            String(lastAssistantForStrategy ?? "")
+          )
+            ? "duration"
+            : null,
+        lastAskedTimestamp: null,
+      },
+      routeType: conversationRoute.routeType,
+      askedField: composedAnswer?.field ?? null,
+      answerKnown: composedAnswer
+        ? composedAnswer.answerKnown === true
+        : Boolean(finalRoutedReply),
+    });
+    if (composedAnswer?.finalAuthority === true) {
+      responseStrategy.strategy = "answer_only";
+      responseStrategy.reason = "composer_final_authority";
+    }
+    console.log("[response_strategy_selected]", {
+      routeType: conversationRoute.routeType,
+      strategy: responseStrategy.strategy,
+      reason: responseStrategy.reason,
+      askedField: composedAnswer?.field ?? null,
+    });
+    const responseStrategyResult = applyResponseStrategy({
+      reply: finalRoutedReply,
+      strategyDecision: responseStrategy,
+      userMessage: message,
+      lastAssistantMessage: lastAssistantForStrategy,
+      conversationState: {
+        lastAskedQuestionType:
+          /\b(kitne time|kitne din|for how long|how many days|duration)\b/i.test(
+            String(lastAssistantForStrategy ?? "")
+          )
+            ? "duration"
+            : null,
+        lastAskedTimestamp: null,
+      },
+    });
+    finalRoutedReply = responseStrategyResult.reply;
+    for (const event of responseStrategyResult.events) {
+      if (event.type === "variation_applied") {
+        console.log("[variation_applied]", {
+          poolName: event.poolName,
+          index: event.index,
+        });
+      } else if (event.type === "followup_added") {
+        console.log("[followup_added]", {
+          questionType: event.questionType,
+        });
+      } else if (event.type === "followup_blocked_due_to_repetition") {
+        console.log("[followup_blocked_due_to_repetition]", {
+          questionType: event.questionType,
+        });
+      } else if (event.type === "no_followup_decision") {
+        console.log("[no_followup_decision]", {
+          strategy: event.strategy,
+        });
+      }
+    }
+    const repeatsDurationQuestion =
+      isInformationalRoute(conversationRoute) &&
+      responseStrategy.strategy !== "answer_then_guide" &&
+      /\b(kitne time|kitne din|for how long|how many days|duration)\b/i.test(
+        String(finalRoutedReply ?? "")
+      );
+    const repeatsPrior = recentAssistantForRoute.some(
+      (prior) => assistantReplySimilarity(finalRoutedReply, prior) >= 0.82
+    );
+    if (repeatsDurationQuestion || repeatsPrior) {
+      console.log("[anti_repetition_applied]", {
+        routeType: conversationRoute.routeType,
+        repeatsDurationQuestion,
+        repeatsPrior,
+      });
+      finalRoutedReply =
+        directReply ||
+        (conversationStyle === "casual_local"
+          ? "Ji, iski detail share kar deta hun — aap kaunsa point confirm karna chah rahe hain?"
+          : "Sure, I can share that detail — which point would you like me to confirm?");
+      finalRoutedReply = applyToneGuard(finalRoutedReply);
+    }
+    console.log("[ai_conversation_response_used]", {
+      routeType: conversationRoute.routeType,
+      directReplyUsed: Boolean(directReply),
+    });
+    console.log("[final_human_response]", {
+      routeType: conversationRoute.routeType,
+      chars: String(finalRoutedReply ?? "").length,
+    });
+    return applyHybridOutboundResult(
+      {
+        reply: finalRoutedReply,
+        text: finalRoutedReply,
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+      },
+      routingCtx,
+      routedMode
+    );
+  }
+
   if (
     ownerApprovalFirst &&
     Boolean(isGroupInbound) &&
@@ -4258,6 +5581,25 @@ export async function processMessage({
     });
 
     if (approvalItemId && approvalDurationDays != null && approvalAvailable) {
+      if (
+        isDuplicateActiveBookingState(memory, {
+          itemId: approvalItemId,
+          durationDays: approvalDurationDays,
+          sessionKey: emilySessionKey,
+          channel: isGroupInbound ? "group" : "dm",
+        })
+      ) {
+        return applyHybridOutboundResult(
+          {
+            reply: "Your booking has already been received. We’ll confirm it shortly.",
+            type: "AI_MESSAGE",
+            messageMeta: {
+              ...messageMetaForKnowledge(hasUsefulBusinessData),
+            },
+          },
+          routingCtx
+        );
+      }
       const approvalItemName =
         buildDisplayLabel(itemContext) ||
         String(itemContext?.name ?? "").trim() ||
@@ -4278,6 +5620,7 @@ export async function processMessage({
         dmTargetSource: dmTargetSource || undefined,
         canDmCustomer,
         approvalStage: "pending_owner_approval",
+        ...bookingSourceMessageMetadata,
       });
 
       if (!approvalResult?.ok && bookingErrorCode(approvalResult) === "ITEM_ALREADY_BOOKED") {
@@ -4293,7 +5636,6 @@ export async function processMessage({
         typeof approvalResult.id === "string" &&
         approvalResult.id.trim() !== ""
       ) {
-        memory.bookingCreated = true;
         memory.askedContact = false;
         memory.stage = "pending_owner_approval";
         bookingCreated = {
@@ -4304,6 +5646,11 @@ export async function processMessage({
           status: "pending_approval",
           approvalStage: "pending_owner_approval",
         };
+        setStructuredBookingState(memory, {
+          ...bookingCreated,
+          sessionKey: emilySessionKey,
+          channel: isGroupInbound ? "group" : "dm",
+        });
         console.log("[approval_request_created]", {
           bookingId: bookingCreated.id,
           itemId: approvalItemId,
@@ -4320,6 +5667,7 @@ export async function processMessage({
           itemName: approvalItemName,
           durationDays: approvalDurationDays,
           ownerApprovalFirstRequest: true,
+          memory: conversationMemory,
         });
         if (bookingFinal?.meta?.bookingCreated === true) {
           console.log("[PIPELINE GUARD] Approval request created \u2192 skipping contact ask");
@@ -4442,6 +5790,10 @@ export async function processMessage({
   }
 
   if (stage && !bookingCreated) {
+    console.log("[transactional_route_used]", {
+      routeType: conversationRoute.routeType,
+      stage,
+    });
     phraseReply = buildPhraseReply({
       stage,
       item: safeItem,
@@ -4775,6 +6127,25 @@ export async function processMessage({
         finalReply =
           "Sorry, I couldn't confirm this option. Let me check and get back to you.";
       } else {
+        if (
+          isDuplicateActiveBookingState(conversationMemory, {
+            itemId: commitRow.id,
+            durationDays: memoryDurationDays,
+            sessionKey: emilySessionKey,
+            channel: isGroupInbound ? "group" : "dm",
+          })
+        ) {
+          return applyHybridOutboundResult(
+            {
+              reply: "Your booking has already been received. We’ll confirm it shortly.",
+              type: "AI_MESSAGE",
+              messageMeta: {
+                ...messageMetaForKnowledge(hasUsefulBusinessData),
+              },
+            },
+            routingCtx
+          );
+        }
         const commitBookings = await getBookingsForItem(
           userId,
           commitRow.id,
@@ -4819,13 +6190,13 @@ export async function processMessage({
           dmTargetPhone: dmTargetPhone || undefined,
           dmTargetSource: dmTargetSource || undefined,
           canDmCustomer,
+          ...bookingSourceMessageMetadata,
         });
         if (!commitBooking?.ok && bookingErrorCode(commitBooking) === "ITEM_ALREADY_BOOKED") {
           console.log("[BOOKING RETRY BLOCKED]");
           return buildBookingBlockedOutbound(conversationMemory);
         }
         if (commitBooking?.ok && typeof commitBooking.id === "string" && commitBooking.id.trim()) {
-          conversationMemory.bookingCreated = true;
           bookingCreated = {
             id: commitBooking.id.trim(),
             itemId: commitRow.id,
@@ -4833,6 +6204,11 @@ export async function processMessage({
             durationDays: memoryDurationDays,
             status: "pending_approval",
           };
+          setStructuredBookingState(conversationMemory, {
+            ...bookingCreated,
+            sessionKey: emilySessionKey,
+            channel: isGroupInbound ? "group" : "dm",
+          });
 
           console.log("📦 Booking created via commit trigger:", {
             bookingId: bookingCreated.id,

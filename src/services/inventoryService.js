@@ -159,11 +159,32 @@ const NO_DATE_BLOCK_MODE = String(process.env.NO_DATE_BLOCK_MODE || "conservativ
   .trim()
   .toLowerCase();
 let availabilityPolicyLogged = false;
+const unknownBlockingStatusesLogged = new Set();
 
-export function isBlockingBookingStatus(status) {
+export function isBlockingBookingStatus(status, meta = {}) {
   const normalized = String(status || "").trim().toLowerCase();
   if (NON_BLOCKING_BOOKING_STATUSES.includes(normalized)) return false;
-  return BLOCKING_BOOKING_STATUSES.includes(normalized) || !normalized;
+  if (!BLOCKING_BOOKING_STATUSES.includes(normalized)) {
+    const logKey = normalized || "(missing)";
+    const itemId =
+      meta?.itemId != null && String(meta.itemId).trim() !== ""
+        ? String(meta.itemId).trim()
+        : null;
+    const bookingId =
+      meta?.bookingId != null && String(meta.bookingId).trim() !== ""
+        ? String(meta.bookingId).trim()
+        : null;
+    const scopedLogKey = [logKey, itemId || "", bookingId || ""].join("|");
+    if (!unknownBlockingStatusesLogged.has(scopedLogKey)) {
+      unknownBlockingStatusesLogged.add(scopedLogKey);
+      console.log("[availability_policy_unknown_status_blocked]", {
+        status: logKey,
+        itemId,
+        bookingId,
+      });
+    }
+  }
+  return true;
 }
 
 function logAvailabilityPolicyOnce() {
@@ -677,7 +698,12 @@ function bookingBlocksWindow(booking, itemId, windowStart, windowEnd, opts = {})
   if (!normalizedItemId || bookingItemId !== normalizedItemId) return false;
 
   const status = String(booking?.status ?? "").trim().toLowerCase();
-  if (!isBlockingBookingStatus(status)) return false;
+  if (
+    !isBlockingBookingStatus(status, {
+      itemId: normalizedItemId,
+      bookingId: booking?.id ?? booking?.bookingId,
+    })
+  ) return false;
 
   const bStart = toValidDate(booking?.startDate ?? booking?.startAt ?? null);
   const bEnd = toValidDate(booking?.endDate ?? booking?.endAt ?? null);
@@ -746,7 +772,10 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
 
   if (!hasRequestedStart && !hasRequestedEnd) {
     const blockingBookings = relevantBookings.filter((b) =>
-      isBlockingBookingStatus(String(b?.status ?? "").trim().toLowerCase())
+      isBlockingBookingStatus(String(b?.status ?? "").trim().toLowerCase(), {
+        itemId: normalizedItemId,
+        bookingId: b?.id ?? b?.bookingId,
+      })
     );
     for (const b of blockingBookings) {
       const bEnd = toValidDate(b?.endDate ?? b?.endAt ?? null);
@@ -804,7 +833,12 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
 
     const status = String(b?.status ?? "").trim().toLowerCase();
     if (nonBlockingStatuses.includes(status)) return false;
-    if (!isBlockingBookingStatus(status)) return false;
+    if (
+      !isBlockingBookingStatus(status, {
+        itemId: normalizedItemId,
+        bookingId: b?.id ?? b?.bookingId,
+      })
+    ) return false;
 
     const bStart = toValidDate(b?.startDate ?? b?.startAt ?? null);
     const bEnd = toValidDate(b?.endDate ?? b?.endAt ?? null);
@@ -878,7 +912,7 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
 /**
  * @param {string} traceId - Correlates with pipeline / processMessage logs
  * @param {string} userId
- * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string }} opts
+ * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null }} opts
  */
 export async function createBooking(
   traceId,
@@ -900,6 +934,15 @@ export async function createBooking(
     dmTargetSource,
     canDmCustomer,
     approvalStage,
+    sourceGroupName,
+    sourcePlaywrightChatKey,
+    sourceMessageId,
+    sourceText,
+    sourceTimestamp,
+    sourceSenderScope,
+    sourceParticipantName,
+    sourceRowKey,
+    sourceMessageIndex,
   }
 ) {
   logAvailabilityPolicyOnce();
@@ -974,6 +1017,11 @@ export async function createBooking(
     ((dmTargetRaw.includes("@") && /@(c\.us|s\.whatsapp\.net)$/i.test(dmTargetRaw)) ||
       (dmTargetDigits.length >= 10 && dmTargetDigits.length <= 15));
   const safeCanDmCustomer = Boolean(canDmCustomer) && dmTargetIsRoutable;
+  const isPlaywrightGroupSource = Boolean(
+    String(source ?? "").trim().toLowerCase() === "playwright" &&
+      (String(groupName ?? sourceGroupName ?? "").trim() ||
+        String(playwrightChatKey ?? sourcePlaywrightChatKey ?? "").trim())
+  );
   console.log("[dm_capability]", {
     canDmCustomer: safeCanDmCustomer,
     dmTargetSource: String(dmTargetSource ?? "").trim() || null,
@@ -1032,6 +1080,68 @@ export async function createBooking(
         ...(playwrightChatKey != null && String(playwrightChatKey).trim() !== ""
           ? { playwrightChatKey: String(playwrightChatKey).trim() }
           : {}),
+        ...(sourceGroupName != null && String(sourceGroupName).trim() !== ""
+          ? { sourceGroupName: String(sourceGroupName).trim() }
+          : {}),
+        ...(sourcePlaywrightChatKey != null &&
+        String(sourcePlaywrightChatKey).trim() !== ""
+          ? { sourcePlaywrightChatKey: String(sourcePlaywrightChatKey).trim() }
+          : {}),
+        ...(sourceMessageId != null && String(sourceMessageId).trim() !== ""
+          ? { sourceMessageId: String(sourceMessageId).trim() }
+          : {}),
+        ...(sourceText != null && String(sourceText).trim() !== ""
+          ? { sourceText: String(sourceText).trim() }
+          : {}),
+        ...(sourceTimestamp != null && Number.isFinite(Number(sourceTimestamp))
+          ? { sourceTimestamp: Number(sourceTimestamp) }
+          : {}),
+        ...(sourceSenderScope != null && String(sourceSenderScope).trim() !== ""
+          ? { sourceSenderScope: String(sourceSenderScope).trim() }
+          : {}),
+        ...(sourceParticipantName != null &&
+        String(sourceParticipantName).trim() !== ""
+          ? { sourceParticipantName: String(sourceParticipantName).trim() }
+          : {}),
+        ...(sourceRowKey != null && String(sourceRowKey).trim() !== ""
+          ? { sourceRowKey: String(sourceRowKey).trim() }
+          : {}),
+        ...(sourceMessageIndex != null && Number.isFinite(Number(sourceMessageIndex))
+          ? { sourceMessageIndex: Number(sourceMessageIndex) }
+          : {}),
+        ...(isPlaywrightGroupSource ? { bookingSource: "PLAYWRIGHT_GROUP" } : {}),
+        ...(String(playwrightChatKey ?? sourcePlaywrightChatKey ?? "").trim()
+          ? { chatKey: String(playwrightChatKey ?? sourcePlaywrightChatKey ?? "").trim() }
+          : {}),
+        ...(String(participantName ?? sourceParticipantName ?? "").trim()
+          ? {
+              originalCustomerDisplayName: String(
+                participantName ?? sourceParticipantName
+              ).trim(),
+            }
+          : {}),
+        ...(dmTargetIsRoutable ? { originalCustomerPhone: dmTargetRaw } : {}),
+        ...(String(sourceText ?? "").trim()
+          ? { originalUserMessageText: String(sourceText).trim() }
+          : {}),
+        ...(sourceTimestamp != null && Number.isFinite(Number(sourceTimestamp))
+          ? { originalMessageTimestamp: Number(sourceTimestamp) }
+          : {}),
+        ...(sourceRowKey != null && String(sourceRowKey).trim() !== ""
+          ? { originalMessageRowKey: String(sourceRowKey).trim() }
+          : {}),
+        ...(sourceMessageIndex != null && Number.isFinite(Number(sourceMessageIndex))
+          ? { originalMessageIndex: Number(sourceMessageIndex) }
+          : {}),
+        ...(isPlaywrightGroupSource
+          ? {
+              playwrightReplyPrivateEligible: Boolean(
+                String(sourceRowKey ?? "").trim() ||
+                  String(sourceMessageId ?? "").trim() ||
+                  String(messageId ?? "").trim()
+              ),
+            }
+          : {}),
         ...(dmTargetRaw && dmTargetIsRoutable
           ? { dmTargetPhone: dmTargetRaw }
           : {}),
@@ -1048,6 +1158,53 @@ export async function createBooking(
         createdAt: FieldValue.serverTimestamp(),
       });
     });
+
+    console.log("[booking_source_message_metadata_stored]", {
+      bookingId: createdBookingId || null,
+      sourceMessageId:
+        sourceMessageId != null && String(sourceMessageId).trim() !== ""
+          ? String(sourceMessageId).trim()
+          : null,
+      sourceRowKey:
+        sourceRowKey != null && String(sourceRowKey).trim() !== ""
+          ? String(sourceRowKey).trim()
+          : null,
+      sourceTextPreview: String(sourceText ?? "").trim().slice(0, 120) || null,
+      sourceParticipantName:
+        sourceParticipantName != null && String(sourceParticipantName).trim() !== ""
+          ? String(sourceParticipantName).trim()
+          : null,
+      sourceSenderScope:
+        sourceSenderScope != null && String(sourceSenderScope).trim() !== ""
+          ? String(sourceSenderScope).trim()
+          : null,
+    });
+    if (
+      isPlaywrightGroupSource &&
+      (String(sourceParticipantName ?? participantName ?? "").trim() ||
+        String(sourceSenderScope ?? senderScope ?? "").trim() ||
+        dmTargetIsRoutable)
+    ) {
+      console.log("[booking_source_customer_metadata_stored]", {
+        bookingId: createdBookingId || null,
+        originalCustomerDisplayName:
+          String(sourceParticipantName ?? participantName ?? "").trim() || null,
+        hasOriginalCustomerPhone: dmTargetIsRoutable,
+        sourceSenderScope:
+          String(sourceSenderScope ?? senderScope ?? "").trim() || null,
+        sourceMessageIndex:
+          sourceMessageIndex != null && Number.isFinite(Number(sourceMessageIndex))
+            ? Number(sourceMessageIndex)
+            : null,
+      });
+    } else if (isPlaywrightGroupSource) {
+      console.warn("[booking_source_customer_metadata_missing]", {
+        bookingId: createdBookingId || null,
+        hasSourceRowKey: Boolean(String(sourceRowKey ?? "").trim()),
+        hasSourceMessageId: Boolean(String(sourceMessageId ?? messageId ?? "").trim()),
+        sourceTextPreview: String(sourceText ?? "").trim().slice(0, 80) || null,
+      });
+    }
 
     logBookingEvent({
       traceId: tid,

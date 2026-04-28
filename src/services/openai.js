@@ -17,6 +17,153 @@ const openai = isTest
       apiKey: process.env.OPENAI_API_KEY,
     });
 
+const UNCLEAR_CONVERSATION_INTENT = {
+  intents: {
+    availability: false,
+    booking: false,
+    price: false,
+    details: false,
+    delivery: false,
+    casual: false,
+    unclear: true,
+  },
+  primaryIntent: "unclear",
+  askedField: "unknown",
+  confidence: "low",
+  reason: "classifier_unavailable",
+};
+
+function normalizeConversationIntentPayload(value) {
+  const obj = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const intentsRaw =
+    obj.intents && typeof obj.intents === "object" && !Array.isArray(obj.intents)
+      ? obj.intents
+      : {};
+  const primary = String(obj.primaryIntent ?? "").trim().toLowerCase();
+  const field = String(obj.askedField ?? "").trim().toLowerCase();
+  const confidence = String(obj.confidence ?? "").trim().toLowerCase();
+  const validPrimary = new Set([
+    "availability",
+    "booking",
+    "price",
+    "details",
+    "delivery",
+    "casual",
+    "unclear",
+  ]);
+  const validFields = new Set([
+    "availability",
+    "price",
+    "price_daily",
+    "price_monthly",
+    "color",
+    "model",
+    "mileage",
+    "condition",
+    "services",
+    "media",
+    "delivery",
+    "unknown",
+  ]);
+  return {
+    intents: {
+      availability: intentsRaw.availability === true,
+      booking: intentsRaw.booking === true,
+      price: intentsRaw.price === true,
+      details: intentsRaw.details === true,
+      delivery: intentsRaw.delivery === true,
+      casual: intentsRaw.casual === true,
+      unclear: intentsRaw.unclear === true,
+    },
+    primaryIntent: validPrimary.has(primary) ? primary : "unclear",
+    askedField: validFields.has(field) ? field : "unknown",
+    confidence:
+      confidence === "high" || confidence === "medium" || confidence === "low"
+        ? confidence
+        : "low",
+    reason: String(obj.reason ?? "").slice(0, 160),
+  };
+}
+
+export async function classifyConversationIntentWithLLM({
+  messageText,
+  selectedItem = null,
+  memory = null,
+  previousAssistantMessage = "",
+  businessContext = null,
+} = {}) {
+  const message = String(messageText ?? "").trim();
+  if (!message) {
+    return { ...UNCLEAR_CONVERSATION_INTENT, reason: "empty_message" };
+  }
+  const itemLabel = formatMatchedItemLabel(selectedItem);
+  const memoryStage =
+    memory && typeof memory === "object" ? String(memory.stage ?? "").trim() : "";
+  const businessType =
+    businessContext && typeof businessContext === "object"
+      ? String(businessContext.businessType ?? businessContext.type ?? "").trim()
+      : "";
+  console.log("[intent_llm_classification_started]", {
+    chars: message.length,
+    hasSelectedItem: Boolean(itemLabel),
+  });
+  if (!openai) {
+    const fallback = { ...UNCLEAR_CONVERSATION_INTENT };
+    console.log("[intent_llm_classification_result]", {
+      primaryIntent: fallback.primaryIntent,
+      askedField: fallback.askedField,
+      confidence: fallback.confidence,
+      reason: fallback.reason,
+    });
+    return fallback;
+  }
+  const system = `Classify the latest WhatsApp customer message by meaning, not keywords.
+Return JSON only with this exact shape:
+{"intents":{"availability":boolean,"booking":boolean,"price":boolean,"details":boolean,"delivery":boolean,"casual":boolean,"unclear":boolean},"primaryIntent":"availability|booking|price|details|delivery|casual|unclear","askedField":"availability|price|price_daily|price_monthly|color|model|mileage|condition|services|media|delivery|unknown","confidence":"high|medium|low","reason":"short internal reason"}
+
+Rules:
+- "available for rent", "rent pe available hai", "mil jaye gi" mean availability, not price.
+- "rent kitna", "rate kya", "how much", "per day", "monthly" mean price.
+- duration or contact for an in-progress booking means booking.
+- color/model/mileage/condition/media/service questions mean details.
+- ok/haan/theek/👍 mean casual.
+- Understand English, Urdu, Roman Urdu, typos, and slang.
+- Do not include prose outside JSON.`;
+  const user = JSON.stringify({
+    latestMessage: message,
+    selectedItem: itemLabel || null,
+    memoryStage: memoryStage || null,
+    previousAssistantMessage: String(previousAssistantMessage ?? "").slice(-500) || null,
+    businessType: businessType || null,
+  });
+  try {
+    const response = await openai.chat.completions.create({
+      model: resolveOpenAiChatModel(),
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    });
+    const raw = response.choices?.[0]?.message?.content ?? "";
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeConversationIntentPayload(parsed);
+    console.log("[intent_llm_classification_result]", {
+      primaryIntent: normalized.primaryIntent,
+      askedField: normalized.askedField,
+      confidence: normalized.confidence,
+      reason: normalized.reason,
+    });
+    return normalized;
+  } catch (error) {
+    console.warn("[intent_llm_classification_failed]", {
+      error: error?.message || String(error),
+    });
+    return { ...UNCLEAR_CONVERSATION_INTENT, reason: "invalid_or_failed_llm_output" };
+  }
+}
+
 /**
  * Strict: only a final line exactly `\n__ROUTE__:GROUP` or `\n__ROUTE__:DM` (case-sensitive) is accepted.
  * @param {string | null | undefined} rawStr
@@ -124,6 +271,12 @@ function formatContextDataForPrompt(ctx) {
     parts.push(
       "Duration is already recorded in thread memory — do not ask again how many days or hours; proceed with pricing or the next booking step."
     );
+  }
+  if (
+    typeof ctx.conversationRouterInstruction === "string" &&
+    ctx.conversationRouterInstruction.trim() !== ""
+  ) {
+    parts.push(`Conversation router: ${ctx.conversationRouterInstruction.trim()}`);
   }
   if (
     typeof ctx.classifierPinnedEntity === "string" &&
