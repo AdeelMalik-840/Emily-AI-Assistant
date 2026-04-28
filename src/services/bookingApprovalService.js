@@ -1,7 +1,6 @@
 import { markItemUnavailableOnApproval } from "./inventoryService.js";
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
 import { sendPlaywrightGroupText } from "./playwrightOutboundBridge.js";
-import { replyPrivatelyToLatestUserMessage } from "./playwrightReplyPrivatelyBridge.js";
 import {
   getBusinessWhatsAppLink,
   getGroupDmHandoffText,
@@ -11,7 +10,6 @@ import {
   getEmilySessionState,
   patchEmilySessionState,
 } from "./conversationIntelligence.js";
-import { buildCustomerApprovalContinuation } from "./customerApprovalContinuation.js";
 import { chatSessionKey } from "./memory.js";
 
 /**
@@ -40,90 +38,6 @@ function isRoutableDmTarget(value) {
 
 function bookingOwnerApprovalFirstEnabled() {
   return /^true$/i.test(String(process.env.BOOKING_OWNER_APPROVAL_FIRST ?? "").trim());
-}
-
-function playwrightReplyPrivatelyEnabled() {
-  return /^true$/i.test(
-    String(process.env.PLAYWRIGHT_REPLY_PRIVATELY_ENABLED ?? "").trim()
-  );
-}
-
-function resolveApprovalResponseStyle(booking) {
-  return (
-    String(
-      booking?.conversationStyle ??
-        booking?.userLanguageStyle ??
-        booking?.languageStyle ??
-        ""
-    ).trim() || "casual_local"
-  );
-}
-
-function buildOwnerApprovedBookingCustomerEvent({ booking, canDmCustomer }) {
-  return {
-    eventType: "OWNER_APPROVED_BOOKING",
-    itemName: String(booking?.itemName ?? "").trim() || null,
-    durationDays:
-      booking?.durationDays != null && Number.isFinite(Number(booking.durationDays))
-        ? Math.max(1, Math.floor(Number(booking.durationDays)))
-        : null,
-    approvalStage: "owner_approved_waiting_customer_details",
-    canDmCustomer: Boolean(canDmCustomer),
-    privacyMode: canDmCustomer ? "dm" : "group_safe",
-    requiredCustomerAction: "share_pickup_or_delivery_details_in_private_chat",
-  };
-}
-
-function resolveOriginalCustomerPhone(booking) {
-  const candidates = [
-    booking?.originalCustomerPhone,
-    booking?.dmTargetPhone,
-    booking?.customerPhone,
-  ];
-  for (const candidate of candidates) {
-    const raw = String(candidate ?? "").trim();
-    if (isRoutableDmTarget(raw)) return raw;
-  }
-  return "";
-}
-
-function isPlaywrightGroupBooking(booking) {
-  return (
-    String(booking?.bookingSource ?? "").trim() === "PLAYWRIGHT_GROUP" ||
-    (String(booking?.source ?? "").trim().toLowerCase() === "playwright" &&
-      Boolean(
-        String(booking?.sourceGroupName ?? booking?.groupName ?? "").trim() ||
-          String(booking?.sourcePlaywrightChatKey ?? booking?.playwrightChatKey ?? "").trim()
-      ))
-  );
-}
-
-function buildSourceMessageForReplyPrivately(booking) {
-  return {
-    sourceRowKey:
-      String(booking?.originalMessageRowKey ?? booking?.sourceRowKey ?? "").trim() ||
-      null,
-    sourceMessageId: String(booking?.sourceMessageId ?? "").trim() || null,
-    sourceText:
-      String(booking?.originalUserMessageText ?? booking?.sourceText ?? "").trim() ||
-      null,
-    sourceTimestamp:
-      booking?.originalMessageTimestamp != null &&
-      Number.isFinite(Number(booking.originalMessageTimestamp))
-        ? Number(booking.originalMessageTimestamp)
-        : booking?.sourceTimestamp != null && Number.isFinite(Number(booking.sourceTimestamp))
-          ? Number(booking.sourceTimestamp)
-          : null,
-    sourceSenderScope:
-      String(booking?.sourceSenderScope ?? booking?.senderScope ?? "").trim() || null,
-    sourceParticipantName:
-      String(
-        booking?.originalCustomerDisplayName ??
-          booking?.sourceParticipantName ??
-          booking?.participantName ??
-          ""
-      ).trim() || null,
-  };
 }
 
 function updateSessionBookingStateFromApproval({ userId, bookingId, booking, status, approvalStage }) {
@@ -310,7 +224,6 @@ export function parseApprovalButtonId(buttonId) {
  *   sendCredentials?: { accessToken?: string, phoneNumberId?: string } | null,
  *   sendGroupText?: typeof sendPlaywrightGroupText,
  *   sendMessage?: typeof sendWhatsAppMessage,
- *   replyPrivately?: typeof replyPrivatelyToLatestUserMessage,
  *   markUnavailable?: typeof markItemUnavailableOnApproval,
  * }} p
  * @returns {Promise<{ ok: boolean, status?: "approved" | "rejected" }>}
@@ -324,7 +237,6 @@ export async function handleBookingApproval({
   sendCredentials = null,
   sendGroupText = sendPlaywrightGroupText,
   sendMessage = sendWhatsAppMessage,
-  replyPrivately = replyPrivatelyToLatestUserMessage,
   markUnavailable = markItemUnavailableOnApproval,
 }) {
   try {
@@ -493,145 +405,6 @@ export async function handleBookingApproval({
           approvalCustomerNotificationStatus: "pending",
           updatedAt: new Date(),
         });
-
-        const customerPhone = resolveOriginalCustomerPhone(data);
-        const canReplyPrivately =
-          !customerPhone &&
-          isPlaywrightGroupBooking(data) &&
-          data?.playwrightReplyPrivateEligible === true &&
-          playwrightReplyPrivatelyEnabled();
-        const responseStyle = resolveApprovalResponseStyle(data);
-        const customerContinuation = buildCustomerApprovalContinuation(
-          buildOwnerApprovedBookingCustomerEvent({
-            booking: data,
-            canDmCustomer: Boolean(customerPhone || canReplyPrivately),
-          }),
-          responseStyle
-        );
-
-        if (customerPhone) {
-          try {
-            console.log("[approval_customer_notify_cloud_started]", {
-              bookingId: bid,
-              hasCustomerPhone: true,
-            });
-            const cloudResult = await sendMessage(customerPhone, customerContinuation, sendCredentials ?? undefined, {
-              recipientType: "individual",
-            });
-            if (cloudResult?.ok === false) {
-              throw new Error("CLOUD_DM_SEND_RETURNED_FALSE");
-            }
-            await bookingRef.update({
-              approvalCustomerNotificationStatus: "sent",
-              approvalCustomerNotificationSentAt: new Date(),
-              approvalCustomerNotificationMethod: "cloud_dm",
-              dmAttempted: true,
-              dmOpened: true,
-              dmMessageSent: true,
-              updatedAt: new Date(),
-            });
-            console.log("[approval_customer_notify_cloud_sent]", { bookingId: bid });
-          } catch (cloudErr) {
-            await bookingRef.update({
-              approvalCustomerNotificationStatus: "failed",
-              approvalCustomerNotificationMethod: "cloud_dm",
-              approvalCustomerNotificationError: String(cloudErr?.message ?? cloudErr ?? ""),
-              updatedAt: new Date(),
-            });
-            console.warn("[approval_customer_notify_failed]", {
-              bookingId: bid,
-              method: "cloud_dm",
-              reason: String(cloudErr?.message ?? cloudErr ?? ""),
-            });
-          }
-        } else if (canReplyPrivately) {
-          const groupName = String(data?.sourceGroupName ?? data?.groupName ?? "").trim();
-          const playwrightChatKey = String(
-            data?.sourcePlaywrightChatKey ?? data?.playwrightChatKey ?? data?.chatKey ?? ""
-          ).trim();
-          try {
-            console.log("[approval_customer_notify_reply_private_started]", {
-              bookingId: bid,
-              groupName: groupName || null,
-              playwrightChatKey: playwrightChatKey || null,
-            });
-            const privateResult = await replyPrivately({
-              bookingId: bid,
-              groupName: groupName || null,
-              playwrightChatKey: playwrightChatKey || null,
-              message: customerContinuation,
-              sourceMessage: buildSourceMessageForReplyPrivately(data),
-              disallowedChatTitles: [groupName, normalizePhone(ownerPhone)].filter(Boolean),
-            });
-            const patch = {
-              dmAttempted: true,
-              dmOpened: Boolean(privateResult?.dmOpened || privateResult?.ok),
-              dmMessageSent: Boolean(
-                privateResult?.ok && privateResult?.dmMessageSent !== false
-              ),
-              dmChatTitle: String(privateResult?.dmChatTitle ?? "").trim() || null,
-              dmPlaywrightChatKey:
-                String(privateResult?.dmPlaywrightChatKey ?? "").trim() || null,
-              approvalCustomerNotificationMethod: "reply_privately",
-              updatedAt: new Date(),
-            };
-            if (privateResult?.ok) {
-              await bookingRef.update({
-                ...patch,
-                approvalCustomerNotificationStatus: "sent",
-                approvalCustomerNotificationSentAt: new Date(),
-                dmOpenMethod: "reply_privately",
-              });
-              console.log("[approval_customer_notify_reply_private_sent]", {
-                bookingId: bid,
-              });
-            } else {
-              await bookingRef.update({
-                ...patch,
-                approvalCustomerNotificationStatus: "failed",
-                approvalCustomerNotificationError: String(
-                  privateResult?.reason ?? "UNKNOWN"
-                ),
-              });
-              console.warn("[approval_customer_notify_failed]", {
-                bookingId: bid,
-                method: "reply_privately",
-                reason: String(privateResult?.reason ?? "UNKNOWN"),
-              });
-            }
-          } catch (privateErr) {
-            await bookingRef.update({
-              approvalCustomerNotificationStatus: "failed",
-              approvalCustomerNotificationMethod: "reply_privately",
-              approvalCustomerNotificationError: String(
-                privateErr?.message ?? privateErr ?? ""
-              ),
-              dmAttempted: true,
-              dmOpened: false,
-              dmMessageSent: false,
-              updatedAt: new Date(),
-            });
-            console.warn("[approval_customer_notify_failed]", {
-              bookingId: bid,
-              method: "reply_privately",
-              reason: String(privateErr?.message ?? privateErr ?? ""),
-            });
-          }
-        } else {
-          await bookingRef.update({
-            approvalCustomerNotificationStatus: "skipped",
-            approvalCustomerNotificationError: "MISSING_CUSTOMER_NOTIFICATION_TARGET",
-            updatedAt: new Date(),
-          });
-          console.warn("[approval_customer_notify_missing_target]", {
-            bookingId: bid,
-            bookingSource: data?.bookingSource ?? null,
-            hasOriginalCustomerPhone: false,
-            playwrightReplyPrivateEligible:
-              data?.playwrightReplyPrivateEligible === true,
-            playwrightReplyPrivatelyEnabled: playwrightReplyPrivatelyEnabled(),
-          });
-        }
       }
     }
 

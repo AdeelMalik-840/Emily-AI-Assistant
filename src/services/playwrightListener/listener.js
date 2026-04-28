@@ -29,6 +29,7 @@ import {
   setMessageState,
 } from "../messageState.js";
 import { clearWhatsAppInboundMessageCaches } from "../whatsappInboundBuffer.js";
+import { pollLocalApprovalContinuations } from "../localApprovalContinuationPoller.js";
 
 /** Open chat identity: sidebar `span[title]` for the target row (not header text). */
 globalThis.__currentOpenChatTitle =
@@ -334,6 +335,8 @@ let pollTimer = null;
 let heartbeatTimer = null;
 /** @type {ReturnType<typeof setInterval> | null} */
 let interruptPollTimer = null;
+/** @type {ReturnType<typeof setInterval> | null} */
+let localApprovalContinuationTimer = null;
 let listenerStarted = false;
 let isStopping = false;
 const PLAYWRIGHT_CHAT_RESPONSE_COOLDOWN_MS = Math.max(
@@ -2962,6 +2965,18 @@ async function runListenerBody() {
     }
   }, 60_000);
 
+  localApprovalContinuationTimer = setInterval(() => {
+    if (isStopping) return;
+    void pollLocalApprovalContinuations().catch((err) => {
+      if (!isStopping) {
+        console.warn(
+          "[local_approval_reply_private_failed]",
+          { bookingId: null, reason: err?.message || String(err) }
+        );
+      }
+    });
+  }, 5_000);
+
   if (isPlaywrightChatLoopEnabled()) {
     if (globalThis.chatLoopInterval != null) {
       clearInterval(globalThis.chatLoopInterval);
@@ -3077,6 +3092,10 @@ export async function stopPlaywrightListener() {
   if (interruptPollTimer) {
     clearInterval(interruptPollTimer);
     interruptPollTimer = null;
+  }
+  if (localApprovalContinuationTimer) {
+    clearInterval(localApprovalContinuationTimer);
+    localApprovalContinuationTimer = null;
   }
 
   if (pollTimer) {

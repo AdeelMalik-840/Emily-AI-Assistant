@@ -11,6 +11,7 @@ import {
   buildCustomerApprovalContinuation,
 } from "../src/services/customerApprovalContinuation.js";
 import { resolveReplyPrivatelyTarget } from "../src/services/playwrightReplyPrivatelyBridge.js";
+import { pollLocalApprovalContinuations } from "../src/services/localApprovalContinuationPoller.js";
 
 function createFakeDb({ booking, business = {} }) {
   const store = {
@@ -59,12 +60,56 @@ function createFakeDb({ booking, business = {} }) {
   }
 
   class CollectionRef {
-    constructor(path) {
+    constructor(path, conditions = [], resultLimit = null) {
       this.path = path;
+      this.conditions = conditions;
+      this.resultLimit = resultLimit;
     }
 
     doc(id) {
       return new DocRef([...this.path, id]);
+    }
+
+    where(field, op, value) {
+      return new CollectionRef(
+        this.path,
+        [...this.conditions, { field, op, value }],
+        this.resultLimit
+      );
+    }
+
+    limit(n) {
+      return new CollectionRef(this.path, this.conditions, n);
+    }
+
+    async get() {
+      const collectionNode = this._collectionNode();
+      let entries = Object.entries(collectionNode ?? {});
+      for (const condition of this.conditions) {
+        entries = entries.filter(([, node]) => {
+          if (condition.op !== "==") return false;
+          return node?.data?.[condition.field] === condition.value;
+        });
+      }
+      if (this.resultLimit != null) entries = entries.slice(0, this.resultLimit);
+      return {
+        docs: entries.map(([id, node]) => ({
+          id,
+          ref: new DocRef([...this.path, id]),
+          data: () => ({ ...(node?.data ?? {}) }),
+        })),
+      };
+    }
+
+    _collectionNode() {
+      let node = store;
+      for (let i = 0; i < this.path.length; i += 2) {
+        const collection = this.path[i];
+        if (i === this.path.length - 1) return node?.[collection] ?? null;
+        const id = this.path[i + 1];
+        node = node?.[collection]?.[id];
+      }
+      return null;
     }
   }
 
@@ -179,7 +224,7 @@ test("approve button id approve:<bookingId> drives approval handler", async () =
   assert.equal(store.businesses.owner1.bookings["book-1"].data.status, "approved");
 });
 
-test("approved booking without customer target logs missing target without group send", async () => {
+test("approval queues customer notification without group fallback or local Playwright call", async () => {
   const { db, store } = createFakeDb({
     booking: {
       id: "book-2",
@@ -199,7 +244,8 @@ test("approved booking without customer target logs missing target without group
     },
   });
   const groupSends = [];
-  const { warns } = await captureConsole(() =>
+  const replyPrivatelyCalls = [];
+  await captureConsole(() =>
     handleBookingApproval({
       db,
       userId: "owner1",
@@ -211,23 +257,27 @@ test("approved booking without customer target logs missing target without group
         return true;
       },
       sendMessage: async () => ({ ok: true }),
+      replyPrivately: async (opts) => {
+        replyPrivatelyCalls.push(opts);
+        return { ok: true };
+      },
       markUnavailable: async () => undefined,
     })
   );
 
   assert.equal(groupSends.length, 0);
+  assert.equal(replyPrivatelyCalls.length, 0);
   assert.equal(
     store.businesses.owner1.bookings["book-2"].data.approvalStage,
     "owner_approved_waiting_customer_details"
   );
   assert.equal(
     store.businesses.owner1.bookings["book-2"].data.approvalCustomerNotificationStatus,
-    "skipped"
+    "pending"
   );
-  assert.ok(warns.find((entry) => entry[0] === "[approval_customer_notify_missing_target]"));
 });
 
-test("approval calls reply privately bridge when flag enabled", async () => {
+test("approval leaves Playwright group continuation pending for local poller", async () => {
   await withReplyPrivatelyFlag("true", async () => {
     const { db, store } = createFakeDb({
       booking: {
@@ -282,47 +332,41 @@ test("approval calls reply privately bridge when flag enabled", async () => {
     });
 
     assert.equal(result.ok, true);
-    assert.equal(replyPrivatelyCalls.length, 1);
-    assert.equal(replyPrivatelyCalls[0].groupName, "Rental Leads");
-    assert.equal(replyPrivatelyCalls[0].playwrightChatKey, "Rental Leads");
-    assert.ok(replyPrivatelyCalls[0].disallowedChatTitles.includes("+923331234567"));
-    assert.match(replyPrivatelyCalls[0].message, /Corolla/);
-    assert.match(replyPrivatelyCalls[0].message, /4 din/);
-    assert.doesNotMatch(replyPrivatelyCalls[0].message, /private chat/i);
+    assert.equal(replyPrivatelyCalls.length, 0);
     assert.equal(groupSends.length, 0);
     assert.equal(cloudSends.length, 1);
     assert.equal(cloudSends[0][0], "+923331234567");
     assert.equal(cloudSends[0][1], "Booking approved.");
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.dmOpenMethod,
-      "reply_privately"
+      undefined
     );
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.dmChatTitle,
-      "Ali Khan"
+      undefined
     );
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.dmPlaywrightChatKey,
-      "ali khan"
+      undefined
     );
-    assert.equal(store.businesses.owner1.bookings["book-rp-1"].data.dmAttempted, true);
-    assert.equal(store.businesses.owner1.bookings["book-rp-1"].data.dmOpened, true);
+    assert.equal(store.businesses.owner1.bookings["book-rp-1"].data.dmAttempted, undefined);
+    assert.equal(store.businesses.owner1.bookings["book-rp-1"].data.dmOpened, undefined);
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.dmMessageSent,
-      true
+      undefined
     );
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.approvalCustomerNotificationStatus,
-      "sent"
+      "pending"
     );
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.approvalCustomerNotificationMethod,
-      "reply_privately"
+      undefined
     );
   });
 });
 
-test("booking with original customer phone sends Cloud DM and owner gets only admin ack", async () => {
+test("approval with original customer phone still sends only owner admin ack from webhook", async () => {
   const { db, store } = createFakeDb({
     booking: {
       id: "book-cloud-1",
@@ -361,19 +405,17 @@ test("booking with original customer phone sends Cloud DM and owner gets only ad
     markUnavailable: async () => undefined,
   });
 
-  assert.equal(cloudSends.length, 2);
+  assert.equal(cloudSends.length, 1);
   assert.equal(cloudSends[0][0], "+923331234567");
   assert.equal(cloudSends[0][1], "Booking approved.");
-  assert.equal(cloudSends[1][0], "+923001111111");
-  assert.match(cloudSends[1][1], /Corolla/);
   assert.doesNotMatch(cloudSends[0][1], /Corolla|delivery|pickup|private/i);
   assert.equal(
     store.businesses.owner1.bookings["book-cloud-1"].data.approvalCustomerNotificationStatus,
-    "sent"
+    "pending"
   );
   assert.equal(
     store.businesses.owner1.bookings["book-cloud-1"].data.approvalCustomerNotificationMethod,
-    "cloud_dm"
+    undefined
   );
 });
 
@@ -417,7 +459,7 @@ test("duplicate approval does not send duplicate customer DM", async () => {
   );
 });
 
-test("Playwright inactive reply privately failure marks failed without group fallback", async () => {
+test("approval does not mark Reply Privately failed when local Playwright is inactive", async () => {
   await withReplyPrivatelyFlag("true", async () => {
     const { db, store } = createFakeDb({
       booking: {
@@ -443,7 +485,7 @@ test("Playwright inactive reply privately failure marks failed without group fal
     const groupSends = [];
     const cloudSends = [];
 
-    const { result, warns } = await captureConsole(() =>
+    const { result } = await captureConsole(() =>
       handleBookingApproval({
         db,
         userId: "owner1",
@@ -474,31 +516,31 @@ test("Playwright inactive reply privately failure marks failed without group fal
       store.businesses.owner1.bookings["book-rp-2"].data.dmOpenMethod,
       undefined
     );
-    assert.equal(store.businesses.owner1.bookings["book-rp-2"].data.dmAttempted, true);
-    assert.equal(store.businesses.owner1.bookings["book-rp-2"].data.dmOpened, false);
+    assert.equal(store.businesses.owner1.bookings["book-rp-2"].data.dmAttempted, undefined);
+    assert.equal(store.businesses.owner1.bookings["book-rp-2"].data.dmOpened, undefined);
     assert.equal(
       store.businesses.owner1.bookings["book-rp-2"].data.dmMessageSent,
-      false
+      undefined
     );
     assert.equal(cloudSends.length, 1);
     assert.equal(cloudSends[0][0], "+923331234567");
     assert.equal(cloudSends[0][1], "Booking approved.");
     assert.equal(
       store.businesses.owner1.bookings["book-rp-2"].data.approvalCustomerNotificationStatus,
-      "failed"
+      "pending"
     );
-    assert.ok(warns.find((entry) => entry[0] === "[approval_customer_notify_failed]"));
   });
 });
 
-test("two group bookings use the approved booking source metadata", async () => {
+test("local approval poller uses the approved booking source metadata", async () => {
   await withReplyPrivatelyFlag("true", async () => {
-    const { db } = createFakeDb({
+    const { db, store } = createFakeDb({
       booking: {
         id: "book-user-a",
         data: {
-          status: "pending_approval",
-          approvalStage: "pending_owner_approval",
+          status: "approved",
+          approvalStage: "owner_approved_waiting_customer_details",
+          approvalCustomerNotificationStatus: "pending",
           ownerNotificationPhone: "+923331234567",
           itemId: "item-a",
           itemName: "Civic",
@@ -521,13 +563,9 @@ test("two group bookings use the approved booking source metadata", async () => 
     });
     const replyPrivatelyCalls = [];
 
-    await handleBookingApproval({
-      db,
-      userId: "owner1",
-      bookingId: "book-user-a",
-      action: "approve",
-      senderPhone: "+923331234567",
-      sendGroupText: async () => true,
+    await pollLocalApprovalContinuations({
+      dbInstance: db,
+      ownerUserId: "owner1",
       replyPrivately: async (opts) => {
         replyPrivatelyCalls.push(opts);
         return {
@@ -538,8 +576,6 @@ test("two group bookings use the approved booking source metadata", async () => 
           dmPlaywrightChatKey: "ali",
         };
       },
-      sendMessage: async () => ({ ok: true }),
-      markUnavailable: async () => undefined,
     });
 
     assert.equal(replyPrivatelyCalls.length, 1);
@@ -548,7 +584,65 @@ test("two group bookings use the approved booking source metadata", async () => 
     assert.equal(replyPrivatelyCalls[0].sourceMessage.sourceSenderScope, "sender-a");
     assert.equal(replyPrivatelyCalls[0].sourceMessage.sourceParticipantName, "Ali");
     assert.equal(replyPrivatelyCalls[0].sourceMessage.sourceRowKey, "row:1000:49075869#1");
+    assert.equal(
+      store.businesses.owner1.bookings["book-user-a"].data.approvalCustomerNotificationStatus,
+      "sent"
+    );
+    assert.equal(
+      store.businesses.owner1.bookings["book-user-a"].data.approvalCustomerNotificationMethod,
+      "reply_privately"
+    );
   });
+});
+
+test("local approval poller marks Reply Privately failure without owner fallback", async () => {
+  const { db, store } = createFakeDb({
+    booking: {
+      id: "book-local-fail",
+      data: {
+        status: "approved",
+        approvalStage: "owner_approved_waiting_customer_details",
+        approvalCustomerNotificationStatus: "pending",
+        ownerNotificationPhone: "+923331234567",
+        itemId: "item-a",
+        itemName: "Civic",
+        durationDays: 4,
+        bookingSource: "PLAYWRIGHT_GROUP",
+        playwrightReplyPrivateEligible: true,
+        groupName: "Rental Leads",
+        playwrightChatKey: "Rental Leads",
+        sourceText: "4 din",
+        sourceRowKey: "row:1000:49075869#1",
+      },
+    },
+  });
+
+  await pollLocalApprovalContinuations({
+    dbInstance: db,
+    ownerUserId: "owner1",
+    replyPrivately: async () => ({
+      ok: false,
+      reason: "NO_ACTIVE_PAGE",
+      dmOpened: false,
+      dmMessageSent: false,
+    }),
+  });
+
+  assert.equal(
+    store.businesses.owner1.bookings["book-local-fail"].data
+      .approvalCustomerNotificationStatus,
+    "failed"
+  );
+  assert.equal(
+    store.businesses.owner1.bookings["book-local-fail"].data
+      .approvalCustomerNotificationMethod,
+    "reply_privately"
+  );
+  assert.equal(
+    store.businesses.owner1.bookings["book-local-fail"].data
+      .approvalCustomerNotificationError,
+    "NO_ACTIVE_PAGE"
+  );
 });
 
 test("reply privately target resolver does not use latest when source metadata matches earlier bubble", () => {
@@ -764,8 +858,8 @@ test("owner-approval-first waiting engagement asks one qualifying question", () 
   assert.match(copy, /within the city|outside the city/i);
 });
 
-test("missing target logs failure and does not silently succeed", async () => {
-  const { db } = createFakeDb({
+test("missing target remains pending for out-of-webhook continuation and does not send fallback", async () => {
+  const { db, store } = createFakeDb({
     booking: {
       id: "book-3",
       data: {
@@ -781,7 +875,7 @@ test("missing target logs failure and does not silently succeed", async () => {
   });
   let sendAttempted = false;
 
-  const { result, warns } = await captureConsole(() =>
+  const { result } = await captureConsole(() =>
     handleBookingApproval({
       db,
       userId: "owner1",
@@ -799,12 +893,10 @@ test("missing target logs failure and does not silently succeed", async () => {
 
   assert.equal(result.ok, true);
   assert.equal(sendAttempted, false);
-  const failureLog = warns.find(
-    (entry) => entry[0] === "[approval_customer_notify_missing_target]"
+  assert.equal(
+    store.businesses.owner1.bookings["book-3"].data.approvalCustomerNotificationStatus,
+    "pending"
   );
-  assert.ok(failureLog);
-  assert.equal(failureLog[1].bookingSource, null);
-  assert.equal(failureLog[1].hasOriginalCustomerPhone, false);
 });
 
 test("reject button still works", async () => {
