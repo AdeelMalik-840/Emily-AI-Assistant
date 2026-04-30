@@ -59,6 +59,58 @@ function shortBookingLabel(booking) {
   );
 }
 
+function clean(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeKey(value) {
+  return clean(value).toLowerCase();
+}
+
+function itemKey(item) {
+  if (!item || typeof item !== "object") return "";
+  const id = clean(item.itemId ?? item.id ?? item.inventoryItemId);
+  if (id) return `id:${normalizeKey(id)}`;
+  const name = clean(
+    item.itemName ?? item.itemLabel ?? item.displayLabel ?? item.name ?? item.label
+  );
+  return name ? `name:${normalizeKey(name)}` : "";
+}
+
+function bookingItemKey(booking) {
+  return itemKey({
+    itemId: booking?.itemId ?? booking?.inventoryItemId,
+    itemName: booking?.itemName ?? booking?.itemLabel ?? booking?.name,
+  });
+}
+
+function bookingParticipantKey(booking) {
+  return (
+    clean(
+      booking?.sourceIdentity?.participantKey ??
+        booking?.sourceParticipantKey ??
+        booking?.sourceIdentity?.participantPhone ??
+        booking?.sourceIdentity?.participantName ??
+        booking?.originalCustomerPhone ??
+        booking?.sourceParticipantPhone ??
+        booking?.customerPhone ??
+        booking?.dmTargetPhone ??
+        booking?.sessionKey
+    ) || ""
+  );
+}
+
+function bookingGroupKey(booking) {
+  return clean(
+    booking?.sourceIdentity?.groupChatKey ??
+      booking?.sourcePlaywrightChatKey ??
+      booking?.playwrightChatKey ??
+      booking?.chatKey ??
+      booking?.groupName ??
+      booking?.sourceIdentity?.groupName
+  );
+}
+
 function uniqueBookings(bookings) {
   const seen = new Set();
   const out = [];
@@ -71,6 +123,140 @@ function uniqueBookings(bookings) {
   return out;
 }
 
+function hasContactSignal(text, extractedSlots = {}) {
+  return Boolean(
+    clean(extractedSlots.contact) ||
+      clean(extractedSlots.contactPhone) ||
+      /(?:\+92|0092|92|0)?3[\d\s-]{9,14}/.test(String(text ?? ""))
+  );
+}
+
+function hasTimeSignal(text, extractedSlots = {}) {
+  return Boolean(
+    clean(extractedSlots.deliveryTime) ||
+      /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i.test(String(text ?? "")) ||
+      /\b(?:at|around|by|time)\s+(\d{1,2})(?::(\d{2}))?\b/i.test(String(text ?? "")) ||
+      /\b(\d{1,2})(?::(\d{2}))?\s*(?:baje|bjay)\b/i.test(String(text ?? ""))
+  );
+}
+
+function hasAddressSignal(text, extractedSlots = {}) {
+  const raw = String(text ?? "").trim();
+  const lower = raw.toLowerCase();
+  if (clean(extractedSlots.address) || clean(extractedSlots.location)) return true;
+  if (/^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(lower)) return false;
+  return (
+    /\b(deliver|delivery|address|location|loc|ghar|home|office|flat|house|street|road|sector|phase|block|near|opposite|mall|market|area|kahan|kidhar)\b/i.test(
+      raw
+    ) || raw.length >= 12
+  );
+}
+
+function missingDetailForSignal({ booking, messageText, extractedSlots }) {
+  const contact = hasContactSignal(messageText, extractedSlots);
+  const address = hasAddressSignal(messageText, extractedSlots);
+  const time = hasTimeSignal(messageText, extractedSlots);
+  if (contact && !clean(booking?.customerPhone) && !clean(booking?.contactPhone)) {
+    return "contact";
+  }
+  if (address && !clean(booking?.deliveryAddress)) return "address";
+  if (time && !clean(booking?.deliveryTime)) return "delivery_time";
+  return "";
+}
+
+export function evaluateBookingAttachmentAuthority({
+  messageText = "",
+  currentParticipantKey = "",
+  candidateParticipantKey = "",
+  resolvedCurrentItem = null,
+  candidateBookingItem = null,
+  candidateBooking = null,
+  currentIntent = "",
+  extractedSlots = {},
+  hasExplicitCurrentMessageItem = false,
+  messageRole = "dm",
+} = {}) {
+  const role = normalizeKey(messageRole) || "dm";
+  const currentKey = clean(currentParticipantKey);
+  const candidateKey = clean(candidateParticipantKey);
+  const currentItemKey = itemKey(resolvedCurrentItem);
+  const candidateItemKey = itemKey(candidateBookingItem);
+  const lower = String(messageText ?? "").toLowerCase();
+  const intent = normalizeKey(currentIntent);
+
+  if (role === "group" && !currentKey) {
+    return { allowed: false, reason: "PARTICIPANT_MISSING" };
+  }
+  if (!currentKey) {
+    return { allowed: false, reason: "PARTICIPANT_MISSING" };
+  }
+  if (!candidateKey) {
+    return { allowed: false, reason: "CANDIDATE_PARTICIPANT_MISSING" };
+  }
+  if (currentKey && candidateKey && currentKey !== candidateKey) {
+    return { allowed: false, reason: "PARTICIPANT_MISMATCH" };
+  }
+  if (intent === "availability" || isBookingAttachAvailabilityQuery({ message: messageText, intent })) {
+    return { allowed: false, reason: "AVAILABILITY_QUERY" };
+  }
+  if (/\b(cancel|cancelled|canceled|nahi chahiye|not needed|stop)\b/i.test(lower)) {
+    return { allowed: false, reason: "CANCELLATION_OR_NEGATION" };
+  }
+  if (
+    /\b(correct|correction|actually|instead|change|replace|wrong|galat|nahi\s+yeh|nahi\s+woh)\b/i.test(
+      lower
+    )
+  ) {
+    return { allowed: false, reason: "CORRECTION_OR_ITEM_CHANGE" };
+  }
+  if (
+    /\b(book|booking|reserve|reservation|order|chahiye|chaiye|need|want)\b/i.test(lower) &&
+    !/\b(deliver|delivery|address|location|loc|ghar|home|office|flat|house|street|road|sector|phase|block|near|opposite|mall|market|area|pickup)\b/i.test(
+      lower
+    ) &&
+    !hasContactSignal(messageText, extractedSlots) &&
+    !hasTimeSignal(messageText, extractedSlots)
+  ) {
+    return { allowed: false, reason: "FRESH_BOOKING_OR_INQUIRY" };
+  }
+  if (hasExplicitCurrentMessageItem) {
+    return { allowed: false, reason: "EXPLICIT_CURRENT_ITEM" };
+  }
+  if (currentItemKey && candidateItemKey && currentItemKey !== candidateItemKey) {
+    return { allowed: false, reason: "ITEM_MISMATCH" };
+  }
+
+  const expectedDetail = missingDetailForSignal({
+    booking: candidateBooking || candidateBookingItem || {},
+    messageText,
+    extractedSlots,
+  });
+  if (!expectedDetail) {
+    return { allowed: false, reason: "NO_EXPECTED_MISSING_DETAIL" };
+  }
+  return { allowed: true, reason: `MISSING_${expectedDetail.toUpperCase()}` };
+}
+
+export function isBookingAttachAvailabilityQuery({ message = "", intent = "" } = {}) {
+  const raw = String(message ?? "").trim();
+  const lower = raw.toLowerCase();
+  const normalizedIntent = String(intent ?? "").trim().toLowerCase();
+  const hasAvailabilityWord = /\b(avail|available|availability)\b/i.test(lower);
+  const hasBookingKeyword =
+    /\b(confirm|book|booking|reserve|reservation|chahiye|chaiye|order|bhej\s*do|send|deliver|delivery|address|location|pickup)\b/i.test(
+      lower
+    );
+  const hasQuestionShape =
+    raw.includes("?") ||
+    /\b(hai|maujood|mojood|mil(?:e|ay|a)?|milega|mila|stock)\b/i.test(lower);
+
+  return Boolean(
+    normalizedIntent === "availability" ||
+      hasAvailabilityWord ||
+      (!hasBookingKeyword && hasQuestionShape)
+  );
+}
+
 export function selectApprovedBookingDetailsMatch({
   bookings = [],
   message = "",
@@ -78,12 +264,14 @@ export function selectApprovedBookingDetailsMatch({
   sessionKey = "",
   groupName = "",
   scope = "dm",
+  isAvailabilityQuery = false,
+  authorityContext = {},
 } = {}) {
   const waiting = uniqueBookings(bookings).filter(isDeliveryWaitingBooking);
   const referenceMatches = waiting.filter((booking) =>
     bookingMatchesReference(message, booking)
   );
-  const scoped =
+  const initialScoped =
     referenceMatches.length > 0
       ? referenceMatches
       : waiting.filter((booking) => {
@@ -106,6 +294,30 @@ export function selectApprovedBookingDetailsMatch({
           }
           return sameSession || sameGroup;
         });
+  let scoped = initialScoped;
+  if (scope === "group") {
+    const participantKey = clean(authorityContext.currentParticipantKey);
+    const requestedGroupKey = clean(
+      authorityContext.groupChatKey ?? groupName ?? sessionKey
+    );
+    const participantScoped = participantKey
+      ? initialScoped.filter(
+          (booking) => bookingParticipantKey(booking) === participantKey
+        )
+      : [];
+    const groupScoped = requestedGroupKey
+      ? participantScoped.filter((booking) => {
+          const candidateGroup = bookingGroupKey(booking);
+          return !candidateGroup || candidateGroup === requestedGroupKey;
+        })
+      : participantScoped;
+    console.log("[booking_candidates_filtered_by_participant]", {
+      totalGlobalCandidates: initialScoped.length,
+      participantCandidates: groupScoped.length,
+      participantKey: participantKey || null,
+    });
+    scoped = groupScoped;
+  }
 
   console.log("[booking_details_match_candidates]", {
     scope,
@@ -134,7 +346,62 @@ export function selectApprovedBookingDetailsMatch({
       candidates: referenceMatches,
     };
   }
+  if (isAvailabilityQuery) {
+    console.log("[booking_attach_blocked_availability]", {
+      scope,
+      candidateCount: scoped.length,
+      reason: "AVAILABILITY_QUERY",
+    });
+    return { match: null, reason: "availability_query", candidates: scoped };
+  }
   if (scoped.length === 1) {
+    const candidate = scoped[0];
+    const authority = evaluateBookingAttachmentAuthority({
+      messageText: message,
+      currentParticipantKey: authorityContext.currentParticipantKey,
+      candidateParticipantKey:
+        authorityContext.candidateParticipantKey ?? bookingParticipantKey(candidate),
+      resolvedCurrentItem: authorityContext.resolvedCurrentItem,
+      candidateBookingItem:
+        authorityContext.candidateBookingItem ?? {
+          itemId: candidate?.itemId ?? candidate?.inventoryItemId,
+          itemName: candidate?.itemName ?? candidate?.itemLabel ?? candidate?.name,
+        },
+      candidateBooking: candidate,
+      currentIntent: authorityContext.currentIntent,
+      extractedSlots: authorityContext.extractedSlots,
+      hasExplicitCurrentMessageItem: authorityContext.hasExplicitCurrentMessageItem,
+      messageRole: authorityContext.messageRole ?? scope,
+    });
+    const currentItemKey = itemKey(authorityContext.resolvedCurrentItem);
+    const candidateItem = {
+      itemId: candidate?.itemId ?? candidate?.inventoryItemId,
+      itemName: candidate?.itemName ?? candidate?.itemLabel ?? candidate?.name,
+    };
+    const candidateItemKey = itemKey(candidateItem);
+    const candidateParticipant = bookingParticipantKey(candidate);
+    if (!authority.allowed) {
+      console.log("[booking_attach_authority_blocked]", {
+        reason: authority.reason,
+        currentParticipantKey: clean(authorityContext.currentParticipantKey) || null,
+        candidateParticipantKey: candidateParticipant || null,
+        currentItemKey: currentItemKey || null,
+        candidateItemKey: candidateItemKey || null,
+      });
+      return {
+        match: null,
+        reason: "authority_blocked",
+        authorityReason: authority.reason,
+        candidates: scoped,
+      };
+    }
+    console.log("[booking_attach_authority_allowed]", {
+      reason: authority.reason,
+      currentParticipantKey: clean(authorityContext.currentParticipantKey) || null,
+      candidateParticipantKey: candidateParticipant || null,
+      currentItemKey: currentItemKey || null,
+      candidateItemKey: candidateItemKey || null,
+    });
     return { match: scoped[0], reason: "single_candidate", candidates: scoped };
   }
   if (scoped.length > 1) {
@@ -225,6 +492,8 @@ export async function findApprovedBookingForDm({
   message,
   customerPhone,
   sessionKey,
+  isAvailabilityQuery = false,
+  authorityContext = {},
 }) {
   const uid = String(userId ?? "").trim();
   if (!db || !uid) return { match: null, reason: "missing_context", candidates: [] };
@@ -235,6 +504,8 @@ export async function findApprovedBookingForDm({
     customerPhone,
     sessionKey,
     scope: "dm",
+    isAvailabilityQuery,
+    authorityContext,
   });
 }
 
@@ -244,6 +515,8 @@ export async function findApprovedBookingForGroupDetails({
   sessionKey,
   groupName,
   message,
+  isAvailabilityQuery = false,
+  authorityContext = {},
 }) {
   const uid = String(userId ?? "").trim();
   if (!db || !uid) return { match: null, reason: "missing_context", candidates: [] };
@@ -254,6 +527,8 @@ export async function findApprovedBookingForGroupDetails({
     sessionKey,
     groupName,
     scope: "group",
+    isAvailabilityQuery,
+    authorityContext,
   });
 }
 

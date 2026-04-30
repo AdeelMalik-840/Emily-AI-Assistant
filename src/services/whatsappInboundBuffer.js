@@ -633,8 +633,12 @@ export async function executeWhatsAppAiPipeline(p) {
     userPhone,
     participantPhoneForDm: participantPhoneForDmRaw,
     participantName: participantNameRaw,
+    participantKey: participantKeyRaw,
     senderScope: senderScopeRaw,
-    sessionKey,
+    sessionKey: sessionKeyRaw,
+    source: sourceRaw,
+    dmPlaywrightChatKey: dmPlaywrightChatKeyRaw,
+    dmChatTitle: dmChatTitleRaw,
     combinedMessage,
     latestMessage: latestMessageRaw,
     contextMessages: contextMessagesRaw = [],
@@ -661,6 +665,14 @@ export async function executeWhatsAppAiPipeline(p) {
     sourceMessageIndex: sourceMessageIndexRaw = null,
   } = p;
 
+  const dmPlaywrightChatKey = String(dmPlaywrightChatKeyRaw ?? "").trim();
+  const dmChatTitle = String(dmChatTitleRaw ?? "").trim();
+  const dmIdentityKey = normalizeTitle(dmPlaywrightChatKey || dmChatTitle);
+  const isPlaywrightDm =
+    String(sourceRaw ?? "").trim() === "PLAYWRIGHT_DM" ||
+    (isGroupMessage !== true && Boolean(dmPlaywrightChatKey));
+  const isPlaywrightDmWithIdentity = Boolean(isPlaywrightDm && dmIdentityKey);
+
   const playwrightWebInbound = Boolean(playwrightWebInboundRaw);
   const playwrightWebTitleIdentity = Boolean(playwrightWebTitleIdentityRaw);
   const groupNameResolved = String(groupNameRaw ?? chatNameRaw ?? "").trim();
@@ -677,6 +689,19 @@ export async function executeWhatsAppAiPipeline(p) {
 
   const fallbackDmTo =
     String(participantPhoneForDmRaw ?? "").trim() || userPhone;
+
+  let sessionKey =
+    sessionKeyRaw != null && String(sessionKeyRaw).trim() !== ""
+      ? String(sessionKeyRaw).trim()
+      : "";
+  if (isPlaywrightDmWithIdentity) {
+    sessionKey = `${ownerUserId}::dm::${dmIdentityKey}`;
+    console.log("[playwright_dm_pipeline_accepted]", {
+      dmChatTitle: dmChatTitle || null,
+      dmPlaywrightChatKey: dmPlaywrightChatKey || null,
+      sessionKey,
+    });
+  }
 
   const tsRaw = p?.messageTimestamp ?? p?.timestamp ?? null;
   const tsNum = Number(tsRaw);
@@ -697,6 +722,7 @@ export async function executeWhatsAppAiPipeline(p) {
       userId: ownerUserId,
       sessionKey,
       chatId:
+        (isPlaywrightDmWithIdentity ? dmIdentityKey : "") ||
         String(playwrightChatKeyRaw ?? "").trim() ||
         String(groupNameResolved ?? "").trim() ||
         String(sessionKey ?? "").trim(),
@@ -736,7 +762,8 @@ export async function executeWhatsAppAiPipeline(p) {
     }
   }
   if (isPlaywrightWebTabInbound(p)) {
-    if (!playwrightWebTitleIdentity || !groupNameResolved) {
+    // Playwright DM continuation: does NOT require group title identity. Must have DM identity key.
+    if (!isPlaywrightDmWithIdentity && (!playwrightWebTitleIdentity || !groupNameResolved)) {
       logBookingEvent({
         traceId,
         step: "pipeline_start",
@@ -992,6 +1019,10 @@ export async function executeWhatsAppAiPipeline(p) {
     playwrightWebInbound,
     participantPhoneForDm:
       String(participantPhoneForDmRaw ?? "").trim() || undefined,
+    participantKey:
+      participantKeyRaw != null && String(participantKeyRaw).trim() !== ""
+        ? String(participantKeyRaw).trim()
+        : undefined,
     inboundIntent:
       inboundIntentRaw != null && String(inboundIntentRaw).trim() !== ""
         ? String(inboundIntentRaw).trim().toLowerCase()
@@ -1250,6 +1281,10 @@ export async function executeWhatsAppAiPipeline(p) {
             whatsappRecipientType,
             userPhone: String(userPhone ?? ""),
             sessionKey,
+            // Pass-through DM continuation markers from the pipeline input (not buffer entry).
+            source: p?.source,
+            dmPlaywrightChatKey: p?.dmPlaywrightChatKey,
+            dmChatTitle: p?.dmChatTitle,
             messageHash,
             dedupeWindowMs: REPLY_DEDUPE_WINDOW_MS,
             lastPlaywrightTextSends,
@@ -1398,7 +1433,10 @@ export async function executeWhatsAppAiPipeline(p) {
           if (pending?.chatKey && String(listenerMsgId ?? "").trim()) {
             globalThis.__lastProcessedUserMsg =
               globalThis.__lastProcessedUserMsg || Object.create(null);
-            globalThis.__lastProcessedUserMsg[pending.chatKey] =
+            const cursorKey =
+              String(pending.participantCursorKey ?? "").trim() ||
+              String(pending.chatKey).trim();
+            globalThis.__lastProcessedUserMsg[cursorKey] =
               String(listenerMsgId).trim();
           }
           if (pending?.chatKey) {
@@ -1815,12 +1853,16 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     sessionKey,
     sendCredentials,
     phoneNumberId,
+    source,
+    dmPlaywrightChatKey,
+    dmChatTitle,
     text,
     isGroupMessage = false,
     whatsappReplyTo,
     whatsappRecipientType,
     conversationCustomerNumber,
     participantPhoneForDm: participantPhoneForDmPayload,
+    participantKey: participantKeyPayload,
     messageId: messageIdPayload,
     messageTimestamp,
     messageSender: messageSenderPayload,
@@ -1913,6 +1955,9 @@ export function scheduleBufferedWhatsAppInbound(payload) {
   const participantPhoneDmMerged =
     String(participantPhoneForDmPayload ?? "").trim() ||
     String(entry.context?.participantPhoneForDm ?? "").trim();
+  const participantKeyMerged =
+    String(participantKeyPayload ?? "").trim() ||
+    String(entry.context?.participantKey ?? "").trim();
 
   entry.context = {
     db,
@@ -1924,6 +1969,9 @@ export function scheduleBufferedWhatsAppInbound(payload) {
       phoneNumberId: String(sendCredentials.phoneNumberId ?? ""),
     },
     phoneNumberId: phoneNumberId != null ? String(phoneNumberId) : null,
+    ...(source !== undefined ? { source } : {}),
+    ...(dmPlaywrightChatKey !== undefined ? { dmPlaywrightChatKey } : {}),
+    ...(dmChatTitle !== undefined ? { dmChatTitle } : {}),
     isGroupMessage:
       Boolean(isGroupMessage) || Boolean(entry.context?.isGroupMessage),
     whatsappReplyTo: replyToMerged,
@@ -1932,6 +1980,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     ...(participantPhoneDmMerged
       ? { participantPhoneForDm: participantPhoneDmMerged }
       : {}),
+    ...(participantKeyMerged ? { participantKey: participantKeyMerged } : {}),
     messageId:
       messageIdPayload != null
         ? String(messageIdPayload)

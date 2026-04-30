@@ -8,15 +8,14 @@ import { createHash } from "node:crypto";
 import db from "../../config/firebase.js";
 import { normalizeTitle } from "../playwrightTitleNormalize.js";
 import { getBusinessWhatsAppCredentials } from "../businessWhatsApp.js";
-import {
-  applyPlaywrightClassifierToSession,
-  classifyIntentWithAI,
-} from "../intentEntityClassifier.js";
-import {
-  executeWhatsAppAiPipeline,
-  scheduleBufferedWhatsAppInbound,
-} from "../whatsappInboundBuffer.js";
+// whatsappInboundBuffer is dynamically imported inside forwarders to avoid
+// side-effectful imports during unit tests.
 import { normalizeInboundMessage } from "../inboundNormalizer.js";
+import {
+  buildParticipantSessionKey,
+  resolveParticipantIdentity,
+} from "../participantIdentity.js";
+import { chatSessionKey } from "../memory.js";
 
 /** Set PLAYWRIGHT_DISABLE_PIPELINE_FORWARD=true to no-op inbound forwarding (debug only; disables AI pipeline). */
 const PIPELINE_FORWARD_DISABLED = /^true$/i.test(
@@ -75,6 +74,7 @@ function groupParticipantScope(senderId) {
  *   sourceRowKey?: string,
  *   sourceMessageIndex?: number,
  *   participantPhoneForDm?: string,
+ *   participantKey?: string,
  *   messageSender?: string,
  *   userPhone?: string,
  *   conversationCustomerNumber?: string,
@@ -137,6 +137,17 @@ async function buildPlaywrightSchedulePayload(adapted) {
     normalizeSenderId(uniqueSenderIdRaw) ||
     `anon::${anonBase}::${anonId}`;
   const senderScope = groupParticipantScope(uniqueSenderId);
+  const participantIdentity = resolveParticipantIdentity({
+    participantPhone: adapted?.participantPhoneForDm,
+    participantKey: adapted?.participantKey,
+    participantName: senderName,
+    senderName,
+    senderAnchor: adapted?.senderAnchor,
+    messageSender: adapted?.messageSender,
+    groupChatKey: adapted?.playwrightChatKey || groupName,
+  });
+  const participantPhoneForDm = participantIdentity.participantPhone || "";
+  const participantKey = participantIdentity.participantKey || "";
   const playwrightChatKey =
     String(adapted?.playwrightChatKey ?? "").trim() ||
     normalizeTitle(groupName);
@@ -144,7 +155,19 @@ async function buildPlaywrightSchedulePayload(adapted) {
   const groupSessionKey =
     String(process.env.PLAYWRIGHT_SESSION_KEY ?? "").trim() ||
     sessionKeyForGroup(ownerUserId, groupName);
-  const sessionKey = `${groupSessionKey}::${senderScope}`;
+  const participantSessionKey = buildParticipantSessionKey({
+    businessId: ownerUserId,
+    groupChatKey: playwrightChatKey || groupName || groupSessionKey,
+    participantKey,
+  });
+  const sessionKey = participantSessionKey || `${groupSessionKey}::participant::missing`;
+  if (!participantKey) {
+    console.warn("[participant_identity_missing_group_state_blocked]", {
+      groupChatKey: playwrightChatKey || null,
+      participantName: senderName || null,
+      reason: "MISSING_PARTICIPANT_KEY",
+    });
+  }
   const normalizedInbound = normalizeInboundMessage({
     source: "playwright",
     message: String(adapted?.text ?? "").trim(),
@@ -160,13 +183,27 @@ async function buildPlaywrightSchedulePayload(adapted) {
     : Array.isArray(adapted?.contextMessages)
       ? adapted.contextMessages
       : [];
-  const classified = await classifyIntentWithAI({
-    message: String(adapted?.text ?? "").trim(),
-    context: recentForClassifier,
-  });
-  const classifierSessionKey = playwrightChatKey || sessionKey;
-  const { resetTopicContext, inboundEntity, inboundIntent } =
-    applyPlaywrightClassifierToSession(classifierSessionKey, classified);
+  let inboundIntent = null;
+  let inboundEntity = null;
+  let resetTopicContext = false;
+  try {
+    const mod = await import("../intentEntityClassifier.js");
+    const classifyIntentWithAI = mod?.classifyIntentWithAI;
+    const applyPlaywrightClassifierToSession = mod?.applyPlaywrightClassifierToSession;
+    if (typeof classifyIntentWithAI === "function" && typeof applyPlaywrightClassifierToSession === "function") {
+      const classified = await classifyIntentWithAI({
+        message: String(adapted?.text ?? "").trim(),
+        context: recentForClassifier,
+      });
+      const classifierSessionKey = sessionKey || playwrightChatKey;
+      const applied = applyPlaywrightClassifierToSession(classifierSessionKey, classified) || {};
+      resetTopicContext = Boolean(applied.resetTopicContext);
+      inboundEntity = applied.inboundEntity ?? null;
+      inboundIntent = applied.inboundIntent ?? null;
+    }
+  } catch {
+    // Classifier is optional; continue without it (preserves existing fallback behavior).
+  }
 
   const conversationCustomerNumber = `grp${createHash("sha256")
     .update(`${groupName}::${senderScope}`, "utf8")
@@ -178,15 +215,30 @@ async function buildPlaywrightSchedulePayload(adapted) {
     senderScope,
     isGroupChat: true,
   });
+  console.log("[group_context_participant_key]", {
+    groupChatKey: playwrightChatKey,
+    participantKey: participantKey || null,
+    participantName: participantIdentity.participantName || senderName || null,
+    hasParticipantPhone: Boolean(participantPhoneForDm),
+    sessionKey,
+    confidence: participantIdentity.confidence,
+    source: participantIdentity.source,
+  });
+  console.log("[participant_session_key_resolved]", {
+    groupChatKey: playwrightChatKey,
+    participantKey: participantKey || null,
+    sessionKey,
+  });
   return {
     payload: {
       db,
       ownerUserId,
       userPhone: "unknown",
-      participantName: senderName,
+      participantName: participantIdentity.participantName || senderName,
+      participantKey,
       senderScope,
-      ...(adapted?.participantPhoneForDm
-        ? { participantPhoneForDm: String(adapted.participantPhoneForDm).trim() }
+      ...(participantPhoneForDm
+        ? { participantPhoneForDm }
         : {}),
       sessionKey,
       sendCredentials: {
@@ -258,6 +310,11 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
   }
 
   try {
+    const mod = await import("../whatsappInboundBuffer.js");
+    const scheduleBufferedWhatsAppInbound = mod?.scheduleBufferedWhatsAppInbound;
+    if (typeof scheduleBufferedWhatsAppInbound !== "function") {
+      throw new Error("scheduleBufferedWhatsAppInbound_missing");
+    }
     scheduleBufferedWhatsAppInbound(built.payload);
     console.log("[Playwright] Forwarded to pipeline");
     return true;
@@ -265,12 +322,18 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
     console.error("[Playwright] pipeline bridge error:", err?.message || err);
     console.log("⚠️ Direct pipeline fallback");
     try {
+      const mod = await import("../whatsappInboundBuffer.js");
+      const executeWhatsAppAiPipeline = mod?.executeWhatsAppAiPipeline;
+      if (typeof executeWhatsAppAiPipeline !== "function") {
+        throw new Error("executeWhatsAppAiPipeline_missing");
+      }
       await executeWhatsAppAiPipeline({
         db: built.payload.db,
         ownerUserId: built.payload.ownerUserId,
         userPhone: built.payload.userPhone,
         participantPhoneForDm: built.payload.participantPhoneForDm,
         participantName: built.payload.participantName,
+        participantKey: built.payload.participantKey,
         senderScope: built.payload.senderScope,
         sessionKey: built.payload.sessionKey,
         combinedMessage: built.line,
@@ -307,5 +370,123 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
       );
       return false;
     }
+  }
+}
+
+/**
+ * Forward a Playwright-captured **private DM** message into scheduleBufferedWhatsAppInbound.
+ * This is additive only and does NOT change the existing group payload shape.
+ *
+ * @param {{
+ *   message: string,
+ *   dmChatTitle?: string | null,
+ *   dmPlaywrightChatKey?: string | null,
+ *   bookingHint?: {
+ *     bookingId?: string | null,
+ *     participantKey?: string | null,
+ *     participantName?: string | null,
+ *     participantPhoneForDm?: string | null,
+ *     originalGroupName?: string | null,
+ *     originalGroupChatKey?: string | null,
+ *   } | null,
+ *   source?: string | null,
+ * }} p
+ */
+export async function forwardPlaywrightDmToPipeline(p = {}) {
+  const clean = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+  if (WHATSAPP_MODE === "cloud") {
+    console.log(
+      "[Playwright] DM forward skipped (WHATSAPP_MODE=cloud) — Cloud API is source of truth"
+    );
+    return false;
+  }
+  if (PIPELINE_FORWARD_DISABLED) {
+    console.log(
+      "[Playwright] DM forward disabled (PLAYWRIGHT_DISABLE_PIPELINE_FORWARD)"
+    );
+    globalThis.__isProcessingAI = false;
+    return false;
+  }
+
+  const ownerUserId = resolveOwnerUid();
+  if (!ownerUserId) return false;
+
+  const dmChatTitle = clean(p?.dmChatTitle);
+  const dmPlaywrightChatKey =
+    clean(p?.dmPlaywrightChatKey) || normalizeTitle(dmChatTitle);
+  if (!dmPlaywrightChatKey) return false;
+
+  const message = clean(p?.message);
+  if (!message) return false;
+
+  const bookingHint =
+    p?.bookingHint && typeof p.bookingHint === "object" ? p.bookingHint : null;
+  const participantPhoneForDm = clean(bookingHint?.participantPhoneForDm);
+  const participantName =
+    clean(bookingHint?.participantName) || dmChatTitle || "customer";
+  const participantKey =
+    clean(bookingHint?.participantKey) || dmPlaywrightChatKey || "";
+
+  const sessionKey = participantPhoneForDm
+    ? chatSessionKey(ownerUserId, `dm::${participantPhoneForDm}`)
+    : chatSessionKey(ownerUserId, `dm::${dmPlaywrightChatKey}`);
+
+  try {
+    const schedule =
+      typeof p?.__scheduleForTests === "function"
+        ? p.__scheduleForTests
+        : (await import("../whatsappInboundBuffer.js"))?.scheduleBufferedWhatsAppInbound;
+    if (typeof schedule !== "function") {
+      throw new Error("scheduleBufferedWhatsAppInbound_missing");
+    }
+    schedule({
+      db,
+      ownerUserId,
+      userPhone: "unknown",
+      participantName,
+      participantKey: participantKey || undefined,
+      ...(participantPhoneForDm ? { participantPhoneForDm } : {}),
+      senderScope: dmPlaywrightChatKey,
+      sessionKey,
+      sendCredentials: { accessToken: "", phoneNumberId: "" },
+      phoneNumberId: null,
+      text: message,
+      isGroupMessage: false,
+      // DM continuation originates from WhatsApp Web (Playwright) and must be eligible
+      // for WA Web outbound delivery (strictly gated at send time).
+      playwrightWebInbound: true,
+      playwrightWebTitleIdentity: false,
+      whatsappReplyTo: null,
+      whatsappRecipientType: "individual",
+      conversationCustomerNumber: participantPhoneForDm || dmPlaywrightChatKey,
+      trackingKey: sessionKey,
+      chatName: dmChatTitle || dmPlaywrightChatKey,
+      messageId: `pw-dm::${dmPlaywrightChatKey}::${Date.now()}`,
+      messageTimestamp: Date.now(),
+      messageSender: "user",
+      inboundIntent: null,
+      inboundEntity: null,
+      resetTopicContext: false,
+      playwrightChatKey: null,
+      dmChatTitle: dmChatTitle || null,
+      dmPlaywrightChatKey: dmPlaywrightChatKey || null,
+      source: clean(p?.source) || "PLAYWRIGHT_DM",
+      bookingHint: bookingHint
+        ? {
+            bookingId: clean(bookingHint?.bookingId) || null,
+            participantKey: clean(bookingHint?.participantKey) || null,
+            participantName: clean(bookingHint?.participantName) || null,
+            originalGroupName: clean(bookingHint?.originalGroupName) || null,
+            originalGroupChatKey: clean(bookingHint?.originalGroupChatKey) || null,
+          }
+        : null,
+    });
+    return true;
+  } catch (err) {
+    console.warn("[playwright_dm_continuation_forward_failed]", {
+      dmPlaywrightChatKey: dmPlaywrightChatKey || null,
+      reason: clean(err?.message ?? err) || "SCHEDULE_FAILED",
+    });
+    return false;
   }
 }

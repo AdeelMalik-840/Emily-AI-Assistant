@@ -1,5 +1,27 @@
 import { sendViaPlaywright } from "./adapters/playwrightAdapter.js";
 import { sendViaCloudAPI } from "./adapters/cloudApiAdapter.js";
+import { normalizeTitle } from "./playwrightTitleNormalize.js";
+
+function clean(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function extractDmKeyFromSessionKey(sessionKey) {
+  const sk = clean(sessionKey);
+  if (!sk) return "";
+  const idx = sk.indexOf("dm::");
+  if (idx < 0) return "";
+  return clean(sk.slice(idx + "dm::".length));
+}
+
+function getCurrentOpenChatTitle() {
+  return clean(
+    globalThis.__currentOpenChatTitle ??
+      globalThis.__activeChatTitle ??
+      globalThis.__activeChatInFocus ??
+      ""
+  );
+}
 
 /**
  * @param {{
@@ -22,6 +44,9 @@ import { sendViaCloudAPI } from "./adapters/cloudApiAdapter.js";
  *     whatsappRecipientType: "group" | "individual",
  *     userPhone: string,
  *     sessionKey: string,
+ *     source?: unknown,
+ *     dmPlaywrightChatKey?: unknown,
+ *     dmChatTitle?: unknown,
  *     messageHash: string,
  *     dedupeWindowMs: number,
  *     lastPlaywrightTextSends: Map<string, { hash: string, timestamp: number }>,
@@ -62,6 +87,9 @@ export async function sendOutboundMessage({
     whatsappRecipientType,
     userPhone,
     sessionKey,
+    source,
+    dmPlaywrightChatKey,
+    dmChatTitle,
     messageHash,
     dedupeWindowMs,
     lastPlaywrightTextSends,
@@ -70,12 +98,60 @@ export async function sendOutboundMessage({
   console.log("📤 Sending message via:", sendVia);
 
   const isPlaywrightGroup = isGroupMessage === true && unknownPhone;
+  const rawSource = clean(source);
+  const rawDmPlaywrightChatKey = clean(dmPlaywrightChatKey);
+  const rawDmChatTitle = clean(dmChatTitle);
+  const hasSessionDmKey = clean(sessionKey).includes("dm::");
+  const dmContinuationKeyFromSession =
+    !rawDmPlaywrightChatKey && !rawDmChatTitle && hasSessionDmKey
+      ? extractDmKeyFromSessionKey(sessionKey)
+      : "";
+  const expectedDmChatKey =
+    normalizeTitle(rawDmPlaywrightChatKey) ||
+    normalizeTitle(rawDmChatTitle) ||
+    (dmContinuationKeyFromSession
+      ? normalizeTitle(dmContinuationKeyFromSession)
+      : null);
+
+  const isPlaywrightDmOutboundCandidate = Boolean(
+    rawSource === "PLAYWRIGHT_DM" &&
+      playwrightWebInbound === true &&
+      whatsappRecipientType === "individual" &&
+      unknownPhone === true &&
+      (rawDmPlaywrightChatKey ||
+        rawDmChatTitle ||
+        hasSessionDmKey)
+  );
+
+  let allowPlaywrightDmOutbound = false;
+  if (isPlaywrightDmOutboundCandidate) {
+    const activeChatKey = normalizeTitle(getCurrentOpenChatTitle());
+    if (!expectedDmChatKey || !activeChatKey || expectedDmChatKey !== activeChatKey) {
+      console.warn("[playwright_dm_outbound_send_blocked_wrong_chat]", {
+        expectedDmChatKey,
+        activeChatKey: activeChatKey || null,
+        dmPlaywrightChatKey: rawDmPlaywrightChatKey || null,
+        dmChatTitle: rawDmChatTitle || null,
+        sessionKey: clean(sessionKey) || null,
+      });
+      return { ok: false, groupSendFailed: false };
+    }
+    console.log("[playwright_dm_outbound_send_path_selected]", {
+      expectedDmChatKey,
+      activeChatKey,
+      source: rawSource,
+      playwrightWebInbound,
+      whatsappRecipientType,
+    });
+    allowPlaywrightDmOutbound = true;
+  }
+
   const usePlaywrightWebSend =
     isTabInbound ||
     (!isTabInbound &&
-      mode === "PLAYWRIGHT" &&
       unknownPhone &&
-      (isGroupMessage === true || playwrightWebInbound));
+      ((mode === "PLAYWRIGHT" && (isGroupMessage === true || playwrightWebInbound)) ||
+        allowPlaywrightDmOutbound));
 
   if (usePlaywrightWebSend) {
     const result = await sendViaPlaywright({

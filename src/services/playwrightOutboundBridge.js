@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import { isReplyPrivateLockActive } from "./replyPrivateUiController.js";
 import { normalizeWhatsAppImage } from "../utils/normalizeWhatsAppImage.js";
 
 /** Align with catalog cap in conversationIntelligence (show_images). */
@@ -418,6 +419,75 @@ async function enforceStrictSendLock(page) {
   }
 }
 
+function titleMatchesReplyPrivateExpected(headerTitle, expectedHeaderTitle, expectedChatKey) {
+  const header = String(headerTitle || "").trim();
+  const expectedHeader = String(expectedHeaderTitle || "").trim();
+  const expectedKey = String(expectedChatKey || "").trim();
+  if (!header) return false;
+  const activeChatKey = normalizeTitle(header);
+  if (expectedKey && normalizeTitle(header) === normalizeTitle(expectedKey)) {
+    return true;
+  }
+  if (expectedKey) return false;
+  if (expectedHeader && activeChatKey === normalizeTitle(expectedHeader)) return true;
+  return false;
+}
+
+async function enforceReplyPrivateSendPreconditions(page, opts = {}) {
+  const expectedHeaderTitle = String(opts.expectedHeaderTitle || "").trim();
+  const expectedChatKey = String(opts.expectedChatKey || "").trim();
+  const originalGroupTitle = String(opts.originalGroupTitle || opts.groupName || "").trim();
+  const disallowedChatTitles = [
+    originalGroupTitle,
+    ...(Array.isArray(opts.disallowedChatTitles) ? opts.disallowedChatTitles : []),
+  ].filter(Boolean);
+
+  console.log("[reply_privately_dm_send_started]", {
+    expectedHeaderTitle: expectedHeaderTitle || null,
+    expectedChatKey: expectedChatKey || null,
+    originalGroupTitle: originalGroupTitle || null,
+  });
+
+  let headerTitle = "";
+  try {
+    headerTitle = await ensureChatView(page);
+  } catch {
+    headerTitle = "";
+  }
+
+  const blockedTitle = disallowedChatTitles.find((title) =>
+    title && headerTitle && normalizeTitle(headerTitle) === normalizeTitle(title)
+  );
+  const allowed = titleMatchesReplyPrivateExpected(
+    headerTitle,
+    expectedHeaderTitle,
+    expectedChatKey
+  );
+  const activeChatKey = headerTitle ? normalizeTitle(headerTitle) : "";
+
+  if (!headerTitle || isInvalidHeader(headerTitle) || blockedTitle || !allowed) {
+    console.warn("[reply_privately_dm_send_blocked_wrong_header]", {
+      headerTitle: headerTitle || null,
+      activeChatKey: activeChatKey || null,
+      expectedHeaderTitle: expectedHeaderTitle || null,
+      expectedChatKey: expectedChatKey || null,
+      blockedTitle: blockedTitle || null,
+      originalGroupTitle: originalGroupTitle || null,
+    });
+    throw Object.assign(new Error("reply_private_wrong_header"), {
+      code: "REPLY_PRIVATE_WRONG_HEADER",
+    });
+  }
+
+  console.log("[reply_privately_dm_send_allowed]", {
+    headerTitle,
+    activeChatKey,
+    expectedHeaderTitle: expectedHeaderTitle || null,
+    expectedChatKey: expectedChatKey || null,
+  });
+  return headerTitle;
+}
+
 /** @type {import("playwright").Page | null} */
 let outboundPage = null;
 
@@ -483,19 +553,50 @@ async function sendTextViaComposeBoxes(page, body) {
   return result;
 }
 
-export async function sendPlaywrightActiveChatText(text) {
+export async function sendPlaywrightActiveChatText(text, opts = {}) {
   const page = outboundPage;
   if (!page || (typeof page.isClosed === "function" && page.isClosed())) {
     console.warn("[playwrightOutbound] no active page");
     return false;
   }
+  const lock =
+    globalThis.__activeChatLock &&
+    typeof globalThis.__activeChatLock === "object" &&
+    globalThis.__activeChatLock.inProgress === true
+      ? globalThis.__activeChatLock
+      : null;
+  if (lock) {
+    const expectedKey = normalizeTitle(String(lock.chatKey ?? "").trim());
+    let activeTitle = String(globalThis.__currentOpenChatTitle ?? "").trim();
+    if (!activeTitle) {
+      activeTitle = await readOpenConversationHeaderTitle(page).catch(() => "");
+    }
+    const activeKey = normalizeTitle(String(activeTitle ?? "").trim());
+    if (!expectedKey || !activeKey || expectedKey !== activeKey) {
+      console.warn("[send_blocked_wrong_active_chat]", {
+        expectedChatKey: expectedKey || null,
+        activeChatKey: activeKey || null,
+      });
+      return false;
+    }
+  }
   const body = String(text ?? "").replace(/\n{3,}/g, "\n\n").trim();
   if (!body) return false;
+  if (isReplyPrivateLockActive() && opts.allowReplyPrivate !== true) {
+    console.log("⛔ Skip switching — reply private flow active");
+    return false;
+  }
+  const replyPrivateContext = opts.replyPrivateContext === true;
   globalThis.__UI_SEND_LOCK = true;
   try {
     globalThis.__OUTBOUND_BUSY__ = true;
-    const activeTitle = await ensureChatView(page);
-    globalThis.__lockedChatTitle = activeTitle;
+    if (replyPrivateContext) {
+      await enforceReplyPrivateSendPreconditions(page, opts);
+      globalThis.__lockedChatTitle = null;
+    } else {
+      const activeTitle = await ensureChatView(page);
+      globalThis.__lockedChatTitle = activeTitle;
+    }
     return await sendTextViaComposeBoxes(page, body);
   } catch (e) {
     console.error("[playwrightOutbound] active chat send error:", e?.message || e);
@@ -504,6 +605,10 @@ export async function sendPlaywrightActiveChatText(text) {
     globalThis.__UI_SEND_LOCK = false;
     globalThis.__OUTBOUND_BUSY__ = false;
     globalThis.__lockedChatTitle = null;
+    if (lock) {
+      globalThis.__activeChatLock = { chatKey: null, inProgress: false, startedAtMs: 0 };
+      console.log("[chat_lock_released]");
+    }
   }
 }
 
@@ -531,6 +636,32 @@ export async function sendPlaywrightGroupText(text, opts = {}) {
   if (!body) {
     console.log("📤 Send result:", false);
     return false;
+  }
+  if (isReplyPrivateLockActive()) {
+    console.log("⛔ Skip switching — reply private flow active");
+    console.log("📤 Send result:", false);
+    return false;
+  }
+  const lock =
+    globalThis.__activeChatLock &&
+    typeof globalThis.__activeChatLock === "object" &&
+    globalThis.__activeChatLock.inProgress === true
+      ? globalThis.__activeChatLock
+      : null;
+  if (lock) {
+    const expectedKey = normalizeTitle(String(lock.chatKey ?? "").trim());
+    let activeTitle = String(globalThis.__currentOpenChatTitle ?? "").trim();
+    if (!activeTitle) {
+      activeTitle = await readOpenConversationHeaderTitle(page).catch(() => "");
+    }
+    const activeKey = normalizeTitle(String(activeTitle ?? "").trim());
+    if (!expectedKey || !activeKey || expectedKey !== activeKey) {
+      console.warn("[send_blocked_wrong_active_chat]", {
+        expectedChatKey: expectedKey || null,
+        activeChatKey: activeKey || null,
+      });
+      return false;
+    }
   }
 
   const expectedChat = String(opts.expectedChat ?? "").trim();
@@ -562,6 +693,10 @@ export async function sendPlaywrightGroupText(text, opts = {}) {
     globalThis.__OUTBOUND_BUSY__ = false;
     globalThis.__lockedChatTitle = null;
     console.log("🔓 Outbound lock RELEASED");
+    if (lock) {
+      globalThis.__activeChatLock = { chatKey: null, inProgress: false, startedAtMs: 0 };
+      console.log("[chat_lock_released]");
+    }
   }
   return result;
 }

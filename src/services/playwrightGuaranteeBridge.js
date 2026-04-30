@@ -35,7 +35,7 @@ export function buildPlaywrightGuaranteeKey(groupName, messageId) {
 
 /**
  * Listener: forward to buffer succeeded — remember anchor row until delivered or released.
- * @param {{ guaranteeKey: string, chatKey: string, rowKey: string }} p
+ * @param {{ guaranteeKey: string, chatKey: string, rowKey: string, participantCursorKey?: string }} p
  */
 export function recordPlaywrightInboundScheduled(p) {
   const guaranteeKey = String(p.guaranteeKey ?? "").trim();
@@ -46,6 +46,7 @@ export function recordPlaywrightInboundScheduled(p) {
   globalThis.__playwrightPendingByGuarantee.set(guaranteeKey, {
     chatKey: String(p.chatKey ?? "").trim(),
     rowKey: String(p.rowKey ?? "").trim(),
+    participantCursorKey: String(p.participantCursorKey ?? "").trim(),
     timestamp: Date.now(),
   });
 }

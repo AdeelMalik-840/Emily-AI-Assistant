@@ -7,11 +7,15 @@ import path from "node:path";
 import process from "node:process";
 import { chromium } from "playwright";
 
+import db from "../../config/firebase.js";
 import {
   resolvePlaywrightAllowedChatTitles,
   resolvePlaywrightBusinessKeywords,
 } from "../../config/aiRuntime.js";
-import { forwardPlaywrightGroupToPipeline } from "./pipelineBridge.js";
+import {
+  forwardPlaywrightDmToPipeline,
+  forwardPlaywrightGroupToPipeline,
+} from "./pipelineBridge.js";
 import {
   clearPlaywrightOutboundPage,
   ensureChatView,
@@ -30,6 +34,12 @@ import {
 } from "../messageState.js";
 import { clearWhatsAppInboundMessageCaches } from "../whatsappInboundBuffer.js";
 import { pollLocalApprovalContinuations } from "../localApprovalContinuationPoller.js";
+import { isReplyPrivateLockActive } from "../replyPrivateUiController.js";
+import {
+  buildParticipantCursorKey,
+  isGroupMessageStale,
+  resolveParticipantIdentity,
+} from "../participantIdentity.js";
 
 /** Open chat identity: sidebar `span[title]` for the target row (not header text). */
 globalThis.__currentOpenChatTitle =
@@ -112,7 +122,7 @@ async function ensureWhatsAppConversationOpen(page) {
     preferredChatKeys.push(key);
   };
 
-  pushKey(globalThis.__activeChatLock);
+  pushKey(activeChatLockKey());
   pushKey(globalThis.__ACTIVE_PROCESSING_CHAT);
   pushKey(globalThis.__forceNextChat);
   if (globalThis.__pendingChats instanceof Set) {
@@ -187,16 +197,334 @@ const MAX_ACTIVE_JOB_MS = 10_000;
 
 const normalize = (s) => String(s || "").trim().toLowerCase();
 
+function clean(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function resolveOwnerUid() {
+  return clean(
+    process.env.PLAYWRIGHT_OWNER_USER_ID ||
+      process.env.LEGACY_BUSINESS_FIREBASE_UID ||
+      process.env.WHATSAPP_GROUP_FALLBACK_OWNER_UID ||
+      ""
+  );
+}
+
+/**
+ * Load DM watch targets from active approved bookings that already completed Reply Privately DM send.
+ * Additive only: does NOT change group scanning; only enables scanning for specific DM chats.
+ */
+async function loadActiveDmWatchTargets({
+  dbInstance = db,
+  ownerUserId = resolveOwnerUid(),
+  limit = 25,
+} = {}) {
+  const uid = clean(ownerUserId);
+  if (!dbInstance || !uid) return { keys: new Set(), byKey: new Map(), count: 0 };
+  try {
+    const snap = await dbInstance
+      .collection("businesses")
+      .doc(uid)
+      .collection("bookings")
+      .where("status", "==", "approved")
+      .limit(limit)
+      .get();
+    const docs = snap?.docs ?? [];
+    const keys = new Set();
+    const byKey = new Map();
+    const waitingStages = new Set([
+      "owner_approved_waiting_customer_details",
+      "waiting_customer_details",
+    ]);
+    for (const doc of docs) {
+      const data = doc.data() || {};
+      const approvalCustomerNotificationStatus = clean(
+        data?.approvalCustomerNotificationStatus
+      );
+      const isDmActuallySent =
+        approvalCustomerNotificationStatus === "sent" ||
+        data?.dmMessageSent === true ||
+        data?.dmOpened === true;
+      if (!isDmActuallySent) {
+        continue;
+      }
+      if (
+        approvalCustomerNotificationStatus !== "sent" &&
+        (data?.dmMessageSent === true || data?.dmOpened === true)
+      ) {
+        console.log("[playwright_dm_watch_target_included_via_fallback]", {
+          bookingId: doc.id,
+          approvalCustomerNotificationStatus: approvalCustomerNotificationStatus || null,
+          dmMessageSent: data?.dmMessageSent === true,
+          dmOpened: data?.dmOpened === true,
+        });
+      }
+      const approvalStage = clean(data?.approvalStage).toLowerCase();
+      if (
+        approvalStage === "delivery_details_collected" ||
+        data?.deliveryDetailsCollectedAt ||
+        data?.deliveryConversationStarted === true
+      ) {
+        continue;
+      }
+      if (approvalStage && !waitingStages.has(approvalStage)) {
+        // Not an active DM continuation target (e.g. already moved on).
+        continue;
+      }
+      const dmKey = normalizeTitle(clean(data?.dmPlaywrightChatKey || "")) ||
+        normalizeTitle(clean(data?.dmChatTitle || ""));
+      if (!dmKey) continue;
+      keys.add(dmKey);
+      const entry = {
+        bookingId: doc.id,
+        updatedAtMs:
+          typeof data?.updatedAtMs === "number"
+            ? data.updatedAtMs
+            : data?.updatedAt?.toMillis?.() ??
+              (data?.updatedAt instanceof Date ? data.updatedAt.getTime() : 0) ??
+              0,
+        dmChatTitle: clean(data?.dmChatTitle) || null,
+        dmPlaywrightChatKey: clean(data?.dmPlaywrightChatKey) || null,
+        participantKey:
+          clean(
+            data?.sourceIdentity?.participantKey ??
+              data?.sourceParticipantKey ??
+              data?.sourceIdentity?.participantPhone ??
+              data?.sourceParticipantPhone ??
+              data?.originalCustomerPhone ??
+              ""
+          ) || null,
+        participantName:
+          clean(
+            data?.sourceIdentity?.participantDisplayName ??
+              data?.sourceIdentity?.participantName ??
+              data?.sourceParticipantName ??
+              data?.originalCustomerDisplayName ??
+              ""
+          ) || null,
+        participantPhoneForDm:
+          clean(
+            data?.sourceIdentity?.participantPhone ??
+              data?.sourceParticipantPhone ??
+              data?.originalCustomerPhone ??
+              ""
+          ) || null,
+        originalGroupName: clean(data?.sourceGroupName ?? data?.groupName) || null,
+        originalGroupChatKey:
+          clean(data?.sourcePlaywrightChatKey ?? data?.playwrightChatKey ?? data?.chatKey) ||
+          null,
+      };
+      const arr = byKey.get(dmKey) ?? [];
+      arr.push(entry);
+      byKey.set(dmKey, arr);
+    }
+    return { keys, byKey, count: keys.size };
+  } catch (err) {
+    return { keys: new Set(), byKey: new Map(), count: 0, error: clean(err?.message ?? err) };
+  }
+}
+
+function normalizedTargetGroupKeys(targetGroups) {
+  const groups = Array.isArray(targetGroups) ? targetGroups : null;
+  if (groups === null) return null;
+  const out = new Set();
+  for (const g of groups) {
+    const key = normalizeTitle(String(g ?? "").trim());
+    if (key) out.add(key);
+  }
+  return out;
+}
+
+function buildWatchedDmAllowlist({ dmWatchTargets, targetGroups } = {}) {
+  const keys = new Set();
+  const byKey =
+    dmWatchTargets && dmWatchTargets.byKey instanceof Map
+      ? dmWatchTargets.byKey
+      : new Map();
+  const groupKeyAllow = normalizedTargetGroupKeys(targetGroups);
+  let added = 0;
+
+  for (const [dmChatKey, list] of byKey.entries()) {
+    const items = Array.isArray(list) ? list : [];
+    if (items.length === 0) continue;
+    const first = items[0] || {};
+    const bookingId = clean(first.bookingId) || null;
+    const dmKey = normalizeTitle(dmChatKey);
+    const sourceGroupKey = clean(first.originalGroupChatKey || "") || null;
+    const sourceGroupName = clean(first.originalGroupName || "") || null;
+
+    const groupAllowedByName = sourceGroupName
+      ? chatRowMatchesTargets(sourceGroupName, targetGroups)
+      : false;
+    const groupAllowedByKey =
+      groupKeyAllow === null
+        ? true
+        : Boolean(sourceGroupKey && groupKeyAllow.has(normalizeTitle(sourceGroupKey)));
+    const allowed = groupAllowedByName || groupAllowedByKey;
+    if (!allowed) {
+      console.log("[playwright_dm_watch_allowlist_excluded]", {
+        bookingId,
+        reason: "SOURCE_GROUP_NOT_ALLOWED",
+      });
+      continue;
+    }
+
+    if (!dmKey) {
+      console.log("[playwright_dm_watch_allowlist_excluded]", {
+        bookingId,
+        reason: "DM_KEY_MISSING",
+      });
+      continue;
+    }
+
+    keys.add(dmKey);
+    added += 1;
+    console.log("[playwright_dm_watch_allowlist_added]", {
+      bookingId,
+      dmChatKey: dmKey,
+      sourceGroupKey: normalizeTitle(sourceGroupKey || sourceGroupName || "") || null,
+    });
+  }
+
+  console.log("[playwright_dm_watch_allowlist_built]", { count: keys.size });
+  return keys;
+}
+
+function pickDmBookingHint(dmChatKey, bookingsByKey) {
+  const list = bookingsByKey?.get(dmChatKey) ?? [];
+  if (list.length === 0) return { ok: false, reason: "NO_BOOKING_MATCH", hint: null };
+  if (list.length === 1) return { ok: true, hint: list[0], ambiguous: false };
+  const sorted = [...list].sort((a, b) => Number(b.updatedAtMs || 0) - Number(a.updatedAtMs || 0));
+  // If multiple active bookings still match this DM key, treat as ambiguous.
+  return { ok: false, reason: "AMBIGUOUS_MATCH", bookingIds: sorted.map((b) => b.bookingId), hint: null };
+}
+
+export function __shouldProcessChatForTests({ chatTitle, targetGroups, activeDmChatKeys }) {
+  const title = String(chatTitle ?? "").trim();
+  if (!title) return false;
+  if (chatRowMatchesTargets(title, targetGroups)) return true;
+  const key = normalizeTitle(title);
+  return Boolean(key && activeDmChatKeys instanceof Set && activeDmChatKeys.has(key));
+}
+
+async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentActiveTitle) {
+  const keys = activeDmChatKeys instanceof Set ? activeDmChatKeys : new Set();
+  if (!keys.size) return null;
+  const curKey = normalizeTitle(String(currentActiveTitle ?? "").trim());
+  const rowSignals = await page
+    .evaluate((maxR) => {
+      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const rows = Array.from(document.querySelectorAll('#pane-side div[role="row"]')).slice(0, maxR);
+      return rows
+        .map((row) => {
+          const titleEl = row.querySelector('span[title]');
+          const title = clean(titleEl?.getAttribute("title") || "");
+          if (!title) return null;
+          const spans = Array.from(row.querySelectorAll("span[dir='auto']"));
+          const parts = spans.map((s) => clean(s.textContent || "")).filter(Boolean);
+          const previewSnippet = parts.length ? parts[parts.length - 1] : "";
+          const hasUnread = Boolean(
+            row.querySelector("[data-testid='unread-count'], [data-testid*='unread']") ||
+              row.querySelector('[data-icon=\"unread\"], [data-icon=\"status-unread\"], span[aria-label*=\"unread\" i]') ||
+              /unread/i.test(row.getAttribute("aria-label") || "")
+          );
+          return { title, previewSnippet, hasUnread };
+        })
+        .filter(Boolean);
+    }, MAX_PRIORITY_CHATS_PER_LOOP)
+    .catch(() => []);
+
+  for (const r of rowSignals) {
+    const chatTitle = String(r?.title ?? "").trim();
+    if (!chatTitle) continue;
+    const chatKey = normalizeTitle(chatTitle);
+    const isWatched = Boolean(chatKey && keys.has(chatKey));
+    const isAlreadyActive = Boolean(curKey && chatKey && chatKey === curKey);
+    const hasUnread = Boolean(r?.hasUnread);
+    const preview = String(r?.previewSnippet ?? "");
+    const norm = normalizePreview(preview);
+    const lastProcessedPreview = String(lastMessageMap[chatTitle] ?? "");
+    const previewLooksOutgoing = sidebarPreviewLooksOutgoing(preview);
+    const previewDelta = Boolean(
+      lastProcessedPreview &&
+        norm &&
+        norm !== lastProcessedPreview &&
+        !previewLooksOutgoing
+    );
+
+    if (!isWatched) {
+      if (TRACE_DEBUG) {
+        console.log("[playwright_dm_watch_priority_skipped_not_watched]", {
+          chatTitle,
+          chatKey: chatKey || null,
+        });
+      }
+      continue;
+    }
+
+    console.log("[playwright_dm_watch_priority_candidate]", { chatTitle, chatKey });
+
+    let selected = false;
+    let skipReason = "";
+    if (isAlreadyActive) {
+      skipReason = "ALREADY_ACTIVE";
+    } else if (!hasUnread && !previewDelta) {
+      skipReason = "NO_UNREAD_OR_PREVIEW_DELTA";
+    } else {
+      selected = true;
+    }
+
+    console.log("[playwright_dm_watch_priority_decision]", {
+      chatTitle,
+      chatKey,
+      isWatched,
+      isAlreadyActive,
+      hasUnread,
+      preview: preview || null,
+      lastProcessedPreview: lastProcessedPreview || null,
+      previewLooksOutgoing,
+      previewDelta,
+      selected,
+      skipReason: skipReason || null,
+    });
+
+    if (!selected) continue;
+
+    return { chatTitle, chatKey };
+  }
+  return null;
+}
+
 /**
  * Stable per-row id for snapshot + delta (sender + text + timestamp + index; robust to DOM reuse).
  * @param {{ __rowKey?: string, sender?: string, text?: string, __ts?: number }} msg
  * @param {number} index
  */
 function getMessageId(msg, index) {
+  // CRITICAL: avoid relying on message text for uniqueness (repeated short replies like "5 din").
+  const prePlainText = String(msg?.prePlainText ?? "").trim();
+  const sourceIndexRaw = msg?.sourceMessageIndex ?? index;
+  const sourceIndex = Number.isFinite(Number(sourceIndexRaw))
+    ? Number(sourceIndexRaw)
+    : index;
+  if (prePlainText) {
+    return `${prePlainText}::${sourceIndex}`;
+  }
+
+  const sender = String(msg?.sender ?? "unknown").trim() || "unknown";
+  const ts =
+    msg?.timestamp != null && String(msg.timestamp).trim() !== ""
+      ? String(msg.timestamp).trim()
+      : msg?.__ts != null && String(msg.__ts).trim() !== ""
+        ? String(msg.__ts).trim()
+        : "";
+  if (ts) {
+    return `${sender}::${ts}`;
+  }
+
   const text = String(msg?.text || "").trim().toLowerCase();
-  const ts = Number(msg?.__ts || 0);
-  const sender = msg?.sender || "unknown";
-  return `${sender}::${text}::${ts}::${index}`;
+  const tsNum = Number(msg?.__ts || 0);
+  return `${sender}::${text}::${tsNum}::${index}`;
 }
 
 /**
@@ -206,6 +534,23 @@ function getMessageId(msg, index) {
  * @param {Array<{ sender?: string, text?: string, __ts?: number }>} extractedList
  */
 function getMessageIdFromExtracted(msg, extractedList) {
+  // Prefer stable metadata when present; avoid ambiguous text-based matching.
+  const prePlainText = String(msg?.prePlainText ?? "").trim();
+  const sourceIndexRaw = msg?.sourceMessageIndex;
+  if (prePlainText && Number.isFinite(Number(sourceIndexRaw))) {
+    return `${prePlainText}::${Number(sourceIndexRaw)}`;
+  }
+  const sender = String(msg?.sender ?? "unknown").trim() || "unknown";
+  const ts =
+    msg?.timestamp != null && String(msg.timestamp).trim() !== ""
+      ? String(msg.timestamp).trim()
+      : msg?.__ts != null && String(msg.__ts).trim() !== ""
+        ? String(msg.__ts).trim()
+        : "";
+  if (ts) {
+    return `${sender}::${ts}`;
+  }
+
   const idx = extractedList.findIndex(
     (m) =>
       m === msg ||
@@ -214,6 +559,11 @@ function getMessageIdFromExtracted(msg, extractedList) {
         Number(m?.__ts ?? 0) === Number(msg?.__ts ?? 0))
   );
   return getMessageId(msg, idx >= 0 ? idx : 0);
+}
+
+function participantCursorKeyForMessage(chatKey, msg) {
+  const participantKey = String(msg?.participantKey ?? "").trim();
+  return buildParticipantCursorKey(chatKey, participantKey);
 }
 
 /**
@@ -379,6 +729,71 @@ globalThis.__playwrightChatLastProcessedAt =
   globalThis.__playwrightChatLastProcessedAt || Object.create(null);
 /** Normalized chat key currently running the forward pipeline (blocks rotation / interrupt picks). */
 globalThis.__ACTIVE_PROCESSING_CHAT ??= null;
+
+/**
+ * Hard chat isolation lock: while in progress, the listener must not switch chats away from `chatKey`.
+ * Shape is mandated by production hardening requirements.
+ * @type {{ chatKey: string | null, inProgress: boolean, startedAtMs?: number } | null}
+ */
+globalThis.__activeChatLock =
+  globalThis.__activeChatLock &&
+  typeof globalThis.__activeChatLock === "object" &&
+  "inProgress" in globalThis.__activeChatLock
+    ? globalThis.__activeChatLock
+    : { chatKey: null, inProgress: false, startedAtMs: 0 };
+
+function activeChatLockKey() {
+  const lock = globalThis.__activeChatLock;
+  if (!lock || typeof lock !== "object") return "";
+  if (lock.inProgress !== true) return "";
+  return String(lock.chatKey ?? "").trim();
+}
+
+function activeChatLockAgeMs() {
+  const lock = globalThis.__activeChatLock;
+  if (!lock || typeof lock !== "object") return 0;
+  if (lock.inProgress !== true) return 0;
+  const startedAtMs = Number(lock.startedAtMs ?? 0);
+  if (!Number.isFinite(startedAtMs) || startedAtMs <= 0) return 0;
+  return Date.now() - startedAtMs;
+}
+
+function releaseChatLock({ stale = false } = {}) {
+  const lock = globalThis.__activeChatLock;
+  const prevKey =
+    lock && typeof lock === "object" ? String(lock.chatKey ?? "").trim() : "";
+  const ageMs = activeChatLockAgeMs();
+  globalThis.__activeChatLock = { chatKey: null, inProgress: false, startedAtMs: 0 };
+  if (stale) {
+    console.warn("[chat_lock_stale_released]", {
+      chatKey: prevKey || null,
+      ageMs: ageMs || null,
+    });
+  } else {
+    console.log("[chat_lock_released]", { chatKey: prevKey || null });
+  }
+}
+
+function maybeReleaseStaleChatLock() {
+  const ageMs = activeChatLockAgeMs();
+  if (!ageMs) return false;
+  if (ageMs <= 120_000) return false;
+  releaseChatLock({ stale: true });
+  return true;
+}
+
+function isChatSwitchBlockedByLock(targetChatKey) {
+  const lockedKey = activeChatLockKey();
+  const attempted = String(targetChatKey ?? "").trim();
+  return Boolean(lockedKey && attempted && lockedKey !== attempted);
+}
+
+function logChatSwitchBlocked(targetChatKey) {
+  console.log("[chat_switch_blocked_due_to_lock]", {
+    activeChat: activeChatLockKey() || null,
+    attempted: String(targetChatKey ?? "").trim() || null,
+  });
+}
 /**
  * Per-chat deterministic listener state: snapshot hash, seen row keys, last check time.
  * @type {Record<string, { snapshot: string, seenRowKeys: Set<string>, lastUpdatedAt: number }>}
@@ -895,10 +1310,23 @@ async function findChatWithNewMessage(page, targetGroups) {
   let bestScore = 0;
   let bestIdx = 999;
 
+  const dmWatch = globalThis.__activeDmWatchTargets || null;
+  const activeDmChatKeys =
+    dmWatch && dmWatch.keys instanceof Set ? dmWatch.keys : new Set();
   for (let i = 0; i < rowSignals.length; i++) {
     const r = rowSignals[i];
     if (!isValidBusinessChat(r.title)) continue;
-    if (!chatRowMatchesTargets(r.title, targetGroups)) continue;
+    if (!__shouldProcessChatForTests({ chatTitle: r.title, targetGroups, activeDmChatKeys })) {
+      if (TRACE_DEBUG) {
+        console.log("[playwright_chat_skipped_not_target]", {
+          chatTitle: r.title,
+          normalizedTitle: normalizeTitle(r.title) || null,
+          targetGroups,
+          activeDmWatchCount: activeDmChatKeys.size,
+        });
+      }
+      continue;
+    }
     if (!isAllowedChat(r.title)) continue;
 
     const norm = normalizePreview(r.previewSnippet);
@@ -1692,6 +2120,14 @@ async function extractIncomingMessages(page, opts = {}) {
               const plain = copyable?.getAttribute("data-pre-plain-text") || "";
               const match = plain.match(/^\[([^\]]+)\]\s*([^:]+):\s*/);
               const displayName = match ? match[2].trim() : "";
+              const senderAnchor =
+                n.getAttribute("data-sender") ||
+                n.getAttribute("data-author") ||
+                n.getAttribute("data-participant-id") ||
+                copyable?.getAttribute("data-sender") ||
+                copyable?.getAttribute("data-author") ||
+                copyable?.getAttribute("data-participant-id") ||
+                "";
               const haystack = `${displayName} ${plain} ${n.innerText || ""}`;
               const phoneMatch = haystack.match(
                 /(?:\+?\d[\d\s().-]{8,}\d|0\d[\d\s().-]{8,}\d)/
@@ -1702,6 +2138,7 @@ async function extractIncomingMessages(page, opts = {}) {
               return {
                 displayName,
                 participantPhone: phone,
+                senderAnchor,
                 prePlainText: plain,
               };
             }
@@ -1709,12 +2146,17 @@ async function extractIncomingMessages(page, opts = {}) {
             const text = getMessageText(node);
             if (!text) return null;
             const meta = participantMeta(node);
+            const timestamp =
+              Number(node.getAttribute("data-t") || node.getAttribute("data-timestamp") || 0) ||
+              null;
             return {
               text,
               sender: getSender(node),
               participantName: meta.displayName,
               participantPhone: meta.participantPhone,
+              senderAnchor: meta.senderAnchor,
               prePlainText: meta.prePlainText,
+              timestamp,
               sourceMessageIndex: nodes.indexOf(node),
             };
           })
@@ -1804,12 +2246,20 @@ async function extractIncomingMessages(page, opts = {}) {
   }
 
   for (const m of newMessages) {
+    const identity = resolveParticipantIdentity({
+      participantPhone: m.participantPhone,
+      participantName: m.participantName,
+      senderAnchor: m.senderAnchor,
+      groupChatKey: groupName,
+    });
+    m.participantKey = identity.participantKey || null;
     console.log("[Playwright] ✅ New message:", m.text, `(${m.sender})`);
-    if (m.sender === "user" && (m.participantName || m.participantPhone)) {
+    if (m.sender === "user" && identity.participantKey) {
       console.log("[playwright_message_sender_metadata_extracted]", {
         groupName,
-        participantName: m.participantName || null,
-        hasParticipantPhone: Boolean(m.participantPhone),
+        participantName: identity.participantName || m.participantName || null,
+        hasParticipantPhone: Boolean(identity.participantPhone),
+        participantKey: identity.participantKey,
         sourceMessageIndex:
           m.sourceMessageIndex != null && Number.isFinite(Number(m.sourceMessageIndex))
             ? Number(m.sourceMessageIndex)
@@ -1835,6 +2285,11 @@ async function extractIncomingMessages(page, opts = {}) {
       m.participantPhone != null && String(m.participantPhone).trim() !== ""
         ? String(m.participantPhone).trim()
         : null,
+    participantKey:
+      m.participantKey != null && String(m.participantKey).trim() !== ""
+        ? String(m.participantKey).trim()
+        : null,
+    timestamp: m.timestamp ?? null,
     sourceMessageIndex:
       m.sourceMessageIndex != null && Number.isFinite(Number(m.sourceMessageIndex))
         ? Number(m.sourceMessageIndex)
@@ -1914,9 +2369,22 @@ function isPlaywrightChatLoopEnabled() {
  * @param {string[] | null} targetGroups
  */
 async function pickInterruptChatFromSidebar(page, topChats, targetGroups) {
+  const dmWatch = globalThis.__activeDmWatchTargets || null;
+  const activeDmChatKeys =
+    dmWatch && dmWatch.keys instanceof Set ? dmWatch.keys : new Set();
   for (const chatName of topChats) {
     if (!isValidBusinessChat(chatName)) continue;
-    if (!chatRowMatchesTargets(chatName, targetGroups)) continue;
+    if (!__shouldProcessChatForTests({ chatTitle: chatName, targetGroups, activeDmChatKeys })) {
+      if (TRACE_DEBUG) {
+        console.log("[playwright_chat_skipped_not_target]", {
+          chatTitle: chatName,
+          normalizedTitle: normalizeTitle(chatName) || null,
+          targetGroups,
+          activeDmWatchCount: activeDmChatKeys.size,
+        });
+      }
+      continue;
+    }
 
     const rawPreview = await getSidebarRowPreviewText(page, chatName);
     const normalized = normalizePreview(rawPreview);
@@ -2063,6 +2531,10 @@ async function runListenerBody() {
   const runChatLoop = async () => {
     let restartAfterInterrupt = false;
     globalThis.__visitedChatsThisCycle = new Set();
+    if (isReplyPrivateLockActive()) {
+      console.log("⛔ Skip switching — reply private flow active");
+      return;
+    }
     if (globalThis.__WA_MEDIA_SEND__) {
       console.log(
         "⏸ Skip switching — WA media send in progress (action: switch_chat deferred)"
@@ -2115,6 +2587,19 @@ async function runListenerBody() {
       console.log("⏳ Processing in progress — skip switching");
       return;
     }
+    const lockedChatKey = activeChatLockKey();
+    if (lockedChatKey) {
+      // Stale-lock failsafe: if something went wrong mid-pipeline, release and recover.
+      if (maybeReleaseStaleChatLock()) {
+        return;
+      }
+      // Hard chat isolation: do not switch/open chats while a pipeline+send is in progress.
+      console.log("[chat_switch_blocked_due_to_lock]", {
+        activeChat: lockedChatKey,
+        attempted: null,
+      });
+      return;
+    }
     console.log("[Loop] Running chat loop");
     if (chatLoopRunning) return;
     chatLoopRunning = true;
@@ -2134,6 +2619,32 @@ async function runListenerBody() {
         if (!sidebarReady) {
           console.log("[Loop] Sidebar not ready (no chat-list / pane-side)");
           return;
+        }
+
+        // DM continuation watch targets (additive only). Refresh periodically.
+        const lastLoaded = Number(globalThis.__dmWatchLoadedAtMs ?? 0);
+        if (!Number.isFinite(lastLoaded) || Date.now() - lastLoaded > 7_500) {
+          const loaded = await loadActiveDmWatchTargets().catch(() => null);
+          const keys =
+            loaded && loaded.keys instanceof Set ? loaded.keys : new Set();
+          const byKey =
+            loaded && loaded.byKey instanceof Map ? loaded.byKey : new Map();
+          globalThis.__activeDmWatchTargets = { keys, byKey };
+          globalThis.__dmWatchLoadedAtMs = Date.now();
+          console.log("[playwright_dm_watch_targets_loaded]", {
+            count: keys.size,
+          });
+          for (const chatKey of keys) {
+            const first = byKey.get(chatKey)?.[0] || null;
+            console.log("[playwright_dm_watch_target_detected]", {
+              chatTitle: clean(first?.dmChatTitle) || null,
+              chatKey,
+            });
+          }
+          globalThis.__watchedDmAllowlist = buildWatchedDmAllowlist({
+            dmWatchTargets: { keys, byKey },
+            targetGroups,
+          });
         }
 
         const conversationOpen = await ensureWhatsAppConversationOpen(page);
@@ -2207,6 +2718,43 @@ async function runListenerBody() {
           }
         }
 
+        // DM watch priority: before group-rotation/stickiness, open watched DM chats
+        // when they have unread/preview-delta signals. Additive only; does not scan arbitrary DMs.
+        if (!chatName && !lockedChatName) {
+          const dmWatch = globalThis.__activeDmWatchTargets || null;
+          const activeDmChatKeys =
+            dmWatch && dmWatch.keys instanceof Set ? dmWatch.keys : new Set();
+          if (activeDmChatKeys.size > 0) {
+            const dmCandidate = await findWatchedDmPriorityCandidate(
+              page,
+              activeDmChatKeys,
+              activeNowForStickiness
+            );
+            if (dmCandidate?.chatTitle) {
+              console.log("[playwright_dm_watch_priority_opening]", {
+                chatTitle: dmCandidate.chatTitle,
+                chatKey: dmCandidate.chatKey,
+              });
+              const opened = await openChatAndConfirm(page, dmCandidate.chatTitle).catch(
+                (err) => {
+                  console.warn("[playwright_dm_watch_priority_open_failed]", {
+                    chatTitle: dmCandidate.chatTitle,
+                    chatKey: dmCandidate.chatKey,
+                    reason: clean(err?.message ?? err) || "OPEN_FAILED",
+                  });
+                  return false;
+                }
+              );
+              if (opened) {
+                chatName = dmCandidate.chatTitle;
+                globalThis.__activeChatTitle = chatName;
+                globalThis.__activeChatInFocus = chatName;
+                skipRotation = true;
+              }
+            }
+          }
+        }
+
         if (!chatName && lockedChatName) {
           chatName = lockedChatName;
           globalThis.__activeChatTitle = chatName;
@@ -2260,7 +2808,14 @@ async function runListenerBody() {
           const allowedForRotation = topChats.filter(
             (name) =>
               isValidBusinessChat(name) &&
-              chatRowMatchesTargets(name, targetGroups) &&
+              __shouldProcessChatForTests({
+                chatTitle: name,
+                targetGroups,
+                activeDmChatKeys:
+                  (globalThis.__activeDmWatchTargets?.keys instanceof Set
+                    ? globalThis.__activeDmWatchTargets.keys
+                    : new Set()),
+              }) &&
               isAllowedChat(name)
           );
           let currentHeaderChat = "";
@@ -2379,6 +2934,10 @@ async function runListenerBody() {
           rotationIdleCount = 0;
         }
 
+        if (isReplyPrivateLockActive()) {
+          console.log("⛔ Skip switching — reply private flow active");
+          return;
+        }
         if (globalThis.__UI_SEND_LOCK) return;
 
         try {
@@ -2423,7 +2982,24 @@ async function runListenerBody() {
           globalThis.__activeChatTitle = activeChat;
           await wait(300);
 
-          if (!isAllowedChat(globalThis.__currentOpenChatTitle)) {
+          const watchedDmAllowlist =
+            globalThis.__watchedDmAllowlist instanceof Set
+              ? globalThis.__watchedDmAllowlist
+              : new Set();
+          const currentTitle = String(globalThis.__currentOpenChatTitle || "").trim();
+          const normalizedChatKey = normalizeTitle(currentTitle);
+          const isGroupAllowed = isAllowedChat(currentTitle);
+          const isWatchedDmAllowed =
+            Boolean(normalizedChatKey) && watchedDmAllowlist.has(normalizedChatKey);
+
+          if (!isGroupAllowed && isWatchedDmAllowed) {
+            console.log("[playwright_dm_watch_allowlist_bypass]", {
+              chatTitle: currentTitle || null,
+              chatKey: normalizedChatKey || null,
+            });
+          }
+
+          if (!isGroupAllowed && !isWatchedDmAllowed) {
             console.log(
               "⛔ Skipping chat (not in allowlist):",
               normalize(globalThis.__currentOpenChatTitle || "")
@@ -2479,6 +3055,87 @@ async function runListenerBody() {
           const sorted = [...rows]
             .map((m, idx) => ({ ...m, __ts: Number(m?.timestamp) || idx }))
             .sort((a, b) => a.__ts - b.__ts);
+          const openTitle = String(globalThis.__currentOpenChatTitle ?? "").trim();
+          if (!openTitle) {
+            console.error("INVALID CHAT CONTEXT — DROPPING MESSAGE", {
+              title: openTitle,
+            });
+            return;
+          }
+
+          const dmWatch = globalThis.__activeDmWatchTargets || null;
+          const activeDmChatKeys =
+            dmWatch && dmWatch.keys instanceof Set ? dmWatch.keys : new Set();
+          const bookingsByDmKey =
+            dmWatch && dmWatch.byKey instanceof Map ? dmWatch.byKey : new Map();
+          const normalizedOpenChatKey = normalizeTitle(openTitle);
+          const isDmContinuationChat = Boolean(
+            normalizedOpenChatKey && activeDmChatKeys.has(normalizedOpenChatKey)
+          );
+          console.log("[playwright_open_chat_classified]", {
+            openTitle,
+            normalizedOpenChatKey: normalizedOpenChatKey || null,
+            isDmContinuationChat,
+          });
+
+          // DM continuation: no group participant bucketing; forward only user/customer replies.
+          if (isDmContinuationChat) {
+            globalThis.__lastProcessedDmMsg =
+              globalThis.__lastProcessedDmMsg || Object.create(null);
+            const dmCursorKey = `dm-continuation::${normalizedOpenChatKey}`;
+            const last = [...sorted].reverse().find((m) => m?.sender === "user" && String(m?.text ?? "").trim());
+            if (!last) {
+              return;
+            }
+            const dmMsgId = getMessageIdFromExtracted(last, sorted);
+            const prevId = String(globalThis.__lastProcessedDmMsg?.[dmCursorKey] ?? "").trim();
+            if (dmMsgId && prevId && dmMsgId === prevId) {
+              console.log("[playwright_dm_message_skipped_already_processed]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+              });
+              return;
+            }
+
+            const match = pickDmBookingHint(normalizedOpenChatKey, bookingsByDmKey);
+            if (!match.ok) {
+              if (match.reason === "AMBIGUOUS_MATCH") {
+                console.warn("[playwright_dm_continuation_ambiguous]", {
+                  dmChatKey: normalizedOpenChatKey,
+                  bookingIds: match.bookingIds || [],
+                });
+              }
+              return;
+            }
+            const hint = match.hint || {};
+            const forwarded = await forwardPlaywrightDmToPipeline({
+              message: String(last.text ?? "").trim(),
+              dmChatTitle: openTitle,
+              dmPlaywrightChatKey: normalizedOpenChatKey,
+              bookingHint: {
+                bookingId: hint.bookingId || null,
+                participantKey: hint.participantKey || null,
+                participantName: hint.participantName || null,
+                participantPhoneForDm: hint.participantPhoneForDm || null,
+                originalGroupName: hint.originalGroupName || null,
+                originalGroupChatKey: hint.originalGroupChatKey || null,
+              },
+              source: "PLAYWRIGHT_DM",
+            }).catch(() => false);
+            if (forwarded) {
+              globalThis.__lastProcessedDmMsg[dmCursorKey] = dmMsgId || String(Date.now());
+              console.log("[playwright_dm_message_forwarded]", {
+                dmChatTitle: openTitle,
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                bookingId: hint.bookingId || null,
+              });
+            } else {
+              console.warn("[playwright_dm_continuation_forward_failed]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                reason: "FORWARD_FAILED",
+              });
+            }
+            return;
+          }
 
           const duplicateRowKeyCounts = new Map();
           /** Index in full `sorted` thread (needed for “reply after this bubble?” checks). */
@@ -2490,22 +3147,37 @@ async function runListenerBody() {
             const seen = duplicateRowKeyCounts.get(baseRowKey) ?? 0;
             const nextSeen = seen + 1;
             duplicateRowKeyCounts.set(baseRowKey, nextSeen);
+            const identity = resolveParticipantIdentity({
+              participantPhone: m.participantPhone,
+              participantName: m.participantName,
+              senderAnchor: m.senderAnchor,
+              groupChatKey: openTitle || chatName || activeChat || "",
+            });
             userMessages.push({
               ...m,
+              participantKey: identity.participantKey || null,
+              participantName: identity.participantName || m.participantName || null,
+              participantPhone: identity.participantPhone || m.participantPhone || null,
               __position: sortedIdx,
               __rowKey: `${baseRowKey}#${nextSeen}`,
             });
           }
           const totalUserMessages = userMessages.length;
           console.log("📥 Total user messages:", totalUserMessages);
-
-          const openTitle = String(globalThis.__currentOpenChatTitle ?? "").trim();
-          if (!openTitle) {
-            console.error("INVALID CHAT CONTEXT — DROPPING MESSAGE", {
-              title: openTitle,
-            });
-            return;
+          const participantBuckets = new Map();
+          for (const msg of userMessages) {
+            const key = String(msg.participantKey ?? "").trim() || "(missing)";
+            if (!participantBuckets.has(key)) participantBuckets.set(key, []);
+            participantBuckets.get(key).push(msg);
           }
+          console.log("[group_messages_partitioned_by_participant]", {
+            groupChatKey: normalizeTitle(openTitle),
+            participantCount: participantBuckets.size,
+            buckets: Array.from(participantBuckets.entries()).map(([participantKey, rows]) => ({
+              participantKey: participantKey === "(missing)" ? null : participantKey,
+              count: rows.length,
+            })),
+          });
           const currentChat = String(openTitle || activeChat || "").trim();
           if (currentChat && currentChat !== lastActiveChat) {
             rotationIdleCount = 0;
@@ -2513,10 +3185,7 @@ async function runListenerBody() {
           }
           const chatKey = normalizeTitle(openTitle);
           const chatId = chatKey;
-          if (
-            globalThis.__activeChatLock &&
-            globalThis.__activeChatLock !== chatId
-          ) {
+          if (isChatSwitchBlockedByLock(chatId)) {
             console.log("⏳ Chat queued due to active lock:", chatId);
             globalThis.__pendingChats = globalThis.__pendingChats || new Set();
             globalThis.__pendingChats.add(chatId);
@@ -2600,51 +3269,75 @@ async function runListenerBody() {
             console.log("🔥 Bootstrap with user messages — processing");
           }
 
-          const lastUserMsg =
-            extractedMessages.length > 0
-              ? extractedMessages[extractedMessages.length - 1]
-              : null;
-          const lastUserMsgId =
-            lastUserMsg && lastUserMsg.sender === "user"
-              ? getMessageIdFromExtracted(lastUserMsg, extractedMessages)
-              : "";
-          const lastProcessedUserMsgId = String(
-            globalThis.__lastProcessedUserMsg?.[chatKey] ?? ""
-          ).trim();
-          if (
-            lastUserMsg &&
-            lastUserMsg.sender === "user" &&
-            String(lastUserMsg.text ?? "").trim() &&
-            lastUserMsgId &&
-            lastUserMsgId !== lastProcessedUserMsgId
-          ) {
-            newUserMessages = [lastUserMsg];
-            console.log("🎯 Last user message selected", {
-              chatKey,
-              lastUserMsgId,
-              selectedCount: 1,
-            });
-            const pos = lastUserMsg.__position;
-            if (typeof pos === "number" && pos >= 0) {
-              const replied = sorted
-                .slice(pos + 1)
-                .some((m) => m.sender === "me");
-              if (replied) {
-                console.log(
-                  "⛔ Already replied after selected message — syncing processed id (DOM has assistant below user)"
-                );
-                globalThis.__lastProcessedUserMsg =
-                  globalThis.__lastProcessedUserMsg || Object.create(null);
-                globalThis.__lastProcessedUserMsg[chatKey] = lastUserMsgId;
-                globalThis.__chatState[chatKey] = {
-                  snapshot: snapshotHash,
-                  seenRowKeys: currentSeen,
-                  lastUpdatedAt: Date.now(),
-                };
-                return;
+          globalThis.__lastProcessedUserMsg =
+            globalThis.__lastProcessedUserMsg || Object.create(null);
+          for (const [, participantMessages] of participantBuckets.entries()) {
+            const lastUserMsg = participantMessages[participantMessages.length - 1] || null;
+            const cursorKey = participantCursorKeyForMessage(chatKey, lastUserMsg);
+            if (!cursorKey) {
+              console.warn("[participant_identity_missing_group_state_blocked]", {
+                groupChatKey: chatKey,
+                textPreview: String(lastUserMsg?.text ?? "").slice(0, 80),
+                reason: "MISSING_PARTICIPANT_CURSOR_KEY",
+              });
+              continue;
+            }
+            const lastUserMsgId =
+              lastUserMsg && lastUserMsg.sender === "user"
+                ? getMessageIdFromExtracted(lastUserMsg, extractedMessages)
+                : "";
+            const lastProcessedUserMsgId = String(
+              globalThis.__lastProcessedUserMsg?.[cursorKey] ?? ""
+            ).trim();
+            if (
+              lastUserMsg &&
+              lastUserMsg.sender === "user" &&
+              String(lastUserMsg.text ?? "").trim() &&
+              lastUserMsgId &&
+              lastUserMsgId !== lastProcessedUserMsgId
+            ) {
+              if (isGroupMessageStale(lastUserMsg.timestamp)) {
+                console.warn("[stale_group_message_reply_blocked]", {
+                  groupChatKey: chatKey,
+                  participantKey: lastUserMsg.participantKey || null,
+                  messageId: lastUserMsgId,
+                  timestamp: lastUserMsg.timestamp ?? null,
+                });
+                globalThis.__lastProcessedUserMsg[cursorKey] = lastUserMsgId;
+                continue;
               }
+              const pos = lastUserMsg.__position;
+              if (typeof pos === "number" && pos >= 0) {
+                const replied = sorted
+                  .slice(pos + 1)
+                  .some((m) => m.sender === "me");
+                if (replied) {
+                  console.log(
+                    "⛔ Already replied after selected message — syncing participant processed id"
+                  );
+                  globalThis.__lastProcessedUserMsg[cursorKey] = lastUserMsgId;
+                  continue;
+                }
+              }
+              newUserMessages.push(lastUserMsg);
+              console.log("[participant_new_message_selected]", {
+                chatKey,
+                participantKey: lastUserMsg.participantKey || null,
+                cursorKey,
+                lastUserMsgId,
+              });
+            } else if (lastUserMsgId) {
+              console.log("[participant_message_skipped_already_processed]", {
+                chatKey,
+                participantKey: lastUserMsg?.participantKey || null,
+                cursorKey,
+                lastUserMsgId,
+              });
             }
           }
+          newUserMessages.sort(
+            (a, b) => (Number(a?.__ts) || 0) - (Number(b?.__ts) || 0)
+          );
 
           console.log("🆕 New user msgs:", newUserMessages.length);
 
@@ -2658,13 +3351,7 @@ async function runListenerBody() {
               seenRowKeys: currentSeen,
               lastUpdatedAt: Date.now(),
             };
-            if (
-              lastUserMsg &&
-              lastUserMsg.sender === "user" &&
-              lastUserMsgId &&
-              lastUserMsgId === lastProcessedUserMsgId &&
-              sidebarSignal.hasSignal
-            ) {
+            if (sidebarSignal.hasSignal) {
               console.log("⏳ Sidebar shows fresh activity; waiting for DOM catch-up", {
                 chatKey,
                 unreadPoints: sidebarSignal.unreadPoints,
@@ -2776,8 +3463,13 @@ async function runListenerBody() {
             }
           }
 
-          globalThis.__activeChatLock = chatId;
+          // Acquire hard chat lock for this chatKey before forwarding (prevents any chat switching).
+          if (!activeChatLockKey()) {
+            globalThis.__activeChatLock = { chatKey, inProgress: true, startedAtMs: Date.now() };
+            console.log("[chat_lock_acquired]", { chatKey });
+          }
           globalThis.__ACTIVE_PROCESSING_CHAT = chatKey;
+          let anyForwarded = false;
           try {
             for (const [index, msg] of messagesToForward.entries()) {
             const lastUserText = String(msg?.text ?? "").trim();
@@ -2854,6 +3546,8 @@ async function runListenerBody() {
                 sender: msg.sender,
                 senderName: msg.participantName || msg.sender,
                 participantPhoneForDm: msg.participantPhone || undefined,
+                participantKey: msg.participantKey || undefined,
+                senderAnchor: msg.senderAnchor || undefined,
                 timestamp: msg.timestamp,
                 groupName: String(
                   globalThis.__currentOpenChatTitle ?? activeChat ?? ""
@@ -2868,6 +3562,7 @@ async function runListenerBody() {
                     : msg.__position,
               });
               if (forwarded) {
+                anyForwarded = true;
                 globalThis.__playwrightChatLastProcessedAt =
                   globalThis.__playwrightChatLastProcessedAt ||
                   Object.create(null);
@@ -2885,6 +3580,7 @@ async function runListenerBody() {
                   guaranteeKey,
                   chatKey,
                   rowKey: String(msg.__rowKey ?? "").trim(),
+                  participantCursorKey: participantCursorKeyForMessage(chatKey, msg),
                 });
               } else {
                 globalThis.__chatResponding[chatKey] = false;
@@ -2903,7 +3599,11 @@ async function runListenerBody() {
             }
           } finally {
             globalThis.__ACTIVE_PROCESSING_CHAT = null;
-            globalThis.__activeChatLock = null;
+            // Release lock if nothing was forwarded (pipeline errored before any send could happen).
+            // If at least one forward succeeded, Playwright outbound releases after send completes.
+            if (!anyForwarded && activeChatLockKey() === chatKey) {
+              releaseChatLock();
+            }
             if (globalThis.__pendingChats && globalThis.__pendingChats.size > 0) {
               const nextChat = globalThis.__pendingChats.values().next().value;
               globalThis.__pendingChats.delete(nextChat);
@@ -2998,13 +3698,20 @@ async function runListenerBody() {
     const pollInterruptSafe = () => {
       void (async () => {
         if (isStopping) return;
+        if (isReplyPrivateLockActive()) {
+          console.log("⛔ Skip switching — reply private flow active");
+          return;
+        }
         /** Defer interrupt queue (switch_chat) while outbound media UI is active. */
         if (globalThis.__WA_MEDIA_SEND__) return;
         if (chatLoopRunning || globalThis.__loopRunning) return;
         if (globalThis.__UI_SEND_LOCK) return;
         if (globalThis.__UI_HARD_LOCK) return;
         if (globalThis.__ACTIVE_PIPELINE__) return;
-        if (globalThis.__activeChatLock) return;
+        if (activeChatLockKey()) {
+          maybeReleaseStaleChatLock();
+          return;
+        }
         if (
           globalThis.__activeJob &&
           typeof globalThis.__activeJobStart === "number" &&
@@ -3025,6 +3732,11 @@ async function runListenerBody() {
           targetGroups
         );
         if (!interruptChat) return;
+        const interruptKey = normalizeTitle(String(interruptChat).trim());
+        if (isChatSwitchBlockedByLock(interruptKey)) {
+          logChatSwitchBlocked(interruptKey);
+          return;
+        }
         const activeChatTitle = String(globalThis.__activeChatTitle ?? "").trim();
         if (activeChatTitle && String(interruptChat).trim() === activeChatTitle) {
           // Same chat inbound: keep current conversation continuity, no forced preemption.
