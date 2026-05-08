@@ -438,19 +438,34 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
         recipientType,
         String(toField).slice(0, 48)
       );
+      console.log("[cloud_send_result_propagated]", {
+        ok: true,
+        httpStatus: result.status,
+        tokenSource: resolved.tokenSource,
+        caller: "sendWhatsAppMessage",
+      });
       return {
         ok: true,
         groupSendFailed: false,
         providerMessageId: extractProviderMessageId(result.data),
+        httpStatus: result.status,
+        tokenSource: resolved.tokenSource,
       };
     }
 
     if (recipientType !== "group") {
+      console.log("[cloud_send_result_propagated]", {
+        ok: false,
+        httpStatus: result.status,
+        tokenSource: resolved.tokenSource,
+        caller: "sendWhatsAppMessage",
+      });
       return {
         ok: false,
         groupSendFailed: false,
         httpStatus: result.status,
         error: result.data,
+        tokenSource: resolved.tokenSource,
       };
     }
 
@@ -465,6 +480,12 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       console.error(
         "[whatsappCloud] group send failed and no fallbackDmTo — cannot DM user"
       );
+      console.log("[cloud_send_result_propagated]", {
+        ok: false,
+        httpStatus: result.status,
+        tokenSource: resolved.tokenSource,
+        caller: "sendWhatsAppMessage",
+      });
       return {
         ok: false,
         groupSendFailed: true,
@@ -524,12 +545,19 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       }
     }
 
+    console.log("[cloud_send_result_propagated]", {
+      ok: dmResult.ok === true,
+      httpStatus: dmResult.status,
+      tokenSource: resolved.tokenSource,
+      caller: "sendWhatsAppMessage.dmFallback",
+    });
     return {
       ok: dmResult.ok,
       groupSendFailed: true,
       providerMessageId: dmResult.ok ? extractProviderMessageId(dmResult.data) : null,
       httpStatus: dmResult.status,
       error: dmResult.ok ? null : dmResult.data,
+      tokenSource: resolved.tokenSource,
     };
   } catch (err) {
     console.error(
@@ -598,7 +626,12 @@ export async function sendWhatsAppImage(
     );
     if (result.ok) {
       console.log("[whatsappCloud] Image sent OK →", String(toField).slice(0, 48));
-      return { ok: true, groupSendFailed: false };
+      return {
+        ok: true,
+        groupSendFailed: false,
+        httpStatus: result.status,
+        tokenSource: resolved.tokenSource,
+      };
     }
 
     if (recipientType !== "group") {
@@ -607,6 +640,7 @@ export async function sendWhatsAppImage(
         groupSendFailed: false,
         httpStatus: result.status,
         error: result.data,
+        tokenSource: resolved.tokenSource,
       };
     }
 
@@ -622,6 +656,7 @@ export async function sendWhatsAppImage(
         groupSendFailed: true,
         httpStatus: result.status,
         error: result.data,
+        tokenSource: resolved.tokenSource,
       };
     }
     const dmPayload = buildImagePayload(fallbackDigits, "individual", link);
@@ -648,6 +683,7 @@ export async function sendWhatsAppImage(
       groupSendFailed: true,
       httpStatus: dmResult.status,
       error: dmResult.ok ? null : dmResult.data,
+      tokenSource: resolved.tokenSource,
     };
   } catch (err) {
     console.error("[whatsappCloud] sendWhatsAppImage error:", err);
@@ -677,12 +713,25 @@ const WHATSAPP_IMAGE_INTRO_FALLBACK = "Here are the images 👇";
  */
 export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) {
   let groupSendFailed = false;
+  let allOk = true;
+  let lastHttpStatus = null;
+  let lastTokenSource = null;
   const recipientType = opts.recipientType === "group" ? "group" : "individual";
   let includeGroupDmNotice = recipientType === "group";
 
-  const track = async (p) => {
+  const track = async (p, caller) => {
     const r = await p;
     if (r?.groupSendFailed) groupSendFailed = true;
+    if (r?.ok !== true) allOk = false;
+    if (r?.httpStatus != null) lastHttpStatus = r.httpStatus;
+    if (r?.tokenSource) lastTokenSource = r.tokenSource;
+    console.log("[cloud_send_result_propagated]", {
+      ok: r?.ok === true,
+      httpStatus: r?.httpStatus ?? null,
+      tokenSource: r?.tokenSource ?? null,
+      caller,
+    });
+    return r;
   };
 
   const nextTextOpts = () => {
@@ -707,12 +756,12 @@ export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) 
       : "whatsapp";
 
   if (channel !== "whatsapp") {
-    await track(sendWhatsAppMessage(to, text, credentials, nextTextOpts()));
-    return { groupSendFailed };
+    await track(sendWhatsAppMessage(to, text, credentials, nextTextOpts()), "deliver_non_whatsapp_text");
+    return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
   }
 
   const raw = String(text ?? "").trim();
-  if (raw === "") return { groupSendFailed: false };
+  if (raw === "") return { ok: false, groupSendFailed: false };
 
   const deliveryIntent = String(opts.deliveryIntent ?? "")
     .trim()
@@ -739,17 +788,17 @@ export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) 
       explicitUrls.length,
       "image(s)"
     );
-    await track(sendWhatsAppMessage(to, intro, credentials, nextTextOpts()));
+    await track(sendWhatsAppMessage(to, intro, credentials, nextTextOpts()), "deliver_show_images_intro");
     for (const imageUrl of explicitUrls) {
-      await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()));
+      await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()), "deliver_show_images_image");
     }
-    return { groupSendFailed };
+    return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
   }
 
   const imageUrls = extractWhatsAppImageUrlsFromText(raw);
   if (imageUrls.length === 0) {
-    await track(sendWhatsAppMessage(to, raw, credentials, nextTextOpts()));
-    return { groupSendFailed };
+    await track(sendWhatsAppMessage(to, raw, credentials, nextTextOpts()), "deliver_text");
+    return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
   }
 
   let textWithoutUrls = cleanTextAfterUrlRemoval(
@@ -766,9 +815,9 @@ export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) 
     textWithoutUrls.length
   );
 
-  await track(sendWhatsAppMessage(to, textWithoutUrls, credentials, nextTextOpts()));
+  await track(sendWhatsAppMessage(to, textWithoutUrls, credentials, nextTextOpts()), "deliver_text_with_images");
   for (const imageUrl of imageUrls) {
-    await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()));
+    await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()), "deliver_embedded_image");
   }
-  return { groupSendFailed };
+  return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
 }

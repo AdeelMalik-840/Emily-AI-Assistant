@@ -378,10 +378,25 @@ export async function handleBookingApproval({
     const feedbackTo = normalizePhone(senderPhone);
     if (feedbackTo) {
       try {
-        await sendMessage(feedbackTo, feedbackMessage, sendCredentials ?? undefined, {
+        const approvalSendResult = await sendMessage(feedbackTo, feedbackMessage, sendCredentials ?? undefined, {
           recipientType: "individual",
         });
-        console.log("[approval_owner_ack_sent]", { bookingId: bid, status: newStatus });
+        console.log("[approval_cloud_send_result]", {
+          bookingId: bid,
+          target: "owner_ack",
+          ok: approvalSendResult?.ok === true,
+          httpStatus: approvalSendResult?.httpStatus ?? null,
+          tokenSource: approvalSendResult?.tokenSource ?? null,
+        });
+        if (approvalSendResult?.ok === true) {
+          console.log("[approval_owner_ack_sent]", { bookingId: bid, status: newStatus });
+        } else {
+          console.warn("[approval_owner_ack_failed]", {
+            bookingId: bid,
+            status: newStatus,
+            httpStatus: approvalSendResult?.httpStatus ?? null,
+          });
+        }
       } catch (feedbackErr) {
         console.warn(
           "⚠️ Booking approval feedback send failed:",

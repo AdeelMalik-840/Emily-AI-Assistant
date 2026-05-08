@@ -53,24 +53,21 @@ export async function sendViaCloudAPI({
     }
   );
   const groupSendFailed = Boolean(deliverResult?.groupSendFailed);
-  const apiSuccess = Boolean(
-    deliverResult &&
-      Array.isArray(deliverResult.messages) &&
-      deliverResult.messages.length > 0
-  );
-  const fallbackSuccess =
-    deliverResult?.ok === true ||
-    deliverResult?.success === true ||
-    (deliverResult != null &&
-      Object.prototype.hasOwnProperty.call(deliverResult, "groupSendFailed") &&
-      groupSendFailed === false);
-  const sendOk = apiSuccess || fallbackSuccess;
+  const sendOk = deliverResult?.ok === true;
+  console.log("[cloud_send_result_propagated]", {
+    ok: sendOk,
+    httpStatus: deliverResult?.httpStatus ?? null,
+    tokenSource: deliverResult?.tokenSource ?? null,
+    caller: "cloudApiAdapter.sendViaCloudAPI",
+  });
   if (!sendOk) {
     console.error("❌ Cloud send failed:", deliverResult);
   }
   return {
     ok: sendOk,
     ...(groupSendFailed ? { groupSendFailed: true } : {}),
+    ...(deliverResult?.httpStatus != null ? { httpStatus: deliverResult.httpStatus } : {}),
+    ...(deliverResult?.tokenSource ? { tokenSource: deliverResult.tokenSource } : {}),
   };
 }
 

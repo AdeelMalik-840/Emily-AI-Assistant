@@ -407,38 +407,72 @@ function failedRetryDecision(data) {
   return { ok: true, retryCount };
 }
 
+function extractFirestoreIndexUrl(error) {
+  const text = String(error?.message || error?.details || error || "");
+  const match = text.match(/https:\/\/console\.firebase\.google\.com\/[^\s)]+/);
+  return match ? match[0] : null;
+}
+
+function replyPrivatePollerFilters(statusFilter) {
+  return {
+    status: "approved",
+    approvalCustomerNotificationStatus: statusFilter,
+    bookingSource: "PLAYWRIGHT_GROUP",
+    playwrightReplyPrivateEligible: true,
+  };
+}
+
+async function runReplyPrivatePollerQuery(collection, statusFilter, limit) {
+  const filters = replyPrivatePollerFilters(statusFilter);
+  console.log("[reply_private_poller_query_started]", {
+    statusFilter,
+    filters,
+  });
+  try {
+    const snap = await collection
+      .where("status", "==", filters.status)
+      .where(
+        "approvalCustomerNotificationStatus",
+        "==",
+        filters.approvalCustomerNotificationStatus
+      )
+      .where("bookingSource", "==", filters.bookingSource)
+      .where("playwrightReplyPrivateEligible", "==", filters.playwrightReplyPrivateEligible)
+      .limit(limit)
+      .get();
+    const docs = snap?.docs ?? [];
+    console.log("[reply_private_poller_query_result]", {
+      statusFilter,
+      count: docs.length,
+      bookingIds: docs.map((doc) => doc.id),
+    });
+    return snap;
+  } catch (error) {
+    console.warn("[reply_private_poller_query_failed]", {
+      statusFilter,
+      code: error?.code || null,
+      message: error?.message || String(error),
+      details: error?.details || null,
+      indexUrlIfPresent: extractFirestoreIndexUrl(error),
+    });
+    return { docs: [] };
+  }
+}
+
 async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 5) {
   const collection = dbInstance
     .collection("businesses")
     .doc(ownerUserId)
     .collection("bookings");
-  const pendingSnap = await collection
-    .where("status", "==", "approved")
-    .where("approvalCustomerNotificationStatus", "==", "pending")
-    .where("bookingSource", "==", "PLAYWRIGHT_GROUP")
-    .where("playwrightReplyPrivateEligible", "==", true)
-    .limit(limit)
-    .get();
-  const processingSnap = await collection
-    .where("status", "==", "approved")
-    .where("approvalCustomerNotificationStatus", "==", "processing")
-    .where("bookingSource", "==", "PLAYWRIGHT_GROUP")
-    .where("playwrightReplyPrivateEligible", "==", true)
-    .limit(limit)
-    .get()
-    .catch(() => ({ docs: [] }));
-
-  const failedSnap = await collection
-    .where("status", "==", "approved")
-    .where("approvalCustomerNotificationStatus", "==", "failed")
-    .where("bookingSource", "==", "PLAYWRIGHT_GROUP")
-    .where("playwrightReplyPrivateEligible", "==", true)
-    .limit(limit)
-    .get()
-    .catch(() => ({ docs: [] }));
+  const pendingSnap = await runReplyPrivatePollerQuery(collection, "pending", limit);
+  const processingSnap = await runReplyPrivatePollerQuery(collection, "processing", limit);
+  const failedSnap = await runReplyPrivatePollerQuery(collection, "failed", limit);
 
   const seen = new Set();
-  const eligible = [...pendingSnap.docs, ...processingSnap.docs].map((doc) => ({
+  const pendingDocs = pendingSnap.docs ?? [];
+  const processingDocs = processingSnap.docs ?? [];
+  const failedDocs = failedSnap.docs ?? [];
+  const eligible = [...pendingDocs, ...processingDocs].map((doc) => ({
     id: doc.id,
     ref: doc.ref,
     data: doc.data() || {},
@@ -458,7 +492,10 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
     return stale;
   });
 
-  const failedEligible = [...failedSnap.docs].map((doc) => ({
+  const processingEligibleCount = eligible.filter(
+    (booking) => clean(booking.data?.approvalCustomerNotificationStatus) === "processing"
+  ).length;
+  const failedEligible = [...failedDocs].map((doc) => ({
     id: doc.id,
     ref: doc.ref,
     data: doc.data() || {},
@@ -493,7 +530,7 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
   // If a failed booking has exhausted retries, mark it terminal so we don't
   // keep scanning it forever.
   try {
-    const exhausted = [...failedSnap.docs].map((doc) => ({
+    const exhausted = [...failedDocs].map((doc) => ({
       id: doc.id,
       ref: doc.ref,
       data: doc.data() || {},
@@ -531,6 +568,14 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
   }
 
   const combined = [...eligible, ...failedEligible].slice(0, limit);
+  console.log("[reply_private_poller_combined_count]", {
+    pendingCount: pendingDocs.length,
+    processingRawCount: processingDocs.length,
+    processingEligibleCount,
+    failedRawCount: failedDocs.length,
+    failedEligibleCount: failedEligible.length,
+    combinedCount: combined.length,
+  });
 
   // Diagnostic-only: if poller query returns 0, log why recent approved bookings are excluded.
   // Does NOT enqueue; does NOT modify any booking fields.
@@ -631,6 +676,21 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
             sourceMessageIndex != null && Number.isFinite(Number(sourceMessageIndex)),
           exclusionReasons,
         });
+        if (exclusionReasons.length === 0) {
+          console.log("[reply_private_poller_query_missed_eligible_candidate]", {
+            bookingId: doc.id,
+            status: clean(data?.status) || null,
+            approvalCustomerNotificationStatus: approvalCustomerNotificationStatus || null,
+            bookingSource: bookingSource || null,
+            playwrightReplyPrivateEligible,
+            hasSourceIdentity: Boolean(identity),
+            hasSourceRowKey: Boolean(sourceRowKey),
+            hasSourceMessageId: Boolean(sourceMessageId),
+            hasSourceMessageIndex:
+              sourceMessageIndex != null && Number.isFinite(Number(sourceMessageIndex)),
+            likelyCause: "query_or_index_mismatch",
+          });
+        }
       }
     } catch (err) {
       console.warn("[reply_private_poller_candidate_excluded]", {
