@@ -20,6 +20,18 @@ function keyFromName(value) {
   return normalizeParticipantIdentityValue(value).replace(/\s+/g, "-");
 }
 
+function maskPhoneLast4(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  if (digits.length < 4) return null;
+  return digits.slice(-4);
+}
+
+function normalizeGroupChatKey(value) {
+  // Keep it consistent across listener extraction and pipeline forwarding.
+  // Use the same normalization style as cursor keys/session keys.
+  return normalizeParticipantIdentityValue(value).replace(/\s+/g, "-");
+}
+
 function stableAnchorValue(...values) {
   for (const value of values) {
     const normalized = normalizeParticipantIdentityValue(value);
@@ -29,7 +41,7 @@ function stableAnchorValue(...values) {
 }
 
 function fallbackAnchorFor(groupChatKey, normalizedName) {
-  const group = keyFromName(groupChatKey);
+  const group = normalizeGroupChatKey(groupChatKey);
   const name = keyFromName(normalizedName);
   if (!group || !name) return "";
   const cacheKey = `${group}::${name}`;
@@ -46,28 +58,6 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
       messageMeta.participantPhoneForDm ??
       extractedRow.participantPhone
   );
-  if (participantPhone) {
-    const participantName =
-      String(
-        messageMeta.participantName ??
-          messageMeta.senderName ??
-          extractedRow.participantName ??
-          ""
-      ).trim() || null;
-    console.log("[participant_identity_resolved]", {
-      source: "phone",
-      hasParticipantPhone: true,
-      participantKey: participantPhone,
-      participantName,
-    });
-    return {
-      participantKey: participantPhone,
-      participantName,
-      participantPhone,
-      confidence: "high",
-      source: "phone",
-    };
-  }
 
   const participantName = String(
     messageMeta.participantName ??
@@ -78,6 +68,10 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
       ""
   ).trim();
   const normalizedName = keyFromName(participantName);
+  const senderScope = stableAnchorValue(
+    messageMeta.senderScope,
+    extractedRow.senderScope
+  );
   const realAnchor = stableAnchorValue(
     messageMeta.senderContactId,
     messageMeta.contactKey,
@@ -104,24 +98,104 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
     extractedRow.playwrightChatKey ??
     extractedRow.groupName ??
     "";
+  const normalizedGroupChatKey = normalizeGroupChatKey(groupChatKey);
+  const isGroupContext = Boolean(normalizedGroupChatKey);
+
+  // Core rule:
+  // - participantKey is stable session identity for group conversations
+  // - phone is metadata (delivery channel / future Cloud handoff) and must NOT replace participantKey mid-flow
+  if (isGroupContext && senderScope) {
+    const stableKey = `scope::${senderScope}`;
+    console.log("[participant_identity_stable_key_selected]", {
+      groupChatKey: normalizedGroupChatKey || null,
+      participantName: participantName || null,
+      participantKey: stableKey,
+      participantPhonePresent: Boolean(participantPhone),
+      keySource: "senderScope",
+    });
+    if (participantPhone) {
+      console.log("[participant_identity_key_not_upgraded_to_phone]", {
+        participantKey: stableKey,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        reason: "STABLE_SESSION_KEY",
+      });
+      console.log("[participant_identity_phone_preserved_as_metadata]", {
+        participantKey: stableKey,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        source: "extracted.participantPhone",
+      });
+    }
+    return {
+      participantKey: stableKey,
+      participantName: participantName || null,
+      participantPhone: participantPhone || null,
+      confidence: "high",
+      source: "sender_scope",
+    };
+  }
+
+  // Non-group contexts (e.g., DM) keep the legacy behavior: phone can be the stable identity.
+  if (!isGroupContext && participantPhone) {
+    const nameForLog =
+      String(
+        messageMeta.participantName ??
+          messageMeta.senderName ??
+          extractedRow.participantName ??
+          ""
+      ).trim() || null;
+    console.log("[participant_identity_resolved]", {
+      source: "phone",
+      hasParticipantPhone: true,
+      participantKey: participantPhone,
+      participantName: nameForLog,
+    });
+    return {
+      participantKey: participantPhone,
+      participantName: nameForLog,
+      participantPhone,
+      confidence: "high",
+      source: "phone",
+    };
+  }
+
   const fallbackAnchor = realAnchor
     ? ""
-    : fallbackAnchorFor(groupChatKey, normalizedName);
+    : fallbackAnchorFor(normalizedGroupChatKey, normalizedName);
   const stableAnchor = realAnchor || fallbackAnchor;
 
   if (normalizedName && stableAnchor) {
     const participantKey = `${normalizedName}::${stableAnchor}`;
     console.log("[participant_identity_resolved]", {
       source: realAnchor ? "real_anchor" : "first_seen_anchor",
-      hasParticipantPhone: false,
+      hasParticipantPhone: Boolean(participantPhone),
       participantKey,
       participantName,
       anchorSource: realAnchor ? "real" : "fallback",
     });
+    if (participantPhone) {
+      console.log("[participant_identity_key_not_upgraded_to_phone]", {
+        participantKey,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        reason: "STABLE_SESSION_KEY",
+      });
+      console.log("[participant_identity_phone_preserved_as_metadata]", {
+        participantKey,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        source: "extracted.participantPhone",
+      });
+    } else {
+      console.log("[participant_identity_stable_key_selected]", {
+        groupChatKey: normalizedGroupChatKey || null,
+        participantName: participantName || null,
+        participantKey,
+        participantPhonePresent: false,
+        keySource: realAnchor ? "real_anchor" : "first_seen_anchor",
+      });
+    }
     return {
       participantKey,
       participantName,
-      participantPhone: null,
+      participantPhone: participantPhone || null,
       confidence: realAnchor ? "high" : "medium",
       source: realAnchor ? "real_anchor" : "first_seen_anchor",
     };
@@ -133,14 +207,33 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
   if (explicitKey) {
     console.log("[participant_identity_resolved]", {
       source: "explicit_key",
-      hasParticipantPhone: false,
+      hasParticipantPhone: Boolean(participantPhone),
       participantKey: explicitKey,
       participantName: participantName || null,
+    });
+    if (participantPhone) {
+      console.log("[participant_identity_key_not_upgraded_to_phone]", {
+        participantKey: explicitKey,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        reason: "STABLE_SESSION_KEY",
+      });
+      console.log("[participant_identity_phone_preserved_as_metadata]", {
+        participantKey: explicitKey,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        source: "extracted.participantPhone",
+      });
+    }
+    console.log("[participant_identity_stable_key_selected]", {
+      groupChatKey: normalizedGroupChatKey || null,
+      participantName: participantName || null,
+      participantKey: explicitKey,
+      participantPhonePresent: Boolean(participantPhone),
+      keySource: "explicit_key",
     });
     return {
       participantKey: explicitKey,
       participantName: participantName || null,
-      participantPhone: null,
+      participantPhone: participantPhone || null,
       confidence: "medium",
       source: "explicit_key",
     };
@@ -149,19 +242,38 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
   if (normalizedName) {
     console.warn("[participant_identity_weak_name_fallback_used]", {
       participantName,
-      groupChatKey: String(groupChatKey ?? "").trim() || null,
+      groupChatKey: String(normalizedGroupChatKey ?? "").trim() || null,
       reason: "NO_STABLE_ANCHOR",
     });
     console.log("[participant_identity_resolved]", {
       source: "name",
-      hasParticipantPhone: false,
+      hasParticipantPhone: Boolean(participantPhone),
       participantKey: normalizedName,
       participantName,
+    });
+    if (participantPhone) {
+      console.log("[participant_identity_key_not_upgraded_to_phone]", {
+        participantKey: normalizedName,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        reason: "STABLE_SESSION_KEY",
+      });
+      console.log("[participant_identity_phone_preserved_as_metadata]", {
+        participantKey: normalizedName,
+        phoneLast4: maskPhoneLast4(participantPhone),
+        source: "extracted.participantPhone",
+      });
+    }
+    console.log("[participant_identity_stable_key_selected]", {
+      groupChatKey: normalizedGroupChatKey || null,
+      participantName: participantName || null,
+      participantKey: normalizedName,
+      participantPhonePresent: Boolean(participantPhone),
+      keySource: "name",
     });
     return {
       participantKey: normalizedName,
       participantName,
-      participantPhone: null,
+      participantPhone: participantPhone || null,
       confidence: "low",
       source: "name",
     };

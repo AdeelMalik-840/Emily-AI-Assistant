@@ -796,30 +796,1477 @@ async function pointerClickMediaSend(page, sendBtn) {
 }
 
 /**
+ * Find only a confirmed WhatsApp media-preview Send button.
+ * This intentionally searches document/body because WhatsApp media overlays may not live under #main.
+ * @param {import("playwright").Page} page
+ * @returns {Promise<{ locator: import("playwright").Locator | null, strategy: string, meta?: Record<string, unknown> }>}
+ */
+async function findConfirmedMediaSendButton(page, opts = {}) {
+  const quiet = opts?.quiet === true;
+  if (!quiet) {
+    console.log("[media_send_confirmed_button_lookup_started]");
+  }
+  const marker = `confirmed-media-send-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+
+  const result = await page
+    .evaluate((marker) => {
+      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const rejectPattern =
+        /view once|wds-ic-view-once|turn on view once|menu|ic-more-vert|msg-check|msg-meta|tail-out|forward|forward media|search/i;
+
+      const isVisible = (el) => {
+        if (!el) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === "none" || s.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        if (!r || r.width <= 0 || r.height <= 0) return false;
+        const op = Number(s.opacity || "1");
+        if (Number.isFinite(op) && op <= 0.05) return false;
+        return true;
+      };
+
+      const parseRgb = (rgb) => {
+        const m = String(rgb || "").match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+        if (!m) return null;
+        return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) };
+      };
+
+      const styleHintFor = (el) => {
+        const s = window.getComputedStyle(el);
+        return {
+          backgroundColor: clean(s.backgroundColor),
+          borderRadius: clean(s.borderRadius),
+        };
+      };
+
+      const metaFor = (el) => {
+        const r = el.getBoundingClientRect();
+        const styleHint = styleHintFor(el);
+        const ariaLabel = clean(el.getAttribute("aria-label"));
+        const dataIcon = clean(el.getAttribute("data-icon"));
+        const dataTestid = clean(el.getAttribute("data-testid"));
+        const className = clean(el.className).slice(0, 120);
+        const text = clean(el.innerText || el.textContent || "").slice(0, 120);
+        return {
+          tag: el.tagName.toLowerCase(),
+          role: clean(el.getAttribute("role")) || null,
+          ariaLabel: ariaLabel || null,
+          dataIcon: dataIcon || null,
+          dataTestid: dataTestid || null,
+          className: className || null,
+          text: text || null,
+          boundingBox: {
+            x: Math.round(r.x),
+            y: Math.round(r.y),
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+          },
+          center: {
+            x: Math.round(r.x + r.width / 2),
+            y: Math.round(r.y + r.height / 2),
+          },
+          styleHint,
+        };
+      };
+
+      const clickableAncestor = (el) =>
+        el?.closest?.('button, [role="button"]') || null;
+
+      const raw = [];
+      const add = (el, strategy) => {
+        if (!el) return;
+        const button = clickableAncestor(el);
+        if (!button) return;
+        raw.push({ el: button, strategy });
+      };
+
+      document
+        .querySelectorAll(
+          '[role="button"][aria-label*="Send" i][aria-label*="selected" i], [aria-label^="Send " i]'
+        )
+        .forEach((el) => add(el, "aria-send-selected"));
+
+      document
+        .querySelectorAll(
+          '[data-icon="wds-ic-send-filled"], [data-testid="wds-ic-send-filled"], [data-icon*="wds-ic-send-filled" i], [data-testid*="wds-ic-send-filled" i]'
+        )
+        .forEach((el) => add(el, "wds-send-icon"));
+
+      document.querySelectorAll("button, [role='button']").forEach((el) => {
+        const m = metaFor(el);
+        const haystack = [
+          m.ariaLabel,
+          m.dataIcon,
+          m.dataTestid,
+          m.className,
+          m.text,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        if (/wds-ic-send-filled/i.test(haystack) || /Send .*selected/i.test(haystack)) {
+          add(el, "button-text-or-attrs");
+        }
+      });
+
+      const seen = new Set();
+      const candidates = [];
+      for (const item of raw) {
+        if (!item.el || seen.has(item.el)) continue;
+        seen.add(item.el);
+        candidates.push(item);
+      }
+
+      const rejected = [];
+      const viewport = { width: window.innerWidth, height: window.innerHeight };
+
+      for (const { el, strategy } of candidates) {
+        const meta = metaFor(el);
+        const haystack = [
+          meta.ariaLabel,
+          meta.dataIcon,
+          meta.dataTestid,
+          meta.className,
+          meta.text,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+        const reject = (reason) => {
+          rejected.push({ reason, strategy, ...meta });
+        };
+
+        if (!isVisible(el)) {
+          reject("not_visible");
+          continue;
+        }
+
+        const disabled =
+          (el.getAttribute("aria-disabled") || "").toLowerCase() === "true" ||
+          ("disabled" in el && Boolean(el.disabled));
+        if (disabled) {
+          reject("disabled");
+          continue;
+        }
+
+        if (rejectPattern.test(haystack)) {
+          reject("blocked_control");
+          continue;
+        }
+
+        const role = clean(el.getAttribute("role"));
+        if (el.tagName.toLowerCase() !== "button" && role !== "button") {
+          reject("not_clickable_button");
+          continue;
+        }
+
+        const { width, height } = meta.boundingBox;
+        if (width < 45 || width > 85 || height < 45 || height > 85) {
+          reject("size_out_of_range");
+          continue;
+        }
+
+        if (meta.center.y < viewport.height * 0.5) {
+          reject("not_lower_half");
+          continue;
+        }
+
+        const rgb = parseRgb(meta.styleHint.backgroundColor);
+        const greenish = rgb && rgb.g >= 120 && rgb.r <= 100 && rgb.b <= 100;
+        const circular =
+          Math.abs(width - height) <= 8 &&
+          /px|%/i.test(String(meta.styleHint.borderRadius || ""));
+        const ariaSendSelected = /Send .*selected/i.test(String(meta.ariaLabel || ""));
+        const wdsSend = /wds-ic-send-filled/i.test(haystack);
+        const ariaSendGreen =
+          /\bSend\b/i.test(String(meta.ariaLabel || "")) && greenish && circular;
+
+        if (!ariaSendSelected && !wdsSend && !ariaSendGreen) {
+          reject("missing_strong_send_signal");
+          continue;
+        }
+
+        el.setAttribute("data-emily-confirmed-media-send", marker);
+        return {
+          found: true,
+          marker,
+          strategy,
+          meta: {
+            ...meta,
+            strongSignals: {
+              ariaSendSelected,
+              wdsSend,
+              ariaSendGreen,
+              greenish: Boolean(greenish),
+              circular: Boolean(circular),
+            },
+          },
+          rejected: rejected.slice(0, 20),
+        };
+      }
+
+      const visibleCandidates = Array.from(
+        document.querySelectorAll(
+          'button, [role="button"], [aria-label], [data-icon], [data-testid], svg'
+        )
+      )
+        .filter(isVisible)
+        .map(metaFor);
+
+      const haystackFor = (m) =>
+        [m.ariaLabel, m.dataIcon, m.dataTestid, m.className, m.text]
+          .filter(Boolean)
+          .join(" ");
+      const sendishCandidates = visibleCandidates
+        .filter((m) => /send|selected/i.test(haystackFor(m)))
+        .slice(0, 80);
+      const wdsCandidates = visibleCandidates
+        .filter((m) => /wds-ic-/i.test(haystackFor(m)))
+        .slice(0, 80);
+      const lowerRightCircularCandidates = visibleCandidates
+        .filter((m) => {
+          const box = m.boundingBox || {};
+          const width = Number(box.width || 0);
+          const height = Number(box.height || 0);
+          const center = m.center || {};
+          const circular =
+            width >= 45 &&
+            width <= 85 &&
+            height >= 45 &&
+            height <= 85 &&
+            Math.abs(width - height) <= 10;
+          const lowerRight =
+            Number(center.x || 0) >= window.innerWidth * 0.55 &&
+            Number(center.y || 0) >= window.innerHeight * 0.5;
+          return circular && lowerRight;
+        })
+        .slice(0, 80);
+
+      return {
+        found: false,
+        rejected: rejected.slice(0, 40),
+        visibleCandidates: visibleCandidates.slice(0, 120),
+        sendishCandidates,
+        wdsCandidates,
+        lowerRightCircularCandidates,
+      };
+    }, marker)
+    .catch((err) => ({
+      found: false,
+      error: err instanceof Error ? err.message : String(err),
+      rejected: [],
+      visibleCandidates: [],
+    }));
+
+  if (!quiet && Array.isArray(result?.rejected)) {
+    for (const rejection of result.rejected.slice(0, 12)) {
+      console.log("[media_send_candidate_rejected]", rejection);
+    }
+  }
+
+  if (result?.found && result.marker) {
+    if (!quiet) {
+      console.log("[media_send_confirmed_button_found]", {
+        strategy: result.strategy,
+        ...(result.meta || {}),
+      });
+    }
+    return {
+      locator: page.locator(`[data-emily-confirmed-media-send="${result.marker}"]`).first(),
+      strategy: `confirmed-${result.strategy || "unknown"}`,
+      meta: result.meta || {},
+    };
+  }
+
+  if (!quiet) {
+    const dump = {
+      error: result?.error || null,
+      visibleCandidates: Array.isArray(result?.visibleCandidates)
+        ? result.visibleCandidates.slice(0, 80)
+        : [],
+      sendishCandidates: Array.isArray(result?.sendishCandidates)
+        ? result.sendishCandidates
+        : [],
+      wdsCandidates: Array.isArray(result?.wdsCandidates)
+        ? result.wdsCandidates
+        : [],
+      lowerRightCircularCandidates: Array.isArray(result?.lowerRightCircularCandidates)
+        ? result.lowerRightCircularCandidates
+        : [],
+    };
+    try {
+      console.warn("[media_send_confirmed_button_not_found]", JSON.stringify(dump, null, 2));
+    } catch {
+      console.warn("[media_send_confirmed_button_not_found]", dump);
+    }
+  }
+  return { locator: null, strategy: "confirmed_not_found" };
+}
+
+/**
+ * Reject candidates that look like the normal chat composer send button.
+ * @param {import("playwright").Page} page
+ * @param {import("playwright").Locator} candidate
+ * @returns {Promise<boolean>}
+ */
+async function isSafeMediaSendCandidate(page, candidate) {
+  const box = await candidate.boundingBox().catch(() => null);
+  if (!box) return false;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  return page
+    .evaluate(
+      ({ cx, cy }) => {
+        const composer = document.querySelector(
+          '[data-testid="conversation-compose-box-input"]'
+        );
+        const composerRect = composer ? composer.getBoundingClientRect() : null;
+        if (composerRect) {
+          const inComposer =
+            cx >= composerRect.left &&
+            cx <= composerRect.right &&
+            cy >= composerRect.top &&
+            cy <= composerRect.bottom;
+          if (inComposer) return false;
+        }
+
+        const previewRoot =
+          document.querySelector('[data-testid="media-preview"]') ||
+          document.querySelector('[data-testid="media-attach-preview"]') ||
+          document.querySelector('[data-testid="media-gallery-preview"]') ||
+          document.querySelector('#main [role="dialog"]');
+        const previewRect = previewRoot ? previewRoot.getBoundingClientRect() : null;
+        if (!previewRect) return false;
+
+        const inPreview =
+          cx >= previewRect.left &&
+          cx <= previewRect.right &&
+          cy >= previewRect.top &&
+          cy <= previewRect.bottom;
+        if (!inPreview) return false;
+
+        // lower-right zone only
+        const inZone =
+          cx >= previewRect.left + previewRect.width * 0.55 &&
+          cy >= previewRect.top + previewRect.height * 0.45;
+        return inZone;
+      },
+      { cx, cy }
+    )
+    .catch(() => false);
+}
+
+/**
+ * Snapshot outgoing media/message state before or after clicking the confirmed media Send button.
+ * @param {import("playwright").Page} page
+ * @returns {Promise<{
+ *   outgoingMediaCount: number,
+ *   outgoingImageThumbCount: number,
+ *   outgoingMediaUrlProviderCount: number,
+ *   outgoingOpenPictureCount: number,
+ *   messageOutCount: number,
+ *   latestMediaSignature: string | null,
+ * }>}
+ */
+async function captureMediaSendCommitState(page) {
+  return page
+    .evaluate(() => {
+      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const rect = el.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        const op = Number(style.opacity || "1");
+        if (Number.isFinite(op) && op <= 0.05) return false;
+        return true;
+      };
+
+      const outgoingMessages = Array.from(
+        document.querySelectorAll(
+          '.message-out, [data-testid="msg-container"][class*="message-out"], div[class*="message-out"]'
+        )
+      ).filter(isVisible);
+
+      const outgoingMediaNodes = [];
+      const outgoingImageThumbNodes = [];
+      const outgoingMediaUrlProviderNodes = [];
+      const outgoingOpenPictureNodes = [];
+
+      for (const msg of outgoingMessages) {
+        const imageThumbs = Array.from(
+          msg.querySelectorAll('[data-testid="image-thumb"]')
+        ).filter(isVisible);
+        const mediaProviders = Array.from(
+          msg.querySelectorAll('[data-testid="media-url-provider"]')
+        ).filter(isVisible);
+        const openPictures = Array.from(
+          msg.querySelectorAll('[aria-label="Open picture"], [aria-label*="Open picture" i]')
+        ).filter(isVisible);
+        const images = Array.from(msg.querySelectorAll("img, canvas, video")).filter(isVisible);
+
+        outgoingImageThumbNodes.push(...imageThumbs);
+        outgoingMediaUrlProviderNodes.push(...mediaProviders);
+        outgoingOpenPictureNodes.push(...openPictures);
+        if (
+          imageThumbs.length > 0 ||
+          mediaProviders.length > 0 ||
+          openPictures.length > 0 ||
+          images.length > 0
+        ) {
+          outgoingMediaNodes.push(msg);
+        }
+      }
+
+      const latest = outgoingMessages[outgoingMessages.length - 1] || null;
+      let latestMediaSignature = null;
+      if (latest) {
+        const rect = latest.getBoundingClientRect();
+        const imageBits = Array.from(latest.querySelectorAll("img, canvas, video"))
+          .slice(-5)
+          .map((el) => {
+            const r = el.getBoundingClientRect();
+            return [
+              el.tagName.toLowerCase(),
+              clean(el.getAttribute("src")).slice(0, 80),
+              clean(el.getAttribute("aria-label")).slice(0, 80),
+              Math.round(r.width),
+              Math.round(r.height),
+            ].join(":");
+          })
+          .join("|");
+        latestMediaSignature = [
+          Math.round(rect.x),
+          Math.round(rect.y),
+          Math.round(rect.width),
+          Math.round(rect.height),
+          clean(latest.textContent).slice(0, 120),
+          imageBits,
+          latest.querySelector('[data-testid="image-thumb"]') ? "image-thumb" : "",
+          latest.querySelector('[data-testid="media-url-provider"]') ? "media-url-provider" : "",
+          latest.querySelector('[aria-label*="Open picture" i]') ? "open-picture" : "",
+        ].join("::");
+      }
+
+      return {
+        outgoingMediaCount: outgoingMediaNodes.length,
+        outgoingImageThumbCount: outgoingImageThumbNodes.length,
+        outgoingMediaUrlProviderCount: outgoingMediaUrlProviderNodes.length,
+        outgoingOpenPictureCount: outgoingOpenPictureNodes.length,
+        messageOutCount: outgoingMessages.length,
+        latestMediaSignature,
+      };
+    })
+    .catch(() => ({
+      outgoingMediaCount: 0,
+      outgoingImageThumbCount: 0,
+      outgoingMediaUrlProviderCount: 0,
+      outgoingOpenPictureCount: 0,
+      messageOutCount: 0,
+      latestMediaSignature: null,
+    }));
+}
+
+/**
+ * Post-click verification: success if preview closes OR outgoing media evidence appears.
+ * @param {import("playwright").Page} page
+ * @param {Awaited<ReturnType<typeof captureMediaSendCommitState>>} baseline
+ * @param {{ imageSendJobId?: string | null, index?: number | null, total?: number | null, timeoutMs?: number }} [opts]
+ * @returns {Promise<boolean>}
+ */
+async function verifyMediaSendCommitted(page, baseline, opts = {}) {
+  const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) ? Number(opts.timeoutMs) : 15_000;
+  const intervalMs = 500;
+  const imageSendJobId = String(opts.imageSendJobId || "").trim() || null;
+  const index = Number.isFinite(Number(opts.index)) ? Number(opts.index) : null;
+  const total = Number.isFinite(Number(opts.total)) ? Number(opts.total) : null;
+  const startedAt = Date.now();
+  let finalCounts = null;
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    const elapsedMs = Date.now() - startedAt;
+    const previewState = await getMediaPreviewState(page);
+    const current = await captureMediaSendCommitState(page);
+    finalCounts = current;
+
+    const outgoingMediaIncreased =
+      current.outgoingMediaCount > Number(baseline?.outgoingMediaCount || 0);
+    const imageThumbIncreased =
+      current.outgoingImageThumbCount > Number(baseline?.outgoingImageThumbCount || 0);
+    const mediaProviderIncreased =
+      current.outgoingMediaUrlProviderCount >
+      Number(baseline?.outgoingMediaUrlProviderCount || 0);
+    const openPictureIncreased =
+      current.outgoingOpenPictureCount > Number(baseline?.outgoingOpenPictureCount || 0);
+    const messageOutIncreased =
+      current.messageOutCount > Number(baseline?.messageOutCount || 0);
+    const latestMediaSignatureChanged =
+      Boolean(current.latestMediaSignature) &&
+      current.latestMediaSignature !== (baseline?.latestMediaSignature || null);
+
+    console.log("[media_send_commit_verify_poll]", {
+      imageSendJobId,
+      index,
+      total,
+      elapsedMs,
+      previewActive: previewState.previewActive,
+      outgoingMediaCount: current.outgoingMediaCount,
+      outgoingImageThumbCount: current.outgoingImageThumbCount,
+      outgoingMediaUrlProviderCount: current.outgoingMediaUrlProviderCount,
+      messageOutCount: current.messageOutCount,
+      increased:
+        outgoingMediaIncreased ||
+        imageThumbIncreased ||
+        mediaProviderIncreased ||
+        openPictureIncreased ||
+        messageOutIncreased,
+      latestMediaSignatureChanged,
+    });
+
+    if (!previewState.previewActive) {
+      console.log("[media_send_post_click_verified]", {
+        ok: true,
+        verification: "preview_closed",
+        imageSendJobId,
+        index,
+        total,
+      });
+      return true;
+    }
+
+    if (outgoingMediaIncreased) {
+      console.log("[media_send_post_click_verified]", {
+        ok: true,
+        verification: "outgoing_media_increased",
+        imageSendJobId,
+        index,
+        total,
+      });
+      return true;
+    }
+
+    if (imageThumbIncreased || mediaProviderIncreased || openPictureIncreased) {
+      console.log("[media_send_post_click_verified]", {
+        ok: true,
+        verification: imageThumbIncreased
+          ? "image_thumb_detected"
+          : mediaProviderIncreased
+            ? "media_url_provider_detected"
+            : "open_picture_detected",
+        imageSendJobId,
+        index,
+        total,
+      });
+      return true;
+    }
+
+    if (messageOutIncreased && latestMediaSignatureChanged) {
+      console.log("[media_send_post_click_verified]", {
+        ok: true,
+        verification: "media_signature_changed",
+        imageSendJobId,
+        index,
+        total,
+      });
+      return true;
+    }
+
+    await page.waitForTimeout(intervalMs);
+  }
+
+  console.warn("[media_send_post_click_failed]", {
+    imageSendJobId,
+    index,
+    total,
+    baseline,
+    finalCounts,
+  });
+  return false;
+}
+
+/**
  * Resolves the best Send control for media preview (multi-image album UI often needs scoping).
  * @param {import("playwright").Page} page
  * @returns {Promise<{ locator: import("playwright").Locator, strategy: string }>}
  */
 async function getActiveMediaSendButton(page) {
-  const previewScoped = page
-    .locator('[data-testid="media-preview"]')
-    .locator('[aria-label="Send"]')
-    .filter({ has: page.locator("svg") });
-
-  if ((await previewScoped.count()) > 0) {
-    return { locator: previewScoped.first(), strategy: "preview-scoped" };
+  const confirmed = await findConfirmedMediaSendButton(page);
+  if (confirmed.locator) {
+    return confirmed;
   }
 
-  const iconBased = page.locator('button:has(span[data-icon="send"])');
+  return { locator: null, strategy: "not_found" };
+}
 
-  if ((await iconBased.count()) > 0) {
-    return { locator: iconBased.last(), strategy: "icon-based" };
+/**
+ * Snapshot preview readiness evidence at lookup time.
+ * @param {import("playwright").Page} page
+ * @returns {Promise<{
+ *   previewRootVisible: boolean,
+ *   dialogVisible: boolean,
+ *   blobImageVisible: boolean,
+ *   captionInputVisible: boolean,
+ *   thumbnailVisible: boolean,
+ *   previewActive: boolean
+ * }>}
+ */
+async function getMediaPreviewState(page) {
+  return page
+    .evaluate(() => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const rect = el.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        const op = Number(style.opacity || "1");
+        if (Number.isFinite(op) && op <= 0.05) return false;
+        return true;
+      };
+
+      const anyVisible = (selector) =>
+        Array.from(document.querySelectorAll(selector)).some(isVisible);
+
+      const previewRootVisible = anyVisible(
+        '[data-testid="media-preview"], [data-testid="media-attach-preview"], [data-testid="media-gallery-preview"]'
+      );
+      const dialogVisible = anyVisible('#main [role="dialog"], [role="dialog"]');
+      const blobImageVisible = anyVisible('img[src^="blob:"]');
+      const captionInputVisible = anyVisible(
+        '[data-testid="media-caption-input"], [contenteditable="true"][data-tab]'
+      );
+      const thumbnailVisible = anyVisible(
+        '[data-testid*="thumb" i], [aria-label*="thumbnail" i], [role="dialog"] img, [role="grid"]'
+      );
+
+      const previewActive =
+        previewRootVisible ||
+        blobImageVisible ||
+        (captionInputVisible && dialogVisible) ||
+        (thumbnailVisible && dialogVisible);
+
+      return {
+        previewRootVisible,
+        dialogVisible,
+        blobImageVisible,
+        captionInputVisible,
+        thumbnailVisible,
+        previewActive,
+      };
+    })
+    .catch(() => ({
+      previewRootVisible: false,
+      dialogVisible: false,
+      blobImageVisible: false,
+      captionInputVisible: false,
+      thumbnailVisible: false,
+      previewActive: false,
+    }));
+}
+
+/**
+ * Wait for the real WhatsApp media Send button to be mounted/exposed.
+ * Never clicks; only returns a confirmed locator or null.
+ * @param {import("playwright").Page} page
+ * @param {{ timeoutMs?: number, intervalMs?: number, imageSendJobId?: string | null, index?: number | null, total?: number | null }} [opts]
+ * @returns {Promise<{ locator: import("playwright").Locator | null, strategy: string, meta?: Record<string, unknown> }>}
+ */
+async function waitForConfirmedMediaSendButton(page, opts = {}) {
+  const timeoutMs = Number.isFinite(Number(opts.timeoutMs))
+    ? Number(opts.timeoutMs)
+    : 15_000;
+  const intervalMs = Number.isFinite(Number(opts.intervalMs))
+    ? Number(opts.intervalMs)
+    : 500;
+  const imageSendJobId = String(opts.imageSendJobId || "").trim() || null;
+  const index = Number.isFinite(Number(opts.index)) ? Number(opts.index) : null;
+  const total = Number.isFinite(Number(opts.total)) ? Number(opts.total) : null;
+  const startedAt = Date.now();
+  let lastPreviewState = null;
+
+  console.log("[media_send_confirmed_button_wait_started]", {
+    imageSendJobId,
+    index,
+    total,
+    timeoutMs,
+    intervalMs,
+  });
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    const elapsedMs = Date.now() - startedAt;
+    const previewState = await getMediaPreviewState(page);
+    lastPreviewState = previewState;
+    const confirmed = await findConfirmedMediaSendButton(page, { quiet: true });
+    const candidateFound = Boolean(confirmed.locator);
+
+    console.log("[media_send_confirmed_button_wait_poll]", {
+      imageSendJobId,
+      elapsedMs,
+      previewActive: previewState.previewActive,
+      blobImageVisible: previewState.blobImageVisible,
+      captionInputVisible: previewState.captionInputVisible,
+      thumbnailVisible: previewState.thumbnailVisible,
+      previewRootVisible: previewState.previewRootVisible,
+      dialogVisible: previewState.dialogVisible,
+      candidateFound,
+    });
+
+    if (candidateFound) {
+      const meta = confirmed.meta || {};
+      console.log("[media_send_confirmed_button_wait_found]", {
+        imageSendJobId,
+        elapsedMs,
+        strategy: confirmed.strategy,
+        ariaLabel: meta.ariaLabel || null,
+        dataIcon: meta.dataIcon || null,
+        dataTestid: meta.dataTestid || null,
+        textPreview: meta.text || null,
+        boundingBox: meta.boundingBox || null,
+      });
+      console.log("[media_send_confirmed_button_found]", {
+        strategy: confirmed.strategy,
+        ...(confirmed.meta || {}),
+      });
+      return confirmed;
+    }
+
+    await page.waitForTimeout(intervalMs);
   }
 
-  return {
-    locator: page.locator('[aria-label="Send"]').last(),
-    strategy: "global-fallback",
-  };
+  console.warn("[media_send_confirmed_button_wait_timeout]", {
+    imageSendJobId,
+    timeoutMs,
+    lastPreviewState,
+  });
+
+  const finalConfirmed = await findConfirmedMediaSendButton(page);
+  return finalConfirmed.locator ? finalConfirmed : { locator: null, strategy: "not_found" };
+}
+
+/**
+ * Best-effort: identify that media preview UI is active (fail-closed).
+ * Uses preview roots + common preview cues.
+ * @param {import("playwright").Page} page
+ * @param {{ uiKind?: "media" | "sticker" | "blob" } | undefined} [hint]
+ */
+async function isMediaPreviewActive(page, hint) {
+  // Prefer reusing the same “preview evidence” used by the upload step:
+  // media-preview / sticker-container / blob image.
+  const hintKind = hint?.uiKind || null;
+
+  const previewRootVisible = await page
+    .locator(MEDIA_PREVIEW_ROOT_LOCATOR)
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  const dialogVisible = await page
+    .locator("#main [role=\"dialog\"]")
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  const blobImageVisible = await page
+    .locator('img[src^="blob:"]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  const captionInputVisible = await page
+    .locator('[data-testid="media-caption-input"], [contenteditable="true"][data-tab]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  // Thumbnail strip varies; use multiple weak signals.
+  const thumbnailVisible = await page
+    .locator(
+      [
+        '[data-testid*="thumb" i]',
+        '[aria-label*="thumbnail" i]',
+        '#main [role="dialog"] img',
+        "#main [role=\"dialog\"] [role=\"grid\"]",
+      ].join(", ")
+    )
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  // “Green send” evidence: any candidate control in lower-right of preview/dialog.
+  const greenButtonCandidateVisible = await page
+    .evaluate(() => {
+      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const isVisible = (el) => {
+        if (!el) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === "none" || s.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        if (!r || r.width <= 0 || r.height <= 0) return false;
+        if (s.opacity && Number(s.opacity) <= 0.05) return false;
+        return true;
+      };
+      const previewRoot =
+        document.querySelector('[data-testid="media-preview"]') ||
+        document.querySelector('[data-testid="media-attach-preview"]') ||
+        document.querySelector('[data-testid="media-gallery-preview"]') ||
+        document.querySelector('#main [role="dialog"]');
+      const rect = previewRoot ? previewRoot.getBoundingClientRect() : null;
+      if (!rect) return false;
+
+      const parseRgb = (rgb) => {
+        const m = String(rgb || "").match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+        if (!m) return null;
+        return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) };
+      };
+
+      const nodes = Array.from(document.querySelectorAll("button, [role='button'], div"));
+      for (const el of nodes) {
+        if (!isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        const cx = r.x + r.width / 2;
+        const cy = r.y + r.height / 2;
+
+        // within preview bounds
+        if (cx < rect.left || cx > rect.right || cy < rect.top || cy > rect.bottom) continue;
+        // lower-right zone
+        if (cx < rect.left + rect.width * 0.55) continue;
+        if (cy < rect.top + rect.height * 0.45) continue;
+        // reasonable control size
+        if (r.width < 22 || r.height < 22 || r.width > 240 || r.height > 240) continue;
+
+        const s = window.getComputedStyle(el);
+        const rgb = parseRgb(s.backgroundColor);
+        const greenish = rgb && rgb.g >= 120 && rgb.r <= 90 && rgb.b <= 90;
+        const aria = clean(el.getAttribute("aria-label"));
+        const icon = clean(el.getAttribute("data-icon"));
+        const looksSend = /\bsend\b/i.test(aria) || /send/i.test(icon);
+
+        // We accept either strong “green-ish” or explicit send hint.
+        if (greenish || looksSend) return true;
+      }
+      return false;
+    })
+    .catch(() => false);
+
+  console.log("[media_preview_active_check]", {
+    hintKind,
+    previewRootVisible,
+    dialogVisible,
+    blobImageVisible,
+    captionInputVisible,
+    thumbnailVisible,
+    greenButtonCandidateVisible,
+  });
+
+  // Treat preview as active when ANY strong evidence is present.
+  // We intentionally do NOT require data-testid media-preview, since WA often hides it.
+  if (previewRootVisible) return true;
+  if (blobImageVisible) return true;
+  if (captionInputVisible && dialogVisible) return true;
+  if (thumbnailVisible && dialogVisible) return true;
+  if (greenButtonCandidateVisible && dialogVisible) return true;
+
+  // Respect explicit upload-step hint.
+  if (hintKind === "blob" && blobImageVisible) return true;
+  if (hintKind === "sticker" && dialogVisible) return true;
+  if (hintKind === "media" && dialogVisible) return true;
+
+  return false;
+}
+
+/**
+ * Pointer click at absolute viewport coordinates.
+ * @param {import("playwright").Page} page
+ * @param {{ x: number, y: number }} point
+ */
+async function pointerClickAt(page, point) {
+  const x = Number(point?.x);
+  const y = Number(point?.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new Error("pointerClickAt: invalid coordinates");
+  }
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.waitForTimeout(50);
+  await page.mouse.up();
+}
+
+/**
+ * Resolve a reliable "media pane" rectangle for preview/fullscreen states.
+ * IMPORTANT: do NOT trust #main when it has a zero-size bounding box.
+ * @param {import("playwright").Page} page
+ * @returns {Promise<{ left: number, top: number, right: number, bottom: number, width: number, height: number, source: string, viewport: { width: number, height: number } } | null>}
+ */
+async function getSafeMediaPaneRect(page) {
+  const rect = await page
+    .evaluate(() => {
+      const roundRect = (r) => ({
+        left: Math.round(r.left),
+        top: Math.round(r.top),
+        right: Math.round(r.right),
+        bottom: Math.round(r.bottom),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+      });
+      const isValid = (r) =>
+        r && Number.isFinite(r.width) && Number.isFinite(r.height) && r.width > 80 && r.height > 80;
+
+      const viewport = { width: window.innerWidth, height: window.innerHeight };
+
+      // Candidate roots (prefer actual preview/dialog roots when visible and non-zero).
+      const candidates = [
+        {
+          source: "media-preview-root",
+          el:
+            document.querySelector('[data-testid="media-preview"]') ||
+            document.querySelector('[data-testid="media-attach-preview"]') ||
+            document.querySelector('[data-testid="media-gallery-preview"]'),
+        },
+        { source: "dialog-root", el: document.querySelector("#main [role='dialog']") },
+      ].filter((c) => c.el);
+
+      for (const c of candidates) {
+        const r = c.el.getBoundingClientRect();
+        if (isValid(r)) return { ...roundRect(r), source: c.source, viewport };
+      }
+
+      // Blob / large preview image geometry.
+      const blobImg =
+        document.querySelector('img[src^="blob:"]') ||
+        document.querySelector("#main img[src^='blob:']");
+      if (blobImg) {
+        const r = blobImg.getBoundingClientRect();
+        if (isValid(r)) {
+          // Expand around image to include caption/thumbnail/send button region.
+          const padX = Math.min(220, Math.max(120, r.width * 0.25));
+          const padTop = Math.min(120, Math.max(60, r.height * 0.12));
+          const padBottom = Math.min(260, Math.max(160, r.height * 0.25));
+          const expanded = {
+            left: Math.max(0, r.left - padX),
+            right: Math.min(viewport.width, r.right + padX),
+            top: Math.max(0, r.top - padTop),
+            bottom: Math.min(viewport.height, r.bottom + padBottom),
+          };
+          const out = {
+            left: expanded.left,
+            right: expanded.right,
+            top: expanded.top,
+            bottom: expanded.bottom,
+            width: expanded.right - expanded.left,
+            height: expanded.bottom - expanded.top,
+          };
+          if (isValid(out)) return { ...roundRect(out), source: "blob-image-expanded", viewport };
+        }
+      }
+
+      // Caption + thumb strip geometry.
+      const cap =
+        document.querySelector('[data-testid="media-caption-input"]') ||
+        document.querySelector("#main [data-testid='media-caption-input']");
+      const anyThumb =
+        document.querySelector('[data-testid*="thumb" i]') ||
+        document.querySelector("#main [role='dialog'] img");
+      if (cap) {
+        const cr = cap.getBoundingClientRect();
+        if (cr && cr.width > 80 && cr.height > 20) {
+          let left = cr.left - 240;
+          let right = cr.right + 240;
+          let top = cr.top - 520;
+          let bottom = cr.bottom + 200;
+          if (anyThumb) {
+            const tr = anyThumb.getBoundingClientRect();
+            if (tr && tr.width > 20 && tr.height > 20) {
+              top = Math.min(top, tr.top - 420);
+              bottom = Math.max(bottom, tr.bottom + 220);
+            }
+          }
+          const out = {
+            left: Math.max(0, left),
+            right: Math.min(viewport.width, right),
+            top: Math.max(0, top),
+            bottom: Math.min(viewport.height, bottom),
+          };
+          const rr = {
+            left: out.left,
+            right: out.right,
+            top: out.top,
+            bottom: out.bottom,
+            width: out.right - out.left,
+            height: out.bottom - out.top,
+          };
+          if (isValid(rr)) return { ...roundRect(rr), source: "caption-thumb-expanded", viewport };
+        }
+      }
+
+      // Avoid trusting #main if it's zero-sized.
+      const main = document.querySelector("#main");
+      if (main) {
+        const mr = main.getBoundingClientRect();
+        if (isValid(mr)) return { ...roundRect(mr), source: "main", viewport };
+      }
+
+      // Viewport right pane fallback: assume sidebar is left ~40%.
+      const x = Math.round(viewport.width * 0.4);
+      const y = 0;
+      const out = {
+        left: x,
+        top: y,
+        right: viewport.width,
+        bottom: viewport.height,
+        width: viewport.width - x,
+        height: viewport.height - y,
+      };
+      if (isValid(out)) return { ...out, source: "viewport-right-pane", viewport };
+
+      return null;
+    })
+    .catch(() => null);
+
+  if (rect) {
+    console.log("[media_safe_pane_rect_resolved]", rect);
+  } else {
+    console.warn("[media_safe_pane_rect_resolved]", { ok: false });
+  }
+  return rect;
+}
+
+/**
+ * Geometry-based visual fallback: pick a likely green circular send button in lower-right of preview.
+ * Must NOT click normal chat composer send; must be inside preview/dialog bounds.
+ * @param {import("playwright").Page} page
+ * @returns {Promise<{ ok: true } | { ok: false, reason: string }>}
+ */
+async function clickMediaSendButtonByGeometry(page, hint) {
+  const previewActive = await isMediaPreviewActive(page, hint);
+  if (!previewActive) {
+    console.log("[media_send_button_visual_fallback_rejected]", {
+      reason: "PREVIEW_NOT_ACTIVE",
+    });
+    return { ok: false, reason: "PREVIEW_NOT_ACTIVE" };
+  }
+
+  const paneRect = await getSafeMediaPaneRect(page);
+  if (!paneRect) {
+    console.log("[media_send_button_visual_fallback_rejected]", {
+      reason: "NO_PANE_RECT",
+    });
+    return { ok: false, reason: "NO_PANE_RECT" };
+  }
+
+  /** @type {{ selected: any, candidates: any[], geometry: any } | null} */
+  const result = await page
+    .evaluate(({ paneRect }) => {
+      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+      const isVisible = (el) => {
+        if (!el) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === "none" || s.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        if (!r || r.width <= 0 || r.height <= 0) return false;
+        if (s.opacity && Number(s.opacity) <= 0.05) return false;
+        return true;
+      };
+
+      const safeRect = paneRect;
+      const previewRect = safeRect
+        ? {
+            left: safeRect.left,
+            right: safeRect.right,
+            top: safeRect.top,
+            bottom: safeRect.bottom,
+            width: safeRect.width,
+            height: safeRect.height,
+          }
+        : null;
+
+      const composer = document.querySelector(
+        '[data-testid="conversation-compose-box-input"]'
+      );
+      const composerRect = composer ? composer.getBoundingClientRect() : null;
+
+      const rectContains = (container, x, y) => {
+        if (!container) return true;
+        return x >= container.left && x <= container.right && y >= container.top && y <= container.bottom;
+      };
+
+      const intersectsComposer = (rect) => {
+        if (!composerRect) return false;
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
+        return rectContains(composerRect, cx, cy);
+      };
+
+      const inPreview = (rect) => {
+        if (!previewRect) return false;
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
+        return rectContains(previewRect, cx, cy);
+      };
+
+      const lowerRightZone = (rect) => {
+        if (!previewRect) return false;
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
+        return (
+          cx >= previewRect.left + previewRect.width * 0.55 &&
+          cy >= previewRect.top + previewRect.height * 0.45
+        );
+      };
+
+      const parseRgb = (rgb) => {
+        const m = String(rgb || "").match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+        if (!m) return null;
+        return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) };
+      };
+
+      const scoreCandidate = (el) => {
+        const rect = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        const aria = clean(el.getAttribute("aria-label"));
+        const icon = clean(el.getAttribute("data-icon"));
+        const testid = clean(el.getAttribute("data-testid"));
+        const bg = s.backgroundColor || "";
+        const rgb = parseRgb(bg);
+
+        const w = rect.width;
+        const h = rect.height;
+        const area = w * h;
+        const isSquareish = Math.abs(w - h) <= 6;
+        const isBig = w >= 34 && h >= 34;
+
+        // "Green-ish" heuristic: WhatsApp send is usually strong G with low R/B.
+        const greenish =
+          rgb && rgb.g >= 120 && rgb.r <= 90 && rgb.b <= 90 ? true : false;
+
+        const labelScore = /\bsend\b/i.test(aria) ? 4 : 0;
+        const iconScore = /send/i.test(icon) ? 3 : 0;
+        const testidScore = /send/i.test(testid) ? 2 : 0;
+        const greenScore = greenish ? 2 : 0;
+        const circleScore = isSquareish ? 1 : 0;
+        const bigScore = isBig ? 1 : 0;
+
+        // Prefer close to bottom-right of preview
+        let brProximity = 0;
+        if (previewRect) {
+          const cx = rect.x + rect.width / 2;
+          const cy = rect.y + rect.height / 2;
+          const dx = Math.abs(previewRect.right - cx);
+          const dy = Math.abs(previewRect.bottom - cy);
+          const norm = clamp(1 - (dx + dy) / (previewRect.width + previewRect.height), 0, 1);
+          brProximity = norm * 2;
+        }
+
+        const score =
+          labelScore +
+          iconScore +
+          testidScore +
+          greenScore +
+          circleScore +
+          bigScore +
+          brProximity +
+          Math.min(2, area / 6000);
+
+        return {
+          score,
+          tag: el.tagName.toLowerCase(),
+          ariaLabel: aria || null,
+          dataIcon: icon || null,
+          dataTestid: testid || null,
+          boundingBox: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          },
+          center: {
+            x: Math.round(rect.x + rect.width / 2),
+            y: Math.round(rect.y + rect.height / 2),
+          },
+          styleHint: {
+            backgroundColor: clean(bg),
+            borderRadius: clean(s.borderRadius),
+          },
+        };
+      };
+
+      const nodes = Array.from(
+        document.querySelectorAll("button, [role='button'], div[role='button'], div")
+      );
+
+      const candidates = [];
+      for (const el of nodes) {
+        if (!isVisible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+
+        if (!inPreview(rect)) continue;
+        if (!lowerRightZone(rect)) continue;
+        if (intersectsComposer(rect)) continue;
+
+        const disabled =
+          (el.getAttribute("aria-disabled") || "").toLowerCase() === "true" ||
+          ("disabled" in el && Boolean(el.disabled));
+        if (disabled) continue;
+
+        // Avoid huge containers; prefer control-sized targets.
+        if (rect.width > 220 || rect.height > 220) continue;
+        if (rect.width < 22 || rect.height < 22) continue;
+
+        candidates.push(scoreCandidate(el));
+        if (candidates.length > 250) break;
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      const selected = candidates[0] || null;
+
+      const geometry = {
+        hasPreview: Boolean(previewRect),
+        hasComposer: Boolean(composerRect),
+        previewRect: previewRect
+          ? {
+              x: Math.round(previewRect.left),
+              y: Math.round(previewRect.top),
+              width: Math.round(previewRect.width),
+              height: Math.round(previewRect.height),
+            }
+          : null,
+        composerRect: composerRect
+          ? {
+              x: Math.round(composerRect.x),
+              y: Math.round(composerRect.y),
+              width: Math.round(composerRect.width),
+              height: Math.round(composerRect.height),
+            }
+          : null,
+      };
+
+      return {
+        selected,
+        candidates: candidates.slice(0, 12),
+        geometry,
+      };
+    }, { paneRect })
+    .catch(() => null);
+
+  if (!result || !result.selected) {
+    console.log("[media_send_button_visual_fallback_rejected]", {
+      reason: "NO_CANDIDATE",
+      geometry: result?.geometry ?? null,
+      candidates: Array.isArray(result?.candidates) ? result.candidates : [],
+    });
+
+    // Coordinate fallback: click near bottom-right of safe pane rect (guarded).
+    console.log("[media_send_coordinate_fallback_started]", {
+      paneRect,
+    });
+    const target = {
+      x: Math.round(paneRect.right - 68),
+      y: Math.round(paneRect.bottom - 68),
+    };
+    console.log("[media_send_coordinate_fallback_target]", target);
+
+    // Avoid caption/composer region if it overlaps.
+    const safeToClick = await page
+      .evaluate(({ target }) => {
+        const composer = document.querySelector(
+          '[data-testid="conversation-compose-box-input"]'
+        );
+        const cap = document.querySelector('[data-testid="media-caption-input"]');
+        const badRects = [composer, cap]
+          .filter(Boolean)
+          .map((el) => el.getBoundingClientRect())
+          .filter((r) => r && r.width > 0 && r.height > 0);
+        for (const r of badRects) {
+          const inBad =
+            target.x >= r.left &&
+            target.x <= r.right &&
+            target.y >= r.top &&
+            target.y <= r.bottom;
+          if (inBad) return false;
+        }
+        return true;
+      }, { target })
+      .catch(() => false);
+
+    if (!safeToClick) {
+      console.log("[media_send_button_visual_fallback_rejected]", {
+        reason: "COORD_TARGET_IN_COMPOSER_OR_CAPTION",
+      });
+      return { ok: false, reason: "NO_CANDIDATE" };
+    }
+
+    await pointerClickAt(page, target);
+    console.log("[media_send_coordinate_fallback_clicked]", target);
+    return { ok: true };
+    return { ok: false, reason: "NO_CANDIDATE" };
+  }
+
+  console.log("[media_preview_geometry_detected]", result.geometry);
+  console.log("[media_send_button_visual_candidate]", {
+    selected: result.selected,
+    candidates: result.candidates,
+  });
+
+  // Final safety guard: ensure we still have preview active at click time.
+  const stillActive = await isMediaPreviewActive(page, hint);
+  if (!stillActive) {
+    console.log("[media_send_button_visual_fallback_rejected]", {
+      reason: "PREVIEW_NOT_ACTIVE_BEFORE_CLICK",
+    });
+    return { ok: false, reason: "PREVIEW_NOT_ACTIVE_BEFORE_CLICK" };
+  }
+
+  console.log("[media_send_button_visual_fallback_selected]", {
+    x: result.selected.center.x,
+    y: result.selected.center.y,
+    score: result.selected.score,
+  });
+  await pointerClickAt(page, { x: result.selected.center.x, y: result.selected.center.y });
+  return { ok: true };
+}
+
+async function dumpMediaSendDomDebug(page) {
+  const paneRect = await getSafeMediaPaneRect(page);
+  const dump = await page
+    .evaluate(({ paneRect }) => {
+      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const isVisible = (el) => {
+        if (!el) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === "none" || s.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const viewport = { width: window.innerWidth, height: window.innerHeight };
+      const safe = paneRect;
+      const pane = safe
+        ? {
+            left: safe.left,
+            right: safe.right,
+            top: safe.top,
+            bottom: safe.bottom,
+            width: safe.width,
+            height: safe.height,
+          }
+        : null;
+
+      const intersectsPane = (rect) => {
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
+        if (pane) {
+          return (
+            cx >= pane.left &&
+            cx <= pane.right &&
+            cy >= pane.top &&
+            cy <= pane.bottom
+          );
+        }
+        return cx >= viewport.width * 0.3;
+      };
+
+      const roots = [
+        { name: "media-preview", el: document.querySelector('[data-testid="media-preview"]') },
+        { name: "dialog", el: document.querySelector('#main [role="dialog"]') },
+        { name: "main", el: document.querySelector("#main") },
+        { name: "body", el: document.body },
+      ].filter((r) => r.el);
+
+      const selector = [
+        "button",
+        "[role=\"button\"]",
+        "[aria-label]",
+        "[data-icon]",
+        "[data-testid]",
+        "svg",
+        "canvas",
+        "div",
+      ].join(",");
+
+      const pick = (root) => {
+        const nodes = Array.from(root.querySelectorAll(selector));
+        const out = [];
+        for (const el of nodes) {
+          const rect = el.getBoundingClientRect();
+          if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+          if (!isVisible(el)) continue;
+          if (!intersectsPane(rect)) continue;
+
+          const tag = el.tagName.toLowerCase();
+          const role = clean(el.getAttribute("role"));
+          const aria = clean(el.getAttribute("aria-label"));
+          const icon = clean(el.getAttribute("data-icon"));
+          const testid = clean(el.getAttribute("data-testid"));
+          const className = clean(el.className).slice(0, 80);
+          const text = clean(el.innerText || el.textContent || "").slice(0, 60);
+          const disabled =
+            (el.getAttribute("aria-disabled") || "").toLowerCase() === "true" ||
+            (tag === "button" && Boolean(el.disabled));
+
+          const s = window.getComputedStyle(el);
+          out.push({
+            tag,
+            ...(role ? { role } : {}),
+            ...(aria ? { ariaLabel: aria.slice(0, 120) } : {}),
+            ...(icon ? { dataIcon: icon.slice(0, 120) } : {}),
+            ...(testid ? { dataTestid: testid.slice(0, 120) } : {}),
+            ...(className ? { className } : {}),
+            ...(text ? { text } : {}),
+            boundingBox: {
+              x: Math.round(rect.x),
+              y: Math.round(rect.y),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+            },
+            isVisible: true,
+            styleHint: {
+              backgroundColor: clean(s.backgroundColor),
+              borderRadius: clean(s.borderRadius),
+            },
+            ...(disabled ? { disabled: true } : {}),
+          });
+
+          if (out.length >= 120) break;
+        }
+        return out;
+      };
+
+      // Also provide the top candidates nearest bottom-right of pane for quick inspection.
+      const all = pick(document.body);
+      const br = pane
+        ? { x: pane.right, y: pane.bottom }
+        : { x: viewport.width, y: viewport.height };
+      const scored = all
+        .map((c) => {
+          const bx = c.boundingBox?.x ?? 0;
+          const by = c.boundingBox?.y ?? 0;
+          const bw = c.boundingBox?.width ?? 0;
+          const bh = c.boundingBox?.height ?? 0;
+          const cx = bx + bw / 2;
+          const cy = by + bh / 2;
+          const dist = Math.abs(br.x - cx) + Math.abs(br.y - cy);
+          return { ...c, __brDist: Math.round(dist) };
+        })
+        .sort((a, b) => a.__brDist - b.__brDist)
+        .slice(0, 10);
+
+      return {
+        paneRect: paneRect || null,
+        viewport,
+        roots: roots.map((r) => ({ root: r.name, sample: pick(r.el) })),
+        lowerRightCandidates: scored,
+      };
+    }, { paneRect })
+    .catch((err) => [{ error: String(err?.message ?? err ?? "dump_failed") }]);
+  // Ensure nested objects are readable (avoid [Object]).
+  try {
+    console.log("[media_send_button_dom_debug_dump]", JSON.stringify(dump, null, 2));
+  } catch {
+    console.log("[media_send_button_dom_debug_dump]", dump);
+  }
 }
 
 /**
@@ -1109,8 +2556,9 @@ async function dismissStaleMediaPreviewIfAny(page) {
  * @param {import("playwright").Page} page
  * @param {string} filePath
  * @param {string} [caption]
+ * @param {{ imageSendJobId?: string | null, index?: number | null, total?: number | null }} [opts]
  */
-export async function sendImage(page, filePath, caption) {
+export async function sendImage(page, filePath, caption, opts = {}) {
   let stuckReleaseTimer = null;
   globalThis.__WA_MEDIA_SEND__ = true;
   try {
@@ -1120,7 +2568,7 @@ export async function sendImage(page, filePath, caption) {
         globalThis.__WA_MEDIA_SEND__ = false;
       }
     }, 60_000);
-    await sendImageBody(page, filePath, caption);
+    await sendImageBody(page, filePath, caption, opts);
   } finally {
     if (stuckReleaseTimer) clearTimeout(stuckReleaseTimer);
     globalThis.__WA_MEDIA_SEND__ = false;
@@ -1131,8 +2579,9 @@ export async function sendImage(page, filePath, caption) {
  * @param {import("playwright").Page} page
  * @param {string} filePath
  * @param {string} [caption]
+ * @param {{ imageSendJobId?: string | null, index?: number | null, total?: number | null }} [opts]
  */
-async function sendImageBody(page, filePath, caption) {
+async function sendImageBody(page, filePath, caption, opts = {}) {
   console.log(
     "📎 Upload: Photos & videos (clip) → preview → Send [aria-label] → pointer send"
   );
@@ -1216,6 +2665,15 @@ async function sendImageBody(page, filePath, caption) {
               ? "✅ Photos & videos flow (blob image visible, proceeding to send)"
               : "✅ Photos & videos flow (media preview visible)"
         );
+
+        // DEBUG ONLY (AUDIT): pause for live Inspector inspection right after preview evidence is confirmed.
+        // Enable by running with DEBUG_MEDIA_SEND_PAUSE=1 (and ideally PWDEBUG=1 so Inspector opens).
+        if (process?.env?.DEBUG_MEDIA_SEND_PAUSE === "1") {
+          console.log("[debug_media_send_pause_enter]", { uiKind });
+          await page.pause();
+          console.log("[debug_media_send_pause_exit]", { uiKind });
+        }
+
         break;
       } catch (err) {
         lastAttachErr = err;
@@ -1274,64 +2732,113 @@ async function sendImageBody(page, filePath, caption) {
     }
   }
 
-  console.log("📤 Wait media Send control (aria-label), not preview testid");
+  const scope = MEDIA_PREVIEW_COMPOSER_ROOT;
+  console.log("[media_send_button_lookup_started]");
+  const ariaSendCount = await page.locator('[aria-label="Send"]').count();
+  const iconSendCount = await page.locator('button:has(span[data-icon="send"])').count();
+  const previewScopedAriaCount = await page.locator(scope).locator(':is(button,[role="button"])[aria-label*="send" i]').count();
+  const previewScopedIconCount = await page.locator(scope).locator(':is(button,[role="button"]):has([data-icon*="send" i])').count();
+  console.log("[media_send_button_lookup_started]", {
+    ariaSendCount,
+    iconSendCount,
+    previewScopedAriaCount,
+    previewScopedIconCount,
+  });
 
-  console.log(
-    "SEND [aria-label=Send] COUNT:",
-    await page.locator('[aria-label="Send"]').count()
-  );
+  const resolved = await waitForConfirmedMediaSendButton(page, {
+    timeoutMs: 15_000,
+    intervalMs: 500,
+    imageSendJobId: opts.imageSendJobId || null,
+    index: opts.index ?? null,
+    total: opts.total ?? null,
+  });
+  console.log("[media_send_button_lookup_result]", {
+    strategy: resolved.strategy,
+    ariaSendCount,
+    iconSendCount,
+    previewScopedAriaCount,
+    previewScopedIconCount,
+  });
 
-  const sendBtn = page.locator('[aria-label="Send"]').last();
-  await sendBtn.waitFor({ state: "visible", timeout: 10_000 });
-
-  console.log("🖱 Pointer send (move → down → up)");
-
-  await pointerClickMediaSend(page, sendBtn);
-
-  console.log("⏳ Wait for preview / sticker UI to detach after send");
-
-  if (uiKind === "sticker") {
-    await page
-      .locator(STICKER_CONTAINER_SELECTOR)
-      .first()
-      .waitFor({ state: "detached", timeout: 10_000 })
-      .catch(() => {});
-  } else {
-    await page
-      .waitForSelector(MEDIA_PREVIEW_SELECTOR, {
-        state: "detached",
-        timeout: 10_000,
-      })
-      .catch(() => {});
-  }
-  await page.waitForTimeout(500);
-
-  console.log("⏳ STEP 9: Verify media preview closed");
-
-  await page
-    .waitForFunction(
-      (selectors) => {
-        const isVisible = (el) => {
-          if (!el) return false;
-          const style = window.getComputedStyle(el);
-          if (style.display === "none" || style.visibility === "hidden")
-            return false;
-          const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0;
-        };
-        for (const sel of selectors) {
-          for (const node of document.querySelectorAll(sel)) {
-            if (isVisible(node)) return false;
-          }
-        }
-        return true;
-      },
-      MEDIA_PREVIEW_SELECTORS,
-      { timeout: 8000 }
-    )
-    .catch(() => {
-      throw new Error("❌ FAILED at STEP 9: send not confirmed");
+  if (!resolved.locator) {
+    console.warn("[media_send_button_not_found]", {
+      errorCode: "MEDIA_SEND_BUTTON_NOT_FOUND",
+      ariaSendCount,
+      iconSendCount,
+      previewScopedAriaCount,
+      previewScopedIconCount,
     });
+    await dumpMediaSendDomDebug(page);
+    throw new Error("MEDIA_SEND_BUTTON_NOT_FOUND");
+  }
+
+  const sendBtn = resolved.locator;
+  const commitBaseline = await captureMediaSendCommitState(page);
+  console.log("[media_send_commit_baseline]", {
+    imageSendJobId: opts.imageSendJobId || null,
+    index: opts.index ?? null,
+    total: opts.total ?? null,
+    outgoingMediaCount: commitBaseline.outgoingMediaCount,
+    outgoingImageThumbCount: commitBaseline.outgoingImageThumbCount,
+    outgoingMediaUrlProviderCount: commitBaseline.outgoingMediaUrlProviderCount,
+    messageOutCount: commitBaseline.messageOutCount,
+    latestMediaSignature: commitBaseline.latestMediaSignature,
+  });
+
+  console.log("[media_send_click_started]", { strategy: resolved.strategy });
+  let clicked = false;
+  try {
+    // Prefer Playwright actionability checks.
+    await sendBtn.click({ timeout: 12_000 });
+    clicked = true;
+  } catch (e) {
+    console.warn("[media_send_click_result]", {
+      ok: false,
+      strategy: resolved.strategy,
+      method: "locator.click",
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+
+  if (!clicked) {
+    // Pointer fallback is allowed only on the same confirmed Send candidate.
+    try {
+      await pointerClickMediaSend(page, sendBtn);
+      clicked = true;
+      console.log("[media_send_click_result]", {
+        ok: true,
+        strategy: `${resolved.strategy}:pointer`,
+        method: "confirmed-candidate-pointer",
+      });
+    } catch (e2) {
+      console.warn("[media_send_click_result]", {
+        ok: false,
+        strategy: `${resolved.strategy}:pointer`,
+        method: "confirmed-candidate-pointer",
+        error: e2 instanceof Error ? e2.message : String(e2),
+      });
+    }
+  } else {
+    console.log("[media_send_click_result]", {
+      ok: true,
+      strategy: resolved.strategy,
+      method: "locator.click",
+    });
+  }
+
+  if (!clicked) {
+    throw new Error("MEDIA_SEND_BUTTON_NOT_FOUND");
+  }
+
+  const verified = await verifyMediaSendCommitted(page, commitBaseline, {
+    imageSendJobId: opts.imageSendJobId || null,
+    index: opts.index ?? null,
+    total: opts.total ?? null,
+    timeoutMs: 15_000,
+  });
+  if (!verified) {
+    throw new Error("❌ FAILED: send click did not close preview");
+  }
 
   console.log("✅ IMAGE SENT SUCCESSFULLY");
   } finally {
@@ -1350,8 +2857,9 @@ async function sendImageBody(page, filePath, caption) {
  * @param {string} filePath
  * @param {string | undefined} captionForFirst
  * @param {boolean} isFirst
+ * @param {{ imageSendJobId?: string | null, index?: number | null, total?: number | null }} [opts]
  */
-async function uploadAndSendOneImage(page, filePath, captionForFirst, isFirst) {
+async function uploadAndSendOneImage(page, filePath, captionForFirst, isFirst, opts = {}) {
   await enforceStrictSendLock(page);
 
   await page.waitForTimeout(randomBetweenMs(500, 800));
@@ -1367,7 +2875,7 @@ async function uploadAndSendOneImage(page, filePath, captionForFirst, isFirst) {
       ? String(captionForFirst).trim()
       : undefined;
 
-  await sendImage(page, filePath, cap);
+  await sendImage(page, filePath, cap, opts);
 }
 
 /**
@@ -1375,16 +2883,32 @@ async function uploadAndSendOneImage(page, filePath, captionForFirst, isFirst) {
  *
  * @param {import("playwright").Page} page
  * @param {string[]} imagePaths
- * @param {{ caption?: string }} [options]
+ * @param {{ caption?: string, imageSendJobId?: string }} [options]
  */
 async function sendImagesSequentially(page, imagePaths, options = {}) {
   const paths = Array.isArray(imagePaths) ? imagePaths.filter(Boolean) : [];
+  const imageSendJobId = String(options.imageSendJobId || "").trim() || null;
   if (paths.length === 0) {
     return true;
   }
 
+  let successCount = 0;
+  console.log("[sequential_image_loop_started]", {
+    imageSendJobId,
+    total: paths.length,
+  });
+
   for (let i = 0; i < paths.length; i++) {
-    console.log(`📸 Sending image ${i + 1}/${paths.length}`);
+    const index = i + 1;
+    const pathPreview =
+      String(paths[i]).length > 80 ? `${String(paths[i]).slice(0, 80)}…` : String(paths[i]);
+    console.log(`📸 Sending image ${index}/${paths.length}`);
+    console.log("[sequential_image_started]", {
+      imageSendJobId,
+      index,
+      total: paths.length,
+      pathPreview,
+    });
 
     const cap =
       i === 0 &&
@@ -1393,43 +2917,88 @@ async function sendImagesSequentially(page, imagePaths, options = {}) {
         ? String(options.caption).trim()
         : undefined;
 
-    await sendImageBody(page, paths[i], cap);
+    try {
+      await sendImageBody(page, paths[i], cap, {
+        imageSendJobId,
+        index,
+        total: paths.length,
+      });
+      successCount++;
+      console.log("[sequential_image_sent]", {
+        imageSendJobId,
+        index,
+        total: paths.length,
+      });
+    } catch (e) {
+      console.warn("[sequential_image_failed]", {
+        imageSendJobId,
+        index,
+        total: paths.length,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
+    }
 
     console.log("⏳ Waiting for WhatsApp UI to reset...");
+    console.log("[sequential_image_reset_started]", {
+      imageSendJobId,
+      index,
+      total: paths.length,
+    });
 
-    await page.waitForFunction(() => {
-      const input = document.querySelector('[contenteditable="true"]');
-      const preview = document.querySelector('[data-testid="media-preview"]');
+    try {
+      await page.waitForFunction(() => {
+        const input = document.querySelector('[contenteditable="true"]');
+        const preview = document.querySelector('[data-testid="media-preview"]');
 
-      if (!input || !input.isContentEditable) return false;
-      if (preview) return false;
+        if (!input || !input.isContentEditable) return false;
+        if (preview) return false;
 
-      const rect = input.getBoundingClientRect();
-      if (!rect || rect.width === 0 || rect.height === 0) return false;
+        const rect = input.getBoundingClientRect();
+        if (!rect || rect.width === 0 || rect.height === 0) return false;
 
-      const elAtPoint = document.elementFromPoint(
-        rect.left + rect.width / 2,
-        rect.top + rect.height / 2
-      );
+        const elAtPoint = document.elementFromPoint(
+          rect.left + rect.width / 2,
+          rect.top + rect.height / 2
+        );
 
-      return input.contains(elAtPoint);
-    }, { timeout: 20_000 });
+        return input.contains(elAtPoint);
+      }, { timeout: 20_000 });
 
-    // small buffer
-    await page.waitForTimeout(800);
+      // small buffer
+      await page.waitForTimeout(800);
 
-    // ensure input is actually usable (CRITICAL)
-    const inputBox = page.locator('[contenteditable="true"]').last();
+      // ensure input is actually usable (CRITICAL)
+      const inputBox = page.locator('[contenteditable="true"]').last();
 
-    await inputBox.click({ timeout: 3000 }).catch(() => {});
-    await page.keyboard.type(" ", { delay: 10 }).catch(() => {});
-    await page.keyboard.press("Backspace").catch(() => {});
+      await inputBox.click({ timeout: 3000 }).catch(() => {});
+      await page.keyboard.type(" ", { delay: 10 }).catch(() => {});
+      await page.keyboard.press("Backspace").catch(() => {});
 
-    await page.waitForTimeout(300);
+      await page.waitForTimeout(300);
 
-    console.log("✅ UI ready for next image");
+      console.log("[sequential_image_reset_done]", {
+        imageSendJobId,
+        index,
+        total: paths.length,
+      });
+      console.log("✅ UI ready for next image");
+    } catch (e) {
+      console.warn("[sequential_image_reset_failed]", {
+        imageSendJobId,
+        index,
+        total: paths.length,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
+    }
   }
 
+  console.log("[sequential_image_loop_completed]", {
+    imageSendJobId,
+    total: paths.length,
+    successCount,
+  });
   console.log("✅ Sequential send completed");
   return true;
 }
@@ -1451,7 +3020,15 @@ async function sendPlaywrightGroupImagesWithPage(
   caption,
   opts = {}
 ) {
+  const imageSendJobId =
+    String(opts.imageSendJobId || "").trim() ||
+    `imgjob_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const raw = Array.isArray(imageUrls) ? imageUrls : [];
+  console.log("[image_send_job_started]", {
+    imageSendJobId,
+    urlCount: raw.length,
+    maxImages: MAX_PLAYWRIGHT_GROUP_IMAGES,
+  });
   if (raw.length > MAX_PLAYWRIGHT_GROUP_IMAGES) {
     console.warn(
       "⚠️ Truncating images to max limit:",
@@ -1528,9 +3105,22 @@ async function sendPlaywrightGroupImagesWithPage(
       }
 
       const paths = downloads.map((d) => d.path);
+      console.log("[image_send_downloads_completed]", {
+        imageSendJobId,
+        downloadsCount: downloads.length,
+        pathsCount: paths.length,
+        pathsPreview: paths.map((p) =>
+          String(p).length > 80 ? `${String(p).slice(0, 80)}…` : String(p)
+        ),
+      });
       let anyOk = false;
 
       if (paths.length === 1) {
+        console.log("[image_send_branch_selected]", {
+          imageSendJobId,
+          branch: "single",
+          pathsCount: paths.length,
+        });
         let sent = false;
         /** @type {unknown} */
         let lastErr;
@@ -1540,7 +3130,12 @@ async function sendPlaywrightGroupImagesWithPage(
             page,
             paths[0],
             captionForFirstOnly,
-            true
+            true,
+            {
+              imageSendJobId,
+              index: 1,
+              total: 1,
+            }
           );
           sent = true;
         } catch (e) {
@@ -1564,12 +3159,18 @@ async function sendPlaywrightGroupImagesWithPage(
       }
 
       if (paths.length > 1) {
+        console.log("[image_send_branch_selected]", {
+          imageSendJobId,
+          branch: "sequential",
+          pathsCount: paths.length,
+        });
         console.log("🔁 Using sequential image send (batch disabled)");
         await enforceStrictSendLock(page);
         let success = false;
         try {
           success = await sendImagesSequentially(page, paths, {
             caption: captionForFirstOnly,
+            imageSendJobId,
           });
         } catch (e) {
           if (isIdentitySendBlockError(e)) {

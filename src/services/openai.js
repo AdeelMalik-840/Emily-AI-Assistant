@@ -24,6 +24,7 @@ const UNCLEAR_CONVERSATION_INTENT = {
     price: false,
     details: false,
     delivery: false,
+    browse_options: false,
     casual: false,
     unclear: true,
   },
@@ -32,6 +33,150 @@ const UNCLEAR_CONVERSATION_INTENT = {
   confidence: "low",
   reason: "classifier_unavailable",
 };
+
+const EMPTY_BOOKING_SLOTS = {
+  slots: {
+    deliveryMethod: null,
+    deliveryAddress: null,
+    deliveryTime: null,
+    contactPhone: null,
+  },
+  confidence: {
+    deliveryMethod: "low",
+    deliveryAddress: "low",
+    deliveryTime: "low",
+    contactPhone: "low",
+  },
+  reason: "unavailable",
+};
+
+function normalizeConfidenceLabel(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "high" || s === "medium" || s === "low" ? s : "low";
+}
+
+function normalizeBookingSlotPayload(value) {
+  const obj = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const slotsRaw =
+    obj.slots && typeof obj.slots === "object" && !Array.isArray(obj.slots) ? obj.slots : {};
+  const confRaw =
+    obj.confidence && typeof obj.confidence === "object" && !Array.isArray(obj.confidence)
+      ? obj.confidence
+      : {};
+  const methodRaw = String(slotsRaw.deliveryMethod ?? "").trim().toLowerCase();
+  const method =
+    methodRaw === "delivery" || methodRaw === "pickup" ? methodRaw : null;
+  const address =
+    slotsRaw.deliveryAddress != null && String(slotsRaw.deliveryAddress).trim() !== ""
+      ? String(slotsRaw.deliveryAddress).trim()
+      : null;
+  const time =
+    slotsRaw.deliveryTime != null && String(slotsRaw.deliveryTime).trim() !== ""
+      ? String(slotsRaw.deliveryTime).trim()
+      : null;
+  const phone =
+    slotsRaw.contactPhone != null && String(slotsRaw.contactPhone).trim() !== ""
+      ? String(slotsRaw.contactPhone).trim()
+      : null;
+  return {
+    slots: {
+      deliveryMethod: method,
+      deliveryAddress: address,
+      deliveryTime: time,
+      contactPhone: phone,
+    },
+    confidence: {
+      deliveryMethod: normalizeConfidenceLabel(confRaw.deliveryMethod),
+      deliveryAddress: normalizeConfidenceLabel(confRaw.deliveryAddress),
+      deliveryTime: normalizeConfidenceLabel(confRaw.deliveryTime),
+      contactPhone: normalizeConfidenceLabel(confRaw.contactPhone),
+    },
+    reason: String(obj.reason ?? "").slice(0, 160) || "ok",
+  };
+}
+
+/**
+ * Extract booking slots using LLM (strict JSON only). This must NOT decide routing or transitions.
+ * @param {{ state: string, messageText: string, booking?: any, __completionForTests?: ((args: any) => Promise<any>) }} p
+ * @returns {Promise<{ slots: { deliveryMethod: null|"delivery"|"pickup", deliveryAddress: string|null, deliveryTime: string|null, contactPhone: string|null }, confidence: { deliveryMethod: "high"|"medium"|"low", deliveryAddress: "high"|"medium"|"low", deliveryTime: "high"|"medium"|"low", contactPhone: "high"|"medium"|"low" }, reason: string }>}
+ */
+export async function extractBookingSlotsWithLLM({
+  state,
+  messageText,
+  booking = null,
+  __completionForTests = null,
+} = {}) {
+  const message = String(messageText ?? "").replace(/\s+/g, " ").trim();
+  const s = String(state ?? "").trim();
+  if (!message || !s) {
+    return { ...EMPTY_BOOKING_SLOTS, reason: "empty_input" };
+  }
+
+  // In tests, allow injection; in production, openai must exist.
+  const completionFn =
+    typeof __completionForTests === "function"
+      ? __completionForTests
+      : openai
+        ? (args) => openai.chat.completions.create(args)
+        : null;
+
+  if (!completionFn) {
+    return { ...EMPTY_BOOKING_SLOTS, reason: "llm_unavailable" };
+  }
+
+  const system = `You extract booking slots from a WhatsApp message for a booking workflow state machine.
+Return JSON ONLY with this exact shape:
+{
+  "slots": {
+    "deliveryMethod": null | "delivery" | "pickup",
+    "deliveryAddress": string | null,
+    "deliveryTime": string | null,
+    "contactPhone": string | null
+  },
+  "confidence": {
+    "deliveryMethod": "high" | "medium" | "low",
+    "deliveryAddress": "high" | "medium" | "low",
+    "deliveryTime": "high" | "medium" | "low",
+    "contactPhone": "high" | "medium" | "low"
+  },
+  "reason": "short"
+}
+
+Rules:
+- Extract only what the user clearly provided; do NOT invent.
+- Preserve the user's wording for address/time phrases.
+- If message is only acknowledgements like "haan/ok/yes", return null slots with low confidence.
+- Examples for deliveryTime: "10 bjy rat", "12 bjy", "2:00 bjy rat", "7pm", "kal 5 baje", "evening".
+- Examples for deliveryAddress: "DHA deliver krni hai", "Delivery faisal town", "Bahria phase 7 mein delivery".
+- Do NOT generate any customer reply text.`;
+
+  const user = JSON.stringify({
+    state: s,
+    latestMessage: message,
+    booking: booking && typeof booking === "object" ? {
+      deliveryMethod: booking?.deliveryMethod ?? null,
+      deliveryAddress: booking?.deliveryAddress ?? null,
+      deliveryTime: booking?.deliveryTime ?? null,
+      customerPhone: booking?.customerPhone ?? null,
+      contactPhone: booking?.contactPhone ?? null,
+    } : null,
+  });
+
+  const resp = await completionFn({
+    model: resolveOpenAiChatModel(),
+    temperature: 0,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_tokens: 220,
+  });
+
+  const raw = resp?.choices?.[0]?.message?.content ?? "";
+  const parsed = JSON.parse(String(raw || "{}"));
+  return normalizeBookingSlotPayload(parsed);
+}
 
 function normalizeConversationIntentPayload(value) {
   const obj = value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -48,6 +193,7 @@ function normalizeConversationIntentPayload(value) {
     "price",
     "details",
     "delivery",
+    "browse_options",
     "casual",
     "unclear",
   ]);
@@ -72,6 +218,7 @@ function normalizeConversationIntentPayload(value) {
       price: intentsRaw.price === true,
       details: intentsRaw.details === true,
       delivery: intentsRaw.delivery === true,
+      browse_options: intentsRaw.browse_options === true,
       casual: intentsRaw.casual === true,
       unclear: intentsRaw.unclear === true,
     },
@@ -119,13 +266,14 @@ export async function classifyConversationIntentWithLLM({
   }
   const system = `Classify the latest WhatsApp customer message by meaning, not keywords.
 Return JSON only with this exact shape:
-{"intents":{"availability":boolean,"booking":boolean,"price":boolean,"details":boolean,"delivery":boolean,"casual":boolean,"unclear":boolean},"primaryIntent":"availability|booking|price|details|delivery|casual|unclear","askedField":"availability|price|price_daily|price_monthly|color|model|mileage|condition|services|media|delivery|unknown","confidence":"high|medium|low","reason":"short internal reason"}
+{"intents":{"availability":boolean,"booking":boolean,"price":boolean,"details":boolean,"delivery":boolean,"browse_options":boolean,"casual":boolean,"unclear":boolean},"primaryIntent":"availability|booking|price|details|delivery|browse_options|casual|unclear","askedField":"availability|price|price_daily|price_monthly|color|model|mileage|condition|services|media|delivery|unknown","confidence":"high|medium|low","reason":"short internal reason"}
 
 Rules:
 - "available for rent", "rent pe available hai", "mil jaye gi" mean availability, not price.
 - "rent kitna", "rate kya", "how much", "per day", "monthly" mean price.
 - duration or contact for an in-progress booking means booking.
 - color/model/mileage/condition/media/service questions mean details.
+- asking for alternatives / other options / what else is available / list available items or services means browse_options.
 - ok/haan/theek/👍 mean casual.
 - Understand English, Urdu, Roman Urdu, typos, and slang.
 - Do not include prose outside JSON.`;

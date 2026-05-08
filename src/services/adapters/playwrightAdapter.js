@@ -71,21 +71,39 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
 
     if (ok && wantsImages) {
       try {
+        const imageSendJobId = `imgjob_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
+        const imageUrlCount = Array.isArray(messageMeta?.whatsappImageUrls)
+          ? messageMeta.whatsappImageUrls.length
+          : 0;
         console.log("📸 Starting image send after text");
-        console.log("🧵 Starting image send");
+        console.log("🧵 Starting image send", {
+          imageSendJobId,
+          imageUrlCount,
+        });
         const imgOk = await sendPlaywrightGroupImages(
           messageMeta.whatsappImageUrls,
           undefined,
           {
             expectedChat: groupNameResolved,
+            imageSendJobId,
           }
         );
         if (imgOk) {
           imagesDelivered = true;
-          console.log("✅ Image send complete");
+          console.log("✅ Image send complete", {
+            imageSendJobId,
+            imageUrlCount,
+            ok: imgOk,
+          });
         } else {
           imagesDelivered = false;
-          console.error("❌ Image send failed");
+          console.error("❌ Image send failed", {
+            imageSendJobId,
+            imageUrlCount,
+            ok: imgOk,
+          });
         }
       } catch (imgErr) {
         imagesDelivered = false;

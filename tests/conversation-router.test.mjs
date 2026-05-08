@@ -208,3 +208,18 @@ test("invalid classification returns unclear without crash", () => {
   assert.equal(priority.priorityIntent, "unclear");
   assert.equal(priority.askedField, "unknown");
 });
+
+test("routes browse_options intent explicitly", () => {
+  const route = decideConversationRoute({
+    message: "what else do you have?",
+    intentClassification: {
+      intents: { browse_options: true },
+      primaryIntent: "browse_options",
+      askedField: "unknown",
+      confidence: "high",
+      reason: "user asked alternatives",
+    },
+  });
+  assert.equal(route.routeType, "BROWSE_OPTIONS");
+  assert.equal(route.shouldBypassPhraseEngine, true);
+});

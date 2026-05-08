@@ -18,6 +18,7 @@ const CASUAL_RE =
 
 const INTENT_PRIORITY = [
   "delivery",
+  "browse_options",
   "booking",
   "availability",
   "price",
@@ -72,6 +73,7 @@ function normalizeIntentClassification(classification) {
     price: rawIntents.price === true,
     details: rawIntents.details === true,
     delivery: rawIntents.delivery === true,
+    browse_options: rawIntents.browse_options === true,
     casual: rawIntents.casual === true,
     unclear: rawIntents.unclear === true,
   };
@@ -94,22 +96,136 @@ function explicitlyAsksAmount(message) {
   );
 }
 
+/**
+ * Generic pricing / product-detail question detector (language-agnostic keywords).
+ * Used to avoid booking shortcuts and duplicate-booking replies when the user is
+ * clearly asking for rates or item details, not submitting a booking turn.
+ */
+export function isExplicitPricingOrDetailsQuestion(message) {
+  const raw = String(message ?? "").trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  if (
+    /\b(price|pricing|rate|rates|charges?|cost|amount|quote|quotation|detail|details|spec|specs|model|colou?r|mileage|capacity|photo|photos|pics|picture|images|info|information|features?)\b/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\b(per\s*day|per\s*month|per\s*week|daily|monthly|weekly|mahina|maheena|mahine|\/day|\/month)\b/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+  if (/\b(kitna|kitni|kitne)\b/i.test(lower)) return true;
+  /** Not a pure rate quote — asking whether rental / item is available. */
+  if (
+    /\b(rent|kiraya|kiraye)\b/i.test(lower) &&
+    /\b(available|availability|maujood|milega|milegi|mil\s+jaye|mil\s+raha)\b/i.test(lower)
+  ) {
+    return false;
+  }
+  if (
+    /\b(rent|kiraya|kiraye)\b/i.test(lower) &&
+    /\b(kitna|kitni|kitne|kya|hai|ho|dena|denge|lag|laga|lagta)\b/i.test(lower)
+  ) {
+    return true;
+  }
+  /** Roman Urdu quote asks: totals / “how much overall” without repeating kitna. */
+  if (
+    /\b(total|overall|overall\s+kitna|kitna\s+overall)\b/i.test(lower) &&
+    /\b(batao|bata|banega|banayega|hoga|ho\s+ga|lagta|lagi|lagegi)\b/i.test(lower)
+  ) {
+    return true;
+  }
+  if (
+    /\b(hafta|haftay|week|weeks)\b/i.test(lower) &&
+    /\b(total|overall|rent|rate|kitna|kya)\b/i.test(lower)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Commit-like signals that should beat generic pricing questions when both appear.
+ * Used with explicit pricing detection so duration + “how much” stays informational.
+ */
+export function hasStrongBookingCommitPhrase(message) {
+  const raw = String(message ?? "").trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  if (
+    /\b(book|booking|bookings|reserve|reservation|confirm(?:ed)?)\b/i.test(lower)
+  ) {
+    return true;
+  }
+  if (/\b(done|finalize|final(?:ise|ize)?|proceed)\b/i.test(lower)) return true;
+  if (/\b(kar\s*do|kardo|karwa(?:do| den)?)\b/i.test(lower)) return true;
+  if (/\b(chahiye|chahye|chaiye|chaahiye)\b/i.test(lower)) return true;
+  if (/\b(chahta|chahti)\b/i.test(lower)) return true;
+  if (/^(haan|han|yes|jee|ji)\b/i.test(lower.trim()) && /\d/.test(lower))
+    return true;
+  return false;
+}
+
 export function applyIntentPriority(classification, context = {}) {
   const normalized = normalizeIntentClassification(classification);
   const intents = { ...normalized.intents };
   const messageText = String(context.messageText ?? "").trim();
-  const hasDuration = hasDurationSignal(messageText);
-  const hasContact = hasContactSignal(messageText);
+  const hasBrowseOptions = intents.browse_options === true;
+  const hasDurationInMessage = hasDurationSignal(messageText);
+  const hasContactInMessage = hasContactSignal(messageText);
+  const explicitPricingOrDetailsQuestion =
+    isExplicitPricingOrDetailsQuestion(messageText);
+  const strongBookingCommit = hasStrongBookingCommitPhrase(messageText);
+  const pricingDetailsOnlyMessage =
+    explicitPricingOrDetailsQuestion &&
+    !hasDurationInMessage &&
+    !hasContactInMessage;
+  const promoteBookingFromContext =
+    !pricingDetailsOnlyMessage &&
+    (context.hasDuration === true || context.hasContact === true);
 
-  if (hasDuration || hasContact || context.hasDuration === true || context.hasContact === true) {
+  const durationAloneWouldPromoteBooking =
+    hasDurationInMessage &&
+    !(explicitPricingOrDetailsQuestion && !strongBookingCommit);
+
+  if (
+    durationAloneWouldPromoteBooking ||
+    hasContactInMessage ||
+    promoteBookingFromContext
+  ) {
     intents.booking = true;
+  }
+
+  // Browse-options (alternatives / "what else do you have") must not be promoted into booking
+  // and should win before generic details/feature mapping.
+  if (hasBrowseOptions) {
+    intents.booking = false;
+    intents.price = false;
+    intents.details = false;
+    intents.delivery = false;
+  }
+
+  if (explicitPricingOrDetailsQuestion && !strongBookingCommit) {
+    intents.price = true;
+    intents.booking = false;
   }
 
   let priorityIntent = "unclear";
   if (
+    hasBrowseOptions &&
+    !hasDurationInMessage &&
+    !hasContactInMessage
+  ) {
+    priorityIntent = "browse_options";
+  } else if (
     intents.availability &&
-    !hasDuration &&
-    !hasContact &&
+    !hasDurationInMessage &&
+    !hasContactInMessage &&
     (normalized.primaryIntent === "availability" ||
       (intents.price && !explicitlyAsksAmount(messageText)))
   ) {
@@ -126,6 +242,35 @@ export function applyIntentPriority(classification, context = {}) {
   if (priorityIntent === "unclear" && normalized.primaryIntent !== "unclear") {
     priorityIntent = normalized.primaryIntent;
   }
+
+  if (
+    explicitPricingOrDetailsQuestion &&
+    !strongBookingCommit &&
+    (priorityIntent === "booking" || priorityIntent === "availability")
+  ) {
+    priorityIntent = "price";
+  }
+
+  const intentPromotionReason = pricingDetailsOnlyMessage
+    ? "skipped_context_booking_promotion_for_pricing_or_details_question"
+    : explicitPricingOrDetailsQuestion && !strongBookingCommit
+      ? "pricing_intent_precedence_over_booking"
+      : promoteBookingFromContext
+        ? "context_duration_or_contact_promotes_booking"
+        : hasDurationInMessage || hasContactInMessage
+          ? "message_shape_promotes_booking"
+          : intents.booking
+            ? "classifier_or_existing_booking_flag"
+            : "no_booking_promotion";
+
+  console.log("[intent_promotion_decision]", {
+    originalIntent: normalized.primaryIntent,
+    promotedIntent: priorityIntent,
+    hasDuration: hasDurationInMessage || context.hasDuration === true,
+    hasContact: hasContactInMessage || context.hasContact === true,
+    explicitPricingOrDetailsQuestion,
+    reason: intentPromotionReason,
+  });
 
   const askedField =
     priorityIntent === "availability"
@@ -155,6 +300,17 @@ function routeFromPriority(priority, item) {
       shouldContinueFlow: true,
       missingFields: [],
       reason: "intent_priority_delivery",
+      intentPriority: priority,
+    };
+  }
+  if (priority.priorityIntent === "browse_options") {
+    return {
+      routeType: "BROWSE_OPTIONS",
+      selectedItem: item,
+      shouldBypassPhraseEngine: true,
+      shouldContinueFlow: false,
+      missingFields: [],
+      reason: "intent_priority_browse_options",
       intentPriority: priority,
     };
   }

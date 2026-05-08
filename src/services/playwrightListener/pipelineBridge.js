@@ -58,6 +58,16 @@ function groupParticipantScope(senderId) {
     .slice(0, 16);
 }
 
+function groupSenderScopeFromAnchor(groupKey, senderAnchor) {
+  const g = String(groupKey ?? "").trim().toLowerCase();
+  const a = String(senderAnchor ?? "").trim().toLowerCase();
+  if (!g || !a) return "";
+  return createHash("sha256")
+    .update(`${g}::${a}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
 /**
  * Build schedule payload; returns null if forwarding cannot run.
  * @param {{
@@ -120,6 +130,11 @@ async function buildPlaywrightSchedulePayload(adapted) {
     return null;
   }
 
+  const playwrightChatKey =
+    String(adapted?.playwrightChatKey ?? "").trim() ||
+    normalizeTitle(groupName);
+  const normalizedGroupChatKey = playwrightChatKey || groupName;
+
   const senderName = String(adapted?.senderName ?? adapted?.sender ?? "user").trim() || "user";
   const uniqueSenderIdRaw =
     adapted?.participantPhoneForDm ||
@@ -136,7 +151,9 @@ async function buildPlaywrightSchedulePayload(adapted) {
   const uniqueSenderId =
     normalizeSenderId(uniqueSenderIdRaw) ||
     `anon::${anonBase}::${anonId}`;
-  const senderScope = groupParticipantScope(uniqueSenderId);
+  const senderScope =
+    groupSenderScopeFromAnchor(normalizedGroupChatKey, adapted?.senderAnchor) ||
+    groupParticipantScope(uniqueSenderId);
   const participantIdentity = resolveParticipantIdentity({
     participantPhone: adapted?.participantPhoneForDm,
     participantKey: adapted?.participantKey,
@@ -144,13 +161,23 @@ async function buildPlaywrightSchedulePayload(adapted) {
     senderName,
     senderAnchor: adapted?.senderAnchor,
     messageSender: adapted?.messageSender,
-    groupChatKey: adapted?.playwrightChatKey || groupName,
+    groupChatKey: normalizedGroupChatKey,
+    senderScope: senderScope ? String(senderScope).trim() : "",
   });
   const participantPhoneForDm = participantIdentity.participantPhone || "";
-  const participantKey = participantIdentity.participantKey || "";
-  const playwrightChatKey =
-    String(adapted?.playwrightChatKey ?? "").trim() ||
-    normalizeTitle(groupName);
+  // CRITICAL: group follow-ups (e.g. "12 din") rely on participant-scoped session memory.
+  // If we fail to provide a stable participantKey, messageProcessor will fail-closed and clear duration.
+  // Fallback to a deterministic senderScope key (stable for the same sender in the same group).
+  const participantKey = senderScope ? `scope::${senderScope}` : (participantIdentity.participantKey || "");
+  if (participantKey) {
+    console.log("[participant_identity_stable_key_selected]", {
+      groupChatKey: String(normalizedGroupChatKey ?? "").trim() || null,
+      participantName: participantIdentity.participantName || senderName || null,
+      participantKey: String(participantKey).slice(0, 64),
+      participantPhonePresent: Boolean(participantPhoneForDm),
+      keySource: senderScope ? "senderScope" : "fallback",
+    });
+  }
 
   const groupSessionKey =
     String(process.env.PLAYWRIGHT_SESSION_KEY ?? "").trim() ||
@@ -167,6 +194,13 @@ async function buildPlaywrightSchedulePayload(adapted) {
       participantName: senderName || null,
       reason: "MISSING_PARTICIPANT_KEY",
     });
+  } else if (!participantIdentity.participantKey) {
+    console.log("[participant_identity_fallback_key_used]", {
+      groupChatKey: playwrightChatKey || null,
+      participantName: senderName || null,
+      participantKeyPreview: String(participantKey).slice(0, 32),
+      fallback: "senderScope",
+    });
   }
   const normalizedInbound = normalizeInboundMessage({
     source: "playwright",
@@ -174,7 +208,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
     messageId: adapted?.messageId,
     userId: ownerUserId,
     sessionKey,
-    chatId: String(adapted?.playwrightChatKey ?? "").trim() || groupName,
+    chatId: String(playwrightChatKey ?? "").trim() || groupName,
     timestamp: adapted?.timestamp,
   });
 

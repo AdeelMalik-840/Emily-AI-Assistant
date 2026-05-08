@@ -912,12 +912,19 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
 function displayNameFromParticipantKey(value) {
   const raw = String(value ?? "").trim();
   if (!raw) return "";
+  // "scope::<hash>" is an internal stable key, not a human name.
+  if (/^scope::/i.test(raw)) return "";
   const beforeAnchor = raw.split("::")[0] || raw;
   return beforeAnchor
     .replace(/\bfirst[-\s]?seen[-\s]*\d+\b/gi, "")
     .replace(/[-_]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// Test-only export to validate name derivation does not leak internal keys.
+export function __displayNameFromParticipantKeyForTests(value) {
+  return displayNameFromParticipantKey(value);
 }
 
 /**
@@ -1032,10 +1039,10 @@ export async function createBooking(
     ((dmTargetRaw.includes("@") && /@(c\.us|s\.whatsapp\.net)$/i.test(dmTargetRaw)) ||
       (dmTargetDigits.length >= 10 && dmTargetDigits.length <= 15));
   const safeCanDmCustomer = Boolean(canDmCustomer) && dmTargetIsRoutable;
-  const sourceParticipantNameClean = String(
+  let sourceParticipantNameClean = String(
     sourceParticipantName ?? participantName ?? ""
   ).trim();
-  const sourceParticipantDisplayNameClean = String(
+  let sourceParticipantDisplayNameClean = String(
     sourceParticipantDisplayName ?? sourceParticipantNameClean ?? participantName ?? ""
   ).trim();
   const sourceParticipantPhoneClean = String(sourceParticipantPhone ?? "").trim();
@@ -1045,6 +1052,18 @@ export async function createBooking(
     sourceParticipantNameClean.toLowerCase().replace(/\s+/g, "-") ||
     sourceParticipantDisplayNameClean.toLowerCase().replace(/\s+/g, "-") ||
     String(sourceSenderScope ?? senderScope ?? "").trim();
+
+  // Guard: never persist internal key fragments like "scope" as a participant display name.
+  if (sourceParticipantNameClean && /^scope$/i.test(sourceParticipantNameClean)) {
+    sourceParticipantNameClean = "";
+  }
+  if (
+    sourceParticipantDisplayNameClean &&
+    /^scope$/i.test(sourceParticipantDisplayNameClean)
+  ) {
+    sourceParticipantDisplayNameClean = "";
+  }
+
   const sourceParticipantNameFromKey = displayNameFromParticipantKey(
     sourceParticipantKeyClean
   );
@@ -1058,6 +1077,17 @@ export async function createBooking(
     sourceParticipantNameClean ||
     sourceParticipantNameFromKey ||
     null;
+
+  if (
+    /^scope::/i.test(String(sourceParticipantKeyClean ?? "")) &&
+    (sourceIdentityParticipantName || sourceIdentityDisplayName)
+  ) {
+    console.log("[participant_identity_display_name_preserved]", {
+      participantKey: String(sourceParticipantKeyClean).trim() || null,
+      participantName: sourceIdentityParticipantName || null,
+      participantDisplayName: sourceIdentityDisplayName || null,
+    });
+  }
   const sourceHasParticipantIdentity = Boolean(
     sourceIdentityParticipantName || sourceIdentityDisplayName || sourceParticipantKeyClean
   );

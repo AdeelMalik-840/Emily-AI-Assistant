@@ -98,18 +98,58 @@ function isWeakOrEmptyCaption(text) {
 
 /**
  * @param {{ phoneNumberId?: string, accessToken?: string } | null} credentials
- * @returns {{ token: string, phoneNumberId: string } | null}
+ * @param {{ recipient?: string }} [context]
+ * @returns {{ token: string, phoneNumberId: string, tokenSource: "per_user" | "env", hasPerUserToken: boolean, hasEnvToken: boolean } | null}
  */
-function resolveWhatsAppCredentials(credentials) {
+function resolveWhatsAppCredentials(credentials, context = {}) {
   const env = getWhatsAppEnv();
-  const token = String(
-    credentials?.accessToken || env.accessToken || ""
-  ).trim();
-  const phoneNumberId = String(
-    credentials?.phoneNumberId || env.phoneNumberId || ""
-  ).trim();
+  const perUserToken = String(credentials?.accessToken || "").trim();
+  const perUserPhoneNumberId = String(credentials?.phoneNumberId || "").trim();
+  const envToken = String(env.accessToken || "").trim();
+  const envPhoneNumberId = String(env.phoneNumberId || "").trim();
+  const hasPerUserToken = Boolean(perUserToken);
+  const hasEnvToken = Boolean(envToken);
+  const forceEnvToken =
+    String(process.env.WHATSAPP_FORCE_ENV_TOKEN ?? "").trim().toLowerCase() ===
+    "true";
+
+  let token = "";
+  let phoneNumberId = "";
+  /** @type {"per_user" | "env"} */
+  let tokenSource = "env";
+
+  if (forceEnvToken) {
+    token = envToken;
+    phoneNumberId = envPhoneNumberId;
+    tokenSource = "env";
+    console.log("[whatsapp_cloud_env_token_forced]", {
+      hasEnvToken,
+      phoneNumberId: envPhoneNumberId || null,
+    });
+  } else if (hasPerUserToken || perUserPhoneNumberId) {
+    token = perUserToken || envToken;
+    phoneNumberId = perUserPhoneNumberId || envPhoneNumberId;
+    tokenSource = hasPerUserToken ? "per_user" : "env";
+  } else {
+    token = envToken;
+    phoneNumberId = envPhoneNumberId;
+    tokenSource = "env";
+  }
+
+  const recipientLast4 = String(context?.recipient ?? "")
+    .replace(/\D/g, "")
+    .slice(-4) || null;
+
+  console.log("[whatsapp_cloud_credential_selected]", {
+    tokenSource,
+    hasPerUserToken,
+    hasEnvToken,
+    phoneNumberId: phoneNumberId || null,
+    recipientLast4,
+  });
+
   if (!phoneNumberId || !token) return null;
-  return { token, phoneNumberId };
+  return { token, phoneNumberId, tokenSource, hasPerUserToken, hasEnvToken };
 }
 
 /**
@@ -194,9 +234,15 @@ function buildImagePayload(toField, recipientType, link) {
  * @param {string} phoneNumberId
  * @param {string} token
  * @param {Record<string, unknown>} payload
+ * @param {{ tokenSource?: "per_user" | "env", phoneNumberId?: string, recipientLast4?: string | null }} [credentialMeta]
  * @returns {Promise<{ ok: boolean, status: number, data: Record<string, unknown> }>}
  */
-async function postWhatsAppMessagesResult(phoneNumberId, token, payload) {
+async function postWhatsAppMessagesResult(
+  phoneNumberId,
+  token,
+  payload,
+  credentialMeta = {}
+) {
   const url = `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`;
   const res = await fetch(url, {
     method: "POST",
@@ -224,6 +270,31 @@ async function postWhatsAppMessagesResult(phoneNumberId, token, payload) {
       "body:",
       JSON.stringify(body)
     );
+    const error = body && typeof body.error === "object" ? body.error : {};
+    const errorCode =
+      error && "code" in error ? String(error.code ?? "").trim() : "";
+    const errorType =
+      error && "type" in error ? String(error.type ?? "").trim() : "";
+    const errorMessage =
+      error && "message" in error ? String(error.message ?? "").trim() : "";
+    if (res.status === 401 || errorCode === "190") {
+      console.error("[whatsapp_cloud_token_invalid]", {
+        tokenSource: credentialMeta.tokenSource || null,
+        phoneNumberId: credentialMeta.phoneNumberId || phoneNumberId || null,
+        recipientLast4: credentialMeta.recipientLast4 || null,
+        errorCode: errorCode || null,
+        errorType: errorType || null,
+        errorMessage: errorMessage || null,
+      });
+      if (credentialMeta.tokenSource === "per_user") {
+        console.error("[whatsapp_cloud_per_user_token_stale]", {
+          phoneNumberId: credentialMeta.phoneNumberId || phoneNumberId || null,
+          recipientLast4: credentialMeta.recipientLast4 || null,
+          errorCode: errorCode || null,
+          errorType: errorType || null,
+        });
+      }
+    }
     return { ok: false, status: res.status, data: body };
   }
   console.log("[whatsappCloud] WhatsApp API response:", JSON.stringify(body));
@@ -257,7 +328,8 @@ export async function sendWhatsAppInteractiveButtons(
   buttons,
   credentials = null
 ) {
-  const resolved = resolveWhatsAppCredentials(credentials);
+  const { toField } = resolveWhatsAppToField(to, "individual");
+  const resolved = resolveWhatsAppCredentials(credentials, { recipient: toField || to });
   if (!resolved) {
     console.error(
       "[whatsappCloud] Missing phoneNumberId/accessToken — cannot send interactive buttons"
@@ -278,18 +350,23 @@ export async function sendWhatsAppInteractiveButtons(
     return { ok: false };
   }
 
-  const { token, phoneNumberId } = resolved;
-  const { toField } = resolveWhatsAppToField(to, "individual");
   if (!toField) {
     console.error("[whatsappCloud] Invalid interactive recipient:", to);
     return { ok: false };
   }
 
+  const { token, phoneNumberId } = resolved;
   const payload = buildInteractiveButtonPayload(toField, safeBody, safeButtons);
-  const result = await postWhatsAppMessagesResult(phoneNumberId, token, payload);
+  const result = await postWhatsAppMessagesResult(phoneNumberId, token, payload, {
+    tokenSource: resolved.tokenSource,
+    phoneNumberId,
+    recipientLast4: toField.replace(/\D/g, "").slice(-4) || null,
+  });
   return {
     ok: Boolean(result.ok),
     providerMessageId: result.ok ? extractProviderMessageId(result.data) : null,
+    httpStatus: result.status,
+    error: result.ok ? null : result.data,
   };
 }
 
@@ -315,24 +392,6 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       String(value ?? "")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
-    const resolved = resolveWhatsAppCredentials(credentials);
-    console.log(
-      "[whatsappCloud] Using per-user token:",
-      !!credentials?.accessToken
-    );
-    console.log(
-      "[whatsappCloud] hasEnvToken:",
-      Boolean(getWhatsAppEnv().accessToken)
-    );
-
-    if (!resolved) {
-      console.error(
-        "[whatsappCloud] Missing phoneNumberId/accessToken (or env WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN) — cannot send"
-      );
-      return { ok: false, groupSendFailed: false };
-    }
-
-    const { token, phoneNumberId } = resolved;
     const reply = enforceSingleMessage(text);
     if (!reply) {
       console.warn("[whatsappCloud] Empty text body, skipping send");
@@ -348,6 +407,16 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       console.error("[whatsappCloud] Invalid recipient:", to);
       return { ok: false, groupSendFailed: false };
     }
+    const resolved = resolveWhatsAppCredentials(credentials, { recipient: toField });
+
+    if (!resolved) {
+      console.error(
+        "[whatsappCloud] Missing phoneNumberId/accessToken (or env WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN) — cannot send"
+      );
+      return { ok: false, groupSendFailed: false };
+    }
+
+    const { token, phoneNumberId } = resolved;
 
     console.log("📤 Sending reply to:", toField);
 
@@ -355,7 +424,12 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
     const result = await postWhatsAppMessagesResult(
       phoneNumberId,
       token,
-      payload
+      payload,
+      {
+        tokenSource: resolved.tokenSource,
+        phoneNumberId,
+        recipientLast4: toField.replace(/\D/g, "").slice(-4) || null,
+      }
     );
 
     if (result.ok) {
@@ -372,7 +446,12 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
     }
 
     if (recipientType !== "group") {
-      return { ok: false, groupSendFailed: false };
+      return {
+        ok: false,
+        groupSendFailed: false,
+        httpStatus: result.status,
+        error: result.data,
+      };
     }
 
     groupSendFailed = true;
@@ -386,14 +465,25 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       console.error(
         "[whatsappCloud] group send failed and no fallbackDmTo — cannot DM user"
       );
-      return { ok: false, groupSendFailed: true, providerMessageId: null };
+      return {
+        ok: false,
+        groupSendFailed: true,
+        providerMessageId: null,
+        httpStatus: result.status,
+        error: result.data,
+      };
     }
 
     const dmPayload = buildTextPayload(fallbackDigits, "individual", reply);
     const dmResult = await postWhatsAppMessagesResult(
       phoneNumberId,
       token,
-      dmPayload
+      dmPayload,
+      {
+        tokenSource: resolved.tokenSource,
+        phoneNumberId,
+        recipientLast4: fallbackDigits.slice(-4) || null,
+      }
     );
     if (dmResult.ok) {
       console.log("[whatsappCloud] DM fallback after group failure: OK");
@@ -418,7 +508,12 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       const nRes = await postWhatsAppMessagesResult(
         phoneNumberId,
         token,
-        noticePayload
+        noticePayload,
+        {
+          tokenSource: resolved.tokenSource,
+          phoneNumberId,
+          recipientLast4: String(toField).replace(/\D/g, "").slice(-4) || null,
+        }
       );
       if (!nRes.ok) {
         console.warn(
@@ -433,6 +528,8 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
       ok: dmResult.ok,
       groupSendFailed: true,
       providerMessageId: dmResult.ok ? extractProviderMessageId(dmResult.data) : null,
+      httpStatus: dmResult.status,
+      error: dmResult.ok ? null : dmResult.data,
     };
   } catch (err) {
     console.error(
@@ -462,12 +559,6 @@ export async function sendWhatsAppImage(
 ) {
   let groupSendFailed = false;
   try {
-    const resolved = resolveWhatsAppCredentials(credentials);
-    if (!resolved) {
-      console.error("[whatsappCloud] sendWhatsAppImage: missing credentials");
-      return { ok: false, groupSendFailed: false };
-    }
-    const { token, phoneNumberId } = resolved;
     const link = String(imageLink ?? "").trim();
     if (!link || !isPlausibleImageUrl(link)) {
       console.warn("[whatsappCloud] sendWhatsAppImage: skip invalid URL");
@@ -480,6 +571,12 @@ export async function sendWhatsAppImage(
       console.error("[whatsappCloud] sendWhatsAppImage: invalid recipient:", to);
       return { ok: false, groupSendFailed: false };
     }
+    const resolved = resolveWhatsAppCredentials(credentials, { recipient: toField });
+    if (!resolved) {
+      console.error("[whatsappCloud] sendWhatsAppImage: missing credentials");
+      return { ok: false, groupSendFailed: false };
+    }
+    const { token, phoneNumberId } = resolved;
     const payload = buildImagePayload(toField, recipientType, link);
     try {
       console.log(
@@ -492,7 +589,12 @@ export async function sendWhatsAppImage(
     const result = await postWhatsAppMessagesResult(
       phoneNumberId,
       token,
-      payload
+      payload,
+      {
+        tokenSource: resolved.tokenSource,
+        phoneNumberId,
+        recipientLast4: toField.replace(/\D/g, "").slice(-4) || null,
+      }
     );
     if (result.ok) {
       console.log("[whatsappCloud] Image sent OK →", String(toField).slice(0, 48));
@@ -500,7 +602,12 @@ export async function sendWhatsAppImage(
     }
 
     if (recipientType !== "group") {
-      return { ok: false, groupSendFailed: false };
+      return {
+        ok: false,
+        groupSendFailed: false,
+        httpStatus: result.status,
+        error: result.data,
+      };
     }
 
     groupSendFailed = true;
@@ -510,13 +617,23 @@ export async function sendWhatsAppImage(
     );
     const fallbackDigits = String(opts.fallbackDmTo ?? "").replace(/\D/g, "");
     if (!fallbackDigits) {
-      return { ok: false, groupSendFailed: true };
+      return {
+        ok: false,
+        groupSendFailed: true,
+        httpStatus: result.status,
+        error: result.data,
+      };
     }
     const dmPayload = buildImagePayload(fallbackDigits, "individual", link);
     const dmResult = await postWhatsAppMessagesResult(
       phoneNumberId,
       token,
-      dmPayload
+      dmPayload,
+      {
+        tokenSource: resolved.tokenSource,
+        phoneNumberId,
+        recipientLast4: fallbackDigits.slice(-4) || null,
+      }
     );
     if (dmResult.ok) {
       console.log("[whatsappCloud] image DM fallback after group failure: OK");
@@ -526,7 +643,12 @@ export async function sendWhatsAppImage(
         dmResult.status
       );
     }
-    return { ok: dmResult.ok, groupSendFailed: true };
+    return {
+      ok: dmResult.ok,
+      groupSendFailed: true,
+      httpStatus: dmResult.status,
+      error: dmResult.ok ? null : dmResult.data,
+    };
   } catch (err) {
     console.error("[whatsappCloud] sendWhatsAppImage error:", err);
     return { ok: false, groupSendFailed };

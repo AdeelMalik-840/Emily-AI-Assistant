@@ -550,6 +550,58 @@ async function loadWaitingBookings({ db, userId, limit = 20 }) {
   );
 }
 
+/**
+ * When true, logistics completion requires customerPhone or contactPhone.
+ * Default false (contact optional unless BOOKING_LOGISTICS_REQUIRE_CONTACT_FOR_COMPLETION is set).
+ * @typedef {{ requireContact?: boolean }} LogisticsCompletionPolicy
+ */
+
+export function resolveLogisticsCompletionPolicy(overrides = {}) {
+  if (
+    overrides &&
+    typeof overrides === "object" &&
+    typeof overrides.requireContact === "boolean"
+  ) {
+    return { requireContact: overrides.requireContact };
+  }
+  const env = String(
+    process.env.BOOKING_LOGISTICS_REQUIRE_CONTACT_FOR_COMPLETION ?? ""
+  )
+    .trim()
+    .toLowerCase();
+  const requireContact =
+    env === "true" || env === "1" || env === "yes";
+  return { requireContact };
+}
+
+/**
+ * Unified rule for whether delivery logistics are complete (method, address when delivery,
+ * time, optional contact per policy).
+ * @param {Record<string, unknown>} booking
+ * @param {LogisticsCompletionPolicy} [policy]
+ */
+export function isLogisticsComplete(booking, policy) {
+  const p = resolveLogisticsCompletionPolicy(policy ?? {});
+  const requireContact = p.requireContact === true;
+
+  const method = String(booking?.deliveryMethod ?? "").trim();
+  if (!method) return false;
+  const methodKey = method.toLowerCase();
+  if (methodKey === "delivery") {
+    const addr = String(booking?.deliveryAddress ?? "").trim();
+    if (!addr) return false;
+  }
+  const time = String(booking?.deliveryTime ?? "").trim();
+  if (!time) return false;
+  if (requireContact) {
+    const phone = String(
+      booking?.customerPhone ?? booking?.contactPhone ?? ""
+    ).trim();
+    if (!phone) return false;
+  }
+  return true;
+}
+
 export function buildDeliveryDetailReply({ booking, updated }) {
   const item = String(booking?.itemName ?? "").trim() || "is option";
   const duration =

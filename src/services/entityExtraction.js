@@ -2,6 +2,8 @@
  * Generic entity / duration extraction — no business-specific vocabulary.
  */
 
+import { parseUserDuration } from "../duration/parseDuration.js";
+
 /** Minimum confidence (0–1) to accept an entity downstream. */
 export const ENTITY_CONFIDENCE_MIN = 0.81;
 
@@ -527,20 +529,12 @@ export function extractEntity(message) {
 }
 
 /**
- * Extract duration in days from patterns like "5 din", "3 days".
+ * Extract duration in days (normalized) from user text.
  * @param {string} message
  * @returns {{ durationDays: number | null }}
  */
 export function extractDuration(message) {
-  const raw = String(message ?? "");
-  const m = raw.match(
-    /(\d+)\s*(?:din|deen|dino|day|days|dinos?)\b/i
-  );
-  if (m) {
-    const n = parseInt(m[1], 10);
-    if (Number.isFinite(n) && n > 0) {
-      return { durationDays: n };
-    }
-  }
-  return { durationDays: null };
+  const parsed = parseUserDuration(message);
+  if (!parsed) return { durationDays: null };
+  return { durationDays: parsed.normalizedDays };
 }

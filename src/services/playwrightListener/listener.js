@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { createHash } from "node:crypto";
 import { chromium } from "playwright";
 
 import db from "../../config/firebase.js";
@@ -201,6 +202,52 @@ function clean(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
+function groupSenderScopeFromAnchor(groupKey, senderAnchor) {
+  const g = String(groupKey ?? "").trim().toLowerCase();
+  const a = String(senderAnchor ?? "").trim().toLowerCase();
+  if (!g || !a) return "";
+  return createHash("sha256")
+    .update(`${g}::${a}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/**
+ * Group reply-after guard: match participant rows with stable keys when present.
+ * @param {{ participantKey?: string | null, sender?: string }} a
+ * @param {{ participantKey?: string | null, sender?: string }} b
+ */
+function isSameParticipant(a, b) {
+  if (a.participantKey && b.participantKey) {
+    return a.participantKey === b.participantKey;
+  }
+  if (!a.participantKey && !b.participantKey) {
+    return Boolean(a.sender && b.sender && a.sender === b.sender);
+  }
+  return false;
+}
+
+/**
+ * Same participant resolution as {@link userMessages} enrichment, for raw `sorted` rows.
+ * @param {object} m
+ * @param {string} normalizedGroupChatKey
+ */
+function participantComparableFromSortedRow(m, normalizedGroupChatKey) {
+  const senderScope =
+    groupSenderScopeFromAnchor(normalizedGroupChatKey, m.senderAnchor) || "";
+  const identity = resolveParticipantIdentity({
+    participantPhone: m.participantPhone,
+    participantName: m.participantName,
+    senderAnchor: m.senderAnchor,
+    groupChatKey: normalizedGroupChatKey,
+    senderScope,
+  });
+  return {
+    participantKey: identity.participantKey || null,
+    sender: String(m?.sender ?? "").trim() || "user",
+  };
+}
+
 function resolveOwnerUid() {
   return clean(
     process.env.PLAYWRIGHT_OWNER_USER_ID ||
@@ -262,9 +309,14 @@ async function loadActiveDmWatchTargets({
       const approvalStage = clean(data?.approvalStage).toLowerCase();
       if (
         approvalStage === "delivery_details_collected" ||
-        data?.deliveryDetailsCollectedAt ||
-        data?.deliveryConversationStarted === true
+        data?.deliveryDetailsCollectedAt
       ) {
+        console.log("[playwright_dm_watch_target_excluded_completed]", {
+          bookingId: doc.id,
+          approvalStage: approvalStage || null,
+          hasDeliveryDetailsCollectedAt: Boolean(data?.deliveryDetailsCollectedAt),
+          deliveryConversationStarted: data?.deliveryConversationStarted === true,
+        });
         continue;
       }
       if (approvalStage && !waitingStages.has(approvalStage)) {
@@ -529,36 +581,103 @@ function getMessageId(msg, index) {
 
 /**
  * Same id as in {@link computeSnapshotHash} for a message in {@link extractedList}.
- * Uses object identity or a stable sender/text/timestamp match; does not use `__rowKey`.
- * @param {{ sender?: string, text?: string, __ts?: number }} msg
+ * Prefers {@link msg.__rowKey} (timestamp + text hash + #n from group enrichment) over
+ * prePlainText + DOM index, which can collide.
+ * @param {{ sender?: string, text?: string, __ts?: number, __rowKey?: string, prePlainText?: string, sourceMessageIndex?: unknown, timestamp?: string | number }} msg
  * @param {Array<{ sender?: string, text?: string, __ts?: number }>} extractedList
  */
-function getMessageIdFromExtracted(msg, extractedList) {
-  // Prefer stable metadata when present; avoid ambiguous text-based matching.
+export function buildExtractedMessageId(msg, extractedList) {
+  const sender = String(msg?.sender ?? "unknown").trim() || "unknown";
+  const rowKeyTrim = String(msg?.__rowKey ?? "").trim();
   const prePlainText = String(msg?.prePlainText ?? "").trim();
   const sourceIndexRaw = msg?.sourceMessageIndex;
-  if (prePlainText && Number.isFinite(Number(sourceIndexRaw))) {
-    return `${prePlainText}::${Number(sourceIndexRaw)}`;
-  }
-  const sender = String(msg?.sender ?? "unknown").trim() || "unknown";
-  const ts =
+  const sourceIndexFinite = Number.isFinite(Number(sourceIndexRaw));
+  const sourceIndex = sourceIndexFinite ? Number(sourceIndexRaw) : null;
+
+  const textNorm = String(msg?.text ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+  const hasText = textNorm.length >= 1;
+
+  const tsCandidate =
     msg?.timestamp != null && String(msg.timestamp).trim() !== ""
       ? String(msg.timestamp).trim()
       : msg?.__ts != null && String(msg.__ts).trim() !== ""
         ? String(msg.__ts).trim()
         : "";
-  if (ts) {
-    return `${sender}::${ts}`;
+
+  /**
+   * @param {string} strategy
+   * @param {string} id
+   */
+  function finish(strategy, id) {
+    console.log("[id_strategy_selected]", {
+      strategy,
+      hasRowKey: Boolean(rowKeyTrim),
+      hasPrePlainText: Boolean(prePlainText),
+      hasIndex: sourceIndexFinite,
+    });
+    return { strategy, id };
   }
 
-  const idx = extractedList.findIndex(
-    (m) =>
-      m === msg ||
-      (String(m?.sender ?? "") === String(msg?.sender ?? "") &&
-        String(m?.text ?? "") === String(msg?.text ?? "") &&
-        Number(m?.__ts ?? 0) === Number(msg?.__ts ?? 0))
+  if (rowKeyTrim) {
+    return finish("ROW_KEY", `${sender}::row::${rowKeyTrim}`);
+  }
+
+  if (tsCandidate && hasText) {
+    return finish(
+      "TIMESTAMP_TEXT_HASH",
+      `${sender}::ts::${tsCandidate}::${hash(textNorm)}`
+    );
+  }
+
+  if (prePlainText && hasText) {
+    return finish(
+      "PRE_PLAIN_TEXT_TEXT_HASH",
+      `${sender}::ppt::${hash(prePlainText)}::${hash(textNorm)}`
+    );
+  }
+
+  if (tsCandidate) {
+    const tsNum = Number(tsCandidate);
+    const plausibleEpoch = Number.isFinite(tsNum) && tsNum > 1_000_000_000_000;
+    const plausibleLength = String(tsCandidate).length >= 10;
+    if (plausibleEpoch || plausibleLength) {
+      return finish("TIMESTAMP", `${sender}::${tsCandidate}`);
+    }
+  }
+
+  if (sourceIndexFinite) {
+    return finish("SOURCE_INDEX", `${sender}::idx::${sourceIndex}`);
+  }
+
+  const normalizedTextPreview = textNorm.slice(0, 80);
+
+  const idx = Array.isArray(extractedList)
+    ? extractedList.findIndex(
+        (m) =>
+          m === msg ||
+          (String(m?.sender ?? "") === String(msg?.sender ?? "") &&
+            String(m?.text ?? "") === String(msg?.text ?? "") &&
+            Number(m?.__ts ?? 0) === Number(msg?.__ts ?? 0))
+      )
+    : -1;
+  const idxHint =
+    idx >= 0
+      ? idx
+      : sourceIndexFinite
+        ? sourceIndex
+        : "unknown";
+  return finish(
+    "TEXT_FALLBACK",
+    `${sender}::text::${normalizedTextPreview}::idx::${idxHint}`
   );
-  return getMessageId(msg, idx >= 0 ? idx : 0);
+}
+
+function getMessageIdFromExtracted(msg, extractedList) {
+  const built = buildExtractedMessageId(msg, extractedList);
+  return String(built?.id ?? "").trim();
 }
 
 function participantCursorKeyForMessage(chatKey, msg) {
@@ -711,6 +830,85 @@ globalThis.__lastProcessedRowKeyByChat =
   globalThis.__lastProcessedRowKeyByChat || {};
 globalThis.__lastProcessedUserMsg =
   globalThis.__lastProcessedUserMsg || Object.create(null);
+/** @type {Record<string, Map<string, { at: number, reason: string }>>} */
+globalThis.__suppressedMessageIds =
+  globalThis.__suppressedMessageIds || Object.create(null);
+
+const GROUP_MESSAGE_SUPPRESSION_TTL_MS = Math.max(
+  60_000,
+  Math.min(
+    900_000,
+    Number.parseInt(
+      String(process.env.PLAYWRIGHT_GROUP_SUPPRESSION_TTL_MS ?? "600000"),
+      10
+    ) || 600_000
+  )
+);
+
+const GROUP_MESSAGE_SUPPRESSION_MAX_IDS_PER_CURSOR = Math.max(
+  10,
+  Math.min(
+    500,
+    Number.parseInt(
+      String(process.env.PLAYWRIGHT_GROUP_SUPPRESSION_MAX_IDS ?? "200"),
+      10
+    ) || 200
+  )
+);
+
+function evictExpiredGroupSuppressions(cursorKey) {
+  const raw = globalThis.__suppressedMessageIds?.[cursorKey];
+  if (!raw || !(raw instanceof Map)) return;
+  const now = Date.now();
+  for (const [id, meta] of raw.entries()) {
+    if (now - (meta?.at ?? 0) > GROUP_MESSAGE_SUPPRESSION_TTL_MS) {
+      raw.delete(id);
+    }
+  }
+}
+
+function trimGroupSuppressionMap(cursorKey) {
+  const raw = globalThis.__suppressedMessageIds?.[cursorKey];
+  if (!raw || !(raw instanceof Map)) return;
+  if (raw.size <= GROUP_MESSAGE_SUPPRESSION_MAX_IDS_PER_CURSOR) return;
+  const entries = [...raw.entries()].sort(
+    (x, y) => (x[1]?.at ?? 0) - (y[1]?.at ?? 0)
+  );
+  while (entries.length > GROUP_MESSAGE_SUPPRESSION_MAX_IDS_PER_CURSOR) {
+    const drop = entries.shift();
+    if (drop) raw.delete(drop[0]);
+  }
+}
+
+function getGroupSuppressionMap(cursorKey) {
+  globalThis.__suppressedMessageIds =
+    globalThis.__suppressedMessageIds || Object.create(null);
+  if (!globalThis.__suppressedMessageIds[cursorKey]) {
+    globalThis.__suppressedMessageIds[cursorKey] = new Map();
+  }
+  return globalThis.__suppressedMessageIds[cursorKey];
+}
+
+function isGroupMessageSuppressed(cursorKey, messageId) {
+  if (!messageId) return false;
+  evictExpiredGroupSuppressions(cursorKey);
+  const m = globalThis.__suppressedMessageIds?.[cursorKey];
+  return m instanceof Map && m.has(messageId);
+}
+
+function suppressGroupMessageSelection(cursorKey, messageId, reason) {
+  if (!cursorKey || !messageId) return;
+  const map = getGroupSuppressionMap(cursorKey);
+  evictExpiredGroupSuppressions(cursorKey);
+  map.set(messageId, { at: Date.now(), reason });
+  trimGroupSuppressionMap(cursorKey);
+  console.log("[MESSAGE_SELECTION_SUPPRESSED]", {
+    reason,
+    messageId,
+    cursorKey,
+  });
+}
+
 globalThis.__chatResponding =
   globalThis.__chatResponding || Object.create(null);
 globalThis.__chatRespondingCooldownUntil =
@@ -2246,11 +2444,15 @@ async function extractIncomingMessages(page, opts = {}) {
   }
 
   for (const m of newMessages) {
+    const normalizedGroupChatKey = normalizeTitle(groupName) || groupName;
+    const senderScope =
+      groupSenderScopeFromAnchor(normalizedGroupChatKey, m.senderAnchor) || "";
     const identity = resolveParticipantIdentity({
       participantPhone: m.participantPhone,
       participantName: m.participantName,
       senderAnchor: m.senderAnchor,
-      groupChatKey: groupName,
+      groupChatKey: normalizedGroupChatKey,
+      senderScope,
     });
     m.participantKey = identity.participantKey || null;
     console.log("[Playwright] ✅ New message:", m.text, `(${m.sender})`);
@@ -2260,6 +2462,7 @@ async function extractIncomingMessages(page, opts = {}) {
         participantName: identity.participantName || m.participantName || null,
         hasParticipantPhone: Boolean(identity.participantPhone),
         participantKey: identity.participantKey,
+        senderScope: senderScope || null,
         sourceMessageIndex:
           m.sourceMessageIndex != null && Number.isFinite(Number(m.sourceMessageIndex))
             ? Number(m.sourceMessageIndex)
@@ -2410,6 +2613,7 @@ async function pickInterruptChatFromSidebar(page, topChats, targetGroups) {
 export function clearPlaywrightExtractedMessageState() {
   globalThis.__chatState = Object.create(null);
   globalThis.__lastProcessedUserMsg = Object.create(null);
+  globalThis.__suppressedMessageIds = Object.create(null);
   globalThis.__lastProcessedRowKeyByChat = Object.create(null);
   globalThis.__playwrightChatLastProcessedAt = Object.create(null);
   globalThis.__ACTIVE_PROCESSING_CHAT = null;
@@ -2438,6 +2642,7 @@ async function runListenerBody() {
 
   globalThis.__chatState = Object.create(null);
   globalThis.__lastProcessedUserMsg = Object.create(null);
+  globalThis.__suppressedMessageIds = Object.create(null);
   globalThis.__chatResponding = Object.create(null);
   globalThis.__chatRespondingCooldownUntil = Object.create(null);
   globalThis.__playwrightListenerMsgIdByGuarantee = new Map();
@@ -3082,14 +3287,52 @@ async function runListenerBody() {
           if (isDmContinuationChat) {
             globalThis.__lastProcessedDmMsg =
               globalThis.__lastProcessedDmMsg || Object.create(null);
+            globalThis.__lastProcessedDmMsgId =
+              globalThis.__lastProcessedDmMsgId || Object.create(null);
             const dmCursorKey = `dm-continuation::${normalizedOpenChatKey}`;
             const last = [...sorted].reverse().find((m) => m?.sender === "user" && String(m?.text ?? "").trim());
             if (!last) {
               return;
             }
-            const dmMsgId = getMessageIdFromExtracted(last, sorted);
-            const prevId = String(globalThis.__lastProcessedDmMsg?.[dmCursorKey] ?? "").trim();
-            if (dmMsgId && prevId && dmMsgId === prevId) {
+            const sourceIndex =
+              Number.isFinite(Number(last?.sourceMessageIndex))
+                ? Number(last.sourceMessageIndex)
+                : -1;
+            const idxForId = sourceIndex >= 0 ? String(sourceIndex) : "unknown";
+            const prePlainText = String(last?.prePlainText ?? "").trim();
+            const sender = String(last?.sender ?? "user").trim() || "user";
+            const rawText = String(last?.text ?? "").replace(/\s+/g, " ").trim();
+            const textKey = rawText.toLowerCase();
+            const tsCandidate =
+              last?.timestamp != null && String(last.timestamp).trim() !== ""
+                ? String(last.timestamp).trim()
+                : last?.__ts != null && String(last.__ts).trim() !== ""
+                  ? String(last.__ts).trim()
+                  : "";
+            const tsNum = Number(tsCandidate);
+            const tsLooksPlausible =
+              (Number.isFinite(tsNum) && tsNum > 1_000_000_000_000) ||
+              String(tsCandidate).length >= 10;
+
+            const messageId = prePlainText
+              ? `${prePlainText}::${idxForId}`
+              : tsCandidate && tsLooksPlausible
+                ? `${sender}::${tsCandidate}`
+                : `${sender}::${textKey}::${idxForId}`;
+
+            const lastProcessedMessageId = String(
+              globalThis.__lastProcessedDmMsgId?.[dmCursorKey] ?? ""
+            ).trim();
+
+            const decision =
+              messageId && messageId !== lastProcessedMessageId ? "process" : "skip";
+            console.log("[dm_message_processing_decision]", {
+              messageId: messageId || null,
+              lastProcessedMessageId: lastProcessedMessageId || null,
+              sourceMessageIndex: sourceIndex >= 0 ? sourceIndex : null,
+              decision,
+            });
+            if (decision === "skip") {
               console.log("[playwright_dm_message_skipped_already_processed]", {
                 dmPlaywrightChatKey: normalizedOpenChatKey,
               });
@@ -3122,7 +3365,11 @@ async function runListenerBody() {
               source: "PLAYWRIGHT_DM",
             }).catch(() => false);
             if (forwarded) {
-              globalThis.__lastProcessedDmMsg[dmCursorKey] = dmMsgId || String(Date.now());
+              // Persist stable id only after successful forward.
+              globalThis.__lastProcessedDmMsgId[dmCursorKey] = messageId || String(Date.now());
+              // Keep legacy debug id store for additional inspection.
+              const dmMsgIdDebug = getMessageIdFromExtracted(last, sorted);
+              globalThis.__lastProcessedDmMsg[dmCursorKey] = dmMsgIdDebug || String(Date.now());
               console.log("[playwright_dm_message_forwarded]", {
                 dmChatTitle: openTitle,
                 dmPlaywrightChatKey: normalizedOpenChatKey,
@@ -3147,11 +3394,17 @@ async function runListenerBody() {
             const seen = duplicateRowKeyCounts.get(baseRowKey) ?? 0;
             const nextSeen = seen + 1;
             duplicateRowKeyCounts.set(baseRowKey, nextSeen);
+            const normalizedGroupChatKey =
+              normalizeTitle(openTitle || chatName || activeChat || "") ||
+              String(openTitle || chatName || activeChat || "").trim();
+            const senderScope =
+              groupSenderScopeFromAnchor(normalizedGroupChatKey, m.senderAnchor) || "";
             const identity = resolveParticipantIdentity({
               participantPhone: m.participantPhone,
               participantName: m.participantName,
               senderAnchor: m.senderAnchor,
-              groupChatKey: openTitle || chatName || activeChat || "",
+              groupChatKey: normalizedGroupChatKey,
+              senderScope,
             });
             userMessages.push({
               ...m,
@@ -3271,6 +3524,9 @@ async function runListenerBody() {
 
           globalThis.__lastProcessedUserMsg =
             globalThis.__lastProcessedUserMsg || Object.create(null);
+          const normalizedGroupChatKeyForCompare =
+            normalizeTitle(openTitle || chatName || activeChat || "") ||
+            String(openTitle || chatName || activeChat || "").trim();
           for (const [, participantMessages] of participantBuckets.entries()) {
             const lastUserMsg = participantMessages[participantMessages.length - 1] || null;
             const cursorKey = participantCursorKeyForMessage(chatKey, lastUserMsg);
@@ -3282,10 +3538,12 @@ async function runListenerBody() {
               });
               continue;
             }
-            const lastUserMsgId =
+            const extractedIdBuilt =
               lastUserMsg && lastUserMsg.sender === "user"
-                ? getMessageIdFromExtracted(lastUserMsg, extractedMessages)
-                : "";
+                ? buildExtractedMessageId(lastUserMsg, extractedMessages)
+                : { id: "", strategy: "NONE" };
+            const lastUserMsgId = String(extractedIdBuilt?.id ?? "").trim();
+            const idStrategy = String(extractedIdBuilt?.strategy ?? "").trim() || "UNKNOWN";
             const lastProcessedUserMsgId = String(
               globalThis.__lastProcessedUserMsg?.[cursorKey] ?? ""
             ).trim();
@@ -3296,6 +3554,15 @@ async function runListenerBody() {
               lastUserMsgId &&
               lastUserMsgId !== lastProcessedUserMsgId
             ) {
+              if (isGroupMessageSuppressed(cursorKey, lastUserMsgId)) {
+                if (TRACE_DEBUG) {
+                  console.log("[group_message_selection_skipped_suppressed]", {
+                    cursorKey,
+                    messageId: lastUserMsgId,
+                  });
+                }
+                continue;
+              }
               if (isGroupMessageStale(lastUserMsg.timestamp)) {
                 console.warn("[stale_group_message_reply_blocked]", {
                   groupChatKey: chatKey,
@@ -3303,21 +3570,59 @@ async function runListenerBody() {
                   messageId: lastUserMsgId,
                   timestamp: lastUserMsg.timestamp ?? null,
                 });
-                globalThis.__lastProcessedUserMsg[cursorKey] = lastUserMsgId;
+                suppressGroupMessageSelection(cursorKey, lastUserMsgId, "stale");
+                console.log("[REPLY_AFTER_BLOCKED_CURSOR_ADVANCE]", {
+                  cursorKey,
+                  messageId: lastUserMsgId,
+                  reason: "stale",
+                });
                 continue;
               }
               const pos = lastUserMsg.__position;
+              let hasReplyAfter = false;
+              let hasNewerSameParticipantUserAfter = false;
+              let skipDueToReplyAfter = false;
               if (typeof pos === "number" && pos >= 0) {
-                const replied = sorted
-                  .slice(pos + 1)
-                  .some((m) => m.sender === "me");
-                if (replied) {
-                  console.log(
-                    "⛔ Already replied after selected message — syncing participant processed id"
+                const tail = sorted.slice(pos + 1);
+                hasReplyAfter = tail.some((m) => m.sender === "me");
+                const lastCmp = {
+                  participantKey: lastUserMsg.participantKey || null,
+                  sender: String(lastUserMsg.sender ?? "").trim() || "user",
+                };
+                hasNewerSameParticipantUserAfter = tail.some((m) => {
+                  if (m.sender !== "user") return false;
+                  const other = participantComparableFromSortedRow(
+                    m,
+                    normalizedGroupChatKeyForCompare
                   );
-                  globalThis.__lastProcessedUserMsg[cursorKey] = lastUserMsgId;
-                  continue;
-                }
+                  return isSameParticipant(lastCmp, other);
+                });
+                skipDueToReplyAfter =
+                  hasReplyAfter && !hasNewerSameParticipantUserAfter;
+              }
+              console.log("[REPLY_AFTER_GUARD_EVALUATION]", {
+                chatKey,
+                cursorKey,
+                lastUserMsgId,
+                hasReplyAfter,
+                hasNewerSameParticipantUserAfter,
+                decision: skipDueToReplyAfter ? "skip" : "process",
+              });
+              if (skipDueToReplyAfter) {
+                suppressGroupMessageSelection(
+                  cursorKey,
+                  lastUserMsgId,
+                  "reply_after"
+                );
+                console.log("[REPLY_AFTER_BLOCKED_CURSOR_ADVANCE]", {
+                  cursorKey,
+                  messageId: lastUserMsgId,
+                  reason: "reply_after",
+                });
+                console.log(
+                  "⛔ Reply-after guard — suppressing selection (no cursor advance)"
+                );
+                continue;
               }
               newUserMessages.push(lastUserMsg);
               console.log("[participant_new_message_selected]", {
@@ -3332,6 +3637,19 @@ async function runListenerBody() {
                 participantKey: lastUserMsg?.participantKey || null,
                 cursorKey,
                 lastUserMsgId,
+                lastProcessedUserMsgId,
+                textPreview: String(lastUserMsg?.text ?? "").slice(0, 80),
+                hasPrePlainText: Boolean(String(lastUserMsg?.prePlainText ?? "").trim()),
+                sourceMessageIndex:
+                  Number.isFinite(Number(lastUserMsg?.sourceMessageIndex))
+                    ? Number(lastUserMsg?.sourceMessageIndex)
+                    : null,
+                timestamp:
+                  lastUserMsg?.timestamp != null && String(lastUserMsg.timestamp).trim() !== ""
+                    ? String(lastUserMsg.timestamp).trim()
+                    : null,
+                rowKey: String(lastUserMsg?.__rowKey ?? "").trim() || null,
+                idStrategy,
               });
             }
           }

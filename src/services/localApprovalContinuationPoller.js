@@ -19,6 +19,69 @@ function clean(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
+function buildCustomerNotificationPatchFromReplyPrivateResult(result, base = {}) {
+  const r = result && typeof result === "object" ? result : {};
+  const ok = r.ok === true && r.verificationPassed === true;
+  const dmOpened = r.dmOpened === true;
+  const dmMessageSentRaw = r.dmMessageSent === true;
+  const retryable = r.retryable !== false;
+  const errorCode = clean(r.errorCode ?? r.failureStage ?? r.reason ?? "") || "REPLY_PRIVATE_FAILED";
+
+  /** Invariant: never persist failed + dmMessageSent true. */
+  const dmMessageSent = ok ? true : false;
+  if (!ok && dmMessageSentRaw) {
+    console.warn("[illegal_customer_notification_state_prevented]", {
+      reason: "FAILED_WITH_DM_MESSAGE_SENT_TRUE",
+      errorCode,
+      dmOpened,
+      dmMessageSentRaw,
+    });
+  }
+
+  const patch = {
+    ...base,
+    approvalCustomerNotificationMethod: "reply_privately",
+    dmAttempted: true,
+    dmOpened,
+    dmMessageSent,
+    approvalCustomerNotificationError: ok ? null : errorCode,
+    approvalCustomerNotificationRetryable: ok ? false : retryable,
+    approvalCustomerNotificationTerminalFailure: ok ? false : !retryable,
+    ...(clean(r.dmChatTitle) ? { dmChatTitle: clean(r.dmChatTitle) } : {}),
+    ...(clean(r.dmPlaywrightChatKey) ? { dmPlaywrightChatKey: clean(r.dmPlaywrightChatKey) } : {}),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  if (ok) {
+    patch.approvalCustomerNotificationStatus = "sent";
+    patch.approvalCustomerNotificationSentAt = FieldValue.serverTimestamp();
+  } else {
+    patch.approvalCustomerNotificationStatus = "failed";
+    patch.approvalCustomerNotificationFailedAt = FieldValue.serverTimestamp();
+    patch.approvalCustomerNotificationFailedAtMs = Date.now();
+  }
+
+  console.log("[customer_notification_patch_built]", {
+    ok,
+    verificationPassed: r.verificationPassed === true,
+    dmOpened,
+    dmMessageSent,
+    errorCode: ok ? null : errorCode,
+    retryable: ok ? false : retryable,
+  });
+  console.log("[CUSTOMER_NOTIFICATION_STATE]", {
+    bookingId: clean(base?.bookingId) || null,
+    approvalCustomerNotificationStatus: patch.approvalCustomerNotificationStatus,
+    dmOpened: patch.dmOpened === true,
+    dmMessageSent: patch.dmMessageSent === true,
+    verificationPassed: r.verificationPassed === true,
+    errorCode: patch.approvalCustomerNotificationError || null,
+    retryable: patch.approvalCustomerNotificationRetryable !== false,
+    terminalFailure: patch.approvalCustomerNotificationTerminalFailure === true,
+  });
+  return patch;
+}
+
 function resolveOwnerUid() {
   return clean(
     process.env.PLAYWRIGHT_OWNER_USER_ID ||
@@ -240,6 +303,110 @@ function ownerDisallowedChatTitles() {
     .filter(Boolean);
 }
 
+function isRetryableReplyPrivateErrorCode(errorCode) {
+  const code = clean(errorCode);
+  // Minimal, fail-closed: identity/anchor/target issues are permanent.
+  // Everything else we treat as retryable (NO_ACTIVE_PAGE, UI timing issues, locks, etc).
+  return ![
+    "MISSING_SOURCE_IDENTITY",
+    "SOURCE_PARTICIPANT_MISSING",
+    "SOURCE_MESSAGE_ANCHOR_MISSING",
+    "INVALID_DM_TARGET",
+    "REPLY_PRIVATE_NOT_ELIGIBLE",
+    "NOT_PLAYWRIGHT_GROUP",
+  ].includes(code);
+}
+
+function terminalFailurePatch({ errorCode, exhausted } = {}) {
+  const nowMs = Date.now();
+  const patch = {
+    approvalCustomerNotificationTerminalFailure: true,
+    approvalCustomerNotificationNextRetryAtMs: null,
+  };
+  if (clean(errorCode)) {
+    patch.approvalCustomerNotificationError = clean(errorCode);
+  }
+  if (exhausted) {
+    patch.approvalCustomerNotificationRetryExhaustedAt = FieldValue.serverTimestamp();
+    patch.approvalCustomerNotificationRetryExhaustedAtMs = nowMs;
+  } else {
+    patch.approvalCustomerNotificationTerminalFailureAt = FieldValue.serverTimestamp();
+    patch.approvalCustomerNotificationTerminalFailureAtMs = nowMs;
+  }
+  return patch;
+}
+
+function resolveRetryCount(data) {
+  const n = Number(data?.approvalCustomerNotificationRetryCount ?? 0);
+  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+}
+
+function retryBackoffMs(attemptNumber) {
+  const n = Number(attemptNumber ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n === 1) return 5 * 1000;
+  if (n === 2) return 30 * 1000;
+  if (n === 3) return 2 * 60 * 1000;
+  return null;
+}
+
+function resolveNextRetryAtMs(data) {
+  const explicit = Number(data?.approvalCustomerNotificationNextRetryAtMs ?? NaN);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const failedAtMs = Number(data?.approvalCustomerNotificationFailedAtMs ?? NaN);
+  if (!Number.isFinite(failedAtMs) || failedAtMs <= 0) return null;
+  const retryCount = resolveRetryCount(data);
+  const nextAttempt = retryCount + 1;
+  const backoffMs = retryBackoffMs(nextAttempt);
+  if (!backoffMs) return null;
+  return failedAtMs + backoffMs;
+}
+
+function failedRetryDecision(data) {
+  if (!data) return { ok: false, reason: "BOOKING_MISSING" };
+  if (clean(data.status) !== "approved") return { ok: false, reason: "BOOKING_NOT_APPROVED" };
+  if (data?.playwrightReplyPrivateEligible !== true) return { ok: false, reason: "REPLY_PRIVATE_NOT_ELIGIBLE" };
+  if (data?.approvalCustomerNotificationTerminalFailure === true) {
+    return { ok: false, reason: "TERMINAL_FAILURE" };
+  }
+  if (data?.approvalCustomerNotificationRetryable === false) {
+    return { ok: false, reason: "TERMINAL_FAILURE" };
+  }
+  // If the failure reason is a permanent one, do not retry.
+  const lastErrorCode = clean(data?.approvalCustomerNotificationError);
+  if (lastErrorCode && !isRetryableReplyPrivateErrorCode(lastErrorCode)) {
+    return { ok: false, reason: "TERMINAL_FAILURE" };
+  }
+  const retryCount = resolveRetryCount(data);
+  if (retryCount >= 3) return { ok: false, reason: "RETRY_EXHAUSTED" };
+
+  const nextRetryAtMs = resolveNextRetryAtMs(data);
+  if (nextRetryAtMs != null && Number.isFinite(nextRetryAtMs) && Date.now() < nextRetryAtMs) {
+    console.log("[reply_private_retry_decision]", {
+      decision: "retry_later",
+      reason: "FAILED_BACKOFF_NOT_ELAPSED",
+      nextRetryAtMs,
+      retryCount,
+      dmOpened: data?.dmOpened === true,
+      dmMessageSent: data?.dmMessageSent === true,
+      approvalCustomerNotificationStatus: clean(data?.approvalCustomerNotificationStatus) || null,
+      approvalCustomerNotificationError: clean(data?.approvalCustomerNotificationError) || null,
+    });
+    return { ok: false, reason: "FAILED_BACKOFF_NOT_ELAPSED", nextRetryAtMs };
+  }
+  console.log("[reply_private_retry_decision]", {
+    decision: "retry_now",
+    reason: "FAILED_READY",
+    nextRetryAtMs,
+    retryCount,
+    dmOpened: data?.dmOpened === true,
+    dmMessageSent: data?.dmMessageSent === true,
+    approvalCustomerNotificationStatus: clean(data?.approvalCustomerNotificationStatus) || null,
+    approvalCustomerNotificationError: clean(data?.approvalCustomerNotificationError) || null,
+  });
+  return { ok: true, retryCount };
+}
+
 async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 5) {
   const collection = dbInstance
     .collection("businesses")
@@ -261,6 +428,15 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
     .get()
     .catch(() => ({ docs: [] }));
 
+  const failedSnap = await collection
+    .where("status", "==", "approved")
+    .where("approvalCustomerNotificationStatus", "==", "failed")
+    .where("bookingSource", "==", "PLAYWRIGHT_GROUP")
+    .where("playwrightReplyPrivateEligible", "==", true)
+    .limit(limit)
+    .get()
+    .catch(() => ({ docs: [] }));
+
   const seen = new Set();
   const eligible = [...pendingSnap.docs, ...processingSnap.docs].map((doc) => ({
     id: doc.id,
@@ -268,19 +444,97 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
     data: doc.data() || {},
   })).filter((booking) => {
     if (seen.has(booking.id)) return false;
-    seen.add(booking.id);
     const status = clean(booking.data?.approvalCustomerNotificationStatus);
-    if (status === "pending") return true;
+    if (status === "pending") {
+      seen.add(booking.id);
+      return true;
+    }
     if (status !== "processing") return false;
     const startedMs = Number(
       booking.data?.approvalCustomerNotificationProcessingStartedAtMs ?? 0
     );
-    return Number.isFinite(startedMs) && Date.now() - startedMs > 2 * 60 * 1000;
-  }).slice(0, limit);
+    const stale = Number.isFinite(startedMs) && Date.now() - startedMs > 2 * 60 * 1000;
+    if (stale) seen.add(booking.id);
+    return stale;
+  });
+
+  const failedEligible = [...failedSnap.docs].map((doc) => ({
+    id: doc.id,
+    ref: doc.ref,
+    data: doc.data() || {},
+  })).filter((booking) => {
+    if (seen.has(booking.id)) return false;
+    seen.add(booking.id);
+    const d = booking.data || {};
+    const decision = failedRetryDecision(d);
+    if (!decision.ok) {
+      if (decision.reason === "FAILED_BACKOFF_NOT_ELAPSED") {
+        console.log("[reply_private_failed_retry_skipped_backoff]", {
+          bookingId: booking.id,
+          nextRetryAtMs: decision.nextRetryAtMs ?? null,
+          retryCount: resolveRetryCount(d),
+        });
+      } else if (decision.reason === "RETRY_EXHAUSTED") {
+        console.log("[reply_private_failed_retry_exhausted]", {
+          bookingId: booking.id,
+          retryCount: resolveRetryCount(d),
+        });
+      }
+      return false;
+    }
+    console.log("[reply_private_failed_retry_candidate]", {
+      bookingId: booking.id,
+      retryCount: resolveRetryCount(d),
+      nextRetryAtMs: resolveNextRetryAtMs(d),
+    });
+    return true;
+  });
+
+  // If a failed booking has exhausted retries, mark it terminal so we don't
+  // keep scanning it forever.
+  try {
+    const exhausted = [...failedSnap.docs].map((doc) => ({
+      id: doc.id,
+      ref: doc.ref,
+      data: doc.data() || {},
+    })).filter((booking) => {
+      const d = booking.data || {};
+      const retryCount = resolveRetryCount(d);
+      const lastErrorCode = clean(d?.approvalCustomerNotificationError);
+      const nonRetryable = lastErrorCode && !isRetryableReplyPrivateErrorCode(lastErrorCode);
+      return (
+        clean(d?.approvalCustomerNotificationStatus) === "failed" &&
+        (retryCount >= 3 || nonRetryable) &&
+        d?.approvalCustomerNotificationTerminalFailure !== true
+      );
+    });
+    if (exhausted.length > 0) {
+      await Promise.all(
+        exhausted.map((b) =>
+          b.ref
+            .update({
+              ...terminalFailurePatch({
+                errorCode: clean(b?.data?.approvalCustomerNotificationError) || null,
+                exhausted: true,
+              }),
+            })
+            .catch(() => undefined)
+        )
+      );
+    }
+  } catch (err) {
+    console.warn("[reply_private_failed_retry_exhausted]", {
+      bookingId: null,
+      retryCount: null,
+      reason: clean(err?.message ?? err) || "EXHAUSTED_MARK_FAILED",
+    });
+  }
+
+  const combined = [...eligible, ...failedEligible].slice(0, limit);
 
   // Diagnostic-only: if poller query returns 0, log why recent approved bookings are excluded.
   // Does NOT enqueue; does NOT modify any booking fields.
-  if (eligible.length === 0) {
+  if (combined.length === 0) {
     try {
       const recentApprovedSnap = await collection
         .where("status", "==", "approved")
@@ -332,7 +586,13 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
         // The poller only looks for pending, plus stale processing.
         if (approvalCustomerNotificationStatus !== "pending") {
           if (approvalCustomerNotificationStatus !== "processing") {
-            exclusionReasons.push("APPROVAL_CUSTOMER_NOTIFICATION_NOT_PENDING");
+            // Failed is retryable with backoff + max retries.
+            if (approvalCustomerNotificationStatus !== "failed") {
+              exclusionReasons.push("APPROVAL_CUSTOMER_NOTIFICATION_NOT_PENDING");
+            } else {
+              const decision = failedRetryDecision(data);
+              if (!decision.ok) exclusionReasons.push(`FAILED_NOT_RETRYABLE:${decision.reason}`);
+            }
           } else {
             const startedMs = Number(
               data?.approvalCustomerNotificationProcessingStartedAtMs ?? 0
@@ -390,7 +650,7 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
     }
   }
 
-  return eligible;
+  return combined;
 }
 
 function claimDecision(data) {
@@ -400,6 +660,11 @@ function claimDecision(data) {
   }
   const status = clean(data.approvalCustomerNotificationStatus);
   if (status === "sent") return { ok: false, reason: "ALREADY_SENT" };
+  if (status === "failed") {
+    const decision = failedRetryDecision(data);
+    if (!decision.ok) return { ok: false, reason: decision.reason };
+    return { ok: true, failedRetry: true, retryCount: decision.retryCount ?? resolveRetryCount(data) };
+  }
   if (status === "processing") {
     const startedMs = Number(data.approvalCustomerNotificationProcessingStartedAtMs ?? 0);
     if (!Number.isFinite(startedMs) || Date.now() - startedMs <= 2 * 60 * 1000) {
@@ -411,12 +676,20 @@ function claimDecision(data) {
   return { ok: true };
 }
 
-function processingPatch() {
-  return {
+function processingPatch({ failedRetry } = {}) {
+  const patch = {
     approvalCustomerNotificationStatus: "processing",
     approvalCustomerNotificationProcessingStartedAt: FieldValue.serverTimestamp(),
     approvalCustomerNotificationProcessingStartedAtMs: Date.now(),
     updatedAt: FieldValue.serverTimestamp(),
+  };
+  if (failedRetry) {
+    patch.approvalCustomerNotificationRetryCount = FieldValue.increment(1);
+    patch.approvalCustomerNotificationNextRetryAtMs = null;
+    patch.approvalCustomerNotificationTerminalFailure = false;
+  }
+  return {
+    ...patch,
   };
 }
 
@@ -427,7 +700,13 @@ async function claimBookingForReplyPrivate(dbInstance, bookingRef, bookingId) {
       const data = snap.exists ? snap.data() || {} : null;
       const decision = claimDecision(data);
       if (!decision.ok) return decision;
-      tx.update(bookingRef, processingPatch());
+      tx.update(bookingRef, processingPatch({ failedRetry: decision.failedRetry === true }));
+      if (decision.failedRetry === true) {
+        console.log("[reply_private_failed_retry_claimed]", {
+          bookingId,
+          retryCount: resolveRetryCount(data) + 1,
+        });
+      }
       console.log("[local_approval_reply_private_claimed]", { bookingId });
       return { ok: true, booking: data };
     });
@@ -437,7 +716,13 @@ async function claimBookingForReplyPrivate(dbInstance, bookingRef, bookingId) {
   const data = snap.exists ? snap.data() || {} : null;
   const decision = claimDecision(data);
   if (!decision.ok) return decision;
-  await bookingRef.update(processingPatch());
+  await bookingRef.update(processingPatch({ failedRetry: decision.failedRetry === true }));
+  if (decision.failedRetry === true) {
+    console.log("[reply_private_failed_retry_claimed]", {
+      bookingId,
+      retryCount: resolveRetryCount(data) + 1,
+    });
+  }
   console.log("[local_approval_reply_private_claimed]", { bookingId });
   return { ok: true, booking: data };
 }
@@ -477,16 +762,30 @@ async function processPendingApproval({
 
   const eligibilityFailure = replyPrivateEligibilityFailure(booking);
   if (eligibilityFailure) {
-    await bookingRef.update({
-      approvalCustomerNotificationStatus: "failed",
-      approvalCustomerNotificationMethod: "reply_privately",
-      approvalCustomerNotificationError: eligibilityFailure,
-      approvalCustomerNotificationFailedAt: FieldValue.serverTimestamp(),
-      dmAttempted: false,
-      dmOpened: false,
-      dmMessageSent: false,
-      updatedAt: FieldValue.serverTimestamp(),
+    const retryable = isRetryableReplyPrivateErrorCode(eligibilityFailure);
+    const patch = buildCustomerNotificationPatchFromReplyPrivateResult(
+      {
+        ok: false,
+        dmOpened: false,
+        dmMessageSent: false,
+        verificationPassed: false,
+        failureStage: "eligibility",
+        errorCode: eligibilityFailure,
+        retryable,
+      },
+      {
+        bookingId,
+        dmAttempted: false,
+        ...(retryable ? {} : terminalFailurePatch({ errorCode: eligibilityFailure })),
+      }
+    );
+    console.log("[reply_private_state_transition]", {
+      bookingId,
+      from: clean(booking?.approvalCustomerNotificationStatus) || null,
+      to: patch.approvalCustomerNotificationStatus,
+      errorCode: patch.approvalCustomerNotificationError || null,
     });
+    await bookingRef.update(patch);
     console.warn("[local_approval_reply_private_failed]", {
       bookingId,
       reason: eligibilityFailure,
@@ -519,23 +818,32 @@ async function processPendingApproval({
     });
 
     if (!result?.ok) {
-      const reason = clean(result?.reason) || "REPLY_PRIVATELY_FAILED";
-      await bookingRef.update({
-        approvalCustomerNotificationStatus: "failed",
-        approvalCustomerNotificationMethod: "reply_privately",
-        approvalCustomerNotificationError: reason,
-        approvalCustomerNotificationFailedAt: FieldValue.serverTimestamp(),
-        dmAttempted: true,
-        dmOpened: result?.dmOpened === true,
-        dmMessageSent: result?.dmMessageSent === true,
-        ...(clean(result?.dmChatTitle)
-          ? { dmChatTitle: clean(result.dmChatTitle) }
-          : {}),
-        ...(clean(result?.dmPlaywrightChatKey)
-          ? { dmPlaywrightChatKey: clean(result.dmPlaywrightChatKey) }
-          : {}),
-        updatedAt: FieldValue.serverTimestamp(),
+      const reason = clean(result?.errorCode ?? result?.failureStage ?? result?.reason) || "REPLY_PRIVATELY_FAILED";
+      const nowMs = Date.now();
+      const retryCount = resolveRetryCount(booking) + 1;
+      const retryable = isRetryableReplyPrivateErrorCode(reason);
+      const nextRetryAtMs = (() => {
+        const backoffMs = retryBackoffMs(retryCount + 1);
+        return backoffMs ? nowMs + backoffMs : null;
+      })();
+      const patch = buildCustomerNotificationPatchFromReplyPrivateResult(result, {
+        bookingId,
+        approvalCustomerNotificationFailedAtMs: nowMs,
+        approvalCustomerNotificationNextRetryAtMs: retryable ? nextRetryAtMs : null,
+        ...(retryable ? {} : terminalFailurePatch({ errorCode: reason })),
       });
+      patch.approvalCustomerNotificationError = reason;
+      patch.approvalCustomerNotificationRetryable = retryable;
+      patch.approvalCustomerNotificationTerminalFailure = !retryable;
+      console.log("[reply_private_state_transition]", {
+        bookingId,
+        from: clean(booking?.approvalCustomerNotificationStatus) || null,
+        to: patch.approvalCustomerNotificationStatus,
+        errorCode: patch.approvalCustomerNotificationError || null,
+        retryable,
+        nextRetryAtMs: patch.approvalCustomerNotificationNextRetryAtMs ?? null,
+      });
+      await bookingRef.update(patch);
       console.warn("[local_approval_reply_private_failed]", {
         bookingId,
         reason,
@@ -543,31 +851,53 @@ async function processPendingApproval({
       return;
     }
 
-    await bookingRef.update({
-      approvalCustomerNotificationStatus: "sent",
-      approvalCustomerNotificationMethod: "reply_privately",
-      approvalCustomerNotificationSentAt: FieldValue.serverTimestamp(),
-      dmAttempted: true,
-      dmOpened: true,
-      dmMessageSent: true,
+    const patch = buildCustomerNotificationPatchFromReplyPrivateResult(result, {
+      bookingId,
       dmOpenMethod: "reply_privately",
-      dmChatTitle: clean(result?.dmChatTitle) || null,
-      dmPlaywrightChatKey: clean(result?.dmPlaywrightChatKey) || null,
-      updatedAt: FieldValue.serverTimestamp(),
     });
+    console.log("[reply_private_state_transition]", {
+      bookingId,
+      from: clean(booking?.approvalCustomerNotificationStatus) || null,
+      to: patch.approvalCustomerNotificationStatus,
+      errorCode: null,
+    });
+    await bookingRef.update(patch);
     console.log("[local_approval_reply_private_sent]", { bookingId });
   } catch (err) {
     const reason = clean(err?.message ?? err) || "UNKNOWN";
-    await bookingRef.update({
-      approvalCustomerNotificationStatus: "failed",
-      approvalCustomerNotificationMethod: "reply_privately",
-      approvalCustomerNotificationError: reason,
-      approvalCustomerNotificationFailedAt: FieldValue.serverTimestamp(),
-      dmAttempted: true,
-      dmOpened: false,
-      dmMessageSent: false,
-      updatedAt: FieldValue.serverTimestamp(),
+    const nowMs = Date.now();
+    const retryCount = resolveRetryCount(booking) + 1;
+    const retryable = isRetryableReplyPrivateErrorCode(reason);
+    const nextRetryAtMs = (() => {
+      const backoffMs = retryBackoffMs(retryCount + 1);
+      return backoffMs ? nowMs + backoffMs : null;
+    })();
+    const patch = buildCustomerNotificationPatchFromReplyPrivateResult(
+      {
+        ok: false,
+        dmOpened: false,
+        dmMessageSent: false,
+        verificationPassed: false,
+        failureStage: "exception",
+        errorCode: reason,
+        retryable,
+      },
+      {
+        bookingId,
+        approvalCustomerNotificationFailedAtMs: nowMs,
+        approvalCustomerNotificationNextRetryAtMs: retryable ? nextRetryAtMs : null,
+        ...(retryable ? {} : terminalFailurePatch({ errorCode: reason })),
+      }
+    );
+    console.log("[reply_private_state_transition]", {
+      bookingId,
+      from: clean(booking?.approvalCustomerNotificationStatus) || null,
+      to: patch.approvalCustomerNotificationStatus,
+      errorCode: patch.approvalCustomerNotificationError || null,
+      retryable,
+      nextRetryAtMs: patch.approvalCustomerNotificationNextRetryAtMs ?? null,
     });
+    await bookingRef.update(patch);
     console.warn("[local_approval_reply_private_failed]", {
       bookingId,
       reason,

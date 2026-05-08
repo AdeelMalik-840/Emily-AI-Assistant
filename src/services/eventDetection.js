@@ -2,6 +2,8 @@
  * Generic booking / order / confirmation signals — pattern-based, no catalog words.
  */
 
+import { isExplicitPricingOrDetailsQuestion } from "./conversationRouter.js";
+
 /**
  * @param {string} message
  * @returns {{
@@ -23,13 +25,35 @@ export function detectBookingEvent(message) {
       lower.replace(/\s+/g, " ")
     );
 
-  const bookingIntent =
-    /\b(book|booking|bookings|reserve|reservation|reservations|rent|rental|rentals|appointment|appointments|schedule|scheduled|slot)\b/.test(
+  const explicitPricingQuestion = isExplicitPricingOrDetailsQuestion(raw);
+
+  const bookingKeywordsNonRent =
+    /\b(book|booking|bookings|reserve|reservation|reservations|rental|rentals|appointment|appointments|schedule|scheduled|slot)\b/.test(
       lower
     ) ||
     /book\s+kar|reserve\s+kar|rent\s+kar|kiraye|kara?ye|slot\s+mil/i.test(
       lower
-    ) ||
+    );
+
+  /** Booking/commit verbs — independent of “rent” keyword (pricing filters rent-as-rate above). */
+  const explicitCommitBooking =
+    /\b(book|booking|bookings|reserve|reservation|confirm(?:ed)?)\b/i.test(
+      lower
+    ) || /\b(kar\s*do|kardo)\b/i.test(lower);
+
+  /** Bare “rent” often means “rental price” (kitna rent); keep booking when clearly transactional. */
+  const rentWordBookingIntent =
+    /\brent\b/i.test(lower) &&
+    !explicitPricingQuestion &&
+    !/\b(kitna|kitni|kitne)\s+rent\b/i.test(lower) &&
+    !/\brent\s+(kitna|kitni|kitne)\b/i.test(lower) &&
+    !/\b(total|overall)\s+rent\b/i.test(lower) &&
+    !/\brent\s+ho\s*(ga|gi|ge)?\b/i.test(lower);
+
+  const bookingIntent =
+    bookingKeywordsNonRent ||
+    rentWordBookingIntent ||
+    explicitCommitBooking ||
     romanUrduWant ||
     romanUrduDurationFor;
 

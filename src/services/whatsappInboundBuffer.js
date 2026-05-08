@@ -996,6 +996,17 @@ export async function executeWhatsAppAiPipeline(p) {
         .map((m) => String(m ?? "").trim())
         .filter(Boolean)
     : [];
+  if (isGroupInbound) {
+    console.log("[group_participant_key_passed_to_processor]", {
+      groupChatKey: String(groupNameResolved ?? "").trim() || null,
+      participantName: String(participantNameRaw ?? "").trim() || null,
+      sourceParticipantKey:
+        participantKeyRaw != null && String(participantKeyRaw).trim() !== ""
+          ? String(participantKeyRaw).trim()
+          : null,
+      messagePreview: String(latestMessage ?? "").slice(0, 120) || null,
+    });
+  }
   const processStartedAt = Date.now();
   const {
     reply,
@@ -1017,6 +1028,7 @@ export async function executeWhatsAppAiPipeline(p) {
     isGreetingFirst,
     isGroupInbound,
     playwrightWebInbound,
+    bookingHint: p?.bookingHint ?? null,
     participantPhoneForDm:
       String(participantPhoneForDmRaw ?? "").trim() || undefined,
     participantKey:
@@ -1856,12 +1868,14 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     source,
     dmPlaywrightChatKey,
     dmChatTitle,
+    bookingHint,
     text,
     isGroupMessage = false,
     whatsappReplyTo,
     whatsappRecipientType,
     conversationCustomerNumber,
     participantPhoneForDm: participantPhoneForDmPayload,
+    participantName: participantNamePayload,
     participantKey: participantKeyPayload,
     messageId: messageIdPayload,
     messageTimestamp,
@@ -1959,6 +1973,21 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     String(participantKeyPayload ?? "").trim() ||
     String(entry.context?.participantKey ?? "").trim();
 
+  const normalizeParticipantName = (value) => {
+    const raw = String(value ?? "").replace(/\s+/g, " ").trim();
+    if (!raw) return "";
+    const lower = raw.toLowerCase();
+    // Ignore sentinel / internal values; never derive names from participantKey.
+    if (lower === "scope") return "";
+    if (lower.startsWith("scope::")) return "";
+    if (lower === "user") return "";
+    if (lower === "me") return "";
+    return raw;
+  };
+  const participantNameIncoming = normalizeParticipantName(participantNamePayload);
+  const participantNameExisting = normalizeParticipantName(entry.context?.participantName);
+  const participantNameMerged = participantNameIncoming || participantNameExisting;
+
   entry.context = {
     db,
     ownerUserId,
@@ -1972,6 +2001,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     ...(source !== undefined ? { source } : {}),
     ...(dmPlaywrightChatKey !== undefined ? { dmPlaywrightChatKey } : {}),
     ...(dmChatTitle !== undefined ? { dmChatTitle } : {}),
+    ...(bookingHint !== undefined ? { bookingHint } : {}),
     isGroupMessage:
       Boolean(isGroupMessage) || Boolean(entry.context?.isGroupMessage),
     whatsappReplyTo: replyToMerged,
@@ -1981,6 +2011,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
       ? { participantPhoneForDm: participantPhoneDmMerged }
       : {}),
     ...(participantKeyMerged ? { participantKey: participantKeyMerged } : {}),
+    ...(participantNameMerged ? { participantName: participantNameMerged } : {}),
     messageId:
       messageIdPayload != null
         ? String(messageIdPayload)
@@ -2046,6 +2077,14 @@ export function scheduleBufferedWhatsAppInbound(payload) {
           : null,
   };
 
+  if (participantNameIncoming && participantNameIncoming !== participantNameExisting) {
+    console.log("[buffer_participant_name_preserved]", {
+      participantName: participantNameIncoming,
+      participantKey: participantKeyMerged || null,
+      messagePreview: String(trimmed ?? "").slice(0, 80) || null,
+    });
+  }
+
   if (isPlaywrightImmediate) {
     entry.messageParts = trimmed ? [trimmed] : [];
     entry.lastUpdatedAt = nowForBurst;
@@ -2101,6 +2140,14 @@ export function __clearWhatsAppInboundBufferForTests() {
   pendingPlaywrightPipelineBySession.clear();
   lastSentReplies.clear();
   lastPlaywrightTextSends.clear();
+}
+
+/** For tests: peek current buffer context (readonly). */
+export function __peekWhatsAppInboundBufferForTests(bufferKey) {
+  const key = String(bufferKey ?? "").trim();
+  const entry = key ? messageBuffer.get(key) : null;
+  const ctx = entry?.context && typeof entry.context === "object" ? entry.context : null;
+  return ctx ? { ...ctx } : null;
 }
 
 /** Same as {@link __clearWhatsAppInboundBufferForTests} — public name for dev / HTTP / signals. */

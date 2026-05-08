@@ -947,6 +947,7 @@ test("local approval poller uses the approved booking source metadata", async ()
         replyPrivatelyCalls.push(opts);
         return {
           ok: true,
+          verificationPassed: true,
           dmOpened: true,
           dmMessageSent: true,
           dmChatTitle: "Ali",
@@ -1076,6 +1077,7 @@ test("local approval poller queues multiple approved group bookings sequentially
       processed.push(opts.bookingId);
       return {
         ok: true,
+        verificationPassed: true,
         dmOpened: true,
         dmMessageSent: true,
         dmChatTitle: opts.sourceMessage.sourceParticipantName,
@@ -1597,6 +1599,7 @@ test("stale processing booking can retry", async () => {
     ownerUserId: "owner1",
     replyPrivately: async () => ({
       ok: true,
+      verificationPassed: true,
       dmOpened: true,
       dmMessageSent: true,
       dmChatTitle: "Ali",

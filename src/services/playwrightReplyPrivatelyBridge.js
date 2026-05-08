@@ -9,9 +9,19 @@ import {
   releaseReplyPrivateLock,
   tryAcquireReplyPrivateLock,
 } from "./replyPrivateUiController.js";
+import db from "../config/firebase.js";
 
 function clean(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function resolveOwnerUid() {
+  return clean(
+    process.env.PLAYWRIGHT_OWNER_USER_ID ||
+      process.env.LEGACY_BUSINESS_FIREBASE_UID ||
+      process.env.WHATSAPP_GROUP_FALLBACK_OWNER_UID ||
+      ""
+  );
 }
 
 function randomDelayMs(min = 500, max = 1500) {
@@ -90,6 +100,96 @@ function participantKeyFromSource(source = {}) {
 function normalizePhone(value) {
   const digits = String(value ?? "").replace(/\D/g, "");
   return digits.length >= 10 && digits.length <= 15 ? digits : "";
+}
+
+/**
+ * Best-effort: extract the active DM contact phone from the WhatsApp UI.
+ * Must be called ONLY after DM is opened+verified. Never throws.
+ *
+ * Constraints:
+ * - Additive only: does not change existing Reply Privately selectors/flow.
+ * - Hard timeout ~2s total; failures are silent.
+ *
+ * @param {import("playwright").Page} page
+ * @returns {Promise<string|null>}
+ */
+export async function extractActiveDmContactPhone(page) {
+  if (!page) return null;
+  const startedAt = Date.now();
+  const timeLeftMs = () => Math.max(0, 2000 - (Date.now() - startedAt));
+  const withTimeout = async (fn, ms) => {
+    const timeoutMs = Math.max(50, Math.min(ms, timeLeftMs()));
+    if (timeoutMs <= 50) return null;
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+      ]);
+    } catch {
+      return null;
+    }
+  };
+
+  try {
+    // Click the same header title element used by readOpenConversationHeaderTitle().
+    // Do NOT change selector logic elsewhere; this is a best-effort click only.
+    await withTimeout(async () => {
+      const headerTitle = page.locator("#main header span[title]").first();
+      if ((await headerTitle.count().catch(() => 0)) === 0) return null;
+      await headerTitle.click({ timeout: 800 }).catch(() => null);
+      return true;
+    }, 900);
+
+    // Give the details panel a brief moment to appear.
+    await withTimeout(async () => {
+      await page.waitForTimeout(120);
+      return true;
+    }, 200);
+
+    const phone = await withTimeout(async () => {
+      // Extract from likely “drawer” / details panel regions if present; otherwise return null.
+      const extracted = await page
+        .evaluate(() => {
+          const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+          const re = /(?:\+?\d[\d\s().-]{8,}\d|0\d[\d\s().-]{8,}\d)/g;
+
+          const roots = [
+            document.querySelector('[data-testid="drawer-right"]'),
+            document.querySelector('[data-testid="drawer"]'),
+            document.querySelector('div[role="dialog"]'),
+            document.querySelector("#app"),
+          ].filter(Boolean);
+
+          for (const root of roots) {
+            const txt = clean(root?.innerText || root?.textContent || "");
+            if (!txt) continue;
+            const matches = txt.match(re) || [];
+            const normalized = matches
+              .map((m) => m.replace(/[^\d+]/g, "").replace(/^\++/, "+"))
+              .map((m) => (m.startsWith("+") ? m : m))
+              .filter((m) => {
+                const digits = m.replace(/\D/g, "");
+                return digits.length >= 10 && digits.length <= 15;
+              });
+            if (normalized.length > 0) return normalized[0];
+          }
+          return "";
+        })
+        .catch(() => "");
+      const n = normalizePhone(extracted);
+      return n || null;
+    }, 800);
+
+    // Close panel without relying on brittle selectors: ESC is the safest.
+    await withTimeout(async () => {
+      await page.keyboard.press("Escape").catch(() => null);
+      return true;
+    }, 300);
+
+    return phone || null;
+  } catch {
+    return null;
+  }
 }
 
 function keyBase(value) {
@@ -606,14 +706,14 @@ export async function openBubbleMenu(page, bubble, opts = {}) {
       .evaluateHandle((root) => {
         const isVisible = (el) => {
           if (!el || !(el instanceof Element)) return false;
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          return (
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.display !== "none" &&
-            style.visibility !== "hidden"
-          );
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden"
+      );
         };
         const candidates = Array.from(
           root.querySelectorAll('button, [role="button"], div[role="button"], span[role="button"]')
@@ -1416,19 +1516,19 @@ async function snapshotOutgoingMessages(page) {
   return page
     .evaluate(() => {
       const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
-      function textFor(node) {
-        const textNode =
-          node.querySelector("span.selectable-text span") ||
-          node.querySelector("span.selectable-text");
+    function textFor(node) {
+      const textNode =
+        node.querySelector("span.selectable-text span") ||
+        node.querySelector("span.selectable-text");
         if (textNode) return clean(textNode.textContent);
-        const copyable = node.querySelector("div.copyable-text");
-        if (copyable) {
+      const copyable = node.querySelector("div.copyable-text");
+      if (copyable) {
           const lines = String(copyable.innerText || "")
-            .split("\n")
+          .split("\n")
             .map((line) => clean(line))
-            .filter(Boolean);
-          return lines[lines.length - 1] || "";
-        }
+          .filter(Boolean);
+        return lines[lines.length - 1] || "";
+      }
         return clean(node.innerText || node.textContent || "");
       }
       function idFor(node) {
@@ -1438,13 +1538,13 @@ async function snapshotOutgoingMessages(page) {
           clean(node.id) ||
           ""
         );
-      }
-      const outgoing = Array.from(document.querySelectorAll("div.message-out"));
-      const last = outgoing[outgoing.length - 1] || null;
+    }
+    const outgoing = Array.from(document.querySelectorAll("div.message-out"));
+    const last = outgoing[outgoing.length - 1] || null;
       const count = outgoing.length;
       const lastText = last ? textFor(last) : "";
       const lastId = last ? idFor(last) : "";
-      return {
+    return {
         count,
         lastText,
         lastId,
@@ -1525,8 +1625,8 @@ export async function verifyReplyPrivatelyMessageSent(page, expectedMessage, opt
         actualHeaderTitle: actualHeaderTitle || null,
       });
     } else if (actualChatKey !== dmLockChatKey) {
-      return {
-        ok: false,
+    return {
+      ok: false,
         reason: "DM_CHAT_CHANGED",
         activeTitle: actualHeaderTitle || null,
         expectedHeaderTitle: expectedHeaderTitle || null,
@@ -1579,7 +1679,7 @@ export async function verifyReplyPrivatelyMessageSent(page, expectedMessage, opt
   });
 
   if (includesExact || matchesNormalized) {
-    return { ok: true };
+  return { ok: true };
   }
 
   if (countIncreased && lastNonEmpty && lastChanged) {
@@ -1948,10 +2048,55 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
   // Truthful partial DM state: persist even on failures.
   let dmOpened = false;
   let dmMessageSent = false;
+  let verificationPassed = false;
+  /** @type {string | null} */
+  let failureStage = null;
+  /** @type {string | null} */
+  let errorCode = null;
+  /** @type {boolean} */
+  let retryable = true;
   /** @type {string | null} */
   let dmChatTitle = null;
   /** @type {string | null} */
   let dmPlaywrightChatKey = null;
+
+  const finalizeResult = (partial) => {
+    const result = {
+      ok: partial?.ok === true && partial?.verificationPassed === true,
+      dmOpened: partial?.dmOpened === true,
+      dmMessageSent: partial?.dmMessageSent === true,
+      verificationPassed: partial?.verificationPassed === true,
+      failureStage: String(partial?.failureStage ?? "").trim() || null,
+      errorCode: String(partial?.errorCode ?? partial?.reason ?? "").trim() || null,
+      retryable: partial?.retryable !== false,
+      dmChatTitle: clean(partial?.dmChatTitle) || null,
+      dmPlaywrightChatKey: clean(partial?.dmPlaywrightChatKey) || null,
+    };
+    console.log("[reply_private_bridge_result_finalized]", {
+      ok: result.ok,
+      dmOpened: result.dmOpened,
+      dmMessageSent: result.dmMessageSent,
+      verificationPassed: result.verificationPassed,
+      failureStage: result.failureStage,
+      errorCode: result.errorCode,
+      retryable: result.retryable,
+      dmChatTitle: result.dmChatTitle,
+      dmPlaywrightChatKey: result.dmPlaywrightChatKey,
+    });
+    console.log("[REPLY_PRIVATE_RESULT]", {
+      bookingId: clean(opts.bookingId) || null,
+      ok: result.ok,
+      dmOpened: result.dmOpened,
+      dmMessageSent: result.dmMessageSent,
+      verificationPassed: result.verificationPassed,
+      failureStage: result.failureStage,
+      errorCode: result.errorCode,
+      retryable: result.retryable,
+      dmChatTitle: result.dmChatTitle,
+      dmPlaywrightChatKey: result.dmPlaywrightChatKey,
+    });
+    return result;
+  };
 
   try {
     try {
@@ -1978,7 +2123,20 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           bookingId,
         });
         if (!located.ok || !located.locator) {
-          return { ok: false, reason: located.reason || "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED" };
+          failureStage = "source_bubble_verify";
+          errorCode = located.reason || "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED";
+          retryable = true;
+          return finalizeResult({
+            ok: false,
+            verificationPassed: false,
+            dmOpened,
+            dmMessageSent,
+            failureStage,
+            errorCode,
+            retryable,
+            dmChatTitle,
+            dmPlaywrightChatKey,
+          });
         }
         const bubble = located.locator;
         await debugHighlightBubble(page, bubble, bookingId);
@@ -1995,11 +2153,11 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         console.log("[reply_privately_menu_opened]");
 
         if (!menuOpened.menuItemClicked) {
-          const clicked = await clickReplyPrivately(page);
-          if (!clicked) {
+        const clicked = await clickReplyPrivately(page);
+        if (!clicked) {
             lastReason = "REPLY_PRIVATE_MENU_ITEM_NOT_CLICKABLE";
-            console.warn("[reply_privately_failed]", { reason: lastReason, attempt });
-            continue;
+          console.warn("[reply_privately_failed]", { reason: lastReason, attempt });
+          continue;
           }
           console.log("[reply_privately_menu_item_click_success]");
         }
@@ -2024,7 +2182,20 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
       }
 
       if (!opened?.ok) {
-        return { ok: false, reason: lastReason };
+        failureStage = "dm_open_verify";
+        errorCode = lastReason;
+        retryable = true;
+        return finalizeResult({
+          ok: false,
+          verificationPassed: false,
+          dmOpened,
+          dmMessageSent,
+          failureStage,
+          errorCode,
+          retryable,
+          dmChatTitle,
+          dmPlaywrightChatKey,
+        });
       }
       dmChatTitle = clean(opened.dmChatTitle) || null;
       dmPlaywrightChatKey =
@@ -2056,14 +2227,83 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           dmChatTitle,
           dmPlaywrightChatKey,
         });
-        return {
+        failureStage = "dm_target_match";
+        errorCode = dmTarget.reason || "REPLY_PRIVATE_DM_TARGET_MISMATCH";
+        retryable = true;
+        return finalizeResult({
           ok: false,
-          reason: dmTarget.reason || "REPLY_PRIVATE_DM_TARGET_MISMATCH",
+          verificationPassed: false,
           dmOpened,
           dmMessageSent,
+          failureStage,
+          errorCode,
+          retryable,
           dmChatTitle,
           dmPlaywrightChatKey,
-        };
+        });
+      }
+
+      // ADDITIVE ONLY: best-effort contact extraction after DM verified (no retries, never throws).
+      // MUST NOT run concurrently with send/verify; run once here with a hard ~2s budget in helper.
+      try {
+        const ownerUid = resolveOwnerUid();
+        if (ownerUid && bookingId) {
+          console.log("[reply_privately_contact_extraction_started]", {
+            bookingId: bookingId || null,
+          });
+          const phone = await extractActiveDmContactPhone(page).catch(() => null);
+          if (!phone) {
+            console.log("[reply_privately_contact_extraction_failed]", {
+              bookingId: bookingId || null,
+              reason: "NO_PHONE_EXTRACTED",
+            });
+          } else {
+            console.log("[reply_privately_contact_extracted]", {
+              bookingId: bookingId || null,
+              phone,
+            });
+            const ref = db
+              .collection("businesses")
+              .doc(ownerUid)
+              .collection("bookings")
+              .doc(bookingId);
+            const snap = await ref.get().catch(() => null);
+            const data = snap?.exists ? snap.data() || {} : {};
+            const patch = {};
+            const existingCustomer = normalizePhone(data?.customerPhone);
+            const existingContact = normalizePhone(data?.contactPhone);
+            const existingDmTarget = normalizePhone(data?.dmTargetPhone);
+            const existingSourcePhone = normalizePhone(
+              data?.sourceIdentity?.participantPhone
+            );
+
+            if (!existingCustomer) patch.customerPhone = phone;
+            if (!existingContact) patch.contactPhone = phone;
+            if (!existingDmTarget) patch.dmTargetPhone = phone;
+            if (
+              data?.sourceIdentity &&
+              typeof data.sourceIdentity === "object" &&
+              !existingSourcePhone
+            ) {
+              patch["sourceIdentity.participantPhone"] = phone;
+            }
+            patch.updatedAt = new Date();
+
+            const keys = Object.keys(patch).filter((k) => k !== "updatedAt");
+            if (keys.length > 0) {
+              await ref.update(patch).catch(() => null);
+              console.log("[reply_privately_contact_persisted]", {
+                bookingId: bookingId || null,
+                phone,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.log("[reply_privately_contact_extraction_failed]", {
+          bookingId: bookingId || null,
+          reason: String(err?.message ?? err ?? "CONTACT_EXTRACTION_FAILED"),
+        });
       }
 
       await humanDelay(page);
@@ -2086,14 +2326,20 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           dmChatTitle,
           dmPlaywrightChatKey,
         });
-        return {
+        failureStage = "dm_send";
+        errorCode = "DM_SEND_FAILED";
+        retryable = true;
+        return finalizeResult({
           ok: false,
-          reason: "DM_SEND_FAILED",
+          verificationPassed: false,
           dmOpened,
           dmMessageSent,
+          failureStage,
+          errorCode,
+          retryable,
           dmChatTitle,
           dmPlaywrightChatKey,
-        };
+        });
       }
       // A DM send attempt was made in the verified DM.
       dmMessageSent = true;
@@ -2122,15 +2368,22 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         console.warn("[reply_privately_failed]", {
           reason: sendVerified.reason || "DM_SEND_VERIFY_FAILED",
         });
-        return {
+        failureStage = "dm_send_verify";
+        errorCode = sendVerified.reason || "DM_SEND_VERIFY_FAILED";
+        retryable = true;
+        return finalizeResult({
           ok: false,
-          reason: sendVerified.reason || "DM_SEND_VERIFY_FAILED",
+          verificationPassed: false,
           dmOpened,
           dmMessageSent,
+          failureStage,
+          errorCode,
+          retryable,
           dmChatTitle,
           dmPlaywrightChatKey,
-        };
+        });
       }
+      verificationPassed = true;
       console.log("[reply_privately_dm_message_sent]", {
         dmChatTitle,
         dmPlaywrightChatKey,
@@ -2145,13 +2398,17 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         dmChatTitle,
         dmPlaywrightChatKey,
       });
-      return {
+      return finalizeResult({
         ok: true,
+        verificationPassed: true,
         dmOpened,
         dmMessageSent: true,
+        failureStage: null,
+        errorCode: null,
+        retryable: true,
         dmChatTitle,
         dmPlaywrightChatKey,
-      };
+      });
     } catch (err) {
       const reason = String(err?.message ?? err ?? "UNKNOWN");
       console.warn("[reply_privately_failed]", { reason });
@@ -2163,14 +2420,20 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         dmChatTitle,
         dmPlaywrightChatKey,
       });
-      return {
+      failureStage = "exception";
+      errorCode = reason;
+      retryable = true;
+      return finalizeResult({
         ok: false,
-        reason,
+        verificationPassed: false,
         dmOpened,
         dmMessageSent,
+        failureStage,
+        errorCode,
+        retryable,
         dmChatTitle,
         dmPlaywrightChatKey,
-      };
+      });
     }
   } finally {
     if (acquiredHere) {

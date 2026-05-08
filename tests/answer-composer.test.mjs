@@ -69,6 +69,41 @@ test("daily price known returns only daily price", () => {
   assert.doesNotMatch(out.reply, /monthly/i);
 });
 
+test("duration pricing: 2 weeks rent includes daily + total when duration present", () => {
+  const out = composeInformationalAnswer({
+    message: "2 weeks k kitna rent ho ga?",
+    draftReply:
+      "Honda Civic 2026 Oriel ka daily rent 8000 PKR hai. Do hafton ka total rent 112000 PKR hoga.",
+    item: { name: "Honda Civic 2026 Oriel", pricing: { daily: "8000" } },
+  });
+  assert.equal(out.field, "price_with_duration");
+  assert.match(out.reply, /\b8000\b/);
+  assert.match(out.reply, /\b112000\b/);
+  assert.equal(out.finalAuthority, true);
+});
+
+test("duration pricing: total ask returns total only", () => {
+  const out = composeInformationalAnswer({
+    message: "14 din ka total?",
+    draftReply: "Daily 8000 hai",
+    item: { name: "Honda Civic", pricing: { daily: "8000" } },
+  });
+  assert.equal(out.field, "price_with_duration");
+  assert.match(out.reply, /\b112000\b/);
+  assert.doesNotMatch(out.reply, /\b8000\b.*\b112000\b/i); // no forced daily line for total-only asks
+});
+
+test("duration pricing: grounded LLM draft total is preserved when it matches computed value", () => {
+  const out = composeInformationalAnswer({
+    message: "2 weeks k kitna rent ho ga?",
+    draftReply:
+      "Honda Civic 2026 Oriel ka daily rent 8000 PKR hai. Do hafton ka total rent 112000 PKR hoga.",
+    item: { name: "Honda Civic 2026 Oriel", pricing: { daily: "8000" } },
+  });
+  assert.equal(out.source, "llm_draft_grounded");
+  assert.match(out.reply, /\b112000\b/);
+});
+
 test("monthly price known returns only monthly price", () => {
   const out = composeInformationalAnswer({
     message: "monthly rent kitna hai?",

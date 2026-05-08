@@ -1,5 +1,6 @@
 import {
   classifyConversationIntentWithLLM,
+  extractBookingSlotsWithLLM,
   generateReply,
 } from "./openai.js";
 import { buildContextData } from "./contextHelpers.js";
@@ -17,6 +18,10 @@ import {
   extractDuration,
   getEntityConfidenceThreshold,
 } from "./entityExtraction.js";
+import {
+  getNormalizedDaysFromDurationPreference,
+  parseUserDuration,
+} from "../duration/parseDuration.js";
 import { detectBookingEvent } from "./eventDetection.js";
 import {
   findItemByName,
@@ -85,13 +90,17 @@ import {
   findApprovedBookingForDm,
   findApprovedBookingForGroupDetails,
   isBookingAttachAvailabilityQuery,
+  isLogisticsComplete,
   parseDeliveryDetails,
+  resolveLogisticsCompletionPolicy,
 } from "./bookingDmFlow.js";
 import {
   decideConversationRoute,
   applyIntentPriority,
   isConversationAiRoute,
   isInformationalRoute,
+  isExplicitPricingOrDetailsQuestion,
+  hasStrongBookingCommitPhrase,
 } from "./conversationRouter.js";
 import {
   applyToneGuard,
@@ -104,6 +113,687 @@ import {
 import { buildBookingWaitingEngagement } from "./customerApprovalContinuation.js";
 import { sanitizeContextForResolvedItemChange } from "./bookingContextSanitizer.js";
 import { resolveParticipantIdentity } from "./participantIdentity.js";
+
+async function createBookingFromValidatedIntent({
+  callerTag,
+  isGroupInbound,
+  itemId,
+  itemName,
+  durationDays,
+  hasParticipantIdentity,
+  ownerApprovalFirstRequest,
+  traceId,
+  userId,
+  createBookingArgs,
+} = {}) {
+  const flowId = String(traceId ?? "").trim() || null;
+  console.log("[booking_create_gate_entered]", {
+    callerTag: String(callerTag ?? "").trim() || null,
+    isGroupInbound: Boolean(isGroupInbound),
+    itemId: String(itemId ?? "").trim() || null,
+    durationDays: Number.isFinite(Number(durationDays)) ? Number(durationDays) : null,
+    hasParticipantIdentity: Boolean(hasParticipantIdentity),
+    ownerApprovalFirstRequest: Boolean(ownerApprovalFirstRequest),
+  });
+  console.log("[BOOKING_GATE]", {
+    ...(flowId ? { flowId } : {}),
+    action: "entered",
+    callerTag: String(callerTag ?? "").trim() || null,
+    isGroupInbound: Boolean(isGroupInbound),
+    itemId: String(itemId ?? "").trim() || null,
+    durationDays: Number.isFinite(Number(durationDays)) ? Number(durationDays) : null,
+  });
+
+  if (!userId || !String(itemId ?? "").trim()) {
+    console.warn("[booking_create_gate_blocked]", { callerTag, reason: "MISSING_ITEM_OR_USER" });
+    console.warn("[BOOKING_GATE]", {
+      ...(flowId ? { flowId } : {}),
+      action: "blocked",
+      callerTag: String(callerTag ?? "").trim() || null,
+      reason: "MISSING_ITEM_OR_USER",
+    });
+    return { ok: false, code: "GATE_MISSING_ITEM_OR_USER" };
+  }
+  if (!Number.isFinite(Number(durationDays)) || Number(durationDays) <= 0) {
+    console.warn("[booking_create_gate_blocked]", { callerTag, reason: "MISSING_DURATION" });
+    console.warn("[BOOKING_GATE]", {
+      ...(flowId ? { flowId } : {}),
+      action: "blocked",
+      callerTag: String(callerTag ?? "").trim() || null,
+      reason: "MISSING_DURATION",
+    });
+    return { ok: false, code: "GATE_MISSING_DURATION" };
+  }
+  if (isGroupInbound && ownerApprovalFirstRequest && !hasParticipantIdentity) {
+    console.warn("[booking_create_gate_blocked]", {
+      callerTag,
+      reason: "MISSING_PARTICIPANT_IDENTITY_FOR_REPLY_PRIVATE",
+    });
+    console.warn("[BOOKING_GATE]", {
+      ...(flowId ? { flowId } : {}),
+      action: "blocked",
+      callerTag: String(callerTag ?? "").trim() || null,
+      reason: "MISSING_PARTICIPANT_IDENTITY_FOR_REPLY_PRIVATE",
+    });
+    return { ok: false, code: "GATE_MISSING_PARTICIPANT_IDENTITY" };
+  }
+
+  console.log("[booking_create_gate_allowed]", {
+    callerTag: String(callerTag ?? "").trim() || null,
+    itemId: String(itemId ?? "").trim() || null,
+    itemName: String(itemName ?? "").trim() || null,
+    durationDays: Math.max(1, Math.floor(Number(durationDays))),
+  });
+  console.log("[BOOKING_GATE]", {
+    ...(flowId ? { flowId } : {}),
+    action: "allowed",
+    callerTag: String(callerTag ?? "").trim() || null,
+    itemId: String(itemId ?? "").trim() || null,
+    durationDays: Math.max(1, Math.floor(Number(durationDays))),
+  });
+
+  return createBooking(traceId, userId, createBookingArgs);
+}
+
+/**
+ * Extract a best-effort location/address slot from a mixed delivery-method message.
+ * Rule-based only (no LLM). Keeps readable casing by operating on the original text,
+ * while using lowercase for detection.
+ *
+ * Examples:
+ * - "Faisal town m delivery ho jye ge?" -> "Faisal town"
+ * - "delivery DHA phase 2 kar dein" -> "DHA phase 2"
+ *
+ * Returns null when the message doesn't contain a usable location or is only an ack + delivery word.
+ * @param {string} text
+ * @returns {string | null}
+ */
+export function extractLocationSlotFromDeliveryText(text) {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  // Avoid false "locations" that are just delivery intent / acknowledgements.
+  const onlyAck = /^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)\b/i.test(lower);
+  const onlyDeliveryWord =
+    /^(?:han|haan|jee|ji|yes|ok|okay|theek|done|sure)?\s*(?:delivery|deliver)\s*$/i.test(
+      lower
+    );
+  if (onlyDeliveryWord || (onlyAck && /\bdelivery\b/i.test(raw) && raw.split(/\s+/).length <= 2)) {
+    return null;
+  }
+
+  /**
+   * @param {string} candidate
+   */
+  function cleanCandidate(candidate) {
+    let out = String(candidate ?? "").replace(/\s+/g, " ").trim();
+    if (!out) return "";
+
+    // Strip obvious leading/trailing punctuation.
+    out = out.replace(/^[\s,.:;!?'"()\-]+/, "").replace(/[\s,.:;!?'"()\-]+$/, "");
+
+    // Remove delivery / pickup and question/filler fragments (case-insensitive).
+    const cleanupPatterns = [
+      /\b(delivery|deliver|deliver(?:y)?|bhej(?:na|do)?|send|drop)\b/gi,
+      /\b(pick\s*up|pickup|self|khud)\b/gi,
+      /\b(address|location)\b/gi,
+      /\b(kya|kab|kahan|kidhar|how|where|when|possible)\b/gi,
+      /\b(ho\s*jaye(?:\s*gi|\s*ga)?|ho\s*jye(?:\s*gi|\s*ga)?|ho\s*jaye\s*ga|ho\s*jaye\s*gi)\b/gi,
+      /\b(hai|hain|ho|hoga|hogi|kr\s*dein|kar\s*dein|kar\s*den|kr\s*do|kar\s*do|pls|plz|please)\b/gi,
+      /\b(krni|karni|krna|karna|krwani|karwani)\b/gi,
+      /\b(mein|mei|me|main|m|tak)\b/gi,
+    ];
+    for (const re of cleanupPatterns) {
+      out = out.replace(re, " ");
+    }
+    out = out.replace(/\s+/g, " ").trim();
+
+    // After cleanup, reject low-signal leftovers.
+    const outLower = out.toLowerCase();
+    if (!outLower) return "";
+    if (/^(delivery|deliver|pickup|pick\s*up)$/i.test(outLower)) return "";
+    if (/^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(outLower)) return "";
+    return out;
+  }
+
+  // Pattern 1: "<location> mein/me/m delivery ..."
+  {
+    const m = /^(.+?)\s+(?:m|me|mei|mein|main)\s+(?:delivery|deliver|bhej|send)\b/i.exec(raw);
+    if (m?.[1]) {
+      const cleaned = cleanCandidate(m[1]);
+      if (cleaned) return cleaned;
+    }
+  }
+
+  // Pattern 2: "<location> tak delivery ..."
+  {
+    const m = /^(.+?)\s+tak\s+(?:delivery|deliver|bhej|send)\b/i.exec(raw);
+    if (m?.[1]) {
+      const cleaned = cleanCandidate(m[1]);
+      if (cleaned) return cleaned;
+    }
+  }
+
+  // Pattern 3: "delivery <location> ..."
+  {
+    const m = /\b(?:delivery|deliver|bhej|send)\b\s+(.+?)(?:\?|$|\b(kar|kr|ho|hai|hain|possible|pls|plz|please)\b)/i.exec(
+      raw
+    );
+    if (m?.[1]) {
+      const cleaned = cleanCandidate(m[1]);
+      if (cleaned) return cleaned;
+    }
+  }
+
+  // Pattern 4: "<location> address/location ..."
+  {
+    const m = /^(.+?)\s+\b(?:address|location)\b/i.exec(raw);
+    if (m?.[1]) {
+      const cleaned = cleanCandidate(m[1]);
+      if (cleaned) return cleaned;
+    }
+  }
+
+  // Pattern 5: "address/location: <location>"
+  {
+    const m = /\b(?:address|location)\b\s*[:\-]?\s*(.+)$/i.exec(raw);
+    if (m?.[1]) {
+      const cleaned = cleanCandidate(m[1]);
+      if (cleaned) return cleaned;
+    }
+  }
+
+  // Pattern 6: "ghar/office/shop <area> ..."
+  {
+    const m = /\b(?:ghar|home|office|shop)\b\s+(.+)$/i.exec(raw);
+    if (m?.[1]) {
+      const cleaned = cleanCandidate(m[1]);
+      if (cleaned) return cleaned;
+    }
+  }
+
+  // Fallback: if it looks like a location-ish phrase embedded in delivery intent, extract the longest
+  // non-question fragment around common area tokens.
+  const hasAreaToken = /\b(sector|phase|block|street|road|near|opposite|town|city|area|dha|bahria)\b/i.test(
+    raw
+  );
+  if (hasAreaToken) {
+    const cleaned = cleanCandidate(raw);
+    if (cleaned) return cleaned;
+  }
+
+  return null;
+}
+
+/**
+ * Rule-based interpretation of delivery method + optional location slot.
+ * @param {string} text
+ */
+export function interpretDeliveryMethodMessage(text) {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  const lower = raw.toLowerCase();
+  const words = raw.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+  const isOnlyAck = /^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(lower);
+  const looksQuestion =
+    raw.includes("?") || /\b(kya|kab|kahan|kidhar|how|where|when)\b/i.test(raw);
+
+  const pickupSignals = [
+    /\bpick\s*up\b/i,
+    /\bpickup\b/i,
+    /\bself\b/i,
+    /\bkhud\b/i,
+    /\bme\s+pick(?:up)?\b/i,
+    /\bmain\s+pick(?:up)?\b/i,
+    /\ble\s+lunga\b/i,
+    /\ble\s+loon(?:ga|gi)?\b/i,
+  ];
+  const deliverySignals = [
+    /\bdeliver\b/i,
+    /\bdelivery\b/i,
+    /\bbhej\b/i,
+    /\bghar\b/i,
+    /\baddress\b/i,
+    /\blocation\b/i,
+    /\bdeliver\s+kar\b/i,
+  ];
+
+  const hasPickup = pickupSignals.some((re) => re.test(raw));
+  if (hasPickup) {
+    return { method: "pickup", location: null, confidence: "high" };
+  }
+
+  const hasDelivery = deliverySignals.some((re) => re.test(raw));
+  const hasLocationShape =
+    /\b(sector|phase|block|street|road|near|opposite|town|city|area|dha|bahria)\b/i.test(
+      raw
+    ) || raw.length >= 12;
+
+  // Treat short, non-ack, non-question replies as likely location answers (e.g. "Faisal town").
+  const shortLikelyLocation = wordCount >= 1 && wordCount <= 5 && !isOnlyAck && !looksQuestion;
+
+  if (hasDelivery || hasLocationShape || shortLikelyLocation) {
+    let location = null;
+    // Prefer explicit slot extraction for mixed delivery messages.
+    if (hasDelivery) {
+      location = extractLocationSlotFromDeliveryText(raw);
+    }
+    // Location-only replies should still map to a location even without the delivery keyword.
+    if (!location && shortLikelyLocation && !hasDelivery) {
+      location = raw;
+    }
+    // If we have a location-shape message that also contains delivery keyword, try extracting too.
+    if (!location && hasLocationShape) {
+      location = extractLocationSlotFromDeliveryText(raw);
+    }
+
+    return {
+      method: "delivery",
+      location: location || null,
+      confidence: hasDelivery ? "high" : shortLikelyLocation ? "medium" : "low",
+    };
+  }
+
+  return { method: null, location: null, confidence: "low" };
+}
+
+/**
+ * Extract a delivery time phrase from natural language.
+ * Rule-based only (no LLM). Stores the raw meaningful phrase for now.
+ *
+ * Examples:
+ * - "kal 5 baje" -> { timeText: "kal 5 baje", confidence: "high" }
+ * - "evening" -> { timeText: "evening", confidence: "medium" }
+ * - "haan" -> { timeText: null, confidence: "low" }
+ *
+ * @param {string} text
+ * @returns {{ timeText: string | null, confidence: "high" | "medium" | "low" }}
+ */
+export function extractDeliveryTime(text) {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return { timeText: null, confidence: "low" };
+  const lower = raw.toLowerCase();
+
+  // Reject pure acknowledgements.
+  if (/^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(lower)) {
+    return { timeText: null, confidence: "low" };
+  }
+
+  const hasQuestionWord =
+    raw.includes("?") || /\b(kya|kab|when|time)\b/i.test(raw);
+
+  const dayTokenMatch = /\b(aaj|kal|today|tomorrow)\b/i.exec(lower);
+  const dayToken = dayTokenMatch ? dayTokenMatch[0] : "";
+
+  // Numeric time patterns
+  const time12h = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i.exec(raw);
+  const timeBaje = /\b(\d{1,2})(?::(\d{2}))?\s*(baje|bajay)\b/i.exec(raw);
+  const timeOclock = /\b(\d{1,2})(?::(\d{2}))?\s*(o'?clock)\b/i.exec(raw);
+
+  const partOfDayMatch =
+    /\b(morning|evening|afternoon|night|raat|shaam)\b/i.exec(lower);
+  const partOfDay = partOfDayMatch ? partOfDayMatch[0] : "";
+
+  const isOnlyDeliveryWord = /^(delivery|deliver)\s*$/i.test(lower);
+  if (isOnlyDeliveryWord) return { timeText: null, confidence: "low" };
+
+  const hasNumeric = Boolean(time12h || timeBaje || timeOclock);
+
+  if (hasNumeric) {
+    // Prefer keeping the full message if it's short enough and includes day/time.
+    const short = raw.split(/\s+/).filter(Boolean).length <= 6;
+    const timeText = short ? raw : [dayToken, time12h?.[0] || timeBaje?.[0] || timeOclock?.[0]]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    return { timeText: timeText || raw, confidence: "high" };
+  }
+
+  if (partOfDay) {
+    // If user says "kal evening", keep both.
+    const composite = [dayToken, partOfDay].filter(Boolean).join(" ").trim();
+    return { timeText: composite || partOfDay, confidence: dayToken ? "high" : "medium" };
+  }
+
+  if (dayToken && !hasQuestionWord) {
+    // "kal" alone is a usable time anchor; treat as medium.
+    return { timeText: dayTokenMatch?.[0] ? raw : dayToken, confidence: "medium" };
+  }
+
+  return { timeText: null, confidence: "low" };
+}
+
+function normalizePhoneDigits(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return digits.length >= 10 && digits.length <= 15 ? digits : "";
+}
+
+/**
+ * Centralized booking slot validation for the booking state machine.
+ * No new architecture: just one acceptance/ambiguity layer.
+ *
+ * @param {{ state: string, messageText: string, llmSlots?: any, booking?: any }} p
+ * @returns {{
+ *  accepted: { deliveryMethod?: ("delivery"|"pickup"), deliveryAddress?: string, deliveryTime?: string, contactPhone?: string },
+ *  ambiguous: string[],
+ *  rejected: string[],
+ *  nextReplyOverride: string | null
+ * }}
+ */
+export function validateBookingSlotForState({
+  state,
+  messageText,
+  llmSlots,
+  booking,
+} = {}) {
+  const s = String(state ?? "").trim();
+  const raw = String(messageText ?? "").replace(/\s+/g, " ").trim();
+  const lower = raw.toLowerCase();
+  const b = booking && typeof booking === "object" ? booking : {};
+  const slots = llmSlots && typeof llmSlots === "object" ? llmSlots : {};
+
+  console.log("[booking_slot_validation_started]", {
+    bookingId: String(b?.id ?? b?.bookingId ?? "").trim() || null,
+    state: s || null,
+    rawTextPreview: raw.slice(0, 120) || null,
+  });
+
+  /** @type {any} */
+  const accepted = {};
+  const ambiguous = [];
+  const rejected = [];
+  let nextReplyOverride = null;
+
+  const looksLikePhone = (value) => {
+    const digits = String(value ?? "").replace(/\D/g, "");
+    return digits.length >= 10 && digits.length <= 15;
+  };
+
+  const cleanAddress = (value) => {
+    let out = String(value ?? "").replace(/\s+/g, " ").trim();
+    if (!out) return "";
+    out = out
+      .replace(/\b(delivery|deliver|deliver(?:y)?|bhej(?:na|do)?|send|drop)\b/gi, " ")
+      .replace(/\b(pick\s*up|pickup|self|khud)\b/gi, " ")
+      .replace(/\b(kar\s*dein|kr\s*dein|kar\s*den|kr\s*den|kar\s*do|kr\s*do)\b/gi, " ")
+      .replace(/\b(sy|se)\s+pick\s*(?:up)?\s*(?:krni|karni)\b/gi, " ")
+      .replace(/\bpick\s*(?:up)?\s*(?:krni|karni)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    out = out.replace(/^[,.:;!?'"()\-]+|[,.:;!?'"()\-]+$/g, "").trim();
+    return out;
+  };
+
+  function isLowSignalSlotValue(slotName, value) {
+    if (!value) return true;
+    const v = String(value).toLowerCase().replace(/\s+/g, " ").trim();
+    if (!v) return true;
+    if (slotName === "deliveryAddress") {
+      const denylist = [
+        "krni",
+        "karni",
+        "krna",
+        "karna",
+        "krwani",
+        "karwani",
+        "hai",
+        "ho",
+        "haan",
+        "jee",
+        "pls",
+        "plz",
+        "please",
+      ];
+      if (denylist.includes(v)) return true;
+    }
+    return false;
+  }
+
+  const isDigitsOnly = /^\d{1,3}$/.test(lower);
+  const hasDurationWord = /\b(din|days?)\b/i.test(raw);
+  const hasTimeMarker =
+    /\b(baje|bjay|am|pm|raat|shaam|evening|morning|afternoon|night|aaj|kal|today|tomorrow)\b/i.test(
+      raw
+    ) || /:\d{2}\b/.test(raw);
+
+  if (s === "awaiting_delivery_method") {
+    const method = String(slots.deliveryMethod ?? "").trim().toLowerCase();
+    if (!String(b?.deliveryMethod ?? "").trim()) {
+      if (method === "delivery" || method === "pickup") accepted.deliveryMethod = method;
+      else if (method) rejected.push("deliveryMethod");
+    }
+    const addrRaw = String(slots.deliveryAddress ?? "").trim();
+    if (!String(b?.deliveryAddress ?? "").trim() && addrRaw) {
+      const cleaned = cleanAddress(addrRaw);
+      if (cleaned && !looksLikePhone(cleaned)) {
+        if (isLowSignalSlotValue("deliveryAddress", cleaned)) {
+          console.log("[delivery_address_rejected_low_signal]", {
+            original: String(addrRaw ?? "").slice(0, 120) || null,
+            cleaned: String(cleaned ?? "").slice(0, 120) || null,
+          });
+          rejected.push("deliveryAddress");
+        } else {
+          accepted.deliveryAddress = cleaned;
+        }
+      } else {
+        rejected.push("deliveryAddress");
+      }
+    }
+  } else if (s === "awaiting_delivery_location") {
+    const addrRaw = String(slots.deliveryAddress ?? "").trim();
+    if (!String(b?.deliveryAddress ?? "").trim() && addrRaw) {
+      const cleaned = cleanAddress(addrRaw);
+      if (cleaned && !looksLikePhone(cleaned)) {
+        if (isLowSignalSlotValue("deliveryAddress", cleaned)) {
+          console.log("[delivery_address_rejected_low_signal]", {
+            original: String(addrRaw ?? "").slice(0, 120) || null,
+            cleaned: String(cleaned ?? "").slice(0, 120) || null,
+          });
+          rejected.push("deliveryAddress");
+        } else {
+          accepted.deliveryAddress = cleaned;
+        }
+      } else {
+        rejected.push("deliveryAddress");
+      }
+    }
+    if (!accepted.deliveryAddress && looksLikePhone(raw)) {
+      ambiguous.push("phone_in_address_state");
+      nextReplyOverride = "Location/address thoda clear bata dein.";
+    }
+  } else if (s === "awaiting_delivery_time") {
+    const t = String(slots.deliveryTime ?? "").replace(/\s+/g, " ").trim();
+    if (!String(b?.deliveryTime ?? "").trim() && t) {
+      if (hasDurationWord && !hasTimeMarker) {
+        // "12 din" is not a time. We don't store duration in this state machine.
+        ambiguous.push("duration_in_time_state");
+        rejected.push("deliveryTime");
+        nextReplyOverride = "Time kya rakhna hai? Jaise 12 bjy rat.";
+      } else if (isDigitsOnly && !hasTimeMarker) {
+        ambiguous.push("number_only");
+        rejected.push("deliveryTime");
+        nextReplyOverride = "12 bjy ka time rakhna hai?";
+      } else {
+        accepted.deliveryTime = t;
+      }
+    }
+  } else if (s === "awaiting_contact") {
+    const p = String(slots.contactPhone ?? "").trim();
+    if (
+      !String(b?.customerPhone ?? "").trim() &&
+      !String(b?.contactPhone ?? "").trim() &&
+      p
+    ) {
+      const digits = String(p).replace(/\D/g, "");
+      if (digits.length >= 10 && digits.length <= 15) accepted.contactPhone = digits;
+      else rejected.push("contactPhone");
+    }
+  }
+
+  if (ambiguous.length > 0) {
+    console.log("[booking_slot_validation_ambiguous]", {
+      bookingId: String(b?.id ?? b?.bookingId ?? "").trim() || null,
+      state: s || null,
+      ambiguous,
+    });
+  }
+  console.log("[booking_slot_validation_result]", {
+    bookingId: String(b?.id ?? b?.bookingId ?? "").trim() || null,
+    state: s || null,
+    acceptedKeys: Object.keys(accepted),
+    rejected,
+    ambiguous,
+    nextReplyOverride: nextReplyOverride || null,
+  });
+
+  return { accepted, ambiguous, rejected, nextReplyOverride };
+}
+
+function looksSyntheticPhoneSource(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (!s) return false;
+  return /\b(grp|group|dm|participant|first[\s_-]*seen)\b/i.test(s);
+}
+
+/**
+ * Resolve a booking/customer contact phone with a strict priority order.
+ * Returns normalized digits only (10–15). Rejects synthetic/group identifiers.
+ *
+ * @param {{ booking: any, participantPhoneForDm?: string | null, sessionKey?: string | null }} p
+ * @returns {{ phone: string | null, source: string }}
+ */
+export function resolveBookingContactPhone({
+  booking,
+  participantPhoneForDm,
+  sessionKey,
+} = {}) {
+  const b = booking && typeof booking === "object" ? booking : {};
+
+  const candidates = [
+    { source: "booking.customerPhone", value: b?.customerPhone },
+    { source: "booking.contactPhone", value: b?.contactPhone },
+    { source: "participantPhoneForDm", value: participantPhoneForDm },
+    { source: "booking.sourceIdentity.participantPhone", value: b?.sourceIdentity?.participantPhone },
+    { source: "booking.sourceParticipantPhone", value: b?.sourceParticipantPhone },
+    { source: "booking.originalCustomerPhone", value: b?.originalCustomerPhone },
+    { source: "booking.dmTargetPhone", value: b?.dmTargetPhone },
+  ];
+
+  for (const c of candidates) {
+    const raw = String(c.value ?? "").trim();
+    if (!raw) continue;
+    if (looksSyntheticPhoneSource(raw)) continue;
+    const phone = normalizePhoneDigits(raw);
+    if (phone) return { phone, source: c.source };
+  }
+
+  // Conservative: extract a phone-looking token from sessionKey only if it clearly contains digits.
+  const sk = String(sessionKey ?? "").trim();
+  if (sk && !looksSyntheticPhoneSource(sk)) {
+    const tokens = sk.split(/[^0-9+]+/).filter(Boolean);
+    for (const t of tokens) {
+      const phone = normalizePhoneDigits(t);
+      if (phone) return { phone, source: "sessionKey" };
+    }
+  }
+
+  return { phone: null, source: "none" };
+}
+
+/**
+ * Best-effort contact phone extraction from raw user message (rule-based).
+ * @param {string} text
+ * @returns {string | null}
+ */
+export function extractContactPhoneFromText(text) {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+  if (looksSyntheticPhoneSource(raw)) return null;
+  const matches =
+    raw.match(/(?:\+?\d[\d\s().-]{8,}\d|0\d[\d\s().-]{8,}\d)/g) || [];
+  for (const m of matches) {
+    const phone = normalizePhoneDigits(m);
+    if (phone) return phone;
+  }
+  return null;
+}
+
+/**
+ * Apply LLM slot extraction (optional) for booking states, while keeping state transitions deterministic.
+ * This is used by the booking state machine to optionally accept LLM slots before rule-based fallback.
+ *
+ * @param {{
+ *  state: string,
+ *  messageText: string,
+ *  booking: any,
+ *  participantPhoneForDm?: string | null,
+ *  sessionKey?: string | null,
+ *  llm?: (args: { state: string, messageText: string, booking: any }) => Promise<any>
+ * }} p
+ * @returns {Promise<{ accepted: { deliveryMethod?: "delivery"|"pickup", deliveryAddress?: string, deliveryTime?: string, contactPhone?: string }, llm: any | null }>}
+ */
+export async function applyBookingSlotLlmExtraction({
+  state,
+  messageText,
+  booking,
+  participantPhoneForDm,
+  sessionKey,
+  llm,
+} = {}) {
+  const s = String(state ?? "").trim();
+  const msg = String(messageText ?? "").trim();
+  const b = booking && typeof booking === "object" ? booking : {};
+  if (!s || !msg) return { accepted: {}, llm: null };
+
+  const fn =
+    typeof llm === "function"
+      ? llm
+      : (args) => extractBookingSlotsWithLLM(args);
+
+  const result = await fn({ state: s, messageText: msg, booking: b });
+  const conf = result?.confidence || {};
+  const slots = result?.slots || {};
+  const ok = (k) => conf?.[k] === "high" || conf?.[k] === "medium";
+
+  /** @type {Record<string, any>} */
+  const accepted = {};
+
+  if (s === "awaiting_delivery_method") {
+    if (!String(b?.deliveryMethod ?? "").trim() && ok("deliveryMethod")) {
+      if (slots.deliveryMethod === "delivery" || slots.deliveryMethod === "pickup") {
+        accepted.deliveryMethod = slots.deliveryMethod;
+      }
+    }
+    if (!String(b?.deliveryAddress ?? "").trim() && ok("deliveryAddress")) {
+      const addr = String(slots.deliveryAddress ?? "").trim();
+      if (addr) accepted.deliveryAddress = addr;
+    }
+  } else if (s === "awaiting_delivery_location") {
+    if (!String(b?.deliveryAddress ?? "").trim() && ok("deliveryAddress")) {
+      const addr = String(slots.deliveryAddress ?? "").trim();
+      if (addr) accepted.deliveryAddress = addr;
+    }
+  } else if (s === "awaiting_delivery_time") {
+    if (!String(b?.deliveryTime ?? "").trim() && ok("deliveryTime")) {
+      const t = String(slots.deliveryTime ?? "").trim();
+      if (t) accepted.deliveryTime = t;
+    }
+  } else if (s === "awaiting_contact") {
+    // Prefer metadata resolver elsewhere; only accept message-provided contactPhone here.
+    const existing = resolveBookingContactPhone({
+      booking: b,
+      participantPhoneForDm,
+      sessionKey,
+    });
+    if (!existing.phone && ok("contactPhone")) {
+      const p = String(slots.contactPhone ?? "").trim();
+      if (p) accepted.contactPhone = p;
+    }
+  }
+
+  return { accepted, llm: result || null };
+}
 
 function bookingOwnerApprovalFirstEnabled() {
   return /^true$/i.test(String(process.env.BOOKING_OWNER_APPROVAL_FIRST ?? "").trim());
@@ -350,6 +1040,69 @@ export function setStructuredBookingState(memory, booking) {
     channel: bookingState.channel,
   });
   return bookingState;
+}
+
+/**
+ * Booking-continuation shape from the *current* user message only (not memory duration).
+ * Used to gate owner-approval shortcuts and duplicate-booking replies for pricing/details turns.
+ */
+function isBookingContinuationShapedCurrentTurn(
+  message,
+  extractedDurationDays,
+  contactValidCurrent,
+  events
+) {
+  const m = String(message ?? "");
+  if (
+    isExplicitPricingOrDetailsQuestion(m) &&
+    !hasStrongBookingCommitPhrase(m)
+  ) {
+    console.log("[pricing_intent_precedence_applied]", {
+      messagePreview: m.slice(0, 160),
+      extractedDurationDays: Number.isFinite(extractedDurationDays)
+        ? extractedDurationDays
+        : null,
+      explicitPricingOrDetailsQuestion: true,
+      bookingContinuationBlocked: true,
+      reason: "pricing_with_duration",
+    });
+    return false;
+  }
+  const dm = Number.isFinite(extractedDurationDays);
+  const dc = contactValidCurrent === true;
+  const durationPhrase =
+    /\b\d+\s*(?:din|deen|dino|day|days|hour|hours|week|weeks)\b/i.test(m) ||
+    /^\s*\d+\s*$/i.test(m.trim());
+  const commitVerb =
+    /\b(book|booking|bookings|reserve|reservation|confirm|confirmed|order|orders|mangwa|mangwao|chahiye|chaiye|chaahiye|kardo|kar\s*do|kara\s*do|lagwa)\b/i.test(
+      m
+    );
+  const rentCommit = /\brent\s*(kar|karna|lena|leni)\b/i.test(m);
+  if (dm || dc || durationPhrase) return true;
+  if (events?.confirmationIntent) return true;
+  if (rentCommit) return true;
+  if (commitVerb) return true;
+  if (events?.transactionalIntent && !isExplicitPricingOrDetailsQuestion(m))
+    return true;
+  if (isExplicitPricingOrDetailsQuestion(m) && commitVerb) return true;
+  return false;
+}
+
+function shouldSuppressDuplicateAlreadyReceivedReply(
+  message,
+  extractedDurationDays,
+  contactValid,
+  events
+) {
+  return (
+    isExplicitPricingOrDetailsQuestion(message) &&
+    !isBookingContinuationShapedCurrentTurn(
+      message,
+      extractedDurationDays,
+      contactValid,
+      events
+    )
+  );
 }
 
 export function clearStructuredBookingState(memory, reason = "UNKNOWN") {
@@ -699,6 +1452,52 @@ function extractYearFromName(name) {
  * @param {"GROUP" | "DM" | null | undefined} [aiStructuredMode] - from generateReply when model emits \`__ROUTE__:\`
  */
 function applyHybridOutboundResult(result, routingCtx, aiStructuredMode) {
+  const flowId = String(routingCtx?.flowId ?? "").trim() || null;
+  const rawReply = String(result?.reply ?? "");
+  const isGroupOutbound = Boolean(
+    routingCtx?.isGroupInbound === true &&
+      planGroupHybridDelivery({
+        isGroupInbound: true,
+        replyText: rawReply,
+        messageMeta: result?.messageMeta,
+        inboundMessage: routingCtx?.message,
+        participantPhoneForDm:
+          routingCtx?.participantPhoneForDm != null &&
+          String(routingCtx.participantPhoneForDm).trim() !== ""
+            ? String(routingCtx.participantPhoneForDm).trim()
+            : null,
+        aiStructuredMode,
+      })?.sendVia === "GROUP"
+  );
+
+  const scrubGroupReply = (text) => {
+    const t = String(text ?? "");
+    if (!t.trim()) return t;
+    const lower = t.toLowerCase();
+    const blocked =
+      /\bconfirm\s+hai\b/i.test(t) ||
+      /\bconfirmed\b/i.test(lower) ||
+      /\bbooking\s+confirm\b/i.test(lower) ||
+      /\b(kis\s+time|time\s+kya)\b/i.test(lower) ||
+      /\bdelivery\s+address\b/i.test(lower) ||
+      /\bpick\s*up\b/i.test(lower) ||
+      /\bpickup\b/i.test(lower) ||
+      /\b(phone\s+number|contact\s+number)\b/i.test(lower) ||
+      /\b(location\s+bhej|address\s+bhej)\b/i.test(lower);
+    if (!blocked) return t;
+    console.warn("[group_reply_safety_scrubbed]", {
+      ...(flowId ? { flowId } : {}),
+      messagePreview: String(routingCtx?.message ?? "").slice(0, 160) || null,
+      originalReplyPreview: t.slice(0, 160),
+    });
+    console.warn("[GROUP_SAFETY]", {
+      ...(flowId ? { flowId } : {}),
+      action: "scrubbed",
+      reason: "BLOCKED_GROUP_LOGISTICS_OR_CONFIRMATION_COPY",
+    });
+    return "Request owner ko bhej di hai. Main details private chat mein le leta hun.";
+  };
+
   const plan = planGroupHybridDelivery({
     isGroupInbound: routingCtx.isGroupInbound,
     replyText: result.reply,
@@ -715,8 +1514,16 @@ function applyHybridOutboundResult(result, routingCtx, aiStructuredMode) {
     plan.fallbackReply != null && String(plan.fallbackReply).trim() !== ""
       ? String(plan.fallbackReply).trim()
       : result.reply;
+  const replyFinal =
+    isGroupOutbound ? scrubGroupReply(replyMerged) : replyMerged;
 
   if (plan.sendVia === "NONE") {
+    console.log("[OUTBOUND_SEND]", {
+      ...(flowId ? { flowId } : {}),
+      sendVia: "NONE",
+      replyChars: 0,
+      replyMode: plan.replyMode ?? null,
+    });
     return {
       ...result,
       reply: "",
@@ -725,9 +1532,17 @@ function applyHybridOutboundResult(result, routingCtx, aiStructuredMode) {
       replyMode: plan.replyMode ?? undefined,
     };
   }
+  console.log("[OUTBOUND_SEND]", {
+    ...(flowId ? { flowId } : {}),
+    sendVia: plan.sendVia,
+    replyChars: String(replyFinal ?? "").length,
+    dmRecipientPhoneLast4:
+      plan.dmRecipientPhone != null ? String(plan.dmRecipientPhone).replace(/\D/g, "").slice(-4) : null,
+    replyMode: plan.replyMode ?? null,
+  });
   return {
     ...result,
-    reply: replyMerged,
+    reply: replyFinal,
     sendVia: plan.sendVia,
     dmRecipientPhone: plan.dmRecipientPhone ?? undefined,
     replyMode: plan.replyMode ?? undefined,
@@ -1134,7 +1949,11 @@ function isBrowseOptionsIntent(message) {
     /\b(?:kya\s+kya|kon\s+kon|kaun\s+kaun)\s+available\b/i.test(text) ||
     /\bshow\s+(?:me\s+)?(?:options|items|products|services)\b/i.test(text) ||
     /\bother\s+options?\b/i.test(text) ||
-    /\b(?:aur|or)\s+dikhao\b/i.test(text)
+    /\b(?:aur|or)\s+dikhao\b/i.test(text) ||
+    /\b(?:what\s+else|anything\s+else|any\s+other)\b/i.test(text) ||
+    /\b(?:aur|or|koi\s+aur)\s+(?:kya|kon|kaun)\b/i.test(text) ||
+    /\b(?:aur|or)\s+(?:kya)\s+available\b/i.test(text) ||
+    /\b(?:koi\s+aur|dusra|doosra|another)\s+(?:option|options|item|items|product|products|service|services)\b/i.test(text)
   );
 }
 
@@ -1225,6 +2044,44 @@ function buildBrowseOptionsReply(items, style) {
       ? "Konsa option dekhna chahenge?"
       : "Which option would you like to check?";
   return `${heading}\n${items.map(formatCatalogOptionLine).join("\n")}\n\n${ask}`;
+}
+
+function formatServiceOptionLine(service) {
+  const s = service && typeof service === "object" ? service : {};
+  const label = String(
+    s.label ?? s.name ?? s.title ?? s.service ?? ""
+  ).trim();
+  if (!label) return "";
+  const priceRaw = s.price ?? s.rate ?? s.cost ?? null;
+  const price = priceRaw != null && String(priceRaw).trim() !== ""
+    ? String(priceRaw).trim()
+    : "";
+  return price ? `- ${label} - ${price}` : `- ${label}`;
+}
+
+function buildBrowseOfferingsReply({ items, services, style }) {
+  const lines = [];
+  for (const it of Array.isArray(items) ? items : []) {
+    const line = formatCatalogOptionLine(it);
+    if (line) lines.push(line);
+    if (lines.length >= 5) break;
+  }
+  for (const svc of Array.isArray(services) ? services : []) {
+    if (lines.length >= 5) break;
+    const line = formatServiceOptionLine(svc);
+    if (line) lines.push(line);
+  }
+  if (lines.length === 0) {
+    return style === "casual_local"
+      ? "Abhi koi aur available option nazar nahi aa raha. Aap koi specific option poochna chahenge?"
+      : "I don't see another available option right now. Would you like to ask about a specific option?";
+  }
+  const heading = "Available options:";
+  const ask =
+    style === "casual_local"
+      ? "Konsa option dekhna chahenge?"
+      : "Which option would you like to check?";
+  return `${heading}\n${lines.join("\n")}\n\n${ask}`;
 }
 
 function isRoutableDmTarget(value) {
@@ -1475,17 +2332,8 @@ function isCommitMessage(text) {
  * @returns {number | null}
  */
 function extractDurationFromMessage(message) {
-  const raw = String(message ?? "").trim();
-  if (!raw) return null;
-  const onlyNumber = /^(\d+)$/.exec(raw);
-  if (onlyNumber) {
-    return Number.parseInt(onlyNumber[1], 10);
-  }
-  const withUnit = /(\d+)\s*(day|days|din|dino|hour|hours|hr|hrs)\b/i.exec(raw);
-  if (withUnit) {
-    return Number.parseInt(withUnit[1], 10);
-  }
-  return null;
+  const r = parseUserDuration(message);
+  return r?.normalizedDays ?? null;
 }
 
 /**
@@ -2191,6 +3039,7 @@ export async function processMessage({
   source = "cloud",
   timestamp = Date.now(),
   sessionKey,
+  bookingHint = null,
   conversationHistory,
   fragmentCount = 1,
   hasMultipleFragments = false,
@@ -2216,6 +3065,19 @@ export async function processMessage({
       ? String(traceIdIn).trim()
       : randomUUID();
   try {
+    const flowId = traceId;
+    const DEBUG_EXTRACT =
+      process.env.DEBUG_EXTRACT === "true" || process.env.DEBUG_EXTRACT === "1";
+
+    const emit = (tag, data = {}, level = "log") => {
+      const payload =
+        data && typeof data === "object" && !Array.isArray(data) ? data : { value: data };
+      const out = { flowId, ...payload };
+      if (level === "warn") console.warn(`[${tag}]`, out);
+      else if (level === "error") console.error(`[${tag}]`, out);
+      else console.log(`[${tag}]`, out);
+    };
+
     const processStartedAt = Date.now();
     const logTiming = (stage, startedAt, extra = {}) => {
       console.log("[latency]", {
@@ -2240,7 +3102,7 @@ export async function processMessage({
 
   const selectedForAi = selectLatestInboundForAi(inboundRaw);
   if (!selectedForAi) {
-    console.log("⏭ No valid user message");
+    emit("FLOW_END", { reason: "NO_VALID_USER_MESSAGE" });
     return applyHybridOutboundResult(
       {
         reply: "",
@@ -2257,10 +3119,15 @@ export async function processMessage({
   }
 
   const message = selectedForAi;
-  console.log("[processMessage] inbound normalized identity", {
+  emit("NEW_MESSAGE", {
     messageId: String(messageId),
     source,
     timestamp,
+    isGroupInbound: Boolean(isGroupInbound),
+    playwrightWebInbound: Boolean(playwrightWebInbound),
+    playwrightChatKey: String(playwrightChatKey ?? "").trim() || null,
+    groupName: String(groupName ?? "").trim() || null,
+    participantKey: String(participantKey ?? "").trim() || null,
   });
 
   /** @type {string | null} */
@@ -2277,7 +3144,722 @@ export async function processMessage({
     message,
     participantPhoneForDm,
     playwrightWebInbound: Boolean(playwrightWebInbound),
+    flowId,
   };
+
+  const logisticsCompletionPolicy = resolveLogisticsCompletionPolicy();
+
+  /**
+   * @param {{ bookingId: string, booking: Record<string, unknown>, isComplete: boolean, source: "FSM" | "parser" }} args
+   */
+  const logLogisticsCompletionEvaluated = ({
+    bookingId,
+    booking,
+    isComplete,
+    source,
+  }) => {
+    const method = String(booking?.deliveryMethod ?? "").trim() || null;
+    const address = String(booking?.deliveryAddress ?? "").trim() || null;
+    const time = String(booking?.deliveryTime ?? "").trim() || null;
+    const contact =
+      String(booking?.customerPhone ?? booking?.contactPhone ?? "").trim() ||
+      null;
+    console.log("[logistics_completion_evaluated]", {
+      bookingId,
+      method,
+      address,
+      time,
+      contact,
+      isComplete,
+      source,
+    });
+  };
+
+  async function handleBookingConversationState(ctx = {}) {
+    const finalizeBookingStateReply = (text) => {
+      const raw = String(text ?? "").trim();
+      if (!raw) return "";
+      // Booking-state replies are customer-facing; apply the same safety/tone normalization as AI replies.
+      const guarded = applyToneGuard(raw);
+      const polished = polishWhatsAppBusinessTone(String(guarded ?? ""));
+      return String(polished ?? guarded ?? raw).trim();
+    };
+
+    const isPotentialContinuation =
+      String(ctx?.source ?? "").trim() === "PLAYWRIGHT_DM" ||
+      (ctx?.playwrightWebInbound === true && ctx?.isGroupInbound === false);
+    if (!isPotentialContinuation) return { handled: false };
+
+    const hint =
+      ctx?.bookingHint && typeof ctx.bookingHint === "object" ? ctx.bookingHint : null;
+    const bookingId = hint ? String(hint.bookingId ?? "").trim() : "";
+    if (!bookingId) {
+      console.log("[booking_state_missing_booking_hint]", {
+        source: String(ctx?.source ?? "").trim() || null,
+        playwrightWebInbound: ctx?.playwrightWebInbound === true,
+        isGroupInbound: ctx?.isGroupInbound === true,
+        dmPlaywrightChatKey: String(ctx?.dmPlaywrightChatKey ?? "").trim() || null,
+        dmChatTitle: String(ctx?.dmChatTitle ?? "").trim() || null,
+        rawTextPreview: String(ctx?.message ?? "").trim().slice(0, 160) || null,
+      });
+      return { handled: false };
+    }
+
+    let booking = null;
+    try {
+      const snap = await db
+        .collection("businesses")
+        .doc(String(ctx.userId))
+        .collection("bookings")
+        .doc(bookingId)
+        .get();
+      booking = snap?.exists ? snap.data() || {} : null;
+    } catch {
+      booking = null;
+    }
+    if (!booking) return { handled: false };
+
+    const status = String(booking?.status ?? "").trim();
+    const approvalStage = String(booking?.approvalStage ?? "").trim();
+    const stageKey = approvalStage.toLowerCase();
+
+    const deliveryMethod = String(booking?.deliveryMethod ?? "").trim().toLowerCase();
+    const deliveryAddress = String(booking?.deliveryAddress ?? "").trim();
+    const deliveryTime = String(booking?.deliveryTime ?? "").trim();
+    const hasDeliveryDetailsCollectedAt = Boolean(booking?.deliveryDetailsCollectedAt);
+    const hasContact =
+      String(booking?.customerPhone ?? "").trim() !== "" ||
+      String(booking?.contactPhone ?? "").trim() !== "";
+
+    /** @type {string} */
+    let canonicalState = "inactive";
+    if (status !== "approved") {
+      canonicalState = "inactive";
+    } else if (hasDeliveryDetailsCollectedAt) {
+      canonicalState = "delivery_details_collected";
+    } else if (!deliveryMethod) {
+      canonicalState = "awaiting_delivery_method";
+    } else if (deliveryMethod === "delivery" && !deliveryAddress) {
+      canonicalState = "awaiting_delivery_location";
+    } else if (
+      deliveryMethod === "delivery" &&
+      Boolean(deliveryAddress) &&
+      !deliveryTime
+    ) {
+      canonicalState = "awaiting_delivery_time";
+    } else if (deliveryMethod === "pickup" && !deliveryTime) {
+      // Pickup uses the same `deliveryTime` field today (no separate pickupTime in schema).
+      canonicalState = "awaiting_delivery_time";
+    } else if (deliveryTime && !hasContact) {
+      canonicalState = "awaiting_contact";
+    } else {
+      canonicalState = "ready_to_finalize";
+    }
+
+    console.log("[booking_state_resolution_debug]", {
+      bookingId,
+      deliveryMethod: deliveryMethod || null,
+      deliveryAddress: deliveryAddress || null,
+      deliveryTime: deliveryTime || null,
+      resolvedState: canonicalState,
+    });
+
+    console.log("[booking_state_detected]", {
+      bookingId,
+      status: status || null,
+      approvalStage: approvalStage || null,
+      canonicalState,
+      source: String(ctx?.source ?? "").trim() || null,
+      playwrightWebInbound: ctx?.playwrightWebInbound === true,
+      isGroupInbound: ctx?.isGroupInbound === true,
+      sessionKey: String(ctx?.sessionKey ?? "").trim() || null,
+      rawTextPreview: String(ctx?.message ?? "").trim().slice(0, 160) || null,
+    });
+
+    // Step 2-4: handle delivery-detail states for Playwright DM continuation only.
+    const allowHandleDeliveryDetailStates = Boolean(
+      ctx?.playwrightWebInbound === true &&
+        ctx?.isGroupInbound === false &&
+        status === "approved"
+    );
+    if (
+      allowHandleDeliveryDetailStates &&
+      canonicalState === "awaiting_delivery_method"
+    ) {
+      console.log("[booking_state_handler_invoked]", {
+        bookingId,
+        state: "awaiting_delivery_method",
+        handler: "handleAwaitingDeliveryMethod",
+      });
+
+      let llmAccepted = {};
+      try {
+        console.log("[booking_slot_llm_extraction_started]", {
+          bookingId,
+          state: "awaiting_delivery_method",
+        });
+        const llmOut = await applyBookingSlotLlmExtraction({
+          state: "awaiting_delivery_method",
+          messageText: String(ctx?.message ?? ""),
+          booking,
+          participantPhoneForDm: ctx?.participantPhoneForDm,
+          sessionKey: ctx?.sessionKey,
+        });
+        llmAccepted = llmOut.accepted || {};
+        console.log("[booking_slot_llm_extraction_result]", {
+          bookingId,
+          state: "awaiting_delivery_method",
+          acceptedKeys: Object.keys(llmAccepted),
+          reason: String(llmOut?.llm?.reason ?? "") || null,
+        });
+      } catch (err) {
+        console.log("[booking_slot_llm_extraction_failed]", {
+          bookingId,
+          state: "awaiting_delivery_method",
+          reason: String(err?.message ?? err ?? "LLM_FAILED"),
+        });
+      }
+
+      const interpreted = interpretDeliveryMethodMessage(String(ctx?.message ?? ""));
+      const validated = validateBookingSlotForState({
+        state: "awaiting_delivery_method",
+        messageText: String(ctx?.message ?? ""),
+        llmSlots: {
+          deliveryMethod: llmAccepted.deliveryMethod || interpreted.method || null,
+          deliveryAddress: llmAccepted.deliveryAddress || interpreted.location || null,
+        },
+        booking,
+      });
+      if (validated?.nextReplyOverride) {
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply(validated.nextReplyOverride),
+          updatedBookingFields: {},
+          nextState: "awaiting_delivery_method",
+          bookingId,
+        };
+      }
+      interpreted.method = validated.accepted.deliveryMethod || interpreted.method;
+      interpreted.location = validated.accepted.deliveryAddress || interpreted.location;
+      console.log("[booking_state_message_interpreted]", {
+        bookingId,
+        state: "awaiting_delivery_method",
+        rawTextPreview: String(ctx?.message ?? "").trim().slice(0, 160) || null,
+        method: interpreted.method,
+        location: interpreted.location,
+        confidence: interpreted.confidence,
+      });
+
+      if (!interpreted.method) {
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply(
+            "Delivery chahiye ya pickup? Reply kar dein: delivery ya pickup."
+          ),
+          updatedBookingFields: {},
+          nextState: "awaiting_delivery_method",
+          bookingId,
+        };
+      }
+
+      const now = new Date();
+      const update = {
+        deliveryMethod: interpreted.method,
+        deliveryConversationStarted: true,
+        updatedAt: now,
+        ...(booking?.dmStartedAt ? {} : { dmStartedAt: now }),
+      };
+      if (interpreted.method === "delivery" && interpreted.location) {
+        update.deliveryAddress = interpreted.location;
+      }
+
+      // Persist update before replying.
+      await db
+        .collection("businesses")
+        .doc(String(ctx.userId))
+        .collection("bookings")
+        .doc(bookingId)
+        .update(update);
+
+      const updatedFields = Object.keys(update);
+      const fromState = "awaiting_delivery_method";
+      let nextState = "awaiting_delivery_method";
+      let replyText = "";
+      if (interpreted.method === "pickup") {
+        nextState = "awaiting_delivery_time";
+        replyText = "Pickup noted. Kis time lena chahenge?";
+      } else {
+        if (interpreted.location) {
+          nextState = "awaiting_delivery_time";
+          replyText = `${interpreted.location} noted 👍 Delivery ka time kya rakhna hai?`;
+        } else {
+          nextState = "awaiting_delivery_location";
+          replyText = "Delivery noted. Location/address share kar dein.";
+        }
+      }
+
+      console.log("[booking_state_transition]", {
+        bookingId,
+        fromState,
+        toState: nextState,
+        updatedFields,
+      });
+
+      return {
+        handled: true,
+        replyText: finalizeBookingStateReply(replyText),
+        updatedBookingFields: update,
+        nextState,
+        bookingId,
+      };
+    }
+
+    if (
+      allowHandleDeliveryDetailStates &&
+      canonicalState === "awaiting_delivery_location"
+    ) {
+      console.log("[booking_state_handler_invoked]", {
+        bookingId,
+        state: "awaiting_delivery_location",
+        handler: "handleAwaitingDeliveryLocation",
+      });
+
+      const rawText = String(ctx?.message ?? "");
+      let llmAccepted = {};
+      try {
+        console.log("[booking_slot_llm_extraction_started]", {
+          bookingId,
+          state: "awaiting_delivery_location",
+        });
+        const llmOut = await applyBookingSlotLlmExtraction({
+          state: "awaiting_delivery_location",
+          messageText: rawText,
+          booking,
+          participantPhoneForDm: ctx?.participantPhoneForDm,
+          sessionKey: ctx?.sessionKey,
+        });
+        llmAccepted = llmOut.accepted || {};
+        console.log("[booking_slot_llm_extraction_result]", {
+          bookingId,
+          state: "awaiting_delivery_location",
+          acceptedKeys: Object.keys(llmAccepted),
+          reason: String(llmOut?.llm?.reason ?? "") || null,
+        });
+      } catch (err) {
+        console.log("[booking_slot_llm_extraction_failed]", {
+          bookingId,
+          state: "awaiting_delivery_location",
+          reason: String(err?.message ?? err ?? "LLM_FAILED"),
+        });
+      }
+      const candidateAddress =
+        String(llmAccepted.deliveryAddress ?? "").trim() ||
+        extractLocationSlotFromDeliveryText(rawText) ||
+        null;
+      const validated = validateBookingSlotForState({
+        state: "awaiting_delivery_location",
+        messageText: rawText,
+        llmSlots: { deliveryAddress: candidateAddress },
+        booking,
+      });
+      if (validated?.nextReplyOverride) {
+        console.log("[booking_state_transition]", {
+          bookingId,
+          fromState: "awaiting_delivery_location",
+          toState: "awaiting_delivery_location",
+          extracted: { location: null },
+          rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        });
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply(validated.nextReplyOverride),
+          updatedBookingFields: {},
+          nextState: "awaiting_delivery_location",
+          bookingId,
+        };
+      }
+      const location = String(validated?.accepted?.deliveryAddress ?? "").trim();
+      console.log("[booking_state_message_interpreted]", {
+        bookingId,
+        state: "awaiting_delivery_location",
+        rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        location: location || null,
+      });
+
+      if (!location) {
+        console.log("[booking_state_transition]", {
+          bookingId,
+          fromState: "awaiting_delivery_location",
+          toState: "awaiting_delivery_location",
+          extracted: { location: null },
+          rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        });
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply("Location/address thoda clear bata dein."),
+          updatedBookingFields: {},
+          nextState: "awaiting_delivery_location",
+          bookingId,
+        };
+      }
+
+      const now = new Date();
+      const update = {
+        deliveryAddress: location,
+        deliveryConversationStarted: true,
+        updatedAt: now,
+        ...(booking?.dmStartedAt ? {} : { dmStartedAt: now }),
+      };
+
+      await db
+        .collection("businesses")
+        .doc(String(ctx.userId))
+        .collection("bookings")
+        .doc(bookingId)
+        .update(update);
+
+      const fromState = "awaiting_delivery_location";
+      const nextState = "awaiting_delivery_time";
+      const replyText = `${location} noted 👍 Delivery ka time kya rakhna hai?`;
+
+      console.log("[booking_state_transition]", {
+        bookingId,
+        fromState,
+        toState: nextState,
+        extracted: { deliveryAddress: location },
+        rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+      });
+
+      return {
+        handled: true,
+        replyText: finalizeBookingStateReply(replyText),
+        updatedBookingFields: update,
+        nextState,
+        bookingId,
+      };
+    }
+
+    if (
+      allowHandleDeliveryDetailStates &&
+      canonicalState === "awaiting_delivery_time"
+    ) {
+      console.log("[booking_state_handler_invoked]", {
+        bookingId,
+        state: "awaiting_delivery_time",
+        handler: "handleAwaitingDeliveryTime",
+      });
+
+      const rawText = String(ctx?.message ?? "");
+      let llmAccepted = {};
+      try {
+        console.log("[booking_slot_llm_extraction_started]", {
+          bookingId,
+          state: "awaiting_delivery_time",
+        });
+        const llmOut = await applyBookingSlotLlmExtraction({
+          state: "awaiting_delivery_time",
+          messageText: rawText,
+          booking,
+          participantPhoneForDm: ctx?.participantPhoneForDm,
+          sessionKey: ctx?.sessionKey,
+        });
+        llmAccepted = llmOut.accepted || {};
+        console.log("[booking_slot_llm_extraction_result]", {
+          bookingId,
+          state: "awaiting_delivery_time",
+          acceptedKeys: Object.keys(llmAccepted),
+          reason: String(llmOut?.llm?.reason ?? "") || null,
+        });
+      } catch (err) {
+        console.log("[booking_slot_llm_extraction_failed]", {
+          bookingId,
+          state: "awaiting_delivery_time",
+          reason: String(err?.message ?? err ?? "LLM_FAILED"),
+        });
+      }
+
+      const interpreted = extractDeliveryTime(rawText);
+      const candidateTime =
+        String(llmAccepted.deliveryTime ?? "").trim() ||
+        String(interpreted.timeText ?? "").trim() ||
+        null;
+      const validated = validateBookingSlotForState({
+        state: "awaiting_delivery_time",
+        messageText: rawText,
+        llmSlots: { deliveryTime: candidateTime },
+        booking,
+      });
+      if (validated?.nextReplyOverride) {
+        console.log("[booking_state_transition]", {
+          bookingId,
+          fromState: "awaiting_delivery_time",
+          toState: "awaiting_delivery_time",
+          extracted: { deliveryTime: null },
+          rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        });
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply(validated.nextReplyOverride),
+          updatedBookingFields: {},
+          nextState: "awaiting_delivery_time",
+          bookingId,
+        };
+      }
+      if (!interpreted.timeText && String(validated?.accepted?.deliveryTime ?? "").trim()) {
+        interpreted.timeText = String(validated.accepted.deliveryTime).trim();
+        interpreted.confidence = "medium";
+      }
+      console.log("[booking_state_message_interpreted]", {
+        bookingId,
+        state: "awaiting_delivery_time",
+        rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        timeText: interpreted.timeText,
+        confidence: interpreted.confidence,
+      });
+
+      if (!interpreted.timeText || interpreted.confidence === "low") {
+        console.log("[booking_state_transition]", {
+          bookingId,
+          fromState: "awaiting_delivery_time",
+          toState: "awaiting_delivery_time",
+          extracted: { deliveryTime: null },
+          rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        });
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply("Delivery ka time kya rakhna hai? (e.g. kal 5 baje)"),
+          updatedBookingFields: {},
+          nextState: "awaiting_delivery_time",
+          bookingId,
+        };
+      }
+
+      const now = new Date();
+      const update = {
+        deliveryTime: String(interpreted.timeText).trim(),
+        updatedAt: now,
+      };
+
+      await db
+        .collection("businesses")
+        .doc(String(ctx.userId))
+        .collection("bookings")
+        .doc(bookingId)
+        .update(update);
+
+      const fromState = "awaiting_delivery_time";
+      const nextState = "awaiting_contact";
+      const replyText = "Time note kar liya. Contact number share kar dein.";
+
+      console.log("[booking_state_transition]", {
+        bookingId,
+        fromState,
+        toState: nextState,
+        extracted: { deliveryTime: update.deliveryTime },
+        rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+      });
+
+      return {
+        handled: true,
+        replyText: finalizeBookingStateReply(replyText),
+        updatedBookingFields: update,
+        nextState,
+        bookingId,
+      };
+    }
+
+    if (allowHandleDeliveryDetailStates && canonicalState === "awaiting_contact") {
+      console.log("[booking_state_handler_invoked]", {
+        bookingId,
+        state: "awaiting_contact",
+        handler: "handleAwaitingContact",
+      });
+
+      const rawText = String(ctx?.message ?? "");
+      const resolved = resolveBookingContactPhone({
+        booking,
+        participantPhoneForDm: ctx?.participantPhoneForDm,
+        sessionKey: ctx?.sessionKey,
+      });
+      console.log("[booking_state_contact_resolved]", {
+        bookingId,
+        resolved: Boolean(resolved?.phone),
+        source: String(resolved?.source ?? "none"),
+      });
+
+      let finalPhone = resolved.phone;
+      let finalSource = resolved.source;
+
+      if (!finalPhone) {
+        let llmAccepted = {};
+        try {
+          console.log("[booking_slot_llm_extraction_started]", {
+            bookingId,
+            state: "awaiting_contact",
+          });
+          const llmOut = await applyBookingSlotLlmExtraction({
+            state: "awaiting_contact",
+            messageText: rawText,
+            booking,
+            participantPhoneForDm: ctx?.participantPhoneForDm,
+            sessionKey: ctx?.sessionKey,
+          });
+          llmAccepted = llmOut.accepted || {};
+          console.log("[booking_slot_llm_extraction_result]", {
+            bookingId,
+            state: "awaiting_contact",
+            acceptedKeys: Object.keys(llmAccepted),
+            reason: String(llmOut?.llm?.reason ?? "") || null,
+          });
+        } catch (err) {
+          console.log("[booking_slot_llm_extraction_failed]", {
+            bookingId,
+            state: "awaiting_contact",
+            reason: String(err?.message ?? err ?? "LLM_FAILED"),
+          });
+        }
+
+        const llmPhone = String(llmAccepted.contactPhone ?? "").trim();
+        // Try extracting from the current user message (rule-based).
+        const parsed = parseDeliveryDetails(rawText);
+        const fromParser = normalizePhoneDigits(parsed?.contactPhone);
+        const fromRegex = extractContactPhoneFromText(rawText);
+        const validated = validateBookingSlotForState({
+          state: "awaiting_contact",
+          messageText: rawText,
+          llmSlots: { contactPhone: fromParser || fromRegex || llmPhone || null },
+          booking,
+        });
+        const validatedPhone = String(validated?.accepted?.contactPhone ?? "").trim();
+        finalPhone = validatedPhone || null;
+        finalSource =
+          fromParser || fromRegex
+            ? "message.phone"
+            : validatedPhone
+              ? "validated.contactPhone"
+              : "none";
+        console.log("[booking_state_contact_resolved]", {
+          bookingId,
+          resolved: Boolean(finalPhone),
+          source: finalSource,
+        });
+      }
+
+      if (!finalPhone) {
+        // No phone after validation; ask again.
+        console.log("[booking_state_transition]", {
+          bookingId,
+          fromState: "awaiting_contact",
+          toState: "awaiting_contact",
+          extracted: { customerPhone: null },
+          rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        });
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply("Contact number share kar dein."),
+          updatedBookingFields: {},
+          nextState: "awaiting_contact",
+          bookingId,
+        };
+      }
+
+      // Finalize as before (approvalStage only when unified logistics rule passes).
+      if (finalPhone) {
+        const mergedForComplete = {
+          ...booking,
+          customerPhone: finalPhone,
+          ...(String(booking?.contactPhone ?? "").trim()
+            ? {}
+            : { contactPhone: finalPhone }),
+        };
+        const isComplete = isLogisticsComplete(
+          mergedForComplete,
+          logisticsCompletionPolicy
+        );
+        logLogisticsCompletionEvaluated({
+          bookingId,
+          booking: mergedForComplete,
+          isComplete,
+          source: "FSM",
+        });
+
+        const now = new Date();
+        const patch = {
+          customerPhone: finalPhone,
+          ...(String(booking?.contactPhone ?? "").trim() ? {} : { contactPhone: finalPhone }),
+          updatedAt: now,
+        };
+        if (isComplete) {
+          patch.approvalStage = "delivery_details_collected";
+          patch.deliveryDetailsCollectedAt = now;
+        }
+        await db
+          .collection("businesses")
+          .doc(String(ctx.userId))
+          .collection("bookings")
+          .doc(bookingId)
+          .update(patch);
+
+        const toState = isComplete
+          ? "delivery_details_collected"
+          : "awaiting_contact";
+        console.log("[booking_state_transition]", {
+          bookingId,
+          fromState: "awaiting_contact",
+          toState,
+          extracted: { customerPhone: finalPhone, source: finalSource },
+          rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+        });
+
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply(
+            isComplete
+              ? "Details complete hain. Booking set hai."
+              : "Contact number note kar liya 👍"
+          ),
+          updatedBookingFields: patch,
+          nextState: toState,
+          bookingId,
+        };
+      }
+
+      // (Unreachable) fallback
+      return {
+        handled: true,
+        replyText: finalizeBookingStateReply("Contact number share kar dein."),
+        updatedBookingFields: {},
+        nextState: "awaiting_contact",
+        bookingId,
+      };
+    }
+
+    return { handled: false };
+  }
+
+  // Step 1 (detection only): run early, no behavior change.
+  const bookingStateResult = await handleBookingConversationState({
+    userId,
+    source,
+    playwrightWebInbound: Boolean(playwrightWebInbound),
+    isGroupInbound: Boolean(isGroupInbound),
+    sessionKey,
+    bookingHint,
+    dmPlaywrightChatKey: null,
+    dmChatTitle: null,
+    message,
+  }).catch(() => ({ handled: false }));
+  if (bookingStateResult?.handled === true) {
+    return applyHybridOutboundResult(
+      {
+        reply: String(bookingStateResult.replyText ?? ""),
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(true),
+      },
+      routingCtx
+    );
+  }
+
   const dmTargetPhone = isRoutableDmTarget(participantPhoneForDm)
     ? String(participantPhoneForDm).trim()
     : "";
@@ -2508,9 +4090,17 @@ export async function processMessage({
         hasAddress: Boolean(details.address || booking.deliveryAddress),
         hasDeliveryTime: Boolean(details.deliveryTime || booking.deliveryTime),
       });
-      const confirmed =
-        Boolean(details.address || booking.deliveryAddress) &&
-        Boolean(details.deliveryTime || booking.deliveryTime);
+      const mergedAfterUpdate = { ...booking, ...update };
+      const confirmed = isLogisticsComplete(
+        mergedAfterUpdate,
+        logisticsCompletionPolicy
+      );
+      logLogisticsCompletionEvaluated({
+        bookingId: String(booking.id),
+        booking: mergedAfterUpdate,
+        isComplete: confirmed,
+        source: "parser",
+      });
       if (confirmed) {
         await db
           .collection("businesses")
@@ -2597,9 +4187,17 @@ export async function processMessage({
       hasAddress: Boolean(details.address || groupBookingMatch.deliveryAddress),
       hasDeliveryTime: Boolean(details.deliveryTime || groupBookingMatch.deliveryTime),
     });
-    const confirmed =
-      Boolean(details.address || groupBookingMatch.deliveryAddress) &&
-      Boolean(details.deliveryTime || groupBookingMatch.deliveryTime);
+    const mergedAfterGroupUpdate = { ...groupBookingMatch, ...update };
+    const confirmed = isLogisticsComplete(
+      mergedAfterGroupUpdate,
+      logisticsCompletionPolicy
+    );
+    logLogisticsCompletionEvaluated({
+      bookingId: String(groupBookingMatch.id),
+      booking: mergedAfterGroupUpdate,
+      isComplete: confirmed,
+      source: "parser",
+    });
     if (confirmed) {
       await db
         .collection("businesses")
@@ -2661,23 +4259,43 @@ export async function processMessage({
     const safeDurationDays = Math.max(1, Number(durationDays) || 1);
     let finalText;
     if (ownerApprovalFirstRequest) {
-      const waitingEvent = {
-        eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
-        itemName: safeItemName,
-        durationDays: safeDurationDays,
-        privacyMode: "group_safe",
-        nextStep: "ask_qualifying_question_while_waiting",
-      };
-      console.log("[booking_waiting_event_built]", {
-        bookingId: safeBookingId,
-        event: waitingEvent,
-      });
-      finalText = buildBookingWaitingEngagement(waitingEvent, conversationStyle);
-      console.log("[booking_waiting_response_generated]", {
-        bookingId: safeBookingId,
-        eventType: waitingEvent.eventType,
-        responsePreview: finalText.slice(0, 160),
-      });
+      const parsed = parseUserDuration(message);
+      const originalDurationText =
+        parsed && typeof parsed === "object" && Number.isFinite(Number(parsed.value)) && parsed.unit
+          ? `${Math.max(1, Math.floor(Number(parsed.value)))} ${String(parsed.unit).trim()}`
+          : null;
+      if (originalDurationText) {
+        const subject = safeItemName ? `${safeItemName} ` : "";
+        finalText =
+          conversationStyle === "casual_local"
+            ? `Perfect 👍 ${subject}${originalDurationText} ke liye note kar liya. City ke andar use karna hai ya outside city?`
+            : `Perfect 👍 I’ve noted ${subject}for ${originalDurationText}. Will you use it within the city or outside the city?`;
+        console.log("[booking_waiting_response_generated]", {
+          bookingId: safeBookingId,
+          eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
+          responsePreview: String(finalText).slice(0, 160),
+          durationDisplay: originalDurationText,
+          durationDays: safeDurationDays,
+        });
+      } else {
+        const waitingEvent = {
+          eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
+          itemName: safeItemName,
+          durationDays: safeDurationDays,
+          privacyMode: "group_safe",
+          nextStep: "ask_qualifying_question_while_waiting",
+        };
+        console.log("[booking_waiting_event_built]", {
+          bookingId: safeBookingId,
+          event: waitingEvent,
+        });
+        finalText = buildBookingWaitingEngagement(waitingEvent, conversationStyle);
+        console.log("[booking_waiting_response_generated]", {
+          bookingId: safeBookingId,
+          eventType: waitingEvent.eventType,
+          responsePreview: finalText.slice(0, 160),
+        });
+      }
       if (memory && typeof memory === "object") {
         memory.pendingEngagementState = buildPendingQualifierState({
           bookingId: safeBookingId,
@@ -2916,8 +4534,10 @@ export async function processMessage({
     });
   }
 
-  console.log("[DEBUG] isGreetingFirst:", isGreetingFirst);
-  console.log("[DEBUG] messageText:", message);
+  if (DEBUG_EXTRACT) {
+    console.log("[DEBUG] isGreetingFirst:", isGreetingFirst);
+    console.log("[DEBUG] messageText:", message);
+  }
 
   let knowledge = "";
 
@@ -2927,7 +4547,9 @@ export async function processMessage({
     console.error("[processor] knowledge extract/save:", e);
   }
 
-  console.log("[messageProcessor] Fetching profile for user:", userId);
+  if (DEBUG_EXTRACT) {
+    console.log("[messageProcessor] Fetching profile for user:", userId);
+  }
 
   let businessProfile = null;
   try {
@@ -3178,7 +4800,7 @@ export async function processMessage({
     }
   }
 
-  {
+  if (DEBUG_EXTRACT) {
     const servicesList = businessContext?.servicesList;
     console.log("[DEBUG] Business data:", {
       userId,
@@ -3200,6 +4822,42 @@ export async function processMessage({
 
   const extractionStartedAt = Date.now();
   const memForCatalogInput = getEmilySessionState(emilySessionKey);
+
+  // Intent classification is needed for safe routing decisions. We cache it so
+  // we can compute it early (before any early-booking returns) and reuse later
+  // without changing the underlying LLM / priority implementation.
+  /** @type {any | null} */
+  let llmIntentClassificationCached = null;
+  /** @type {any | null} */
+  let prioritizedIntentCached = null;
+
+  function isInformationalPriorityIntent(priorityIntent) {
+    const p = String(priorityIntent ?? "").trim().toLowerCase();
+    // NOTE: applyIntentPriority currently emits "price" (not "pricing").
+    return p === "price" || p === "pricing" || p === "details" || p === "information";
+  }
+
+  async function computeIntentPriorityIfNeeded({ selectedItem } = {}) {
+    if (llmIntentClassificationCached && prioritizedIntentCached) {
+      return { llmIntentClassificationCached, prioritizedIntentCached };
+    }
+
+    const previousAssistantForIntent =
+      getRecentAssistantReplies(userId, 1, sessionKey)[0] ?? "";
+    llmIntentClassificationCached = await classifyConversationIntentWithLLM({
+      messageText: message,
+      selectedItem: selectedItem ?? null,
+      memory: memForCatalogInput,
+      previousAssistantMessage: previousAssistantForIntent,
+      businessContext,
+    });
+    prioritizedIntentCached = applyIntentPriority(llmIntentClassificationCached, {
+      messageText: message,
+      hasDuration: durationDays != null,
+      hasContact: hasContactForBookingEarly,
+    });
+    return { llmIntentClassificationCached, prioritizedIntentCached };
+  }
   const currentFocusedItemForPinnedGuard =
     memForCatalogInput?.lastItem && typeof memForCatalogInput.lastItem === "object"
       ? memForCatalogInput.lastItem
@@ -3324,6 +4982,15 @@ export async function processMessage({
     ) ||
     String(durationMemoryCandidate?.name ?? "").trim() ||
     null;
+  if (isGroupInbound) {
+    console.log("[group_duration_context_check]", {
+      bareDurationMessage,
+      previousAssistantAskedDuration,
+      hasDurationMemoryItem: Boolean(normalizeId(durationMemoryCandidate?.id)),
+      sourceParticipantKey: sourceParticipantKey || null,
+      emilySessionKey,
+    });
+  }
   if (bareDurationMessage && durationContextAllowed && activeDurationItemId) {
     const activeAvailability = await getUserFacingAvailabilityForItem(
       activeDurationItemId,
@@ -3820,8 +5487,16 @@ export async function processMessage({
       transactionalIntent: true,
     };
   }
+  const continuationEligibleForMemoryBookingIntent =
+    isBookingContinuationShapedCurrentTurn(
+      message,
+      extracted.durationDays ?? null,
+      contactPartsEarly.isValid,
+      events
+    );
   if (
     durationDays != null &&
+    continuationEligibleForMemoryBookingIntent &&
     (memForCatalogInput?.hasBookingIntent === true || memForCatalogInput?.lastItem?.id)
   ) {
     events = {
@@ -3837,6 +5512,21 @@ export async function processMessage({
         item: memForCatalogInput?.lastItem?.name ?? null,
       }
     );
+  }
+  if (
+    isExplicitPricingOrDetailsQuestion(message) &&
+    !isBookingContinuationShapedCurrentTurn(
+      message,
+      extracted.durationDays ?? null,
+      contactPartsEarly.isValid,
+      events
+    )
+  ) {
+    events = {
+      ...events,
+      bookingIntent: false,
+      transactionalIntent: Boolean(events.orderIntent || events.confirmationIntent),
+    };
   }
   const nameForBooking =
     (effectiveEntityForItemFlow && entityType !== "category"
@@ -4001,6 +5691,67 @@ export async function processMessage({
           query: String(effectiveBookingName).slice(0, 120),
         },
       });
+
+      // Guard: same-participant continuation should not re-run availability against their own active booking.
+      // Conservative: only trigger when we have an active structured booking for this session + same item,
+      // and the current message does not look like a new item/availability/price/details request.
+      const structured = memForCatalogInput?.bookingState && typeof memForCatalogInput.bookingState === "object"
+        ? memForCatalogInput.bookingState
+        : null;
+      const structuredStatus = String(structured?.status ?? "").trim().toLowerCase();
+      const structuredBookingId = String(structured?.bookingId ?? "").trim();
+      const structuredItemId = normalizeId(structured?.itemId);
+      const currentItemId = normalizeId(row?.id);
+      const sameItem = Boolean(structuredItemId && currentItemId && structuredItemId === currentItemId);
+      const sameParticipantSession =
+        Boolean(structured?.sessionKey) && String(structured.sessionKey).trim() === String(emilySessionKey ?? "").trim();
+      const activeStatus = structuredStatus === "pending_approval" || structuredStatus === "approved";
+
+      const msgLower = String(message ?? "").trim().toLowerCase();
+      const explicitNewItemMention = Boolean(extractedEntity) || Boolean(pinnedEntityName) || Boolean(inboundEntity);
+      const explicitAvailabilityOrInfoQuestion = Boolean(
+        // NOTE: prioritizedIntent is declared later (after LLM intent classification).
+        // Do NOT reference it here (TDZ ReferenceError even with optional chaining).
+        /\b(avail|available|availability|price|rate|cost|charges?|kitna|kitni|kitne|model|color|colour|mileage|condition|photo|picture|pics|images)\b/i.test(
+          msgLower
+        )
+      );
+      console.log("[early_booking_guard_intent_signals]", {
+        explicitAvailabilityOrInfoQuestion,
+        usedSignals: ["keyword_regex"],
+      });
+      const explicitRestartOrNewBooking =
+        /\b(new|another|koi\s+aur|different)\b/i.test(msgLower) ||
+        /\b(book|booking|reserve|confirm|mujhe\s+chahiye|need|want)\b/i.test(msgLower);
+      const likelyFollowupAnswer =
+        !explicitNewItemMention &&
+        !explicitAvailabilityOrInfoQuestion &&
+        !explicitRestartOrNewBooking &&
+        String(message ?? "").trim().length <= 80;
+
+      const sameUserContinuation =
+        Boolean(structuredBookingId) &&
+        sameParticipantSession &&
+        activeStatus &&
+        sameItem &&
+        likelyFollowupAnswer;
+
+      if (sameUserContinuation) {
+        console.log("[booking_continuation_same_user_detected]", {
+          bookingId: structuredBookingId || null,
+          participantKey: String(sourceParticipantKey ?? "").trim() || null,
+          itemId: structuredItemId || null,
+          status: structuredStatus || null,
+          messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+          reason: "SAME_SESSION_ACTIVE_BOOKING_SAME_ITEM_FOLLOWUP",
+        });
+        console.log("[early_booking_skipped_due_to_same_user_continuation]", {
+          bookingId: structuredBookingId || null,
+          participantKey: String(sourceParticipantKey ?? "").trim() || null,
+          itemId: structuredItemId || null,
+        });
+      }
+
       const bookings = await getBookingsForItem(userId, row.id, row.name);
       const availabilityItemId = String(row?.id ?? "").trim();
       if (!availabilityItemId) {
@@ -4025,7 +5776,20 @@ export async function processMessage({
           }),
         },
       });
-      if (!av.isAvailable) {
+      // Ensure intent routing is available BEFORE any early-booking return.
+      const { prioritizedIntentCached: earlyPrioritizedIntent } =
+        await computeIntentPriorityIfNeeded({
+          selectedItem:
+            itemContext ??
+            resolvedItemFromCatalog ??
+            memForCatalogInput?.lastItem ??
+            null,
+        });
+      const isInformationalIntent = isInformationalPriorityIntent(
+        earlyPrioritizedIntent?.priorityIntent
+      );
+
+      if (!sameUserContinuation && !av.isAvailable && !isInformationalIntent) {
         const itemLabel = buildDisplayLabel(row) || String(row.name ?? "").trim();
         console.log("[final_reply_source]", {
           source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
@@ -4090,19 +5854,43 @@ export async function processMessage({
       }
 
       if (
+        !isInformationalIntent &&
         shouldPersist &&
         av.isAvailable &&
         hasDuration &&
         hasContactForBookingEarly
       ) {
-        if (
-          isDuplicateActiveBookingState(memForCatalogInput, {
-            itemId: row.id,
-            durationDays,
-            sessionKey: emilySessionKey,
-            channel: isGroupInbound ? "group" : "dm",
-          })
-        ) {
+        const duplicateEarly = isDuplicateActiveBookingState(memForCatalogInput, {
+          itemId: row.id,
+          durationDays,
+          sessionKey: emilySessionKey,
+          channel: isGroupInbound ? "group" : "dm",
+        });
+        const explicitPricingOrDetailsQuestionEarly =
+          isExplicitPricingOrDetailsQuestion(message);
+        const suppressDupEarly = shouldSuppressDuplicateAlreadyReceivedReply(
+          message,
+          extracted.durationDays ?? null,
+          contactPartsEarly.isValid,
+          events
+        );
+        const willReturnAlreadyReceivedEarly =
+          duplicateEarly && !suppressDupEarly;
+        console.log("[duplicate_booking_guard_decision]", {
+          messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+          itemId: row.id,
+          durationDays,
+          sessionKey: emilySessionKey,
+          duplicate: duplicateEarly,
+          duplicateReason: duplicateEarly
+            ? "active_booking_match"
+            : "no_match",
+          currentIntent: "early_booking_create",
+          priorityIntent: earlyPrioritizedIntent?.priorityIntent ?? null,
+          explicitPricingOrDetailsQuestion: explicitPricingOrDetailsQuestionEarly,
+          willReturnAlreadyReceived: willReturnAlreadyReceivedEarly,
+        });
+        if (willReturnAlreadyReceivedEarly) {
           return applyHybridOutboundResult(
             {
               reply: "Your booking has already been received. We’ll confirm it shortly.",
@@ -4114,25 +5902,36 @@ export async function processMessage({
             routingCtx
           );
         }
-        const r = await createBooking(traceId, userId, {
+        const r = await createBookingFromValidatedIntent({
+          callerTag: "early_booking_create",
+          isGroupInbound,
           itemId: row.id,
           itemName: row.name,
-          durationDays: durationDays,
-          customerName:
-            contactPartsEarly.name || String(memForCatalogInput?.customerName ?? "").trim() || undefined,
-          customerPhone:
-            extractedContactEarly || String(memForCatalogInput?.contact ?? "").trim() || undefined,
-          source,
-          groupName,
-          sessionKey,
-          messageId,
-          participantName,
-          senderScope,
-          playwrightChatKey,
-          dmTargetPhone: dmTargetPhone || undefined,
-          dmTargetSource: dmTargetSource || undefined,
-          canDmCustomer,
-          ...bookingSourceMessageMetadata,
+          durationDays,
+          hasParticipantIdentity: Boolean(sourceParticipantKey),
+          ownerApprovalFirstRequest: false,
+          traceId,
+          userId,
+          createBookingArgs: {
+            itemId: row.id,
+            itemName: row.name,
+            durationDays: durationDays,
+            customerName:
+              contactPartsEarly.name || String(memForCatalogInput?.customerName ?? "").trim() || undefined,
+            customerPhone:
+              extractedContactEarly || String(memForCatalogInput?.contact ?? "").trim() || undefined,
+            source,
+            groupName,
+            sessionKey,
+            messageId,
+            participantName,
+            senderScope,
+            playwrightChatKey,
+            dmTargetPhone: dmTargetPhone || undefined,
+            dmTargetSource: dmTargetSource || undefined,
+            canDmCustomer,
+            ...bookingSourceMessageMetadata,
+          },
         });
         if (!r?.ok && bookingErrorCode(r) === "ITEM_ALREADY_BOOKED") {
           console.log("[BOOKING BLOCKED - EARLY]", row.name);
@@ -4291,20 +6090,15 @@ export async function processMessage({
     other: "general",
     confirmation_followup: "confirmation_followup",
   };
-  const previousAssistantForIntent =
-    getRecentAssistantReplies(userId, 1, sessionKey)[0] ?? "";
-  const llmIntentClassification = await classifyConversationIntentWithLLM({
-    messageText: message,
-    selectedItem: itemContext ?? resolvedItemFromCatalog ?? memForCatalogInput?.lastItem ?? null,
-    memory: memForCatalogInput,
-    previousAssistantMessage: previousAssistantForIntent,
-    businessContext,
-  });
-  const prioritizedIntent = applyIntentPriority(llmIntentClassification, {
-    messageText: message,
-    hasDuration: durationDays != null,
-    hasContact: hasContactForBookingEarly,
-  });
+  const { llmIntentClassificationCached: llmIntentClassification } =
+    await computeIntentPriorityIfNeeded({
+      selectedItem:
+        itemContext ??
+        resolvedItemFromCatalog ??
+        memForCatalogInput?.lastItem ??
+        null,
+    });
+  const prioritizedIntent = prioritizedIntentCached;
   console.log("[intent_priority_applied]", {
     primaryIntent: llmIntentClassification.primaryIntent,
     priorityIntent: prioritizedIntent.priorityIntent,
@@ -4321,6 +6115,8 @@ export async function processMessage({
     detectedIntent = "booking";
   } else if (prioritizedIntent.priorityIntent === "delivery") {
     detectedIntent = "general";
+  } else if (prioritizedIntent.priorityIntent === "browse_options") {
+    detectedIntent = "browse_options";
   }
   const classifierIntentKey =
     inboundIntent != null && String(inboundIntent).trim() !== ""
@@ -4337,6 +6133,9 @@ export async function processMessage({
     detectedIntent = classifierToDetectedIntent[classifierIntentKey];
   }
   if (isBrowseOptionsIntent(message)) {
+    detectedIntent = "browse_options";
+  }
+  if (llmIntentClassification?.primaryIntent === "browse_options") {
     detectedIntent = "browse_options";
   }
   const shortConfirm = String(message ?? "").trim().toLowerCase();
@@ -4365,11 +6164,36 @@ export async function processMessage({
       itemContext = null;
     }
   }
+  const messageForGreetingGuard = String(message ?? "").trim();
+  const priorityIntentForGuard = String(
+    prioritizedIntent?.priorityIntent ?? ""
+  ).trim();
+  const hasRealIntentBypass =
+    priorityIntentForGuard === "availability" ||
+    priorityIntentForGuard === "price" ||
+    priorityIntentForGuard === "booking" ||
+    /\b(avail|available|availability)\b/i.test(messageForGreetingGuard) ||
+    isExplicitPricingOrDetailsQuestion(message) ||
+    events?.bookingIntent === true ||
+    detectedIntent === "availability" ||
+    detectedIntent === "pricing" ||
+    detectedIntent === "booking" ||
+    classifierIntentKey === "availability" ||
+    classifierIntentKey === "pricing" ||
+    classifierIntentKey === "booking";
+  if (hasRealIntentBypass) {
+    console.log("[GREETING_GUARD_BYPASSED_FOR_REAL_INTENT]", {
+      message: messageForGreetingGuard.slice(0, 200),
+      detectedIntent,
+      priorityIntent: priorityIntentForGuard || null,
+    });
+  }
   const isGreetingIntent =
-    detectedIntent === "greeting" ||
-    classifierIntentKey === "greeting" ||
-    isEnglishOnlyGreetingMessage(message) ||
-    /^(hi|hello|hey|assalam|aoa)\b/i.test(String(message ?? "").trim());
+    !hasRealIntentBypass &&
+    (detectedIntent === "greeting" ||
+      classifierIntentKey === "greeting" ||
+      isEnglishOnlyGreetingMessage(message) ||
+      /^(hi|hello|hey|assalam|aoa)\b/i.test(messageForGreetingGuard));
   if (isGreetingIntent) {
     history = "";
     console.log("[GREETING GUARD] Conversation history hard reset");
@@ -4478,6 +6302,35 @@ export async function processMessage({
     itemContext,
   });
   const conversationMemory = getEmilySessionState(emilySessionKey);
+
+  // Group privacy: after owner approval, logistics collection should happen in private chat.
+  if (isGroupInbound) {
+    const stageKey = String(conversationMemory?.approvalStage ?? conversationMemory?.stage ?? "")
+      .trim()
+      .toLowerCase();
+    const waitingStages = new Set([
+      "owner_approved_waiting_customer_details",
+      "waiting_customer_details",
+    ]);
+    if (waitingStages.has(stageKey)) {
+      console.warn("[group_privacy_action_blocked]", {
+        reason: "LOGISTICS_IN_GROUP_BLOCKED",
+        approvalStage: stageKey || null,
+        messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      });
+      console.log("[group_privacy_safe_handoff_sent]", {
+        approvalStage: stageKey || null,
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: "Main details private chat mein le leta hun.",
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(true),
+        },
+        routingCtx
+      );
+    }
+  }
   const wantsImages = detectShowImagesRequest(message);
   if (
     emilyTurn.userLanguageStyle === "ur-roman" ||
@@ -4513,6 +6366,11 @@ export async function processMessage({
   }
 
   if (detectedIntent === "browse_options") {
+    console.log("[browse_options_intent_detected]", {
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      classifierPrimary: llmIntentClassification?.primaryIntent ?? null,
+      priorityIntent: prioritizedIntent?.priorityIntent ?? null,
+    });
     const memoryLastItemBefore =
       conversationMemory?.lastItem && typeof conversationMemory.lastItem === "object"
         ? {
@@ -4537,6 +6395,9 @@ export async function processMessage({
 
     const wantsOther =
       /\b(?:other|aur|or)\b/i.test(String(message ?? ""));
+    const wantsServices =
+      /\b(service|services)\b/i.test(String(message ?? "")) ||
+      /\b(khidmat|khidmaat|service)\b/i.test(String(message ?? ""));
     const availableOptions = [];
     for (const row of normalizedCatalogForTurn) {
       if (!row || typeof row !== "object") continue;
@@ -4553,6 +6414,12 @@ export async function processMessage({
       availableOptions.push(row);
       if (availableOptions.length >= 5) break;
     }
+    const services =
+      businessProfile?.rawBusinessProfile &&
+      typeof businessProfile.rawBusinessProfile === "object" &&
+      Array.isArray(businessProfile.rawBusinessProfile.services)
+        ? businessProfile.rawBusinessProfile.services
+        : [];
 
     conversationMemory.stage = "BROWSING";
     conversationMemory.hasBookingIntent = false;
@@ -4576,10 +6443,20 @@ export async function processMessage({
       memoryLastItemBefore,
       memoryLastItemAfter,
     });
+    const reply = buildBrowseOfferingsReply({
+      items: availableOptions,
+      services: wantsServices || availableOptions.length === 0 ? services : [],
+      style: conversationStyle,
+    });
+    console.log("[browse_options_reply_built]", {
+      optionCount: availableOptions.length,
+      serviceCount: Array.isArray(services) ? services.length : 0,
+      replyPreview: String(reply ?? "").slice(0, 180) || null,
+    });
     console.log("[final_reply_source]", { source: "PHRASE_ENGINE" });
     return applyHybridOutboundResult(
       {
-        reply: buildBrowseOptionsReply(availableOptions, conversationStyle),
+        reply,
         type: "AI_MESSAGE",
         messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
       },
@@ -5439,26 +7316,24 @@ export async function processMessage({
   const hasKnowledgeForModel =
     businessProfile != null || hasUsefulBusinessData;
 
-  console.log("[DEBUG] Final AI input:", {
-    message,
-    intent,
-    emilyIntent: emilyTurn.emilyIntent,
-    contextKeys: Object.keys(contextData),
-    contextHasBusiness: contextData.business != null,
-    mergedKnowledgeChars: mergedKnowledge.length,
-    hasKnowledgeForModel,
-    businessName,
-    isGreetingFirst,
-    isDelayedCommitment,
-  });
+  if (DEBUG_EXTRACT) {
+    console.log("[DEBUG] Final AI input:", {
+      message,
+      intent,
+      emilyIntent: emilyTurn.emilyIntent,
+      contextKeys: Object.keys(contextData),
+      contextHasBusiness: contextData.business != null,
+      mergedKnowledgeChars: mergedKnowledge.length,
+      hasKnowledgeForModel,
+      businessName,
+      isGreetingFirst,
+      isDelayedCommitment,
+    });
+  }
 
-  const memoryDurationValue =
-    conversationMemory?.durationPreference != null &&
-    typeof conversationMemory.durationPreference === "object" &&
-    typeof conversationMemory.durationPreference.value === "number" &&
-    Number.isFinite(conversationMemory.durationPreference.value)
-      ? Math.max(1, Math.floor(conversationMemory.durationPreference.value))
-      : null;
+  const memoryDurationValue = getNormalizedDaysFromDurationPreference(
+    conversationMemory?.durationPreference
+  );
   const memoryBookingItemId =
     normalizeId(conversationMemory?.lastItem?.id) ||
     normalizeId(conversationMemory?.lastResolvedItemId);
@@ -5587,14 +7462,34 @@ export async function processMessage({
     bookingDurationDays != null &&
     (wasAwaitingContact || memory?.hasBookingIntent === true || resolvedEmilyIntent === "booking")
   ) {
-    if (
-      isDuplicateActiveBookingState(memory, {
-        itemId: memoryBookingItemId,
-        durationDays: bookingDurationDays,
-        sessionKey: emilySessionKey,
-        channel: isGroupInbound ? "group" : "dm",
-      })
-    ) {
+    const duplicateContact = isDuplicateActiveBookingState(memory, {
+      itemId: memoryBookingItemId,
+      durationDays: bookingDurationDays,
+      sessionKey: emilySessionKey,
+      channel: isGroupInbound ? "group" : "dm",
+    });
+    const explicitPricingContact = isExplicitPricingOrDetailsQuestion(message);
+    const suppressDupContact = shouldSuppressDuplicateAlreadyReceivedReply(
+      message,
+      extracted.durationDays ?? null,
+      contactParts.isValid,
+      events
+    );
+    const willReturnAlreadyReceivedContact =
+      duplicateContact && !suppressDupContact;
+    console.log("[duplicate_booking_guard_decision]", {
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      itemId: memoryBookingItemId,
+      durationDays: bookingDurationDays,
+      sessionKey: emilySessionKey,
+      duplicate: duplicateContact,
+      duplicateReason: duplicateContact ? "active_booking_match" : "no_match",
+      currentIntent: "contact_step_booking",
+      priorityIntent: prioritizedIntent?.priorityIntent ?? null,
+      explicitPricingOrDetailsQuestion: explicitPricingContact,
+      willReturnAlreadyReceived: willReturnAlreadyReceivedContact,
+    });
+    if (willReturnAlreadyReceivedContact) {
       console.log("[BOOKING SKIPPED - ALREADY CREATED]");
       return applyHybridOutboundResult(
         {
@@ -5611,25 +7506,36 @@ export async function processMessage({
       messageText: message,
       item: memoryBookingItemName || null,
     });
-    const bookingResult = await createBooking(traceId, userId, {
+    const bookingResult = await createBookingFromValidatedIntent({
+      callerTag: "contact_step_booking",
+      isGroupInbound,
       itemId: memoryBookingItemId,
       itemName: memoryBookingItemName || undefined,
       durationDays: bookingDurationDays,
-      customerName:
-        contactParts.name || String(memory?.customerName ?? "").trim() || undefined,
-      customerPhone:
-        extractedContact || String(memory?.contact ?? "").trim() || undefined,
-      source,
-      groupName,
-      sessionKey,
-      messageId,
-      participantName,
-      senderScope,
-      playwrightChatKey,
-      dmTargetPhone: dmTargetPhone || undefined,
-      dmTargetSource: dmTargetSource || undefined,
-      canDmCustomer,
-      ...bookingSourceMessageMetadata,
+      hasParticipantIdentity: Boolean(sourceParticipantKey),
+      ownerApprovalFirstRequest: false,
+      traceId,
+      userId,
+      createBookingArgs: {
+        itemId: memoryBookingItemId,
+        itemName: memoryBookingItemName || undefined,
+        durationDays: bookingDurationDays,
+        customerName:
+          contactParts.name || String(memory?.customerName ?? "").trim() || undefined,
+        customerPhone:
+          extractedContact || String(memory?.contact ?? "").trim() || undefined,
+        source,
+        groupName,
+        sessionKey,
+        messageId,
+        participantName,
+        senderScope,
+        playwrightChatKey,
+        dmTargetPhone: dmTargetPhone || undefined,
+        dmTargetSource: dmTargetSource || undefined,
+        canDmCustomer,
+        ...bookingSourceMessageMetadata,
+      },
     });
     if (!bookingResult?.ok && bookingErrorCode(bookingResult) === "ITEM_ALREADY_BOOKED") {
       console.log("[BOOKING BLOCKED - CONTACT STEP]", memoryBookingItemName);
@@ -5856,12 +7762,87 @@ export async function processMessage({
     reason: conversationRoute.reason,
   });
 
+  emit("INTENT_DECISION", {
+    detectedIntent,
+    classifierIntentKey,
+    priorityIntent: prioritizedIntent?.priorityIntent ?? null,
+    routeType: conversationRoute.routeType,
+    askedField: conversationRoute.askedField ?? prioritizedIntent?.askedField ?? null,
+    explicitPricingOrDetailsQuestion: isExplicitPricingOrDetailsQuestion(message),
+  });
+
+  const explicitPricingOrDetailsQuestionRoute =
+    isExplicitPricingOrDetailsQuestion(message);
+  const strongBookingCommitForShortcut =
+    hasStrongBookingCommitPhrase(message);
+  const bookingContinuationShapedForShortcut =
+    isBookingContinuationShapedCurrentTurn(
+      message,
+      extracted.durationDays ?? null,
+      contactParts.isValid,
+      events
+    );
+  const ownerApprovalBlockedByPricingIntent =
+    explicitPricingOrDetailsQuestionRoute && !strongBookingCommitForShortcut;
   const shouldRunGroupOwnerApprovalAfterDuration =
     ownerApprovalFirst &&
     Boolean(isGroupInbound) &&
     !bookingCreated &&
     hasDurationSignal === true &&
-    !hasContact;
+    !hasContact &&
+    bookingContinuationShapedForShortcut &&
+    !ownerApprovalBlockedByPricingIntent;
+
+  if (
+    ownerApprovalBlockedByPricingIntent &&
+    ownerApprovalFirst &&
+    Boolean(isGroupInbound) &&
+    !bookingCreated &&
+    hasDurationSignal === true &&
+    !hasContact
+  ) {
+    console.log("[group_owner_approval_skipped_pricing_intent]", {
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      extractedDurationDays: Number.isFinite(Number(extracted?.durationDays))
+        ? Number(extracted.durationDays)
+        : null,
+      explicitPricingOrDetailsQuestion: true,
+    });
+  }
+
+  let ownerShortcutReason = "other";
+  if (shouldRunGroupOwnerApprovalAfterDuration) {
+    ownerShortcutReason = "armed_group_owner_approval_after_duration";
+  } else if (!ownerApprovalFirst) {
+    ownerShortcutReason = "owner_approval_not_first";
+  } else if (!isGroupInbound) {
+    ownerShortcutReason = "not_group_inbound";
+  } else if (bookingCreated) {
+    ownerShortcutReason = "booking_already_created_this_turn";
+  } else if (!hasDurationSignal) {
+    ownerShortcutReason = "missing_duration_signal";
+  } else if (hasContact) {
+    ownerShortcutReason = "has_contact";
+  } else if (
+    explicitPricingOrDetailsQuestionRoute &&
+    !bookingContinuationShapedForShortcut
+  ) {
+    ownerShortcutReason = "pricing_or_details_without_booking_continuation";
+  }
+
+  console.log("[group_owner_approval_shortcut_decision]", {
+    messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+    isGroupInbound: Boolean(isGroupInbound),
+    hasDurationSignal,
+    hasContact,
+    bookingIntent: events.bookingIntent,
+    transactionalIntent: events.transactionalIntent,
+    priorityIntent: prioritizedIntent.priorityIntent,
+    askedField: prioritizedIntent.askedField,
+    explicitPricingOrDetailsQuestion: explicitPricingOrDetailsQuestionRoute,
+    willArmShortcut: shouldRunGroupOwnerApprovalAfterDuration,
+    reason: ownerShortcutReason,
+  });
 
   if (
     isConversationAiRoute(conversationRoute) &&
@@ -6089,12 +8070,22 @@ export async function processMessage({
         repeatsDurationQuestion,
         repeatsPrior,
       });
-      finalRoutedReply =
-        directReply ||
-        (conversationStyle === "casual_local"
-          ? "Ji, iski detail share kar deta hun — aap kaunsa point confirm karna chah rahe hain?"
-          : "Sure, I can share that detail — which point would you like me to confirm?");
-      finalRoutedReply = applyToneGuard(finalRoutedReply);
+      if (composedAnswer?.finalAuthority === true) {
+        console.log("[anti_repetition_skipped_verified_answer]", {
+          routeType: conversationRoute.routeType,
+          field: composedAnswer?.field ?? null,
+          source: composedAnswer?.source ?? null,
+          repeatsDurationQuestion,
+          repeatsPrior,
+        });
+      } else {
+        finalRoutedReply =
+          directReply ||
+          (conversationStyle === "casual_local"
+            ? "Ji, iski detail share kar deta hun — aap kaunsa point confirm karna chah rahe hain?"
+            : "Sure, I can share that detail — which point would you like me to confirm?");
+        finalRoutedReply = applyToneGuard(finalRoutedReply);
+      }
     }
     console.log("[ai_conversation_response_used]", {
       routeType: conversationRoute.routeType,
@@ -6139,14 +8130,36 @@ export async function processMessage({
     });
 
     if (approvalItemId && approvalDurationDays != null && approvalAvailable) {
-      if (
-        isDuplicateActiveBookingState(memory, {
-          itemId: approvalItemId,
-          durationDays: approvalDurationDays,
-          sessionKey: emilySessionKey,
-          channel: isGroupInbound ? "group" : "dm",
-        })
-      ) {
+      const duplicateApproval = isDuplicateActiveBookingState(memory, {
+        itemId: approvalItemId,
+        durationDays: approvalDurationDays,
+        sessionKey: emilySessionKey,
+        channel: isGroupInbound ? "group" : "dm",
+      });
+      const explicitPricingApproval =
+        isExplicitPricingOrDetailsQuestion(message);
+      const suppressDupApproval =
+        shouldSuppressDuplicateAlreadyReceivedReply(
+          message,
+          extracted.durationDays ?? null,
+          contactParts.isValid,
+          events
+        );
+      const willReturnAlreadyReceivedApproval =
+        duplicateApproval && !suppressDupApproval;
+      console.log("[duplicate_booking_guard_decision]", {
+        messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+        itemId: approvalItemId,
+        durationDays: approvalDurationDays,
+        sessionKey: emilySessionKey,
+        duplicate: duplicateApproval,
+        duplicateReason: duplicateApproval ? "active_booking_match" : "no_match",
+        currentIntent: "group_owner_approval_flow",
+        priorityIntent: prioritizedIntent?.priorityIntent ?? null,
+        explicitPricingOrDetailsQuestion: explicitPricingApproval,
+        willReturnAlreadyReceived: willReturnAlreadyReceivedApproval,
+      });
+      if (willReturnAlreadyReceivedApproval) {
         return applyHybridOutboundResult(
           {
             reply: "Your booking has already been received. We’ll confirm it shortly.",
@@ -6163,22 +8176,33 @@ export async function processMessage({
         String(itemContext?.name ?? "").trim() ||
         memoryBookingItemName ||
         undefined;
-      const approvalResult = await createBooking(traceId, userId, {
+      const approvalResult = await createBookingFromValidatedIntent({
+        callerTag: "group_owner_approval_flow",
+        isGroupInbound,
         itemId: approvalItemId,
         itemName: approvalItemName,
         durationDays: approvalDurationDays,
-        source,
-        groupName,
-        sessionKey,
-        messageId,
-        participantName,
-        senderScope,
-        playwrightChatKey,
-        dmTargetPhone: dmTargetPhone || undefined,
-        dmTargetSource: dmTargetSource || undefined,
-        canDmCustomer,
-        approvalStage: "pending_owner_approval",
-        ...bookingSourceMessageMetadata,
+        hasParticipantIdentity: Boolean(sourceParticipantKey),
+        ownerApprovalFirstRequest: true,
+        traceId,
+        userId,
+        createBookingArgs: {
+          itemId: approvalItemId,
+          itemName: approvalItemName,
+          durationDays: approvalDurationDays,
+          source,
+          groupName,
+          sessionKey,
+          messageId,
+          participantName,
+          senderScope,
+          playwrightChatKey,
+          dmTargetPhone: dmTargetPhone || undefined,
+          dmTargetSource: dmTargetSource || undefined,
+          canDmCustomer,
+          approvalStage: "pending_owner_approval",
+          ...bookingSourceMessageMetadata,
+        },
       });
 
       if (!approvalResult?.ok && bookingErrorCode(approvalResult) === "ITEM_ALREADY_BOOKED") {
@@ -6611,12 +8635,8 @@ export async function processMessage({
 
   const memoryDurationRaw = conversationMemory?.durationPreference;
   const memoryDurationDays =
-    memoryDurationRaw != null &&
-    typeof memoryDurationRaw === "object" &&
-    typeof memoryDurationRaw.value === "number"
-      ? Number.isFinite(memoryDurationRaw.value)
-        ? Math.max(1, Math.floor(memoryDurationRaw.value))
-        : null
+    memoryDurationRaw != null && typeof memoryDurationRaw === "object"
+      ? getNormalizedDaysFromDurationPreference(memoryDurationRaw)
       : typeof memoryDurationRaw === "string"
         ? extractDurationFromMessage(memoryDurationRaw)
         : null;
@@ -6692,14 +8712,35 @@ export async function processMessage({
         finalReply =
           "Sorry, I couldn't confirm this option. Let me check and get back to you.";
       } else {
-        if (
-          isDuplicateActiveBookingState(conversationMemory, {
-            itemId: commitRow.id,
-            durationDays: memoryDurationDays,
-            sessionKey: emilySessionKey,
-            channel: isGroupInbound ? "group" : "dm",
-          })
-        ) {
+        const duplicateCommit = isDuplicateActiveBookingState(conversationMemory, {
+          itemId: commitRow.id,
+          durationDays: memoryDurationDays,
+          sessionKey: emilySessionKey,
+          channel: isGroupInbound ? "group" : "dm",
+        });
+        const explicitPricingCommit =
+          isExplicitPricingOrDetailsQuestion(message);
+        const suppressDupCommit = shouldSuppressDuplicateAlreadyReceivedReply(
+          message,
+          extracted.durationDays ?? null,
+          contactParts.isValid,
+          events
+        );
+        const willReturnAlreadyReceivedCommit =
+          duplicateCommit && !suppressDupCommit;
+        console.log("[duplicate_booking_guard_decision]", {
+          messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+          itemId: commitRow.id,
+          durationDays: memoryDurationDays,
+          sessionKey: emilySessionKey,
+          duplicate: duplicateCommit,
+          duplicateReason: duplicateCommit ? "active_booking_match" : "no_match",
+          currentIntent: "pre_commit_strong",
+          priorityIntent: prioritizedIntent?.priorityIntent ?? null,
+          explicitPricingOrDetailsQuestion: explicitPricingCommit,
+          willReturnAlreadyReceived: willReturnAlreadyReceivedCommit,
+        });
+        if (willReturnAlreadyReceivedCommit) {
           return applyHybridOutboundResult(
             {
               reply: "Your booking has already been received. We’ll confirm it shortly.",
@@ -6739,23 +8780,34 @@ export async function processMessage({
             }),
           },
         });
-        const commitBooking = await createBooking(traceId, userId, {
+        const commitBooking = await createBookingFromValidatedIntent({
+          callerTag: "commit_trigger_booking",
+          isGroupInbound,
           itemId: commitRow.id,
           itemName: commitRow.name,
           durationDays: memoryDurationDays,
-          customerName: String(conversationMemory?.customerName ?? "").trim() || undefined,
-          customerPhone: String(conversationMemory?.contact ?? "").trim() || undefined,
-          source,
-          groupName,
-          sessionKey,
-          messageId,
-          participantName,
-          senderScope,
-          playwrightChatKey,
-          dmTargetPhone: dmTargetPhone || undefined,
-          dmTargetSource: dmTargetSource || undefined,
-          canDmCustomer,
-          ...bookingSourceMessageMetadata,
+          hasParticipantIdentity: Boolean(sourceParticipantKey),
+          ownerApprovalFirstRequest: false,
+          traceId,
+          userId,
+          createBookingArgs: {
+            itemId: commitRow.id,
+            itemName: commitRow.name,
+            durationDays: memoryDurationDays,
+            customerName: String(conversationMemory?.customerName ?? "").trim() || undefined,
+            customerPhone: String(conversationMemory?.contact ?? "").trim() || undefined,
+            source,
+            groupName,
+            sessionKey,
+            messageId,
+            participantName,
+            senderScope,
+            playwrightChatKey,
+            dmTargetPhone: dmTargetPhone || undefined,
+            dmTargetSource: dmTargetSource || undefined,
+            canDmCustomer,
+            ...bookingSourceMessageMetadata,
+          },
         });
         if (!commitBooking?.ok && bookingErrorCode(commitBooking) === "ITEM_ALREADY_BOOKED") {
           console.log("[BOOKING RETRY BLOCKED]");
@@ -6929,6 +8981,11 @@ export async function processMessage({
     String(outFinal.reply).trim() !== ""
   ) {
     console.log("[final_reply_source]", { source: "AI_GENERAL" });
+    emit("FLOW_END", {
+      sendVia: outFinal.sendVia,
+      replyChars: String(outFinal.reply ?? "").length,
+      reason: "SUCCESS",
+    });
     appendConversationTurn(
       userId,
       message,
@@ -6954,4 +9011,89 @@ export async function processMessage({
       }
     );
   }
+}
+
+// Test-only export: allows unit tests to validate intent gating without calling LLMs.
+export function __isInformationalPriorityIntentForTests(priorityIntent) {
+  const p = String(priorityIntent ?? "").trim().toLowerCase();
+  return p === "price" || p === "pricing" || p === "details" || p === "information";
+}
+
+export function __isBookingContinuationShapedForTests(
+  message,
+  extractedDurationDays,
+  contactValidCurrent,
+  events
+) {
+  return isBookingContinuationShapedCurrentTurn(
+    message,
+    extractedDurationDays,
+    contactValidCurrent,
+    events
+  );
+}
+
+export function __shouldSuppressDuplicateAlreadyReceivedForTests(
+  message,
+  extractedDurationDays,
+  contactValid,
+  events
+) {
+  return shouldSuppressDuplicateAlreadyReceivedReply(
+    message,
+    extractedDurationDays,
+    contactValid,
+    events
+  );
+}
+
+export function __buildGroupWaitingEngagementForTests({
+  message,
+  itemName = "Civic",
+  conversationStyle = "casual_local",
+} = {}) {
+  const safeItemName = String(itemName ?? "").trim() || "your item";
+  const parsed = parseUserDuration(message);
+  const originalDurationText =
+    parsed && typeof parsed === "object" && Number.isFinite(Number(parsed.value)) && parsed.unit
+      ? `${Math.max(1, Math.floor(Number(parsed.value)))} ${String(parsed.unit).trim()}`
+      : null;
+  if (originalDurationText) {
+    const subject = safeItemName ? `${safeItemName} ` : "";
+    return conversationStyle === "casual_local"
+      ? `Perfect 👍 ${subject}${originalDurationText} ke liye note kar liya. City ke andar use karna hai ya outside city?`
+      : `Perfect 👍 I’ve noted ${subject}for ${originalDurationText}. Will you use it within the city or outside the city?`;
+  }
+  return buildBookingWaitingEngagement(
+    {
+      eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
+      itemName: safeItemName,
+      durationDays: 14,
+      privacyMode: "group_safe",
+      nextStep: "ask_qualifying_question_while_waiting",
+    },
+    conversationStyle
+  );
+}
+
+export function __antiRepetitionMayOverrideForTests({
+  finalRoutedReply,
+  recentAssistantForRoute = [],
+  composedAnswer = null,
+} = {}) {
+  const repeatsPrior = Array.isArray(recentAssistantForRoute) &&
+    recentAssistantForRoute.some(
+      (prior) => assistantReplySimilarity(finalRoutedReply, prior) >= 0.82
+    );
+  const wouldOverride = repeatsPrior && !(composedAnswer?.finalAuthority === true);
+  return { repeatsPrior, wouldOverride };
+}
+
+// Test-only export: semantic browse intent + reply builder.
+export function __isBrowseOptionsIntentForTests(message) {
+  return isBrowseOptionsIntent(message);
+}
+
+export function __buildBrowseOfferingsReplyForTests({ items = [], services = [], style = "neutral_english" } = {}) {
+  return buildBrowseOfferingsReply({ items, services, style });
 }

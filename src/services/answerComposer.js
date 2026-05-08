@@ -1,4 +1,5 @@
 import { enforceToneStyle, selectVariation } from "./responseStrategy.js";
+import { parseUserDuration } from "../duration/parseDuration.js";
 
 const FORBIDDEN_RE =
   /\b(AI|assistant|system|workflow|process|database|data(?:base)?|as per data|not mentioned|not available in (?:the )?system|please provide|your request)\b/i;
@@ -11,6 +12,7 @@ const KNOWN_FACT_FIELDS = new Set([
   "price_daily",
   "price_monthly",
   "price",
+  "price_with_duration",
   "attribute_color",
   "attribute_transmission",
   "features",
@@ -89,6 +91,27 @@ function colorFromDisplayLabel(item) {
 
 function detectAskedField(message) {
   const text = clean(message).toLowerCase();
+  // If the user is asking "what else / other options" (browse intent), do not treat "options" as item features.
+  if (
+    /\b(?:what\s+else|anything\s+else|any\s+other)\b/i.test(text) ||
+    /\b(?:other|another)\s+(?:option|options|item|items|product|products|service|services)\b/i.test(text) ||
+    /\b(?:aur|or|koi\s+aur)\b/i.test(text) && /\b(?:available|options?|items?|products?|services?)\b/i.test(text)
+  ) {
+    return "unknown";
+  }
+  const hasPricing =
+    /\b(price|rate|cost|charges?|rent|kitna|kitni|kitne)\b/.test(text);
+  const duration = parseUserDuration(text);
+  const hasDuration = duration != null && Number.isFinite(Number(duration.normalizedDays));
+  const asksTotal =
+    /\b(total|overall)\b/.test(text) ||
+    /\b(kitna\s+banega|kitna\s+banta|overall\s+kitna)\b/.test(text) ||
+    /\b(total\s+batao|overall\s+batao)\b/.test(text);
+  // "total"/"overall" with an explicit duration implies a duration-based price quote even without "rent" keyword.
+  if (asksTotal && hasDuration) return "price_with_duration";
+  if (hasPricing && hasDuration && !/\b(per\s*day|daily|\/day|din)\b/.test(text) && !/\b(month|monthly|mahina|maheena|mahine)\b/.test(text)) {
+    return "price_with_duration";
+  }
   if (/\b(month|monthly|mahina|maheena|mahine)\b/.test(text)) return "price_monthly";
   if (/\b(day|daily|per\s*day|\/day|din)\b/.test(text) && /\b(price|rate|cost|charges?|rent|kitna|kitni|kitne)\b/.test(text)) {
     return "price_daily";
@@ -126,6 +149,7 @@ function fieldValue(field, item, businessContext) {
   if (field === "price_daily") return dailyPriceValue(item) || priceValue(item);
   if (field === "price_monthly") return monthlyPriceValue(item);
   if (field === "price") return priceValue(item);
+  if (field === "price_with_duration") return dailyPriceValue(item) || priceValue(item);
   if (field === "attribute_color") {
     return firstPresent(
       item?.color,
@@ -162,6 +186,48 @@ function fieldValue(field, item, businessContext) {
     return item.isAvailable ? "available" : "unavailable";
   }
   return "";
+}
+
+function parseMoneyNumber(value) {
+  const raw = clean(value);
+  if (!raw) return null;
+  const match = raw.replace(/,/g, "").match(/\b(\d{2,})(?:\.\d+)?\b/);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function extractTotalCandidateNumber(text) {
+  const raw = clean(text);
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  const nums = raw.replace(/,/g, "").match(/\b\d{2,}\b/g) || [];
+  const parsed = nums.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0);
+  if (parsed.length === 0) return null;
+  // Prefer a "total" labeled number; else the largest number is likely the total.
+  const totalTagged = lower.match(/\b(total|overall)\b[\s\S]{0,30}\b(\d{2,})\b/);
+  if (totalTagged) {
+    const n = Number(String(totalTagged[2]).replace(/,/g, ""));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return Math.max(...parsed);
+}
+
+function sanitizeInformationalAnswerTwoLines(reply) {
+  let text = clean(reply)
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .replace(BLOCKED_INFORMATIONAL_RE, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text || FORBIDDEN_RE.test(text) || BLOCKED_INFORMATIONAL_RE.test(text)) {
+    return selectVariation("unknown_fallback", { index: 0 }).text;
+  }
+  const sentences = text
+    .split(/(?<=[.!?۔])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const out = sentences.slice(0, 2).join("\n").trim();
+  return enforceToneStyle(out || selectVariation("unknown_fallback", { index: 0 }).text);
 }
 
 function humanUnknown(field) {
@@ -443,6 +509,57 @@ export function composeInformationalAnswer({
       answerKnown: false,
     };
   }
+  if (field === "price_with_duration") {
+    const dur = parseUserDuration(message);
+    const durationDays =
+      dur != null && Number.isFinite(Number(dur.normalizedDays))
+        ? Math.max(1, Math.floor(Number(dur.normalizedDays)))
+        : null;
+    const dailyRaw = value;
+    const dailyNumber = parseMoneyNumber(dailyRaw);
+    const asksTotal =
+      /\b(total|overall)\b/i.test(clean(message)) ||
+      /\b(kitna\s+banega|kitna\s+banta|overall\s+kitna)\b/i.test(clean(message));
+    if (durationDays != null && dailyNumber != null) {
+      const total = dailyNumber * durationDays;
+      const draftTotal = extractTotalCandidateNumber(draft);
+      const draftGrounded =
+        draft &&
+        Number.isFinite(draftTotal) &&
+        Math.abs(Number(draftTotal) - total) <= Math.max(1, Math.floor(total * 0.005));
+      if (draftGrounded) {
+        console.log("[composer_verified_answer_used]", { field: "price_with_duration" });
+        return {
+          reply: sanitizeInformationalAnswerTwoLines(draft),
+          field: "price_with_duration",
+          source: "llm_draft_grounded",
+          unknownHumanized: false,
+          finalAuthority: true,
+          answerKnown: true,
+        };
+      }
+
+      const label = firstPresent(itemObj?.name, itemObj?.displayLabel) || "";
+      const dailyLine = dailyRaw ? `${label ? `${label} ka daily rent ` : ""}${clean(dailyRaw)} hai.` : "";
+      const totalLine = durationDays
+        ? `${durationDays} din ka total rent ${total} PKR hoga.`
+        : `Total rent ${total} PKR hoga.`;
+      const reply = asksTotal
+        ? totalLine
+        : `${dailyLine} ${totalLine}`.trim();
+      console.log("[composer_verified_answer_used]", { field: "price_with_duration" });
+      return {
+        reply: sanitizeInformationalAnswerTwoLines(reply),
+        field: "price_with_duration",
+        source: "verified_catalog",
+        unknownHumanized: false,
+        finalAuthority: true,
+        answerKnown: true,
+      };
+    }
+    // Fall back to existing price logic when duration missing or daily not numeric.
+  }
+
   if (value) {
     console.log("[composer_verified_answer_used]", { field });
     return {
@@ -542,4 +659,5 @@ export function applyToneGuard(reply) {
 export const _test = {
   detectAskedField,
   sanitizeInformationalAnswer,
+  sanitizeInformationalAnswerTwoLines,
 };
