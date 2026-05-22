@@ -51,6 +51,43 @@ test("parseUserDuration: Roman Urdu continuation phrase", () => {
   });
 });
 
+test("parseUserDuration: Roman Urdu hour aliases", () => {
+  const samples = [
+    "2 gnty",
+    "2 gnty k lye",
+    "6 ghnty",
+    "12 gnte",
+    "3 ghntay",
+    "4 ghantey",
+    "5 gantay",
+    "7 gante",
+  ];
+  for (const sample of samples) {
+    const r = parseUserDuration(sample);
+    assert.ok(r, sample);
+    assert.equal(r.unit, "hours", sample);
+    assert.equal(r.normalizedHours, Number.parseInt(sample, 10), sample);
+    assert.equal(r.normalizedDays, 1, sample);
+  }
+});
+
+test("parseUserDuration: half-day phrases", () => {
+  assert.deepEqual(parseUserDuration("aadha din"), {
+    value: 12,
+    unit: "hours",
+    normalizedDays: 1,
+    normalizedHours: 12,
+    billingUnit: "half_day",
+  });
+  assert.deepEqual(parseUserDuration("half day"), {
+    value: 12,
+    unit: "hours",
+    normalizedDays: 1,
+    normalizedHours: 12,
+    billingUnit: "half_day",
+  });
+});
+
 test("parseUserDuration: bare number", () => {
   assert.deepEqual(parseUserDuration("10"), {
     value: 10,

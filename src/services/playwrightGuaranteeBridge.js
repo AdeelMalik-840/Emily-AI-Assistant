@@ -35,7 +35,17 @@ export function buildPlaywrightGuaranteeKey(groupName, messageId) {
 
 /**
  * Listener: forward to buffer succeeded — remember anchor row until delivered or released.
- * @param {{ guaranteeKey: string, chatKey: string, rowKey: string, participantCursorKey?: string }} p
+ * @param {{
+ *   guaranteeKey: string,
+ *   chatKey: string,
+ *   rowKey: string,
+ *   participantCursorKey?: string,
+ *   ownerUserId?: string,
+ *   groupChatKey?: string,
+ *   participantKey?: string,
+ *   inboundId?: string,
+ *   sourceMessageIndex?: number | null,
+ * }} p
  */
 export function recordPlaywrightInboundScheduled(p) {
   const guaranteeKey = String(p.guaranteeKey ?? "").trim();
@@ -47,6 +57,14 @@ export function recordPlaywrightInboundScheduled(p) {
     chatKey: String(p.chatKey ?? "").trim(),
     rowKey: String(p.rowKey ?? "").trim(),
     participantCursorKey: String(p.participantCursorKey ?? "").trim(),
+    ownerUserId: String(p.ownerUserId ?? "").trim(),
+    groupChatKey: String(p.groupChatKey ?? p.chatKey ?? "").trim(),
+    participantKey: String(p.participantKey ?? "").trim(),
+    inboundId: String(p.inboundId ?? "").trim(),
+    sourceMessageIndex:
+      p.sourceMessageIndex != null && Number.isFinite(Number(p.sourceMessageIndex))
+        ? Number(p.sourceMessageIndex)
+        : null,
     timestamp: Date.now(),
   });
 }

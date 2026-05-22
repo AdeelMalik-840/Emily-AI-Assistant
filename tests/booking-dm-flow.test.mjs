@@ -2,11 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildBookingLogisticsCompletionPatch,
   buildBookingDetailsClarificationReply,
   evaluateBookingAttachmentAuthority,
+  getBookingLogisticsCompletionState,
   getBusinessWhatsAppLink,
   getGroupDmHandoffText,
   isBookingAttachAvailabilityQuery,
+  isLogisticsComplete,
   parseDeliveryDetails,
   selectApprovedBookingDetailsMatch,
 } from "../src/services/bookingDmFlow.js";
@@ -405,4 +408,102 @@ test("authority blocks ambiguous message unless exact missing detail is expected
   assert.equal(ambiguous.reason, "NO_EXPECTED_MISSING_DETAIL");
   assert.equal(exactMissing.allowed, true);
   assert.equal(exactMissing.reason, "MISSING_ADDRESS");
+});
+
+test("generic delivery logistics complete with method, address, and time", () => {
+  const booking = {
+    status: "approved",
+    approvalStage: "owner_approved_waiting_customer_details",
+    deliveryMethod: "delivery",
+    deliveryAddress: "Customer delivery area",
+    deliveryTime: "evening",
+  };
+
+  const state = getBookingLogisticsCompletionState(booking, { requireContact: false });
+  assert.equal(state.complete, true);
+  assert.equal(state.reason, "delivery_details_complete");
+  assert.equal(isLogisticsComplete(booking, { requireContact: false }), true);
+});
+
+test("generic completion patch advances stale waiting stage after logistics collection", () => {
+  const updatedAt = new Date("2026-01-01T10:00:00Z");
+  const { patch, completion } = buildBookingLogisticsCompletionPatch(
+    {
+      status: "approved",
+      approvalStage: "owner_approved_waiting_customer_details",
+      deliveryMethod: "delivery",
+      deliveryAddress: "Customer delivery area",
+    },
+    {
+      deliveryTime: "evening",
+      updatedAt,
+    },
+    { requireContact: false }
+  );
+
+  assert.equal(completion.complete, true);
+  assert.equal(patch.approvalStage, "delivery_details_collected");
+  assert.equal(patch.deliveryDetailsCollectedAt, updatedAt);
+});
+
+test("generic delivery logistics incomplete when address or time is missing", () => {
+  assert.equal(
+    isLogisticsComplete(
+      {
+        status: "approved",
+        deliveryMethod: "delivery",
+        deliveryTime: "evening",
+      },
+      { requireContact: false }
+    ),
+    false
+  );
+  assert.equal(
+    isLogisticsComplete(
+      {
+        status: "approved",
+        deliveryMethod: "delivery",
+        deliveryAddress: "Customer delivery area",
+      },
+      { requireContact: false }
+    ),
+    false
+  );
+});
+
+test("generic pickup logistics complete when pickup time exists", () => {
+  const state = getBookingLogisticsCompletionState(
+    {
+      status: "approved",
+      approvalStage: "waiting_customer_details",
+      deliveryMethod: "pickup",
+      deliveryTime: "morning",
+    },
+    { requireContact: false }
+  );
+
+  assert.equal(state.complete, true);
+  assert.equal(state.reason, "pickup_details_complete");
+});
+
+test("contact-required policy controls logistics completion", () => {
+  const booking = {
+    status: "approved",
+    deliveryMethod: "delivery",
+    deliveryAddress: "Customer delivery area",
+    deliveryTime: "evening",
+  };
+
+  assert.equal(isLogisticsComplete(booking, { requireContact: false }), true);
+  assert.equal(isLogisticsComplete(booking, { requireContact: true }), false);
+  assert.equal(
+    isLogisticsComplete(
+      {
+        ...booking,
+        customerPhone: "customer-contact",
+      },
+      { requireContact: true }
+    ),
+    true
+  );
 });

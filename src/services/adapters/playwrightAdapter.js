@@ -2,6 +2,7 @@ import {
   sendPlaywrightGroupImages,
   sendPlaywrightGroupText,
 } from "../playwrightOutboundBridge.js";
+import { logOutboundLifecycle } from "../outboundLifecycleLog.js";
 
 /**
  * @param {{
@@ -13,6 +14,7 @@ import {
  *     messageHash: string,
  *     dedupeWindowMs: number,
  *     lastPlaywrightTextSends: Map<string, { hash: string, timestamp: number }>,
+ *     outboundLifecycle?: Record<string, unknown>,
  *   }
  * }} p
  * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
@@ -27,7 +29,13 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
     messageHash,
     dedupeWindowMs,
     lastPlaywrightTextSends,
+    outboundLifecycle,
   } = context;
+
+  const lifecycleBase =
+    outboundLifecycle && typeof outboundLifecycle === "object"
+      ? outboundLifecycle
+      : {};
 
   if (!groupNameResolved.length) {
     console.error("BLOCKED SEND — NO CHAT NAME (Playwright title)", {
@@ -52,13 +60,44 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
       Array.isArray(messageMeta?.whatsappImageUrls) &&
       messageMeta.whatsappImageUrls.length > 0;
     let imagesDelivered = !wantsImages;
+    const activeHeaderTitle = String(
+      globalThis.__currentOpenChatTitle ?? groupNameResolved ?? ""
+    ).trim();
+
     if (textAlreadySentRecently) {
       console.log(
         "[whatsappInboundBuffer] text already sent for this inbound; skipping text resend"
       );
+      logOutboundLifecycle("duplicate_send_skipped", {
+        ...lifecycleBase,
+        reason: "playwright_text_hash_window",
+        outboundReplyDelivered: true,
+      });
+      logOutboundLifecycle("playwright_send_result", {
+        ...lifecycleBase,
+        ok: true,
+        activeHeaderTitle: activeHeaderTitle || null,
+      });
     } else {
-      ok = await sendPlaywrightGroupText(reply, {
-        expectedChat: groupNameResolved,
+      logOutboundLifecycle("playwright_send_start", {
+        ...lifecycleBase,
+        activeHeaderTitle: activeHeaderTitle || null,
+      });
+      let sendError = null;
+      try {
+        ok = await sendPlaywrightGroupText(reply, {
+          expectedChat: groupNameResolved,
+          outboundLifecycle: lifecycleBase,
+        });
+      } catch (sendErr) {
+        sendError = sendErr;
+        ok = false;
+      }
+      logOutboundLifecycle("playwright_send_result", {
+        ...lifecycleBase,
+        ok: ok === true,
+        error: sendError ? String(sendError?.message ?? sendError) : null,
+        activeHeaderTitle: activeHeaderTitle || null,
       });
       if (ok) {
         console.log("🧵 Text sent complete");

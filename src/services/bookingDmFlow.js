@@ -145,10 +145,14 @@ function hasAddressSignal(text, extractedSlots = {}) {
   const lower = raw.toLowerCase();
   if (clean(extractedSlots.address) || clean(extractedSlots.location)) return true;
   if (/^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(lower)) return false;
+  if (isInformationalItemQuestion(raw)) return false;
+  if (detectBroadDeliveryAreaHint(raw)?.areaOnly) return false;
   return (
-    /\b(deliver|delivery|address|location|loc|ghar|home|office|flat|house|street|road|sector|phase|block|near|opposite|mall|market|area|kahan|kidhar)\b/i.test(
+    /\b(deliver|delivery|address|location|loc|ghar|home|office|flat|house|street|road|sector|phase|block|near|opposite|mall|market|area)\b/i.test(
       raw
-    ) || raw.length >= 12
+    ) ||
+    /\b(house|street|phase|sector|block|road)\s*\d+\b/i.test(raw) ||
+    /\b\d+\s*(?:house|street|phase|sector|block|road)\b/i.test(raw)
   );
 }
 
@@ -466,6 +470,70 @@ export function getBusinessWhatsAppLink(businessContext, phoneNumberId = "") {
   return "";
 }
 
+export function isInformationalItemQuestion(text = "") {
+  const raw = String(text ?? "").trim();
+  const lower = raw.toLowerCase();
+  if (!lower) return false;
+  const hasQuestionShape =
+    /\?/.test(raw) ||
+    /\b(kya|kia|kesi|kaisi|kaisa|kaisay|kese|kahan|kidhar|where|what|which|batao|btado|bataye|confirm)\b/i.test(
+      raw
+    );
+  const hasInfoField =
+    /\b(condition|halat|haalat|new|used|mileage|milage|low mileage|slightly used|color|colour|model|price|rent|rate|details?|detail|available|availability)\b/i.test(
+      raw
+    ) ||
+    /\b(qeemat|kiraya|rang|gari|gaari|car)\b/i.test(raw);
+  if (hasQuestionShape && hasInfoField) return true;
+  return /\b(new\s+hai|used\s+hai|low mileage|slightly used)\b/i.test(raw);
+}
+
+export function isWeekdayOrDateOnlyMessage(text = "") {
+  const raw = String(text ?? "").trim();
+  const lower = raw.toLowerCase();
+  if (!lower) return false;
+  const hasWeekday =
+    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|peer|mangal|budh|jumeraat|jumerat|jumma|juma|hafta|itwar|ittewar|aitwar)\b/i.test(
+      lower
+    );
+  const hasDate =
+    /\b\d{1,2}\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(lower) ||
+    /\b(?:aaj|kal|parso|tomorrow|today)\b/i.test(lower);
+  if (!hasWeekday && !hasDate) return false;
+  return !/\b(deliver|delivery|address|house|street|phase|sector|block|pickup|contact|phone|number)\b/i.test(
+    lower
+  );
+}
+
+export function detectBroadDeliveryAreaHint(text = "") {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  const lower = raw.toLowerCase();
+  if (!lower) return null;
+  const areaMap = [
+    { pattern: /\b(?:rwp|rawalpindi)\b/i, display: "Rawalpindi" },
+    { pattern: /\b(?:isb|islamabad)\b/i, display: "Islamabad" },
+    { pattern: /\b(?:lhr|lahore)\b/i, display: "Lahore" },
+  ];
+  const match = areaMap.find((entry) => entry.pattern.test(lower));
+  if (!match) return null;
+  const hasDeliveryIntent = /\b(deliver|delivery|bhej|drop|chahiye|chaiye|chyh|chahye|need|want)\b/i.test(
+    lower
+  );
+  const isCoverageQuestion =
+    /\b(delivery|deliver)\b/i.test(lower) &&
+    /\b(hoti|possible|available|karte|krte|kahan|where|tak|area|areas)\b/i.test(lower) &&
+    /\?*$/.test(raw);
+  const addressLike = /\b(house|street|road|sector|phase|block|near|opposite|flat|office|market|mall)\b/i.test(
+    lower
+  );
+  return {
+    normalizedArea: match.display,
+    areaOnly: !addressLike,
+    hasDeliveryIntent,
+    isCoverageQuestion,
+  };
+}
+
 export function parseDeliveryDetails(text) {
   const raw = String(text ?? "").trim();
   const lower = raw.toLowerCase();
@@ -473,14 +541,34 @@ export function parseDeliveryDetails(text) {
     raw.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i) ||
     raw.match(/\b(?:at|around|by|time)\s+(\d{1,2})(?::(\d{2}))?\b/i) ||
     raw.match(/\b(\d{1,2})(?::(\d{2}))?\s*(?:baje|bjay)\b/i);
-  const hasLocationSignal =
-    /\b(deliver|delivery|address|location|loc|ghar|home|office|flat|house|street|road|sector|phase|block|near|opposite|mall|market|area|kahan|kidhar)\b/i.test(
+  const broadAreaHint = detectBroadDeliveryAreaHint(raw);
+  const hasAddressLikeSignal =
+    /\b(deliver|delivery|address|location|loc|ghar|home|office|flat|house|street|road|sector|phase|block|near|opposite|mall|market|area)\b/i.test(
       raw
-    ) || raw.length >= 12;
+    ) ||
+    /\b(house|street|phase|sector|block|road)\s*\d+\b/i.test(raw) ||
+    /\b\d+\s*(?:house|street|phase|sector|block|road)\b/i.test(raw);
   const phoneMatch = raw.match(/(?:\+92|0092|92|0)?3[\d\s-]{9,14}/);
   const isOnlyAck = /^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(lower);
+  const blockedQuestion =
+    isInformationalItemQuestion(raw) ||
+    isWeekdayOrDateOnlyMessage(raw) ||
+    (/\b(kya|kia|kesi|kaisi|kaisa|kahan|kidhar|where|what)\b/i.test(raw) &&
+      !hasAddressLikeSignal);
+  const address =
+    hasAddressLikeSignal &&
+    !isOnlyAck &&
+    !blockedQuestion &&
+    !(broadAreaHint?.areaOnly && !/\b(house|street|phase|sector|block|road)\b/i.test(lower))
+      ? raw
+      : "";
   return {
-    address: hasLocationSignal && !isOnlyAck ? raw : "",
+    address,
+    deliveryArea: broadAreaHint?.normalizedArea || "",
+    deliveryLocationHint: broadAreaHint?.normalizedArea || "",
+    areaOnly: Boolean(broadAreaHint?.areaOnly),
+    deliveryIntent: Boolean(broadAreaHint?.hasDeliveryIntent),
+    deliveryCoverageQuestion: Boolean(broadAreaHint?.isCoverageQuestion),
     deliveryTime: timeMatch ? timeMatch[0].trim() : "",
     contactPhone: phoneMatch ? phoneMatch[0].replace(/[^\d+]/g, "") : "",
   };
@@ -575,31 +663,75 @@ export function resolveLogisticsCompletionPolicy(overrides = {}) {
 }
 
 /**
+ * Unified logistics completion state, including the reason needed for safe logs/guards.
+ * @param {Record<string, unknown>} booking
+ * @param {LogisticsCompletionPolicy} [policy]
+ */
+export function getBookingLogisticsCompletionState(booking, policy) {
+  const p = resolveLogisticsCompletionPolicy(policy ?? {});
+  const requireContact = p.requireContact === true;
+
+  const method = String(booking?.deliveryMethod ?? "").trim();
+  if (!method) {
+    return { complete: false, reason: "missing_delivery_method", requireContact };
+  }
+
+  const methodKey = method.toLowerCase();
+  if (methodKey === "delivery") {
+    const addr = String(booking?.deliveryAddress ?? "").trim();
+    if (!addr) {
+      return { complete: false, reason: "missing_delivery_address", requireContact };
+    }
+  }
+
+  const time = String(booking?.deliveryTime ?? "").trim();
+  if (!time) {
+    return { complete: false, reason: "missing_delivery_time", requireContact };
+  }
+
+  if (requireContact) {
+    const phone = String(
+      booking?.customerPhone ?? booking?.contactPhone ?? ""
+    ).trim();
+    if (!phone) {
+      return { complete: false, reason: "missing_contact", requireContact };
+    }
+  }
+
+  return {
+    complete: true,
+    reason: methodKey === "pickup" ? "pickup_details_complete" : "delivery_details_complete",
+    requireContact,
+  };
+}
+
+export function buildBookingLogisticsCompletionPatch(booking, patch = {}, policy) {
+  const merged = { ...(booking || {}), ...(patch || {}) };
+  const completion = getBookingLogisticsCompletionState(merged, policy);
+  if (!completion.complete) return { patch: {}, completion };
+  const completedAt =
+    patch?.updatedAt instanceof Date
+      ? patch.updatedAt
+      : new Date();
+  return {
+    patch: {
+      approvalStage: "delivery_details_collected",
+      ...(booking?.deliveryDetailsCollectedAt
+        ? {}
+        : { deliveryDetailsCollectedAt: completedAt }),
+    },
+    completion,
+  };
+}
+
+/**
  * Unified rule for whether delivery logistics are complete (method, address when delivery,
  * time, optional contact per policy).
  * @param {Record<string, unknown>} booking
  * @param {LogisticsCompletionPolicy} [policy]
  */
 export function isLogisticsComplete(booking, policy) {
-  const p = resolveLogisticsCompletionPolicy(policy ?? {});
-  const requireContact = p.requireContact === true;
-
-  const method = String(booking?.deliveryMethod ?? "").trim();
-  if (!method) return false;
-  const methodKey = method.toLowerCase();
-  if (methodKey === "delivery") {
-    const addr = String(booking?.deliveryAddress ?? "").trim();
-    if (!addr) return false;
-  }
-  const time = String(booking?.deliveryTime ?? "").trim();
-  if (!time) return false;
-  if (requireContact) {
-    const phone = String(
-      booking?.customerPhone ?? booking?.contactPhone ?? ""
-    ).trim();
-    if (!phone) return false;
-  }
-  return true;
+  return getBookingLogisticsCompletionState(booking, policy).complete === true;
 }
 
 export function buildDeliveryDetailReply({ booking, updated }) {

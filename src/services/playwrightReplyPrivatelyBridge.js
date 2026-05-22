@@ -102,6 +102,179 @@ function normalizePhone(value) {
   return digits.length >= 10 && digits.length <= 15 ? digits : "";
 }
 
+function envFlagEnabled(name) {
+  return /^true$/i.test(String(process.env[name] ?? "").trim()) ||
+    String(process.env[name] ?? "").trim() === "1";
+}
+
+function dmContactPhoneExtractionDryRunEnabled() {
+  return envFlagEnabled("PLAYWRIGHT_DM_CONTACT_PHONE_EXTRACTION_DRY_RUN");
+}
+
+function dmContactPhoneExtractionEnabled() {
+  return envFlagEnabled("PLAYWRIGHT_DM_CONTACT_PHONE_EXTRACTION_ENABLED");
+}
+
+function shouldRunLegacyContactPhonePersistence({ dryRun } = {}) {
+  return dryRun !== true;
+}
+
+function maskPhone(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  if (!digits) return null;
+  return `${"*".repeat(Math.max(4, digits.length - 4))}${digits.slice(-4)}`;
+}
+
+function isPakistanMobileDigits(digits) {
+  const d = String(digits ?? "").replace(/\D/g, "");
+  return /^03\d{9}$/.test(d) || /^923\d{9}$/.test(d);
+}
+
+function isPlausibleE164Digits(digits) {
+  const d = String(digits ?? "").replace(/\D/g, "");
+  return d.length >= 10 && d.length <= 15;
+}
+
+function knownBusinessPhoneDigits() {
+  return [
+    process.env.WHATSAPP_BUSINESS_PHONE,
+    process.env.BUSINESS_WHATSAPP_PHONE,
+    process.env.OWNER_WHATSAPP_PHONE,
+    process.env.WHATSAPP_OWNER_PHONE,
+  ]
+    .map((value) => normalizePhone(value))
+    .filter(Boolean);
+}
+
+function safeDmContactLogContext(ctx = {}, extra = {}) {
+  return {
+    businessId: clean(ctx.businessId) || null,
+    bookingId: clean(ctx.bookingId) || null,
+    expectedDmChatKey: clean(ctx.expectedDmChatKey) || null,
+    expectedDmTitle: clean(ctx.expectedDmTitle) || null,
+    activeChatKey: clean(ctx.activeChatKey) || null,
+    activeChatTitle: clean(ctx.activeChatTitle) || null,
+    panelDetected:
+      typeof extra.panelDetected === "boolean" ? extra.panelDetected : undefined,
+    candidateCount:
+      Number.isFinite(Number(extra.candidateCount)) ? Number(extra.candidateCount) : undefined,
+    selectedConfidence: extra.selectedConfidence || undefined,
+    wouldStore: typeof extra.wouldStore === "boolean" ? extra.wouldStore : undefined,
+    skippedReason: clean(extra.skippedReason) || undefined,
+    maskedPhone: maskPhone(extra.phone) || undefined,
+    ...(extra.source ? { source: clean(extra.source) } : {}),
+  };
+}
+
+function scoreDmContactPhoneCandidate(candidate, allCandidates, panelDetected) {
+  const digits = normalizePhone(candidate?.raw);
+  const businessPhones = new Set(knownBusinessPhoneDigits());
+  const fromDiagnosticApp = candidate?.source === "#app";
+  const strongCandidates = allCandidates.filter(
+    (c) => c.source !== "#app" && normalizePhone(c.raw)
+  );
+  const distinctStrongPhones = Array.from(
+    new Set(strongCandidates.map((c) => normalizePhone(c.raw)).filter(Boolean))
+  );
+
+  if (!digits) {
+    return {
+      confidence: "low",
+      reason: "PHONE_NORMALIZATION_FAILED",
+      selected: false,
+    };
+  }
+  if (businessPhones.has(digits)) {
+    return {
+      confidence: "low",
+      reason: "MATCHES_KNOWN_BUSINESS_PHONE",
+      selected: false,
+    };
+  }
+  if (fromDiagnosticApp) {
+    return {
+      confidence: "low",
+      reason: "APP_FALLBACK_DIAGNOSTIC_ONLY",
+      selected: false,
+    };
+  }
+  if (!panelDetected) {
+    return {
+      confidence: "low",
+      reason: "CONTACT_PANEL_NOT_CONFIRMED",
+      selected: false,
+    };
+  }
+  if (distinctStrongPhones.length > 1) {
+    return {
+      confidence: "low",
+      reason: "MULTIPLE_CONFLICTING_STRONG_CANDIDATES",
+      selected: false,
+    };
+  }
+  if (isPakistanMobileDigits(digits) && distinctStrongPhones.length === 1) {
+    return {
+      confidence: "high",
+      reason: "PAKISTAN_MOBILE_SINGLE_STRONG_CANDIDATE",
+      selected: true,
+    };
+  }
+  if (isPlausibleE164Digits(digits)) {
+    return {
+      confidence: "medium",
+      reason: "GENERAL_PHONE_SINGLE_STRONG_CANDIDATE",
+      selected: true,
+    };
+  }
+  return {
+    confidence: "low",
+    reason: "PHONE_FORMAT_NOT_PLAUSIBLE",
+    selected: false,
+  };
+}
+
+export function __scoreDmContactPhoneCandidateForTests({
+  candidate,
+  allCandidates = [],
+  panelDetected = false,
+} = {}) {
+  return scoreDmContactPhoneCandidate(candidate, allCandidates, panelDetected);
+}
+
+export function __shouldRunLegacyContactPhonePersistenceForTests(opts = {}) {
+  return shouldRunLegacyContactPhonePersistence(opts);
+}
+
+function buildLegacyBookingContactPhonePatch(data, phone) {
+  const normalized = normalizePhone(phone);
+  if (!normalized) return {};
+  const source = data && typeof data === "object" ? data : {};
+  const patch = {};
+  const existingCustomer = normalizePhone(source?.customerPhone);
+  const existingContact = normalizePhone(source?.contactPhone);
+  const existingDmTarget = normalizePhone(source?.dmTargetPhone);
+  const existingSourcePhone = normalizePhone(
+    source?.sourceIdentity?.participantPhone
+  );
+
+  if (!existingCustomer) patch.customerPhone = normalized;
+  if (!existingContact) patch.contactPhone = normalized;
+  if (!existingDmTarget) patch.dmTargetPhone = normalized;
+  if (
+    source?.sourceIdentity &&
+    typeof source.sourceIdentity === "object" &&
+    !existingSourcePhone
+  ) {
+    patch["sourceIdentity.participantPhone"] = normalized;
+  }
+  patch.updatedAt = new Date();
+  return patch;
+}
+
+export function __buildLegacyBookingContactPhonePatchForTests(data, phone) {
+  return buildLegacyBookingContactPhonePatch(data, phone);
+}
+
 /**
  * Best-effort: extract the active DM contact phone from the WhatsApp UI.
  * Must be called ONLY after DM is opened+verified. Never throws.
@@ -189,6 +362,327 @@ export async function extractActiveDmContactPhone(page) {
     return phone || null;
   } catch {
     return null;
+  }
+}
+
+async function runDmContactPhoneExtractionDryRun(page, ctx = {}) {
+  const startedAt = Date.now();
+  const expectedDmChatKey = clean(ctx.expectedDmChatKey);
+  const expectedDmTitle = clean(ctx.expectedDmTitle);
+  const baseCtx = {
+    ...ctx,
+    expectedDmChatKey,
+    expectedDmTitle,
+  };
+  let activeChatTitle = "";
+  let activeChatKey = "";
+  let panelDetected = false;
+  let selected = null;
+
+  const withTimeout = async (fn, ms, fallback = null) => {
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+      ]);
+    } catch {
+      return fallback;
+    }
+  };
+
+  try {
+    activeChatTitle = await readOpenConversationHeaderTitle(page).catch(() => "");
+    activeChatKey = normalizeTitle(activeChatTitle);
+    console.log("[dm_contact_phone_dry_run_started]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle,
+      activeChatKey,
+    }, {
+      wouldStore: false,
+    }));
+    console.log("[dm_contact_phone_expected_dm_context]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle,
+      activeChatKey,
+    }, {
+      skippedReason:
+        expectedDmChatKey && activeChatKey && expectedDmChatKey !== activeChatKey
+          ? "ACTIVE_CHAT_KEY_DIFFERS_FROM_EXPECTED"
+          : "",
+      wouldStore: false,
+    }));
+
+    if (expectedDmChatKey && activeChatKey && expectedDmChatKey !== activeChatKey) {
+      console.log("[dm_contact_phone_dry_run_failed_safe]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        skippedReason: "ACTIVE_CHAT_KEY_DIFFERS_FROM_EXPECTED",
+        selectedConfidence: "none",
+        wouldStore: false,
+      }));
+      return { ok: false, reason: "ACTIVE_CHAT_KEY_DIFFERS_FROM_EXPECTED" };
+    }
+
+    console.log("[dm_contact_phone_panel_open_attempt]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle,
+      activeChatKey,
+    }, {
+      wouldStore: false,
+    }));
+
+    const headerTitle = page.locator("#main header span[title]").first();
+    const headerTitleCount = await headerTitle.count().catch(() => 0);
+    if (headerTitleCount === 0) {
+      console.log("[dm_contact_phone_panel_not_detected]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        panelDetected: false,
+        skippedReason: "HEADER_TITLE_NOT_FOUND",
+        selectedConfidence: "none",
+        wouldStore: false,
+      }));
+      return { ok: false, reason: "HEADER_TITLE_NOT_FOUND" };
+    }
+    await headerTitle.click({ timeout: 1000 }).catch(() => null);
+    await page.waitForTimeout(250).catch(() => null);
+
+    const panelSnapshot = await withTimeout(async () => page.evaluate(() => {
+      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const phoneRe = /(?:\+?\d[\d\s().-]{8,}\d|0\d[\d\s().-]{8,}\d)/g;
+      const isVisible = (el) => {
+        if (!el || !(el instanceof Element)) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 &&
+          rect.height > 0 &&
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.opacity !== "0";
+      };
+      const looksLikeContactPanel = (text) => {
+        const lower = clean(text).toLowerCase();
+        return /\b(contact info|profile|profile details|phone|mobile|about|business account|message|audio|video|block|report)\b/i.test(lower) ||
+          /(?:\+?\d[\d\s().-]{8,}\d|0\d[\d\s().-]{8,}\d)/.test(lower);
+      };
+      const roots = [
+        { source: '[data-testid="drawer-right"]', node: document.querySelector('[data-testid="drawer-right"]'), diagnosticOnly: false },
+        { source: '[data-testid="drawer"]', node: document.querySelector('[data-testid="drawer"]'), diagnosticOnly: false },
+        { source: 'div[role="dialog"]', node: document.querySelector('div[role="dialog"]'), diagnosticOnly: false },
+        { source: "#app", node: document.querySelector("#app"), diagnosticOnly: true },
+      ];
+      const candidates = [];
+      let detected = false;
+      let detectedSource = "";
+      for (const root of roots) {
+        if (!root.node || !isVisible(root.node)) continue;
+        const text = clean(root.node.innerText || root.node.textContent || "");
+        const contactLike = looksLikeContactPanel(text);
+        if (!root.diagnosticOnly && contactLike) {
+          detected = true;
+          detectedSource = detectedSource || root.source;
+        }
+        const values = new Set();
+        for (const match of text.match(phoneRe) || []) values.add(match);
+        for (const el of Array.from(root.node.querySelectorAll("[href^='tel:'], [aria-label], [title]"))) {
+          const href = clean(el.getAttribute("href") || "");
+          const aria = clean(el.getAttribute("aria-label") || "");
+          const title = clean(el.getAttribute("title") || "");
+          for (const raw of [href.replace(/^tel:/i, ""), aria, title]) {
+            for (const match of raw.match(phoneRe) || []) values.add(match);
+          }
+        }
+        for (const raw of values) {
+          candidates.push({
+            raw,
+            source: root.source,
+            diagnosticOnly: root.diagnosticOnly,
+            panelContactLike: contactLike,
+          });
+        }
+      }
+      return { panelDetected: detected, detectedSource, candidates };
+    }), 1500, { panelDetected: false, detectedSource: "", candidates: [] });
+
+    panelDetected = panelSnapshot?.panelDetected === true;
+    if (panelDetected) {
+      console.log("[dm_contact_phone_panel_detected]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        panelDetected: true,
+        source: panelSnapshot?.detectedSource || null,
+        wouldStore: false,
+      }));
+    } else {
+      console.log("[dm_contact_phone_panel_not_detected]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        panelDetected: false,
+        skippedReason: "CONTACT_PANEL_NOT_CONFIRMED",
+        selectedConfidence: "none",
+        wouldStore: false,
+      }));
+    }
+
+    const rawCandidates = Array.isArray(panelSnapshot?.candidates)
+      ? panelSnapshot.candidates
+      : [];
+    const candidates = rawCandidates
+      .map((candidate) => ({
+        raw: clean(candidate?.raw),
+        source: clean(candidate?.source) || "unknown",
+        diagnosticOnly: candidate?.diagnosticOnly === true,
+        panelContactLike: candidate?.panelContactLike === true,
+      }))
+      .filter((candidate) => clean(candidate.raw));
+
+    console.log("[dm_contact_phone_candidates_found]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle,
+      activeChatKey,
+    }, {
+      panelDetected,
+      candidateCount: candidates.length,
+      selectedConfidence: "none",
+      wouldStore: false,
+    }));
+
+    const scored = candidates.map((candidate) => {
+      const score = scoreDmContactPhoneCandidate(candidate, candidates, panelDetected);
+      console.log("[dm_contact_phone_candidate_scored]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        panelDetected,
+        candidateCount: candidates.length,
+        selectedConfidence: score.confidence,
+        skippedReason: score.reason,
+        phone: candidate.raw,
+        source: candidate.source,
+        wouldStore: false,
+      }));
+      return { candidate, score };
+    });
+
+    selected = scored.find((entry) => entry.score.selected === true) || null;
+    if (selected) {
+      console.log("[dm_contact_phone_candidate_selected]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        panelDetected,
+        candidateCount: candidates.length,
+        selectedConfidence: selected.score.confidence,
+        phone: selected.candidate.raw,
+        source: selected.candidate.source,
+        wouldStore: false,
+      }));
+    }
+    for (const entry of scored.filter((item) => item !== selected)) {
+      console.log("[dm_contact_phone_candidate_rejected]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        panelDetected,
+        candidateCount: candidates.length,
+        selectedConfidence: entry.score.confidence,
+        skippedReason: entry.score.reason,
+        phone: entry.candidate.raw,
+        source: entry.candidate.source,
+        wouldStore: false,
+      }));
+    }
+    if (!selected && candidates.length === 0) {
+      console.log("[dm_contact_phone_candidate_rejected]", safeDmContactLogContext({
+        ...baseCtx,
+        activeChatTitle,
+        activeChatKey,
+      }, {
+        panelDetected,
+        candidateCount: 0,
+        selectedConfidence: "none",
+        skippedReason: "NO_PHONE_CANDIDATES_FOUND",
+        wouldStore: false,
+      }));
+    }
+
+    return {
+      ok: true,
+      panelDetected,
+      candidateCount: candidates.length,
+      selectedConfidence: selected?.score?.confidence || "none",
+    };
+  } catch (err) {
+    console.log("[dm_contact_phone_dry_run_failed_safe]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle,
+      activeChatKey,
+    }, {
+      panelDetected,
+      selectedConfidence: selected?.score?.confidence || "none",
+      skippedReason: String(err?.message ?? err ?? "DRY_RUN_FAILED"),
+      wouldStore: false,
+    }));
+    return { ok: false, reason: "DRY_RUN_FAILED_SAFE" };
+  } finally {
+    console.log("[dm_contact_phone_panel_close_attempt]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle,
+      activeChatKey,
+    }, {
+      panelDetected,
+      selectedConfidence: selected?.score?.confidence || "none",
+      wouldStore: false,
+    }));
+    await page.keyboard.press("Escape").catch(() => null);
+    await page.waitForTimeout(250).catch(() => null);
+    const afterTitle = await readOpenConversationHeaderTitle(page).catch(() => "");
+    const afterKey = normalizeTitle(afterTitle);
+    console.log("[dm_contact_phone_panel_closed]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle: afterTitle || activeChatTitle,
+      activeChatKey: afterKey || activeChatKey,
+    }, {
+      panelDetected,
+      selectedConfidence: selected?.score?.confidence || "none",
+      skippedReason: afterKey && expectedDmChatKey && afterKey !== expectedDmChatKey
+        ? "ACTIVE_CHAT_KEY_DIFFERS_AFTER_CLOSE"
+        : "",
+      wouldStore: false,
+    }));
+    const composeReady = await activeComposeBoxReady(page).catch(() => false);
+    console.log("[dm_contact_phone_compose_reverified]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle: afterTitle || activeChatTitle,
+      activeChatKey: afterKey || activeChatKey,
+    }, {
+      panelDetected,
+      selectedConfidence: selected?.score?.confidence || "none",
+      skippedReason: composeReady ? "" : "COMPOSE_BOX_NOT_READY_AFTER_DRY_RUN",
+      wouldStore: false,
+    }));
+    console.log("[dm_contact_phone_dry_run_finished]", safeDmContactLogContext({
+      ...baseCtx,
+      activeChatTitle: afterTitle || activeChatTitle,
+      activeChatKey: afterKey || activeChatKey,
+    }, {
+      panelDetected,
+      selectedConfidence: selected?.score?.confidence || "none",
+      candidateCount: selected ? 1 : undefined,
+      wouldStore: false,
+      skippedReason: `duration_ms_${Date.now() - startedAt}`,
+    }));
   }
 }
 
@@ -1759,6 +2253,18 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
         : null,
   };
   const triedStrategies = [];
+  console.log("[reply_privately_source_anchor_selected]", {
+    bookingId: expected.bookingId,
+    participantName: expected.expectedParticipantName,
+    participantKey: expected.expectedParticipantKey,
+    sourceRowKey: expected.expectedSourceRowKey,
+    sourceMessageId: expected.expectedSourceMessageId,
+    sourceMessageIndex: expected.expectedSourceMessageIndex,
+    sourceTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
+    fallbackAnchorType: messageId ? "sourceMessageId" : expected.expectedSourceRowKey ? "sourceRowKey" : "participant_text",
+    groupChatKey: clean(sourceMessage?.groupChatKey ?? sourceMessage?.sourceGroupName ?? "") || null,
+    expectedTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
+  });
 
   const escapeCssAttrValue = (value) =>
     String(value ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -1844,6 +2350,13 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
   };
 
   const logResolutionFailedDetail = async () => {
+    const visibleCandidateCount = triedStrategies.reduce(
+      (sum, entry) => sum + Number(entry.visibleCount || 0),
+      0
+    );
+    const rejectedReasons = Array.from(
+      new Set(triedStrategies.map((entry) => clean(entry.reason)).filter(Boolean))
+    );
     console.warn("[reply_privately_locator_resolution_failed_detail]", {
       bookingId: expected.bookingId,
       expectedParticipantName: expected.expectedParticipantName,
@@ -1853,6 +2366,20 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       expectedSourceMessageId: expected.expectedSourceMessageId,
       expectedSourceMessageIndex: expected.expectedSourceMessageIndex,
       triedStrategies,
+    });
+    console.warn("[reply_privately_source_bubble_confirm_failed_diagnostics]", {
+      bookingId: expected.bookingId,
+      participantName: expected.expectedParticipantName,
+      participantKey: expected.expectedParticipantKey,
+      sourceRowKey: expected.expectedSourceRowKey,
+      sourceMessageId: expected.expectedSourceMessageId,
+      sourceMessageIndex: expected.expectedSourceMessageIndex,
+      sourceTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
+      fallbackAnchorType: triedStrategies.at(-1)?.strategy ?? null,
+      visibleCandidateCount,
+      rejectedReasons,
+      groupChatKey: clean(sourceMessage?.groupChatKey ?? sourceMessage?.sourceGroupName ?? "") || null,
+      expectedTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
     });
   };
 
@@ -1901,6 +2428,16 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
     bookingId: expected.bookingId,
     expectedText: text,
     participantName: participant,
+  });
+  console.log("[reply_privately_source_anchor_fallback_attempt]", {
+    bookingId: expected.bookingId,
+    fallbackAnchorType: "participant_text",
+    participantName: participant,
+    participantKey: expected.expectedParticipantKey,
+    sourceRowKey: expected.expectedSourceRowKey,
+    sourceMessageId: expected.expectedSourceMessageId,
+    sourceMessageIndex: expected.expectedSourceMessageIndex,
+    sourceTextPreview: text.slice(0, 120),
   });
   const bubble = page
     .locator("div.message-in")
@@ -2048,6 +2585,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
   // Truthful partial DM state: persist even on failures.
   let dmOpened = false;
   let dmMessageSent = false;
+  let sendActionAttempted = false;
   let verificationPassed = false;
   /** @type {string | null} */
   let failureStage = null;
@@ -2065,6 +2603,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
       ok: partial?.ok === true && partial?.verificationPassed === true,
       dmOpened: partial?.dmOpened === true,
       dmMessageSent: partial?.dmMessageSent === true,
+      sendActionAttempted: partial?.sendActionAttempted === true,
       verificationPassed: partial?.verificationPassed === true,
       failureStage: String(partial?.failureStage ?? "").trim() || null,
       errorCode: String(partial?.errorCode ?? partial?.reason ?? "").trim() || null,
@@ -2076,6 +2615,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
       ok: result.ok,
       dmOpened: result.dmOpened,
       dmMessageSent: result.dmMessageSent,
+      sendActionAttempted: result.sendActionAttempted,
       verificationPassed: result.verificationPassed,
       failureStage: result.failureStage,
       errorCode: result.errorCode,
@@ -2088,6 +2628,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
       ok: result.ok,
       dmOpened: result.dmOpened,
       dmMessageSent: result.dmMessageSent,
+      sendActionAttempted: result.sendActionAttempted,
       verificationPassed: result.verificationPassed,
       failureStage: result.failureStage,
       errorCode: result.errorCode,
@@ -2131,6 +2672,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
             verificationPassed: false,
             dmOpened,
             dmMessageSent,
+            sendActionAttempted,
             failureStage,
             errorCode,
             retryable,
@@ -2190,6 +2732,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           verificationPassed: false,
           dmOpened,
           dmMessageSent,
+          sendActionAttempted,
           failureStage,
           errorCode,
           retryable,
@@ -2235,6 +2778,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           verificationPassed: false,
           dmOpened,
           dmMessageSent,
+          sendActionAttempted,
           failureStage,
           errorCode,
           retryable,
@@ -2243,66 +2787,74 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         });
       }
 
-      // ADDITIVE ONLY: best-effort contact extraction after DM verified (no retries, never throws).
-      // MUST NOT run concurrently with send/verify; run once here with a hard ~2s budget in helper.
-      try {
-        const ownerUid = resolveOwnerUid();
-        if (ownerUid && bookingId) {
-          console.log("[reply_privately_contact_extraction_started]", {
-            bookingId: bookingId || null,
-          });
-          const phone = await extractActiveDmContactPhone(page).catch(() => null);
-          if (!phone) {
-            console.log("[reply_privately_contact_extraction_failed]", {
+      const contactPhoneDryRun = dmContactPhoneExtractionDryRunEnabled();
+      // Dry-run only: inspect contact info reliability without storing or affecting send.
+      if (contactPhoneDryRun) {
+        await runDmContactPhoneExtractionDryRun(page, {
+          businessId: resolveOwnerUid(),
+          bookingId,
+          expectedDmChatKey: dmPlaywrightChatKey,
+          expectedDmTitle: dmChatTitle,
+        }).catch((err) => {
+          console.log("[dm_contact_phone_dry_run_failed_safe]", safeDmContactLogContext({
+            businessId: resolveOwnerUid(),
+            bookingId,
+            expectedDmChatKey: dmPlaywrightChatKey,
+            expectedDmTitle: dmChatTitle,
+          }, {
+            skippedReason: String(err?.message ?? err ?? "DRY_RUN_FAILED"),
+            selectedConfidence: "none",
+            wouldStore: false,
+          }));
+        });
+      } else if (shouldRunLegacyContactPhonePersistence({ dryRun: contactPhoneDryRun })) {
+        // Preserve existing production behavior: best-effort contact extraction + booking patch.
+        // This is intentionally skipped only in explicit dry-run mode.
+        try {
+          const ownerUid = resolveOwnerUid();
+          if (ownerUid && bookingId) {
+            console.log("[reply_privately_contact_extraction_started]", {
               bookingId: bookingId || null,
-              reason: "NO_PHONE_EXTRACTED",
             });
-          } else {
-            console.log("[reply_privately_contact_extracted]", {
-              bookingId: bookingId || null,
-              phone,
-            });
-            const ref = db
-              .collection("businesses")
-              .doc(ownerUid)
-              .collection("bookings")
-              .doc(bookingId);
-            const snap = await ref.get().catch(() => null);
-            const data = snap?.exists ? snap.data() || {} : {};
-            const patch = {};
-            const existingCustomer = normalizePhone(data?.customerPhone);
-            const existingContact = normalizePhone(data?.contactPhone);
-            const existingDmTarget = normalizePhone(data?.dmTargetPhone);
-            const existingSourcePhone = normalizePhone(
-              data?.sourceIdentity?.participantPhone
-            );
-
-            if (!existingCustomer) patch.customerPhone = phone;
-            if (!existingContact) patch.contactPhone = phone;
-            if (!existingDmTarget) patch.dmTargetPhone = phone;
-            if (
-              data?.sourceIdentity &&
-              typeof data.sourceIdentity === "object" &&
-              !existingSourcePhone
-            ) {
-              patch["sourceIdentity.participantPhone"] = phone;
-            }
-            patch.updatedAt = new Date();
-
-            const keys = Object.keys(patch).filter((k) => k !== "updatedAt");
-            if (keys.length > 0) {
-              await ref.update(patch).catch(() => null);
-              console.log("[reply_privately_contact_persisted]", {
+            const phone = await extractActiveDmContactPhone(page).catch(() => null);
+            if (!phone) {
+              console.log("[reply_privately_contact_extraction_failed]", {
+                bookingId: bookingId || null,
+                reason: "NO_PHONE_EXTRACTED",
+              });
+            } else {
+              console.log("[reply_privately_contact_extracted]", {
                 bookingId: bookingId || null,
                 phone,
               });
+              const ref = db
+                .collection("businesses")
+                .doc(ownerUid)
+                .collection("bookings")
+                .doc(bookingId);
+              const snap = await ref.get().catch(() => null);
+              const data = snap?.exists ? snap.data() || {} : {};
+              const patch = buildLegacyBookingContactPhonePatch(data, phone);
+              const keys = Object.keys(patch).filter((k) => k !== "updatedAt");
+              if (keys.length > 0) {
+                await ref.update(patch).catch(() => null);
+                console.log("[reply_privately_contact_persisted]", {
+                  bookingId: bookingId || null,
+                  phone,
+                });
+              }
             }
           }
+        } catch (err) {
+          console.log("[reply_privately_contact_extraction_failed]", {
+            bookingId: bookingId || null,
+            reason: String(err?.message ?? err ?? "CONTACT_EXTRACTION_FAILED"),
+          });
         }
-      } catch (err) {
+      } else if (dmContactPhoneExtractionEnabled()) {
         console.log("[reply_privately_contact_extraction_failed]", {
           bookingId: bookingId || null,
-          reason: String(err?.message ?? err ?? "CONTACT_EXTRACTION_FAILED"),
+          reason: "CONTACT_EXTRACTION_DISABLED",
         });
       }
 
@@ -2334,6 +2886,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           verificationPassed: false,
           dmOpened,
           dmMessageSent,
+          sendActionAttempted,
           failureStage,
           errorCode,
           retryable,
@@ -2343,6 +2896,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
       }
       // A DM send attempt was made in the verified DM.
       dmMessageSent = true;
+      sendActionAttempted = true;
       await humanDelay(page);
       const dmLock = {
         chatKey: normalizeTitle(dmPlaywrightChatKey || dmChatTitle || ""),
@@ -2361,6 +2915,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           sendVerified.ok === true ? null : sendVerified.reason || "DM_SEND_VERIFY_FAILED",
         dmOpened,
         dmMessageSent,
+        sendActionAttempted,
         dmChatTitle,
         dmPlaywrightChatKey,
       });
@@ -2369,13 +2924,26 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           reason: sendVerified.reason || "DM_SEND_VERIFY_FAILED",
         });
         failureStage = "dm_send_verify";
-        errorCode = sendVerified.reason || "DM_SEND_VERIFY_FAILED";
-        retryable = true;
+        errorCode = "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT";
+        retryable = false;
+        console.warn("[reply_private_send_attempted_unverified]", {
+          bookingId: bookingId || null,
+          notificationPurpose: "owner_approved_customer_handoff",
+          notificationKey: bookingId
+            ? `${bookingId}::owner_approved_customer_handoff`
+            : null,
+          approvalCustomerNotificationStatus: null,
+          dmSendAttempted: true,
+          verificationPassed: false,
+          retryable: false,
+          reason: sendVerified.reason || "DM_SEND_VERIFY_FAILED",
+        });
         return finalizeResult({
           ok: false,
           verificationPassed: false,
           dmOpened,
           dmMessageSent,
+          sendActionAttempted,
           failureStage,
           errorCode,
           retryable,
@@ -2403,6 +2971,7 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         verificationPassed: true,
         dmOpened,
         dmMessageSent: true,
+        sendActionAttempted: true,
         failureStage: null,
         errorCode: null,
         retryable: true,
@@ -2421,13 +2990,16 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         dmPlaywrightChatKey,
       });
       failureStage = "exception";
-      errorCode = reason;
-      retryable = true;
+      errorCode = sendActionAttempted
+        ? "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT"
+        : reason;
+      retryable = sendActionAttempted ? false : true;
       return finalizeResult({
         ok: false,
         verificationPassed: false,
         dmOpened,
         dmMessageSent,
+        sendActionAttempted,
         failureStage,
         errorCode,
         retryable,

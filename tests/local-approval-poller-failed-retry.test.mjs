@@ -281,3 +281,164 @@ test("failed reply privately with dmOpened true never persists dmMessageSent tru
   assert.equal(booking.approvalCustomerNotificationError, "DM_SEND_VERIFY_FAILED");
 });
 
+test("send attempted but unverified is terminal manual review and not retryable", async () => {
+  const fake = createFakeDb({
+    bookings: [
+      {
+        id: "b_unverified",
+        data: baseApprovedBooking({
+          approvalCustomerNotificationStatus: "pending",
+          approvalCustomerNotificationTerminalFailure: false,
+          sourceIdentity: {
+            participantDisplayName: "Customer",
+            participantKey: "scope::abc",
+            sourceRowKey: "row::abc#1",
+            sourceMessageId: "user::1::1",
+            sourceTextPreview: "10 din",
+            sourceMessageIndex: 1,
+          },
+        }),
+      },
+    ],
+  });
+
+  let calls = 0;
+  const replyPrivately = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      verificationPassed: false,
+      dmOpened: true,
+      dmMessageSent: true,
+      sendActionAttempted: true,
+      failureStage: "dm_send_verify",
+      errorCode: "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT",
+      retryable: false,
+      dmChatTitle: "Customer",
+      dmPlaywrightChatKey: "customer",
+    };
+  };
+
+  await pollLocalApprovalContinuations({
+    dbInstance: fake.db,
+    ownerUserId: "owner1",
+    replyPrivately,
+  });
+
+  assert.equal(calls, 1);
+  const booking = fake.store.businesses.owner1.bookings.b_unverified.data;
+  assert.equal(booking.approvalCustomerNotificationStatus, "failed");
+  assert.equal(booking.approvalCustomerNotificationRetryable, false);
+  assert.equal(booking.approvalCustomerNotificationTerminalFailure, true);
+  assert.equal(
+    booking.approvalCustomerNotificationError,
+    "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT"
+  );
+  assert.equal(booking.dmMessageSent, false);
+  assert.equal(booking.dmSendAttempted, true);
+  assert.equal(booking.dmSendVerificationPassed, false);
+  assert.equal(booking.requiresManualReview, true);
+  assert.equal(
+    booking.replyPrivateCustomerNotificationKey,
+    "b_unverified::owner_approved_customer_handoff"
+  );
+  assert.equal(booking.replyPrivateNotificationPurpose, "owner_approved_customer_handoff");
+  assert.equal(booking.replyPrivateSourceRowKey, "row::abc#1");
+  assert.equal(booking.replyPrivateSourceMessageId, "user::1::1");
+  assert.equal(typeof booking.replyPrivateMessageHash, "string");
+});
+
+test("send attempted terminal manual review is not retried", async () => {
+  const fake = createFakeDb({
+    bookings: [
+      {
+        id: "b_already_attempted",
+        data: baseApprovedBooking({
+          approvalCustomerNotificationStatus: "pending",
+          approvalCustomerNotificationTerminalFailure: true,
+          approvalCustomerNotificationRetryable: false,
+          dmSendAttempted: true,
+          dmSendVerificationPassed: false,
+          requiresManualReview: true,
+          replyPrivateCustomerNotificationKey:
+            "b_already_attempted::owner_approved_customer_handoff",
+        }),
+      },
+    ],
+  });
+
+  let calls = 0;
+  await pollLocalApprovalContinuations({
+    dbInstance: fake.db,
+    ownerUserId: "owner1",
+    replyPrivately: async () => {
+      calls += 1;
+      return { ok: true, verificationPassed: true };
+    },
+  });
+
+  assert.equal(calls, 0);
+  const booking = fake.store.businesses.owner1.bookings.b_already_attempted.data;
+  assert.equal(booking.approvalCustomerNotificationStatus, "pending");
+});
+
+test("already dmMessageSent booking is skipped before sending", async () => {
+  const fake = createFakeDb({
+    bookings: [
+      {
+        id: "b_already_sent_dm",
+        data: baseApprovedBooking({
+          approvalCustomerNotificationStatus: "pending",
+          dmMessageSent: true,
+        }),
+      },
+    ],
+  });
+
+  let calls = 0;
+  await pollLocalApprovalContinuations({
+    dbInstance: fake.db,
+    ownerUserId: "owner1",
+    replyPrivately: async () => {
+      calls += 1;
+      return { ok: true, verificationPassed: true };
+    },
+  });
+
+  assert.equal(calls, 0);
+});
+
+test("compose failure before send action remains retryable", async () => {
+  const fake = createFakeDb({
+    bookings: [
+      {
+        id: "b_compose_failed",
+        data: baseApprovedBooking({
+          approvalCustomerNotificationStatus: "pending",
+          approvalCustomerNotificationTerminalFailure: false,
+        }),
+      },
+    ],
+  });
+
+  await pollLocalApprovalContinuations({
+    dbInstance: fake.db,
+    ownerUserId: "owner1",
+    replyPrivately: async () => ({
+      ok: false,
+      verificationPassed: false,
+      dmOpened: true,
+      dmMessageSent: false,
+      sendActionAttempted: false,
+      errorCode: "DM_SEND_FAILED",
+      retryable: true,
+    }),
+  });
+
+  const booking = fake.store.businesses.owner1.bookings.b_compose_failed.data;
+  assert.equal(booking.approvalCustomerNotificationStatus, "failed");
+  assert.equal(booking.approvalCustomerNotificationRetryable, true);
+  assert.equal(booking.approvalCustomerNotificationTerminalFailure, false);
+  assert.equal(booking.dmSendAttempted, false);
+});
+

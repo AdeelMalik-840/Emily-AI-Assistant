@@ -30,8 +30,17 @@ import {
   notifyPlaywrightGuaranteeReleased,
 } from "./playwrightGuaranteeBridge.js";
 import { setMessageState } from "./messageState.js";
+import {
+  normalizePlaywrightOutboundTrace,
+  savePlaywrightInboundCursor,
+} from "./playwrightInboundCursorStore.js";
+import { getEmilySessionState } from "./conversationIntelligence.js";
 import { randomUUID } from "node:crypto";
 import { logBookingEvent } from "../utils/bookingLogger.js";
+import {
+  buildOutboundLifecycleBase,
+  logOutboundLifecycle,
+} from "./outboundLifecycleLog.js";
 import { normalizeInboundMessage } from "./inboundNormalizer.js";
 import {
   markBookingNotificationFailed,
@@ -600,6 +609,120 @@ function releasePlaywrightChatFocusNoReply() {
 }
 
 /**
+ * Structured intentional silent no-op (no WhatsApp outbound, inbound still handled).
+ * @param {{ sendVia?: string | null, messageMeta?: Record<string, unknown> | null }} p
+ * @returns {boolean}
+ */
+export function isIntentionalSilentInboundResult(p) {
+  if (String(p?.sendVia ?? "").trim().toUpperCase() !== "NONE") return false;
+  const meta =
+    p?.messageMeta && typeof p.messageMeta === "object" ? p.messageMeta : null;
+  if (!meta) return false;
+  if (meta.handledWithoutOutbound === true) return true;
+  const trace =
+    meta.outboundTrace && typeof meta.outboundTrace === "object"
+      ? meta.outboundTrace
+      : null;
+  if (!trace) return false;
+  if (String(trace.kind ?? "").trim() === "silent_noop") return true;
+  if (String(trace.finalReplySource ?? "").trim() === "PURE_ACK_SILENT") return true;
+  return false;
+}
+
+/**
+ * Playwright tab inbound is complete when outbound delivered or intentional silent noop.
+ * @param {boolean} outboundReplyDelivered
+ * @param {boolean} intentionalSilent
+ * @returns {boolean}
+ */
+function playwrightInboundTurnComplete(outboundReplyDelivered, intentionalSilent) {
+  return Boolean(outboundReplyDelivered || intentionalSilent);
+}
+
+/**
+ * @param {string} gk
+ * @param {{ db?: unknown, ownerUserId?: string, messageMeta?: Record<string, unknown> | null }} [opts]
+ */
+async function advancePlaywrightInboundCompletion(gk, opts = {}) {
+  if (!gk) return;
+  const pending = globalThis.__playwrightPendingByGuarantee?.get(gk);
+  const listenerMsgId =
+    globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map
+      ? globalThis.__playwrightListenerMsgIdByGuarantee.get(gk)
+      : "";
+  if (pending?.chatKey && pending?.rowKey) {
+    globalThis.__lastProcessedRowKeyByChat =
+      globalThis.__lastProcessedRowKeyByChat || {};
+    globalThis.__lastProcessedRowKeyByChat[pending.chatKey] = pending.rowKey;
+    console.log("📍 Anchor advanced after delivery", {
+      chatKey: pending.chatKey,
+      rowKey: pending.rowKey,
+    });
+  }
+  if (pending?.chatKey && String(listenerMsgId ?? "").trim()) {
+    globalThis.__lastProcessedUserMsg =
+      globalThis.__lastProcessedUserMsg || Object.create(null);
+    const cursorKey =
+      String(pending.participantCursorKey ?? "").trim() ||
+      String(pending.chatKey).trim();
+    globalThis.__lastProcessedUserMsg[cursorKey] = String(listenerMsgId).trim();
+  }
+  const ownerForCursor = String(
+    opts.ownerUserId ?? pending?.ownerUserId ?? ""
+  ).trim();
+  const participantKeyForCursor = String(pending?.participantKey ?? "").trim();
+  const inboundIdForCursor =
+    String(pending?.inboundId ?? "").trim() ||
+    String(listenerMsgId ?? "").trim();
+  if (
+    ownerForCursor &&
+    pending?.chatKey &&
+    participantKeyForCursor &&
+    inboundIdForCursor
+  ) {
+    const saved = await savePlaywrightInboundCursor(opts.db, {
+      businessId: ownerForCursor,
+      chatKey: pending.chatKey,
+      groupChatKey: pending.groupChatKey || pending.chatKey,
+      participantKey: participantKeyForCursor,
+      lastProcessedInboundId: inboundIdForCursor,
+      lastProcessedRowKey: pending.rowKey || "",
+      lastProcessedSourceMessageIndex: pending.sourceMessageIndex,
+      lastProcessedAt: new Date(),
+      lastAssistantOutboundTrace: normalizePlaywrightOutboundTrace(
+        opts.messageMeta?.outboundTrace
+      ),
+    });
+    if (saved?.cursorKey) {
+      globalThis.__playwrightPersistedCursorByParticipant =
+        globalThis.__playwrightPersistedCursorByParticipant || Object.create(null);
+      const cursorKey =
+        String(pending.participantCursorKey ?? "").trim() ||
+        String(pending.chatKey).trim();
+      globalThis.__playwrightPersistedCursorByParticipant[cursorKey] = saved;
+      console.log("[playwright_cursor_persisted]", {
+        cursorKey,
+        storeKey: saved.cursorKey,
+        inboundId: inboundIdForCursor,
+        rowKey: pending.rowKey || null,
+      });
+    }
+  }
+  if (pending?.chatKey) {
+    globalThis.__chatResponding =
+      globalThis.__chatResponding || Object.create(null);
+    globalThis.__chatRespondingCooldownUntil =
+      globalThis.__chatRespondingCooldownUntil || Object.create(null);
+    globalThis.__chatResponding[pending.chatKey] = false;
+    globalThis.__chatRespondingCooldownUntil[pending.chatKey] = Date.now() + 2500;
+  }
+  notifyPlaywrightGuaranteeDelivered(gk);
+  if (globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map) {
+    globalThis.__playwrightListenerMsgIdByGuarantee.delete(gk);
+  }
+}
+
+/**
  * @param {FlushContext & {
  *   combinedMessage: string,
  *   structuredSnapshot: string,
@@ -663,6 +786,9 @@ export async function executeWhatsAppAiPipeline(p) {
     playwrightChatKey: playwrightChatKeyRaw = null,
     sourceRowKey: sourceRowKeyRaw = null,
     sourceMessageIndex: sourceMessageIndexRaw = null,
+    startupCatchup: startupCatchupRaw = false,
+    suppressAckNoopOutbound: suppressAckNoopOutboundRaw = false,
+    cursorLastAssistantOutboundTrace: cursorLastAssistantOutboundTraceRaw = null,
   } = p;
 
   const dmPlaywrightChatKey = String(dmPlaywrightChatKeyRaw ?? "").trim();
@@ -853,6 +979,10 @@ export async function executeWhatsAppAiPipeline(p) {
   let processingSuccess = false;
   /** Hoisted for guarantee bridge (Playwright deliver vs release). */
   let outboundReplyDelivered = false;
+  /** Intentional handled-without-outbound (e.g. PURE_ACK_SILENT). */
+  let intentionalSilent = false;
+  /** Hoisted for finally-block guarantee completion (declared inside try is TDZ in finally). */
+  let messageMeta = null;
 
   const groupLogFields =
     isGroupMessage === true
@@ -996,6 +1126,20 @@ export async function executeWhatsAppAiPipeline(p) {
         .map((m) => String(m ?? "").trim())
         .filter(Boolean)
     : [];
+  const startupCatchup = Boolean(startupCatchupRaw);
+  const suppressAckNoopOutbound = Boolean(suppressAckNoopOutboundRaw);
+  const cursorLastAssistantOutboundTrace = normalizePlaywrightOutboundTrace(
+    cursorLastAssistantOutboundTraceRaw
+  );
+  if (startupCatchup && cursorLastAssistantOutboundTrace && sessionKey) {
+    const memory = getEmilySessionState(sessionKey);
+    memory.lastAssistantOutbound = cursorLastAssistantOutboundTrace;
+    console.log("[playwright_cursor_outbound_trace_rehydrated]", {
+      sessionKey,
+      kind: cursorLastAssistantOutboundTrace.kind || null,
+      finalReplySource: cursorLastAssistantOutboundTrace.finalReplySource || null,
+    });
+  }
   if (isGroupInbound) {
     console.log("[group_participant_key_passed_to_processor]", {
       groupChatKey: String(groupNameResolved ?? "").trim() || null,
@@ -1008,7 +1152,10 @@ export async function executeWhatsAppAiPipeline(p) {
     });
   }
   const processStartedAt = Date.now();
-  const {
+  let reply;
+  let sendVia;
+  let dmRecipientPhone;
+  ({
     reply,
     messageMeta,
     sendVia,
@@ -1027,6 +1174,8 @@ export async function executeWhatsAppAiPipeline(p) {
     hasMultipleFragments,
     isGreetingFirst,
     isGroupInbound,
+    isGroupMessage,
+    whatsappRecipientType,
     playwrightWebInbound,
     bookingHint: p?.bookingHint ?? null,
     participantPhoneForDm:
@@ -1065,10 +1214,37 @@ export async function executeWhatsAppAiPipeline(p) {
       sourceMessageIndexRaw != null && Number.isFinite(Number(sourceMessageIndexRaw))
         ? Number(sourceMessageIndexRaw)
         : null,
-  });
+  }));
+  const finalReplySourceFromMeta = String(
+    messageMeta?.outboundTrace?.finalReplySource ?? ""
+  ).trim();
+  if (suppressAckNoopOutbound && finalReplySourceFromMeta === "PURE_ACK_NOOP") {
+    console.log("[stale_ack_noop_outbound_suppressed]", {
+      messageId: String(normalizedInbound.messageId ?? "").trim() || null,
+      sourceRowKey:
+        sourceRowKeyRaw != null && String(sourceRowKeyRaw).trim() !== ""
+          ? String(sourceRowKeyRaw).trim()
+          : null,
+    });
+    reply = "";
+    sendVia = "NONE";
+    messageMeta = {
+      ...(messageMeta && typeof messageMeta === "object" ? messageMeta : {}),
+      handledWithoutOutbound: true,
+      outboundTrace: {
+        ...(messageMeta?.outboundTrace && typeof messageMeta.outboundTrace === "object"
+          ? messageMeta.outboundTrace
+          : {}),
+        finalReplySource: "PURE_ACK_NOOP",
+        kind: "silent_noop",
+      },
+    };
+  }
+  intentionalSilent = isIntentionalSilentInboundResult({ sendVia, messageMeta });
   logLatency("processMessage", processStartedAt, {
     sendVia,
     hasReply: String(reply ?? "").trim() !== "",
+    intentionalSilent,
   });
   const bookingIdMeta =
     messageMeta?.bookingCreated &&
@@ -1172,6 +1348,7 @@ export async function executeWhatsAppAiPipeline(p) {
     String(combinedMessage ?? "").trim()
   );
   const isFalseProcessingResponse =
+    !intentionalSilent &&
     confirmationIntent === true &&
     !messageMeta?.bookingCreated &&
     !messageMeta?.bookingBlocked;
@@ -1236,6 +1413,33 @@ export async function executeWhatsAppAiPipeline(p) {
   );
 
   if (replyText !== "") {
+    const outboundLifecycleBase = buildOutboundLifecycleBase({
+      traceId,
+      guaranteeKey: guaranteeKey || null,
+      sourceMessageIndex:
+        sourceMessageIndexRaw != null && Number.isFinite(Number(sourceMessageIndexRaw))
+          ? Number(sourceMessageIndexRaw)
+          : null,
+      chatKey: safeChatKey || sessionKey || null,
+      groupChatKey:
+        (playwrightChatKeyRaw != null && String(playwrightChatKeyRaw).trim() !== ""
+          ? String(playwrightChatKeyRaw).trim()
+          : null) ||
+        (groupNameResolved ? normalizeTitle(groupNameResolved) : null),
+      inboundId: messageId || null,
+      messageHash,
+    });
+    const finalReplySourceForLifecycle = String(
+      messageMeta?.outboundTrace?.finalReplySource ?? ""
+    ).trim();
+    logOutboundLifecycle("prepared", {
+      ...outboundLifecycleBase,
+      replyPreview: replyText.slice(0, 120),
+      replyChars: replyText.length,
+      sendVia: String(sendVia ?? "").trim() || null,
+      finalReplySource: finalReplySourceForLifecycle || null,
+    });
+
     const beforeSend = Date.now();
     const sentRecord = lastSentReplies.get(sessionKey);
     const duplicateWithinWindow =
@@ -1251,8 +1455,24 @@ export async function executeWhatsAppAiPipeline(p) {
       if (isPlaywrightWebTabInbound(p)) {
         outboundReplyDelivered = true;
       }
+      logOutboundLifecycle("duplicate_send_skipped", {
+        ...outboundLifecycleBase,
+        reason: "same_inbound_hash_window",
+        outboundReplyDelivered,
+        sendVia: String(sendVia ?? "").trim() || null,
+      });
+      logOutboundLifecycle("buffer_mark_delivered", {
+        ...outboundLifecycleBase,
+        outboundReplyDelivered,
+        sendVia: String(sendVia ?? "").trim() || null,
+      });
     } else {
       console.log("📤 Sending reply");
+      logOutboundLifecycle("buffer_send_start", {
+        ...outboundLifecycleBase,
+        sendVia: String(sendVia ?? "").trim() || null,
+        finalReplySource: finalReplySourceForLifecycle || null,
+      });
       let groupSendFailed = false;
       let outboundStartedAt = 0;
       try {
@@ -1301,6 +1521,7 @@ export async function executeWhatsAppAiPipeline(p) {
             dedupeWindowMs: REPLY_DEDUPE_WINDOW_MS,
             lastPlaywrightTextSends,
             usePlaywrightWebSend,
+            outboundLifecycle: outboundLifecycleBase,
           },
         });
         logLatency("outbound send", outboundStartedAt, {
@@ -1342,6 +1563,11 @@ export async function executeWhatsAppAiPipeline(p) {
       } else {
         console.log("⚠️ Reply not fully delivered");
       }
+      logOutboundLifecycle("buffer_mark_delivered", {
+        ...outboundLifecycleBase,
+        outboundReplyDelivered,
+        sendVia: String(sendVia ?? "").trim() || null,
+      });
 
       try {
         await appendConversationMessage(db, {
@@ -1397,8 +1623,20 @@ export async function executeWhatsAppAiPipeline(p) {
     }
   }
 
+  if (intentionalSilent) {
+    console.log("[silent_noop_marked_processed]", {
+      source:
+        String(messageMeta?.outboundTrace?.finalReplySource ?? "").trim() ||
+        "PURE_ACK_SILENT",
+      messageId: String(messageId ?? "").trim() || null,
+      bufferKey: String(sessionKey ?? "").trim() || null,
+      guaranteeKey: guaranteeKey || null,
+    });
+  }
+
   if (
     isPlaywrightWebTabInbound(p) &&
+    !intentionalSilent &&
     (replyText === "" || !outboundReplyDelivered)
   ) {
     console.log("⚠️ No reply sent — releasing chat focus");
@@ -1414,53 +1652,28 @@ export async function executeWhatsAppAiPipeline(p) {
       setMessageState(guaranteeKey, "failed");
     }
   } finally {
+    const playwrightTurnCompleteFinally = playwrightInboundTurnComplete(
+      outboundReplyDelivered,
+      intentionalSilent
+    );
     if (
       guaranteeKey &&
       processingSuccess &&
-      (!isPlaywrightWebTabInbound(p) || outboundReplyDelivered)
+      (!isPlaywrightWebTabInbound(p) || playwrightTurnCompleteFinally)
     ) {
       setMessageState(guaranteeKey, "done");
-    } else if (guaranteeKey && !outboundReplyDelivered) {
+    } else if (guaranteeKey && !playwrightTurnCompleteFinally) {
       console.log("⚠️ Not marking processed — no reply sent");
     }
     if (isPlaywrightWebTabInbound(p) && messageId) {
       const gk = buildPlaywrightGuaranteeKey(groupNameResolved, messageId);
       if (gk) {
-        if (processingSuccess && outboundReplyDelivered) {
-          const pending = globalThis.__playwrightPendingByGuarantee?.get(gk);
-          const listenerMsgId =
-            globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map
-              ? globalThis.__playwrightListenerMsgIdByGuarantee.get(gk)
-              : "";
-          if (pending?.chatKey && pending?.rowKey) {
-            globalThis.__lastProcessedRowKeyByChat =
-              globalThis.__lastProcessedRowKeyByChat || {};
-            globalThis.__lastProcessedRowKeyByChat[pending.chatKey] =
-              pending.rowKey;
-            console.log("📍 Anchor advanced after delivery", {
-              chatKey: pending.chatKey,
-              rowKey: pending.rowKey,
-            });
-          }
-          if (pending?.chatKey && String(listenerMsgId ?? "").trim()) {
-            globalThis.__lastProcessedUserMsg =
-              globalThis.__lastProcessedUserMsg || Object.create(null);
-            const cursorKey =
-              String(pending.participantCursorKey ?? "").trim() ||
-              String(pending.chatKey).trim();
-            globalThis.__lastProcessedUserMsg[cursorKey] =
-              String(listenerMsgId).trim();
-          }
-          if (pending?.chatKey) {
-            globalThis.__chatResponding =
-              globalThis.__chatResponding || Object.create(null);
-            globalThis.__chatRespondingCooldownUntil =
-              globalThis.__chatRespondingCooldownUntil || Object.create(null);
-            globalThis.__chatResponding[pending.chatKey] = false;
-            globalThis.__chatRespondingCooldownUntil[pending.chatKey] =
-              Date.now() + 2500;
-          }
-          notifyPlaywrightGuaranteeDelivered(gk);
+        if (processingSuccess && playwrightTurnCompleteFinally) {
+          await advancePlaywrightInboundCompletion(gk, {
+            db,
+            ownerUserId,
+            messageMeta,
+          });
         } else {
           const pending = globalThis.__playwrightPendingByGuarantee?.get(gk);
           if (pending?.chatKey) {
@@ -1469,9 +1682,9 @@ export async function executeWhatsAppAiPipeline(p) {
             globalThis.__chatResponding[pending.chatKey] = false;
           }
           notifyPlaywrightGuaranteeReleased(gk);
-        }
-        if (globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map) {
-          globalThis.__playwrightListenerMsgIdByGuarantee.delete(gk);
+          if (globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map) {
+            globalThis.__playwrightListenerMsgIdByGuarantee.delete(gk);
+          }
         }
       }
     }
@@ -2148,6 +2361,58 @@ export function __peekWhatsAppInboundBufferForTests(bufferKey) {
   const entry = key ? messageBuffer.get(key) : null;
   const ctx = entry?.context && typeof entry.context === "object" ? entry.context : null;
   return ctx ? { ...ctx } : null;
+}
+
+/** @param {Parameters<typeof isIntentionalSilentInboundResult>[0]} p */
+export function __isIntentionalSilentInboundResultForTests(p) {
+  return isIntentionalSilentInboundResult(p);
+}
+
+/** @param {boolean} outboundReplyDelivered @param {boolean} intentionalSilent */
+export function __playwrightInboundTurnCompleteForTests(
+  outboundReplyDelivered,
+  intentionalSilent
+) {
+  return playwrightInboundTurnComplete(outboundReplyDelivered, intentionalSilent);
+}
+
+/**
+ * @internal Tests — stale merged catch-up ack noop → intentional silent (no Theek hai).
+ */
+export function __applyStaleAckNoopSuppressionForTests({
+  suppressAckNoopOutbound = false,
+  reply = "Theek hai 👍",
+  sendVia = "CLOUD_API",
+  messageMeta = { outboundTrace: { finalReplySource: "PURE_ACK_NOOP" } },
+} = {}) {
+  let outReply = reply;
+  let outSendVia = sendVia;
+  let outMeta =
+    messageMeta && typeof messageMeta === "object" ? { ...messageMeta } : {};
+  const finalReplySourceFromMeta = String(
+    outMeta?.outboundTrace?.finalReplySource ?? ""
+  ).trim();
+  if (suppressAckNoopOutbound && finalReplySourceFromMeta === "PURE_ACK_NOOP") {
+    outReply = "";
+    outSendVia = "NONE";
+    outMeta = {
+      ...outMeta,
+      handledWithoutOutbound: true,
+      outboundTrace: {
+        ...(outMeta?.outboundTrace && typeof outMeta.outboundTrace === "object"
+          ? outMeta.outboundTrace
+          : {}),
+        finalReplySource: "PURE_ACK_NOOP",
+        kind: "silent_noop",
+      },
+    };
+  }
+  return { reply: outReply, sendVia: outSendVia, messageMeta: outMeta };
+}
+
+/** @internal Tests — persist cursor after successful Playwright turn. */
+export async function __advancePlaywrightInboundCompletionForTests(gk, opts = {}) {
+  return advancePlaywrightInboundCompletion(gk, opts);
 }
 
 /** Same as {@link __clearWhatsAppInboundBufferForTests} — public name for dev / HTTP / signals. */

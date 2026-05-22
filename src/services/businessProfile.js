@@ -202,6 +202,53 @@ export function formatEmilyBrainBusinessProfileForPrompt(bp) {
     }
   }
 
+  const logistics =
+    o.logistics != null && typeof o.logistics === "object" && !Array.isArray(o.logistics)
+      ? /** @type {Record<string, unknown>} */ (o.logistics)
+      : null;
+  if (logistics) {
+    const pickupLocation =
+      typeof logistics.defaultPickupLocation === "string"
+        ? logistics.defaultPickupLocation.trim()
+        : "";
+    const pickupInstructions =
+      typeof logistics.pickupInstructions === "string"
+        ? logistics.pickupInstructions.trim()
+        : "";
+    const pickupHours =
+      typeof logistics.pickupAvailableHours === "string"
+        ? logistics.pickupAvailableHours.trim()
+        : "";
+    const deliveryAreas = Array.isArray(logistics.deliveryCoverageAreas)
+      ? logistics.deliveryCoverageAreas
+          .map((x) => (typeof x === "string" ? x.trim() : ""))
+          .filter(Boolean)
+      : typeof logistics.deliveryCoverageAreas === "string" &&
+          logistics.deliveryCoverageAreas.trim() !== ""
+        ? [logistics.deliveryCoverageAreas.trim()]
+        : [];
+    const deliveryCharges =
+      typeof logistics.deliveryChargesNote === "string"
+        ? logistics.deliveryChargesNote.trim()
+        : "";
+    if (
+      pickupLocation ||
+      pickupInstructions ||
+      pickupHours ||
+      deliveryAreas.length > 0 ||
+      deliveryCharges
+    ) {
+      lines.push("Pickup & Delivery Details:");
+      if (pickupLocation) lines.push(`- Pickup location: ${pickupLocation}`);
+      if (pickupHours) lines.push(`- Pickup timings: ${pickupHours}`);
+      if (pickupInstructions) lines.push(`- Pickup instructions: ${pickupInstructions}`);
+      if (deliveryAreas.length > 0) {
+        lines.push(`- Delivery areas: ${deliveryAreas.join(", ")}`);
+      }
+      if (deliveryCharges) lines.push(`- Delivery charges: ${deliveryCharges}`);
+    }
+  }
+
   const tone = typeof o.tone === "string" ? o.tone.trim() : "";
   if (tone) {
     lines.push(`Tone (customer-facing): ${tone}`);
@@ -324,6 +371,53 @@ export function formatBusinessProfileContextPlain(ctx) {
       lines.push("Pricing (default / global):");
       if (daily != null) lines.push(`- Daily: ${daily} ${cur}`);
       if (monthly != null) lines.push(`- Monthly: ${monthly} ${cur}`);
+    }
+  }
+
+  const logistics =
+    o.logistics != null && typeof o.logistics === "object" && !Array.isArray(o.logistics)
+      ? /** @type {Record<string, unknown>} */ (o.logistics)
+      : null;
+  if (logistics) {
+    const pickupLocation =
+      typeof logistics.defaultPickupLocation === "string"
+        ? logistics.defaultPickupLocation.trim()
+        : "";
+    const pickupInstructions =
+      typeof logistics.pickupInstructions === "string"
+        ? logistics.pickupInstructions.trim()
+        : "";
+    const pickupHours =
+      typeof logistics.pickupAvailableHours === "string"
+        ? logistics.pickupAvailableHours.trim()
+        : "";
+    const deliveryAreas = Array.isArray(logistics.deliveryCoverageAreas)
+      ? logistics.deliveryCoverageAreas
+          .map((x) => (typeof x === "string" ? x.trim() : ""))
+          .filter(Boolean)
+      : typeof logistics.deliveryCoverageAreas === "string" &&
+          logistics.deliveryCoverageAreas.trim() !== ""
+        ? [logistics.deliveryCoverageAreas.trim()]
+        : [];
+    const deliveryCharges =
+      typeof logistics.deliveryChargesNote === "string"
+        ? logistics.deliveryChargesNote.trim()
+        : "";
+    if (
+      pickupLocation ||
+      pickupInstructions ||
+      pickupHours ||
+      deliveryAreas.length > 0 ||
+      deliveryCharges
+    ) {
+      lines.push("Pickup & Delivery Details:");
+      if (pickupLocation) lines.push(`- Pickup location: ${pickupLocation}`);
+      if (pickupHours) lines.push(`- Pickup timings: ${pickupHours}`);
+      if (pickupInstructions) lines.push(`- Pickup instructions: ${pickupInstructions}`);
+      if (deliveryAreas.length > 0) {
+        lines.push(`- Delivery areas: ${deliveryAreas.join(", ")}`);
+      }
+      if (deliveryCharges) lines.push(`- Delivery charges: ${deliveryCharges}`);
     }
   }
 
@@ -604,6 +698,13 @@ export async function getBusinessProfile(userId) {
       }
       if (typeof bpNested.instructions === "string" && bpNested.instructions.trim() !== "") {
         profileData.ownerInstructions = bpNested.instructions.trim();
+      }
+      if (
+        bpNested.logistics != null &&
+        typeof bpNested.logistics === "object" &&
+        !Array.isArray(bpNested.logistics)
+      ) {
+        profileData.logistics = bpNested.logistics;
       }
     }
 
