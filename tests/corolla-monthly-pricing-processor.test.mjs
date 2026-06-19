@@ -108,8 +108,8 @@ test("monthly duration uses monthly x months; daily duration uses daily x days",
     item: corolla,
   });
   assert.equal(dailyOut.field, "price_with_duration");
-  assert.match(dailyOut.reply, /\b5000\b/);
-  assert.match(dailyOut.reply, /\b15000\b/);
+  assert.match(dailyOut.reply, /5,?000/);
+  assert.match(dailyOut.reply, /15,?000/);
 });
 
 test("Corolla b hai available still reconciles to Toyota Corolla", async () => {

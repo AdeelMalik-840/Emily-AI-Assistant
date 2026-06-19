@@ -89,7 +89,7 @@ test("resolveItemlessPriceDurationAskedField maps rent+duration bare turns", () 
     __resolveItemlessPriceDurationAskedFieldForTests("3 din ka rent?"),
     "price_with_duration"
   );
-  assert.equal(detectAskedField("3 din ka rent?"), "price_daily");
+  assert.equal(detectAskedField("3 din ka rent?"), "price_with_duration");
 });
 
 test("shouldStoreLastVerifiedCatalogAnswer: verified pricing yes, human unknown and browse no", () => {

@@ -57,6 +57,11 @@ import {
   isGroupMessageStale,
   resolveParticipantIdentity,
 } from "../participantIdentity.js";
+import { loadPlaywrightInboundCursor } from "../playwrightInboundCursorStore.js";
+import {
+  getBookingLogisticsCompletionState,
+  resolveLogisticsCompletionPolicy,
+} from "../bookingDmFlow.js";
 
 /** Open chat identity: sidebar `span[title]` for the target row (not header text). */
 globalThis.__currentOpenChatTitle =
@@ -273,11 +278,204 @@ function resolveOwnerUid() {
   );
 }
 
+const OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT =
+  "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT";
+
+const WRONG_DM_RECOVERY_ERROR_CODES = new Set([
+  "DM_CHAT_CHANGED",
+  "REPLY_PRIVATE_DM_TARGET_MISMATCH",
+  "REPLY_PRIVATE_WRONG_HEADER",
+  "INVALID_DM_TARGET",
+  "WRONG_CHAT",
+  "TARGET_PARTICIPANT_MISMATCH",
+  "PHONE_MISMATCH",
+  "ROW_KEY_NAME_MISMATCH",
+  "NAME_MISMATCH",
+  "BASE_KEY_TITLE_MISMATCH",
+]);
+
+function sourceIdentityForDmWatch(data = {}) {
+  return data?.sourceIdentity && typeof data.sourceIdentity === "object"
+    ? data.sourceIdentity
+    : null;
+}
+
+function participantIdentityForDmWatch(data = {}) {
+  const identity = sourceIdentityForDmWatch(data) || {};
+  const participantName =
+    clean(
+      identity.participantDisplayName ??
+        identity.participantName ??
+        data?.sourceParticipantName ??
+        data?.originalCustomerDisplayName ??
+        data?.participantName
+    ) || "";
+  const participantKey =
+    clean(
+      identity.participantKey ??
+        data?.sourceParticipantKey ??
+        identity.participantPhone ??
+        data?.sourceParticipantPhone ??
+        data?.originalCustomerPhone ??
+        data?.senderScope
+    ) || "";
+  const participantPhone =
+    clean(
+      identity.participantPhone ??
+        data?.sourceParticipantPhone ??
+        data?.originalCustomerPhone
+    ) || "";
+  return { participantName, participantKey, participantPhone };
+}
+
+function dmTargetMatchesParticipantIdentity({ data = {}, dmKey = "", dmTitle = "" } = {}) {
+  const { participantName, participantKey, participantPhone } =
+    participantIdentityForDmWatch(data);
+  const dmKeys = [
+    normalizeTitle(dmKey),
+    normalizeTitle(dmTitle),
+    normalizeTitle(clean(data?.dmPlaywrightChatKey || "")),
+    normalizeTitle(clean(data?.dmChatTitle || "")),
+  ].filter(Boolean);
+  const identityKeys = [
+    participantName,
+    participantKey,
+    participantPhone,
+    data?.sourceIdentity?.participantDisplayName,
+    data?.sourceIdentity?.participantName,
+    data?.sourceIdentity?.participantPhone,
+    data?.sourceParticipantName,
+    data?.sourceParticipantKey,
+    data?.sourceParticipantPhone,
+    data?.originalCustomerDisplayName,
+    data?.originalCustomerPhone,
+  ]
+    .map((value) => normalizeTitle(clean(value)))
+    .filter(Boolean);
+
+  if (dmKeys.some((key) => identityKeys.includes(key))) return true;
+
+  const phoneDigits = String(participantPhone ?? "").replace(/\D/g, "");
+  if (phoneDigits.length >= 7) {
+    return dmKeys.some((key) => key.replace(/\D/g, "").includes(phoneDigits));
+  }
+  return false;
+}
+
+function dmWatchRecoveryDecision({
+  docId = "",
+  data = {},
+  dmKey = "",
+  approvalStage = "",
+  logisticsState = {},
+  dmKeyActiveCounts = new Map(),
+} = {}) {
+  const approvalCustomerNotificationError = clean(data?.approvalCustomerNotificationError);
+  const sourceIdentity = sourceIdentityForDmWatch(data);
+  const { participantName, participantKey, participantPhone } =
+    participantIdentityForDmWatch(data);
+  const hasParticipantIdentity = Boolean(participantName || participantKey || participantPhone);
+  const hasDmKey = Boolean(dmKey || clean(data?.dmChatTitle));
+  const wrongDmMismatch = WRONG_DM_RECOVERY_ERROR_CODES.has(
+    approvalCustomerNotificationError
+  );
+  const ambiguousDmKey = Boolean(dmKey && Number(dmKeyActiveCounts.get(dmKey) ?? 0) > 1);
+  const baseLog = {
+    bookingId: docId || null,
+    status: clean(data?.status) || null,
+    approvalCustomerNotificationError: approvalCustomerNotificationError || null,
+    hasDmKey,
+    hasSourceIdentity: Boolean(sourceIdentity),
+    logisticsComplete: logisticsState?.complete === true,
+    ambiguousDmKey,
+    wrongDmMismatch,
+  };
+
+  const fail = (reason) => {
+    console.log("[dm_watch_recovery_excluded]", {
+      ...baseLog,
+      reason,
+    });
+    return { ok: false, reason };
+  };
+
+  if (clean(data?.status) !== "approved") return fail("STATUS_NOT_APPROVED");
+  if (clean(data?.bookingSource) !== "PLAYWRIGHT_GROUP") {
+    return fail("BOOKING_SOURCE_NOT_PLAYWRIGHT_GROUP");
+  }
+  if (approvalCustomerNotificationError !== OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT) {
+    return fail("ERROR_NOT_UNVERIFIED_AFTER_ATTEMPT");
+  }
+  if (wrongDmMismatch) return fail("WRONG_DM_MISMATCH");
+  if (data?.dmOpened !== true) return fail("DM_NOT_OPENED");
+  if (data?.dmSendAttempted !== true) return fail("DM_SEND_NOT_ATTEMPTED");
+  if (!hasDmKey) return fail("DM_KEY_MISSING");
+  if (!sourceIdentity) return fail("MISSING_SOURCE_IDENTITY");
+  if (!hasParticipantIdentity) return fail("PARTICIPANT_IDENTITY_MISSING");
+  if (!dmTargetMatchesParticipantIdentity({ data, dmKey, dmTitle: data?.dmChatTitle })) {
+    return fail("DM_TARGET_PARTICIPANT_MISMATCH");
+  }
+  if (logisticsState?.complete === true || data?.deliveryDetailsCollectedAt) {
+    return fail("LOGISTICS_COMPLETE");
+  }
+  if (
+    approvalStage === "delivery_details_collected" ||
+    approvalStage === "completed" ||
+    approvalStage === "rejected" ||
+    approvalStage === "cancelled"
+  ) {
+    return fail("BOOKING_STAGE_NOT_ACTIVE");
+  }
+  if (ambiguousDmKey) return fail("AMBIGUOUS_DM_KEY");
+  return {
+    ok: true,
+    watchOnlyRecovery: true,
+    recoveryReason: OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT,
+  };
+}
+
+function timestampToMillis(value) {
+  if (!value) return 0;
+  if (typeof value?.toMillis === "function") {
+    const ms = Number(value.toMillis());
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    if (numeric > 1_000_000_000_000) return numeric;
+    if (numeric > 1_000_000_000) return numeric * 1000;
+  }
+  const raw = String(value).trim();
+  if (/^\d+$/.test(raw)) return 0;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function __isDmWatchMessageOlderThanBookingMarkersForTests({
+  messageTimestamp,
+  booking,
+  toleranceMs = 30_000,
+} = {}) {
+  const messageMs = timestampToMillis(messageTimestamp);
+  if (!messageMs) return false;
+  const markerMs = Math.max(
+    timestampToMillis(booking?.dmStartedAt),
+    timestampToMillis(booking?.approvalCustomerNotificationSentAt),
+    timestampToMillis(booking?.deliveryDetailsCollectedAt),
+    timestampToMillis(booking?.updatedAt)
+  );
+  return Boolean(markerMs && messageMs + Number(toleranceMs || 0) < markerMs);
+}
+
 /**
  * Load DM watch targets from active approved bookings that already completed Reply Privately DM send.
  * Additive only: does NOT change group scanning; only enables scanning for specific DM chats.
  */
-async function loadActiveDmWatchTargets({
+export async function loadActiveDmWatchTargets({
   dbInstance = db,
   ownerUserId = resolveOwnerUid(),
   limit = 25,
@@ -295,14 +493,43 @@ async function loadActiveDmWatchTargets({
     const docs = snap?.docs ?? [];
     const keys = new Set();
     const byKey = new Map();
+    const logisticsCompletionPolicy = resolveLogisticsCompletionPolicy();
     const waitingStages = new Set([
       "owner_approved_waiting_customer_details",
       "waiting_customer_details",
     ]);
+    const dmKeyActiveCounts = new Map();
+    for (const doc of docs) {
+      const data = doc.data() || {};
+      const approvalStage = clean(data?.approvalStage).toLowerCase();
+      const dmKey = normalizeTitle(clean(data?.dmPlaywrightChatKey || "")) ||
+        normalizeTitle(clean(data?.dmChatTitle || ""));
+      if (!dmKey) continue;
+      if (clean(data?.status) !== "approved") continue;
+      if (
+        approvalStage === "delivery_details_collected" ||
+        approvalStage === "completed" ||
+        approvalStage === "rejected" ||
+        approvalStage === "cancelled" ||
+        data?.deliveryDetailsCollectedAt
+      ) {
+        continue;
+      }
+      const logisticsState = getBookingLogisticsCompletionState(
+        data,
+        logisticsCompletionPolicy
+      );
+      if (logisticsState.complete) continue;
+      if (approvalStage && !waitingStages.has(approvalStage)) continue;
+      dmKeyActiveCounts.set(dmKey, Number(dmKeyActiveCounts.get(dmKey) ?? 0) + 1);
+    }
     for (const doc of docs) {
       const data = doc.data() || {};
       const approvalCustomerNotificationStatus = clean(
         data?.approvalCustomerNotificationStatus
+      );
+      const approvalCustomerNotificationError = clean(
+        data?.approvalCustomerNotificationError
       );
       const isDmActuallySent =
         approvalCustomerNotificationStatus === "sent" ||
@@ -310,6 +537,56 @@ async function loadActiveDmWatchTargets({
         data?.dmOpened === true;
       if (!isDmActuallySent) {
         continue;
+      }
+      const approvalStage = clean(data?.approvalStage).toLowerCase();
+      const dmKey = normalizeTitle(clean(data?.dmPlaywrightChatKey || "")) ||
+        normalizeTitle(clean(data?.dmChatTitle || ""));
+      const logisticsState = getBookingLogisticsCompletionState(
+        data,
+        logisticsCompletionPolicy
+      );
+      let watchOnlyRecovery = false;
+      let recoveryReason = null;
+      if (
+        data?.approvalCustomerNotificationTerminalFailure === true &&
+        data?.dmSendAttempted === true &&
+        data?.requiresManualReview === true
+      ) {
+        const recovery = dmWatchRecoveryDecision({
+          docId: doc.id,
+          data,
+          dmKey,
+          approvalStage,
+          logisticsState,
+          dmKeyActiveCounts,
+        });
+        if (!recovery.ok) {
+          console.log("[playwright_dm_watch_target_skipped_terminal_manual_review]", {
+            bookingId: doc.id,
+            approvalCustomerNotificationStatus: approvalCustomerNotificationStatus || null,
+            dmMessageSent: data?.dmMessageSent === true,
+            dmOpened: data?.dmOpened === true,
+            requiresManualReview: data?.requiresManualReview === true,
+          });
+          continue;
+        }
+        watchOnlyRecovery = true;
+        recoveryReason = recovery.recoveryReason;
+        const { participantName, participantKey } = participantIdentityForDmWatch(data);
+        console.log("[dm_watch_target_included_via_unverified_send_recovery]", {
+          bookingId: doc.id,
+          dmChatTitle: clean(data?.dmChatTitle) || null,
+          hasDmPlaywrightChatKey: clean(data?.dmPlaywrightChatKey) !== "",
+          participantName: participantName || null,
+          participantKey: participantKey || null,
+          approvalCustomerNotificationStatus: approvalCustomerNotificationStatus || null,
+          approvalCustomerNotificationError: approvalCustomerNotificationError || null,
+          dmOpened: data?.dmOpened === true,
+          dmSendAttempted: data?.dmSendAttempted === true,
+          dmMessageSent: data?.dmMessageSent === true,
+          requiresManualReview: data?.requiresManualReview === true,
+          watchOnlyRecovery: true,
+        });
       }
       if (
         approvalCustomerNotificationStatus !== "sent" &&
@@ -322,7 +599,6 @@ async function loadActiveDmWatchTargets({
           dmOpened: data?.dmOpened === true,
         });
       }
-      const approvalStage = clean(data?.approvalStage).toLowerCase();
       if (
         approvalStage === "delivery_details_collected" ||
         data?.deliveryDetailsCollectedAt
@@ -335,14 +611,25 @@ async function loadActiveDmWatchTargets({
         });
         continue;
       }
-      if (approvalStage && !waitingStages.has(approvalStage)) {
-        // Not an active DM continuation target (e.g. already moved on).
+      if (logisticsState.complete) {
+        console.log("[playwright_dm_watch_target_skipped_logistics_complete]", {
+          bookingId: doc.id,
+          dmChatKey: dmKey || null,
+          approvalStage: approvalStage || null,
+          deliveryMethod: clean(data?.deliveryMethod) || null,
+          hasDeliveryAddress: clean(data?.deliveryAddress) !== "",
+          hasDeliveryTime: clean(data?.deliveryTime) !== "",
+          deliveryDetailsCollectedAtPresent: Boolean(data?.deliveryDetailsCollectedAt),
+          completionReason: logisticsState.reason,
+        });
         continue;
       }
-      const dmKey = normalizeTitle(clean(data?.dmPlaywrightChatKey || "")) ||
-        normalizeTitle(clean(data?.dmChatTitle || ""));
+      if (approvalStage && !waitingStages.has(approvalStage)) {
+        continue;
+      }
       if (!dmKey) continue;
       keys.add(dmKey);
+      const identity = sourceIdentityForDmWatch(data);
       const entry = {
         bookingId: doc.id,
         updatedAtMs:
@@ -351,8 +638,18 @@ async function loadActiveDmWatchTargets({
             : data?.updatedAt?.toMillis?.() ??
               (data?.updatedAt instanceof Date ? data.updatedAt.getTime() : 0) ??
               0,
+        approvalStage: approvalStage || null,
+        deliveryMethod: clean(data?.deliveryMethod) || null,
+        hasDeliveryAddress: clean(data?.deliveryAddress) !== "",
+        hasDeliveryTime: clean(data?.deliveryTime) !== "",
+        dmStartedAt: data?.dmStartedAt ?? null,
+        updatedAt: data?.updatedAt ?? data?.updatedAtMs ?? null,
+        approvalCustomerNotificationSentAt:
+          data?.approvalCustomerNotificationSentAt ?? null,
+        deliveryDetailsCollectedAt: data?.deliveryDetailsCollectedAt ?? null,
         dmChatTitle: clean(data?.dmChatTitle) || null,
         dmPlaywrightChatKey: clean(data?.dmPlaywrightChatKey) || null,
+        sourceIdentity: identity,
         participantKey:
           clean(
             data?.sourceIdentity?.participantKey ??
@@ -381,6 +678,12 @@ async function loadActiveDmWatchTargets({
         originalGroupChatKey:
           clean(data?.sourcePlaywrightChatKey ?? data?.playwrightChatKey ?? data?.chatKey) ||
           null,
+        ...(watchOnlyRecovery
+          ? {
+              watchOnlyRecovery: true,
+              recoveryReason,
+            }
+          : {}),
       };
       const arr = byKey.get(dmKey) ?? [];
       arr.push(entry);
@@ -702,6 +1005,230 @@ export function buildExtractedMessageId(msg, extractedList) {
 function getMessageIdFromExtracted(msg, extractedList) {
   const built = buildStableMessageKey(msg, extractedList);
   return String(built?.id ?? "").trim();
+}
+
+function parsePrePlainTextTimestampMs(prePlainText) {
+  const raw = String(prePlainText ?? "").trim();
+  const m = /^\[([^\]]+)]/.exec(raw);
+  if (!m) return 0;
+  const inner = m[1].trim();
+  let parsed = Date.parse(inner);
+  if (Number.isFinite(parsed)) return parsed;
+  const wa = /^(\d{1,2}:\d{2}),\s*(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(inner);
+  if (wa) {
+    const [, hm, day, month, year] = wa;
+    const [hours, minutes] = hm.split(":").map(Number);
+    parsed = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      hours,
+      minutes
+    ).getTime();
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function getRowTimestampMs(row) {
+  const rawTs = Number(row?.timestamp ?? 0);
+  if (Number.isFinite(rawTs) && rawTs > 0) {
+    return rawTs < 1_000_000_000_000 ? rawTs * 1000 : rawTs;
+  }
+  return parsePrePlainTextTimestampMs(row?.prePlainText);
+}
+
+function rowFreshEnoughForStartup(row, now = Date.now()) {
+  const freshnessMs = Number(
+    process.env.PLAYWRIGHT_STARTUP_CATCHUP_FRESH_MS ?? 10 * 60 * 1000
+  );
+  if (!Number.isFinite(freshnessMs) || freshnessMs <= 0) return false;
+  const tsMs = getRowTimestampMs(row);
+  return Number.isFinite(tsMs) && tsMs > 0 && now - tsMs <= freshnessMs;
+}
+
+function candidateRowsAfterCursor({
+  participantMessages,
+  extractedMessages,
+  persistedCursor,
+  sidebarHasSignal = false,
+  now = Date.now(),
+} = {}) {
+  const rows = Array.isArray(participantMessages)
+    ? participantMessages.filter((m) => m?.sender === "user" && String(m?.text ?? "").trim())
+    : [];
+  if (rows.length === 0) return [];
+
+  const lastProcessedInboundId = String(
+    persistedCursor?.lastProcessedInboundId ?? ""
+  ).trim();
+  const lastProcessedSourceMessageIndex = Number(
+    persistedCursor?.lastProcessedSourceMessageIndex
+  );
+  const hasSourceIndexCursor = Number.isFinite(lastProcessedSourceMessageIndex);
+
+  if (lastProcessedInboundId) {
+    const cursorIdx = rows.findIndex(
+      (row) =>
+        buildExtractedMessageId(row, extractedMessages).id ===
+        lastProcessedInboundId
+    );
+    if (cursorIdx >= 0) return rows.slice(cursorIdx + 1);
+    if (hasSourceIndexCursor) {
+      return rows.filter((row) => {
+        const idx = Number(row?.sourceMessageIndex ?? row?.__position);
+        return Number.isFinite(idx) && idx > lastProcessedSourceMessageIndex;
+      });
+    }
+    return sidebarHasSignal ? [rows[rows.length - 1]] : [];
+  }
+
+  if (!sidebarHasSignal) {
+    return rows.filter((row) => rowFreshEnoughForStartup(row, now));
+  }
+
+  let lastAssistantPosition = -1;
+  for (const row of extractedMessages || []) {
+    if (row?.sender === "me" && Number.isFinite(Number(row?.__position))) {
+      lastAssistantPosition = Math.max(lastAssistantPosition, Number(row.__position));
+    }
+  }
+  const afterLastAssistant = rows.filter(
+    (row) => Number(row?.__position ?? -1) > lastAssistantPosition
+  );
+  return afterLastAssistant.length ? afterLastAssistant : [rows[rows.length - 1]];
+}
+
+function collapseRowsForForward(rows) {
+  const cleanRows = Array.isArray(rows)
+    ? rows.filter((row) => row?.sender === "user" && String(row?.text ?? "").trim())
+    : [];
+  if (cleanRows.length <= 1) return cleanRows;
+  const latest = cleanRows[cleanRows.length - 1];
+  const mergedText = cleanRows
+    .slice(-2)
+    .map((row) => String(row?.text ?? "").trim())
+    .filter(Boolean)
+    .join(" | ");
+  return [
+    {
+      ...latest,
+      text: mergedText || String(latest?.text ?? "").trim(),
+      __catchupMergedRowCount: cleanRows.length,
+      __catchupMergedRowIds: cleanRows.map((row) =>
+        buildExtractedMessageId(row, cleanRows).id
+      ),
+    },
+  ];
+}
+
+/** @internal Tests — row timestamp from DOM or prePlainText. */
+export function __getRowTimestampMsForTests(row) {
+  return getRowTimestampMs(row);
+}
+
+/** @internal Tests — cursor filter after persisted inbound position. */
+export function __candidateRowsAfterCursorForTests(args) {
+  return candidateRowsAfterCursor(args);
+}
+
+/** @internal Tests — merge last two catch-up user rows for one forward. */
+export function __collapseRowsForForwardForTests(rows) {
+  return collapseRowsForForward(rows);
+}
+
+/**
+ * @internal Tests — startup catch-up selection (cursor, collapse, reply-after, suppress flags).
+ */
+export function __planPlaywrightStartupForwardForTests({
+  participantMessages,
+  extractedMessages,
+  sorted = [],
+  persistedCursor = null,
+  lastProcessedUserMsgId = "",
+  sidebarHasSignal = false,
+  groupChatKey = "leads",
+  now = Date.now(),
+  applyStaleGate = false,
+} = {}) {
+  const normalizedGroupChatKeyForCompare = String(groupChatKey ?? "").trim() || "leads";
+  const candidateRows = candidateRowsAfterCursor({
+    participantMessages,
+    extractedMessages,
+    persistedCursor,
+    sidebarHasSignal,
+    now,
+  });
+  const rowsForForward = collapseRowsForForward(candidateRows);
+  const selected = [];
+  for (const candidate of rowsForForward) {
+    const extractedIdBuilt =
+      candidate && candidate.sender === "user"
+        ? buildExtractedMessageId(candidate, extractedMessages)
+        : { id: "", strategy: "NONE" };
+    const lastUserMsgId = String(extractedIdBuilt?.id ?? "").trim();
+    if (!lastUserMsgId || lastUserMsgId === lastProcessedUserMsgId) {
+      continue;
+    }
+    if (
+      applyStaleGate &&
+      !persistedCursor &&
+      isGroupMessageStale(getRowTimestampMs(candidate), now)
+    ) {
+      selected.push({
+        skipped: true,
+        reason: "stale",
+        lastUserMsgId,
+      });
+      continue;
+    }
+    const pos = candidate.__position;
+    let hasReplyAfter = false;
+    let hasNewerSameParticipantUserAfter = false;
+    if (typeof pos === "number" && pos >= 0) {
+      const tail = sorted.slice(pos + 1);
+      hasReplyAfter = tail.some((m) => m.sender === "me");
+      const lastCmp = {
+        participantKey: candidate.participantKey || null,
+        sender: String(candidate.sender ?? "").trim() || "user",
+      };
+      hasNewerSameParticipantUserAfter = tail.some((m) => {
+        if (m.sender !== "user") return false;
+        const other = participantComparableFromSortedRow(
+          m,
+          normalizedGroupChatKeyForCompare
+        );
+        return isSameParticipant(lastCmp, other);
+      });
+    }
+    const allowCursorCatchupDespiteReplyAfter = Boolean(persistedCursor);
+    const skipDueToReplyAfter =
+      hasReplyAfter &&
+      !hasNewerSameParticipantUserAfter &&
+      !allowCursorCatchupDespiteReplyAfter;
+    if (skipDueToReplyAfter) {
+      selected.push({
+        skipped: true,
+        reason: "reply_after",
+        lastUserMsgId,
+        hasReplyAfter,
+        hasNewerSameParticipantUserAfter,
+      });
+      continue;
+    }
+    selected.push({
+      skipped: false,
+      lastUserMsgId,
+      text: String(candidate.text ?? ""),
+      __suppressAckNoopOutbound:
+        candidateRows.length > 1 && candidate === rowsForForward[0],
+      __catchupMergedRowCount: candidate.__catchupMergedRowCount || 1,
+      hasReplyAfter,
+      hasNewerSameParticipantUserAfter,
+      persistedCursorPresent: Boolean(persistedCursor),
+    });
+  }
+  return { candidateRows, rowsForForward, selected };
 }
 
 /**
@@ -1160,7 +1687,33 @@ function isAllowedChat(title) {
 }
 
 /**
- * @param {string | undefined | null} text
+ * Group selection signal for an open allowlisted chat (tests + logging).
+ */
+export function __buildActiveGroupSelectionSignalForTests({
+  openTitle = "",
+  refreshedOpenTitle = "",
+  sidebarHasSignal = false,
+  activeNowForStickiness = "",
+} = {}) {
+  const verifiedOpenTitle = String(refreshedOpenTitle || openTitle || "").trim();
+  const isAllowedOpenTitle = isAllowedChat(verifiedOpenTitle);
+  const activeAllowlistedOpen = isAllowedOpenTitle;
+  const sidebarHasSignalForSelection =
+    Boolean(sidebarHasSignal) || activeAllowlistedOpen;
+  return {
+    openTitle: String(openTitle ?? "").trim(),
+    refreshedOpenTitle: String(refreshedOpenTitle ?? "").trim(),
+    activeNowForStickiness: String(activeNowForStickiness ?? "").trim(),
+    verifiedOpenTitle,
+    isAllowedOpenTitle,
+    activeAllowlistedOpen,
+    sidebarSignal: Boolean(sidebarHasSignal),
+    sidebarHasSignalForSelection,
+  };
+}
+
+/**
+ * @param {string | null | undefined} text
  */
 function isBusinessMessage(text) {
   if (!text) return false;
@@ -6257,9 +6810,16 @@ async function runListenerBody() {
 
           globalThis.__lastProcessedUserMsg =
             globalThis.__lastProcessedUserMsg || Object.create(null);
+          globalThis.__playwrightPersistedCursorByParticipant =
+            globalThis.__playwrightPersistedCursorByParticipant || Object.create(null);
+          const ownerUserIdForCursor = resolveOwnerUid();
           const normalizedGroupChatKeyForCompare =
             normalizeTitle(openTitle || chatName || activeChat || "") ||
             String(openTitle || chatName || activeChat || "").trim();
+          const verifiedOpenTitle = String(
+            openTitle || chatName || activeChat || ""
+          ).trim();
+          const sidebarHasSignalForSelection = isAllowedChat(verifiedOpenTitle);
           const guaranteeFirst = isPlaywrightGuaranteeFirstAdmissionEnabled();
           for (const [participantKey, participantMessages] of participantBuckets.entries()) {
             const anchorMsg =
@@ -6273,12 +6833,69 @@ async function runListenerBody() {
               });
               continue;
             }
-            const lastProcessedUserMsgId = guaranteeFirst
-              ? ""
-              : String(globalThis.__lastProcessedUserMsg?.[cursorKey] ?? "").trim();
+            let persistedCursor =
+              globalThis.__playwrightPersistedCursorByParticipant[cursorKey] ?? null;
+            if (persistedCursor === null) {
+              persistedCursor = await loadPlaywrightInboundCursor(db, {
+                businessId: ownerUserIdForCursor,
+                chatKey,
+                groupChatKey: chatKey,
+                participantKey: anchorMsg?.participantKey || "",
+              });
+              globalThis.__playwrightPersistedCursorByParticipant[cursorKey] =
+                persistedCursor || false;
+              if (persistedCursor?.lastProcessedInboundId) {
+                globalThis.__lastProcessedUserMsg[cursorKey] = String(
+                  persistedCursor.lastProcessedInboundId
+                ).trim();
+              }
+              console.log("[playwright_cursor_loaded]", {
+                chatKey,
+                cursorKey,
+                hasCursor: Boolean(persistedCursor),
+                lastProcessedInboundId:
+                  persistedCursor?.lastProcessedInboundId || null,
+              });
+            } else if (persistedCursor === false) {
+              persistedCursor = null;
+            }
+
+            const cursorCandidateRows = candidateRowsAfterCursor({
+              participantMessages,
+              extractedMessages,
+              persistedCursor,
+              sidebarHasSignal: sidebarHasSignalForSelection,
+            });
+            const cursorRowsForForward = collapseRowsForForward(cursorCandidateRows);
+            if (cursorRowsForForward.length === 0) {
+              if (anchorMsg) {
+                const extractedIdBuilt =
+                  anchorMsg.sender === "user"
+                    ? buildExtractedMessageId(anchorMsg, extractedMessages)
+                    : { id: "", strategy: "NONE" };
+                const lastUserMsgId = String(extractedIdBuilt?.id ?? "").trim();
+                const lastProcessedUserMsgId = String(
+                  globalThis.__lastProcessedUserMsg?.[cursorKey] ?? ""
+                ).trim();
+                console.log("[participant_message_skipped_already_processed]", {
+                  chatKey,
+                  participantKey: anchorMsg?.participantKey || null,
+                  cursorKey,
+                  lastUserMsgId,
+                  lastProcessedUserMsgId,
+                  textPreview: String(anchorMsg?.text ?? "").slice(0, 80),
+                  persistedCursorPresent: Boolean(persistedCursor),
+                });
+              }
+              continue;
+            }
+
+            const lastProcessedUserMsgId = String(
+              globalThis.__lastProcessedUserMsg?.[cursorKey] ?? ""
+            ).trim();
 
             const candidate = buildParticipantForwardCandidate({
-              participantMessages,
+              participantMessages: cursorRowsForForward,
               allParticipantUserRows: guaranteeFirst
                 ? allParticipantBuckets.get(participantKey) || participantMessages
                 : undefined,
@@ -6291,25 +6908,6 @@ async function runListenerBody() {
               tickFirstSeenByStableId: freshState?.tickFirstSeenByStableId,
             });
             if (!candidate) {
-              if (!guaranteeFirst) {
-                const lastUserMsg =
-                  participantMessages[participantMessages.length - 1] || null;
-                const extractedIdBuilt =
-                  lastUserMsg && lastUserMsg.sender === "user"
-                    ? buildStableMessageKey(lastUserMsg, extractedMessages)
-                    : { id: "", strategy: "NONE" };
-                const lastUserMsgId = String(extractedIdBuilt?.id ?? "").trim();
-                if (lastUserMsgId && lastUserMsgId === lastProcessedUserMsgId) {
-                  console.log("[participant_message_skipped_already_processed]", {
-                    chatKey,
-                    participantKey: lastUserMsg?.participantKey || null,
-                    cursorKey,
-                    lastUserMsgId,
-                    lastProcessedUserMsgId,
-                    textPreview: String(lastUserMsg?.text ?? "").slice(0, 80),
-                  });
-                }
-              }
               continue;
             }
 
@@ -6318,10 +6916,7 @@ async function runListenerBody() {
               extractedMessages
             );
             const lastUserMsgId = String(stableId ?? "").trim();
-              if (
-                !guaranteeFirst &&
-                (!lastUserMsgId || lastUserMsgId === lastProcessedUserMsgId)
-              ) {
+              if (!lastUserMsgId || lastUserMsgId === lastProcessedUserMsgId) {
                 continue;
               }
 
@@ -6351,7 +6946,10 @@ async function runListenerBody() {
               continue;
             }
 
-            if (isGroupMessageStale(candidate.timestamp)) {
+            if (
+              !persistedCursor &&
+              isGroupMessageStale(getRowTimestampMs(candidate))
+            ) {
                 console.warn("[stale_group_message_reply_blocked]", {
                   groupChatKey: chatKey,
                   participantKey: candidate.participantKey || null,
@@ -6406,6 +7004,12 @@ async function runListenerBody() {
               }
             }
 
+            candidate.__persistedCursor = persistedCursor || null;
+            candidate.__listenerInboundId = lastUserMsgId;
+            candidate.__suppressAckNoopOutbound =
+              cursorCandidateRows.length > 1;
+            candidate.__startupCatchup = Boolean(persistedCursor);
+
               newUserMessages.push(candidate);
               console.log("[participant_new_message_selected]", {
                 chatKey,
@@ -6415,6 +7019,8 @@ async function runListenerBody() {
                 idStrategy,
               burstMerged: Boolean(candidate.__burstMerged),
               burstCount: candidate.__burstMergedCount ?? 1,
+              mergedRowCount: candidate.__catchupMergedRowCount || 1,
+              persistedCursorPresent: Boolean(persistedCursor),
               textPreview: String(candidate.text ?? "").slice(0, 120),
               });
           }
@@ -6719,6 +7325,9 @@ async function runListenerBody() {
             }
             setMessageState(guaranteeKey, "processing");
             try {
+              const listenerInboundId =
+                String(msg?.__listenerInboundId ?? "").trim() ||
+                getMessageIdFromExtracted(msg, extractedMessages);
               const forwarded = await forwardPlaywrightGroupToPipeline({
                 messageId,
                 text: msg.text,
@@ -6740,6 +7349,10 @@ async function runListenerBody() {
                     ? Number(msg.sourceMessageIndex)
                     : msg.__position,
                 inboundSourceOrigin: INBOUND_SOURCE_REAL_CUSTOMER,
+                startupCatchup: Boolean(msg.__startupCatchup),
+                suppressAckNoopOutbound: Boolean(msg.__suppressAckNoopOutbound),
+                cursorLastAssistantOutboundTrace:
+                  msg.__persistedCursor?.lastAssistantOutboundTrace || null,
               });
               if (forwarded) {
                 anyForwarded = true;
@@ -6753,7 +7366,7 @@ async function runListenerBody() {
                 ) {
                   globalThis.__playwrightListenerMsgIdByGuarantee.set(
                     guaranteeKey,
-                    getMessageIdFromExtracted(msg, extractedMessages)
+                    listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages)
                   );
                 }
                 recordPlaywrightInboundScheduled({
@@ -6762,6 +7375,16 @@ async function runListenerBody() {
                   rowKey: String(msg.__rowKey ?? "").trim(),
                   participantCursorKey: participantCursorKeyForMessage(chatKey, msg),
                   burstStableIds: claimIds,
+                  ownerUserId: ownerUserIdForCursor,
+                  groupChatKey: chatKey,
+                  participantKey: String(msg.participantKey ?? "").trim(),
+                  inboundId:
+                    listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages),
+                  sourceMessageIndex:
+                    msg.sourceMessageIndex != null &&
+                    Number.isFinite(Number(msg.sourceMessageIndex))
+                      ? Number(msg.sourceMessageIndex)
+                      : msg.__position,
                 });
                 if (
                   freshState &&
