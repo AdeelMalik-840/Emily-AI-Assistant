@@ -940,8 +940,30 @@ app.listen(PORT, () => {
   }
 });
 
+/** @type {(() => Promise<void>) | null} */
+let stopPlaywrightListenerFn = null;
+
+async function gracefulPlaywrightShutdown(signal) {
+  console.log(`[server] ${signal} — stopping Playwright listener`);
+  if (stopPlaywrightListenerFn) {
+    try {
+      await stopPlaywrightListenerFn();
+    } catch (err) {
+      console.warn("[server] Playwright stop error:", err?.message || err);
+    }
+  }
+}
+
+process.once("SIGTERM", () => {
+  void gracefulPlaywrightShutdown("SIGTERM").finally(() => process.exit(0));
+});
+process.once("SIGINT", () => {
+  void gracefulPlaywrightShutdown("SIGINT").finally(() => process.exit(0));
+});
+
 if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true") {
   void import("./services/playwrightListener/index.js").then((mod) => {
+    stopPlaywrightListenerFn = mod.stopPlaywrightListener;
     mod.startPlaywrightListener().catch((err) => {
       console.error("[Playwright] failed to start:", err?.message || err);
     });

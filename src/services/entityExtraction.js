@@ -414,11 +414,58 @@ function inferEntityType(name, message) {
 }
 
 /**
+ * Rent/pricing tails must not be treated as catalog item names.
+ * @param {unknown} name
+ * @param {unknown} [message]
+ */
+export function isRentPricingEntityLabel(name, message = "") {
+  const norm = String(name ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  if (!norm) return true;
+  const exact = new Set([
+    "ho ga",
+    "kitna",
+    "rent",
+    "kiraya",
+    "kiraye",
+    "ho ga 3 months ka",
+    "rent ho ga",
+    "kitna rent ho ga",
+    "rent kitna hai",
+    "3 months ka rent",
+    "monthly rent",
+    "daily rent",
+  ]);
+  if (exact.has(norm)) return true;
+  if (/^(ho\s+ga|kitna|rent|kiraya|kiraye)\b/.test(norm)) return true;
+  if (/\b(rent|kiraya|kiraye)\s+(ho\s+ga|kitna|kitni|kitne)\b/.test(norm)) return true;
+  if (/\b(ho\s+ga|kitna)\b/.test(norm) && /\b(months?|mahine?|din|days?|ka|ki|ke)\b/.test(norm)) {
+    return true;
+  }
+  if (/^\d+\s*(months?|mahine?|din|days?)\s+ka\b/.test(norm)) return true;
+  if (/\b(monthly|daily)\s+rent\b/.test(norm)) return true;
+  if (/\brent\s+ho\s+ga\b/.test(norm)) return true;
+  if (/^(pe\s+hai|hai|hain|milega|milegi)\b/.test(norm)) return true;
+  if (/\bpe\s+hai\b/.test(norm)) return true;
+  const msg = String(message ?? "").toLowerCase();
+  if (
+    msg &&
+    /\b(kitna|kitni|kitne|rent|kiraya|kiraye|ho\s+ga)\b/.test(msg) &&
+    /\b(months?|mahine?|din|days?)\b/.test(norm) &&
+    !/\b(civic|corolla|stonic|toyota|honda|kia|bmw|swift|city|audi|mercedes|fortuner|alto)\b/.test(
+      norm
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * @param {{ name: string | null, confidence: number }} out
  * @param {string} message
  */
 function finalizeEntityResult(out, message) {
-  if (out.name == null) {
+  if (out.name == null || isRentPricingEntityLabel(out.name, message)) {
     return { name: null, confidence: 0, entityType: "item" };
   }
   return {
@@ -461,6 +508,22 @@ export function extractEntity(message) {
     }
   }
 
+  const strongMentions = [
+    /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3}?)\s+(?:ka|ki|ke)\s+(?:kya\s+scene|scene|details?|detail|info|rate|price|rent|model|color|colour|mileage|condition)\b/i,
+    /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3})\s+(?:available|avail|milega|milegi|hai|hain)\??\s*$/i,
+    /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3}?)\s+rent\s+pe\b/i,
+  ];
+
+  for (const p of strongMentions) {
+    const m = text.match(p);
+    if (m) {
+      const name = trimEntityName(m[1]);
+      if (name && !isStopPhrase(name)) {
+        return finalizeEntityResult(entityOutcome(name, CONF.STRONG_MENTION), raw);
+      }
+    }
+  }
+
   const patterns = [
     /(?:^|\s)(?:book|booking|reserve|reservation|order|rent|rental|purchase|buy)\s+([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,4})/i,
     /(?:^|\s)(?:need|needs|want|wants|looking\s+for|searching\s+for)\s+([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,4})/i,
@@ -473,21 +536,6 @@ export function extractEntity(message) {
       const name = trimEntityName(m[1]);
       if (name && !isStopPhrase(name)) {
         return finalizeEntityResult(entityOutcome(name, CONF.PATTERN), raw);
-      }
-    }
-  }
-
-  const strongMentions = [
-    /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3}?)\s+(?:ka|ki|ke)\s+(?:kya\s+scene|scene|details?|detail|info|rate|price|rent|model|color|colour|mileage|condition)\b/i,
-    /^\s*([a-zA-Z0-9\u0600-\u06FF]+(?:\s+[a-zA-Z0-9\u0600-\u06FF]+){0,3})\s+(?:available|avail|milega|milegi|hai|hain)\??\s*$/i,
-  ];
-
-  for (const p of strongMentions) {
-    const m = text.match(p);
-    if (m) {
-      const name = trimEntityName(m[1]);
-      if (name && !isStopPhrase(name)) {
-        return finalizeEntityResult(entityOutcome(name, CONF.STRONG_MENTION), raw);
       }
     }
   }

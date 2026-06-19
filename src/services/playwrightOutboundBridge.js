@@ -7,8 +7,9 @@ import { writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import { registerPlaywrightOutboundChunks } from "./playwrightOutboundRegistry.js";
 import { isReplyPrivateLockActive } from "./replyPrivateUiController.js";
+import { normalizeTitle } from "./playwrightTitleNormalize.js";
 import { normalizeWhatsAppImage } from "../utils/normalizeWhatsAppImage.js";
 
 /** Align with catalog cap in conversationIntelligence (show_images). */
@@ -682,6 +683,9 @@ export async function sendPlaywrightGroupText(text, opts = {}) {
 
     console.log("💬 Replying via Playwright (active header title)");
     result = await sendTextViaComposeBoxes(page, body);
+    if (result) {
+      registerPlaywrightOutboundChunks(expectedChat, body);
+    }
   } catch (e) {
     if (!isIdentitySendBlockError(e)) {
       console.error("[playwrightOutbound] send error:", e);

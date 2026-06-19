@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
+    "logs:clear": "node scripts/clear-logs.mjs",
+    "predev": "node scripts/clear-logs.mjs",
+    "dev": "PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY=true PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION=true PLAYWRIGHT_INBOUND_TURN_LEDGER=true PLAYWRIGHT_FRESH_DELTA_ROW_DECISION_TRACE=true node --watch src/server.js",
     "test": "NODE_ENV=test node --test tests/*.test.mjs"
   },
   "engines": {

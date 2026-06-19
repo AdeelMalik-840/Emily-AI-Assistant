@@ -50,6 +50,7 @@ function getCurrentOpenChatTitle() {
  *     messageHash: string,
  *     dedupeWindowMs: number,
  *     lastPlaywrightTextSends: Map<string, { hash: string, timestamp: number }>,
+ *     guaranteeKey?: string,
  *   }
  * }} p
  * @returns {Promise<{ ok: boolean, groupSendFailed?: boolean }>}
@@ -93,6 +94,7 @@ export async function sendOutboundMessage({
     messageHash,
     dedupeWindowMs,
     lastPlaywrightTextSends,
+    guaranteeKey,
   } = context;
 
   console.log("📤 Sending message via:", sendVia);
@@ -163,6 +165,7 @@ export async function sendOutboundMessage({
         messageHash,
         dedupeWindowMs,
         lastPlaywrightTextSends,
+        guaranteeKey: String(context.guaranteeKey ?? "").trim(),
       },
     });
     return normalizeAdapterResult(result);
