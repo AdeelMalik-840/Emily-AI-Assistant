@@ -84,3 +84,20 @@ test("low-confidence fallback stays below override threshold", () => {
   assert.equal(out.confidence < 0.8, true);
   assert.equal(out.confidence < getEntityConfidenceThreshold(out.name), true);
 });
+
+test("does not extract rent pricing tail as catalog item", () => {
+  const msg = "3 months k lye chyh kitna rent ho ga 3 months ka?";
+  const out = extractEntity(msg);
+  assert.equal(out.name, null);
+  assert.notEqual(out.name, "ho ga 3 months ka");
+});
+
+test("does not extract kitna rent ho ga as item", () => {
+  const out = extractEntity("kitna rent ho ga");
+  assert.equal(out.name, null);
+});
+
+test("still extracts BMW as unknown catalog item", () => {
+  const out = extractEntity("BMW rent pe hai?");
+  assert.match(String(out.name ?? "").toLowerCase(), /bmw/);
+});

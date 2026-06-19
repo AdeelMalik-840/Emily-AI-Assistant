@@ -2,7 +2,22 @@ import {
   sendPlaywrightGroupImages,
   sendPlaywrightGroupText,
 } from "../playwrightOutboundBridge.js";
+import { registerPlaywrightOutboundChunks } from "../playwrightOutboundRegistry.js";
 import { logOutboundLifecycle } from "../outboundLifecycleLog.js";
+
+function playwrightGuaranteeTextDedupeMap() {
+  if (!(globalThis.__playwrightTextSentForGuarantee instanceof Map)) {
+    globalThis.__playwrightTextSentForGuarantee = new Map();
+  }
+  return globalThis.__playwrightTextSentForGuarantee;
+}
+
+/** @internal */
+export function __clearPlaywrightGuaranteeTextDedupeForTests() {
+  if (globalThis.__playwrightTextSentForGuarantee instanceof Map) {
+    globalThis.__playwrightTextSentForGuarantee.clear();
+  }
+}
 
 /**
  * @param {{
@@ -14,7 +29,9 @@ import { logOutboundLifecycle } from "../outboundLifecycleLog.js";
  *     messageHash: string,
  *     dedupeWindowMs: number,
  *     lastPlaywrightTextSends: Map<string, { hash: string, timestamp: number }>,
+ *     guaranteeKey?: string,
  *     outboundLifecycle?: Record<string, unknown>,
+ *     sourceInboundMessageId?: string,
  *   }
  * }} p
  * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
@@ -29,6 +46,7 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
     messageHash,
     dedupeWindowMs,
     lastPlaywrightTextSends,
+    guaranteeKey,
     outboundLifecycle,
   } = context;
 
@@ -54,8 +72,12 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
       textSentRecord &&
       textSentRecord.hash === messageHash &&
       Date.now() - textSentRecord.timestamp < dedupeWindowMs;
+    const guaranteeGk = String(guaranteeKey ?? "").trim();
+    const textAlreadySentForGuarantee =
+      guaranteeGk &&
+      playwrightGuaranteeTextDedupeMap().get(guaranteeGk) === messageHash;
 
-    let ok = Boolean(textAlreadySentRecently);
+    let ok = Boolean(textAlreadySentRecently || textAlreadySentForGuarantee);
     const wantsImages =
       Array.isArray(messageMeta?.whatsappImageUrls) &&
       messageMeta.whatsappImageUrls.length > 0;
@@ -64,9 +86,11 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
       globalThis.__currentOpenChatTitle ?? groupNameResolved ?? ""
     ).trim();
 
-    if (textAlreadySentRecently) {
+    if (textAlreadySentRecently || textAlreadySentForGuarantee) {
       console.log(
-        "[whatsappInboundBuffer] text already sent for this inbound; skipping text resend"
+        textAlreadySentForGuarantee
+          ? "[playwright_guarantee_text_skip] text already sent for guarantee retry; skipping text resend"
+          : "[whatsappInboundBuffer] text already sent for this inbound; skipping text resend"
       );
       logOutboundLifecycle("duplicate_send_skipped", {
         ...lifecycleBase,
@@ -101,10 +125,17 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
       });
       if (ok) {
         console.log("🧵 Text sent complete");
+        registerPlaywrightOutboundChunks(groupNameResolved, reply, {
+          guaranteeKey: guaranteeGk || null,
+          sourceInboundMessageId: String(context?.sourceInboundMessageId ?? "").trim() || null,
+        });
         lastPlaywrightTextSends.set(sessionKey, {
           hash: messageHash,
           timestamp: Date.now(),
         });
+        if (guaranteeGk) {
+          playwrightGuaranteeTextDedupeMap().set(guaranteeGk, messageHash);
+        }
       }
     }
 
@@ -154,6 +185,9 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
     }
 
     if (ok && imagesDelivered) {
+      if (guaranteeGk) {
+        playwrightGuaranteeTextDedupeMap().delete(guaranteeGk);
+      }
       return { ok: true };
     }
     console.error(
@@ -167,4 +201,3 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
     console.log("🔓 Outbound lock RELEASED");
   }
 }
-

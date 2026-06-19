@@ -99,7 +99,7 @@ test("generic duration proposal validates typo-like hour unit without adding par
   assert.equal(policy.createFields, undefined);
   assert.equal(
     policy.reply,
-    "Kam se kam 12 ghantay ke liye gari rent par milti hai, is se kam nahi hoti. 12 ghantay ka rent 6400 PKR hoga. Check karun?"
+    "2 ghantay ke liye gari rent par nahi milti. Minimum 12 ghantay ka slot hai. 12 ghantay ka rent 6400 PKR hoga. 12 ghantay ke liye check karun?"
   );
 });
 
@@ -134,7 +134,7 @@ test("processMessage applies validated generic duration before half-day policy",
 
   assert.equal(
     out.reply,
-    "Kam se kam 12 ghantay ke liye gari rent par milti hai, is se kam nahi hoti. 12 ghantay ke liye check karun?"
+    "2 ghantay ke liye gari rent par nahi milti. Minimum 12 ghantay ka slot hai. 12 ghantay ke liye check karun?"
   );
   assert.equal(out.messageMeta?.bookingCreated, undefined);
 });
@@ -162,7 +162,8 @@ test("processMessage does not call generic duration proposal when deterministic 
   });
 
   assert.equal(called, false);
-  assert.match(out.reply, /Kam se kam 12 ghantay ke liye/);
+  assert.match(out.reply, /Minimum 12 ghantay/);
+  assert.match(out.reply, /nahi milti/i);
 });
 
 test("deterministic duration parser wins over generic duration proposal", async () => {

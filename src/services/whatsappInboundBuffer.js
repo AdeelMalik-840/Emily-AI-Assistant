@@ -24,11 +24,21 @@ import {
 } from "./playwrightTitleNormalize.js";
 import { evaluateWhatsAppGroupInboundGate } from "./whatsappGroupInboundGate.js";
 import {
+  INBOUND_SOURCE_REAL_CUSTOMER,
+  resolveInboundSourceOrigin,
+  validateOutboundReplyBinding,
+  logOutboundReplyBoundToTurn,
+} from "./inboundOriginGuard.js";
+import {
   buildPlaywrightGuaranteeKey,
   markPlaywrightGroupGateBlockedProcessed,
   notifyPlaywrightGuaranteeDelivered,
   notifyPlaywrightGuaranteeReleased,
 } from "./playwrightGuaranteeBridge.js";
+import {
+  markInboundTurnLedgerDoneForGuarantee,
+  markInboundTurnLedgerFailedForGuarantee,
+} from "./inboundTurnLedger.js";
 import { setMessageState } from "./messageState.js";
 import {
   normalizePlaywrightOutboundTrace,
@@ -789,6 +799,7 @@ export async function executeWhatsAppAiPipeline(p) {
     startupCatchup: startupCatchupRaw = false,
     suppressAckNoopOutbound: suppressAckNoopOutboundRaw = false,
     cursorLastAssistantOutboundTrace: cursorLastAssistantOutboundTraceRaw = null,
+    inboundSourceOrigin: inboundSourceOriginRaw = INBOUND_SOURCE_REAL_CUSTOMER,
   } = p;
 
   const dmPlaywrightChatKey = String(dmPlaywrightChatKeyRaw ?? "").trim();
@@ -802,6 +813,35 @@ export async function executeWhatsAppAiPipeline(p) {
   const playwrightWebInbound = Boolean(playwrightWebInboundRaw);
   const playwrightWebTitleIdentity = Boolean(playwrightWebTitleIdentityRaw);
   const groupNameResolved = String(groupNameRaw ?? chatNameRaw ?? "").trim();
+  const inboundSourceOrigin =
+    inboundSourceOriginRaw != null && String(inboundSourceOriginRaw).trim() !== ""
+      ? String(inboundSourceOriginRaw).trim()
+      : INBOUND_SOURCE_REAL_CUSTOMER;
+  const latestMessageForOrigin = String(latestMessageRaw ?? combinedMessage ?? "").trim();
+  const originCheck = resolveInboundSourceOrigin({
+    text: latestMessageForOrigin,
+    chatKey: String(playwrightChatKeyRaw ?? groupNameResolved ?? "").trim(),
+    sender: "user",
+    isStartupBaseline: inboundSourceOrigin === "startup_baseline",
+  });
+  const effectiveInboundSourceOrigin = originCheck.blocked
+    ? originCheck.sourceOrigin
+    : inboundSourceOrigin;
+  if (effectiveInboundSourceOrigin !== INBOUND_SOURCE_REAL_CUSTOMER) {
+    console.log("[inbound_pipeline_blocked_non_customer_origin]", {
+      inboundSourceOrigin: effectiveInboundSourceOrigin,
+      reason: originCheck.reason,
+      messagePreview: latestMessageForOrigin.slice(0, 120),
+      messageId: String(messageIdRaw ?? "").trim() || null,
+    });
+    if (isPlaywrightWebTabInbound(p)) {
+      notifyPlaywrightGuaranteeReleased(
+        buildPlaywrightGuaranteeKey(groupNameResolved, messageIdRaw)
+      );
+      releasePlaywrightListenerProcessingLocks();
+    }
+    return;
+  }
 
   const conversationCustomerNumber =
     String(conversationCustomerNumberRaw ?? "").trim() ||
@@ -1214,6 +1254,7 @@ export async function executeWhatsAppAiPipeline(p) {
       sourceMessageIndexRaw != null && Number.isFinite(Number(sourceMessageIndexRaw))
         ? Number(sourceMessageIndexRaw)
         : null,
+    inboundSourceOrigin: effectiveInboundSourceOrigin,
   }));
   const finalReplySourceFromMeta = String(
     messageMeta?.outboundTrace?.finalReplySource ?? ""
@@ -1413,6 +1454,30 @@ export async function executeWhatsAppAiPipeline(p) {
   );
 
   if (replyText !== "") {
+    const outboundBinding = validateOutboundReplyBinding({
+      replyToMessageId: messageId,
+      sourceOrigin: effectiveInboundSourceOrigin,
+      guaranteeKey,
+      textPreview: replyText.slice(0, 120),
+      activeMessageId: messageId,
+    });
+    if (!outboundBinding.ok) {
+      console.log("[stale_outbound_reply_blocked]", {
+        replyToMessageId: messageId,
+        reason: outboundBinding.reason,
+        activeMessageId: messageId,
+        textPreview: replyText.slice(0, 120),
+      });
+      processingSuccess = true;
+      return;
+    }
+    logOutboundReplyBoundToTurn({
+      replyToMessageId: messageId,
+      guaranteeKey,
+      traceId,
+      finalReplySource: messageMeta?.finalReplySource ?? null,
+      textPreview: replyText.slice(0, 120),
+    });
     const outboundLifecycleBase = buildOutboundLifecycleBase({
       traceId,
       guaranteeKey: guaranteeKey || null,
@@ -1521,6 +1586,7 @@ export async function executeWhatsAppAiPipeline(p) {
             dedupeWindowMs: REPLY_DEDUPE_WINDOW_MS,
             lastPlaywrightTextSends,
             usePlaywrightWebSend,
+            guaranteeKey: String(guaranteeKey ?? "").trim(),
             outboundLifecycle: outboundLifecycleBase,
           },
         });
@@ -1650,6 +1716,13 @@ export async function executeWhatsAppAiPipeline(p) {
     console.error("❌ Processing error:", err);
     if (guaranteeKey) {
       setMessageState(guaranteeKey, "failed");
+      const pendingFail =
+        globalThis.__playwrightPendingByGuarantee?.get(guaranteeKey);
+      markInboundTurnLedgerFailedForGuarantee({
+        guaranteeKey,
+        burstStableIds: pendingFail?.burstStableIds,
+        textPreview: String(combinedMessage ?? "").slice(0, 120),
+      });
     }
   } finally {
     const playwrightTurnCompleteFinally = playwrightInboundTurnComplete(
@@ -1662,6 +1735,14 @@ export async function executeWhatsAppAiPipeline(p) {
       (!isPlaywrightWebTabInbound(p) || playwrightTurnCompleteFinally)
     ) {
       setMessageState(guaranteeKey, "done");
+      const pendingDone =
+        globalThis.__playwrightPendingByGuarantee?.get(guaranteeKey);
+      markInboundTurnLedgerDoneForGuarantee({
+        guaranteeKey,
+        burstStableIds: pendingDone?.burstStableIds,
+        replySent: outboundReplyDelivered,
+        textPreview: String(combinedMessage ?? "").slice(0, 120),
+      });
     } else if (guaranteeKey && !playwrightTurnCompleteFinally) {
       console.log("⚠️ Not marking processed — no reply sent");
     }
@@ -1947,6 +2028,12 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
       releasePlaywrightChatLockFromGate(ctx);
       if (gk) {
         markPlaywrightGroupGateBlockedProcessed(gk);
+        const pendingGate = globalThis.__playwrightPendingByGuarantee?.get(gk);
+        markInboundTurnLedgerFailedForGuarantee({
+          guaranteeKey: gk,
+          burstStableIds: pendingGate?.burstStableIds,
+          textPreview: combined.slice(0, 120),
+        });
       }
       try {
         await ctx.db.collection("messages").add({

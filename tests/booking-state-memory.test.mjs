@@ -248,7 +248,7 @@ test("expired booking state is cleared before duplicate guard", () => {
   assert.equal(memory.bookingStatesByItemId["item-1"], undefined);
 });
 
-test("pending owner engagement qualifier reply is stored and short-circuits", async () => {
+test("pending owner engagement qualifier reply is blocked in group (owner-first safe)", async () => {
   const memory = {};
   setStructuredBookingState(memory, {
     id: "b1",
@@ -281,6 +281,47 @@ test("pending owner engagement qualifier reply is stored and short-circuits", as
 
   assert.ok(result);
   assert.equal(outboundCalls.length, 1);
+  assert.equal(result.meta.pendingEngagementHandled, false);
+  assert.equal(result.meta.groupPrivateDetailBlocked, true);
+  assert.equal(memory.pendingEngagementState, undefined);
+  assert.equal(memory.qualifiers?.usage_area, undefined);
+  assert.equal(updates.length, 0);
+  assert.match(String(result.reply ?? ""), /request receive ho gayi|confirm kar ke bata/i);
+});
+
+test("pending owner engagement qualifier reply is stored in DM and short-circuits", async () => {
+  const memory = {};
+  setStructuredBookingState(memory, {
+    id: "b1-dm",
+    itemId: "item-1",
+    status: "pending_approval",
+    approvalStage: "pending_owner_approval",
+    durationDays: 3,
+    sessionKey: "s1",
+    channel: "dm",
+  });
+  memory.pendingEngagementState = buildPendingQualifierState({
+    bookingId: "b1-dm",
+    qualifierKey: "usage_area",
+    allowedValues: ["inside_city", "outside_city"],
+  });
+  const { db, updates } = createFakeDb();
+  const outboundCalls = [];
+
+  const result = await maybeHandlePendingEngagementQualifier({
+    db,
+    userId: "owner1",
+    message: "outside city",
+    memory,
+    routingCtx: { isGroupInbound: false },
+    applyOutbound: (payload, routingCtx) => {
+      outboundCalls.push({ payload, routingCtx });
+      return payload;
+    },
+  });
+
+  assert.ok(result);
+  assert.equal(outboundCalls.length, 1);
   assert.equal(result.meta.pendingEngagementHandled, true);
   assert.equal(memory.qualifiers.usage_area, "outside_city");
   assert.equal(memory.pendingEngagementState.rawAnswer, "outside city");
@@ -289,12 +330,12 @@ test("pending owner engagement qualifier reply is stored and short-circuits", as
     "businesses",
     "owner1",
     "bookings",
-    "b1",
+    "b1-dm",
   ]);
   assert.equal(updates[0].patch.qualifiers.usage_area, "outside_city");
 });
 
-test("pending owner engagement ignores non-qualifier reply", async () => {
+test("pending owner engagement ignores non-qualifier reply in DM", async () => {
   const memory = {};
   setStructuredBookingState(memory, {
     id: "b2",
@@ -317,7 +358,7 @@ test("pending owner engagement ignores non-qualifier reply", async () => {
     userId: "owner1",
     message: "kal chahiye",
     memory,
-    routingCtx: { isGroupInbound: true },
+    routingCtx: { isGroupInbound: false },
     applyOutbound: (payload) => payload,
   });
 

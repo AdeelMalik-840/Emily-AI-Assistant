@@ -33,3 +33,6 @@ mobile-app/dist/
 # logs
 logs/
 *.log
+
+# cursor IDE local runtime (ledger, outbound registry, booking traces)
+.cursor/

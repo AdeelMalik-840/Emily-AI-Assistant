@@ -123,7 +123,9 @@ test("real group outbound path scrubs phone leak with Playwright GROUP reply mod
 
   assert.equal(out.sendVia, "PLAYWRIGHT");
   assert.equal(out.replyMode, "GROUP");
-  assert.equal(out.reply, "Kam se kam 12 ghantay ke liye gari rent par milti hai, is se kam nahi hoti. 12 ghantay ke liye check karun?");
+  assert.equal(out.reply, "2 ghantay ke liye gari rent par nahi milti. Minimum 12 ghantay ka slot hai. 12 ghantay ke liye check karun?");
+  assert.match(out.reply, /Minimum 12 ghantay/);
+  assert.match(out.reply, /nahi milti/i);
   assert.doesNotMatch(out.reply, /\+92|03\d{9}|contact number|kya yeh sahi/i);
 });
 

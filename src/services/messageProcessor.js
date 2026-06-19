@@ -141,7 +141,21 @@ import {
   decideResponseStrategy,
 } from "./responseStrategy.js";
 import { sanitizeContextForResolvedItemChange } from "./bookingContextSanitizer.js";
+import { findConservativeFuzzyCatalogMention } from "./currentTurnAuthority.js";
+import {
+  buildSameSessionBookingContinuationReply,
+  isAwaitingBookingContactCapture,
+  isSameSessionBookingContinuation,
+  maybeHandleGroupBookingSlotCapture,
+  maybeHandlePendingEngagementCommitWithoutQualifier,
+  reconcileItemContextWithExplicitMessage,
+  resolveExplicitUnlistedMention,
+} from "./bookingStabilityHelpers.js";
 import { resolveParticipantIdentity } from "./participantIdentity.js";
+import {
+  shouldBlockBookingForAssistantOrigin,
+  INBOUND_SOURCE_REAL_CUSTOMER,
+} from "./inboundOriginGuard.js";
 
 async function createBookingFromValidatedIntent({
   callerTag,
@@ -154,8 +168,32 @@ async function createBookingFromValidatedIntent({
   traceId,
   userId,
   createBookingArgs,
+  inboundSourceOrigin = INBOUND_SOURCE_REAL_CUSTOMER,
+  inboundMessage = "",
+  playwrightChatKey = null,
+  groupName = null,
 } = {}) {
   const flowId = String(traceId ?? "").trim() || null;
+  const assistantBookingBlock = shouldBlockBookingForAssistantOrigin({
+    message: inboundMessage,
+    sourceOrigin: inboundSourceOrigin,
+    chatKey: String(playwrightChatKey ?? groupName ?? "").trim(),
+    itemId,
+    durationDays,
+  });
+  if (assistantBookingBlock.blocked) {
+    console.warn("[booking_create_gate_blocked]", {
+      callerTag,
+      reason: assistantBookingBlock.reason,
+    });
+    console.warn("[BOOKING_GATE]", {
+      ...(flowId ? { flowId } : {}),
+      action: "blocked",
+      callerTag: String(callerTag ?? "").trim() || null,
+      reason: assistantBookingBlock.reason,
+    });
+    return { ok: false, code: "GATE_ASSISTANT_ORIGIN_BLOCKED" };
+  }
   console.log("[booking_create_gate_entered]", {
     callerTag: String(callerTag ?? "").trim() || null,
     isGroupInbound: Boolean(isGroupInbound),
@@ -4829,19 +4867,42 @@ function formatCatalogOptionLine(item) {
   return price ? `- ${label} - ${price}` : `- ${label}`;
 }
 
-function buildBrowseOptionsReply(items, style) {
+function buildBrowseOptionsReply(items, style, options = {}) {
+  const actuallyAvailable = options?.actuallyAvailable !== false;
   if (!Array.isArray(items) || items.length === 0) {
     return style === "casual_local"
       ? "Abhi koi aur available option nazar nahi aa raha. Aap koi specific option poochna chahenge?"
       : "I don't see another available option right now. Would you like to ask about a specific option?";
   }
-  const heading =
-    style === "casual_local" ? "Available options:" : "Available options:";
+  const heading = actuallyAvailable
+    ? "Available options:"
+    : style === "casual_local"
+      ? "Hamari list mein ye options hain:"
+      : "Listed options:";
   const ask =
     style === "casual_local"
       ? "Konsa option dekhna chahenge?"
       : "Which option would you like to check?";
   return `${heading}\n${items.map(formatCatalogOptionLine).join("\n")}\n\n${ask}`;
+}
+
+function buildNotListedReply({ itemLabel, style, catalogItems = [] }) {
+  const label = String(itemLabel ?? "").trim() || "yeh option";
+  const available = (Array.isArray(catalogItems) ? catalogItems : []).filter(
+    (row) => row && typeof row === "object"
+  );
+  if (style === "casual_local") {
+    const head = `Sorry, ${label} hamari list mein nahi hai.`;
+    if (available.length > 0) {
+      return `${head}\n${buildBrowseOptionsReply(available, style, { actuallyAvailable: false })}`;
+    }
+    return `${head} Kya aap koi aur available option dekhna chahenge?`;
+  }
+  const head = `Sorry, ${label} is not listed in our available options.`;
+  if (available.length > 0) {
+    return `${head}\n${buildBrowseOptionsReply(available, style, { actuallyAvailable: false })}`;
+  }
+  return `${head} Would you like to see what we currently have?`;
 }
 
 function formatServiceOptionLine(service) {
@@ -5233,7 +5294,7 @@ function computeAskDurationPhraseEligibility({
   message,
   normalizedCatalogForTurn,
   emilyTurn,
-  prioritizedIntent,
+  priorityIntentSnapshot,
   llmIntentClassification,
 } = {}) {
   if (stage !== "availability") {
@@ -5249,7 +5310,7 @@ function computeAskDurationPhraseEligibility({
     return { eligible: false, reason: "MEMORY_FALLBACK_UNVERIFIED" };
   }
   const classifierTime =
-    intentReasonSuggestsAvailabilityTimeframe(prioritizedIntent?.reason) ||
+    intentReasonSuggestsAvailabilityTimeframe(priorityIntentSnapshot?.reason) ||
     intentReasonSuggestsAvailabilityTimeframe(llmIntentClassification?.reason);
   const genericTimingShape = messageLooksLikeGenericAvailabilityTimingFollowup(message);
   if (classifierTime || genericTimingShape) {
@@ -5309,7 +5370,7 @@ function detailFieldForEntityGuard(message) {
   return null;
 }
 
-function shouldSkipEntityExtractionForDetailQuestion(message, catalogItems) {
+export function shouldSkipEntityExtractionForDetailQuestion(message, catalogItems) {
   const field = detailFieldForEntityGuard(message);
   if (!field) return { skip: false, field: null };
   const explicitCatalogItem = hasExplicitNewItemMention(
@@ -5841,10 +5902,15 @@ export function resolveAuthoritativeItemForTurn({
     Array.isArray(catalogItems) ? catalogItems : [],
     normalizeId(lockedItem?.id ?? focusedMemoryItem?.id)
   );
+  const fuzzyCatalogMention = findConservativeFuzzyCatalogMention(
+    userText,
+    catalogItems
+  );
   const explicitMention =
     Boolean(explicitItem) &&
     (hasExplicitEntity ||
       explicitCatalogMention.found ||
+      (fuzzyCatalogMention.found && !fuzzyCatalogMention.ambiguous) ||
       latestMessageMentionsEntity(
         userText,
         explicitItem?.displayLabel ?? explicitItem?.name
@@ -5868,8 +5934,49 @@ export function resolveAuthoritativeItemForTurn({
     selected = lockedItem;
     source = "turn_lock";
   } else if (isFollowup && focusedMemoryItem) {
-    selected = focusedMemoryItem;
-    source = "memory_followup";
+    const memoryId = normalizeId(focusedMemoryItem.id ?? focusedMemoryItem.itemId);
+    const catalogExplicit = hasExplicitNewItemMention(userText, catalogItems, null);
+    const vehicleConflict =
+      (catalogExplicit.found &&
+        normalizeId(catalogExplicit.itemId) &&
+        normalizeId(catalogExplicit.itemId) !== memoryId) ||
+      (fuzzyCatalogMention.found &&
+        !fuzzyCatalogMention.ambiguous &&
+        normalizeId(fuzzyCatalogMention.itemId) &&
+        normalizeId(fuzzyCatalogMention.itemId) !== memoryId);
+    if (vehicleConflict) {
+      if (
+        fuzzyCatalogMention.found &&
+        !fuzzyCatalogMention.ambiguous &&
+        fuzzyCatalogMention.itemId
+      ) {
+        const row = catalogItems.find(
+          (r) => normalizeId(r?.id) === normalizeId(fuzzyCatalogMention.itemId)
+        );
+        if (row && typeof row === "object") {
+          selected = normalizeAuthorityItem(row);
+          source = "explicit_fuzzy";
+        }
+      } else if (catalogExplicit.found && catalogExplicit.itemId) {
+        const row = catalogItems.find(
+          (r) => normalizeId(r?.id) === normalizeId(catalogExplicit.itemId)
+        );
+        if (row && typeof row === "object") {
+          selected = normalizeAuthorityItem(row);
+          source = "explicit_catalog_mention";
+        }
+      }
+      if (!selected) {
+        console.log("[item_authority_memory_blocked_vehicle_conflict]", {
+          memoryItemId: memoryId,
+          catalogExplicit: catalogExplicit.found ? catalogExplicit.itemId : null,
+          fuzzyItemId: fuzzyCatalogMention.itemId ?? null,
+        });
+      }
+    } else {
+      selected = focusedMemoryItem;
+      source = "memory_followup";
+    }
   }
 
   console.log("[item_authority_decision]", {
@@ -6730,6 +6837,7 @@ export async function processMessage({
   senderScope = null,
   sourceRowKey = null,
   sourceMessageIndex = null,
+  inboundSourceOrigin = INBOUND_SOURCE_REAL_CUSTOMER,
   __genericSlotProposalForTests = null,
   __availabilityAiCompletionForTests = null,
 }) {
@@ -6808,6 +6916,25 @@ export async function processMessage({
 
   const rawInboundMessage = selectedForAi;
   let message = rawInboundMessage;
+  if (String(inboundSourceOrigin ?? INBOUND_SOURCE_REAL_CUSTOMER) !== INBOUND_SOURCE_REAL_CUSTOMER) {
+    emit("INBOUND_ORIGIN_BLOCKED", {
+      inboundSourceOrigin: String(inboundSourceOrigin ?? ""),
+      messagePreview: String(message ?? "").slice(0, 120),
+    });
+    return applyHybridOutboundResult(
+      {
+        reply: "",
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(false),
+      },
+      {
+        isGroupInbound: Boolean(isGroupInbound),
+        message: String(inboundRaw ?? "").trim(),
+        participantPhoneForDm,
+        playwrightWebInbound: Boolean(playwrightWebInbound),
+      }
+    );
+  }
   emit("NEW_MESSAGE", {
     messageId: String(messageId),
     source,
@@ -6848,6 +6975,12 @@ export async function processMessage({
     playwrightChatKey: String(playwrightChatKey ?? "").trim() || null,
     whatsappRecipientType: normalizedWhatsappRecipientType,
     flowId,
+  };
+  const bookingInboundGuard = {
+    inboundSourceOrigin,
+    inboundMessage: message,
+    playwrightChatKey,
+    groupName,
   };
 
   const logisticsCompletionPolicy = resolveLogisticsCompletionPolicy();
@@ -8388,7 +8521,61 @@ export async function processMessage({
       /^(yes|yeah|yep|han|haan|ji|jee|ok|okay|done|outside|inside|andar|bahar)$/i.test(raw)
     );
   }
-  function buildBookingBlockedResponse({ itemName, memory }) {
+  function buildBookingBlockedResponse({
+    itemName,
+    memory,
+    itemId = null,
+    message: blockedMessage = message,
+    extractedDurationDays = null,
+    contactValid = null,
+    events: blockedEvents = null,
+  } = {}) {
+    const blockedItemId =
+      normalizeId(itemId) ||
+      normalizeId(memory?.bookingState?.itemId) ||
+      normalizeId(memory?.lastItem?.id);
+    const blockedContact =
+      contactValid === null
+        ? extractBookingContactParts(blockedMessage).isValid
+        : contactValid;
+    const blockedDurationDays =
+      extractedDurationDays ??
+      (Number.isFinite(Number(extractDuration(blockedMessage)?.durationDays))
+        ? Number(extractDuration(blockedMessage).durationDays)
+        : null);
+    const continuation = isSameSessionBookingContinuation({
+      memory,
+      emilySessionKey,
+      itemId: blockedItemId,
+      message: blockedMessage,
+      extractedDurationDays: blockedDurationDays,
+      contactValid: blockedContact,
+      events: blockedEvents ?? detectBookingEvent(blockedMessage),
+    });
+    if (continuation) {
+      const itemLabel = String(itemName ?? "").trim();
+      const text = buildSameSessionBookingContinuationReply({
+        memory,
+        itemName: itemLabel,
+        style: conversationStyle,
+      });
+      console.log("[final_reply_source]", {
+        source: "BOOKING_CONTINUATION_ALREADY_NOTED",
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: text,
+          text,
+          type: "AI_MESSAGE",
+          meta: {
+            bookingContinuation: true,
+            bookingId: String(memory?.bookingState?.bookingId ?? "").trim() || null,
+          },
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx
+      );
+    }
     resetBookingMemoryAfterBlock(memory);
     const itemLabel = String(itemName ?? "").trim();
     const text = buildUnavailableReply({
@@ -8492,6 +8679,28 @@ export async function processMessage({
   });
   if (pendingEngagementResult) {
     return pendingEngagementResult;
+  }
+  const pendingCommitQualifierResult =
+    await maybeHandlePendingEngagementCommitWithoutQualifier({
+      message,
+      memory: pendingEngagementMemory,
+      routingCtx,
+      applyOutbound: applyHybridOutboundResult,
+      knowledgeMeta: messageMetaForKnowledge(true),
+    });
+  if (pendingCommitQualifierResult) {
+    return pendingCommitQualifierResult;
+  }
+  const slotCaptureResult = await maybeHandleGroupBookingSlotCapture({
+    userId,
+    message,
+    memory: pendingEngagementMemory,
+    routingCtx,
+    isGroupInbound: Boolean(isGroupInbound),
+    applyOutbound: applyHybridOutboundResult,
+  });
+  if (slotCaptureResult) {
+    return slotCaptureResult;
   }
 
   globalThis.__topicEntityBySession =
@@ -8949,6 +9158,7 @@ export async function processMessage({
       ownerApprovalFirstRequest: true,
       traceId,
       userId,
+      ...bookingInboundGuard,
       createBookingArgs: {
         itemId,
         itemName,
@@ -9209,6 +9419,7 @@ export async function processMessage({
       ownerApprovalFirstRequest: isGroupInbound,
       traceId,
       userId,
+      ...bookingInboundGuard,
       createBookingArgs: {
         itemId,
         itemName: displayLabel,
@@ -11122,6 +11333,7 @@ export async function processMessage({
           ownerApprovalFirstRequest: false,
           traceId,
           userId,
+          ...bookingInboundGuard,
           createBookingArgs: {
             itemId: row.id,
             itemName: row.name,
@@ -13141,6 +13353,7 @@ export async function processMessage({
       ownerApprovalFirstRequest: false,
       traceId,
       userId,
+      ...bookingInboundGuard,
       createBookingArgs: {
         itemId: memoryBookingItemId,
         itemName: memoryBookingItemName || undefined,
@@ -13278,6 +13491,20 @@ export async function processMessage({
             : "fallback"
     );
   }
+  if (!skipItemResolutionForGreeting) {
+    const reconciledBeforeAvailability =
+      await reconcileItemContextWithExplicitMessage({
+        message,
+        itemContext,
+        catalogItems: normalizedCatalogForTurn,
+        resolveCatalog: resolveCatalogThisTurn,
+        hydrateFn: hydrateItemWithAvailability,
+      });
+    if (reconciledBeforeAvailability) {
+      itemContext = reconciledBeforeAvailability;
+      syncLastItemFromItemContextIfMissing(conversationMemory, itemContext);
+    }
+  }
   if (turnLockedItem) {
     await applyTurnLockedItemContext(
       turnLockedItem.reason === "CONTACT_AFTER_ASK_CONTACT" ? "memory" : "duration"
@@ -13304,6 +13531,44 @@ export async function processMessage({
             extractYearFromName(safeItemCandidate.name),
         }
       : null;
+  const explicitUnlistedCheck = !skipItemResolutionForGreeting
+    ? await resolveExplicitUnlistedMention({
+        message,
+        itemContext,
+        catalogItems: normalizedCatalogForTurn,
+        resolveCatalog: resolveCatalogThisTurn,
+        extractedEntity: extractedEntity ?? null,
+      })
+    : null;
+  if (explicitUnlistedCheck?.notInCatalog) {
+    if (isAwaitingBookingContactCapture(conversationMemory)) {
+      console.log("[explicit_unlisted_skipped_slot_collection]", {
+        label: explicitUnlistedCheck.label,
+        reason: "AWAITING_BOOKING_CONTACT",
+      });
+    } else {
+      console.log("[explicit_unlisted_overrides_stale_memory]", explicitUnlistedCheck);
+      console.log("[final_reply_source]", {
+        source: "EXPLICIT_UNLISTED_NOT_STALE_MEMORY",
+      });
+      logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
+        source: "EXPLICIT_UNLISTED_NOT_STALE_MEMORY",
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: buildNotListedReply({
+            itemLabel: explicitUnlistedCheck.label,
+            style: conversationStyle,
+            catalogItems: normalizedCatalogForTurn,
+          }),
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
+    }
+  }
   const safeItemSource = resolveSafeItemSource({
     itemContext,
     resolvedItem,
@@ -14346,24 +14611,67 @@ export async function processMessage({
     const approvalDurationDays = Number.isFinite(bookingDurationDays)
       ? Math.max(1, Math.floor(Number(bookingDurationDays)))
       : null;
+    const approvalContinuation = isSameSessionBookingContinuation({
+      memory: conversationMemory,
+      emilySessionKey,
+      itemId: approvalItemId,
+      message,
+      extractedDurationDays: extracted.durationDays ?? bookingDurationDays ?? null,
+      contactValid: contactParts.isValid,
+      events,
+    });
     const approvalHydratedAvailable =
       itemContext != null &&
       typeof itemContext === "object" &&
-      itemContext.isAvailable === true;
+      (itemContext.isAvailable === true || approvalContinuation);
     console.log("[group_contact_request_blocked]", {
       itemId: approvalItemId,
       hasDuration: approvalDurationDays != null,
       hasContact,
       isAvailable: approvalHydratedAvailable,
+      approvalContinuation,
       reason: "OWNER_APPROVAL_FIRST",
     });
 
     if (
       approvalItemId &&
       approvalDurationDays != null &&
+      approvalContinuation &&
       itemContext != null &&
       typeof itemContext === "object" &&
       itemContext.isAvailable === false
+    ) {
+      const approvalItemName =
+        buildDisplayLabel(itemContext) ||
+        String(itemContext?.name ?? "").trim() ||
+        memoryBookingItemName ||
+        "";
+      const continuationReply = buildSameSessionBookingContinuationReply({
+        memory: conversationMemory,
+        itemName: approvalItemName,
+        style: conversationStyle,
+      });
+      console.log("[final_reply_source]", {
+        source: "BOOKING_CONTINUATION_ALREADY_NOTED",
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: continuationReply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
+    }
+
+    if (
+      approvalItemId &&
+      approvalDurationDays != null &&
+      itemContext != null &&
+      typeof itemContext === "object" &&
+      itemContext.isAvailable === false &&
+      !approvalContinuation
     ) {
       const styleKeyApproval =
         conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
@@ -14465,6 +14773,7 @@ export async function processMessage({
         ownerApprovalFirstRequest: true,
         traceId,
         userId,
+        ...bookingInboundGuard,
         createBookingArgs: {
           itemId: approvalItemId,
           itemName: approvalItemName,
@@ -14693,11 +15002,60 @@ export async function processMessage({
   }
 
   if (
+    !skipItemResolutionForGreeting &&
+    (isAvailabilityQuestion || hasDurationSignal || events.transactionalIntent)
+  ) {
+    const reconciledLate = await reconcileItemContextWithExplicitMessage({
+      message,
+      itemContext,
+      catalogItems: normalizedCatalogForTurn,
+      resolveCatalog: resolveCatalogThisTurn,
+      hydrateFn: hydrateItemWithAvailability,
+    });
+    if (reconciledLate) {
+      itemContext = reconciledLate;
+      syncLastItemFromItemContextIfMissing(conversationMemory, itemContext);
+    }
+  }
+
+  if (
     itemContext != null &&
     typeof itemContext === "object" &&
     itemContext.isAvailable === false &&
     (isAvailabilityQuestion || hasDurationSignal || events.transactionalIntent)
   ) {
+    const lateContinuation = isSameSessionBookingContinuation({
+      memory: conversationMemory,
+      emilySessionKey,
+      itemId: itemContext?.itemId ?? memoryBookingItemId,
+      message,
+      extractedDurationDays: extracted.durationDays ?? bookingDurationDays ?? null,
+      contactValid: contactParts.isValid,
+      events,
+    });
+    if (lateContinuation) {
+      const itemLabel =
+        buildDisplayLabel(itemContext) ||
+        String(itemContext?.name ?? "").trim() ||
+        memoryBookingItemName;
+      const reply = buildSameSessionBookingContinuationReply({
+        memory: conversationMemory,
+        itemName: itemLabel,
+        style: conversationStyle,
+      });
+      console.log("[final_reply_source]", {
+        source: "BOOKING_CONTINUATION_ALREADY_NOTED",
+      });
+      return applyHybridOutboundResult(
+        {
+          reply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
+    }
     const itemLabel =
       buildDisplayLabel(itemContext) ||
       String(itemContext?.name ?? "").trim() ||
@@ -14870,7 +15228,7 @@ export async function processMessage({
       message,
       normalizedCatalogForTurn,
       emilyTurn,
-      prioritizedIntent,
+      priorityIntentSnapshot: prioritizedIntent,
       llmIntentClassification,
     });
     if (!phraseElig.eligible) {
@@ -15391,6 +15749,7 @@ export async function processMessage({
           ownerApprovalFirstRequest: false,
           traceId,
           userId,
+          ...bookingInboundGuard,
           createBookingArgs: {
             itemId: commitRow.id,
             itemName: commitRow.name,
@@ -16105,4 +16464,38 @@ export async function __buildBookingDurationUnavailableStructuredCustomerReplyFo
 
 export function __clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptionsForTests(p) {
   return clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptions(p);
+}
+
+export {
+  isCommitActionEntityLabel,
+  isBookingCommitOnlyMessage,
+  matchedCommitPhrasePreview,
+} from "./bookingCommitPhrase.js";
+
+export {
+  resolveCurrentTurnAuthority,
+  stripParticipantPrefixForItemResolution,
+  applyTurnAuthorityMask,
+  gateUnavailableReplyAuthority,
+  buildUnavailableReplyWithAuthorityGate,
+  findConservativeFuzzyCatalogMention,
+} from "./currentTurnAuthority.js";
+
+export {
+  isSameSessionBookingContinuation,
+  maybeHandlePendingEngagementCommitWithoutQualifier,
+  reconcileItemContextWithExplicitMessage,
+  resolveExplicitUnlistedMention,
+  extractCustomerNameFromMessage,
+  isAwaitingBookingContactCapture,
+  maybeHandleGroupBookingSlotCapture,
+  buildSameSessionBookingContinuationReply,
+} from "./bookingStabilityHelpers.js";
+
+export function __buildBrowseOptionsReplyForTests(items, style, options = {}) {
+  return buildBrowseOptionsReply(items, style, options);
+}
+
+export function __buildNotListedReplyForTests(opts = {}) {
+  return buildNotListedReply(opts);
 }

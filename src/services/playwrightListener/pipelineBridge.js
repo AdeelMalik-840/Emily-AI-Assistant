@@ -16,6 +16,7 @@ import {
   resolveParticipantIdentity,
 } from "../participantIdentity.js";
 import { chatSessionKey } from "../memory.js";
+import { INBOUND_SOURCE_REAL_CUSTOMER } from "../inboundOriginGuard.js";
 
 /** Set PLAYWRIGHT_DISABLE_PIPELINE_FORWARD=true to no-op inbound forwarding (debug only; disables AI pipeline). */
 const PIPELINE_FORWARD_DISABLED = /^true$/i.test(
@@ -333,6 +334,11 @@ async function buildPlaywrightSchedulePayload(adapted) {
         Number.isFinite(Number(adapted.sourceMessageIndex))
           ? Number(adapted.sourceMessageIndex)
           : null,
+      inboundSourceOrigin:
+        adapted?.inboundSourceOrigin != null &&
+        String(adapted.inboundSourceOrigin).trim() !== ""
+          ? String(adapted.inboundSourceOrigin).trim()
+          : INBOUND_SOURCE_REAL_CUSTOMER,
       startupCatchup: Boolean(adapted?.startupCatchup),
       suppressAckNoopOutbound: Boolean(adapted?.suppressAckNoopOutbound),
       cursorLastAssistantOutboundTrace:

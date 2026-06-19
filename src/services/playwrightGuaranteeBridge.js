@@ -40,6 +40,7 @@ export function buildPlaywrightGuaranteeKey(groupName, messageId) {
  *   chatKey: string,
  *   rowKey: string,
  *   participantCursorKey?: string,
+ *   burstStableIds?: string[],
  *   ownerUserId?: string,
  *   groupChatKey?: string,
  *   participantKey?: string,
@@ -53,10 +54,14 @@ export function recordPlaywrightInboundScheduled(p) {
   if (!(globalThis.__playwrightPendingByGuarantee instanceof Map)) {
     globalThis.__playwrightPendingByGuarantee = new Map();
   }
+  const burstStableIds = Array.isArray(p.burstStableIds)
+    ? p.burstStableIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+    : [];
   globalThis.__playwrightPendingByGuarantee.set(guaranteeKey, {
     chatKey: String(p.chatKey ?? "").trim(),
     rowKey: String(p.rowKey ?? "").trim(),
     participantCursorKey: String(p.participantCursorKey ?? "").trim(),
+    burstStableIds,
     ownerUserId: String(p.ownerUserId ?? "").trim(),
     groupChatKey: String(p.groupChatKey ?? p.chatKey ?? "").trim(),
     participantKey: String(p.participantKey ?? "").trim(),
@@ -67,6 +72,21 @@ export function recordPlaywrightInboundScheduled(p) {
         : null,
     timestamp: Date.now(),
   });
+}
+
+/**
+ * @param {string} chatKey
+ * @param {string[]} stableIds
+ * @param {"done" | "failed"} state
+ */
+function syncBurstStableKeyStates(chatKey, stableIds, state) {
+  const ck = String(chatKey ?? "").trim();
+  if (!ck || !Array.isArray(stableIds)) return;
+  for (const sid of stableIds) {
+    const id = String(sid ?? "").trim();
+    if (!id) continue;
+    setMessageState(`${ck}::${id}`, state);
+  }
 }
 
 /**
@@ -81,12 +101,18 @@ export function notifyPlaywrightGuaranteeDelivered(guaranteeKey) {
       ? globalThis.__playwrightPendingByGuarantee.get(gk)
       : null;
   const pendingChatKey = String(pending?.chatKey ?? "").trim();
+  if (pendingChatKey && Array.isArray(pending?.burstStableIds)) {
+    syncBurstStableKeyStates(pendingChatKey, pending.burstStableIds, "done");
+  }
   if (pendingChatKey && globalThis.__processingChats instanceof Map) {
     globalThis.__processingChats.delete(pendingChatKey);
   }
 
   if (globalThis.__playwrightPendingByGuarantee instanceof Map) {
     globalThis.__playwrightPendingByGuarantee.delete(gk);
+  }
+  if (globalThis.__playwrightTextSentForGuarantee instanceof Map) {
+    globalThis.__playwrightTextSentForGuarantee.delete(gk);
   }
 
   console.log("🧹 Guarantee cleared:", gk);
@@ -106,6 +132,9 @@ export function markPlaywrightGroupGateBlockedProcessed(guaranteeKey) {
       ? globalThis.__playwrightPendingByGuarantee.get(gk)
       : null;
   const pendingChatKey = String(pending?.chatKey ?? "").trim();
+  if (pendingChatKey && Array.isArray(pending?.burstStableIds)) {
+    syncBurstStableKeyStates(pendingChatKey, pending.burstStableIds, "failed");
+  }
   if (pendingChatKey && globalThis.__processingChats instanceof Map) {
     globalThis.__processingChats.delete(pendingChatKey);
   }
@@ -119,12 +148,15 @@ export function markPlaywrightGroupGateBlockedProcessed(guaranteeKey) {
 export function notifyPlaywrightGuaranteeReleased(guaranteeKey) {
   const gk = String(guaranteeKey ?? "").trim();
   if (!gk) return;
-  setMessageState(gk, "failed");
   const pending =
     globalThis.__playwrightPendingByGuarantee instanceof Map
       ? globalThis.__playwrightPendingByGuarantee.get(gk)
       : null;
   const pendingChatKey = String(pending?.chatKey ?? "").trim();
+  setMessageState(gk, "failed");
+  if (pendingChatKey && Array.isArray(pending?.burstStableIds)) {
+    syncBurstStableKeyStates(pendingChatKey, pending.burstStableIds, "failed");
+  }
   if (pendingChatKey && globalThis.__processingChats instanceof Map) {
     globalThis.__processingChats.delete(pendingChatKey);
   }

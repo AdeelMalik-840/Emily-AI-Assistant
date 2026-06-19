@@ -210,7 +210,7 @@ export function detectAskedField(message) {
     /\b(total\s+batao|overall\s+batao)\b/.test(text);
   // "total"/"overall" with an explicit duration implies a duration-based price quote even without "rent" keyword.
   if (asksTotal && hasDuration) return "price_with_duration";
-  if (hasPricing && hasDuration && !/\b(per\s*day|daily|\/day|din)\b/.test(text) && !/\b(month|monthly|mahina|maheena|mahine)\b/.test(text)) {
+  if (hasPricing && hasDuration) {
     return "price_with_duration";
   }
   if (/\b(month|monthly|mahina|maheena|mahine)\b/.test(text)) return "price_monthly";
@@ -225,11 +225,65 @@ export function detectAskedField(message) {
   if (/\b(?:new|used)\s+(?:hai|he|hy|ya|or)\b/.test(text)) return "condition";
   if (/\b(?:slightly\s+used|low\s+mileage)\b/.test(text)) return "condition";
   if (/\b(mileage|miles|km|kilometer|kilometre|used|usage|chali|chli|chalay|chale|chla|chala|driven)\b/.test(text)) return "mileage";
+  if (/\b(rent|kiraya|kiraye)\b/.test(text) && !/\b(month|monthly|mahina|maheena|mahine)\b/.test(text)) {
+    return "price_daily";
+  }
   if (/\b(price|rate|cost|charges?|rent|kitna|kitni|kitne)\b/.test(text)) return "price";
   if (/\b(driver|delivery|deliver|airport|pickup|drop|service|services)\b/.test(text)) return "service";
   if (/\b(photo|photos|picture|pictures|image|images|pic|pics)\b/.test(text)) return "media";
   if (/\b(avail|available|availability)\b/.test(text)) return "availability";
   return "unknown";
+}
+
+const PARTIAL_PRICE_FIELDS = new Set(["price", "price_daily", "price_monthly", "unknown"]);
+
+function hasPricingRentSignal(message) {
+  const text = clean(message).toLowerCase();
+  return /\b(price|rate|cost|charges?|rent|kiraya|kiraye|kitna|kitni|kitne)\b/.test(text);
+}
+
+/**
+ * Parsed rental period with explicit count (e.g. 4 months, 10 din) — not bare "monthly"/"daily" rate asks.
+ * @param {unknown} message
+ */
+function parsedRentalDuration(message) {
+  const dur = parseUserDuration(message);
+  if (!dur || !Number.isFinite(Number(dur.value)) || !Number.isFinite(Number(dur.normalizedDays))) {
+    return null;
+  }
+  return dur;
+}
+
+/**
+ * Upstream askedField can be price_monthly/daily; upgrade to duration total when period + pricing + item exist.
+ * @param {unknown} message
+ * @param {unknown} askedFieldIn
+ * @param {object | null | undefined} item
+ */
+function resolveComposerAskedField(message, askedFieldIn, item) {
+  const upstreamRaw = clean(askedFieldIn);
+  const upstream =
+    upstreamRaw && upstreamRaw !== "unknown" ? normalizeAskedField(askedFieldIn) : null;
+  const detected = detectAskedField(message);
+  let field = upstream || detected;
+  const dur = parsedRentalDuration(message);
+  if (
+    dur &&
+    hasItemIdentity(item) &&
+    hasPricingRentSignal(message) &&
+    PARTIAL_PRICE_FIELDS.has(field)
+  ) {
+    if (field !== "price_with_duration") {
+      console.log("[composer_duration_pricing_field_forced]", {
+        from: field,
+        to: "price_with_duration",
+        durationValue: dur.value,
+        durationUnit: dur.unit,
+      });
+    }
+    field = "price_with_duration";
+  }
+  return field;
 }
 
 function normalizeAskedField(field) {
@@ -256,7 +310,7 @@ function fieldValue(field, item, businessContext) {
     if (summary.daily || summary.monthly) {
       return genericPriceSummaryReply(item) || "catalog_pricing";
     }
-    return priceValue(item);
+    return dailyPriceValue(item) || priceValue(item);
   }
   if (field === "price_with_duration") return dailyPriceValue(item) || priceValue(item);
   if (field === "attribute_color") {
@@ -475,15 +529,17 @@ function extractTotalCandidateNumber(text) {
 function sanitizeInformationalAnswerTwoLines(reply) {
   let text = clean(reply)
     .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
-    .replace(BLOCKED_INFORMATIONAL_RE, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (!text || FORBIDDEN_RE.test(text) || BLOCKED_INFORMATIONAL_RE.test(text)) {
+  if (!text || FORBIDDEN_RE.test(text)) {
     return selectVariation("unknown_fallback", { index: 0 }).text;
   }
   const sentences = text
     .split(/(?<=[.!?۔])\s+|\n+/)
     .map((s) => s.trim())
+    .filter(Boolean)
+    .filter((s) => !FORBIDDEN_RE.test(s) && !BLOCKED_INFORMATIONAL_RE.test(s))
+    .map((s) => s.replace(BLOCKED_INFORMATIONAL_RE, "").replace(/\s+/g, " ").trim())
     .filter(Boolean);
   const out = sentences.slice(0, 2).join("\n").trim();
   return enforceToneStyle(out || selectVariation("unknown_fallback", { index: 0 }).text);
@@ -794,9 +850,7 @@ export function composeInformationalAnswer({
   businessContext = null,
   askedField = null,
 } = {}) {
-  const field = clean(askedField) && clean(askedField) !== "unknown"
-    ? normalizeAskedField(askedField)
-    : detectAskedField(message);
+  const field = resolveComposerAskedField(message, askedField, item);
   const itemObj = item || {};
   console.log("[composer_item_payload]", {
     itemId: firstPresent(itemObj?.itemId, itemObj?.id) || null,
@@ -828,11 +882,32 @@ export function composeInformationalAnswer({
       dur != null && Number.isFinite(Number(dur.normalizedDays))
         ? Math.max(1, Math.floor(Number(dur.normalizedDays)))
         : null;
+    const monthCount =
+      dur?.unit === "months" && Number.isFinite(Number(dur.value))
+        ? Math.max(1, Math.floor(Number(dur.value)))
+        : null;
+    const monthlyRaw = monthlyPriceValue(itemObj);
+    const monthlyNumber = parseMoneyNumber(monthlyRaw);
     const dailyRaw = value;
     const dailyNumber = parseMoneyNumber(dailyRaw);
     const asksTotal =
       /\b(total|overall)\b/i.test(clean(message)) ||
       /\b(kitna\s+banega|kitna\s+banta|overall\s+kitna)\b/i.test(clean(message));
+    if (monthCount != null && monthlyNumber != null) {
+      const total = monthlyNumber * monthCount;
+      const label = firstPresent(itemObj?.displayLabel, itemObj?.name) || "";
+      const monthlyDisplay = clean(monthlyRaw) || String(monthlyNumber);
+      const reply = `${label} ${monthCount} months ke liye available hai. Monthly rent ${monthlyDisplay} hai, ${monthCount} months ka total ${total} PKR hoga.`;
+      console.log("[composer_verified_answer_used]", { field: "price_with_duration", basis: "monthly" });
+      return {
+        reply: sanitizeInformationalAnswerTwoLines(reply),
+        field: "price_with_duration",
+        source: "verified_catalog",
+        unknownHumanized: false,
+        finalAuthority: true,
+        answerKnown: true,
+      };
+    }
     if (durationDays != null && dailyNumber != null) {
       const total = dailyNumber * durationDays;
       if (hasItemIdentity(itemObj)) {
@@ -973,6 +1048,7 @@ export function applyToneGuard(reply) {
 
 export const _test = {
   detectAskedField,
+  resolveComposerAskedField,
   sanitizeInformationalAnswer,
   sanitizeInformationalAnswerTwoLines,
   resolveCatalogPricingSummary,

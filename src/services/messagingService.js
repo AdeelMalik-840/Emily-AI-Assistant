@@ -51,6 +51,7 @@ function getCurrentOpenChatTitle() {
  *     messageHash: string,
  *     dedupeWindowMs: number,
  *     lastPlaywrightTextSends: Map<string, { hash: string, timestamp: number }>,
+ *     guaranteeKey?: string,
  *     outboundLifecycle?: Record<string, unknown>,
  *   }
  * }} p
@@ -95,6 +96,7 @@ export async function sendOutboundMessage({
     messageHash,
     dedupeWindowMs,
     lastPlaywrightTextSends,
+    guaranteeKey,
     outboundLifecycle,
   } = context;
 
@@ -176,6 +178,7 @@ export async function sendOutboundMessage({
         messageHash,
         dedupeWindowMs,
         lastPlaywrightTextSends,
+        guaranteeKey: String(guaranteeKey ?? context.guaranteeKey ?? "").trim(),
         outboundLifecycle: lifecycleBase,
       },
     });
@@ -242,4 +245,3 @@ export async function sendOutboundMessage({
   });
   return { ok: false, groupSendFailed: false };
 }
-
