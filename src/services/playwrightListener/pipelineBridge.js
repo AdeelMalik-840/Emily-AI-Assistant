@@ -52,6 +52,17 @@ function normalizeSenderId(id) {
     .slice(0, 128);
 }
 
+function looksLikePhoneLabel(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return false;
+  const digits = raw.replace(/\D/g, "");
+  return (
+    /^(?:92)?3\d{9}$/.test(digits) ||
+    /^03\d{9}$/.test(digits) ||
+    (/^00923\d{9}$/.test(digits) && /^[+\d\s().-]+$/.test(raw))
+  );
+}
+
 function groupParticipantScope(senderId) {
   return createHash("sha256")
     .update(normalizeSenderId(senderId) || "unknown-sender", "utf8")
@@ -84,6 +95,9 @@ function groupSenderScopeFromAnchor(groupKey, senderAnchor) {
  *   playwrightChatKey?: string,
  *   sourceRowKey?: string,
  *   sourceMessageIndex?: number,
+ *   startupCatchup?: boolean,
+ *   suppressAckNoopOutbound?: boolean,
+ *   cursorLastAssistantOutboundTrace?: Record<string, unknown> | null,
  *   participantPhoneForDm?: string,
  *   participantKey?: string,
  *   messageSender?: string,
@@ -108,7 +122,10 @@ async function buildPlaywrightSchedulePayload(adapted) {
     return null;
   }
 
-  const sendCredentials = await getBusinessWhatsAppCredentials(db, ownerUserId);
+  const sendCredentials =
+    adapted?.__sendCredentialsForTests && typeof adapted.__sendCredentialsForTests === "object"
+      ? adapted.__sendCredentialsForTests
+      : await getBusinessWhatsAppCredentials(db, ownerUserId);
   const hasCloudCreds = Boolean(
     sendCredentials?.accessToken && sendCredentials?.phoneNumberId
   );
@@ -244,7 +261,17 @@ async function buildPlaywrightSchedulePayload(adapted) {
     .update(`${groupName}::${senderScope}`, "utf8")
     .digest("hex")
     .slice(0, 24)}`;
-  const line = `[${senderName}] ${adapted.text}`.trim();
+  const hadPhoneLookingSenderName = looksLikePhoneLabel(senderName);
+  const safeText = String(adapted?.text ?? "").trim();
+  const line = hadPhoneLookingSenderName ? safeText : `[${senderName}] ${safeText}`.trim();
+  if (hadPhoneLookingSenderName) {
+    console.log("[group_sender_phone_label_stripped]", {
+      groupChatKey: playwrightChatKey || null,
+      hadPhoneLookingSenderName,
+      participantPhonePresent: Boolean(participantPhoneForDm),
+      textPreview: safeText.slice(0, 120) || null,
+    });
+  }
   console.log("🧠 Session isolation:", {
     chatId: groupName,
     senderScope,
@@ -312,6 +339,13 @@ async function buildPlaywrightSchedulePayload(adapted) {
         String(adapted.inboundSourceOrigin).trim() !== ""
           ? String(adapted.inboundSourceOrigin).trim()
           : INBOUND_SOURCE_REAL_CUSTOMER,
+      startupCatchup: Boolean(adapted?.startupCatchup),
+      suppressAckNoopOutbound: Boolean(adapted?.suppressAckNoopOutbound),
+      cursorLastAssistantOutboundTrace:
+        adapted?.cursorLastAssistantOutboundTrace &&
+        typeof adapted.cursorLastAssistantOutboundTrace === "object"
+          ? adapted.cursorLastAssistantOutboundTrace
+          : null,
     },
     line,
     groupName,
@@ -350,8 +384,10 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
   }
 
   try {
-    const mod = await import("../whatsappInboundBuffer.js");
-    const scheduleBufferedWhatsAppInbound = mod?.scheduleBufferedWhatsAppInbound;
+    const scheduleBufferedWhatsAppInbound =
+      typeof adapted?.__scheduleForTests === "function"
+        ? adapted.__scheduleForTests
+        : (await import("../whatsappInboundBuffer.js"))?.scheduleBufferedWhatsAppInbound;
     if (typeof scheduleBufferedWhatsAppInbound !== "function") {
       throw new Error("scheduleBufferedWhatsAppInbound_missing");
     }

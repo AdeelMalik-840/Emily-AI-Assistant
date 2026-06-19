@@ -23,6 +23,18 @@ const KNOWN_FACT_FIELDS = new Set([
   "availability",
 ]);
 
+const INFORMATIONAL_CTA_SANITIZER_FIELDS = new Set([
+  "price",
+  "price_daily",
+  "price_monthly",
+  "price_with_duration",
+  "model",
+  "condition",
+  "attribute_color",
+  "media",
+  "features",
+]);
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -80,6 +92,95 @@ function monthlyPriceValue(item) {
   );
 }
 
+function pricingCurrency(item) {
+  return firstPresent(
+    item?.pricing?.currency,
+    item?.priceCurrency,
+    item?.attributes?.pricing?.currency,
+    item?.attributes?.priceCurrency,
+    item?.state?.pricing?.currency,
+    "PKR"
+  );
+}
+
+/**
+ * @param {unknown} item
+ * @returns {{
+ *   daily: string,
+ *   monthly: string,
+ *   legacy: string,
+ *   currency: string,
+ *   hasAnyPricing: boolean,
+ * }}
+ */
+export function resolveCatalogPricingSummary(item) {
+  const row = item && typeof item === "object" && !Array.isArray(item) ? item : {};
+  const daily = dailyPriceValue(row);
+  const monthly = monthlyPriceValue(row);
+  const legacy = priceValue(row);
+  const currency = pricingCurrency(row);
+  return {
+    daily,
+    monthly,
+    legacy,
+    currency,
+    hasAnyPricing: Boolean(daily || monthly || legacy),
+  };
+}
+
+/**
+ * @param {unknown} item
+ */
+export function hasAnyCatalogPricing(item) {
+  return resolveCatalogPricingSummary(item).hasAnyPricing;
+}
+
+/**
+ * @param {string} raw
+ * @param {string} currency
+ */
+function formatPricingAmount(raw, currency) {
+  const amount = clean(raw);
+  if (!amount) return "";
+  const n = parseMoneyNumber(amount);
+  const cur = clean(currency) || "PKR";
+  if (n != null) return `${n} ${cur}`;
+  if (/\b(pkr|rs|rupees?)\b/i.test(amount)) return amount;
+  return `${amount} ${cur}`;
+}
+
+/**
+ * @param {unknown} item
+ */
+function genericPriceSummaryReply(item) {
+  const summary = resolveCatalogPricingSummary(item);
+  const label = firstPresent(
+    /** @type {{ displayLabel?: unknown; name?: unknown }} */ (item)?.displayLabel,
+    /** @type {{ name?: unknown }} */ (item)?.name
+  );
+  const dailyAmt = formatPricingAmount(summary.daily, summary.currency);
+  const monthlyAmt = formatPricingAmount(summary.monthly, summary.currency);
+
+  if (summary.daily && summary.monthly) {
+    return label
+      ? `${label} ka rent ${dailyAmt} per day aur ${monthlyAmt} per month hai.`
+      : `Rent ${dailyAmt} per day aur ${monthlyAmt} per month hai.`;
+  }
+  if (summary.daily) {
+    return label ? `${label} ka rent ${dailyAmt} per day hai.` : `${dailyAmt} per day hai.`;
+  }
+  if (summary.monthly) {
+    return label
+      ? `${label} ka monthly rent ${monthlyAmt} hai.`
+      : `Monthly rent ${monthlyAmt} hai.`;
+  }
+  if (summary.legacy) {
+    const legacy = clean(summary.legacy);
+    return label ? `${label} ka rate ${legacy} hai.` : `${legacy} hai.`;
+  }
+  return "";
+}
+
 function colorFromDisplayLabel(item) {
   const label = firstPresent(item?.displayLabel, item?.normalizedLabel, item?.label, item?.name);
   const match = label.match(/\(([^()]+)\)\s*$/);
@@ -89,7 +190,7 @@ function colorFromDisplayLabel(item) {
   return value;
 }
 
-function detectAskedField(message) {
+export function detectAskedField(message) {
   const text = clean(message).toLowerCase();
   // If the user is asking "what else / other options" (browse intent), do not treat "options" as item features.
   if (
@@ -120,8 +221,10 @@ function detectAskedField(message) {
   if (/\b(colou?r)\b/.test(text)) return "attribute_color";
   if (/\b(transmission|automatic|manual)\b/.test(text)) return "attribute_transmission";
   if (/\b(feature|features|spec|specs|option|options)\b/.test(text)) return "features";
+  if (/\b(condition|halat|haalat)\b/.test(text)) return "condition";
+  if (/\b(?:new|used)\s+(?:hai|he|hy|ya|or)\b/.test(text)) return "condition";
+  if (/\b(?:slightly\s+used|low\s+mileage)\b/.test(text)) return "condition";
   if (/\b(mileage|miles|km|kilometer|kilometre|used|usage|chali|chli|chalay|chale|chla|chala|driven)\b/.test(text)) return "mileage";
-  if (/\b(condition|halat)\b/.test(text)) return "condition";
   if (/\b(rent|kiraya|kiraye)\b/.test(text) && !/\b(month|monthly|mahina|maheena|mahine)\b/.test(text)) {
     return "price_daily";
   }
@@ -202,7 +305,13 @@ function fieldValue(field, item, businessContext) {
   }
   if (field === "price_daily") return dailyPriceValue(item) || priceValue(item);
   if (field === "price_monthly") return monthlyPriceValue(item);
-  if (field === "price") return dailyPriceValue(item) || priceValue(item);
+  if (field === "price") {
+    const summary = resolveCatalogPricingSummary(item);
+    if (summary.daily || summary.monthly) {
+      return genericPriceSummaryReply(item) || "catalog_pricing";
+    }
+    return dailyPriceValue(item) || priceValue(item);
+  }
   if (field === "price_with_duration") return dailyPriceValue(item) || priceValue(item);
   if (field === "attribute_color") {
     return firstPresent(
@@ -251,6 +360,156 @@ function parseMoneyNumber(value) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function splitInformationalSentences(text) {
+  return clean(text)
+    .split(/(?<=[.!?۔])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * @param {string} field
+ */
+function normalizeComposerFieldForCta(field) {
+  const f = clean(field).toLowerCase();
+  if (f === "color" || f === "colour") return "attribute_color";
+  if (f === "photo" || f === "photos") return "media";
+  if (f === "details") return "features";
+  return f;
+}
+
+/**
+ * @param {string} field
+ */
+function shouldSanitizeInformationalCta(field) {
+  return INFORMATIONAL_CTA_SANITIZER_FIELDS.has(normalizeComposerFieldForCta(field));
+}
+
+/**
+ * Deferral copy (unknown / will confirm later) — not a booking proceed CTA.
+ * @param {string} sentence
+ */
+function isHumanUnknownDeferralSentence(sentence) {
+  const lower = normalizeText(sentence);
+  if (!lower) return false;
+  return (
+    /\b(?:confirm|check)\s+(?:kar|kr)\s+(?:ke\s+)?(?:bata|batata|deta|dunga|dungi|dun|deta hun|batata hun|bata deta)\b/.test(
+      lower
+    ) ||
+    /\b(?:bata|batata|deta|dunga|dungi)\s+(?:hun|hoon|hon)\b/.test(lower)
+  );
+}
+
+/**
+ * @param {string} sentence
+ */
+function isInformationalProceedCtaSentence(sentence) {
+  const raw = clean(sentence);
+  if (!raw || isHumanUnknownDeferralSentence(raw)) return false;
+  const lower = normalizeText(raw);
+  const isQuestion = /\?\s*$/.test(raw);
+  const hasBookingProceedAction =
+    /\b(?:book(?:ing)?|reserve|reservation)\b/.test(lower) ||
+    /\bbook\s+karna\b/.test(lower) ||
+    /\bbooking\s+karni\b/.test(lower) ||
+    /\block\s+in\b/.test(lower) ||
+    /\bproceed\b/.test(lower) ||
+    (/\bconfirm\b/.test(lower) && /\b(?:book(?:ing)?|reserve)\b/.test(lower)) ||
+    (/\bconfirm\s+kar(?:un|doon|dein|den)\b/.test(lower) && isQuestion) ||
+    (/\bcheck\s+kar(?:un|un)\b/.test(lower) && isQuestion);
+  if (!hasBookingProceedAction) return false;
+  return (
+    isQuestion ||
+    /^(?:kya|kyaa|would you|shall i|do you want)\b/.test(lower) ||
+    /\b(?:chahenge|chahte hain|chahiye)\b/.test(lower)
+  );
+}
+
+/**
+ * @param {string} draft
+ */
+function draftContainsProceedCta(draft) {
+  return splitInformationalSentences(draft).some((sentence) =>
+    isInformationalProceedCtaSentence(sentence)
+  );
+}
+
+/**
+ * @param {string} reply
+ * @param {{ field?: string }} [opts]
+ */
+export function stripInformationalProceedCtaSentences(reply, { field } = {}) {
+  const raw = clean(reply);
+  if (!raw || !shouldSanitizeInformationalCta(String(field ?? ""))) return raw;
+  const sentences = splitInformationalSentences(raw);
+  if (sentences.length === 0) return raw;
+  const kept = sentences.filter((sentence) => !isInformationalProceedCtaSentence(sentence));
+  const removedSentenceCount = sentences.length - kept.length;
+  if (removedSentenceCount > 0) {
+    console.log("[informational_proceed_cta_stripped]", {
+      field: normalizeComposerFieldForCta(String(field ?? "")),
+      removedSentenceCount,
+    });
+  }
+  if (kept.length === 0) return raw;
+  return kept.join(" ").trim();
+}
+
+function formatMoneyAmount(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return String(amount ?? "").trim();
+  return Math.round(n)
+    .toString()
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/**
+ * @param {{
+ *   label: string,
+ *   durationDays: number,
+ *   total: number,
+ *   dailyNumber: number,
+ *   asksTotal: boolean,
+ * }} p
+ */
+function buildVerifiedPriceWithDurationReply(p) {
+  const totalStr = `${formatMoneyAmount(p.total)} PKR`;
+  const dailyStr = `${formatMoneyAmount(p.dailyNumber)} PKR`;
+  if (p.asksTotal) {
+    return `${p.durationDays} din ka total rent ${totalStr} hoga.`;
+  }
+  const prefix = p.label ? `${p.label} ki ` : "";
+  return `${prefix}${p.durationDays} din ki rent ${totalStr} hogi (${dailyStr} per din).`;
+}
+
+/**
+ * @param {{
+ *   reply: string,
+ *   field: string,
+ *   source: string,
+ *   unknownHumanized?: boolean,
+ *   finalAuthority?: boolean,
+ *   answerKnown?: boolean,
+ *   fieldMismatchBlocked?: boolean,
+ * }} payload
+ */
+function finalizeInformationalComposerReply(payload) {
+  const field = clean(payload.field);
+  let reply = clean(payload.reply);
+  const skipCtaSanitize =
+    payload.source === "human_unknown" ||
+    payload.source === "missing_item_clarification" ||
+    payload.unknownHumanized === true;
+  if (!skipCtaSanitize && shouldSanitizeInformationalCta(field) && reply) {
+    reply = stripInformationalProceedCtaSentences(reply, { field });
+    reply =
+      field === "price_with_duration" || field === "condition"
+        ? sanitizeInformationalAnswerTwoLines(reply)
+        : sanitizeInformationalAnswer(reply);
+  }
+  return { ...payload, reply };
+}
+
 function extractTotalCandidateNumber(text) {
   const raw = clean(text);
   if (!raw) return null;
@@ -288,7 +547,7 @@ function sanitizeInformationalAnswerTwoLines(reply) {
 
 function humanUnknown(field) {
   if (field === "mileage") return "Mileage ka confirm kar deta hun 👍";
-  if (field === "condition") return "Condition check kar ke bata deta hun 👍";
+  if (field === "condition") return "Condition detail abhi saved nahi hai, confirm kar ke bata deta hun.";
   if (field === "attribute_color") return "Color confirm kar ke bata deta hun 👍";
   if (field === "attribute_transmission") return "Transmission confirm kar ke bata deta hun 👍";
   if (field === "price" || field === "price_daily" || field === "price_monthly") {
@@ -460,6 +719,11 @@ function isVagueDraft(draft) {
   );
 }
 
+function hasVerifiedCatalogValueForField(field, item, businessContext) {
+  if (field === "price") return hasAnyCatalogPricing(item);
+  return Boolean(fieldValue(field, item, businessContext));
+}
+
 function isUsefulFieldDraft({ field, draft, item }) {
   if (!draft || FORBIDDEN_RE.test(draft) || BLOCKED_INFORMATIONAL_RE.test(draft)) return false;
   if (isVagueDraft(draft)) return false;
@@ -467,6 +731,17 @@ function isUsefulFieldDraft({ field, draft, item }) {
     return false;
   }
   if (draftHasCompetingField(field, draft)) return false;
+  if (
+    (field === "price" ||
+      field === "price_daily" ||
+      field === "price_monthly" ||
+      field === "price_with_duration" ||
+      field === "condition") &&
+    !hasVerifiedCatalogValueForField(field, item)
+  ) {
+    return false;
+  }
+  if (shouldSanitizeInformationalCta(field) && draftContainsProceedCta(draft)) return false;
   const hasValue = draftHasConcreteValue(field, draft, item);
   if (!hasValue) return false;
   const referencesItem = draftReferencesCurrentItem(draft, item);
@@ -491,11 +766,49 @@ function clarificationForMissingItem(field) {
   return "Kis option ki detail confirm karni hai?";
 }
 
-function answerForField(field, value, item) {
+function conditionMatchesQuestion(message, value) {
+  const text = normalizeText(message);
+  const normalizedValue = normalizeText(value);
+  if (!text || !normalizedValue) return false;
+  if (normalizedValue.includes("new") && /\bnew\b/.test(text)) return true;
+  if (normalizedValue.includes("used") && /\bused\b/.test(text)) return true;
+  if (normalizedValue.includes("low mileage") && /\blow mileage\b/.test(text)) return true;
+  if (normalizedValue.includes("slightly used") && /\bslightly used\b/.test(text)) return true;
+  return false;
+}
+
+function conditionAnswer(value, item, message) {
+  const label = firstPresent(item?.name, item?.displayLabel);
+  const condition = clean(value).toLowerCase();
+  const note = firstPresent(item?.conditionNote, item?.attributes?.conditionNote, item?.state?.conditionNote);
+  const prefix = conditionMatchesQuestion(message, value) ? "Jee, " : "";
+  const conditionPhrase = /\bcondition\b/.test(condition)
+    ? condition
+    : /^(new|used)$/.test(condition)
+      ? `${condition} condition`
+      : condition;
+  const base = /\bmileage\b/.test(conditionPhrase)
+    ? label
+      ? `${prefix}${label} ${conditionPhrase} hai.`
+      : `${prefix}${conditionPhrase} hai.`
+    : label
+      ? `${prefix}${label} ${conditionPhrase} mein hai.`
+      : `${prefix}${conditionPhrase} mein hai.`;
+  return note ? `${base} ${note}.` : base;
+}
+
+function answerForField(field, value, item, message = "") {
   if (field === "model") return `${value} hai 👍`;
   if (field === "price_daily") return `${value} per day hai 👍`;
   if (field === "price_monthly") return `${value} per month hai 👍`;
-  if (field === "price") return `${value} hai 👍`;
+  if (field === "price") {
+    const summary = resolveCatalogPricingSummary(item);
+    if (summary.daily || summary.monthly) {
+      const summaryReply = genericPriceSummaryReply(item);
+      if (summaryReply) return summaryReply;
+    }
+    return `${value} hai 👍`;
+  }
   if (field === "attribute_color") {
     const label = firstPresent(item?.name, item?.displayLabel);
     const color = clean(value).toLowerCase();
@@ -506,7 +819,7 @@ function answerForField(field, value, item) {
   if (field === "attribute_transmission") return `${value} transmission hai.`;
   if (field === "features") return value;
   if (field === "mileage") return `${value} mileage hai.`;
-  if (field === "condition") return `Condition ${value} hai.`;
+  if (field === "condition") return conditionAnswer(value, item, message);
   if (field === "media") return "Pictures share kar deta hun 👍";
   if (field === "availability") {
     return value === "available" ? "Available hai 👍" : "Abhi available nahi hai.";
@@ -554,14 +867,14 @@ export function composeInformationalAnswer({
   const draft = clean(draftReply);
   const isKnownFactField = KNOWN_FACT_FIELDS.has(field);
   if (!hasItemIdentity(itemObj) && field !== "unknown") {
-    return {
-      reply: sanitizeInformationalAnswer(clarificationForMissingItem(field)),
+    return finalizeInformationalComposerReply({
+      reply: clarificationForMissingItem(field),
       field,
       source: "missing_item_clarification",
       unknownHumanized: false,
       finalAuthority: true,
       answerKnown: false,
-    };
+    });
   }
   if (field === "price_with_duration") {
     const dur = parseUserDuration(message);
@@ -597,112 +910,114 @@ export function composeInformationalAnswer({
     }
     if (durationDays != null && dailyNumber != null) {
       const total = dailyNumber * durationDays;
+      if (hasItemIdentity(itemObj)) {
+        const label = firstPresent(itemObj?.name, itemObj?.displayLabel) || "";
+        const deterministicReply = buildVerifiedPriceWithDurationReply({
+          label,
+          durationDays,
+          total,
+          dailyNumber,
+          asksTotal,
+        });
+        console.log("[composer_verified_answer_used]", { field: "price_with_duration" });
+        return finalizeInformationalComposerReply({
+          reply: deterministicReply,
+          field: "price_with_duration",
+          source: "verified_catalog",
+          unknownHumanized: false,
+          finalAuthority: true,
+          answerKnown: true,
+        });
+      }
       const draftTotal = extractTotalCandidateNumber(draft);
       const draftGrounded =
         draft &&
+        !FORBIDDEN_RE.test(draft) &&
+        !draftContainsProceedCta(draft) &&
         Number.isFinite(draftTotal) &&
         Math.abs(Number(draftTotal) - total) <= Math.max(1, Math.floor(total * 0.005));
       if (draftGrounded) {
         console.log("[composer_verified_answer_used]", { field: "price_with_duration" });
-        return {
-          reply: sanitizeInformationalAnswerTwoLines(draft),
+        return finalizeInformationalComposerReply({
+          reply: draft,
           field: "price_with_duration",
           source: "llm_draft_grounded",
           unknownHumanized: false,
           finalAuthority: true,
           answerKnown: true,
-        };
+        });
       }
-
-      const label = firstPresent(itemObj?.name, itemObj?.displayLabel) || "";
-      const dailyLine = dailyRaw ? `${label ? `${label} ka daily rent ` : ""}${clean(dailyRaw)} hai.` : "";
-      const totalLine = durationDays
-        ? `${durationDays} din ka total rent ${total} PKR hoga.`
-        : `Total rent ${total} PKR hoga.`;
-      const reply = asksTotal
-        ? totalLine
-        : `${dailyLine} ${totalLine}`.trim();
-      console.log("[composer_verified_answer_used]", { field: "price_with_duration" });
-      return {
-        reply: sanitizeInformationalAnswerTwoLines(reply),
-        field: "price_with_duration",
-        source: "verified_catalog",
-        unknownHumanized: false,
-        finalAuthority: true,
-        answerKnown: true,
-      };
     }
     // Fall back to existing price logic when duration missing or daily not numeric.
   }
 
   if (value) {
     console.log("[composer_verified_answer_used]", { field });
-    return {
-      reply: sanitizeInformationalAnswer(answerForField(field, value, itemObj)),
+    const verifiedReply = answerForField(field, value, itemObj, message);
+    return finalizeInformationalComposerReply({
+      reply: verifiedReply,
       field,
       source: "verified_catalog",
       unknownHumanized: false,
       finalAuthority: true,
       answerKnown: true,
-    };
+    });
   }
   if (fallbackFieldValue) {
     console.log("[composer_fallback_field_mapping_used]", {
       field,
       mappedFrom: "item.name",
     });
-    return {
-      reply: sanitizeInformationalAnswer(
-        answerForField(field, fallbackFieldValue, itemObj)
-      ),
+    return finalizeInformationalComposerReply({
+      reply: answerForField(field, fallbackFieldValue, itemObj, message),
       field,
       source: "fallback_field_mapping",
       unknownHumanized: false,
       finalAuthority: true,
       answerKnown: true,
-    };
+    });
   }
   if (isKnownFactField && isUsefulFieldDraft({ field, draft, item: itemObj })) {
     console.log("[composer_unknown_fallback_suppressed]", { field });
-    return {
-      reply: sanitizeInformationalAnswer(draft),
+    return finalizeInformationalComposerReply({
+      reply: draft,
       field,
       source: "llm_draft_grounded",
       unknownHumanized: false,
       finalAuthority: false,
       answerKnown: true,
-    };
+    });
   }
   if (isKnownFactField) {
     console.log("[composer_unknown_fallback_used]", { field, reason: "no_verified_or_useful_draft" });
-    return {
-      reply: sanitizeInformationalAnswer(humanUnknown(field)),
+    return finalizeInformationalComposerReply({
+      reply: humanUnknown(field),
       field,
       source: "human_unknown",
       unknownHumanized: true,
       finalAuthority: true,
       answerKnown: false,
-    };
+    });
   }
   if (!draft || FORBIDDEN_RE.test(draft)) {
     console.log("[composer_unknown_fallback_used]", { field, reason: "empty_or_forbidden_draft" });
-    return {
-      reply: sanitizeInformationalAnswer(humanUnknown(field)),
+    return finalizeInformationalComposerReply({
+      reply: humanUnknown(field),
       field,
       source: "human_unknown",
       unknownHumanized: true,
       finalAuthority: false,
       answerKnown: false,
-    };
+    });
   }
-  return {
+  return finalizeInformationalComposerReply({
     reply: enforceToneStyle(draft),
     field,
     source: "llm_draft",
     unknownHumanized: false,
     finalAuthority: false,
     answerKnown: false,
-  };
+  });
 }
 
 export function applyToneGuard(reply) {
@@ -736,4 +1051,7 @@ export const _test = {
   resolveComposerAskedField,
   sanitizeInformationalAnswer,
   sanitizeInformationalAnswerTwoLines,
+  resolveCatalogPricingSummary,
+  hasAnyCatalogPricing,
+  stripInformationalProceedCtaSentences,
 };

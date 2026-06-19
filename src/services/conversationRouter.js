@@ -1,3 +1,5 @@
+import { isPricingOrDetailsFieldQuestion } from "./intentShapeResolver.js";
+
 /**
  * Durable route decision before phrase templates.
  * The router is intentionally business-agnostic: it looks for message shape,
@@ -101,52 +103,8 @@ function explicitlyAsksAmount(message) {
  * Used to avoid booking shortcuts and duplicate-booking replies when the user is
  * clearly asking for rates or item details, not submitting a booking turn.
  */
-export function isExplicitPricingOrDetailsQuestion(message) {
-  const raw = String(message ?? "").trim();
-  if (!raw) return false;
-  const lower = raw.toLowerCase();
-  if (
-    /\b(price|pricing|rate|rates|charges?|cost|amount|quote|quotation|detail|details|spec|specs|model|colou?r|mileage|capacity|photo|photos|pics|picture|images|info|information|features?)\b/i.test(
-      lower
-    )
-  ) {
-    return true;
-  }
-  if (
-    /\b(per\s*day|per\s*month|per\s*week|daily|monthly|weekly|mahina|maheena|mahine|\/day|\/month)\b/i.test(
-      lower
-    )
-  ) {
-    return true;
-  }
-  if (/\b(kitna|kitni|kitne)\b/i.test(lower)) return true;
-  /** Not a pure rate quote — asking whether rental / item is available. */
-  if (
-    /\b(rent|kiraya|kiraye)\b/i.test(lower) &&
-    /\b(available|availability|maujood|milega|milegi|mil\s+jaye|mil\s+raha)\b/i.test(lower)
-  ) {
-    return false;
-  }
-  if (
-    /\b(rent|kiraya|kiraye)\b/i.test(lower) &&
-    /\b(kitna|kitni|kitne|kya|hai|ho|dena|denge|lag|laga|lagta)\b/i.test(lower)
-  ) {
-    return true;
-  }
-  /** Roman Urdu quote asks: totals / “how much overall” without repeating kitna. */
-  if (
-    /\b(total|overall|overall\s+kitna|kitna\s+overall)\b/i.test(lower) &&
-    /\b(batao|bata|banega|banayega|hoga|ho\s+ga|lagta|lagi|lagegi)\b/i.test(lower)
-  ) {
-    return true;
-  }
-  if (
-    /\b(hafta|haftay|week|weeks)\b/i.test(lower) &&
-    /\b(total|overall|rent|rate|kitna|kya)\b/i.test(lower)
-  ) {
-    return true;
-  }
-  return false;
+export function isExplicitPricingOrDetailsQuestion(message, context = {}) {
+  return isPricingOrDetailsFieldQuestion(message, context);
 }
 
 /**
@@ -432,7 +390,13 @@ export function decideConversationRoute({
     };
   }
 
-  if (hasDuration || hasContact || BOOKING_RE.test(text)) {
+  if (
+    !isPricingOrDetailsFieldQuestion(text, {
+      hasDuration,
+      hasContact,
+    }) &&
+    (hasDuration || hasContact || BOOKING_RE.test(text))
+  ) {
     const missingFields = [];
     if (!hasDuration && !memory?.lastDuration && !memory?.durationPreference) {
       missingFields.push("duration");

@@ -939,6 +939,11 @@ export async function createBooking(
     itemId,
     itemName,
     durationDays,
+    durationHours,
+    billingUnit,
+    billingRatePercentOfDaily,
+    calculatedPrice,
+    currency,
     customerName,
     customerPhone,
     source,
@@ -1158,6 +1163,27 @@ export async function createBooking(
         itemId: id,
         ...(name ? { itemName: name } : {}),
         durationDays: days,
+        ...(durationHours != null && Number.isFinite(Number(durationHours))
+          ? { durationHours: Math.max(1, Math.floor(Number(durationHours))) }
+          : {}),
+        ...(billingUnit != null && String(billingUnit).trim() !== ""
+          ? { billingUnit: String(billingUnit).trim() }
+          : {}),
+        ...(billingRatePercentOfDaily != null &&
+        Number.isFinite(Number(billingRatePercentOfDaily))
+          ? {
+              billingRatePercentOfDaily: Math.max(
+                1,
+                Math.min(100, Math.floor(Number(billingRatePercentOfDaily)))
+              ),
+            }
+          : {}),
+        ...(calculatedPrice != null && Number.isFinite(Number(calculatedPrice))
+          ? { calculatedPrice: Math.round(Number(calculatedPrice)) }
+          : {}),
+        ...(currency != null && String(currency).trim() !== ""
+          ? { currency: String(currency).trim().toUpperCase() }
+          : {}),
         ...(customerName != null && String(customerName).trim() !== ""
           ? { customerName: String(customerName).trim() }
           : {}),
@@ -1464,6 +1490,128 @@ export async function getAlternativeAvailableItems(
     console.error("[inventoryService] getAlternativeAvailableItems:", e);
     return [];
   }
+}
+
+/**
+ * Ranked alternative items from an in-memory catalog snapshot only (no extra items collection read).
+ * Uses the same relevance + booking availability rules as {@link getAlternativeAvailableItems}.
+ *
+ * @param {string} userId
+ * @param {string} excludeItemId
+ * @param {string} referenceItemName
+ * @param {Array<Record<string, unknown>>} catalogRows
+ * @param {{ limit?: number, maxRankedCandidates?: number }} [opts]
+ * @returns {Promise<Array<Record<string, unknown>>>}
+ */
+export async function pickAlternativeAvailableItemsFromCatalogRows(
+  userId,
+  excludeItemId,
+  referenceItemName,
+  catalogRows,
+  opts = {}
+) {
+  const uid = String(userId ?? "").trim();
+  const exclude = String(excludeItemId ?? "").trim();
+  const ref = String(referenceItemName ?? "").trim();
+  if (!uid || !exclude || !ref || !Array.isArray(catalogRows) || catalogRows.length === 0) {
+    return [];
+  }
+  const limit = Math.max(1, Math.min(10, Number(opts.limit) || 5));
+  const maxRanked = Math.max(10, Math.min(400, Number(opts.maxRankedCandidates) || 120));
+
+  const ranked = catalogRows
+    .map((row) => {
+      if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+      const id = String(row.id ?? row.itemId ?? "").trim();
+      const name = String(row.name ?? "").trim();
+      if (!id || !name || id === exclude) return null;
+      const relevance = alternativeRelevanceScore(ref, name);
+      if (relevance < ALT_RELEVANCE_MIN) return null;
+      return { row, relevance, id, name };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.relevance - a.relevance)
+    .slice(0, maxRanked);
+
+  const out = [];
+  for (const { id, name, row } of ranked) {
+    try {
+      const bookings = await getBookingsForItem(uid, id, name);
+      const av = computeUserFacingAvailability(bookings, id);
+      if (!av.isAvailable) continue;
+      out.push(
+        normalizeCatalogItem({
+          ...row,
+          id,
+          itemId: id,
+          name,
+        })
+      );
+      if (out.length >= limit) break;
+    } catch (e) {
+      console.error("[inventoryService] pickAlternativeAvailableItemsFromCatalogRows row:", e);
+    }
+  }
+  return out;
+}
+
+/**
+ * Bounded scan: count user-facing available items and return the first N for browse UX.
+ * Does not change availability math — uses {@link computeUserFacingAvailability} per row.
+ *
+ * @param {string} userId
+ * @param {Array<Record<string, unknown>>} catalogRows
+ * @param {{ maxScan?: number, maxList?: number }} [opts]
+ */
+export async function summarizeBrowseAvailabilityFromCatalogRows(
+  userId,
+  catalogRows,
+  opts = {}
+) {
+  const uid = String(userId ?? "").trim();
+  const rows = Array.isArray(catalogRows) ? catalogRows : [];
+  const maxScan = Math.max(1, Math.min(500, Number(opts.maxScan) || 300));
+  const maxList = Math.max(1, Math.min(10, Number(opts.maxList) || 5));
+  const scan = Math.min(rows.length, maxScan);
+
+  let availableCount = 0;
+  /** @type {Array<Record<string, unknown>>} */
+  const top = [];
+
+  for (let i = 0; i < scan; i++) {
+    const row = rows[i];
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const id = String(row.id ?? row.itemId ?? "").trim();
+    const name = String(row.name ?? "").trim();
+    if (!uid || !id || !name) continue;
+    try {
+      const bookings = await getBookingsForItem(uid, id, name);
+      const av = computeUserFacingAvailability(bookings, id);
+      if (!av.isAvailable) continue;
+      availableCount += 1;
+      if (top.length < maxList) {
+        top.push(
+          normalizeCatalogItem({
+            ...row,
+            id,
+            itemId: id,
+            name,
+          })
+        );
+      }
+    } catch (e) {
+      console.error("[inventoryService] summarizeBrowseAvailabilityFromCatalogRows row:", e);
+    }
+  }
+
+  const summaryStatus = rows.length > scan ? "stale" : "fresh";
+  return {
+    availableCount,
+    topAvailableRows: top,
+    scannedRows: scan,
+    summaryStatus,
+    totalCatalogRows: rows.length,
+  };
 }
 
 /**

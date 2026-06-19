@@ -1944,6 +1944,26 @@ test("DM approval continuation asks for pickup or delivery without asking user t
   assert.doesNotMatch(copy, /\bDM\b|private chat/i);
 });
 
+test("DM approval continuation displays half-day hours instead of one day", () => {
+  const copy = buildCustomerApprovalContinuation(
+    {
+      eventType: "OWNER_APPROVED_BOOKING",
+      itemName: "Honda Civic 2026 Oriel",
+      durationDays: 1,
+      durationHours: 12,
+      billingUnit: "half_day",
+      canDmCustomer: true,
+      privacyMode: "dm",
+      requiredCustomerAction: "share_pickup_or_delivery_details_in_private_chat",
+    },
+    "urdu-english"
+  );
+
+  assert.match(copy, /12 ghantay/);
+  assert.doesNotMatch(copy, /1 din/);
+  assert.match(copy, /Delivery ya pickup details share kar dein/);
+});
+
 test("Urdu-English approval continuation style is supported", () => {
   const copy = buildCustomerApprovalContinuation(
     {

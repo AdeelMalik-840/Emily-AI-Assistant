@@ -1,6 +1,7 @@
 import {
   classifyConversationIntentWithLLM,
   extractBookingSlotsWithLLM,
+  extractGenericSlotsWithLLM,
   generateReply,
 } from "./openai.js";
 import { buildContextData } from "./contextHelpers.js";
@@ -17,7 +18,6 @@ import {
   extractEntity,
   extractDuration,
   getEntityConfidenceThreshold,
-  isRentPricingEntityLabel,
 } from "./entityExtraction.js";
 import {
   getNormalizedDaysFromDurationPreference,
@@ -35,6 +35,8 @@ import {
   computeUserFacingAvailability,
   createBooking,
   getAlternativeAvailableItems,
+  pickAlternativeAvailableItemsFromCatalogRows,
+  summarizeBrowseAvailabilityFromCatalogRows,
   normalizeCatalogItem,
 } from "./inventoryService.js";
 import {
@@ -53,7 +55,6 @@ import {
   getEmilySessionState,
   intentForContextLayer,
   matchCatalogAgainstMessage,
-  patchEmilySessionState,
 } from "./conversationIntelligence.js";
 import {
   resolveEmilyContextLabel,
@@ -88,11 +89,16 @@ import { logBookingEvent } from "../utils/bookingLogger.js";
 import db from "../config/firebase.js";
 import {
   buildDeliveryDetailReply,
+  buildBookingLogisticsCompletionPatch,
   buildBookingDetailsClarificationReply,
   findApprovedBookingForDm,
   findApprovedBookingForGroupDetails,
+  getBookingLogisticsCompletionState,
   isBookingAttachAvailabilityQuery,
+  detectBroadDeliveryAreaHint,
   isLogisticsComplete,
+  isInformationalItemQuestion,
+  isWeekdayOrDateOnlyMessage,
   parseDeliveryDetails,
   resolveLogisticsCompletionPolicy,
 } from "./bookingDmFlow.js";
@@ -105,35 +111,41 @@ import {
   hasStrongBookingCommitPhrase,
 } from "./conversationRouter.js";
 import {
+  isAnswerRequestedFieldPolicy,
+  isPricingOrDetailsFieldQuestion,
+  resolveTurnIntentShape,
+} from "./intentShapeResolver.js";
+import {
+  normalizeFuzzyTurn,
+  resolveFuzzyCatalogOutbound,
+  inferCatalogQuestionIntent,
+} from "./fuzzyTurnNormalizer.js";
+import {
   applyToneGuard,
   composeInformationalAnswer,
+  detectAskedField,
 } from "./answerComposer.js";
+import {
+  buildAvailabilityContextSkeleton,
+  catalogRowToTopAvailabilityItem,
+  composeStructuredAvailabilityCustomerReply,
+  enforceAvailabilityTruthOnReply,
+} from "./availabilityContext.js";
+import {
+  guardAvailabilityAiReply,
+  isAvailabilityAiEligible,
+} from "./availabilityAi.js";
+import { generateAvailabilityReplyFromFacts } from "./availabilityAiReply.js";
 import {
   applyResponseStrategy,
   decideResponseStrategy,
 } from "./responseStrategy.js";
-import { buildBookingWaitingEngagement } from "./customerApprovalContinuation.js";
 import { sanitizeContextForResolvedItemChange } from "./bookingContextSanitizer.js";
 import { resolveParticipantIdentity } from "./participantIdentity.js";
 import {
   shouldBlockBookingForAssistantOrigin,
   INBOUND_SOURCE_REAL_CUSTOMER,
 } from "./inboundOriginGuard.js";
-import {
-  isCommitActionEntityLabel,
-  isBookingCommitOnlyMessage,
-  matchedCommitPhrasePreview,
-} from "./bookingCommitPhrase.js";
-import {
-  persistBookingCommitContext,
-  recoverBookingCommitContext,
-  buildCommitOnlyMissingContextReply,
-} from "./bookingCommitContextHydration.js";
-import {
-  resolveCurrentTurnAuthority,
-  applyTurnAuthorityMask,
-  buildUnavailableReplyWithAuthorityGate,
-} from "./currentTurnAuthority.js";
 
 async function createBookingFromValidatedIntent({
   callerTag,
@@ -380,7 +392,7 @@ export function interpretDeliveryMethodMessage(text) {
   const lower = raw.toLowerCase();
   const words = raw.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
-  const isOnlyAck = /^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(lower);
+  const isOnlyAck = isLikelyAffirmationToken(lower);
   const looksQuestion =
     raw.includes("?") || /\b(kya|kab|kahan|kidhar|how|where|when)\b/i.test(raw);
 
@@ -403,6 +415,10 @@ export function interpretDeliveryMethodMessage(text) {
     /\blocation\b/i,
     /\bdeliver\s+kar\b/i,
   ];
+
+  if (isPickupLocationQuestion(raw) || isDeliveryCoverageQuestion(raw)) {
+    return { method: null, location: null, confidence: "low" };
+  }
 
   const hasPickup = pickupSignals.some((re) => re.test(raw));
   if (hasPickup) {
@@ -441,6 +457,200 @@ export function interpretDeliveryMethodMessage(text) {
   }
 
   return { method: null, location: null, confidence: "low" };
+}
+
+function isPickupLocationQuestion(text) {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  const hasQuestionShape =
+    raw.includes("?") || /\b(kya|kia|kahan|kidhar|where|address|location|point)\b/i.test(raw);
+  if (!hasQuestionShape) return false;
+  return (
+    /\bpick\s*up\b.*\b(kahan|kidhar|where|address|location|point)\b/i.test(lower) ||
+    /\bpickup\b.*\b(kahan|kidhar|where|address|location|point)\b/i.test(lower) ||
+    /\b(kahan|kidhar|where)\b.*\bpick\s*up\b/i.test(lower) ||
+    /\b(kahan|kidhar|where)\b.*\bpickup\b/i.test(lower) ||
+    /\b(kahan|kidhar|where)\b.*\b(lena|lain|lenay|lene|collect)\b/i.test(lower)
+  );
+}
+
+function isDeliveryCoverageQuestion(text) {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  const hasDelivery = /\b(delivery|deliver)\b/i.test(lower);
+  if (!hasDelivery) return false;
+  const hasCoverageShape =
+    raw.includes("?") ||
+    /\b(kahan|kidhar|where|area|areas|coverage|cover|tak|hoti|hota)\b/i.test(
+      raw
+    );
+  if (!hasCoverageShape) return false;
+  return (
+    /\b(delivery|deliver)\b.*\b(kahan|kidhar|where|area|areas|coverage|cover|tak|hoti|hota)\b/i.test(
+      lower
+    ) ||
+    /\b(kahan|kidhar|where)\b.*\b(delivery|deliver)\b/i.test(lower)
+  );
+}
+
+function cleanLogisticsText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeDeliveryCoverageAreas(value) {
+  if (Array.isArray(value)) {
+    return value.map((x) => cleanLogisticsText(x)).filter(Boolean);
+  }
+  const raw = cleanLogisticsText(value);
+  if (!raw) return [];
+  return raw
+    .split(/[,|\n]+/)
+    .map((x) => cleanLogisticsText(x))
+    .filter(Boolean);
+}
+
+function normalizeBusinessLogistics(value) {
+  const src = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    defaultPickupLocation: cleanLogisticsText(src.defaultPickupLocation),
+    pickupInstructions: cleanLogisticsText(src.pickupInstructions),
+    pickupAvailableHours: cleanLogisticsText(src.pickupAvailableHours),
+    deliveryCoverageAreas: normalizeDeliveryCoverageAreas(src.deliveryCoverageAreas),
+    deliveryChargesNote: cleanLogisticsText(src.deliveryChargesNote),
+  };
+}
+
+function sentence(value) {
+  const text = cleanLogisticsText(value);
+  if (!text) return "";
+  return /[.!?]$/.test(text) ? text : `${text}.`;
+}
+
+export function buildDeliveryMethodChoicePrompt({ acknowledgement = false } = {}) {
+  return acknowledgement
+    ? "Theek hai, pickup rakh dun ya delivery chahiye?"
+    : "Aap pickup karna chahenge ya delivery?";
+}
+
+function appendDeliveryMethodChoicePrompt(reply, { acknowledgement = false } = {}) {
+  const base = cleanLogisticsText(reply);
+  const prompt = buildDeliveryMethodChoicePrompt({ acknowledgement });
+  if (!base) return prompt;
+  if (/\b(pickup\s+(?:karna|rakh|rakhun)|delivery\s+chahiye|pickup.*delivery|delivery.*pickup)\b/i.test(base)) {
+    return base;
+  }
+  return `${base} ${prompt}`;
+}
+
+export function buildLogisticsQuestionReplyFromProfile(message, logisticsInput = {}) {
+  const logistics = normalizeBusinessLogistics(logisticsInput);
+  if (isPickupLocationQuestion(message)) {
+    const parts = [];
+    if (logistics.defaultPickupLocation) {
+      parts.push(`Pickup ${logistics.defaultPickupLocation} se ho ga.`);
+      if (logistics.pickupAvailableHours) {
+        parts.push(`Pickup timing ${logistics.pickupAvailableHours} hai.`);
+      }
+      if (logistics.pickupInstructions) {
+        parts.push(sentence(logistics.pickupInstructions));
+      }
+      return {
+        handled: true,
+        kind: "pickup_location",
+        reply: parts.join(" ").trim(),
+      };
+    }
+    return {
+      handled: true,
+      kind: "pickup_location",
+      reply:
+        "Pickup point abhi saved nahi hai. Delivery chahiye ho to address share kar dein, warna pickup point confirm karna hoga.",
+    };
+  }
+
+  if (isDeliveryCoverageQuestion(message)) {
+    if (logistics.deliveryCoverageAreas.length > 0) {
+      const parts = [
+        `Delivery ${logistics.deliveryCoverageAreas.join(", ")} mein ho sakti hai.`,
+      ];
+      if (logistics.deliveryChargesNote) {
+        parts.push(sentence(logistics.deliveryChargesNote));
+      }
+      return {
+        handled: true,
+        kind: "delivery_coverage",
+        reply: parts.join(" ").trim(),
+      };
+    }
+    return {
+      handled: true,
+      kind: "delivery_coverage",
+      reply:
+        "Delivery area abhi saved nahi hai. Aap address share kar dein, confirm kar ke bata denge.",
+    };
+  }
+
+  return { handled: false, kind: null, reply: "" };
+}
+
+function buildBookingInformationalFallbackReply(message = "", booking = {}) {
+  const raw = String(message ?? "");
+  const itemLabel =
+    buildDisplayLabel(booking) ||
+    String(booking?.itemName ?? booking?.itemLabel ?? booking?.name ?? "Is item").trim() ||
+    "Is item";
+  const condition =
+    String(
+      booking?.condition ??
+        booking?.itemCondition ??
+        booking?.attributes?.condition ??
+        booking?.state?.condition ??
+        ""
+    ).trim();
+  const conditionNote =
+    String(
+      booking?.conditionNote ??
+        booking?.itemConditionNote ??
+        booking?.attributes?.conditionNote ??
+        ""
+    ).trim();
+  if (/\b(condition|halat|haalat)\b/i.test(raw)) {
+    if (condition) {
+      return `${itemLabel} ${condition} mein hai.${conditionNote ? ` ${conditionNote}.` : ""}`;
+    }
+    return "Iski exact condition abhi clear nahi hai. Booking se pehle confirm kar lena best rahega.";
+  }
+  if (/\b(new|used)\b/i.test(raw)) {
+    if (condition) return `${itemLabel} ${condition} mein hai.`;
+    return "New/used detail abhi clear nahi hai. Booking se pehle confirm kar lena best rahega.";
+  }
+  if (/\b(mileage|milage|low mileage)\b/i.test(raw)) {
+    const mileage = String(booking?.mileage ?? booking?.attributes?.mileage ?? "").trim();
+    return mileage ? `${itemLabel} mileage ${mileage} hai.` : "Mileage detail abhi clear nahi hai.";
+  }
+  return "Is detail ko booking se pehle confirm kar lena best rahega.";
+}
+
+async function loadBusinessLogisticsForUser(userId) {
+  const uid = String(userId ?? "").trim();
+  if (!uid) return {};
+  try {
+    const snap = await db.collection("businesses").doc(uid).get();
+    const data = snap?.exists ? snap.data() || {} : {};
+    const profile =
+      data?.businessProfile && typeof data.businessProfile === "object" && !Array.isArray(data.businessProfile)
+        ? data.businessProfile
+        : {};
+    return normalizeBusinessLogistics(profile?.logistics);
+  } catch (err) {
+    console.warn("[business_logistics_load_failed]", {
+      userId: uid || null,
+      reason: String(err?.message ?? err ?? "unknown"),
+    });
+    return {};
+  }
 }
 
 /**
@@ -512,6 +722,60 @@ export function extractDeliveryTime(text) {
 function normalizePhoneDigits(value) {
   const digits = String(value ?? "").replace(/\D/g, "");
   return digits.length >= 10 && digits.length <= 15 ? digits : "";
+}
+
+function isMeaningfulDeliveryAddressToken(raw) {
+  const t = String(raw ?? "").trim();
+  if (!t) return false;
+  const compact = t.replace(/\s+/g, "");
+  if (!/[a-z0-9\u0600-\u06FF]/i.test(compact)) return false;
+  if (/[\u0600-\u06FF]/.test(compact)) return compact.length >= 2;
+  if (/^[a-z]\d{1,2}$/i.test(compact)) return true;
+  if (/^[a-z]-\d{1,2}$/i.test(compact)) return true;
+  if (compact.length >= 2 && /^[a-z0-9.\-]+$/i.test(compact)) return true;
+  return false;
+}
+
+/**
+ * Tokens left after stripping common delivery-intent words (evaluation only; does not change stored address).
+ * @param {string} cleaned
+ * @returns {string[]}
+ */
+export function getMeaningfulDeliveryAddressTokensForEval(cleaned) {
+  let seval = String(cleaned ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!seval) return [];
+  seval = seval.replace(
+    /\b(?:delivery|deliver|bhej|send|drop|pickup|pick\s*up|self|khud|krni|karni|krna|karna|krwani|karwani|kr|kar|db|do|de|den|hai|hain|ho|chahiye|chaiye|pls|plz|please|mein|mei|me|main|sy|se|par|pe|tak|wala|wali|walay|m)\b/gi,
+    " "
+  );
+  seval = seval.replace(/\s+/g, " ").trim();
+  if (!seval) return [];
+  return seval
+    .split(/\s+/)
+    .map((w) => w.replace(/^[\s,.:;!?'"()\-]+|[\s,.:;!?'"()\-]+$/g, "").trim())
+    .filter(Boolean)
+    .filter(isMeaningfulDeliveryAddressToken);
+}
+
+function evaluateDeliveryAddressQualityAfterSanity(cleaned) {
+  const s = String(cleaned ?? "").replace(/\s+/g, " ").trim();
+  if (!s) return { ok: false, reason: "empty_after_clean", meaningfulTokens: [] };
+  if (!/[a-z0-9\u0600-\u06FF]/i.test(s)) return { ok: false, reason: "punctuation_only", meaningfulTokens: [] };
+  const meaningfulTokens = getMeaningfulDeliveryAddressTokensForEval(s);
+  if (!meaningfulTokens.length) return { ok: false, reason: "no_meaningful_tokens", meaningfulTokens: [] };
+  return { ok: true, reason: "ok", meaningfulTokens };
+}
+
+/**
+ * Generic booking-FSM check: reject empty, phone-like, punctuation-only, and filler-only / one-letter junk.
+ * @param {string} cleaned Already normalized (e.g. after {@link validateBookingSlotForState} cleanAddress).
+ */
+export function isValidDeliveryAddressCandidate(cleaned) {
+  const s = String(cleaned ?? "").replace(/\s+/g, " ").trim();
+  if (!s) return false;
+  const digits = s.replace(/\D/g, "");
+  if (digits.length >= 10 && digits.length <= 15) return false;
+  return evaluateDeliveryAddressQualityAfterSanity(s).ok;
 }
 
 /**
@@ -595,53 +859,132 @@ export function validateBookingSlotForState({
     return false;
   }
 
+  const tryAcceptBookingDeliveryAddressSlot = (addrRaw) => {
+    const addrStr = String(addrRaw ?? "").trim();
+    const bookingId = String(b?.id ?? b?.bookingId ?? "").trim() || null;
+    if (!addrStr) return;
+
+    const cleaned = cleanAddress(addrStr);
+    console.log("[address_validation_started]", {
+      bookingId,
+      state: s,
+      rawTextPreview: raw.slice(0, 160) || null,
+      rawAddress: addrStr,
+      cleanedAddress: cleaned || null,
+    });
+
+    let meaningfulTokens = [];
+    let acceptedAddr = false;
+    /** @type {string | null} */
+    let rejectReason = null;
+
+    if (!cleaned) {
+      rejectReason = "empty_after_clean";
+    } else if (looksLikePhone(cleaned)) {
+      rejectReason = "phone_like";
+    } else if (isLowSignalSlotValue("deliveryAddress", cleaned)) {
+      rejectReason = "low_signal_word";
+      console.log("[delivery_address_rejected_low_signal]", {
+        original: addrStr.slice(0, 120) || null,
+        cleaned: cleaned.slice(0, 120) || null,
+      });
+    } else {
+      const q = evaluateDeliveryAddressQualityAfterSanity(cleaned);
+      meaningfulTokens = q.meaningfulTokens;
+      if (q.ok) acceptedAddr = true;
+      else rejectReason = q.reason;
+    }
+
+    const nextStateGuess =
+      s === "awaiting_delivery_location"
+        ? "awaiting_delivery_location"
+        : accepted.deliveryMethod === "delivery" ||
+            String(slots.deliveryMethod ?? "").trim().toLowerCase() === "delivery"
+          ? "awaiting_delivery_location"
+          : "awaiting_delivery_method";
+
+    console.log("[address_validation_result]", {
+      bookingId,
+      accepted: acceptedAddr,
+      reason: acceptedAddr ? "accepted" : rejectReason,
+      cleanedAddress: cleaned || null,
+      meaningfulTokens,
+      nextState: nextStateGuess,
+    });
+
+    if (acceptedAddr) {
+      accepted.deliveryAddress = cleaned;
+      return;
+    }
+
+    rejected.push("deliveryAddress");
+    console.log("[booking_address_rejected]", {
+      bookingId,
+      rawTextPreview: raw.slice(0, 160) || null,
+      rawAddress: addrStr,
+      cleanedAddress: cleaned || null,
+      reason: rejectReason,
+    });
+
+    if (
+      rejectReason === "no_meaningful_tokens" ||
+      rejectReason === "punctuation_only" ||
+      rejectReason === "low_signal_word" ||
+      rejectReason === "empty_after_clean"
+    ) {
+      ambiguous.push("invalid_delivery_address");
+    }
+  };
+
   const isDigitsOnly = /^\d{1,3}$/.test(lower);
+  const isOnlyAck = /^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(lower);
   const hasDurationWord = /\b(din|days?)\b/i.test(raw);
   const hasTimeMarker =
     /\b(baje|bjay|am|pm|raat|shaam|evening|morning|afternoon|night|aaj|kal|today|tomorrow)\b/i.test(
       raw
     ) || /:\d{2}\b/.test(raw);
+  const broadAreaHint = detectBroadDeliveryAreaHint(raw);
 
   if (s === "awaiting_delivery_method") {
+    if (broadAreaHint?.areaOnly && broadAreaHint?.isCoverageQuestion) {
+      ambiguous.push("delivery_coverage_question");
+      rejected.push("deliveryMethod", "deliveryAddress");
+      nextReplyOverride = null;
+      return { accepted, rejected, ambiguous, nextReplyOverride };
+    }
     const method = String(slots.deliveryMethod ?? "").trim().toLowerCase();
-    if (!String(b?.deliveryMethod ?? "").trim()) {
-      if (method === "delivery" || method === "pickup") accepted.deliveryMethod = method;
+    if (!isOnlyAck && !String(b?.deliveryMethod ?? "").trim()) {
+      if (broadAreaHint?.areaOnly && !broadAreaHint?.hasDeliveryIntent) {
+        rejected.push("deliveryMethod");
+        accepted.deliveryLocationHint = broadAreaHint.normalizedArea;
+        nextReplyOverride = `${broadAreaHint.normalizedArea} mein delivery chahiye ya pickup?`;
+      } else if (method === "delivery" || method === "pickup") accepted.deliveryMethod = method;
       else if (method) rejected.push("deliveryMethod");
     }
     const addrRaw = String(slots.deliveryAddress ?? "").trim();
-    if (!String(b?.deliveryAddress ?? "").trim() && addrRaw) {
-      const cleaned = cleanAddress(addrRaw);
-      if (cleaned && !looksLikePhone(cleaned)) {
-        if (isLowSignalSlotValue("deliveryAddress", cleaned)) {
-          console.log("[delivery_address_rejected_low_signal]", {
-            original: String(addrRaw ?? "").slice(0, 120) || null,
-            cleaned: String(cleaned ?? "").slice(0, 120) || null,
-          });
-          rejected.push("deliveryAddress");
-        } else {
-          accepted.deliveryAddress = cleaned;
-        }
-      } else {
-      rejected.push("deliveryAddress");
-    }
+    if (
+      broadAreaHint?.areaOnly &&
+      broadAreaHint?.hasDeliveryIntent &&
+      !broadAreaHint?.isCoverageQuestion
+    ) {
+      accepted.deliveryLocationHint = broadAreaHint.normalizedArea;
+      accepted.deliveryArea = broadAreaHint.normalizedArea;
+      if (!accepted.deliveryMethod) accepted.deliveryMethod = "delivery";
+      nextReplyOverride = `${broadAreaHint.normalizedArea} noted 👍 Exact kis area mein delivery chahiye?`;
+    } else if (!String(b?.deliveryAddress ?? "").trim() && addrRaw) {
+      tryAcceptBookingDeliveryAddressSlot(addrRaw);
     }
   } else if (s === "awaiting_delivery_location") {
+    if (broadAreaHint?.areaOnly) {
+      accepted.deliveryLocationHint = broadAreaHint.normalizedArea;
+      accepted.deliveryArea = broadAreaHint.normalizedArea;
+      rejected.push("deliveryAddress");
+      nextReplyOverride = `${broadAreaHint.normalizedArea} noted 👍 Exact kis area mein delivery chahiye?`;
+      return { accepted, rejected, ambiguous, nextReplyOverride };
+    }
     const addrRaw = String(slots.deliveryAddress ?? "").trim();
     if (!String(b?.deliveryAddress ?? "").trim() && addrRaw) {
-      const cleaned = cleanAddress(addrRaw);
-      if (cleaned && !looksLikePhone(cleaned)) {
-        if (isLowSignalSlotValue("deliveryAddress", cleaned)) {
-          console.log("[delivery_address_rejected_low_signal]", {
-            original: String(addrRaw ?? "").slice(0, 120) || null,
-            cleaned: String(cleaned ?? "").slice(0, 120) || null,
-          });
-          rejected.push("deliveryAddress");
-        } else {
-          accepted.deliveryAddress = cleaned;
-        }
-      } else {
-        rejected.push("deliveryAddress");
-      }
+      tryAcceptBookingDeliveryAddressSlot(addrRaw);
     }
     if (!accepted.deliveryAddress && looksLikePhone(raw)) {
       ambiguous.push("phone_in_address_state");
@@ -693,6 +1036,339 @@ export function validateBookingSlotForState({
   });
 
   return { accepted, ambiguous, rejected, nextReplyOverride };
+}
+
+function normalizeSlotTextForMatch(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function rawTextCorrespondsToMessage(rawText, messageText, proposedValue = null) {
+  const raw = normalizeSlotTextForMatch(rawText);
+  const msg = normalizeSlotTextForMatch(messageText);
+  if (!raw || !msg) return false;
+  if (msg.includes(raw)) return true;
+  const valueText = proposedValue != null ? String(proposedValue).trim() : "";
+  if (valueText && !msg.split(" ").includes(valueText)) return false;
+  const rawTokens = raw.split(" ").filter((t) => t.length >= 2 && t !== valueText);
+  if (rawTokens.length === 0) return Boolean(valueText);
+  const msgTokens = new Set(msg.split(" "));
+  return rawTokens.some((token) => msgTokens.has(token));
+}
+
+function normalizedDurationFromSlot(value, unitGuess) {
+  const v = Math.floor(Number(value));
+  const unit = String(unitGuess ?? "").trim().toLowerCase();
+  if (!Number.isFinite(v) || v <= 0) return null;
+  if (!["hours", "days", "weeks", "months"].includes(unit)) return null;
+  if (unit === "hours") {
+    if (v > 24 * 365) return null;
+    return { value: v, unit: "hours", normalizedDays: Math.max(1, Math.ceil(v / 24)), normalizedHours: v };
+  }
+  if (unit === "days") {
+    if (v > 365) return null;
+    return { value: v, unit: "days", normalizedDays: v };
+  }
+  if (unit === "weeks") {
+    if (v > 52) return null;
+    return { value: v, unit: "weeks", normalizedDays: v * 7 };
+  }
+  if (v > 24) return null;
+  return { value: v, unit: "months", normalizedDays: v * 30 };
+}
+
+function logGenericSlotDecision(tag, payload) {
+  console.log(tag, {
+    slotType: payload.slotType,
+    rawText: payload.rawText || null,
+    proposedValue: payload.proposedValue ?? null,
+    proposedUnit: payload.proposedUnit ?? null,
+    confidence: payload.confidence || null,
+    validatorResult: payload.validatorResult,
+    rejectionReason: payload.rejectionReason || null,
+    isGroupInbound: Boolean(payload.isGroupInbound),
+    deterministicParserAlreadySucceeded: Boolean(payload.deterministicParserAlreadySucceeded),
+  });
+}
+
+/**
+ * Validate generic LLM slot proposals. This function is proposal-only: it never
+ * mutates booking state, memory, price, contact, address, or approval fields.
+ * @param {{
+ *   proposal?: any,
+ *   messageText?: string,
+ *   deterministicSlots?: { duration?: any },
+ *   currentItem?: any,
+ *   hasExplicitEntity?: boolean,
+ *   isGroupInbound?: boolean,
+ *   resolveCatalogItem?: (raw: string) => Promise<any>
+ * }} p
+ */
+export async function validateGenericSlotProposalForTurn({
+  proposal,
+  messageText = "",
+  deterministicSlots = {},
+  currentItem = null,
+  hasExplicitEntity = false,
+  isGroupInbound = false,
+  resolveCatalogItem = null,
+} = {}) {
+  const slots = proposal?.slots && typeof proposal.slots === "object" ? proposal.slots : {};
+  /** @type {Record<string, any>} */
+  const accepted = {};
+  /** @type {Record<string, string>} */
+  const rejected = {};
+  const forbiddenFields = Array.isArray(proposal?.rejectedForbiddenFields)
+    ? proposal.rejectedForbiddenFields
+    : [];
+  const unknownSlotKeys = Array.isArray(proposal?.rejectedUnknownSlotKeys)
+    ? proposal.rejectedUnknownSlotKeys
+    : [];
+
+  for (const field of forbiddenFields) {
+    rejected[field] = "forbidden_field";
+    logGenericSlotDecision("[slot_proposal_rejected]", {
+      slotType: field,
+      validatorResult: "rejected",
+      rejectionReason: "forbidden_field",
+      isGroupInbound,
+    });
+  }
+  for (const key of unknownSlotKeys) {
+    if (rejected[key] === "forbidden_field") continue;
+    rejected[key] = "unknown_slot_key";
+    logGenericSlotDecision("[slot_proposal_rejected]", {
+      slotType: key,
+      validatorResult: "rejected",
+      rejectionReason: "unknown_slot_key",
+      isGroupInbound,
+    });
+  }
+
+  const duration = slots.duration;
+  if (duration) {
+    const deterministicParserAlreadySucceeded = Boolean(deterministicSlots?.duration);
+    const baseLog = {
+      slotType: "duration",
+      rawText: duration.rawText,
+      proposedValue: duration.value,
+      proposedUnit: duration.unitGuess,
+      confidence: duration.confidence,
+      isGroupInbound,
+      deterministicParserAlreadySucceeded,
+    };
+    if (deterministicParserAlreadySucceeded) {
+      rejected.duration = "deterministic_parser_already_succeeded";
+      logGenericSlotDecision("[slot_proposal_rejected]", {
+        ...baseLog,
+        validatorResult: "rejected",
+        rejectionReason: rejected.duration,
+      });
+    } else if (duration.confidence !== "high") {
+      rejected.duration = "confidence_not_high";
+      logGenericSlotDecision("[slot_proposal_rejected]", {
+        ...baseLog,
+        validatorResult: "rejected",
+        rejectionReason: rejected.duration,
+      });
+    } else if (!rawTextCorrespondsToMessage(duration.rawText, messageText, duration.value)) {
+      rejected.duration = "raw_text_not_in_message";
+      logGenericSlotDecision("[slot_proposal_rejected]", {
+        ...baseLog,
+        validatorResult: "rejected",
+        rejectionReason: rejected.duration,
+      });
+    } else {
+      const parsed = normalizedDurationFromSlot(duration.value, duration.unitGuess);
+      if (!parsed) {
+        rejected.duration = "invalid_or_unreasonable_duration";
+        logGenericSlotDecision("[slot_proposal_rejected]", {
+          ...baseLog,
+          validatorResult: "rejected",
+          rejectionReason: rejected.duration,
+        });
+      } else {
+        accepted.duration = parsed;
+        logGenericSlotDecision("[slot_proposal_accepted]", {
+          ...baseLog,
+          validatorResult: "accepted",
+        });
+      }
+    }
+  }
+
+  const itemReference = slots.itemReference;
+  if (itemReference) {
+    const baseLog = {
+      slotType: "itemReference",
+      rawText: itemReference.rawText,
+      proposedValue: itemReference.value,
+      confidence: itemReference.confidence,
+      isGroupInbound,
+    };
+    if (itemReference.confidence !== "high") {
+      rejected.itemReference = "confidence_not_high";
+    } else if (!rawTextCorrespondsToMessage(itemReference.rawText, messageText, itemReference.value)) {
+      rejected.itemReference = "raw_text_not_in_message";
+    } else if (itemReference.referenceType === "explicit_item") {
+      if (typeof resolveCatalogItem !== "function" || !itemReference.value) {
+        rejected.itemReference = "explicit_item_not_resolved";
+      } else {
+        const resolved = await resolveCatalogItem(itemReference.value);
+        if (resolved) accepted.itemReference = { type: "explicit_item", item: resolved };
+        else rejected.itemReference = "explicit_item_not_resolved";
+      }
+    } else if (itemReference.referenceType === "current_item") {
+      const currentId = normalizeId(currentItem?.id ?? currentItem?.itemId);
+      if (currentId && !hasExplicitEntity) {
+        accepted.itemReference = { type: "current_item", item: currentItem };
+      } else {
+        rejected.itemReference = hasExplicitEntity ? "explicit_entity_present" : "current_item_missing";
+      }
+    } else {
+      rejected.itemReference = "unknown_item_reference";
+    }
+    logGenericSlotDecision(rejected.itemReference ? "[slot_proposal_rejected]" : "[slot_proposal_accepted]", {
+      ...baseLog,
+      validatorResult: rejected.itemReference ? "rejected" : "accepted",
+      rejectionReason: rejected.itemReference || null,
+    });
+  }
+
+  const requestedField = slots.requestedField;
+  if (requestedField) {
+    const fieldMap = {
+      price: "price",
+      condition: "condition",
+      color: "attribute_color",
+      model: "model",
+      mileage: "mileage",
+      photos: "media",
+      availability: "availability",
+    };
+    const baseLog = {
+      slotType: "requestedField",
+      rawText: requestedField.rawText,
+      proposedValue: requestedField.field,
+      confidence: requestedField.confidence,
+      isGroupInbound,
+    };
+    if (requestedField.confidence !== "high") {
+      rejected.requestedField = "confidence_not_high";
+    } else if (!fieldMap[requestedField.field]) {
+      rejected.requestedField = "unknown_requested_field";
+    } else if (!rawTextCorrespondsToMessage(requestedField.rawText, messageText, requestedField.field)) {
+      rejected.requestedField = "raw_text_not_in_message";
+    } else {
+      accepted.requestedField = fieldMap[requestedField.field];
+    }
+    logGenericSlotDecision(rejected.requestedField ? "[slot_proposal_rejected]" : "[slot_proposal_accepted]", {
+      ...baseLog,
+      validatorResult: rejected.requestedField ? "rejected" : "accepted",
+      rejectionReason: rejected.requestedField || null,
+    });
+  }
+
+  const deliveryLocationHint = slots.deliveryLocationHint;
+  if (deliveryLocationHint) {
+    const confidenceOk =
+      deliveryLocationHint.confidence === "high" ||
+      (deliveryLocationHint.confidence === "medium" && deliveryLocationHint.isCompleteAddress !== true);
+    const baseLog = {
+      slotType: "deliveryLocationHint",
+      rawText: deliveryLocationHint.rawText,
+      proposedValue: deliveryLocationHint.value,
+      confidence: deliveryLocationHint.confidence,
+      isGroupInbound,
+    };
+    if (!confidenceOk) {
+      rejected.deliveryLocationHint = "confidence_too_low";
+    } else if (!deliveryLocationHint.value) {
+      rejected.deliveryLocationHint = "missing_location_value";
+    } else if (!rawTextCorrespondsToMessage(deliveryLocationHint.rawText, messageText, deliveryLocationHint.value)) {
+      rejected.deliveryLocationHint = "raw_text_not_in_message";
+    } else {
+      accepted.deliveryLocationHint = {
+        value: deliveryLocationHint.value,
+        isCompleteAddress: deliveryLocationHint.isCompleteAddress === true,
+      };
+    }
+    logGenericSlotDecision(
+      rejected.deliveryLocationHint ? "[slot_proposal_rejected]" : "[slot_proposal_accepted]",
+      {
+        ...baseLog,
+        validatorResult: rejected.deliveryLocationHint ? "rejected" : "accepted",
+        rejectionReason: rejected.deliveryLocationHint || null,
+      }
+    );
+  }
+
+  const deliveryMethod = slots.deliveryMethod;
+  if (deliveryMethod) {
+    const lower = String(messageText ?? "").toLowerCase();
+    const hasMethodSignal =
+      deliveryMethod.value === "pickup"
+        ? /\b(pick\s*up|pickup|self|khud)\b/i.test(lower)
+        : /\b(deliver|delivery|bhej|drop)\b/i.test(lower);
+    const baseLog = {
+      slotType: "deliveryMethod",
+      rawText: deliveryMethod.rawText,
+      proposedValue: deliveryMethod.value,
+      confidence: deliveryMethod.confidence,
+      isGroupInbound,
+    };
+    if (deliveryMethod.confidence !== "high") {
+      rejected.deliveryMethod = "confidence_not_high";
+    } else if (deliveryMethod.value !== "pickup" && deliveryMethod.value !== "delivery") {
+      rejected.deliveryMethod = "unknown_delivery_method";
+    } else if (!hasMethodSignal) {
+      rejected.deliveryMethod = "missing_method_signal";
+    } else if (!rawTextCorrespondsToMessage(deliveryMethod.rawText, messageText, deliveryMethod.value)) {
+      rejected.deliveryMethod = "raw_text_not_in_message";
+    } else {
+      accepted.deliveryMethod = deliveryMethod.value;
+    }
+    logGenericSlotDecision(rejected.deliveryMethod ? "[slot_proposal_rejected]" : "[slot_proposal_accepted]", {
+      ...baseLog,
+      validatorResult: rejected.deliveryMethod ? "rejected" : "accepted",
+      rejectionReason: rejected.deliveryMethod || null,
+    });
+  }
+
+  const dateOrTime = slots.dateOrTime;
+  if (dateOrTime) {
+    const baseLog = {
+      slotType: "dateOrTime",
+      rawText: dateOrTime.rawText,
+      proposedValue: dateOrTime.value,
+      confidence: dateOrTime.confidence,
+      isGroupInbound,
+    };
+    const looksLikeDuration =
+      /\b(hours?|hrs?|days?|din|weeks?|months?|mahina|mahinay)\b/i.test(String(dateOrTime.rawText ?? "")) ||
+      /\b(hours?|hrs?|days?|din|weeks?|months?|mahina|mahinay)\b/i.test(String(dateOrTime.value ?? ""));
+    if (dateOrTime.confidence !== "high") {
+      rejected.dateOrTime = "confidence_not_high";
+    } else if (!dateOrTime.value || dateOrTime.type === "unknown") {
+      rejected.dateOrTime = "unknown_date_or_time";
+    } else if (looksLikeDuration) {
+      rejected.dateOrTime = "duration_not_delivery_time";
+    } else if (!rawTextCorrespondsToMessage(dateOrTime.rawText, messageText, dateOrTime.value)) {
+      rejected.dateOrTime = "raw_text_not_in_message";
+    } else {
+      accepted.dateOrTime = { value: dateOrTime.value, type: dateOrTime.type };
+    }
+    logGenericSlotDecision(rejected.dateOrTime ? "[slot_proposal_rejected]" : "[slot_proposal_accepted]", {
+      ...baseLog,
+      validatorResult: rejected.dateOrTime ? "rejected" : "accepted",
+      rejectionReason: rejected.dateOrTime || null,
+    });
+  }
+
+  return { accepted, rejected, forbiddenFields, unknownSlotKeys };
 }
 
 function looksSyntheticPhoneSource(raw) {
@@ -907,17 +1583,6 @@ export async function maybeHandlePendingEngagementQualifier({
   knowledgeMeta = messageMetaForKnowledge(true),
 } = {}) {
   if (!pendingEngagementStateIsActive(memory)) return null;
-  const inbound = String(message ?? "").trim();
-  if (
-    inbound.length > 160 ||
-    /available options:|rate confirm kar|perfect\s*👍|already been received/i.test(inbound)
-  ) {
-    console.log("[pending_engagement_qualifier_skipped]", {
-      reason: "assistant_echo_or_concatenated_inbound",
-      preview: inbound.slice(0, 120),
-    });
-    return null;
-  }
   const pending = memory.pendingEngagementState;
   const bookingId =
     String(pending.bookingId ?? "").trim() ||
@@ -926,6 +1591,31 @@ export async function maybeHandlePendingEngagementQualifier({
   const allowedValues = Array.isArray(pending.allowedValues)
     ? pending.allowedValues.map((value) => String(value).trim()).filter(Boolean)
     : [];
+  if (routingCtx?.isGroupInbound === true) {
+    console.log("[group_logistics_mutation_blocked]", {
+      bookingId,
+      attemptedFields: [qualifierKey || "qualifier"],
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      groupName: routingCtx?.groupName ?? null,
+      chatKey: routingCtx?.chatKey ?? null,
+      reason: "GROUP_PENDING_QUALIFIER_BLOCKED",
+    });
+    delete memory.pendingEngagementState;
+    return applyOutbound(
+      {
+        reply: groupSafeRequestReceivedReply({ itemAndDurationKnown: true }),
+        text: groupSafeRequestReceivedReply({ itemAndDurationKnown: true }),
+        type: "AI_MESSAGE",
+        meta: {
+          pendingEngagementHandled: false,
+          bookingId,
+          groupPrivateDetailBlocked: true,
+        },
+        messageMeta: knowledgeMeta,
+      },
+      routingCtx
+    );
+  }
   const matchedValue = normalizeQualifierAnswer({
     rawAnswer: message,
     qualifierKey,
@@ -1058,6 +1748,7 @@ export function setStructuredBookingState(memory, booking) {
   const status = String(booking?.status ?? "pending_approval").trim() || "pending_approval";
   const approvalStage = String(booking?.approvalStage ?? "").trim();
   const durationNumber = Number(booking?.durationDays);
+  const durationHoursNumber = Number(booking?.durationHours);
   const scopedSessionKey = String(booking?.sessionKey ?? "").trim();
   const channel = String(booking?.channel ?? "").trim().toLowerCase();
   const bookingState = {
@@ -1068,6 +1759,27 @@ export function setStructuredBookingState(memory, booking) {
     durationDays: Number.isFinite(durationNumber)
       ? Math.max(1, Math.floor(durationNumber))
       : null,
+    ...(Number.isFinite(durationHoursNumber) && durationHoursNumber > 0
+      ? { durationHours: Math.max(1, Math.floor(durationHoursNumber)) }
+      : {}),
+    ...(booking?.billingUnit != null && String(booking.billingUnit).trim() !== ""
+      ? { billingUnit: String(booking.billingUnit).trim() }
+      : {}),
+    ...(booking?.billingRatePercentOfDaily != null &&
+    Number.isFinite(Number(booking.billingRatePercentOfDaily))
+      ? {
+          billingRatePercentOfDaily: Math.max(
+            1,
+            Math.min(100, Math.floor(Number(booking.billingRatePercentOfDaily)))
+          ),
+        }
+      : {}),
+    ...(booking?.calculatedPrice != null && Number.isFinite(Number(booking.calculatedPrice))
+      ? { calculatedPrice: Math.round(Number(booking.calculatedPrice)) }
+      : {}),
+    ...(booking?.currency != null && String(booking.currency).trim() !== ""
+      ? { currency: String(booking.currency).trim().toUpperCase() }
+      : {}),
     sessionKey: scopedSessionKey || null,
     channel: channel || null,
     updatedAt: new Date().toISOString(),
@@ -1127,7 +1839,7 @@ function isBookingContinuationShapedCurrentTurn(
   const dm = Number.isFinite(extractedDurationDays);
   const dc = contactValidCurrent === true;
   const durationPhrase =
-    /\b\d+\s*(?:din|deen|dino|day|days|hour|hours|week|weeks)\b/i.test(m) ||
+    /\b\d+\s*(?:din|deen|dino|day|days|hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey|week|weeks)\b/i.test(m) ||
     /^\s*\d+\s*$/i.test(m.trim());
   const commitVerb =
     /\b(book|booking|bookings|reserve|reservation|confirm|confirmed|order|orders|mangwa|mangwao|chahiye|chaiye|chaahiye|kardo|kar\s*do|kara\s*do|lagwa)\b/i.test(
@@ -1142,220 +1854,6 @@ function isBookingContinuationShapedCurrentTurn(
     return true;
   if (isExplicitPricingOrDetailsQuestion(m) && commitVerb) return true;
   return false;
-}
-
-/**
- * Same participant/session is continuing an active owner-approval booking on the
- * same item — not a fresh availability probe or a new item switch.
- */
-export function isSameSessionBookingContinuation({
-  memory,
-  emilySessionKey,
-  itemId,
-  message,
-  extractedDurationDays = null,
-  contactValid = false,
-  events = null,
-} = {}) {
-  const structured =
-    memory?.bookingState && typeof memory.bookingState === "object"
-      ? memory.bookingState
-      : null;
-  if (!structured || !bookingStateIsActive(structured)) return false;
-
-  const structuredBookingId = String(structured.bookingId ?? "").trim();
-  const structuredItemId = normalizeId(structured.itemId);
-  const currentItemId = normalizeId(itemId);
-  if (!structuredBookingId || !structuredItemId || !currentItemId) return false;
-  if (structuredItemId !== currentItemId) return false;
-
-  const sameParticipantSession =
-    Boolean(structured.sessionKey) &&
-    String(structured.sessionKey).trim() === String(emilySessionKey ?? "").trim();
-  if (!sameParticipantSession) return false;
-
-  const structuredStatus = String(structured.status ?? "").trim().toLowerCase();
-  const approvalStage = String(structured.approvalStage ?? "").trim().toLowerCase();
-  const pendingOwnerFlow =
-    structuredStatus === "pending_approval" ||
-    approvalStage === "pending_owner_approval";
-  if (!pendingOwnerFlow && structuredStatus !== "approved") return false;
-
-  const msgLower = String(message ?? "").trim().toLowerCase();
-  if (/\b(avail|available|availability)\b/i.test(msgLower)) return false;
-  if (
-    /\b(new|another|koi\s+aur|different)\b/i.test(msgLower) &&
-    !/\bconfirm\b/i.test(msgLower)
-  ) {
-    return false;
-  }
-
-  const explicitPricingOnly =
-    isExplicitPricingOrDetailsQuestion(message) &&
-    !hasStrongBookingCommitPhrase(message) &&
-    !isBookingContinuationShapedCurrentTurn(
-      message,
-      extractedDurationDays,
-      contactValid,
-      events ?? detectBookingEvent(message)
-    );
-  if (explicitPricingOnly) return false;
-
-  return isBookingContinuationShapedCurrentTurn(
-    message,
-    extractedDurationDays,
-    contactValid,
-    events ?? detectBookingEvent(message)
-  );
-}
-
-function isExplicitRestartOrNewBookingMessage(msgLower, { sameSessionContinuation = false } = {}) {
-  if (/\b(new|another|koi\s+aur|different)\b/i.test(msgLower)) return true;
-  if (sameSessionContinuation) return false;
-  return /\b(book|booking|reserve|confirm|mujhe\s+chahiye|need|want)\b/i.test(msgLower);
-}
-
-function buildSameSessionContinuationReply({ memory, itemName, style }) {
-  if (pendingEngagementStateIsActive(memory)) {
-    const durationDays = Number.isFinite(Number(memory?.bookingState?.durationDays))
-      ? Math.max(1, Math.floor(Number(memory.bookingState.durationDays)))
-      : Number.isFinite(Number(memory?.lastDuration))
-        ? Math.max(1, Math.floor(Number(memory.lastDuration)))
-        : null;
-    return buildBookingWaitingEngagement(
-      {
-        eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
-        itemName: String(itemName ?? "").trim() || null,
-        durationDays,
-      },
-      style
-    );
-  }
-  if (style === "casual_local") {
-    return "Aapki booking request note ho chuki hai. Hum jald confirm kar denge.";
-  }
-  return "Your booking has already been received. We'll confirm it shortly.";
-}
-
-/**
- * Pending usage_area qualifier expects inside/outside city — not a fresh availability
- * probe or explicit switch to another catalog item.
- */
-function shouldDeferPendingEngagementCommitForFreshTurn(message, memory) {
-  const inbound = String(message ?? "").trim();
-  if (!inbound) return false;
-
-  if (
-    isBookingAttachAvailabilityQuery({
-      message: inbound,
-      intent: detectIntent(inbound),
-    })
-  ) {
-    console.log("[pending_engagement_commit_deferred]", {
-      reason: "AVAILABILITY_QUERY",
-      preview: inbound.slice(0, 120),
-      bookingId: String(memory?.bookingState?.bookingId ?? "").trim() || null,
-    });
-    return true;
-  }
-
-  const pendingLabel =
-    buildDisplayLabel(
-      memory?.lastItem && typeof memory.lastItem === "object" ? memory.lastItem : {}
-    ) ||
-    String(memory?.lastItem?.name ?? "").trim() ||
-    "";
-  const extracted = extractEntity(inbound);
-  if (
-    extracted?.name &&
-    extracted.confidence >= getEntityConfidenceThreshold(extracted.name)
-  ) {
-    const pendingNorm = normalizeForContextMatch(pendingLabel);
-    const mentionNorm = normalizeForContextMatch(extracted.name);
-    if (
-      pendingNorm &&
-      mentionNorm &&
-      !pendingNorm.includes(mentionNorm) &&
-      !mentionNorm.includes(pendingNorm)
-    ) {
-      console.log("[pending_engagement_commit_deferred]", {
-        reason: "EXPLICIT_DIFFERENT_ITEM",
-        preview: inbound.slice(0, 120),
-        pendingItem: pendingLabel.slice(0, 80),
-        mentionedEntity: extracted.name,
-        bookingId: String(memory?.bookingState?.bookingId ?? "").trim() || null,
-      });
-      return true;
-    }
-  }
-
-  return false;
-}
-
-export async function maybeHandlePendingEngagementCommitWithoutQualifier({
-  message,
-  memory,
-  routingCtx,
-  applyOutbound = applyHybridOutboundResult,
-  knowledgeMeta = messageMetaForKnowledge(true),
-} = {}) {
-  if (!pendingEngagementStateIsActive(memory)) return null;
-  const inbound = String(message ?? "").trim();
-  if (!inbound || inbound.length > 160) return null;
-  if (
-    /available options:|rate confirm kar|perfect\s*👍|already been received/i.test(
-      inbound
-    )
-  ) {
-    return null;
-  }
-  const matchedValue = normalizeQualifierAnswer({
-    rawAnswer: message,
-    qualifierKey: "usage_area",
-    allowedValues: ["inside_city", "outside_city"],
-  });
-  if (matchedValue) return null;
-  if (shouldDeferPendingEngagementCommitForFreshTurn(inbound, memory)) {
-    return null;
-  }
-
-  const events = detectBookingEvent(message);
-  const parsedDuration = parseUserDuration(message);
-  const extractedDurationDays = Number.isFinite(Number(parsedDuration?.normalizedDays))
-    ? Number(parsedDuration.normalizedDays)
-    : null;
-  const isCommit =
-    hasStrongBookingCommitPhrase(message) ||
-    isBookingContinuationShapedCurrentTurn(message, extractedDurationDays, false, events);
-  if (!isCommit) return null;
-
-  const itemName =
-    buildDisplayLabel(memory?.lastItem && typeof memory.lastItem === "object" ? memory.lastItem : {}) ||
-    String(memory?.lastItem?.name ?? "").trim() ||
-    null;
-  const style = detectConversationStyle([message]);
-  const reply = buildSameSessionContinuationReply({
-    memory,
-    itemName,
-    style,
-  });
-  console.log("[pending_engagement_commit_reask_qualifier]", {
-    preview: inbound.slice(0, 120),
-    bookingId: String(memory?.bookingState?.bookingId ?? "").trim() || null,
-  });
-  return applyOutbound(
-    {
-      reply,
-      text: reply,
-      type: "AI_MESSAGE",
-      meta: {
-        pendingEngagementHandled: true,
-        bookingContinuation: true,
-      },
-      messageMeta: knowledgeMeta,
-    },
-    routingCtx
-  );
 }
 
 function shouldSuppressDuplicateAlreadyReceivedReply(
@@ -1520,6 +2018,29 @@ function mergeAssistantReplyListsForNorm(historyList, memoryList, max = 8) {
   return out.slice(-max);
 }
 
+/**
+ * Recent assistant line offered browsing / "pick a specific option" (flexible Roman Urdu + English).
+ * Intentionally allows words between "aur" and "option" (e.g. "koi aur available option").
+ */
+function assistantReplySignalsCatalogSelectionPrompt(text) {
+  const s = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!s) return false;
+  const patterns = [
+    /\bspecific\s+option\b/i,
+    /\boption\s+poochna\b/i,
+    /\b(?:koi\s+aur|another|other)\b[\s\S]{0,80}?\boption\b/i,
+    /\baur\b[\s\S]{0,48}?\bavailable\b[\s\S]{0,48}?\boption\b/i,
+    /\bavailable\s+options?\b/i,
+    /\bavailable\s+option\b/i,
+    /\boption\b[\s\S]{0,48}?\bnazar\b/i,
+    /\bnazar\b[\s\S]{0,48}?\boption\b/i,
+    /\bdekhna\s+chahenge\b/i,
+    /\bwhich\s+option\b/i,
+    /\b(?:kaunsa|konsa)\s+option\b/i,
+  ];
+  return patterns.some((re) => re.test(s));
+}
+
 const defaultPhraseLibrary = {
   askContact: [
     "Aap apna naam aur number share kar dein",
@@ -1561,6 +2082,9 @@ function buildPhraseReply({ stage, item, duration, businessConfig, style }) {
   };
 
   if (stage === "availability") {
+    if (item && typeof item === "object" && item.isAvailable !== true) {
+      return null;
+    }
     if (!businessConfig?.phrases) {
       const label = buildDisplayLabel(item) || "this option";
       if (style === "casual_local") {
@@ -1632,23 +2156,395 @@ function buildUnavailableReply({ itemLabel, style }) {
   return `Sorry, ${label || "this option"} is not available right now. Would you like to check another option?`;
 }
 
-function buildNotListedReply({ itemLabel, style, catalogItems = [] }) {
-  const label = String(itemLabel ?? "").trim() || "yeh option";
-  const available = (Array.isArray(catalogItems) ? catalogItems : []).filter(
-    (row) => row && typeof row === "object"
+/**
+ * Composer-only unavailable item reply (same spine as early availability question).
+ * Does not invoke narrow availability AI.
+ * @param {{
+ *   itemLabel: string,
+ *   reqId: string | null,
+ *   blockingStatusesSeen: string[],
+ *   alternativeItems: Array<{ id?: string, name?: string }>,
+ *   alternativeSummarySkipped: boolean,
+ *   catalogLength: number,
+ *   styleKey: "casual_local" | "neutral_english",
+ *   normalizedCatalogForTurn: unknown[],
+ * }} p
+ */
+function composeBookingUnavailableItemAvailabilityContextReply(p) {
+  const itemLabel = String(p.itemLabel ?? "").trim() || "yeh option";
+  const reqId = p.reqId != null ? String(p.reqId).trim() || null : null;
+  const blockingStatusesSeen = Array.isArray(p.blockingStatusesSeen)
+    ? p.blockingStatusesSeen
+    : [];
+  const altRows = Array.isArray(p.alternativeItems) ? p.alternativeItems : [];
+  const topItems = altRows
+    .map((a) => {
+      const id = String(a.id ?? "").trim();
+      const match = (Array.isArray(p.normalizedCatalogForTurn) ? p.normalizedCatalogForTurn : []).find(
+        (r) => String(r.id ?? r.itemId ?? "").trim() === id
+      );
+      return match
+        ? catalogRowToTopAvailabilityItem(
+            /** @type {Record<string, unknown>} */ (match),
+            buildDisplayLabel
+          )
+        : {
+            itemId: id,
+            displayLabel: String(a.name ?? "").trim(),
+            priceDaily: null,
+            category: null,
+            tags: [],
+          };
+    })
+    .slice(0, 5);
+  const summarySkipped = p.alternativeSummarySkipped === true;
+  const summaryStatus = summarySkipped ? "missing" : "fresh";
+  const otherAvailableCount = summarySkipped ? 0 : altRows.length;
+  const catalogLen = Number.isFinite(Number(p.catalogLength))
+    ? Math.max(0, Math.floor(Number(p.catalogLength)))
+    : 0;
+  const availabilityCtx = buildAvailabilityContextSkeleton({
+    intent: "item_availability",
+    requestedItem: {
+      itemId: reqId,
+      displayLabel: itemLabel,
+      availabilityStatus: "unavailable",
+      blockingReason:
+        blockingStatusesSeen.length > 0
+          ? String(blockingStatusesSeen[0])
+          : "ALREADY_BOOKED",
+    },
+    inventorySummary: {
+      status: summaryStatus,
+      totalItems: catalogLen,
+      availableCount: otherAvailableCount,
+      unavailableCount: null,
+      topAvailableItems: topItems,
+      maxItemsShown: 5,
+    },
+    policy: {},
+    alternativeSummarySkipped: summarySkipped,
+  });
+  const composed = composeStructuredAvailabilityCustomerReply(
+    availabilityCtx,
+    p.styleKey
   );
-  if (style === "casual_local") {
-    const head = `Sorry, ${label} hamari list mein nahi hai.`;
-    if (available.length > 0) {
-      return `${head}\n${buildBrowseOptionsReply(available, style, { actuallyAvailable: false })}`;
+  const reply = enforceAvailabilityTruthOnReply(
+    composed,
+    availabilityCtx,
+    p.styleKey
+  );
+  return {
+    reply,
+    availabilityCtx,
+    meta: {
+      summaryStatus,
+      availableCount: otherAvailableCount,
+      topItemCount: topItems.length,
+      alternativeSummarySkipped: summarySkipped,
+    },
+  };
+}
+
+/**
+ * Early booking / duration path: unavailable item reply aligned with
+ * {@link composeStructuredAvailabilityCustomerReply} + truth enforce (no narrow availability AI).
+ * @param {{
+ *   userId: string,
+ *   catalogRow: Record<string, unknown>,
+ *   availabilitySnapshot: { blockingStatusesSeen?: string[] },
+ *   normalizedCatalogForTurn: unknown[],
+ *   styleKey: "casual_local" | "neutral_english",
+ *   traceId?: string | null,
+ *   logKind?: "booking_unavailable" | "booking_blocked",
+ *   memory?: Record<string, unknown> | null,
+ * }} p
+ */
+async function buildBookingDurationUnavailableStructuredCustomerReply(p) {
+  const userId = String(p.userId ?? "").trim();
+  const row = p.catalogRow && typeof p.catalogRow === "object" && !Array.isArray(p.catalogRow)
+    ? p.catalogRow
+    : null;
+  const av = p.availabilitySnapshot && typeof p.availabilitySnapshot === "object"
+    ? p.availabilitySnapshot
+    : {};
+  const catalog = Array.isArray(p.normalizedCatalogForTurn) ? p.normalizedCatalogForTurn : [];
+  const styleKey = p.styleKey === "casual_local" ? "casual_local" : "neutral_english";
+  const traceId = p.traceId != null ? String(p.traceId).trim() || null : null;
+  const logKind = p.logKind === "booking_blocked" ? "booking_blocked" : "booking_unavailable";
+  const builtLogName =
+    logKind === "booking_blocked"
+      ? "[booking_blocked_availability_context_built]"
+      : "[booking_unavailable_availability_context_built]";
+  const replyLogName =
+    logKind === "booking_blocked"
+      ? "[booking_blocked_reply_source]"
+      : "[booking_unavailable_reply_source]";
+  const missingLogName =
+    logKind === "booking_blocked"
+      ? "[booking_blocked_availability_context_missing]"
+      : "[booking_unavailable_availability_context_missing]";
+
+  if (!userId || !row) {
+    console.log(missingLogName, {
+      traceId,
+      requestedItemId: null,
+      reason: "MISSING_USER_OR_ROW",
+      catalogCount: catalog.length,
+      summaryStatus: null,
+    });
+    return null;
+  }
+
+  const itemLabel =
+    buildDisplayLabel(/** @type {Record<string, unknown>} */ (row)) ||
+    String(row.name ?? "").trim() ||
+    "yeh option";
+  const reqId = String(row.itemId ?? row.id ?? "").trim() || null;
+  const blockingStatusesSeen = Array.isArray(av.blockingStatusesSeen)
+    ? av.blockingStatusesSeen
+    : [];
+
+  /** @type {Array<{ id: string, name: string }>} */
+  let alternativeItems = [];
+  let alternativeSummarySkipped = false;
+  const MAX_CATALOG_FOR_ALT_SNAPSHOT = 400;
+
+  if (catalog.length > MAX_CATALOG_FOR_ALT_SNAPSHOT) {
+    alternativeSummarySkipped = true;
+  } else if (catalog.length > 0) {
+    const rowId = String(row.id ?? row.itemId ?? "").trim();
+    const rowName = String(row.name ?? "").trim();
+    if (rowId) {
+      const raw = await pickAlternativeAvailableItemsFromCatalogRows(
+        userId,
+        rowId,
+        rowName,
+        catalog,
+        { limit: 5, maxRankedCandidates: 150 }
+      );
+      alternativeItems = raw.map((x) => ({
+        id: String(x.id ?? x.itemId ?? "").trim(),
+        name: String(x.name ?? "").trim(),
+      }));
     }
-    return `${head} Kya aap koi aur available option dekhna chahenge?`;
+  } else {
+    const rowId = String(row.id ?? row.itemId ?? "").trim();
+    if (rowId) {
+      const raw = await getAlternativeAvailableItems(
+        userId,
+        rowId,
+        String(row.name ?? "").trim(),
+        5
+      );
+      alternativeItems = raw.map(({ id, name }) => ({
+        id: String(id ?? "").trim(),
+        name: String(name ?? "").trim(),
+      }));
+    }
   }
-  const head = `Sorry, ${label} is not listed in our available options.`;
-  if (available.length > 0) {
-    return `${head}\n${buildBrowseOptionsReply(available, style, { actuallyAvailable: false })}`;
+
+  const composed = composeBookingUnavailableItemAvailabilityContextReply({
+    itemLabel,
+    reqId,
+    blockingStatusesSeen,
+    alternativeItems,
+    alternativeSummarySkipped,
+    catalogLength: catalog.length,
+    styleKey,
+    normalizedCatalogForTurn: catalog,
+  });
+
+  console.log(builtLogName, {
+    traceId,
+    source:
+      logKind === "booking_blocked"
+        ? "BOOKING_BLOCKED_AVAILABILITY_CHECK"
+        : "booking_duration_unavailable",
+    requestedItemId: reqId,
+    requestedItemLabel: itemLabel,
+    summaryStatus: composed.meta.summaryStatus,
+    availableCount: composed.meta.availableCount,
+    topItemCount: composed.meta.topItemCount,
+    alternativeSummarySkipped: composed.meta.alternativeSummarySkipped,
+  });
+
+  const preview = String(composed.reply ?? "").trim().slice(0, 220) || null;
+  console.log(replyLogName, {
+    traceId,
+    source: "availability_context",
+    previousSource:
+      logKind === "booking_blocked"
+        ? "BOOKING_BLOCKED_AVAILABILITY_CHECK/buildUnavailableReply"
+        : "buildUnavailableReply",
+    summaryStatus: composed.meta.summaryStatus,
+    availableCount: composed.meta.availableCount,
+    replyPreview: preview,
+  });
+
+  const meta = composed.meta;
+  if (
+    p.memory &&
+    typeof p.memory === "object" &&
+    meta.alternativeSummarySkipped !== true &&
+    String(meta.summaryStatus ?? "").trim().toLowerCase() === "fresh" &&
+    Number.isFinite(Number(meta.availableCount)) &&
+    Number(meta.availableCount) === 0
+  ) {
+    markAvailabilityFreshNoOtherOptionsStructured(p.memory);
   }
-  return `${head} Would you like to see what we currently have?`;
+
+  return composed.reply;
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} itemLike
+ * @param {string} [fallbackLabel]
+ */
+function catalogRowFromItemLike(itemLike, fallbackLabel = "") {
+  const ic = itemLike && typeof itemLike === "object" && !Array.isArray(itemLike) ? itemLike : null;
+  const id = normalizeId(ic?.itemId ?? ic?.id);
+  if (!id) return null;
+  const label =
+    buildDisplayLabel(ic) ||
+    String(ic?.name ?? "").trim() ||
+    String(fallbackLabel ?? "").trim();
+  return {
+    ...ic,
+    id,
+    itemId: id,
+    name: label || String(ic?.name ?? "").trim(),
+  };
+}
+
+function buildCollectDurationAvailabilityUnknownReply({ itemLabel, style }) {
+  const label = String(itemLabel ?? "").trim();
+  if (style === "casual_local") {
+    return label
+      ? `Main abhi ${label} ki availability confirm kar ke bata deta hun.`
+      : "Main abhi availability confirm kar ke bata deta hun.";
+  }
+  return label
+    ? `I’ll confirm availability for ${label} and get back to you shortly.`
+    : "I’ll confirm availability and get back to you shortly.";
+}
+
+/**
+ * Structured unavailable reply from catalog row + hydration snapshot (composer + truth enforce).
+ * @param {{
+ *   userId: string,
+ *   catalogRow: Record<string, unknown> | null,
+ *   availabilitySnapshot?: { blockingStatusesSeen?: string[], isAvailable?: boolean },
+ *   normalizedCatalogForTurn: unknown[],
+ *   styleKey: "casual_local" | "neutral_english",
+ *   conversationStyle?: string,
+ *   traceId?: string | null,
+ *   logKind?: "booking_unavailable" | "booking_blocked",
+ *   memory?: Record<string, unknown> | null,
+ * }} p
+ */
+async function resolveStructuredUnavailableCustomerReply(p) {
+  const styleKey = p.styleKey === "casual_local" ? "casual_local" : "neutral_english";
+  const row = catalogRowFromItemLike(p.catalogRow);
+  const itemLabel =
+    (row && (buildDisplayLabel(row) || String(row.name ?? "").trim())) || "yeh option";
+  if (!row || !String(p.userId ?? "").trim()) {
+    return buildUnavailableReply({
+      itemLabel,
+      style: p.conversationStyle === "casual_local" ? "casual_local" : "neutral_english",
+    });
+  }
+  try {
+    const structuredReply = await buildBookingDurationUnavailableStructuredCustomerReply({
+      userId: String(p.userId ?? "").trim(),
+      catalogRow: row,
+      availabilitySnapshot: p.availabilitySnapshot ?? {},
+      normalizedCatalogForTurn: p.normalizedCatalogForTurn,
+      styleKey,
+      traceId: p.traceId ?? null,
+      logKind: p.logKind,
+      memory: p.memory,
+    });
+    const text = String(structuredReply ?? "").trim();
+    if (text) return text;
+  } catch (err) {
+    console.warn("[structured_unavailable_reply_failed]", {
+      traceId: p.traceId ?? null,
+      error: String(err?.message ?? err),
+    });
+  }
+  return buildUnavailableReply({
+    itemLabel,
+    style: p.conversationStyle === "casual_local" ? "casual_local" : "neutral_english",
+  });
+}
+
+/**
+ * Hydrated user-facing availability wins over early booking-window check before any booking create.
+ * @param {{
+ *   userId: string,
+ *   catalogRow: Record<string, unknown>,
+ *   earlyAvailabilitySnapshot?: { isAvailable?: boolean, blockingStatusesSeen?: string[] },
+ *   normalizedCatalogForTurn: unknown[],
+ *   styleKey: "casual_local" | "neutral_english",
+ *   conversationStyle?: string,
+ *   traceId?: string | null,
+ *   logKind?: "booking_unavailable" | "booking_blocked",
+ *   memory?: Record<string, unknown> | null,
+ *   hydrationSource?: string,
+ * }} p
+ * @returns {Promise<{ blocked: boolean, reply?: string, hydrated?: { isAvailable: boolean, blockingStatusesSeen?: string[] } }>}
+ */
+async function blockCustomerBookingIfHydratedUnavailable(p) {
+  const row = catalogRowFromItemLike(p.catalogRow);
+  const rowId = row ? String(row.id ?? row.itemId ?? "").trim() : "";
+  if (!rowId || !String(p.userId ?? "").trim()) {
+    return { blocked: false };
+  }
+  const hydrated = await getUserFacingAvailabilityForItem(
+    rowId,
+    String(row.name ?? "").trim(),
+    String(p.hydrationSource ?? "booking_hydration_gate").trim() || "booking_hydration_gate"
+  );
+  if (hydrated.isAvailable !== false) {
+    return { blocked: false, hydrated };
+  }
+  const earlySnap = p.earlyAvailabilitySnapshot;
+  const earlyAvailable = earlySnap?.isAvailable !== false;
+  if (earlyAvailable) {
+    console.log("[availability_path_mismatch_detected]", {
+      traceId: p.traceId != null ? String(p.traceId).trim() || null : null,
+      itemId: rowId,
+      earlyBookingAvailable: true,
+      hydratedAvailable: false,
+      earlyBlockingStatusesSeen: Array.isArray(earlySnap?.blockingStatusesSeen)
+        ? earlySnap.blockingStatusesSeen
+        : [],
+      hydratedBlockingStatusesSeen: Array.isArray(hydrated.blockingStatusesSeen)
+        ? hydrated.blockingStatusesSeen
+        : [],
+      earlyReason: earlySnap?.isAvailable === false ? "ALREADY_BOOKED" : "NO_CONFLICT",
+      hydratedReason: "ALREADY_BOOKED",
+      requestedStart: null,
+      requestedEnd: null,
+    });
+  }
+  const reply = await resolveStructuredUnavailableCustomerReply({
+    userId: p.userId,
+    catalogRow: row,
+    availabilitySnapshot: {
+      blockingStatusesSeen: Array.isArray(hydrated.blockingStatusesSeen)
+        ? hydrated.blockingStatusesSeen
+        : [],
+    },
+    normalizedCatalogForTurn: p.normalizedCatalogForTurn,
+    styleKey: p.styleKey,
+    conversationStyle: p.conversationStyle,
+    traceId: p.traceId,
+    logKind: p.logKind ?? "booking_blocked",
+    memory: p.memory,
+  });
+  return { blocked: true, reply, hydrated };
 }
 
 function buildAskContactReply({ duration, style }) {
@@ -1663,6 +2559,1069 @@ function buildAskContactReply({ duration, style }) {
   return [ack, ask].filter(Boolean).join(" ");
 }
 
+function isPrivateDetailPromptText(text = "") {
+  const t = String(text ?? "");
+  if (!t.trim()) return false;
+  const diagnostics = groupPrivateDetailBlockDiagnostics(t);
+  return (
+    diagnostics.containsPhonePattern ||
+    diagnostics.containsContactConfirmation ||
+    /\b(phone\s*number|contact\s*number|contact\s+share|number\s+share|contact\s+share\s+kar)\b/i.test(t) ||
+    /\b(naam|name)\b/i.test(t) && /\b(share|bhej|bata|send|contact)\b/i.test(t) ||
+    /\b(apna\s+naam|your\s+name)\b/i.test(t) ||
+    /\b(delivery\s+address|address\s+share|location\s*\/?\s*address\s+share|location\s+share|address\s+bhej|location\s+bhej|address\s+thoda\s+clear)\b/i.test(t) ||
+    /\b(delivery\s+ka\s+time|delivery\s+time|kis\s+time\s+(?:bhej|lena)|time\s+kya\s+rakhna|pickup\s+details?)\b/i.test(t) ||
+    /\b(delivery\s+kahan|exact\s+kis\s+area|pickup\s+noted|delivery\s+noted)\b/i.test(t) ||
+    /\b(city\s+ke\s+andar|inside\s*\/?\s*outside|outside\s+city|city\s+ke\s+bahar|pickup\s+karna|delivery\s+chahiye|pickup\s+rakh|pickup\s+karna\s+chah)\b/i.test(t)
+  );
+}
+
+function formatCustomerDuration({
+  durationDays = null,
+  durationHours = null,
+  billingUnit = null,
+  local = true,
+} = {}) {
+  const hours = Number(durationHours);
+  if (Number.isFinite(hours) && hours > 0) {
+    const safeHours = Math.max(1, Math.floor(hours));
+    if (String(billingUnit ?? "").trim().toLowerCase() === "half_day" || safeHours < 24) {
+      return local ? `${safeHours} ghantay` : `${safeHours} hours`;
+    }
+  }
+  const days = Number(durationDays);
+  if (!Number.isFinite(days) || days <= 0) return "";
+  const safeDays = Math.max(1, Math.floor(days));
+  if (safeDays % 30 === 0) {
+    const months = safeDays / 30;
+    return `${months} month${months === 1 ? "" : "s"}`;
+  }
+  if (safeDays % 7 === 0) {
+    const weeks = safeDays / 7;
+    return `${weeks} week${weeks === 1 ? "" : "s"}`;
+  }
+  return `${safeDays} din`;
+}
+
+function groupPrivateDetailBlockDiagnostics(text = "") {
+  const t = String(text ?? "");
+  return {
+    containsPhonePattern:
+      /(?:\[\s*)?(?:\+?92|0092|0)?3[\d\s().-]{8,}\d(?:\s*\])?/i.test(t) ||
+      /(?:\[\s*)?\+\d[\d\s().-]{8,}\d(?:\s*\])?/i.test(t),
+    containsContactConfirmation:
+      /\b(?:aapka|apka|your)?\s*(?:contact|phone)\s*number\s+(?:hai|is)\b/i.test(t) ||
+      /\b(?:contact|phone)\s*number\s+(?:hai|is)\b/i.test(t) ||
+      (/\bkya\s+yeh\s+sahi\s+hai\b/i.test(t) &&
+        /\b(contact|phone|number)\b/i.test(t)),
+  };
+}
+
+function groupSafeRequestReceivedReply({
+  itemAndDurationKnown = false,
+  itemName = "",
+  durationDays = null,
+  durationHours = null,
+  billingUnit = null,
+} = {}) {
+  const itemLabel = String(itemName ?? "").trim();
+  const durationLabel = formatCustomerDuration({
+    durationDays,
+    durationHours,
+    billingUnit,
+    local: true,
+  });
+  if (itemLabel && durationLabel) {
+    return `Perfect 👍 ${itemLabel} ${durationLabel} ke liye note kar liya. Main confirm kar ke bata deta hun.`;
+  }
+  return itemAndDurationKnown
+    ? "Perfect 👍 request receive ho gayi hai. Main confirm kar ke bata deta hun."
+    : "Request receive ho gayi hai. Main confirm kar ke bata deta hun.";
+}
+
+function buildGroupSafetyReplacementReply({ inboundMessage = "", result = {}, businessProfile = null } = {}) {
+  const parsed = parseUserDuration(inboundMessage);
+  const selection = shortBookingSelectionFromParsedDuration(parsed, businessProfile);
+  if (selection?.type === "below_minimum") {
+    const item =
+      result?.messageMeta?.itemContext ||
+      result?.messageMeta?.item ||
+      result?.messageMeta?.matchedItem ||
+      null;
+    return buildBelowMinimumShortBookingReply({
+      item,
+      selection,
+      includePrice: hasPriceDisplayIntent(inboundMessage),
+    }).reply;
+  }
+  const itemAndDurationKnown = Boolean(
+    result?.messageMeta?.bookingCreated ||
+      result?.messageMeta?.durationDays ||
+      result?.messageMeta?.durationHours ||
+      result?.messageMeta?.bookingId
+  );
+  const booking =
+    result?.messageMeta?.bookingCreated && typeof result.messageMeta.bookingCreated === "object"
+      ? result.messageMeta.bookingCreated
+      : {};
+  return groupSafeRequestReceivedReply({
+    itemAndDurationKnown,
+    itemName:
+      result?.messageMeta?.itemName ??
+      booking?.itemName ??
+      result?.meta?.itemName ??
+      "",
+    durationDays:
+      result?.messageMeta?.durationDays ??
+      booking?.durationDays ??
+      result?.meta?.durationDays ??
+      null,
+    durationHours:
+      result?.messageMeta?.durationHours ??
+      booking?.durationHours ??
+      result?.meta?.durationHours ??
+      null,
+    billingUnit:
+      result?.messageMeta?.billingUnit ??
+      booking?.billingUnit ??
+      result?.meta?.billingUnit ??
+      null,
+  });
+}
+
+const DEFAULT_SHORT_BOOKING_POLICY = {
+  shortBookingMinimumHours: 12,
+  shortBookingRatePercentOfDaily: 80,
+  shortBookingLabel: "half_day",
+};
+
+function resolveShortBookingPolicy(businessProfile = null) {
+  const policy =
+    businessProfile?.bookingPolicy && typeof businessProfile.bookingPolicy === "object"
+      ? businessProfile.bookingPolicy
+      : {};
+  const minHours = Number(policy.shortBookingMinimumHours);
+  const ratePct = Number(policy.shortBookingRatePercentOfDaily);
+  const label = String(policy.shortBookingLabel ?? "").trim();
+  return {
+    shortBookingMinimumHours:
+      Number.isFinite(minHours) && minHours > 0
+        ? Math.max(1, Math.floor(minHours))
+        : DEFAULT_SHORT_BOOKING_POLICY.shortBookingMinimumHours,
+    shortBookingRatePercentOfDaily:
+      Number.isFinite(ratePct) && ratePct > 0
+        ? Math.max(1, Math.min(100, Math.floor(ratePct)))
+        : DEFAULT_SHORT_BOOKING_POLICY.shortBookingRatePercentOfDaily,
+    shortBookingLabel: label || DEFAULT_SHORT_BOOKING_POLICY.shortBookingLabel,
+  };
+}
+
+function shortBookingSelectionFromParsedDuration(parsed, businessProfile = null) {
+  if (!parsed || typeof parsed !== "object") return null;
+  const hours = Number(parsed.normalizedHours ?? (String(parsed.unit).toLowerCase() === "hours" ? parsed.value : NaN));
+  if (!Number.isFinite(hours) || hours <= 0) return null;
+  const policy = resolveShortBookingPolicy(businessProfile);
+  const selectedHours = Math.max(1, Math.floor(hours));
+  if (selectedHours < policy.shortBookingMinimumHours) {
+    return {
+      type: "below_minimum",
+      requestedHours: selectedHours,
+      minimumHours: policy.shortBookingMinimumHours,
+      billingUnit: policy.shortBookingLabel,
+      billingRatePercentOfDaily: policy.shortBookingRatePercentOfDaily,
+    };
+  }
+  if (selectedHours === policy.shortBookingMinimumHours) {
+    return {
+      type: "accepted",
+      durationHours: policy.shortBookingMinimumHours,
+      billingUnit: policy.shortBookingLabel,
+      billingRatePercentOfDaily: policy.shortBookingRatePercentOfDaily,
+    };
+  }
+  return null;
+}
+
+function parseDailyRateNumber(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const match = raw.replace(/,/g, "").match(/\b(\d{2,})(?:\.\d+)?\b/);
+  if (!match) return null;
+  const num = Number(match[1]);
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+function numericDailyRateFromItem(item = null) {
+  if (!item || typeof item !== "object") return null;
+  const candidates = [
+    item.pricing?.daily,
+    item.pricing?.perDay,
+    item.pricing?.day,
+    item.dailyRate,
+    item.pricePerDay,
+    item.rentPerDay,
+    item.ratePerDay,
+    item.perDay,
+    item.price,
+    item.rent,
+    item.rate,
+    item.pricing?.dailyRate,
+    item.pricing?.pricePerDay,
+    item.attributes?.pricing?.daily,
+    item.attributes?.pricePerDay,
+    item.attributes?.dailyRate,
+  ];
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    const parsed = parseDailyRateNumber(candidate);
+    if (parsed != null) return parsed;
+    const num = Number(String(candidate).replace(/[^\d.]/g, ""));
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+  return null;
+}
+
+function computeBelowMinimumCalculatedPrice(item, selection) {
+  const dailyRate = numericDailyRateFromItem(item);
+  if (dailyRate == null) return { dailyRate: null, calculatedPrice: null };
+  const calculatedPrice = Math.round(
+    dailyRate * (Number(selection?.billingRatePercentOfDaily ?? 80) / 100)
+  );
+  console.log("[booking_half_day_price_calculated]", {
+    dailyRate,
+    billingRatePercentOfDaily: selection?.billingRatePercentOfDaily ?? null,
+    calculatedPrice,
+  });
+  return { dailyRate, calculatedPrice };
+}
+
+function classifyBelowMinimumTurnKind(message, turnIntentShape = null) {
+  if (hasStrongBookingCommitPhrase(message)) return "booking";
+  const primary = String(turnIntentShape?.primaryIntent ?? "").trim();
+  const policy = String(turnIntentShape?.responsePolicy ?? "").trim();
+  if (primary === "booking_request" || policy === "start_or_continue_booking") {
+    return "booking";
+  }
+  if (
+    isExplicitPricingOrDetailsQuestion(message) ||
+    primary === "pricing_question" ||
+    isAnswerRequestedFieldPolicy(turnIntentShape)
+  ) {
+    return "informational";
+  }
+  if (/\b(kitna|kitni|kitne|price|pricing|rate|rent|charges?|cost)\b/i.test(String(message ?? ""))) {
+    return "informational";
+  }
+  if (
+    /\b(chahiye|chahye|chaiye|book|booking|reserve|lena|lye|ly|karwana|chahye)\b/i.test(
+      String(message ?? "")
+    )
+  ) {
+    return "booking";
+  }
+  return "informational";
+}
+
+function buildBelowMinimumDurationReply({
+  item = null,
+  selection,
+  mode = "informational",
+  includePrice = true,
+  isAvailable = true,
+  itemLabel = "",
+  hasAlternativeOptions = false,
+}) {
+  const minimumHours = Number(selection?.minimumHours ?? 12);
+  const safeMinimumHours =
+    Number.isFinite(minimumHours) && minimumHours > 0 ? Math.floor(minimumHours) : 12;
+  const requestedHours = Number(selection?.requestedHours ?? 0);
+  const safeRequestedHours =
+    Number.isFinite(requestedHours) && requestedHours > 0
+      ? Math.floor(requestedHours)
+      : safeMinimumHours;
+  const { calculatedPrice } = computeBelowMinimumCalculatedPrice(item, selection);
+  const currency = currencyFromItem(item);
+  const label =
+    String(itemLabel ?? "").trim() ||
+    buildDisplayLabel(item) ||
+    String(item?.displayLabel ?? item?.name ?? "").trim() ||
+    "Yeh option";
+  const parts = [
+    `${safeRequestedHours} ghantay ke liye gari rent par nahi milti. Minimum ${safeMinimumHours} ghantay ka slot hai.`,
+  ];
+  if (includePrice && calculatedPrice != null && !(mode === "booking" && !isAvailable)) {
+    const priceLine = `${safeMinimumHours} ghantay ka rent ${calculatedPrice} ${currency} hoga`;
+    if (!isAvailable && mode === "informational") {
+      parts.push(`${priceLine}, lekin ${label} abhi available nahi hai.`);
+    } else {
+      parts.push(`${priceLine}.`);
+    }
+  } else if (!isAvailable) {
+    if (hasAlternativeOptions) {
+      parts.push(`Lekin ${label} abhi available nahi hai.`);
+    } else {
+      parts.push(
+        `Lekin ${label} abhi available nahi hai, aur filhaal koi aur option bhi available nahi hai.`
+      );
+    }
+  }
+  const offerCheckKarun = mode === "booking" && isAvailable;
+  if (offerCheckKarun) {
+    parts.push(`${safeMinimumHours} ghantay ke liye check karun?`);
+  }
+  return {
+    reply: parts.join(" "),
+    calculatedPrice,
+    offerCheckKarun,
+  };
+}
+
+function planBelowMinimumHoursTurn({
+  message,
+  selection,
+  item,
+  turnIntentShape = null,
+  isGroupInbound = false,
+  isAvailable = true,
+  itemLabel = "",
+  alternativeItems = [],
+  modeOverride = null,
+}) {
+  const kind =
+    modeOverride ??
+    classifyBelowMinimumTurnKind(message, turnIntentShape);
+  const explicitPriceIntent = hasPriceDisplayIntent(message);
+  const includePrice =
+    kind === "informational" || !isGroupInbound || explicitPriceIntent;
+  const hasAlternativeOptions =
+    Array.isArray(alternativeItems) && alternativeItems.length > 0;
+  const built = buildBelowMinimumDurationReply({
+    item,
+    selection,
+    mode: kind === "booking" ? "booking" : "informational",
+    includePrice,
+    isAvailable,
+    itemLabel,
+    hasAlternativeOptions,
+  });
+  const itemId = normalizeId(item?.itemId ?? item?.id);
+  const shouldStorePending =
+    kind === "booking" && isAvailable && built.offerCheckKarun && Boolean(itemId);
+  return {
+    kind,
+    explicitPriceIntent,
+    shouldStorePending,
+    ...built,
+  };
+}
+
+function currencyFromItem(item = null) {
+  if (!item || typeof item !== "object") return "PKR";
+  const raw =
+    item.currency ??
+    item.priceCurrency ??
+    item.currencyCode ??
+    item.pricing?.currency ??
+    item.pricing?.priceCurrency ??
+    item.pricing?.currencyCode ??
+    "PKR";
+  const currency = String(raw ?? "").trim().toUpperCase();
+  return currency || "PKR";
+}
+
+function buildBelowMinimumShortBookingReply({
+  item = null,
+  selection,
+  includePrice = true,
+  mode = "booking",
+  isAvailable = true,
+  itemLabel = "",
+  alternativeItems = [],
+}) {
+  return buildBelowMinimumDurationReply({
+    item,
+    selection,
+    mode,
+    includePrice,
+    isAvailable,
+    itemLabel,
+    hasAlternativeOptions: Array.isArray(alternativeItems) && alternativeItems.length > 0,
+  });
+}
+
+function shortBookingCreateFields(selection = null, item = null) {
+  if (!selection || selection.type !== "accepted") return {};
+  const dailyRate = numericDailyRateFromItem(item);
+  const calculatedPrice =
+    dailyRate != null
+      ? Math.round(dailyRate * (Number(selection.billingRatePercentOfDaily ?? 80) / 100))
+      : null;
+  if (calculatedPrice != null) {
+    console.log("[booking_half_day_price_calculated]", {
+      dailyRate,
+      billingRatePercentOfDaily: selection.billingRatePercentOfDaily,
+      calculatedPrice,
+    });
+  }
+  return {
+    durationHours: selection.durationHours,
+    billingUnit: selection.billingUnit,
+    billingRatePercentOfDaily: selection.billingRatePercentOfDaily,
+    ...(calculatedPrice != null ? { calculatedPrice } : {}),
+  };
+}
+
+const PENDING_ACTION_TTL_MS = 5 * 60 * 1000;
+const LAST_VERIFIED_CATALOG_ANSWER_TTL_MS = PENDING_ACTION_TTL_MS;
+const VERIFIED_CATALOG_PRICING_ANSWER_TYPE = "pricing";
+const TRUSTED_VERIFIED_CATALOG_ANSWER_SOURCES = new Set(["verified_catalog"]);
+const VERIFIED_CATALOG_PRICING_REQUESTED_FIELDS = new Set([
+  "price",
+  "price_daily",
+  "price_monthly",
+  "price_with_duration",
+]);
+const PENDING_ACTION_STATUS_AWAITING = "awaiting_user";
+const PENDING_ACTION_TYPES = Object.freeze({
+  ACCEPT_SHORT_BOOKING_OFFER: "accept_short_booking_offer",
+  COLLECT_DURATION: "collect_duration",
+  CONFIRM_FUZZY_CATALOG: "confirm_fuzzy_catalog",
+  SHOW_ALTERNATIVE_OPTIONS: "show_alternative_options",
+  SEND_ITEM_PHOTOS: "send_item_photos",
+  SELECT_ITEM_OPTION: "select_item_option",
+  CONFIRM_BOOKING_REQUEST: "confirm_booking_request",
+  COLLECT_DELIVERY_METHOD: "collect_delivery_method",
+});
+
+const FUZZY_PENDING_INFERRED_INTENTS = new Set([
+  "availability_check",
+  "pricing_question",
+  "general_item_question",
+]);
+
+function pendingActionNowIso(nowMs = Date.now()) {
+  return new Date(nowMs).toISOString();
+}
+
+function pendingActionExpiryIso(nowMs = Date.now(), ttlMs = PENDING_ACTION_TTL_MS) {
+  return new Date(nowMs + ttlMs).toISOString();
+}
+
+function hasPriceDisplayIntent(message) {
+  const lower = String(message ?? "").toLowerCase();
+  return /\b(price|pricing|rate|rates|rent|rental|cost|charges?|amount|quote|quotation|kitna|kitni|kitne|how much|per\s*day|daily|rs\.?|pkr)\b/i.test(
+    lower
+  );
+}
+
+function normalizeReplyIntentText(message) {
+  return String(message ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isLikelyAffirmationToken(text) {
+  const compact = normalizeReplyIntentText(text).replace(/\s+/g, "");
+  if (!compact) return false;
+  if (/^(?:yes|yep|yeah|han|haan|ok|okay|theek|thik|sure|done)$/i.test(compact)) {
+    return true;
+  }
+  if (/^j+i*$/i.test(compact) || /^j+e+$/i.test(compact)) return true;
+  if (compact === "g") return true;
+  return false;
+}
+
+function normalizeAffirmationReplyToken(text) {
+  const base = normalizeReplyIntentText(text);
+  if (!base) return "";
+  return isLikelyAffirmationToken(base) ? "ji" : base;
+}
+
+function inferPendingActionReplyIntent(message, { pendingAction = null } = {}) {
+  const raw = String(message ?? "").replace(/\s+/g, " ").trim();
+  const text = normalizeReplyIntentText(raw);
+  const words = text ? text.split(/\s+/).filter(Boolean) : [];
+  const wordCount = words.length;
+  const duration = parseUserDuration(raw);
+  const pendingExpectsDuration =
+    pendingAction?.type === PENDING_ACTION_TYPES.COLLECT_DURATION ||
+    pendingAction?.expectedReplyType === "duration";
+
+  if (!text) {
+    return { type: "unknown", confidence: "low", explicitNewIntent: false };
+  }
+
+  if (pendingExpectsDuration && duration) {
+    return { type: "duration", confidence: "high", explicitNewIntent: false, duration };
+  }
+
+  const hasExplicitNewRequest =
+    /\b(available|availability|maujood|mil(?:e|a|egi|ega)?|book|booking|reserve|rent|rental|chahiye|chahye|chaiye|need|want|show|dikhao|photo|photos|picture|pictures|image|images|option|options|koi\s+aur|another|different|instead|change|replace)\b/i.test(
+      text
+    ) &&
+    !/^(?:ji|jee|han|haan|yes|ok|okay|theek|thik|sure|done|please|pls)(?:\s+(?:please|pls))?$/i.test(
+      text
+    );
+
+  if (hasExplicitNewRequest) {
+    return { type: "new_request", confidence: "high", explicitNewIntent: true };
+  }
+
+  if (/^(?:no|nope|nah|nahi|nahe|nai|mat|cancel|stop|rehne\s+den|rehne\s+dein|not\s+now)$/i.test(text)) {
+    return { type: "rejection", confidence: "high", explicitNewIntent: false };
+  }
+
+  if (duration) {
+    return { type: "duration", confidence: "high", explicitNewIntent: false, duration };
+  }
+
+  const affirmationText = normalizeAffirmationReplyToken(text);
+  const isAffirmation =
+    wordCount <= 4 &&
+    (/^(?:yes|yep|yeah|han|haan|ji|jee|ok|okay|theek|thik|sure|done|please|pls)(?:\s+(?:please|pls|ji|jee))?$/i.test(
+      affirmationText
+    ) ||
+      isLikelyAffirmationToken(text) ||
+      /^(?:kar|kr)\s*(?:do|dein|den|dain)$/i.test(affirmationText) ||
+      /^check\s*(?:karen|karain|karna|kar\s+den|kar\s+dein)$/i.test(affirmationText));
+
+  if (isAffirmation) {
+    return { type: "affirmation", confidence: "high", explicitNewIntent: false };
+  }
+
+  const delivery = interpretDeliveryMethodMessage(raw);
+  if (delivery?.method === "delivery" || delivery?.method === "pickup") {
+    return {
+      type: "delivery_method",
+      confidence: delivery.confidence === "high" ? "high" : "medium",
+      explicitNewIntent: false,
+      deliveryMethod: delivery.method,
+    };
+  }
+
+  return {
+    type: pendingAction?.expectedReplyType === "affirmation" && wordCount <= 3 ? "unknown" : "unknown",
+    confidence: "low",
+    explicitNewIntent: false,
+  };
+}
+
+function pendingActionIsExpired(pendingAction, nowMs = Date.now()) {
+  const expiresMs = Date.parse(String(pendingAction?.expiresAt ?? ""));
+  return !Number.isFinite(expiresMs) || expiresMs <= nowMs;
+}
+
+function clearPendingAction(memory, reason = "UNKNOWN") {
+  if (!memory || typeof memory !== "object" || !memory.pendingAction) return false;
+  const pending = memory.pendingAction;
+  delete memory.pendingAction;
+  console.log("[pending_action_cleared]", {
+    reason,
+    type: String(pending?.type ?? "").trim() || null,
+    pendingActionId: String(pending?.id ?? "").trim() || null,
+  });
+  return true;
+}
+
+function buildPendingAction({
+  type,
+  expectedReplyType,
+  participantKey,
+  groupChatKey,
+  sessionKey,
+  itemId,
+  itemDisplayLabel,
+  payload = {},
+  sourceMessageId = null,
+  sourcePromptText = "",
+  nowMs = Date.now(),
+} = {}) {
+  return {
+    id: randomUUID(),
+    type,
+    status: PENDING_ACTION_STATUS_AWAITING,
+    expectedReplyType,
+    participantKey: String(participantKey ?? "").trim() || null,
+    groupChatKey: String(groupChatKey ?? "").trim() || null,
+    sessionKey: String(sessionKey ?? "").trim() || null,
+    itemId: String(itemId ?? "").trim() || null,
+    itemDisplayLabel: String(itemDisplayLabel ?? "").trim() || null,
+    payload,
+    createdAt: pendingActionNowIso(nowMs),
+    expiresAt: pendingActionExpiryIso(nowMs),
+    sourceMessageId: String(sourceMessageId ?? "").trim() || null,
+    sourcePromptText: String(sourcePromptText ?? "").trim() || null,
+  };
+}
+
+function storePendingAction(memory, pendingAction) {
+  if (!memory || typeof memory !== "object" || !pendingAction) return null;
+  memory.pendingAction = pendingAction;
+  console.log("[pending_action_stored]", {
+    pendingActionId: String(pendingAction.id ?? "").trim() || null,
+    type: pendingAction.type,
+    expectedReplyType: pendingAction.expectedReplyType,
+    itemId: pendingAction.itemId,
+    participantKey: pendingAction.participantKey || null,
+    groupChatKey: pendingAction.groupChatKey || null,
+    expiresAt: pendingAction.expiresAt || null,
+  });
+  return pendingAction;
+}
+
+function validateAcceptShortBookingOfferPayload(payload = {}) {
+  const itemId = String(payload?.itemId ?? "").trim();
+  const minimumHours = Number(payload?.minimumHours);
+  const billingUnit = String(payload?.billingUnit ?? "").trim();
+  const billingRatePercentOfDaily = Number(payload?.billingRatePercentOfDaily);
+  if (!itemId) return { ok: false, reason: "MISSING_ITEM_ID" };
+  if (!Number.isFinite(minimumHours) || minimumHours <= 0) {
+    return { ok: false, reason: "MISSING_MINIMUM_HOURS" };
+  }
+  if (!billingUnit) return { ok: false, reason: "MISSING_BILLING_UNIT" };
+  if (
+    !Number.isFinite(billingRatePercentOfDaily) ||
+    billingRatePercentOfDaily <= 0
+  ) {
+    return { ok: false, reason: "MISSING_BILLING_RATE" };
+  }
+  return { ok: true };
+}
+
+function validateCollectDurationPayload(pendingAction = {}) {
+  const itemId = String(pendingAction?.itemId ?? pendingAction?.payload?.itemId ?? "").trim();
+  const itemDisplayLabel = String(
+    pendingAction?.itemDisplayLabel ?? pendingAction?.payload?.itemDisplayLabel ?? ""
+  ).trim();
+  const source = String(pendingAction?.payload?.source ?? "").trim();
+  if (!itemId) return { ok: false, reason: "MISSING_ITEM_ID" };
+  if (!itemDisplayLabel) return { ok: false, reason: "MISSING_ITEM_LABEL" };
+  if (source !== "verified_item_selection") {
+    return { ok: false, reason: "INVALID_COLLECT_DURATION_SOURCE" };
+  }
+  return { ok: true };
+}
+
+function validateConfirmFuzzyCatalogPayload(pendingAction = {}) {
+  const itemId = String(pendingAction?.itemId ?? pendingAction?.payload?.itemId ?? "").trim();
+  const itemDisplayLabel = String(
+    pendingAction?.itemDisplayLabel ?? pendingAction?.payload?.itemDisplayLabel ?? ""
+  ).trim();
+  const inferredIntent = String(pendingAction?.payload?.inferredIntent ?? "").trim();
+  if (!itemId) return { ok: false, reason: "MISSING_ITEM_ID" };
+  if (!itemDisplayLabel) return { ok: false, reason: "MISSING_ITEM_LABEL" };
+  if (!FUZZY_PENDING_INFERRED_INTENTS.has(inferredIntent)) {
+    return { ok: false, reason: "INVALID_INFERRED_INTENT" };
+  }
+  return { ok: true };
+}
+
+/**
+ * @param {import("./fuzzyTurnNormalizer.js").FuzzyTurnResult} fuzzyTurnNormalization
+ */
+function mapFuzzyPendingInferredIntent(fuzzyTurnNormalization) {
+  const intent = inferCatalogQuestionIntent(fuzzyTurnNormalization);
+  if (intent === "availability") return "availability_check";
+  if (
+    intent === "price" ||
+    intent === "price_daily" ||
+    intent === "price_monthly"
+  ) {
+    return "pricing_question";
+  }
+  return "general_item_question";
+}
+
+function isPureAckMessage(message) {
+  const raw = String(message ?? "").replace(/\s+/g, " ").trim();
+  if (!raw || raw.length > 28) return false;
+  if (/^👍[\u{1f3fb}-\u{1f3ff}]?$/u.test(raw)) return true;
+  const text = normalizeReplyIntentText(raw);
+  if (!text) return false;
+  const stripped = text
+    .replace(/^[^\p{L}\d]+/u, "")
+    .replace(/[!?.…]+$/gu, "")
+    .trim();
+  const normalized = normalizeAffirmationReplyToken(stripped);
+  return /^(?:yes|yep|yeah|han|haan|ji|jee|ok|okay|theek|thik|sure|done)$/iu.test(normalized);
+}
+
+function buildPureAckNoOpReply(conversationStyle) {
+  return conversationStyle === "casual_local" ? "Theek hai 👍" : "Ok 👍";
+}
+
+const ASSISTANT_OUTBOUND_KIND = Object.freeze({
+  TERMINAL_INFO: "terminal_info",
+  ACTIONABLE_PROMPT: "actionable_prompt",
+  QUESTION: "question",
+  UNKNOWN: "unknown",
+});
+
+/**
+ * @param {boolean} hasUsefulBusinessData
+ * @param {Record<string, unknown> | null | undefined} outboundTrace
+ */
+function messageMetaWithOutboundTrace(hasUsefulBusinessData, outboundTrace) {
+  const base = messageMetaForKnowledge(hasUsefulBusinessData);
+  if (!outboundTrace || typeof outboundTrace !== "object") return base;
+  return { ...base, outboundTrace };
+}
+
+/**
+ * Structured metadata for intentional no-outbound handling (e.g. pure ack after terminal info).
+ * @param {boolean} hasUsefulBusinessData
+ */
+function buildIntentionalSilentNoopMessageMeta(hasUsefulBusinessData) {
+  return {
+    ...messageMetaWithOutboundTrace(hasUsefulBusinessData, {
+      finalReplySource: "PURE_ACK_SILENT",
+      kind: "silent_noop",
+    }),
+    handledWithoutOutbound: true,
+  };
+}
+
+function buildOutboundTrace({
+  kind = ASSISTANT_OUTBOUND_KIND.UNKNOWN,
+  finalReplySource = null,
+  routeType = null,
+  responsePolicy = null,
+  askedField = null,
+  pendingActionTypeStored = null,
+  collectDurationPrompt = false,
+  composedAnswerSource = null,
+  bookingBlocked = false,
+} = {}) {
+  const trace = {
+    kind: String(kind ?? ASSISTANT_OUTBOUND_KIND.UNKNOWN).trim() || ASSISTANT_OUTBOUND_KIND.UNKNOWN,
+    finalReplySource: finalReplySource != null ? String(finalReplySource).trim() || null : null,
+    routeType: routeType != null ? String(routeType).trim() || null : null,
+    responsePolicy: responsePolicy != null ? String(responsePolicy).trim() || null : null,
+    askedField: askedField != null ? String(askedField).trim() || null : null,
+    pendingActionTypeStored:
+      pendingActionTypeStored != null ? String(pendingActionTypeStored).trim() || null : null,
+    collectDurationPrompt: collectDurationPrompt === true,
+    composedAnswerSource:
+      composedAnswerSource != null ? String(composedAnswerSource).trim() || null : null,
+    bookingBlocked: bookingBlocked === true,
+    createdAtMs: Date.now(),
+  };
+  trace.kind = classifyAssistantOutboundKind(trace);
+  return trace;
+}
+
+function classifyAssistantOutboundKind(trace = {}) {
+  const finalReplySource = String(trace.finalReplySource ?? "").trim();
+  if (trace.collectDurationPrompt === true) {
+    return ASSISTANT_OUTBOUND_KIND.ACTIONABLE_PROMPT;
+  }
+  if (trace.pendingActionTypeStored) {
+    return ASSISTANT_OUTBOUND_KIND.ACTIONABLE_PROMPT;
+  }
+  if (trace.bookingBlocked === true) {
+    return ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO;
+  }
+  const composedSource = String(trace.composedAnswerSource ?? "").trim();
+  if (composedSource === "verified_catalog" || composedSource === "llm_draft_grounded") {
+    return ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO;
+  }
+  const terminalSources = new Set([
+    "FUZZY_CATALOG_CONFIRMED_PRICING",
+    "FUZZY_CATALOG_CONFIRMED_AVAILABILITY",
+    "FUZZY_CATALOG_CONFIRMED_GENERAL",
+    "VERIFIED_CATALOG",
+    "INFORMATIONAL_COMPOSER",
+    "AVAILABILITY_TIMING_UNKNOWN",
+    "BOOKING_BLOCKED_AVAILABILITY_CHECK",
+    "UNAVAILABLE_REPLY",
+  ]);
+  if (terminalSources.has(finalReplySource)) {
+    return ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO;
+  }
+  const actionableSources = new Set([
+    "COLLECT_DURATION_REASK",
+    "COLLECT_DURATION_PROMPT",
+    "ASK_CONTACT",
+    "AVAILABILITY_AVAILABLE_ASK_DURATION",
+    "BELOW_MINIMUM_BOOKING_OFFER",
+    "FUZZY_CATALOG_CONFIRMATION",
+    "CONFIRM_FUZZY_CATALOG",
+  ]);
+  if (actionableSources.has(finalReplySource)) {
+    return ASSISTANT_OUTBOUND_KIND.ACTIONABLE_PROMPT;
+  }
+  if (String(trace.responsePolicy ?? "").trim() === "answer_requested_field") {
+    return ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO;
+  }
+  if (finalReplySource === "PHRASE_ENGINE") {
+    return trace.askedField === "duration" || trace.collectDurationPrompt
+      ? ASSISTANT_OUTBOUND_KIND.ACTIONABLE_PROMPT
+      : ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO;
+  }
+  if (
+    finalReplySource === "AI_CONVERSATION_ROUTER" ||
+    finalReplySource === "AI_GENERAL"
+  ) {
+    if (String(trace.routeType ?? "").trim() === "INFORMATIONAL_QUESTION") {
+      return ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO;
+    }
+    return ASSISTANT_OUTBOUND_KIND.UNKNOWN;
+  }
+  return ASSISTANT_OUTBOUND_KIND.UNKNOWN;
+}
+
+function recordLastAssistantOutbound(memory, outboundTrace) {
+  if (!memory || typeof memory !== "object" || !outboundTrace) return;
+  memory.lastAssistantOutbound = outboundTrace;
+}
+
+function wasPreviousAssistantTurnTerminalInfo(memory) {
+  const prior = memory?.lastAssistantOutbound;
+  return (
+    prior &&
+    typeof prior === "object" &&
+    String(prior.kind ?? "").trim() === ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO
+  );
+}
+
+function buildCollectDurationReaskReply(pendingAction, conversationStyle = "casual_local") {
+  const fromPrompt = String(pendingAction?.sourcePromptText ?? "").trim();
+  if (fromPrompt) return fromPrompt;
+  const label = String(pendingAction?.itemDisplayLabel ?? "").trim();
+  if (conversationStyle === "casual_local") {
+    return label
+      ? `${label} ke liye kitne din chahiye?`
+      : "Kitne din ke liye chahiye?";
+  }
+  return label
+    ? `For how many days would you like the ${label}?`
+    : "For how many days would you like it?";
+}
+
+function resolvePureAckNoOutbound({ memory, conversationStyle = "casual_local" }) {
+  if (wasPreviousAssistantTurnTerminalInfo(memory)) {
+    return { type: "silent" };
+  }
+  return {
+    type: "verbal",
+    reply: buildPureAckNoOpReply(conversationStyle),
+  };
+}
+
+function canResolvePureAckWithoutConsumablePending(memory, message, bindingCtx) {
+  if (!memory?.pendingAction) return true;
+  const replyIntent = inferPendingActionReplyIntent(message, { pendingAction: memory.pendingAction });
+  const validation = validatePendingActionBinding({
+    pendingAction: memory.pendingAction,
+    replyIntent,
+    ...bindingCtx,
+  });
+  if (validation.ok) return false;
+  if (validation.clear) return true;
+  const nonBlocking = new Set([
+    "PARTICIPANT_MISMATCH",
+    "GROUP_CHAT_MISMATCH",
+    "SESSION_MISMATCH",
+  ]);
+  if (nonBlocking.has(String(validation.reason ?? "").trim())) return true;
+  return false;
+}
+
+function deriveOutboundTraceFromMessageMeta(messageMeta, finalReplySource = null) {
+  if (messageMeta?.outboundTrace && typeof messageMeta.outboundTrace === "object") {
+    return messageMeta.outboundTrace;
+  }
+  return buildOutboundTrace({
+    finalReplySource,
+    routeType: messageMeta?.routeType ?? null,
+    responsePolicy: messageMeta?.responsePolicy ?? null,
+    askedField: messageMeta?.askedField ?? null,
+    pendingActionTypeStored: messageMeta?.pendingActionType ?? null,
+    collectDurationPrompt:
+      String(messageMeta?.pendingActionType ?? "").trim() ===
+      PENDING_ACTION_TYPES.COLLECT_DURATION,
+    composedAnswerSource: messageMeta?.composedAnswerSource ?? null,
+    bookingBlocked: messageMeta?.bookingBlocked === true,
+  });
+}
+
+function isSpecificInformationalItemSelectionQuestion(message) {
+  const lower = String(message ?? "").toLowerCase();
+  if (!lower.trim()) return false;
+  return /\b(price|pricing|rate|rates|rent|rental|charges?|cost|amount|quote|quotation|kitna|kitni|kitne|colou?r|condition|halat|haalat|photo|photos|pic|pics|picture|pictures|image|images|details?|detail|model|variant|version|info|information|mileage|milage|feature|features|spec|specs)\b/i.test(
+    lower
+  );
+}
+
+function collectDurationSelectionGuardDecision({
+  message = "",
+  item = null,
+  route = "",
+  isAlternativeContext = false,
+  hasParticipantSession = false,
+  hasDurationSignal = false,
+  isContactMessage = false,
+  isAvailabilityQuestion = false,
+} = {}) {
+  const itemId = normalizeId(item?.itemId ?? item?.id);
+  const itemDisplayLabel =
+    String(item?.name ?? "").trim() ||
+    String(item?.displayLabel ?? "").trim() ||
+    buildDisplayLabel(item && typeof item === "object" ? item : {});
+  const availabilityStatus =
+    item && typeof item === "object" && item.isAvailable === false
+      ? "unavailable"
+      : item && typeof item === "object" && item.isAvailable === true
+        ? "available"
+        : "unknown";
+  const latestUserSegmentForCollectDurationGuard =
+    getLatestUserSegmentForGuard(message);
+  const isInformationalQuestion =
+    isExplicitPricingOrDetailsQuestion(message) ||
+    detectShowImagesRequest(message) ||
+    isInformationalItemQuestion(latestUserSegmentForCollectDurationGuard) ||
+    isSpecificInformationalItemSelectionQuestion(
+      latestUserSegmentForCollectDurationGuard
+    );
+  const base = {
+    itemId: itemId || null,
+    itemDisplayLabel: itemDisplayLabel || null,
+    route: String(route ?? "").trim() || null,
+    hasStableItemId: Boolean(itemId),
+    hasAvailability: availabilityStatus !== "unknown",
+    availabilityStatus,
+    isAlternativeContext: Boolean(isAlternativeContext),
+    isInformationalQuestion: Boolean(isInformationalQuestion),
+    hasParticipantSession: Boolean(hasParticipantSession),
+  };
+  if (!item || typeof item !== "object") {
+    return { ok: false, reason: "NO_VERIFIED_CURRENT_TURN_ITEM", ...base };
+  }
+  if (!itemId) return { ok: false, reason: "MISSING_ITEM_ID", ...base };
+  if (!itemDisplayLabel) return { ok: false, reason: "MISSING_ITEM_LABEL", ...base };
+  if (!isAlternativeContext) {
+    return { ok: false, reason: "NO_ALTERNATIVE_CONTEXT", ...base };
+  }
+  if (!hasParticipantSession) {
+    return { ok: false, reason: "MISSING_PARTICIPANT_SESSION", ...base };
+  }
+  if (isInformationalQuestion) {
+    return { ok: false, reason: "INFORMATIONAL_QUESTION", ...base };
+  }
+  if (hasDurationSignal) {
+    return { ok: false, reason: "MESSAGE_ALREADY_HAS_DURATION", ...base };
+  }
+  if (isContactMessage) {
+    return { ok: false, reason: "CONTACT_MESSAGE", ...base };
+  }
+  if (isAvailabilityQuestion) {
+    return { ok: false, reason: "AVAILABILITY_QUESTION", ...base };
+  }
+  if (availabilityStatus === "unavailable") {
+    return { ok: false, reason: "ITEM_UNAVAILABLE", ...base };
+  }
+  if (availabilityStatus !== "available") {
+    return { ok: false, reason: "AVAILABILITY_UNKNOWN", ...base };
+  }
+  return { ok: true, reason: "OK", ...base };
+}
+
+const pendingActionHandlers = Object.freeze({
+  [PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER]: {
+    expectedReplyType: "affirmation",
+    validate: (pendingAction) =>
+      validateAcceptShortBookingOfferPayload({
+        ...(pendingAction?.payload && typeof pendingAction.payload === "object"
+          ? pendingAction.payload
+          : {}),
+        itemId: pendingAction?.itemId,
+      }),
+  },
+  [PENDING_ACTION_TYPES.COLLECT_DURATION]: {
+    expectedReplyType: "duration",
+    validate: validateCollectDurationPayload,
+  },
+  [PENDING_ACTION_TYPES.CONFIRM_FUZZY_CATALOG]: {
+    expectedReplyType: "affirmation",
+    validate: validateConfirmFuzzyCatalogPayload,
+  },
+  [PENDING_ACTION_TYPES.SHOW_ALTERNATIVE_OPTIONS]: {
+    expectedReplyType: "affirmation",
+    validate: () => ({ ok: false, reason: "ACTION_NOT_WIRED" }),
+  },
+  [PENDING_ACTION_TYPES.SEND_ITEM_PHOTOS]: {
+    expectedReplyType: "affirmation",
+    validate: () => ({ ok: false, reason: "ACTION_NOT_WIRED" }),
+  },
+  [PENDING_ACTION_TYPES.SELECT_ITEM_OPTION]: {
+    expectedReplyType: "item_selection",
+    validate: () => ({ ok: false, reason: "ACTION_NOT_WIRED" }),
+  },
+  [PENDING_ACTION_TYPES.CONFIRM_BOOKING_REQUEST]: {
+    expectedReplyType: "affirmation",
+    validate: () => ({ ok: false, reason: "ACTION_NOT_WIRED" }),
+  },
+  [PENDING_ACTION_TYPES.COLLECT_DELIVERY_METHOD]: {
+    expectedReplyType: "delivery_method",
+    validate: () => ({ ok: false, reason: "ACTION_NOT_WIRED" }),
+  },
+});
+
+function validatePendingActionBinding({
+  pendingAction,
+  replyIntent,
+  participantKey,
+  groupChatKey,
+  sessionKey,
+  nowMs = Date.now(),
+} = {}) {
+  if (!pendingAction || typeof pendingAction !== "object") {
+    return { ok: false, reason: "NO_PENDING_ACTION" };
+  }
+  if (String(pendingAction.status ?? "") !== PENDING_ACTION_STATUS_AWAITING) {
+    return { ok: false, reason: "PENDING_ACTION_NOT_AWAITING" };
+  }
+  if (pendingActionIsExpired(pendingAction, nowMs)) {
+    return { ok: false, reason: "PENDING_ACTION_EXPIRED", clear: true };
+  }
+  const currentParticipantKey = String(participantKey ?? "").trim();
+  const pendingParticipantKey = String(pendingAction.participantKey ?? "").trim();
+  if (pendingParticipantKey && currentParticipantKey !== pendingParticipantKey) {
+    return { ok: false, reason: "PARTICIPANT_MISMATCH" };
+  }
+  const currentGroupChatKey = String(groupChatKey ?? "").trim();
+  const pendingGroupChatKey = String(pendingAction.groupChatKey ?? "").trim();
+  if (pendingGroupChatKey && currentGroupChatKey !== pendingGroupChatKey) {
+    return { ok: false, reason: "GROUP_CHAT_MISMATCH" };
+  }
+  const currentSessionKey = String(sessionKey ?? "").trim();
+  const pendingSessionKey = String(pendingAction.sessionKey ?? "").trim();
+  if (pendingSessionKey && currentSessionKey !== pendingSessionKey) {
+    return { ok: false, reason: "SESSION_MISMATCH" };
+  }
+  if (replyIntent?.explicitNewIntent === true || replyIntent?.type === "new_request") {
+    return { ok: false, reason: "EXPLICIT_NEW_INTENT", clear: true };
+  }
+  if (replyIntent?.type === "rejection") {
+    return { ok: false, reason: "REJECTION", clear: true, rejected: true };
+  }
+  const handler = pendingActionHandlers[pendingAction.type];
+  if (!handler) return { ok: false, reason: "UNKNOWN_ACTION_TYPE", clear: true };
+  const expectedReplyType =
+    String(pendingAction.expectedReplyType ?? "").trim() ||
+    String(handler.expectedReplyType ?? "").trim();
+  if (replyIntent?.type !== expectedReplyType) {
+    return { ok: false, reason: "REPLY_INTENT_MISMATCH" };
+  }
+  const payloadValidation = handler.validate(pendingAction);
+  if (!payloadValidation.ok) {
+    return { ok: false, reason: payloadValidation.reason || "INVALID_PAYLOAD", clear: true };
+  }
+  return { ok: true, handler };
+}
+
 function isValidContactValue(contact) {
   return (
     typeof contact === "string" &&
@@ -1675,12 +3634,11 @@ function extractBookingContactParts(rawText) {
   const phoneMatch = text.match(/(?:\+92|0092|92|0)?3[\d\s-]{9,14}/);
 
   if (!phoneMatch) {
-    const parsedName = extractCustomerNameFromMessage(text);
     return {
       rawText: text,
       phone: null,
       normalizedPhone: null,
-      name: parsedName,
+      name: null,
       isValid: false,
     };
   }
@@ -1709,163 +3667,9 @@ function extractBookingContactParts(rawText) {
     rawText: text,
     phone: rawPhone,
     normalizedPhone,
-    name: name || extractCustomerNameFromMessage(text) || null,
+    name: name || null,
     isValid,
   };
-}
-
-const SLOT_CAPTURE_VEHICLE_WORD_RE =
-  /\b(corolla|civic|stonic|swift|toyota|honda|kia|suzuki|rent|kiraya|available|kitna|kitni|options?)\b/i;
-
-function isPlausibleCustomerName(name) {
-  const n = String(name ?? "").trim();
-  if (!n || n.length < 2 || n.length > 40) return false;
-  if (/\d/.test(n)) return false;
-  if (SLOT_CAPTURE_VEHICLE_WORD_RE.test(n.toLowerCase())) return false;
-  return /^[A-Za-z][A-Za-z\s.'-]*$/.test(n);
-}
-
-/**
- * Parse customer name from common Urdu/English booking slot replies.
- * @param {string} rawText
- * @param {{ allowShortName?: boolean }} [opts]
- */
-export function extractCustomerNameFromMessage(rawText, opts = {}) {
-  let text = String(rawText ?? "").trim();
-  text = text.replace(/^\[[^\]]+\]\s*/, "").trim();
-  if (!text || text.length > 120) return null;
-  if (/(?:\+92|0092|92|0)?3[\d\s-]{9,14}/.test(text)) return null;
-  if (SLOT_CAPTURE_VEHICLE_WORD_RE.test(text.toLowerCase())) return null;
-
-  const patterns = [
-    /^(.+?)\s+hai\s+mera\s+naa?m(?:e)?\s*$/i,
-    /^mera\s+naa?m(?:e)?\s+(.+?)\s+hai\s*$/i,
-    /^(?:my\s+)?naa?m(?:e)?\s*(?:is|:|-|—)\s*(.+)$/i,
-    /^name\s*(?:is|:|-|—)\s*(.+)$/i,
-    /^naa?m(?:e)?\s+(.+)$/i,
-  ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match?.[1]) {
-      const candidate = String(match[1]).trim().replace(/[.!?]+$/g, "");
-      if (isPlausibleCustomerName(candidate)) return candidate;
-    }
-  }
-  if (opts.allowShortName === true) {
-    const words = text.split(/\s+/).filter(Boolean);
-    if (words.length === 1 && isPlausibleCustomerName(words[0])) {
-      return words[0];
-    }
-    if (words.length === 2 && isPlausibleCustomerName(words.join(" "))) {
-      return words.join(" ");
-    }
-  }
-  return null;
-}
-
-export function isAwaitingBookingContactCapture(memory) {
-  const bookingId = String(memory?.bookingState?.bookingId ?? "").trim();
-  if (!bookingId) return false;
-  return (
-    memory?.askedContact === true ||
-    String(memory?.stage ?? "").toLowerCase() === "askcontact"
-  );
-}
-
-export async function maybeHandleGroupBookingSlotCapture({
-  userId,
-  message,
-  memory,
-  routingCtx,
-  isGroupInbound,
-  applyOutbound = applyHybridOutboundResult,
-  db: dbInstance = db,
-} = {}) {
-  if (!isGroupInbound || !isAwaitingBookingContactCapture(memory)) return null;
-
-  const contactParts = extractBookingContactParts(message);
-  logContactParse(contactParts);
-  const parsedName =
-    contactParts.name || extractCustomerNameFromMessage(message, { allowShortName: true });
-  const bookingId = String(memory?.bookingState?.bookingId ?? "").trim();
-  if (!bookingId) return null;
-
-  if (contactParts.isValid) {
-    memory.contact = String(
-      contactParts.normalizedPhone || contactParts.phone || ""
-    ).trim();
-    if (parsedName) memory.customerName = parsedName;
-    memory.askedContact = false;
-    if (!memory.entities || typeof memory.entities !== "object") {
-      memory.entities = {};
-    }
-    memory.entities.lastNamed = memory.customerName || parsedName || memory.entities.lastNamed;
-    memory.entities.lastNamedType = "person";
-    try {
-      await dbInstance
-        .collection("businesses")
-        .doc(String(userId))
-        .collection("bookings")
-        .doc(bookingId)
-        .update({
-          customerName: memory.customerName || undefined,
-          customerPhone: memory.contact || undefined,
-          updatedAt: new Date(),
-        });
-    } catch (e) {
-      console.warn("[slot_capture_contact_update_failed]", e?.message || e);
-    }
-    console.log("[group_slot_capture_contact]", {
-      bookingId,
-      hasName: Boolean(memory.customerName),
-      phoneLast4: String(memory.contact ?? "").slice(-4) || null,
-    });
-    return null;
-  }
-
-  if (parsedName) {
-    memory.customerName = parsedName;
-    memory.stage = "askContact";
-    memory.askedContact = true;
-    if (!memory.entities || typeof memory.entities !== "object") {
-      memory.entities = {};
-    }
-    memory.entities.lastNamed = parsedName;
-    memory.entities.lastNamedType = "person";
-    try {
-      await dbInstance
-        .collection("businesses")
-        .doc(String(userId))
-        .collection("bookings")
-        .doc(bookingId)
-        .update({
-          customerName: parsedName,
-          updatedAt: new Date(),
-        });
-    } catch (e) {
-      console.warn("[slot_capture_name_update_failed]", e?.message || e);
-    }
-    console.log("[group_slot_capture_name]", { bookingId, customerName: parsedName });
-    const style =
-      String(memory?.conversationStyle ?? "").trim() === "casual_local" ||
-      String(routingCtx?.conversationStyle ?? "").trim() === "casual_local"
-        ? "casual_local"
-        : "casual_local";
-    const reply =
-      style === "casual_local"
-        ? `Shukriya ${parsedName} 👍 Apna contact number share kar dein.`
-        : `Thanks ${parsedName}. Please share your contact number.`;
-    return applyOutbound(
-      {
-        reply,
-        type: "AI_MESSAGE",
-        messageMeta: messageMetaForKnowledge(true),
-      },
-      routingCtx
-    );
-  }
-
-  return null;
 }
 
 function logContactParse(parts) {
@@ -1895,60 +3699,55 @@ function extractYearFromName(name) {
  * @param {{ isGroupInbound: boolean, message: string, participantPhoneForDm?: string | null, playwrightWebInbound?: boolean }} routingCtx
  * @param {"GROUP" | "DM" | null | undefined} [aiStructuredMode] - from generateReply when model emits \`__ROUTE__:\`
  */
-function scheduleBookingCommitContextPersist(routingCtx, meta) {
-  if (!routingCtx || !meta || typeof meta !== "object") return;
-  routingCtx.bookingContextPersistMeta = meta;
-}
-
 function applyHybridOutboundResult(result, routingCtx, aiStructuredMode) {
-  if (routingCtx?.bookingContextPersistMeta) {
-    persistBookingCommitContext(routingCtx.bookingContextPersistMeta);
-    delete routingCtx.bookingContextPersistMeta;
-  }
   const flowId = String(routingCtx?.flowId ?? "").trim() || null;
   const rawReply = String(result?.reply ?? "");
-  const isGroupOutbound = Boolean(
-    routingCtx?.isGroupInbound === true &&
-      planGroupHybridDelivery({
-        isGroupInbound: true,
-        replyText: rawReply,
-        messageMeta: result?.messageMeta,
-        inboundMessage: routingCtx?.message,
-        participantPhoneForDm:
-          routingCtx?.participantPhoneForDm != null &&
-          String(routingCtx.participantPhoneForDm).trim() !== ""
-            ? String(routingCtx.participantPhoneForDm).trim()
-            : null,
-        aiStructuredMode,
-      })?.sendVia === "GROUP"
-  );
 
   const scrubGroupReply = (text) => {
     const t = String(text ?? "");
     if (!t.trim()) return t;
-    const lower = t.toLowerCase();
-    const blocked =
-      /\bconfirm\s+hai\b/i.test(t) ||
-      /\bconfirmed\b/i.test(lower) ||
-      /\bbooking\s+confirm\b/i.test(lower) ||
-      /\b(kis\s+time|time\s+kya)\b/i.test(lower) ||
-      /\bdelivery\s+address\b/i.test(lower) ||
-      /\bpick\s*up\b/i.test(lower) ||
-      /\bpickup\b/i.test(lower) ||
-      /\b(phone\s+number|contact\s+number)\b/i.test(lower) ||
-      /\b(location\s+bhej|address\s+bhej)\b/i.test(lower);
+    const blocked = isPrivateDetailPromptText(t);
     if (!blocked) return t;
+    const diagnostics = groupPrivateDetailBlockDiagnostics(t);
+    const replacement = buildGroupSafetyReplacementReply({
+      inboundMessage: routingCtx?.message,
+      result,
+      businessProfile: routingCtx?.businessProfile,
+    });
     console.warn("[group_reply_safety_scrubbed]", {
       ...(flowId ? { flowId } : {}),
       messagePreview: String(routingCtx?.message ?? "").slice(0, 160) || null,
       originalReplyPreview: t.slice(0, 160),
     });
+    console.warn("[group_private_detail_prompt_blocked]", {
+      ...(flowId ? { traceId: flowId } : {}),
+      bookingId: result?.messageMeta?.bookingId ?? null,
+      groupName: routingCtx?.groupName ?? null,
+      chatKey: routingCtx?.chatKey ?? null,
+      stage: result?.messageMeta?.stage ?? result?.messageMeta?.approvalStage ?? null,
+      route: result?.type ?? null,
+      originalReplyPreview: t.slice(0, 160),
+      replacementReplyPreview: replacement,
+      reason: "PRIVATE_DETAIL_PROMPT_IN_GROUP",
+      isGroupInbound: routingCtx?.isGroupInbound === true,
+      isGroupMessage: routingCtx?.isGroupMessage === true || routingCtx?.isGroupInbound === true,
+    });
+    console.warn("[group_private_detail_prompt_blocked_final]", {
+      originalFinalTextPreview: t.slice(0, 160),
+      replacementTextPreview: replacement.slice(0, 160),
+      containsPhonePattern: diagnostics.containsPhonePattern,
+      containsContactConfirmation: diagnostics.containsContactConfirmation,
+      isGroupMessage: routingCtx?.isGroupMessage === true || routingCtx?.isGroupInbound === true,
+      isGroupInbound: routingCtx?.isGroupInbound === true,
+      replyMode: plan?.replyMode ?? null,
+      sendVia: plan?.sendVia ?? null,
+    });
     console.warn("[GROUP_SAFETY]", {
       ...(flowId ? { flowId } : {}),
       action: "scrubbed",
-      reason: "BLOCKED_GROUP_LOGISTICS_OR_CONFIRMATION_COPY",
+      reason: "BLOCKED_GROUP_PRIVATE_DETAIL_PROMPT",
     });
-    return "Request owner ko bhej di hai. Main details private chat mein le leta hun.";
+    return replacement;
   };
 
   const plan = planGroupHybridDelivery({
@@ -1967,10 +3766,32 @@ function applyHybridOutboundResult(result, routingCtx, aiStructuredMode) {
     plan.fallbackReply != null && String(plan.fallbackReply).trim() !== ""
       ? String(plan.fallbackReply).trim()
       : result.reply;
+  const hasGroupContext = Boolean(
+    routingCtx?.isGroupInbound === true ||
+      routingCtx?.isGroupMessage === true ||
+      String(routingCtx?.whatsappRecipientType ?? "").toLowerCase() === "group" ||
+      String(routingCtx?.groupName ?? "").trim() ||
+      String(routingCtx?.chatKey ?? routingCtx?.playwrightChatKey ?? "").trim()
+  );
+  const isGroupOutbound = Boolean(
+    hasGroupContext &&
+      (plan.replyMode === "GROUP" ||
+        String(routingCtx?.whatsappRecipientType ?? "").toLowerCase() === "group" ||
+        (plan.sendVia === "PLAYWRIGHT" && routingCtx?.isGroupInbound === true))
+  );
   const replyFinal =
     isGroupOutbound ? scrubGroupReply(replyMerged) : replyMerged;
+  const sessionKeyForOutbound = String(routingCtx?.emilySessionKey ?? "").trim();
+  const finalReplySourceForTrace = String(
+    result?.messageMeta?.outboundTrace?.finalReplySource ??
+      routingCtx?.outboundFinalReplySource ??
+      ""
+  ).trim();
 
-  if (plan.sendVia === "NONE") {
+  if (
+    plan.sendVia === "NONE" ||
+    String(result?.sendVia ?? "").trim().toUpperCase() === "NONE"
+  ) {
     console.log("[OUTBOUND_SEND]", {
       ...(flowId ? { flowId } : {}),
       sendVia: "NONE",
@@ -1984,6 +3805,19 @@ function applyHybridOutboundResult(result, routingCtx, aiStructuredMode) {
       dmRecipientPhone: undefined,
       replyMode: plan.replyMode ?? undefined,
     };
+  }
+  if (sessionKeyForOutbound && String(replyFinal ?? "").trim()) {
+    const outboundTrace = deriveOutboundTraceFromMessageMeta(
+      result?.messageMeta,
+      finalReplySourceForTrace || null
+    );
+    recordLastAssistantOutbound(getEmilySessionState(sessionKeyForOutbound), outboundTrace);
+    console.log("[assistant_outbound_context_recorded]", {
+      sessionKey: sessionKeyForOutbound,
+      kind: outboundTrace.kind,
+      finalReplySource: outboundTrace.finalReplySource,
+      routeType: outboundTrace.routeType,
+    });
   }
   console.log("[OUTBOUND_SEND]", {
     ...(flowId ? { flowId } : {}),
@@ -2046,6 +3880,102 @@ function selectLatestInboundForAi(rawMessage) {
     .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
     .map((m) => m.text.replace(/^\[.*?\]\s*/, ""))
     .join(" | ");
+}
+
+/**
+ * Last non-empty segment from buffer-style merged inbound (`a | b`), else full text.
+ * Used only for collect_duration availability guard so a prior "…available…" segment
+ * does not false-positive on the latest bare item token (e.g. "stonic?").
+ * @param {unknown} message
+ */
+function getLatestUserSegmentForGuard(message) {
+  const raw = String(message ?? "").trim();
+  if (!raw) return "";
+  const segments = raw.split(/\s*\|\s*/).map((s) => s.trim()).filter(Boolean);
+  return segments.length > 0 ? segments[segments.length - 1] : raw;
+}
+
+/** Strip `[Sender] body` prefix used in Playwright group lines (collect_duration path only). */
+function stripPlaywrightBracketSenderPrefix(text) {
+  return String(text ?? "").replace(/^\[[^\]]+\]\s*/, "").trim();
+}
+
+/**
+ * Bare catalog token for collect_duration resolver only: trim, collapse spaces, strip trailing
+ * punctuation (ASCII + Arabic/comma/fullwidth marks). No business-specific tokens.
+ * @param {unknown} segment
+ */
+function normalizeBareCatalogSelectionQuery(segment) {
+  let s = stripPlaywrightBracketSenderPrefix(String(segment ?? "").replace(/\s+/g, " ").trim());
+  if (!s) return "";
+  const trailingPunct = /[\s\u00a0\u200c\u200d\uFEFF]*(?:[!?.…,;:،؛'"()[\]{}]|؟|｡|。|，|．|・|？|！)+$/gu;
+  let guard = 0;
+  let prev;
+  do {
+    prev = s;
+    s = s.replace(trailingPunct, "").trim();
+    guard += 1;
+  } while (s !== prev && guard < 24);
+  return s;
+}
+
+/**
+ * Resolver input for collect_duration verified selection: latest `|`-segment, bracket prefix,
+ * then bare-token punctuation normalization (not the merged multi-segment string).
+ * @param {unknown} message
+ */
+function computeCollectDurationCatalogQuery(message) {
+  const latest = getLatestUserSegmentForGuard(message);
+  return normalizeBareCatalogSelectionQuery(latest);
+}
+
+/**
+ * Availability-as-question for collect_duration guard only (latest segment + detectIntent).
+ * Intentionally does not reuse global classifier/intent merged across buffer segments.
+ * @param {unknown} message
+ */
+function isAvailabilityQuestionForCollectDurationGuard(message) {
+  const latest = getLatestUserSegmentForGuard(message);
+  if (!latest) return false;
+  return (
+    detectIntent(latest) === "availability" ||
+    /\b(avail|available|availability)\b/i.test(latest)
+  );
+}
+
+/**
+ * Bare catalog token turn (no price/color/photo/detail question) — used to avoid model-template
+ * composer fallback after an options / specific-option assistant prompt.
+ */
+function isBareCatalogSelectionMessageShapeForComposer(message) {
+  const latest = getLatestUserSegmentForGuard(message);
+  if (!String(latest ?? "").trim()) return false;
+  const q = computeCollectDurationCatalogQuery(message);
+  if (q.length < 2 || q.length > 48) return false;
+  if (isExplicitPricingOrDetailsQuestion(message)) return false;
+  if (isExplicitPricingOrDetailsQuestion(latest)) return false;
+  if (detectShowImagesRequest(message)) return false;
+  if (isInformationalItemQuestion(latest)) return false;
+  if (isAvailabilityQuestionForCollectDurationGuard(message)) return false;
+  if (isSpecificInformationalItemSelectionQuestion(latest)) return false;
+  return true;
+}
+
+/**
+ * Booking FSM customer replies: tone guard + polish, then force single line for WA Web compose
+ * (embedded newlines can send as separate bubbles).
+ * @param {unknown} text
+ */
+function finalizeBookingFsmCustomerReply(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return "";
+  const guarded = applyToneGuard(raw);
+  const polished = polishWhatsAppBusinessTone(String(guarded ?? ""));
+  return String(polished ?? guarded ?? raw)
+    .replace(/\r\n/g, "\n")
+    .replace(/\n+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 /** Max User/Assistant lines embedded into the model user payload (small window). */
@@ -2415,7 +4345,450 @@ function isBrowseOptionsIntent(message) {
  */
 function isBareDurationMessage(message) {
   const raw = String(message ?? "").trim();
-  return /^(\d+)(?:\s*(?:day|days|din|dino|hour|hours|hr|hrs)(?:\s+\S+){0,3})?$/i.test(raw);
+  return /^(\d+)(?:\s*(?:day|days|din|dino|hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey)(?:\s+\S+){0,3})?$/i.test(raw);
+}
+
+/**
+ * Bare multi-day rent quote field (e.g. "3 day rent?", "3 din ka rent?").
+ * @param {unknown} message
+ * @returns {"price_with_duration" | null}
+ */
+function resolveItemlessPriceDurationAskedField(message) {
+  const field = detectAskedField(message);
+  if (field === "price_with_duration") return "price_with_duration";
+  const dur = parseUserDuration(message);
+  const hasDuration =
+    dur != null && Number.isFinite(Number(dur.normalizedDays));
+  if (
+    hasDuration &&
+    isBareDurationMessage(message) &&
+    field === "price_daily" &&
+    /\b(rent|rate|kiraya|kiraye|kitna|kitni|kitne|price)\b/i.test(String(message ?? ""))
+  ) {
+    return "price_with_duration";
+  }
+  return null;
+}
+
+/**
+ * Itemless duration + rent/price quote (e.g. "3 day rent?") — informational, not booking slot-fill.
+ * @param {unknown} message
+ * @param {unknown[]} catalogItems
+ */
+function isItemlessPriceDurationFollowup(message, catalogItems) {
+  if (!isBareDurationMessage(message)) return false;
+  if (!resolveItemlessPriceDurationAskedField(message)) return false;
+  if (!isExplicitPricingOrDetailsQuestion(message)) return false;
+  if (hasStrongBookingCommitPhrase(message)) return false;
+  if (hasExplicitNewItemMention(message, catalogItems, null).found) return false;
+  return true;
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} memory
+ */
+function memoryStageBlocksPriceDurationFollowup(memory) {
+  const stage = String(memory?.stage ?? "").trim().toLowerCase();
+  if (stage === "confirmed") return true;
+  if (/^(?:browsing|browse|options?|select_item|item_selection)$/i.test(stage)) return true;
+  return false;
+}
+
+/**
+ * @param {string[]} recentAssistantReplies
+ * @param {Record<string, unknown> | null | undefined} item
+ */
+function verifiedCatalogAnswerExpiryIso(nowMs = Date.now()) {
+  return new Date(nowMs + LAST_VERIFIED_CATALOG_ANSWER_TTL_MS).toISOString();
+}
+
+/**
+ * @param {unknown} field
+ */
+function normalizeVerifiedCatalogPricingRequestedField(field) {
+  const f = String(field ?? "").trim().toLowerCase();
+  if (f === "price_daily" || f === "price_monthly") return f;
+  if (f === "price_with_duration") return "price_with_duration";
+  if (f === "price" || /\bprice\b/.test(f)) return "price";
+  return f || "price";
+}
+
+/**
+ * @param {{
+ *   composedAnswer: Record<string, unknown> | null | undefined,
+ *   composerItem: Record<string, unknown> | null | undefined,
+ *   conversationRoute?: { routeType?: string } | null,
+ * }} p
+ */
+function shouldStoreLastVerifiedCatalogAnswer(p) {
+  const composedAnswer = p.composedAnswer;
+  const composerItem = p.composerItem;
+  if (!composedAnswer || composedAnswer.finalAuthority !== true) return false;
+  if (composedAnswer.answerKnown !== true) return false;
+  const source = String(composedAnswer.source ?? "").trim();
+  if (!TRUSTED_VERIFIED_CATALOG_ANSWER_SOURCES.has(source)) return false;
+  const field = String(composedAnswer.field ?? "").trim().toLowerCase();
+  if (!VERIFIED_CATALOG_PRICING_REQUESTED_FIELDS.has(field)) return false;
+  if (composedAnswer.unknownHumanized === true) return false;
+  if (composedAnswer.fieldMismatchBlocked === true) return false;
+  const itemId = normalizeId(composerItem?.itemId ?? composerItem?.id);
+  if (!itemId) return false;
+  if (p.conversationRoute && !isInformationalRoute(p.conversationRoute)) return false;
+  const reply = String(composedAnswer.reply ?? "").trim();
+  if (!reply) return false;
+  if (assistantReplySignalsCatalogSelectionPrompt(reply)) return false;
+  if (/\b(kis option|which option|kaunsa option|kaun si option)\b/i.test(reply)) {
+    return false;
+  }
+  if (/\brate confirm kar\b/i.test(reply)) return false;
+  return true;
+}
+
+/**
+ * @param {{
+ *   memory: Record<string, unknown>,
+ *   item: Record<string, unknown>,
+ *   composedAnswer: Record<string, unknown>,
+ *   requestedField?: string | null,
+ *   participantKey?: string | null,
+ *   chatContextKey?: string | null,
+ *   sessionKey?: string | null,
+ *   traceId?: string | null,
+ *   nowMs?: number,
+ * }} p
+ */
+function storeLastVerifiedCatalogAnswer(p) {
+  const memory = p.memory;
+  if (!memory || typeof memory !== "object") return null;
+  const itemId = normalizeId(p.item?.itemId ?? p.item?.id);
+  if (!itemId) return null;
+  const itemDisplayLabel =
+    buildDisplayLabel(p.item) ||
+    String(p.item?.displayLabel ?? p.item?.name ?? "").trim() ||
+    null;
+  const nowMs = Number.isFinite(p.nowMs) ? Number(p.nowMs) : Date.now();
+  const requestedField = normalizeVerifiedCatalogPricingRequestedField(
+    p.requestedField ?? p.composedAnswer?.field
+  );
+  const ctx = {
+    itemId,
+    itemDisplayLabel,
+    answerType: VERIFIED_CATALOG_PRICING_ANSWER_TYPE,
+    requestedField,
+    source: "verified_catalog",
+    participantKey: String(p.participantKey ?? "").trim() || null,
+    chatContextKey: String(p.chatContextKey ?? "").trim() || null,
+    sessionKey: String(p.sessionKey ?? "").trim() || null,
+    createdAt: pendingActionNowIso(nowMs),
+    expiresAt: verifiedCatalogAnswerExpiryIso(nowMs),
+  };
+  memory.lastVerifiedCatalogAnswer = ctx;
+  console.log("[verified_catalog_answer_context_stored]", {
+    traceId: String(p.traceId ?? "").trim() || null,
+    itemId,
+    itemDisplayLabel,
+    answerType: ctx.answerType,
+    requestedField: ctx.requestedField,
+    source: ctx.source,
+    participantKey: ctx.participantKey,
+    chatContextKey: ctx.chatContextKey,
+    sessionKey: ctx.sessionKey,
+    expiresAt: ctx.expiresAt,
+  });
+  return ctx;
+}
+
+/**
+ * @param {{
+ *   memory?: Record<string, unknown> | null,
+ *   message: unknown,
+ *   catalogItems: unknown[],
+ *   participantKey?: string | null,
+ *   chatContextKey?: string | null,
+ *   sessionKey?: string | null,
+ *   traceId?: string | null,
+ *   nowMs?: number,
+ * }} p
+ */
+function resolveLastVerifiedCatalogAnswerForPriceFollowup(p) {
+  const memory = p.memory && typeof p.memory === "object" ? p.memory : null;
+  const ctx =
+    memory?.lastVerifiedCatalogAnswer &&
+    typeof memory.lastVerifiedCatalogAnswer === "object"
+      ? memory.lastVerifiedCatalogAnswer
+      : null;
+  const logReject = (reason, extra = {}) => {
+    console.log("[price_duration_followup_context_rejected]", {
+      traceId: String(p.traceId ?? "").trim() || null,
+      reason,
+      ...extra,
+    });
+    return { ok: false, reason, itemId: null, item: null };
+  };
+  if (!resolveItemlessPriceDurationAskedField(p.message)) {
+    return logReject("NOT_PRICE_DURATION_FOLLOWUP");
+  }
+  if (!ctx) {
+    return logReject("NO_LAST_VERIFIED_CATALOG_ANSWER");
+  }
+  const nowMs = Number.isFinite(p.nowMs) ? Number(p.nowMs) : Date.now();
+  const expiresMs = Date.parse(String(ctx.expiresAt ?? ""));
+  if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) {
+    return logReject("LAST_VERIFIED_CATALOG_ANSWER_EXPIRED", {
+      expiresAt: ctx.expiresAt ?? null,
+    });
+  }
+  const source = String(ctx.source ?? "").trim();
+  if (!TRUSTED_VERIFIED_CATALOG_ANSWER_SOURCES.has(source)) {
+    return logReject("UNTRUSTED_SOURCE", { source });
+  }
+  if (String(ctx.answerType ?? "").trim() !== VERIFIED_CATALOG_PRICING_ANSWER_TYPE) {
+    return logReject("AMBIGUOUS_CONTEXT", { answerType: ctx.answerType ?? null });
+  }
+  const storedField = String(ctx.requestedField ?? "").trim().toLowerCase();
+  if (!VERIFIED_CATALOG_PRICING_REQUESTED_FIELDS.has(storedField)) {
+    return logReject("AMBIGUOUS_CONTEXT", { requestedField: storedField || null });
+  }
+  const currentParticipantKey = String(p.participantKey ?? "").trim();
+  const storedParticipantKey = String(ctx.participantKey ?? "").trim();
+  if (storedParticipantKey && currentParticipantKey && storedParticipantKey !== currentParticipantKey) {
+    return logReject("PARTICIPANT_MISMATCH", {
+      participantKey: currentParticipantKey,
+      storedParticipantKey,
+    });
+  }
+  const currentSessionKey = String(p.sessionKey ?? "").trim();
+  const storedSessionKey = String(ctx.sessionKey ?? "").trim();
+  if (storedSessionKey && currentSessionKey && storedSessionKey !== currentSessionKey) {
+    return logReject("SESSION_MISMATCH", {
+      sessionKey: currentSessionKey,
+      storedSessionKey,
+    });
+  }
+  const currentChatContextKey = String(p.chatContextKey ?? "").trim();
+  const storedChatContextKey = String(ctx.chatContextKey ?? "").trim();
+  if (
+    storedChatContextKey &&
+    currentChatContextKey &&
+    storedChatContextKey !== currentChatContextKey
+  ) {
+    return logReject("SESSION_MISMATCH", {
+      chatContextKey: currentChatContextKey,
+      storedChatContextKey,
+    });
+  }
+  const itemId = normalizeId(ctx.itemId);
+  if (!itemId) {
+    return logReject("NO_LAST_VERIFIED_CATALOG_ANSWER");
+  }
+  const explicitNew = hasExplicitNewItemMention(p.message, p.catalogItems, itemId);
+  if (explicitNew.found) {
+    return logReject("EXPLICIT_NEW_ITEM_PRESENT", {
+      itemId: explicitNew.itemId,
+      itemLabel: explicitNew.itemLabel,
+    });
+  }
+  const catalogItems = Array.isArray(p.catalogItems) ? p.catalogItems : [];
+  const catalogRow = catalogItems.find(
+    (row) =>
+      row &&
+      typeof row === "object" &&
+      !Array.isArray(row) &&
+      normalizeId(/** @type {Record<string, unknown>} */ (row).id) === itemId
+  );
+  if (!catalogRow || typeof catalogRow !== "object" || Array.isArray(catalogRow)) {
+    return logReject("ITEM_NOT_IN_CATALOG", { itemId });
+  }
+  const row = /** @type {Record<string, unknown>} */ (catalogRow);
+  const item = {
+    ...row,
+    id: itemId,
+    itemId,
+    displayLabel:
+      String(ctx.itemDisplayLabel ?? "").trim() ||
+      buildDisplayLabel(row) ||
+      String(row.name ?? "").trim() ||
+      null,
+    name: String(row.name ?? ctx.itemDisplayLabel ?? "").trim() || null,
+  };
+  return { ok: true, reason: "LAST_VERIFIED_CATALOG_ANSWER", itemId, item, ctx };
+}
+
+function recentAssistantVerifiedPriceAnswerForItem(recentAssistantReplies, item) {
+  const itemTokens = new Set();
+  for (const part of [item?.displayLabel, item?.name]) {
+    const norm = normalizeForContextMatch(part);
+    for (const token of norm.split(/\s+/)) {
+      if (token.length >= 4) itemTokens.add(token);
+    }
+  }
+  const priceCue =
+    /\b(per\s*day|per\s*month|pkr|\/day|daily|monthly|rent|rate|kiraya)\b/i;
+  const replies = Array.isArray(recentAssistantReplies)
+    ? recentAssistantReplies.slice(0, 4)
+    : [];
+  return replies.some((reply) => {
+    const text = String(reply ?? "");
+    if (!priceCue.test(text)) return false;
+    if (itemTokens.size === 0) return true;
+    const norm = normalizeForContextMatch(text);
+    return [...itemTokens].some((token) => norm.includes(token));
+  });
+}
+
+/**
+ * @param {{
+ *   memory?: Record<string, unknown> | null,
+ *   recentAssistantReplies?: string[],
+ *   message?: unknown,
+ *   catalogItems?: unknown[],
+ *   participantKey?: string | null,
+ *   chatContextKey?: string | null,
+ *   sessionKey?: string | null,
+ *   traceId?: string | null,
+ * }} p
+ */
+function hasSafePreviousCatalogItemForPriceFollowup(p) {
+  const memory = p.memory && typeof p.memory === "object" ? p.memory : null;
+  if (memoryStageBlocksPriceDurationFollowup(memory)) {
+    return {
+      ok: false,
+      reason: "STAGE_BLOCKED",
+      itemId: normalizeId(memory?.lastItem?.id) || null,
+      item: null,
+      proofSource: null,
+    };
+  }
+  if (memory?.pendingAction) {
+    return {
+      ok: false,
+      reason: "PENDING_ACTION_ACTIVE",
+      itemId: normalizeId(memory?.lastItem?.id) || null,
+      item: null,
+      proofSource: null,
+    };
+  }
+  const structured = resolveLastVerifiedCatalogAnswerForPriceFollowup({
+    memory,
+    message: p.message,
+    catalogItems: p.catalogItems ?? [],
+    participantKey: p.participantKey,
+    chatContextKey: p.chatContextKey,
+    sessionKey: p.sessionKey,
+    traceId: p.traceId,
+  });
+  if (structured.ok) {
+    return {
+      ok: true,
+      reason: "LAST_VERIFIED_CATALOG_ANSWER",
+      itemId: structured.itemId,
+      item: structured.item,
+      proofSource: "LAST_VERIFIED_CATALOG_ANSWER",
+    };
+  }
+  const structuredRejectReason = structured.reason;
+  if (
+    structuredRejectReason &&
+    structuredRejectReason !== "NO_LAST_VERIFIED_CATALOG_ANSWER"
+  ) {
+    return {
+      ok: false,
+      reason: structuredRejectReason,
+      itemId: null,
+      item: null,
+      proofSource: null,
+    };
+  }
+  const itemId =
+    normalizeId(memory?.lastItem?.id) || normalizeId(memory?.lastResolvedItemId);
+  if (!itemId) {
+    return { ok: false, reason: "NO_ITEM_ID", itemId: null, item: null, proofSource: null };
+  }
+  const item =
+    memory?.lastItem && typeof memory.lastItem === "object"
+      ? memory.lastItem
+      : { id: itemId };
+  const recentAssistantReplies = Array.isArray(p.recentAssistantReplies)
+    ? p.recentAssistantReplies
+    : [];
+  if (!recentAssistantVerifiedPriceAnswerForItem(recentAssistantReplies, item)) {
+    return {
+      ok: false,
+      reason: "NO_RECENT_VERIFIED_PRICE_ANSWER",
+      itemId,
+      item,
+      proofSource: null,
+    };
+  }
+  return {
+    ok: true,
+    reason: "OK",
+    itemId,
+    item,
+    proofSource: "RECENT_ASSISTANT_REPLY",
+  };
+}
+
+/**
+ * @param {{
+ *   message: unknown,
+ *   bareDurationMessage: boolean,
+ *   previousAssistantAskedDuration: boolean,
+ *   durationMemoryCandidate: Record<string, unknown> | null,
+ *   catalogItems: unknown[],
+ *   memory: Record<string, unknown> | null | undefined,
+ *   recentAssistantReplies: string[],
+ *   participantKey?: string | null,
+ *   chatContextKey?: string | null,
+ *   sessionKey?: string | null,
+ *   traceId?: string | null,
+ * }} p
+ */
+function resolveDurationContextPolicy(p) {
+  const bareDurationMessage = p.bareDurationMessage === true;
+  const memoryItemId = normalizeId(p.durationMemoryCandidate?.id);
+  const itemlessPriceDurationFollowup = isItemlessPriceDurationFollowup(
+    p.message,
+    p.catalogItems
+  );
+  const safePrevious = itemlessPriceDurationFollowup
+    ? hasSafePreviousCatalogItemForPriceFollowup({
+        memory: p.memory,
+        recentAssistantReplies: p.recentAssistantReplies,
+        message: p.message,
+        catalogItems: p.catalogItems,
+        participantKey: p.participantKey,
+        chatContextKey: p.chatContextKey,
+        sessionKey: p.sessionKey,
+        traceId: p.traceId,
+      })
+    : { ok: false, reason: null, proofSource: null, item: null, itemId: null };
+  const priceDurationFollowupWithSafeItem =
+    itemlessPriceDurationFollowup && safePrevious.ok === true;
+  const durationContextAllowed =
+    !bareDurationMessage ||
+    (p.previousAssistantAskedDuration && memoryItemId != null) ||
+    priceDurationFollowupWithSafeItem;
+  let durationContextReason = "OK";
+  if (!durationContextAllowed) {
+    durationContextReason = !p.previousAssistantAskedDuration
+      ? "PREVIOUS_ASSISTANT_DID_NOT_ASK_DURATION"
+      : "ACTIVE_ITEM_MISSING";
+  } else if (priceDurationFollowupWithSafeItem) {
+    durationContextReason = "PRICE_DURATION_FOLLOWUP_WITH_SAFE_ITEM";
+  }
+  return {
+    durationContextAllowed,
+    durationContextReason,
+    priceDurationFollowupWithSafeItem,
+    itemlessPriceDurationFollowup,
+    safePreviousReason: safePrevious.reason ?? null,
+    safePreviousProofSource: safePrevious.proofSource ?? null,
+    priceFollowupCatalogItem:
+      priceDurationFollowupWithSafeItem && safePrevious.item
+        ? safePrevious.item
+        : null,
+  };
 }
 
 /**
@@ -2484,18 +4857,14 @@ function formatCatalogOptionLine(item) {
   return price ? `- ${label} - ${price}` : `- ${label}`;
 }
 
-function buildBrowseOptionsReply(items, style, options = {}) {
-  const actuallyAvailable = options?.actuallyAvailable !== false;
+function buildBrowseOptionsReply(items, style) {
   if (!Array.isArray(items) || items.length === 0) {
     return style === "casual_local"
       ? "Abhi koi aur available option nazar nahi aa raha. Aap koi specific option poochna chahenge?"
       : "I don't see another available option right now. Would you like to ask about a specific option?";
   }
-  const heading = actuallyAvailable
-    ? "Available options:"
-    : style === "casual_local"
-      ? "Hamari list mein ye options hain:"
-      : "Listed options:";
+  const heading =
+    style === "casual_local" ? "Available options:" : "Available options:";
   const ask =
     style === "casual_local"
       ? "Konsa option dekhna chahenge?"
@@ -2553,11 +4922,161 @@ function isRoutableDmTarget(value) {
 }
 
 /**
+ * Generic “when will something be available again?” without naming a catalog row in the message.
+ * Used to block stale {@link nextChatContext.lastFocusedItem} scoped-follow-up binding.
  * @param {unknown} message
- * @param {unknown[]} catalogItems
- * @param {string | null | undefined} lockedItemId
- * @returns {{ found: boolean, itemId: string | null, itemLabel: string | null }}
  */
+function messageLooksLikeGenericAvailabilityTimingFollowup(message) {
+  const text = String(message ?? "").trim().toLowerCase();
+  if (!text) return false;
+  const timing =
+    /\b(kb\s+tk|kab\s+tak|kab|when|how\s+long|kitne\s+din)\b/i.test(text);
+  const availabilityCue =
+    /\b(available|avail)\b/i.test(text) ||
+    /\b(mil\s+jaye|mil\s+jayegi|ho\s+jaye|ho\s+jayegi|ho\s+jye(?:gi|ge)?|hogi|hoga)\b/i.test(text);
+  return Boolean(timing && availabilityCue);
+}
+
+const STRUCTURED_NO_OTHER_OPTIONS_UR_RE =
+  /\bfilhaal\s+koi\s+aur\s+option\s+bhi\s+available\s+nahi\s+hai\b/i;
+const STRUCTURED_NO_OTHER_OPTIONS_EN_RE =
+  /\b(i\s+)?don'?t\s+see\s+any\s+other\s+available\s+options\b/i;
+
+/**
+ * Recent assistant line matched structured “no other verified options” copy (Urdu/English).
+ * @param {string | null | undefined} conversationHistory
+ * @param {string} userId
+ * @param {string} sessionKey
+ */
+function recentAssistantStructuredNoOtherOptionsReply(
+  conversationHistory,
+  userId,
+  sessionKey
+) {
+  const fromBlock = extractRecentAssistantTextsFromPromptBlock(conversationHistory, 5);
+  const fromMem = getRecentAssistantReplies(userId, 5, sessionKey);
+  const merged = mergeAssistantReplyListsForNorm(fromBlock, fromMem, 10);
+  return merged.some((t) => {
+    const s = String(t ?? "");
+    return (
+      STRUCTURED_NO_OTHER_OPTIONS_UR_RE.test(s) || STRUCTURED_NO_OTHER_OPTIONS_EN_RE.test(s)
+    );
+  });
+}
+
+function markAvailabilityFreshNoOtherOptionsStructured(memory) {
+  if (!memory || typeof memory !== "object") return;
+  memory.availabilityFreshNoOtherOptionsAt = Date.now();
+}
+
+function clearAvailabilityFreshNoOtherOptionsStructured(memory) {
+  if (!memory || typeof memory !== "object") return;
+  delete memory.availabilityFreshNoOtherOptionsAt;
+}
+
+const AVAILABILITY_NO_OPTIONS_FLAG_TTL_MS = 48 * 60 * 60 * 1000;
+
+function isAvailabilityFreshNoOtherOptionsActive(memory) {
+  const mem = memory && typeof memory === "object" ? memory : null;
+  return (
+    mem != null &&
+    Number.isFinite(Number(mem.availabilityFreshNoOtherOptionsAt)) &&
+    Date.now() - Number(mem.availabilityFreshNoOtherOptionsAt) < AVAILABILITY_NO_OPTIONS_FLAG_TTL_MS
+  );
+}
+
+/**
+ * “Global no other options” wording for timing-unknown templates (no explicit catalog label in turn).
+ * @param {{
+ *   memory: unknown,
+ *   explicitItemLabel?: string | null,
+ *   conversationHistory: string | null | undefined,
+ *   userId: string,
+ *   sessionKey: string,
+ * }} p
+ */
+function computeAvailabilityTimingGlobalNoOptions(p) {
+  if (String(p.explicitItemLabel ?? "").trim()) return false;
+  const mem = p.memory && typeof p.memory === "object" ? p.memory : null;
+  if (Boolean(mem?.browseAllUnavailableFresh)) return true;
+  if (isAvailabilityFreshNoOtherOptionsActive(mem)) return true;
+  return recentAssistantStructuredNoOtherOptionsReply(
+    p.conversationHistory,
+    String(p.userId ?? "").trim(),
+    String(p.sessionKey ?? "").trim()
+  );
+}
+
+/**
+ * After verified “no other options” structured reply, timing follow-ups should not
+ * re-open alternative suggestions via stock-check templates or general AI.
+ * @param {{
+ *   message: unknown,
+ *   memory: unknown,
+ *   prioritizedIntent: unknown,
+ *   llmIntentClassification: unknown,
+ *   conversationHistory: string | null | undefined,
+ *   userId: string,
+ *   sessionKey: string,
+ * }} p
+ */
+function shouldRouteAvailabilityTimingUnknownAfterNoOptionsContext(p) {
+  const timing =
+    messageLooksLikeGenericAvailabilityTimingFollowup(p.message) ||
+    intentReasonSuggestsAvailabilityTimeframe(
+      /** @type {{ reason?: string }} */ (p.prioritizedIntent)?.reason
+    ) ||
+    intentReasonSuggestsAvailabilityTimeframe(
+      /** @type {{ reason?: string }} */ (p.llmIntentClassification)?.reason
+    );
+  if (!timing) return false;
+  const mem = p.memory && typeof p.memory === "object" ? p.memory : null;
+  if (Boolean(mem?.browseAllUnavailableFresh)) return true;
+  if (isAvailabilityFreshNoOtherOptionsActive(mem)) return true;
+  return recentAssistantStructuredNoOtherOptionsReply(
+    p.conversationHistory,
+    String(p.userId ?? "").trim(),
+    String(p.sessionKey ?? "").trim()
+  );
+}
+
+/**
+ * Clears participant-scoped lastFocusedItem after a verified global zero-availability reply.
+ * @param {{
+ *   chatContextKey: string,
+ *   nextChatContext: { lastFocusedItem?: unknown },
+ *   source: string,
+ *   availableCount: number,
+ *   summaryStatus: string,
+ *   reason: string,
+ * }} p
+ */
+function clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptions({
+  chatContextKey,
+  nextChatContext,
+  source,
+  availableCount,
+  summaryStatus,
+  reason,
+} = {}) {
+  if (!chatContextKey || !nextChatContext || typeof nextChatContext !== "object") return;
+  if (String(summaryStatus ?? "").trim().toLowerCase() !== "fresh") return;
+  if (!Number.isFinite(Number(availableCount)) || Number(availableCount) !== 0) return;
+  const prev = String(nextChatContext.lastFocusedItem ?? "").trim();
+  if (!prev) return;
+  nextChatContext.lastFocusedItem = null;
+  if (globalThis.__chatContext && typeof globalThis.__chatContext === "object") {
+    globalThis.__chatContext[chatContextKey] = nextChatContext;
+  }
+  console.log("[no_options_focus_cleared]", {
+    previousLastFocusedItem: prev,
+    source,
+    availableCount,
+    summaryStatus,
+    reason,
+  });
+}
+
 function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
   const msg = normalizeCatalogMatchText(message);
   const lockedId = normalizeId(lockedItemId);
@@ -2582,6 +5101,199 @@ function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
     }
   }
   return { found: false, itemId: null, itemLabel: null };
+}
+
+/**
+ * LLM intent `reason` (English) often distinguishes timeframe vs stock check.
+ * @param {unknown} reasonRaw
+ */
+function intentReasonSuggestsAvailabilityTimeframe(reasonRaw) {
+  const r = String(reasonRaw ?? "").toLowerCase();
+  if (!r) return false;
+  if (/\btimeframe\b/.test(r) || /\btiming\b/.test(r)) return true;
+  if (
+    r.includes("availability") &&
+    (/\bwhen\b/.test(r) || /\bhow long\b/.test(r) || /\btime\b/.test(r))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @param {{ itemContext: unknown, resolvedItem: unknown, memory: unknown, safeItem: unknown }} p
+ * @returns {"none"|"memory_fallback"|"current_turn_resolved"|"current_turn_verified"|"unknown"}
+ */
+function resolveSafeItemSource({ itemContext, resolvedItem, memory, safeItem } = {}) {
+  if (!safeItem || typeof safeItem !== "object") return "none";
+  const sid = normalizeId(safeItem.itemId ?? safeItem.id);
+  if (!sid) return "unknown";
+  if (itemContext != null && typeof itemContext === "object") {
+    const ic = normalizeId(itemContext.itemId ?? itemContext.id);
+    if (ic && ic === sid) return "current_turn_verified";
+  }
+  if (resolvedItem != null && typeof resolvedItem === "object") {
+    const rid = normalizeId(resolvedItem.itemId ?? resolvedItem.id);
+    if (rid && rid === sid) return "current_turn_resolved";
+  }
+  const mem = memory?.lastItem && typeof memory.lastItem === "object" ? memory.lastItem : null;
+  if (mem) {
+    const mid = normalizeId(mem.itemId ?? mem.id);
+    if (mid && mid === sid) return "memory_fallback";
+  }
+  return "unknown";
+}
+
+/**
+ * @param {{ style: string, explicitItemLabel?: string | null }} p
+ */
+function buildAvailabilityTimingUnknownReply({
+  style,
+  explicitItemLabel,
+  globalNoOptions = false,
+} = {}) {
+  const isUr = style === "casual_local";
+  const label = String(explicitItemLabel ?? "").trim();
+  if (label) {
+    return isUr
+      ? `${label} ki exact availability abhi confirm nahi hai. Jaise hi available hogi, main update kar dunga.`
+      : `We can’t confirm exact availability for ${label} right now. I’ll update you as soon as it’s available.`;
+  }
+  if (globalNoOptions) {
+    return isUr
+      ? "Exact time abhi confirm nahi hai. Jaise hi koi option available hogi, main update kar dunga."
+      : "We can’t confirm an exact time right now. I’ll update you as soon as any option is available.";
+  }
+  return isUr
+    ? "Exact time abhi confirm nahi hai. Jaise hi available hogi, main update kar dunga."
+    : "We can’t confirm an exact time right now. I’ll update you as soon as it’s available.";
+}
+
+/**
+ * Timing follow-up after verified no-options context (route-order safe; not gated on AI route).
+ * @param {{
+ *   message: unknown,
+ *   memory: unknown,
+ *   prioritizedIntent: unknown,
+ *   llmIntentClassification: unknown,
+ *   conversationHistory: string | null | undefined,
+ *   userId: string,
+ *   sessionKey: string,
+ *   normalizedCatalogForTurn: unknown[],
+ *   emilyTurn: unknown,
+ *   conversationStyle: string,
+ *   safeItemSource: string,
+ *   routeLogSource: string,
+ * }} p
+ * @returns {{ reply: string, replyType: string } | null}
+ */
+function availabilityTimingUnknownTurnIfRouted(p) {
+  if (
+    !shouldRouteAvailabilityTimingUnknownAfterNoOptionsContext({
+      message: p.message,
+      memory: p.memory,
+      prioritizedIntent: p.prioritizedIntent,
+      llmIntentClassification: p.llmIntentClassification,
+      conversationHistory: p.conversationHistory,
+      userId: p.userId,
+      sessionKey: p.sessionKey,
+    })
+  ) {
+    return null;
+  }
+  const explicitHit = hasExplicitNewItemMention(
+    p.message,
+    p.normalizedCatalogForTurn,
+    null
+  );
+  const explicitLabel =
+    (explicitHit.found && explicitHit.itemLabel) ||
+    String(
+      labelFromMatchedItem(
+        /** @type {{ match?: { matchedItem?: unknown } }} */ (p.emilyTurn)?.match
+          ?.matchedItem
+      ) ?? ""
+    ).trim() ||
+    "";
+  const globalNoOptions = computeAvailabilityTimingGlobalNoOptions({
+    memory: p.memory,
+    explicitItemLabel: explicitLabel,
+    conversationHistory: p.conversationHistory,
+    userId: p.userId,
+    sessionKey: p.sessionKey,
+  });
+  const timingReply = buildAvailabilityTimingUnknownReply({
+    style: p.conversationStyle,
+    explicitItemLabel: explicitLabel || null,
+    globalNoOptions,
+  });
+  const replyType = explicitLabel ? "EXPLICIT_ITEM_TIMING_UNKNOWN" : "GENERIC_TIMING_UNKNOWN";
+  console.log("[availability_timing_followup_routed]", {
+    rawTextPreview: String(p.message ?? "").trim().slice(0, 160) || null,
+    classifierReason:
+      String(
+        /** @type {{ reason?: string }} */ (p.llmIntentClassification)?.reason ?? ""
+      ).slice(0, 200) || null,
+    askedField:
+      /** @type {{ askedField?: string }} */ (p.prioritizedIntent)?.askedField ?? null,
+    selectedItemSource: p.safeItemSource,
+    hasExplicitCatalogItem: Boolean(
+      String(
+        labelFromMatchedItem(
+          /** @type {{ match?: { matchedItem?: unknown } }} */ (p.emilyTurn)?.match
+            ?.matchedItem
+        ) ?? ""
+      ).trim() || explicitHit.found
+    ),
+    replyType,
+    source: p.routeLogSource,
+  });
+  return { reply: timingReply, replyType };
+}
+
+/**
+ * @param {object} p
+ */
+function computeAskDurationPhraseEligibility({
+  stage,
+  itemContext,
+  safeItemSource,
+  message,
+  normalizedCatalogForTurn,
+  emilyTurn,
+  prioritizedIntent,
+  llmIntentClassification,
+} = {}) {
+  if (stage !== "availability") {
+    return { eligible: false, reason: "NOT_AVAILABILITY_STAGE" };
+  }
+  if (!itemContext || typeof itemContext !== "object") {
+    return { eligible: false, reason: "MISSING_ITEM_CONTEXT" };
+  }
+  if (itemContext.isAvailable !== true) {
+    return { eligible: false, reason: "ITEM_NOT_AVAILABLE" };
+  }
+  if (safeItemSource === "memory_fallback") {
+    return { eligible: false, reason: "MEMORY_FALLBACK_UNVERIFIED" };
+  }
+  const classifierTime =
+    intentReasonSuggestsAvailabilityTimeframe(prioritizedIntent?.reason) ||
+    intentReasonSuggestsAvailabilityTimeframe(llmIntentClassification?.reason);
+  const genericTimingShape = messageLooksLikeGenericAvailabilityTimingFollowup(message);
+  if (classifierTime || genericTimingShape) {
+    return { eligible: false, reason: "AVAILABILITY_TIMING_OR_TIMEFRAME" };
+  }
+  const explicitCatalogThisTurn =
+    Boolean(String(labelFromMatchedItem(emilyTurn?.match?.matchedItem) ?? "").trim()) ||
+    hasExplicitNewItemMention(message, normalizedCatalogForTurn, null).found;
+  if (
+    !explicitCatalogThisTurn &&
+    safeItemSource !== "current_turn_verified" &&
+    safeItemSource !== "current_turn_resolved"
+  ) {
+    return { eligible: false, reason: "NO_EXPLICIT_ITEM_AND_NO_RESOLVED_SOURCE" };
+  }
+  return { eligible: true, reason: "OK" };
 }
 
 function latestMessageMentionsEntity(message, entityName) {
@@ -2625,111 +5337,7 @@ function detailFieldForEntityGuard(message) {
   return null;
 }
 
-/** @param {string} a @param {string} b */
-function catalogTokenEditDistance(a, b) {
-  const s = String(a ?? "");
-  const t = String(b ?? "");
-  if (s === t) return 0;
-  const m = s.length;
-  const n = t.length;
-  if (m === 0) return n;
-  if (n === 0) return m;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i += 1) dp[i][0] = i;
-  for (let j = 0; j <= n; j += 1) dp[0][j] = j;
-  for (let i = 1; i <= m; i += 1) {
-    for (let j = 1; j <= n; j += 1) {
-      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-    }
-  }
-  return dp[m][n];
-}
-
-/** @param {string} a @param {string} b */
-function catalogTokensLikelyTypo(msgToken, catalogToken) {
-  if (msgToken === catalogToken) return true;
-  if (msgToken.length < 4 || catalogToken.length < 4) return false;
-  const dist = catalogTokenEditDistance(msgToken, catalogToken);
-  if (dist === 1) return true;
-  if (dist === 2) {
-    const maxLen = Math.max(msgToken.length, catalogToken.length);
-    let prefix = 0;
-    for (let i = 0; i < Math.min(msgToken.length, catalogToken.length); i += 1) {
-      if (msgToken[i] !== catalogToken[i]) break;
-      prefix += 1;
-    }
-    return maxLen >= 5 && prefix >= 2;
-  }
-  return false;
-}
-
-/**
- * Conservative typo match against catalog item name tokens only (e.g. ciivc → civic).
- * @param {unknown} message
- * @param {unknown[]} catalogItems
- */
-export function findConservativeFuzzyCatalogMention(message, catalogItems = []) {
-  const items = Array.isArray(catalogItems) ? catalogItems : [];
-  const msgTokens = normalizeCatalogMatchText(message)
-    .split(/\s+/)
-    .filter((t) => t.length >= 4);
-  if (!msgTokens.length || !items.length) {
-    return { found: false, ambiguous: false, itemId: null, itemLabel: null, candidates: [] };
-  }
-
-  /** @type {Map<string, { itemId: string, itemLabel: string, token: string }>} */
-  const matchedById = new Map();
-
-  for (const row of items) {
-    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
-    const itemId = normalizeId(row.id);
-    if (!itemId) continue;
-    const itemLabel =
-      buildDisplayLabel(row) || String(row.name ?? row.displayLabel ?? "").trim();
-    const catalogTokens = normalizeCatalogMatchText(row.name ?? itemLabel)
-      .split(/\s+/)
-      .filter((t) => t.length >= 4);
-    for (const msgToken of msgTokens) {
-      for (const catalogToken of catalogTokens) {
-        if (msgToken === catalogToken) {
-          matchedById.set(itemId, { itemId, itemLabel, token: msgToken });
-          continue;
-        }
-        if (catalogTokensLikelyTypo(msgToken, catalogToken)) {
-          matchedById.set(itemId, { itemId, itemLabel, token: msgToken });
-        }
-      }
-    }
-  }
-
-  const candidates = [...matchedById.values()];
-  if (candidates.length === 1) {
-    return {
-      found: true,
-      ambiguous: false,
-      itemId: candidates[0].itemId,
-      itemLabel: candidates[0].itemLabel,
-      candidates,
-    };
-  }
-  if (candidates.length > 1) {
-    return {
-      found: true,
-      ambiguous: true,
-      itemId: null,
-      itemLabel: null,
-      candidates,
-    };
-  }
-  return { found: false, ambiguous: false, itemId: null, itemLabel: null, candidates: [] };
-}
-
-export function shouldSkipEntityExtractionForDetailQuestion(message, catalogItems) {
+function shouldSkipEntityExtractionForDetailQuestion(message, catalogItems) {
   const field = detailFieldForEntityGuard(message);
   if (!field) return { skip: false, field: null };
   const explicitCatalogItem = hasExplicitNewItemMention(
@@ -2737,12 +5345,8 @@ export function shouldSkipEntityExtractionForDetailQuestion(message, catalogItem
     Array.isArray(catalogItems) ? catalogItems : [],
     null
   );
-  const fuzzyCatalogItem = findConservativeFuzzyCatalogMention(message, catalogItems);
-  const hasCatalogItem =
-    explicitCatalogItem.found ||
-    (fuzzyCatalogItem.found && !fuzzyCatalogItem.ambiguous);
   return {
-    skip: !hasCatalogItem,
+    skip: !explicitCatalogItem.found,
     field,
   };
 }
@@ -2819,6 +5423,431 @@ function mergeComposerCatalogItem(item, catalogItems = []) {
   };
 }
 
+function itemHasPricingData(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+  const pricing = item.pricing;
+  if (pricing && typeof pricing === "object" && !Array.isArray(pricing)) {
+    if (Object.values(pricing).some((value) => String(value ?? "").trim() !== "")) {
+      return true;
+    }
+  }
+  const attrs = item.attributes && typeof item.attributes === "object" ? item.attributes : {};
+  const state = item.state && typeof item.state === "object" ? item.state : {};
+  return [
+    item.price,
+    item.pricePerDay,
+    item.dailyRate,
+    item.monthlyRate,
+    item.rent,
+    item.rate,
+    item.perDay,
+    item.perMonth,
+    attrs.price,
+    attrs.rate,
+    attrs.pricePerDay,
+    attrs.dailyRate,
+    state.price,
+    state.pricePerDay,
+  ].some((value) => String(value ?? "").trim() !== "");
+}
+
+function normalizedCatalogEntries(catalogItems = []) {
+  return (Array.isArray(catalogItems) ? catalogItems : [])
+    .filter((row) => row && typeof row === "object" && !Array.isArray(row))
+    .map((row) => {
+      const item = normalizeCatalogItem(/** @type {Record<string, unknown>} */ (row));
+      const id = normalizeId(item.id ?? item.itemId);
+      if (!id) return null;
+      const labels = Array.from(
+        new Set(
+          [
+            item.name,
+            item.displayLabel,
+            buildDisplayLabel(item),
+          ]
+            .map((value) => String(value ?? "").trim())
+            .filter(Boolean)
+        )
+      );
+      return {
+        id,
+        item: { ...item, id, itemId: id },
+        labels,
+        normalizedLabels: labels.map((label) => normalizeCatalogMatchText(label)).filter(Boolean),
+        tokens: Array.from(new Set(labels.flatMap((label) => tokenizeCatalogMatch(label)))),
+      };
+    })
+    .filter(Boolean);
+}
+
+function itemFactValue(item, field) {
+  return String(item?.[field] ?? "").trim();
+}
+
+function itemConditionFacts(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  const condition = itemFactValue(item, "condition");
+  const conditionNote = itemFactValue(item, "conditionNote");
+  if (!condition && !conditionNote) return null;
+  return {
+    ...(condition ? { condition } : {}),
+    ...(conditionNote ? { conditionNote } : {}),
+  };
+}
+
+function profileItemLabels(item) {
+  return Array.from(
+    new Set(
+      [
+        item?.name,
+        item?.displayLabel,
+        item?.normalizedLabel,
+        buildDisplayLabel(item || {}),
+      ]
+        .map((value) => String(value ?? "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function findCatalogEntryForProfileItem(entries, profileItem) {
+  const idCandidates = Array.from(
+    new Set(
+      [normalizeId(profileItem?.id), normalizeId(profileItem?.itemId), normalizeId(profileItem?._id)]
+        .filter(Boolean)
+    )
+  );
+  const idMatches = idCandidates.flatMap((id) => entries.filter((entry) => entry.id === id));
+  if (idMatches.length === 1) {
+    return { status: "matched", entry: idMatches[0], reason: "exact_id" };
+  }
+  if (idMatches.length > 1) {
+    return { status: "ambiguous", matches: idMatches.map((entry) => entry.item), reason: "ambiguous_id" };
+  }
+
+  const labels = profileItemLabels(profileItem);
+  const exactMatches = findExactLabelMatches(entries, labels);
+  if (exactMatches.length === 1) {
+    return { status: "matched", entry: exactMatches[0], reason: "exact_normalized_label" };
+  }
+  if (exactMatches.length > 1) {
+    return {
+      status: "ambiguous",
+      matches: exactMatches.map((entry) => entry.item),
+      reason: "ambiguous_exact_normalized_label",
+    };
+  }
+
+  const normalizedLabels = labels.map((label) => normalizeCatalogMatchText(label)).filter(Boolean);
+  const fuzzyMatches = entries.filter((entry) =>
+    entry.normalizedLabels.some((catalogLabel) =>
+      normalizedLabels.some((profileLabel) => {
+        if (catalogLabel.length < 3 || profileLabel.length < 3) return false;
+        return catalogLabel.includes(profileLabel) || profileLabel.includes(catalogLabel);
+      })
+    )
+  );
+  if (fuzzyMatches.length === 1) {
+    return { status: "matched", entry: fuzzyMatches[0], reason: "unambiguous_normalized_label" };
+  }
+  if (fuzzyMatches.length > 1) {
+    return {
+      status: "ambiguous",
+      matches: fuzzyMatches.map((entry) => entry.item),
+      reason: "ambiguous_normalized_label",
+    };
+  }
+  return { status: "no_match", reason: "no_profile_item_match" };
+}
+
+export function mergeBusinessProfileItemFactsIntoCatalog(catalogItems = [], businessProfile = null) {
+  const rawProfileItems =
+    businessProfile?.rawBusinessProfile &&
+    typeof businessProfile.rawBusinessProfile === "object" &&
+    !Array.isArray(businessProfile.rawBusinessProfile) &&
+    Array.isArray(businessProfile.rawBusinessProfile.items)
+      ? businessProfile.rawBusinessProfile.items
+      : businessProfile?.profileData &&
+          typeof businessProfile.profileData === "object" &&
+          !Array.isArray(businessProfile.profileData) &&
+          Array.isArray(businessProfile.profileData.items)
+        ? businessProfile.profileData.items
+        : [];
+  if (!Array.isArray(rawProfileItems) || rawProfileItems.length === 0) {
+    return catalogItems;
+  }
+  const profileItems = rawProfileItems.filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item) && itemConditionFacts(item)
+  );
+  if (profileItems.length === 0) return catalogItems;
+
+  const entries = normalizedCatalogEntries(catalogItems);
+  const patchesById = new Map();
+  for (const profileItem of profileItems) {
+    const facts = itemConditionFacts(profileItem);
+    if (!facts) continue;
+    const match = findCatalogEntryForProfileItem(entries, profileItem);
+    if (match.status === "matched") {
+      const id = normalizeId(match.entry.item?.id ?? match.entry.item?.itemId);
+      if (!id) continue;
+      patchesById.set(id, { ...(patchesById.get(id) || {}), ...facts });
+      console.log("[catalog_condition_facts_merged]", {
+        itemId: id,
+        itemName: match.entry.item?.name ?? match.entry.item?.displayLabel ?? null,
+        matchReason: match.reason,
+        hasCondition: Boolean(facts.condition),
+        hasConditionNote: Boolean(facts.conditionNote),
+      });
+      continue;
+    }
+    if (match.status === "ambiguous") {
+      console.log("[catalog_condition_facts_merge_ambiguous]", {
+        profileItemName: profileItem?.name ?? profileItem?.displayLabel ?? null,
+        reason: match.reason,
+        candidateCount: match.matches?.length ?? 0,
+        candidateNames: (match.matches || [])
+          .slice(0, 5)
+          .map((item) => item?.name ?? item?.displayLabel ?? null)
+          .filter(Boolean),
+      });
+    }
+  }
+  if (patchesById.size === 0) return catalogItems;
+  return catalogItems.map((item) => {
+    const id = normalizeId(item?.id ?? item?.itemId);
+    const patch = id ? patchesById.get(id) : null;
+    return patch ? { ...item, ...patch } : item;
+  });
+}
+
+function mergeCatalogUpgradeItem(catalogItem, partialItem = null) {
+  const itemId = normalizeId(catalogItem?.id ?? catalogItem?.itemId);
+  const partial =
+    partialItem && typeof partialItem === "object" && !Array.isArray(partialItem)
+      ? partialItem
+      : {};
+  const catalogPricing =
+    catalogItem?.pricing && typeof catalogItem.pricing === "object"
+      ? catalogItem.pricing
+      : undefined;
+  const partialPricing =
+    partial?.pricing && typeof partial.pricing === "object" ? partial.pricing : undefined;
+  const partialPricingHasValues =
+    partialPricing &&
+    Object.values(partialPricing).some((value) => String(value ?? "").trim() !== "");
+  return {
+    ...(catalogItem || {}),
+    ...partial,
+    id: itemId || normalizeId(partial?.id ?? partial?.itemId) || "",
+    itemId: itemId || normalizeId(partial?.id ?? partial?.itemId) || "",
+    name:
+      String(catalogItem?.name ?? "").trim() ||
+      String(partial?.name ?? "").trim() ||
+      String(partial?.displayLabel ?? "").trim(),
+    displayLabel:
+      String(partial?.displayLabel ?? "").trim() ||
+      String(catalogItem?.displayLabel ?? "").trim() ||
+      buildDisplayLabel(catalogItem || {}) ||
+      String(catalogItem?.name ?? partial?.name ?? "").trim(),
+    color: partial?.color ?? partial?.colour ?? catalogItem?.color ?? catalogItem?.colour,
+    colour: partial?.colour ?? partial?.color ?? catalogItem?.colour ?? catalogItem?.color,
+    pricing: partialPricingHasValues ? partialPricing : catalogPricing,
+    attributes:
+      partial?.attributes && typeof partial.attributes === "object"
+        ? { ...(catalogItem?.attributes || {}), ...partial.attributes }
+        : catalogItem?.attributes,
+  };
+}
+
+function findUniqueById(entries, idRaw) {
+  const id = normalizeId(idRaw);
+  if (!id) return null;
+  return entries.find((entry) => entry.id === id) || null;
+}
+
+function findExactLabelMatches(entries, labels = []) {
+  const wanted = new Set(
+    labels
+      .map((label) => normalizeCatalogMatchText(label))
+      .filter((label) => label.length >= 2)
+  );
+  if (wanted.size === 0) return [];
+  return entries.filter((entry) =>
+    entry.normalizedLabels.some((label) => wanted.has(label))
+  );
+}
+
+function scoreCatalogEntryAgainstText(entry, text, { allowTypo = false } = {}) {
+  const msgTokens = tokenizeCatalogMatch(text).filter((token) => token.length >= 3);
+  if (msgTokens.length === 0) return 0;
+  let score = 0;
+  for (const itemToken of entry.tokens) {
+    if (itemToken.length < 3) continue;
+    if (msgTokens.includes(itemToken)) {
+      score += 2;
+      continue;
+    }
+    if (
+      allowTypo &&
+      msgTokens.some((msgToken) => catalogTokensLikelySameWord(msgToken, itemToken))
+    ) {
+      score += 1;
+    }
+  }
+  return score;
+}
+
+function findUnambiguousTextMatch(entries, text, { allowTypo = false } = {}) {
+  const scored = entries
+    .map((entry) => ({
+      entry,
+      score: scoreCatalogEntryAgainstText(entry, text, { allowTypo }),
+    }))
+    .filter((row) => row.score > 0)
+    .sort((a, b) => b.score - a.score);
+  if (scored.length === 0) {
+    return { status: "no_match", reason: allowTypo ? "no_fuzzy_match" : "no_token_match" };
+  }
+  const topScore = scored[0].score;
+  const top = scored.filter((row) => row.score === topScore);
+  if (top.length !== 1) {
+    return {
+      status: "ambiguous",
+      reason: allowTypo ? "ambiguous_fuzzy_match" : "ambiguous_token_match",
+      matches: top.map((row) => row.entry.item),
+    };
+  }
+  return {
+    status: "matched",
+    matchReason: allowTypo ? "unambiguous_fuzzy_match" : "unambiguous_token_match",
+    item: top[0].entry.item,
+  };
+}
+
+function currentMessageHasAnyCatalogSignal(userMessage, entries, ignoredItemId = null) {
+  const ignored = normalizeId(ignoredItemId);
+  const msg = normalizeCatalogMatchText(userMessage);
+  if (!msg) return false;
+  return entries.some((entry) => {
+    if (ignored && entry.id === ignored) return false;
+    return scoreCatalogEntryAgainstText(entry, msg, { allowTypo: true }) > 0;
+  });
+}
+
+export function maybeUpgradePartialItemFromCatalog({
+  partialItem = null,
+  catalogItems = [],
+  userMessage = "",
+  memoryContext = null,
+} = {}) {
+  const entries = normalizedCatalogEntries(catalogItems);
+  if (entries.length === 0) {
+    return { status: "no_match", reason: "catalog_empty" };
+  }
+
+  const partial =
+    partialItem && typeof partialItem === "object" && !Array.isArray(partialItem)
+      ? partialItem
+      : null;
+  const partialId = normalizeId(partial?.itemId ?? partial?.id);
+  const memoryItem =
+    memoryContext?.lastItem &&
+    typeof memoryContext.lastItem === "object" &&
+    !Array.isArray(memoryContext.lastItem)
+      ? memoryContext.lastItem
+      : null;
+  const memoryId = normalizeId(memoryItem?.itemId ?? memoryItem?.id);
+  const currentMessageSignalsAnotherItem = currentMessageHasAnyCatalogSignal(
+    userMessage,
+    entries,
+    memoryId
+  );
+  const partialLooksLikeMemory =
+    memoryId && partialId && partialId === memoryId;
+
+  const byPartialId =
+    currentMessageSignalsAnotherItem && partialLooksLikeMemory
+      ? null
+      : findUniqueById(entries, partialId);
+  if (byPartialId) {
+    return {
+      status: "matched",
+      matchReason: "exact_item_id",
+      item: mergeCatalogUpgradeItem(byPartialId.item, partial),
+    };
+  }
+
+  const partialLabels = [
+    partial?.name,
+    partial?.displayLabel,
+    buildDisplayLabel(partial || {}),
+  ]
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean);
+  const exactLabelMatches =
+    currentMessageSignalsAnotherItem && partialLooksLikeMemory
+      ? []
+      : findExactLabelMatches(entries, partialLabels);
+  if (exactLabelMatches.length === 1) {
+    return {
+      status: "matched",
+      matchReason: "exact_label",
+      item: mergeCatalogUpgradeItem(exactLabelMatches[0].item, partial),
+    };
+  }
+  if (exactLabelMatches.length > 1) {
+    return {
+      status: "ambiguous",
+      reason: "ambiguous_exact_label",
+      matches: exactLabelMatches.map((entry) => entry.item),
+    };
+  }
+
+  const byMemoryId = !currentMessageSignalsAnotherItem
+    ? findUniqueById(entries, memoryId)
+    : null;
+  if (byMemoryId) {
+    return {
+      status: "matched",
+      matchReason: "memory_item_id",
+      item: mergeCatalogUpgradeItem(byMemoryId.item, partial || memoryItem),
+    };
+  }
+
+  const queryParts = [
+    userMessage,
+    ...(currentMessageSignalsAnotherItem && partialLooksLikeMemory
+      ? []
+      : partialLabels),
+    ...(currentMessageSignalsAnotherItem
+      ? []
+      : [memoryItem?.name, memoryItem?.displayLabel]),
+  ]
+    .map((value) => String(value ?? "").trim())
+    .filter((value) => value.length >= 2);
+  const query = queryParts.join(" ");
+
+  const tokenMatch = findUnambiguousTextMatch(entries, query, { allowTypo: false });
+  if (tokenMatch.status === "matched") {
+    return {
+      status: "matched",
+      matchReason: tokenMatch.matchReason,
+      item: mergeCatalogUpgradeItem(tokenMatch.item, partial),
+    };
+  }
+  if (tokenMatch.status === "ambiguous") return tokenMatch;
+
+  const fuzzyMatch = findUnambiguousTextMatch(entries, query, { allowTypo: true });
+  if (fuzzyMatch.status === "matched") {
+    return {
+      status: "matched",
+      matchReason: fuzzyMatch.matchReason,
+      item: mergeCatalogUpgradeItem(fuzzyMatch.item, partial),
+    };
+  }
+  return fuzzyMatch;
+}
+
 export function resolveAuthoritativeItemForTurn({
   userText,
   explicitResolvedItem,
@@ -2840,15 +5869,10 @@ export function resolveAuthoritativeItemForTurn({
     Array.isArray(catalogItems) ? catalogItems : [],
     normalizeId(lockedItem?.id ?? focusedMemoryItem?.id)
   );
-  const fuzzyCatalogMention = findConservativeFuzzyCatalogMention(
-    userText,
-    catalogItems
-  );
   const explicitMention =
     Boolean(explicitItem) &&
     (hasExplicitEntity ||
       explicitCatalogMention.found ||
-      (fuzzyCatalogMention.found && !fuzzyCatalogMention.ambiguous) ||
       latestMessageMentionsEntity(
         userText,
         explicitItem?.displayLabel ?? explicitItem?.name
@@ -2872,49 +5896,8 @@ export function resolveAuthoritativeItemForTurn({
     selected = lockedItem;
     source = "turn_lock";
   } else if (isFollowup && focusedMemoryItem) {
-    const memoryId = normalizeId(focusedMemoryItem.id ?? focusedMemoryItem.itemId);
-    const catalogExplicit = hasExplicitNewItemMention(userText, catalogItems, null);
-    const vehicleConflict =
-      (catalogExplicit.found &&
-        normalizeId(catalogExplicit.itemId) &&
-        normalizeId(catalogExplicit.itemId) !== memoryId) ||
-      (fuzzyCatalogMention.found &&
-        !fuzzyCatalogMention.ambiguous &&
-        normalizeId(fuzzyCatalogMention.itemId) &&
-        normalizeId(fuzzyCatalogMention.itemId) !== memoryId);
-    if (vehicleConflict) {
-      if (
-        fuzzyCatalogMention.found &&
-        !fuzzyCatalogMention.ambiguous &&
-        fuzzyCatalogMention.itemId
-      ) {
-        const row = catalogItems.find(
-          (r) => normalizeId(r?.id) === normalizeId(fuzzyCatalogMention.itemId)
-        );
-        if (row && typeof row === "object") {
-          selected = normalizeAuthorityItem(row);
-          source = "explicit_fuzzy";
-        }
-      } else if (catalogExplicit.found && catalogExplicit.itemId) {
-        const row = catalogItems.find(
-          (r) => normalizeId(r?.id) === normalizeId(catalogExplicit.itemId)
-        );
-        if (row && typeof row === "object") {
-          selected = normalizeAuthorityItem(row);
-          source = "explicit_catalog_mention";
-        }
-      }
-      if (!selected) {
-        console.log("[item_authority_memory_blocked_vehicle_conflict]", {
-          memoryItemId: memoryId,
-          catalogExplicit: catalogExplicit.found ? catalogExplicit.itemId : null,
-          fuzzyItemId: fuzzyCatalogMention.itemId ?? null,
-        });
-      }
-    } else {
-      selected = focusedMemoryItem;
-      source = "memory_followup";
-    }
+    selected = focusedMemoryItem;
+    source = "memory_followup";
   }
 
   console.log("[item_authority_decision]", {
@@ -2928,168 +5911,6 @@ export function resolveAuthoritativeItemForTurn({
     hasMemoryItem: Boolean(focusedMemoryItem),
   });
   return selected;
-}
-
-/**
- * When the current message explicitly names a catalog item, re-hydrate itemContext
- * if it still points at a different stale item from session memory.
- * @param {{
- *   message: string,
- *   itemContext: Record<string, unknown> | null,
- *   catalogItems?: unknown[],
- *   resolveCatalog?: (input: string, mem: unknown) => Promise<Record<string, unknown> | null>,
- *   hydrateFn?: (ctx: Record<string, unknown>, source: string) => Promise<Record<string, unknown> | null>,
- * }} p
- * @returns {Promise<Record<string, unknown> | null>}
- */
-export async function reconcileItemContextWithExplicitMessage({
-  message,
-  itemContext,
-  catalogItems = [],
-  resolveCatalog,
-  hydrateFn,
-} = {}) {
-  const items = Array.isArray(catalogItems) ? catalogItems : [];
-  const explicit = hasExplicitNewItemMention(message, items, null);
-  const extracted = extractEntity(message);
-  const hasEntity =
-    extracted.name != null &&
-    extracted.confidence > 0.8 &&
-    extracted.confidence >= getEntityConfidenceThreshold(extracted.name);
-  if (!explicit.found && !hasEntity) {
-    return null;
-  }
-
-  const contextId = normalizeId(itemContext?.itemId ?? itemContext?.id);
-  let targetId = explicit.found ? normalizeId(explicit.itemId) : null;
-  let targetLabel =
-    (explicit.found ? String(explicit.itemLabel ?? "").trim() : "") ||
-    (hasEntity ? String(extracted.name ?? "").trim() : "");
-
-  if (!targetId && targetLabel && typeof resolveCatalog === "function") {
-    const resolved = await resolveCatalog(targetLabel, null);
-    targetId = normalizeId(resolved?.id);
-    targetLabel = String(resolved?.name ?? "").trim() || targetLabel;
-  }
-
-  if (!targetId) return null;
-  if (contextId && contextId === targetId) return null;
-
-  console.log("[item_context_reconciled_for_current_message]", {
-    previousItemId: contextId || null,
-    currentItemId: targetId,
-    currentLabel: targetLabel || null,
-  });
-
-  let base =
-    typeof resolveCatalog === "function" && targetLabel
-      ? await resolveCatalog(targetLabel, null)
-      : null;
-  if (!base || !normalizeId(base?.id)) {
-    const row = items.find((r) => normalizeId(r?.id) === targetId);
-    base = row && typeof row === "object" ? row : { id: targetId, name: targetLabel };
-  }
-
-  const ctx = {
-    itemId: targetId,
-    id: targetId,
-    name: String(base?.name ?? targetLabel ?? "").trim() || targetLabel,
-    displayLabel:
-      buildDisplayLabel(base && typeof base === "object" ? base : {}) ||
-      targetLabel,
-  };
-
-  if (typeof hydrateFn !== "function") {
-    return ctx;
-  }
-  return hydrateFn(ctx, "initial");
-}
-
-/**
- * Detect when the current message names an item that is not in catalog (or a
- * different catalog item than stale unavailable memory) so AVAILABILITY_BLOCKED_EARLY
- * must not reply about the wrong car.
- */
-export async function resolveExplicitUnlistedMention({
-  message,
-  itemContext,
-  catalogItems = [],
-  resolveCatalog,
-  extractedEntity = null,
-} = {}) {
-  const items = Array.isArray(catalogItems) ? catalogItems : [];
-  if (isBookingCommitOnlyMessage(message, items)) {
-    console.log("[catalog_unlisted_skipped_for_booking_commit]", {
-      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
-      extractedEntity:
-        String(extractedEntity ?? "").trim() ||
-        extractEntity(String(message ?? "")).name ||
-        null,
-      reason: "BOOKING_COMMIT_ONLY_MESSAGE",
-    });
-    return null;
-  }
-  const explicit = hasExplicitNewItemMention(message, items, null);
-  const extracted = extractEntity(message);
-  const hasEntity =
-    extracted.name != null &&
-    extracted.confidence > 0.8 &&
-    extracted.confidence >= getEntityConfidenceThreshold(extracted.name);
-  const label =
-    String(extractedEntity ?? "").trim() ||
-    (hasEntity ? String(extracted.name ?? "").trim() : "") ||
-    (explicit.found ? String(explicit.itemLabel ?? "").trim() : "");
-  if (!label || (!hasEntity && !explicit.found && !extractedEntity)) {
-    return null;
-  }
-  if (label && isRentPricingEntityLabel(label, message) && !explicit.found) {
-    return null;
-  }
-  const normLabel = label.trim().toLowerCase().replace(/\s+/g, " ");
-  if (/^\d{3,7}$/.test(normLabel) || /^\d{3,7}\s+hai$/i.test(normLabel)) {
-    return null;
-  }
-
-  const contextId = normalizeId(itemContext?.itemId ?? itemContext?.id);
-  const durationParsed = parseUserDuration(message);
-  if (
-    contextId &&
-    isExplicitPricingOrDetailsQuestion(message) &&
-    durationParsed != null &&
-    !explicit.found
-  ) {
-    return null;
-  }
-
-  let resolved = null;
-  if (typeof resolveCatalog === "function") {
-    resolved = await resolveCatalog(label, null);
-  }
-  const resolvedId =
-    normalizeId(resolved?.id) ||
-    (explicit.found ? normalizeId(explicit.itemId) : null);
-
-  if (!resolvedId) {
-    return {
-      notInCatalog: true,
-      label,
-      contextId: contextId || null,
-      staleUnavailableContext:
-        itemContext != null &&
-        typeof itemContext === "object" &&
-        itemContext.isAvailable === false,
-    };
-  }
-  if (contextId && resolvedId && contextId !== resolvedId) {
-    return {
-      notInCatalog: false,
-      label,
-      contextId,
-      resolvedId,
-      contextMismatch: true,
-    };
-  }
-  return null;
 }
 
 /**
@@ -3619,9 +6440,9 @@ async function ensureItemContextFromMatchedItemReply(
   userId,
   existing,
   matchedItemForReply,
-  resolveCatalog,
-  options = {}
+  resolveCatalog
 ) {
+  if (existing != null && typeof existing === "object") return existing;
   if (!matchedItemForReply || typeof matchedItemForReply !== "object") {
     return existing;
   }
@@ -3640,29 +6461,10 @@ async function ensureItemContextFromMatchedItemReply(
   });
   if (!resolved?.id) return existing;
 
-  const newId = String(resolved.id).trim();
-  const existingId = String(existing?.itemId ?? existing?.id ?? "").trim();
-  if (
-    existing != null &&
-    typeof existing === "object" &&
-    existingId &&
-    existingId !== newId &&
-    !options.explicitCatalogSwitch
-  ) {
-    return existing;
-  }
-  if (
-    existing != null &&
-    typeof existing === "object" &&
-    existingId === newId
-  ) {
-    return existing;
-  }
-
   const rowName = String(resolved.name ?? "").trim() || name;
   /** @type {Record<string, unknown>} */
   const ctx = {
-    itemId: newId,
+    itemId: String(resolved.id).trim(),
     name: rowName,
     displayLabel:
       typeof mi.displayLabel === "string" && mi.displayLabel.trim() !== ""
@@ -3671,15 +6473,7 @@ async function ensureItemContextFromMatchedItemReply(
     availability:
       typeof resolved.availability === "boolean" ? resolved.availability : null,
   };
-  if (existingId && existingId !== newId) {
-    console.log("[item_context_explicit_replace]", {
-      fromItemId: existingId,
-      toItemId: newId,
-      label: ctx.displayLabel || ctx.name,
-    });
-  } else {
-    console.log("🧠 itemContext CREATED from matchedItem:", ctx);
-  }
+  console.log("🧠 itemContext CREATED from matchedItem:", ctx);
   return ctx;
 }
 
@@ -3722,11 +6516,7 @@ async function ensureItemContextItemId(userId, itemContext, resolveCatalog) {
  * @param {Record<string, unknown> | null | undefined} conversationMemory
  * @param {Record<string, unknown> | null} itemContext
  */
-function syncLastItemFromItemContextIfMissing(
-  conversationMemory,
-  itemContext,
-  persistOpts = null
-) {
+function syncLastItemFromItemContextIfMissing(conversationMemory, itemContext) {
   if (
     !conversationMemory ||
     typeof conversationMemory !== "object" ||
@@ -3749,21 +6539,7 @@ function syncLastItemFromItemContextIfMissing(
     name: nameStr,
     displayLabel: labelRaw || nameStr,
   };
-  conversationMemory.lastItemMentioned = nameStr || labelRaw || conversationMemory.lastItemMentioned;
   console.log("🧠 Memory synced from itemContext:", conversationMemory.lastItem);
-  if (persistOpts && typeof persistOpts === "object") {
-    persistBookingCommitContext({
-      memory: conversationMemory,
-      itemContext,
-      durationDays: persistOpts.durationDays ?? null,
-      sessionKey: persistOpts.sessionKey,
-      source: persistOpts.source ?? "item_context_sync",
-      messagePreview: persistOpts.messagePreview ?? null,
-      detectedIntent: persistOpts.detectedIntent ?? null,
-      catalogItems: persistOpts.catalogItems ?? [],
-      replyText: persistOpts.replyText ?? null,
-    });
-  }
 }
 
 /**
@@ -3776,6 +6552,7 @@ function syncLastItemFromItemContextIfMissing(
  *   detectedIntent: string,
  *   shouldResetTopicContext: boolean,
  *   nextChatContext: { lastFocusedItem?: unknown },
+ *   catalogRowsForStaleFocusGuard?: unknown[],
  * }} p
  * @returns {{ matchedItemForReply: unknown, fallbackScopedLabel: string }}
  */
@@ -3787,6 +6564,7 @@ function matchedItemForReplyFromCatalogState({
   detectedIntent,
   shouldResetTopicContext,
   nextChatContext,
+  catalogRowsForStaleFocusGuard = [],
 }) {
   const matchedItemLabelFromTurn = labelFromMatchedItem(catalogMatch.matchedItem);
   const hasRawEntityCandidate =
@@ -3801,13 +6579,35 @@ function matchedItemForReplyFromCatalogState({
     detectedIntent !== "list" &&
     detectedIntent !== "exclude" &&
     (!hasRawEntityCandidate || wantsImages) &&
-    messageWordCount <= 6 &&
-    !catalogMatch?.matchedItem;
-  const fallbackScopedLabel =
+    messageWordCount <= 6;
+  const rows = Array.isArray(catalogRowsForStaleFocusGuard)
+    ? catalogRowsForStaleFocusGuard
+    : [];
+  let useScopedLastFocused =
     !matchedItemLabelFromTurn &&
     !pinnedEntityName &&
     String(nextChatContext.lastFocusedItem ?? "").trim() !== "" &&
-    canUseScopedFollowup
+    canUseScopedFollowup;
+  if (useScopedLastFocused) {
+    const explicit =
+      rows.length > 0
+        ? hasExplicitNewItemMention(message, rows, null)
+        : { found: false };
+    if (explicit.found) {
+      useScopedLastFocused = false;
+    } else if (messageLooksLikeGenericAvailabilityTimingFollowup(message)) {
+      console.log("[stale_focus_blocked_for_availability_timing]", {
+        rawTextPreview: String(message ?? "").trim().slice(0, 160) || null,
+        latestUserSegment: getLatestUserSegmentForGuard(message) || null,
+        previousLastFocusedItem:
+          String(nextChatContext.lastFocusedItem ?? "").trim() || null,
+        reason: "GENERIC_AVAILABILITY_TIMING_NO_CATALOG_TOKEN",
+        hasExplicitCatalogItem: explicit.found,
+      });
+      useScopedLastFocused = false;
+    }
+  }
+  const fallbackScopedLabel = useScopedLastFocused
     ? String(nextChatContext.lastFocusedItem).trim()
     : "";
   const matchedItemForReply = fallbackScopedLabel
@@ -3820,11 +6620,87 @@ function matchedItemForReplyFromCatalogState({
 }
 
 /**
+ * Structured availability reply: composer by default; optional narrow AI when
+ * `AVAILABILITY_AI_REPLY_ENABLED=true` and {@link isAvailabilityAiEligible} passes (Phase 2 cases only).
+ * @param {{ availabilityCtx: Record<string, unknown>, userMessage: string, styleKey: "casual_local" | "neutral_english", __availabilityAiCompletionForTests?: (args: unknown) => Promise<unknown> }} p
+ */
+async function resolveAvailabilityCustomerReply({
+  availabilityCtx,
+  userMessage,
+  styleKey,
+  __availabilityAiCompletionForTests = null,
+}) {
+  const sum = availabilityCtx?.inventorySummary;
+  const elig = isAvailabilityAiEligible(availabilityCtx);
+  console.log("[availability_ai_eligibility_checked]", {
+    caseId: elig.caseId,
+    eligible: elig.eligible,
+    reason: elig.reason,
+    intent: availabilityCtx?.intent ?? null,
+    summaryStatus: sum?.status ?? null,
+    availableCount: sum?.availableCount ?? null,
+    topItemCount: Array.isArray(sum?.topAvailableItems) ? sum.topAvailableItems.length : 0,
+    alternativeSummarySkipped: availabilityCtx?.alternativeSummarySkipped === true,
+  });
+
+  const enabled = /^true$/i.test(String(process.env.AVAILABILITY_AI_REPLY_ENABLED ?? "").trim());
+  if (!enabled || !elig.eligible) {
+    const composed = composeStructuredAvailabilityCustomerReply(availabilityCtx, styleKey);
+    return enforceAvailabilityTruthOnReply(composed, availabilityCtx, styleKey);
+  }
+
+  console.log("[availability_context_passed_to_ai]", {
+    caseId: elig.caseId,
+    intent: availabilityCtx?.intent ?? null,
+    requestedItemId: availabilityCtx?.requestedItem?.itemId ?? null,
+    summaryStatus: sum?.status ?? null,
+    availableCount: sum?.availableCount ?? null,
+    topItemCount: Array.isArray(sum?.topAvailableItems) ? sum.topAvailableItems.length : 0,
+  });
+
+  const t0 = Date.now();
+  const aiRaw = await generateAvailabilityReplyFromFacts({
+    availabilityContext: availabilityCtx,
+    userMessage,
+    styleKey,
+    __chatCompletionsCreateForTests: __availabilityAiCompletionForTests,
+  });
+  const latencyMs = Date.now() - t0;
+  console.log("[availability_ai_reply_generated]", {
+    caseId: elig.caseId,
+    chars: String(aiRaw ?? "").length,
+    latencyMs,
+  });
+
+  const guarded = guardAvailabilityAiReply(aiRaw, availabilityCtx, styleKey);
+  if (!guarded.ok) {
+    console.log("[availability_ai_reply_guard_replaced]", {
+      caseId: elig.caseId,
+      reason: guarded.reason,
+      violationSnippet: String(aiRaw ?? "").trim().slice(0, 120) || null,
+      summaryStatus: sum?.status ?? null,
+      availableCount: sum?.availableCount ?? null,
+      topItemCount: Array.isArray(sum?.topAvailableItems) ? sum.topAvailableItems.length : 0,
+    });
+    console.log("[availability_structured_fallback_used]", {
+      caseId: elig.caseId,
+      reason: guarded.reason,
+    });
+  } else {
+    console.log("[availability_ai_reply_guard_passed]", {
+      caseId: elig.caseId,
+      mentionedLabelCount: guarded.mentionedTopCount ?? 0,
+    });
+  }
+
+  return enforceAvailabilityTruthOnReply(guarded.reply, availabilityCtx, styleKey);
+}
+
+/**
  * Emily Brain entry point (channel-agnostic).
  * Uses OpenAI gpt-4o-mini via generateReply() in openai.js (business knowledge + history), not a raw single-line completion.
  * Static fallback only when there is no business profile AND no conversation history; otherwise always OpenAI.
- */
-/**
+ *
  * @param {object} opts
  * @param {string} opts.userId - Business owner Firebase uid (knowledge / inventory)
  * @param {string} opts.message
@@ -3848,6 +6724,8 @@ function matchedItemForReplyFromCatalogState({
  * @param {string | null} [opts.senderScope] - hashed per-group participant scope when available
  * @param {string | null} [opts.sourceRowKey] - Playwright DOM row key for the triggering inbound message
  * @param {number | null} [opts.sourceMessageIndex] - Playwright DOM message index for the triggering inbound message
+ * @param {Function | null} [opts.__genericSlotProposalForTests] - deterministic slot proposal hook for tests
+ * @param {Function | null} [opts.__availabilityAiCompletionForTests] - mock OpenAI chat.completions.create for narrow availability AI tests
  * @param {string} [opts.traceId] - booking-flow trace id (from executeWhatsAppAiPipeline)
  */
 export async function processMessage({
@@ -3865,6 +6743,8 @@ export async function processMessage({
   isGreetingFirst = false,
   replyChannel = "whatsapp",
   isGroupInbound = false,
+  isGroupMessage = false,
+  whatsappRecipientType = null,
   playwrightWebInbound = false,
   participantPhoneForDm,
   contextMessages = [],
@@ -3879,11 +6759,14 @@ export async function processMessage({
   sourceRowKey = null,
   sourceMessageIndex = null,
   inboundSourceOrigin = INBOUND_SOURCE_REAL_CUSTOMER,
+  __genericSlotProposalForTests = null,
+  __availabilityAiCompletionForTests = null,
 }) {
   const traceId =
     traceIdIn != null && String(traceIdIn).trim() !== ""
       ? String(traceIdIn).trim()
       : randomUUID();
+  let routeTypeForProcessMessageLog = null;
   try {
     const flowId = traceId;
     const DEBUG_EXTRACT =
@@ -3922,6 +6805,20 @@ export async function processMessage({
 
   const selectedForAi = selectLatestInboundForAi(inboundRaw);
   if (!selectedForAi) {
+    if (
+      String(source ?? "").trim() === "PLAYWRIGHT_DM" ||
+      (playwrightWebInbound === true && isGroupInbound === false && bookingHint)
+    ) {
+      console.log("[booking_dm_generic_fallback_suppressed]", {
+        bookingId: String(bookingHint?.bookingId ?? "").trim() || null,
+        dmChatKey: String(sessionKey ?? "").split("dm::").pop()?.trim() || null,
+        reason: "EMPTY_MESSAGE_TEXT",
+        messageId: String(messageId ?? "").trim() || null,
+        lastProcessedMessageId: null,
+        approvalStage: null,
+        logisticsComplete: false,
+      });
+    }
     emit("FLOW_END", { reason: "NO_VALID_USER_MESSAGE" });
     return applyHybridOutboundResult(
       {
@@ -3938,7 +6835,8 @@ export async function processMessage({
     );
   }
 
-  const message = selectedForAi;
+  const rawInboundMessage = selectedForAi;
+  let message = rawInboundMessage;
   if (String(inboundSourceOrigin ?? INBOUND_SOURCE_REAL_CUSTOMER) !== INBOUND_SOURCE_REAL_CUSTOMER) {
     emit("INBOUND_ORIGIN_BLOCKED", {
       inboundSourceOrigin: String(inboundSourceOrigin ?? ""),
@@ -3978,11 +6876,25 @@ export async function processMessage({
     }
   }
 
+  const normalizedWhatsappRecipientType =
+    String(whatsappRecipientType ?? "").trim().toLowerCase() === "group"
+      ? "group"
+      : String(whatsappRecipientType ?? "").trim() || null;
+  const effectiveIsGroupMessage = Boolean(
+    isGroupMessage ||
+      isGroupInbound ||
+      normalizedWhatsappRecipientType === "group"
+  );
   const routingCtx = {
     isGroupInbound: Boolean(isGroupInbound),
+    isGroupMessage: effectiveIsGroupMessage,
     message,
     participantPhoneForDm,
     playwrightWebInbound: Boolean(playwrightWebInbound),
+    groupName: String(groupName ?? "").trim() || null,
+    chatKey: String(playwrightChatKey ?? groupName ?? sessionKey ?? "").trim() || null,
+    playwrightChatKey: String(playwrightChatKey ?? "").trim() || null,
+    whatsappRecipientType: normalizedWhatsappRecipientType,
     flowId,
   };
   const bookingInboundGuard = {
@@ -4020,15 +6932,65 @@ export async function processMessage({
     });
   };
 
-  async function handleBookingConversationState(ctx = {}) {
-    const finalizeBookingStateReply = (text) => {
-      const raw = String(text ?? "").trim();
-      if (!raw) return "";
-      // Booking-state replies are customer-facing; apply the same safety/tone normalization as AI replies.
-      const guarded = applyToneGuard(raw);
-      const polished = polishWhatsAppBusinessTone(String(guarded ?? ""));
-      return String(polished ?? guarded ?? raw).trim();
+  const buildLogisticsCompletionPatch = ({
+    bookingId,
+    booking,
+    patch,
+    sourcePath,
+  }) => {
+    const merged = { ...(booking || {}), ...(patch || {}) };
+    const completionPatch = buildBookingLogisticsCompletionPatch(
+      booking,
+      patch,
+      logisticsCompletionPolicy
+    );
+    const completion = completionPatch.completion;
+    if (completion.complete) {
+      Object.assign(patch, completionPatch.patch);
+      console.log("[booking_dm_logistics_completed]", {
+        bookingId,
+        approvalStageBefore:
+          String(booking?.approvalStage ?? "").trim() || null,
+        approvalStageAfter: "delivery_details_collected",
+        deliveryMethod: String(merged?.deliveryMethod ?? "").trim() || null,
+        hasDeliveryAddress: String(merged?.deliveryAddress ?? "").trim() !== "",
+        hasDeliveryTime: String(merged?.deliveryTime ?? "").trim() !== "",
+        requireContactForCompletion: completion.requireContact === true,
+        completionReason: completion.reason,
+        sourcePath,
+      });
+    }
+    return { completion, merged };
+  };
+
+  const noOutboundResult = ({
+    reason,
+    bookingId = null,
+    dmChatKey = null,
+    messageIdForLog = null,
+    lastProcessedMessageId = null,
+    approvalStage = null,
+    logisticsComplete = false,
+  } = {}) => {
+    console.log("[booking_dm_generic_fallback_suppressed]", {
+      bookingId: bookingId || null,
+      dmChatKey: dmChatKey || null,
+      reason,
+      messageId: messageIdForLog || null,
+      lastProcessedMessageId: lastProcessedMessageId || null,
+      approvalStage: approvalStage || null,
+      logisticsComplete: logisticsComplete === true,
+    });
+    return {
+      handled: true,
+      suppressOutbound: true,
+      replyText: "",
+      bookingId: bookingId || null,
     };
+  };
+
+  async function handleBookingConversationState(ctx = {}) {
+    const finalizeBookingStateReply = (text) => finalizeBookingFsmCustomerReply(text);
 
     const isPotentialContinuation =
       String(ctx?.source ?? "").trim() === "PLAYWRIGHT_DM" ||
@@ -4075,12 +7037,16 @@ export async function processMessage({
     const hasContact =
       String(booking?.customerPhone ?? "").trim() !== "" ||
       String(booking?.contactPhone ?? "").trim() !== "";
+    const logisticsState = getBookingLogisticsCompletionState(
+      booking,
+      logisticsCompletionPolicy
+    );
 
     /** @type {string} */
     let canonicalState = "inactive";
     if (status !== "approved") {
       canonicalState = "inactive";
-    } else if (hasDeliveryDetailsCollectedAt) {
+    } else if (hasDeliveryDetailsCollectedAt || logisticsState.complete) {
       canonicalState = "delivery_details_collected";
     } else if (!deliveryMethod) {
       canonicalState = "awaiting_delivery_method";
@@ -4127,6 +7093,69 @@ export async function processMessage({
         ctx?.isGroupInbound === false &&
         status === "approved"
     );
+    if (allowHandleDeliveryDetailStates) {
+      const logistics = await loadBusinessLogisticsForUser(ctx?.userId);
+      const logisticsQuestion = buildLogisticsQuestionReplyFromProfile(
+        String(ctx?.message ?? ""),
+        logistics
+      );
+      if (logisticsQuestion.handled) {
+        const replyText =
+          canonicalState === "awaiting_delivery_method"
+            ? appendDeliveryMethodChoicePrompt(logisticsQuestion.reply)
+            : logisticsQuestion.reply;
+        console.log("[booking_logistics_question_answered]", {
+          bookingId,
+          kind: logisticsQuestion.kind,
+          hasPickupLocation: Boolean(logistics.defaultPickupLocation),
+          deliveryCoverageCount: Array.isArray(logistics.deliveryCoverageAreas)
+            ? logistics.deliveryCoverageAreas.length
+            : 0,
+        });
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply(replyText),
+          updatedBookingFields: {},
+          nextState: canonicalState,
+          bookingId,
+        };
+      }
+      if (isInformationalItemQuestion(String(ctx?.message ?? ""))) {
+        const replyText = buildBookingInformationalFallbackReply(
+          String(ctx?.message ?? ""),
+          booking
+        );
+        console.log("[booking_informational_question_answered_before_logistics]", {
+          bookingId,
+          canonicalState,
+          rawTextPreview: String(ctx?.message ?? "").trim().slice(0, 160) || null,
+        });
+        return {
+          handled: true,
+          replyText: finalizeBookingStateReply(replyText),
+          updatedBookingFields: {},
+          nextState: canonicalState,
+          bookingId,
+        };
+      }
+    }
+    if (
+      allowHandleDeliveryDetailStates &&
+      canonicalState === "delivery_details_collected"
+    ) {
+      return noOutboundResult({
+        reason: logisticsState.complete
+          ? "BOOKING_LOGISTICS_ALREADY_COMPLETE"
+          : "BOOKING_DETAILS_ALREADY_COLLECTED",
+        bookingId,
+        dmChatKey: String(
+          ctx?.dmPlaywrightChatKey ?? ctx?.dmChatTitle ?? ""
+        ).trim() || null,
+        messageIdForLog: String(ctx?.messageId ?? "").trim() || null,
+        approvalStage,
+        logisticsComplete: logisticsState.complete,
+      });
+    }
     if (
       allowHandleDeliveryDetailStates &&
       canonicalState === "awaiting_delivery_method"
@@ -4176,6 +7205,46 @@ export async function processMessage({
         booking,
       });
       if (validated?.nextReplyOverride) {
+        if (validated.accepted?.deliveryLocationHint) {
+          const now = new Date();
+          const update = {
+            deliveryConversationStarted: true,
+            deliveryArea: validated.accepted.deliveryArea || validated.accepted.deliveryLocationHint,
+            deliveryLocationHint: validated.accepted.deliveryLocationHint,
+            ...(validated.accepted.deliveryMethod ? { deliveryMethod: validated.accepted.deliveryMethod } : {}),
+            updatedAt: now,
+            ...(booking?.dmStartedAt ? {} : { dmStartedAt: now }),
+          };
+          await db
+            .collection("businesses")
+            .doc(String(ctx.userId))
+            .collection("bookings")
+            .doc(bookingId)
+            .update(update);
+          console.log("[booking_delivery_area_hint_detected]", {
+            bookingId,
+            rawTextPreview: String(ctx?.message ?? "").trim().slice(0, 160) || null,
+            normalizedArea: validated.accepted.deliveryLocationHint,
+            canonicalState,
+            savedAsCompleteAddress: false,
+            nextPrompt: validated.nextReplyOverride,
+          });
+          console.log("[booking_delivery_address_incomplete_area_only]", {
+            bookingId,
+            rawTextPreview: String(ctx?.message ?? "").trim().slice(0, 160) || null,
+            normalizedArea: validated.accepted.deliveryLocationHint,
+            canonicalState,
+            savedAsCompleteAddress: false,
+            nextPrompt: validated.nextReplyOverride,
+          });
+          return {
+            handled: true,
+            replyText: finalizeBookingStateReply(validated.nextReplyOverride),
+            updatedBookingFields: update,
+            nextState: validated.accepted.deliveryMethod === "delivery" ? "awaiting_delivery_location" : "awaiting_delivery_method",
+            bookingId,
+          };
+        }
         return {
           handled: true,
           replyText: finalizeBookingStateReply(validated.nextReplyOverride),
@@ -4185,7 +7254,11 @@ export async function processMessage({
         };
       }
       interpreted.method = validated.accepted.deliveryMethod || interpreted.method;
-      interpreted.location = validated.accepted.deliveryAddress || interpreted.location;
+      const acceptedAddr = validated.accepted.deliveryAddress;
+      interpreted.location =
+        acceptedAddr != null && String(acceptedAddr).trim() !== ""
+          ? String(acceptedAddr).trim()
+          : null;
       console.log("[booking_state_message_interpreted]", {
         bookingId,
         state: "awaiting_delivery_method",
@@ -4196,10 +7269,13 @@ export async function processMessage({
       });
 
       if (!interpreted.method) {
+        const ackOnly = /^(han|haan|jee|ji|yes|ok|okay|theek|done|sure)$/i.test(
+          String(ctx?.message ?? "").trim().toLowerCase()
+        );
         return {
           handled: true,
           replyText: finalizeBookingStateReply(
-            "Delivery chahiye ya pickup? Reply kar dein: delivery ya pickup."
+            buildDeliveryMethodChoicePrompt({ acknowledgement: ackOnly })
           ),
           updatedBookingFields: {},
           nextState: "awaiting_delivery_method",
@@ -4217,6 +7293,18 @@ export async function processMessage({
       if (interpreted.method === "delivery" && interpreted.location) {
         update.deliveryAddress = interpreted.location;
       }
+      const { completion: methodCompletion } = buildLogisticsCompletionPatch({
+        bookingId,
+        booking,
+        patch: update,
+        sourcePath: "booking_state.awaiting_delivery_method",
+      });
+      logLogisticsCompletionEvaluated({
+        bookingId,
+        booking: { ...booking, ...update },
+        isComplete: methodCompletion.complete,
+        source: "FSM",
+      });
 
       // Persist update before replying.
       await db
@@ -4230,7 +7318,10 @@ export async function processMessage({
       const fromState = "awaiting_delivery_method";
       let nextState = "awaiting_delivery_method";
       let replyText = "";
-      if (interpreted.method === "pickup") {
+      if (methodCompletion.complete) {
+        nextState = "delivery_details_collected";
+        replyText = "Details complete hain. Booking set hai.";
+      } else if (interpreted.method === "pickup") {
         nextState = "awaiting_delivery_time";
         replyText = "Pickup noted. Kis time lena chahenge?";
       } else {
@@ -4239,7 +7330,9 @@ export async function processMessage({
           replyText = `${interpreted.location} noted 👍 Delivery ka time kya rakhna hai?`;
         } else {
           nextState = "awaiting_delivery_location";
-          replyText = "Delivery noted. Location/address share kar dein.";
+          replyText = validated.ambiguous?.includes("invalid_delivery_address")
+            ? "Delivery karni hai, address/area thora clear bata dein?"
+            : "Delivery noted. Location/address share kar dein.";
         }
       }
 
@@ -4308,6 +7401,45 @@ export async function processMessage({
         booking,
       });
       if (validated?.nextReplyOverride) {
+        if (validated.accepted?.deliveryLocationHint) {
+          const now = new Date();
+          const update = {
+            deliveryArea: validated.accepted.deliveryArea || validated.accepted.deliveryLocationHint,
+            deliveryLocationHint: validated.accepted.deliveryLocationHint,
+            deliveryConversationStarted: true,
+            updatedAt: now,
+            ...(booking?.dmStartedAt ? {} : { dmStartedAt: now }),
+          };
+          await db
+            .collection("businesses")
+            .doc(String(ctx.userId))
+            .collection("bookings")
+            .doc(bookingId)
+            .update(update);
+          console.log("[booking_delivery_area_hint_detected]", {
+            bookingId,
+            rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+            normalizedArea: validated.accepted.deliveryLocationHint,
+            canonicalState,
+            savedAsCompleteAddress: false,
+            nextPrompt: validated.nextReplyOverride,
+          });
+          console.log("[booking_delivery_address_incomplete_area_only]", {
+            bookingId,
+            rawTextPreview: String(rawText).trim().slice(0, 160) || null,
+            normalizedArea: validated.accepted.deliveryLocationHint,
+            canonicalState,
+            savedAsCompleteAddress: false,
+            nextPrompt: validated.nextReplyOverride,
+          });
+          return {
+            handled: true,
+            replyText: finalizeBookingStateReply(validated.nextReplyOverride),
+            updatedBookingFields: update,
+            nextState: "awaiting_delivery_location",
+            bookingId,
+          };
+        }
         console.log("[booking_state_transition]", {
           bookingId,
           fromState: "awaiting_delivery_location",
@@ -4339,9 +7471,12 @@ export async function processMessage({
           extracted: { location: null },
           rawTextPreview: String(rawText).trim().slice(0, 160) || null,
         });
+        const clarify = validated.ambiguous?.includes("invalid_delivery_address")
+          ? "Delivery karni hai, address/area thora clear bata dein?"
+          : "Location/address thoda clear bata dein.";
         return {
           handled: true,
-          replyText: finalizeBookingStateReply("Location/address thoda clear bata dein."),
+          replyText: finalizeBookingStateReply(clarify),
           updatedBookingFields: {},
           nextState: "awaiting_delivery_location",
           bookingId,
@@ -4355,6 +7490,18 @@ export async function processMessage({
         updatedAt: now,
         ...(booking?.dmStartedAt ? {} : { dmStartedAt: now }),
       };
+      const { completion: locationCompletion } = buildLogisticsCompletionPatch({
+        bookingId,
+        booking,
+        patch: update,
+        sourcePath: "booking_state.awaiting_delivery_location",
+      });
+      logLogisticsCompletionEvaluated({
+        bookingId,
+        booking: { ...booking, ...update },
+        isComplete: locationCompletion.complete,
+        source: "FSM",
+      });
 
       await db
         .collection("businesses")
@@ -4364,8 +7511,12 @@ export async function processMessage({
         .update(update);
 
       const fromState = "awaiting_delivery_location";
-      const nextState = "awaiting_delivery_time";
-      const replyText = `${location} noted 👍 Delivery ka time kya rakhna hai?`;
+      const nextState = locationCompletion.complete
+        ? "delivery_details_collected"
+        : "awaiting_delivery_time";
+      const replyText = locationCompletion.complete
+        ? "Details complete hain. Booking set hai."
+        : `${location} noted 👍 Delivery ka time kya rakhna hai?`;
 
       console.log("[booking_state_transition]", {
         bookingId,
@@ -4484,6 +7635,18 @@ export async function processMessage({
         deliveryTime: String(interpreted.timeText).trim(),
         updatedAt: now,
       };
+      const { completion: timeCompletion } = buildLogisticsCompletionPatch({
+        bookingId,
+        booking,
+        patch: update,
+        sourcePath: "booking_state.awaiting_delivery_time",
+      });
+      logLogisticsCompletionEvaluated({
+        bookingId,
+        booking: { ...booking, ...update },
+        isComplete: timeCompletion.complete,
+        source: "FSM",
+      });
 
       await db
         .collection("businesses")
@@ -4493,8 +7656,12 @@ export async function processMessage({
         .update(update);
 
       const fromState = "awaiting_delivery_time";
-      const nextState = "awaiting_contact";
-      const replyText = "Time note kar liya. Contact number share kar dein.";
+      const nextState = timeCompletion.complete
+        ? "delivery_details_collected"
+        : "awaiting_contact";
+      const replyText = timeCompletion.complete
+        ? "Details complete hain. Booking set hai."
+        : "Time note kar liya. Contact number share kar dein.";
 
       console.log("[booking_state_transition]", {
         bookingId,
@@ -4634,10 +7801,12 @@ export async function processMessage({
           ...(String(booking?.contactPhone ?? "").trim() ? {} : { contactPhone: finalPhone }),
           updatedAt: now,
         };
-        if (isComplete) {
-          patch.approvalStage = "delivery_details_collected";
-          patch.deliveryDetailsCollectedAt = now;
-        }
+        buildLogisticsCompletionPatch({
+          bookingId,
+          booking,
+          patch,
+          sourcePath: "booking_state.awaiting_contact",
+        });
         await db
           .collection("businesses")
           .doc(String(ctx.userId))
@@ -4690,11 +7859,20 @@ export async function processMessage({
     isGroupInbound: Boolean(isGroupInbound),
     sessionKey,
     bookingHint,
+    messageId,
     dmPlaywrightChatKey: null,
     dmChatTitle: null,
     message,
   }).catch(() => ({ handled: false }));
   if (bookingStateResult?.handled === true) {
+    if (bookingStateResult?.suppressOutbound === true) {
+      return {
+        reply: "",
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(true),
+        sendVia: "NONE",
+      };
+    }
     return applyHybridOutboundResult(
       {
         reply: String(bookingStateResult.replyText ?? ""),
@@ -4853,6 +8031,19 @@ export async function processMessage({
             Object.keys(update).forEach((key) => {
               if (update[key] === undefined) delete update[key];
             });
+            const { completion: fallbackCompletion } =
+              buildLogisticsCompletionPatch({
+                bookingId: String(booking.id),
+                booking,
+                patch: update,
+                sourcePath: "booking_attach.single_waiting_candidate",
+              });
+            logLogisticsCompletionEvaluated({
+              bookingId: String(booking.id),
+              booking: { ...booking, ...update },
+              isComplete: fallbackCompletion.complete,
+              source: "parser",
+            });
             await db
               .collection("businesses")
               .doc(String(userId))
@@ -4862,7 +8053,9 @@ export async function processMessage({
 
             // Acknowledge + next step (booking continuation tone).
             let reply = "";
-            if (detectedField === "delivery_location") {
+            if (fallbackCompletion.complete) {
+              reply = "Details complete hain. Booking set hai.";
+            } else if (detectedField === "delivery_location") {
               reply = `${raw} noted 👍 Delivery ka time kya rakhna hai?`;
             } else {
               reply = buildDeliveryDetailReply({ booking, updated: patched });
@@ -4896,6 +8089,17 @@ export async function processMessage({
           );
         }
         console.log("[dm_resume_no_safe_match]", { reason: resume.reason });
+        if (isPlaywrightDmContinuation) {
+          return noOutboundResult({
+            reason: `BOOKING_ATTACH_FAILED:${resume.reason || "NO_SAFE_MATCH"}`,
+            bookingId: String(bookingHint?.bookingId ?? "").trim() || null,
+            dmChatKey:
+              String(sessionKey ?? "").split("dm::").pop()?.trim() || null,
+            messageIdForLog: String(messageId ?? "").trim() || null,
+            approvalStage: null,
+            logisticsComplete: false,
+          });
+        }
         return null;
       }
 
@@ -4915,6 +8119,19 @@ export async function processMessage({
       Object.keys(update).forEach((key) => {
         if (update[key] === undefined) delete update[key];
       });
+      const mergedAfterUpdate = { ...booking, ...update };
+      const completion = getBookingLogisticsCompletionState(
+        mergedAfterUpdate,
+        logisticsCompletionPolicy
+      );
+      if (completion.complete) {
+        buildLogisticsCompletionPatch({
+          bookingId: String(booking.id),
+          booking,
+          patch: update,
+          sourcePath: "booking_attach.dm_resume",
+        });
+      }
       await db
         .collection("businesses")
         .doc(String(userId))
@@ -4935,28 +8152,13 @@ export async function processMessage({
         hasAddress: Boolean(details.address || booking.deliveryAddress),
         hasDeliveryTime: Boolean(details.deliveryTime || booking.deliveryTime),
       });
-      const mergedAfterUpdate = { ...booking, ...update };
-      const confirmed = isLogisticsComplete(
-        mergedAfterUpdate,
-        logisticsCompletionPolicy
-      );
       logLogisticsCompletionEvaluated({
         bookingId: String(booking.id),
         booking: mergedAfterUpdate,
-        isComplete: confirmed,
+        isComplete: completion.complete,
         source: "parser",
       });
-      if (confirmed) {
-        await db
-          .collection("businesses")
-          .doc(String(userId))
-          .collection("bookings")
-          .doc(String(booking.id))
-          .update({
-            approvalStage: "delivery_details_collected",
-            deliveryDetailsCollectedAt: new Date(),
-            updatedAt: new Date(),
-          });
+      if (completion.complete) {
         console.log("[delivery_details_collected]", { bookingId: booking.id });
         console.log("[booking_delivery_confirmed]", { bookingId: booking.id });
       }
@@ -5005,65 +8207,51 @@ export async function processMessage({
     }
     const groupBookingMatch = groupBooking.match;
     const details = parseDeliveryDetails(message);
-    if (!details.address && !details.deliveryTime && !details.contactPhone) return null;
-    const update = { updatedAt: new Date() };
-    if (details.address) update.deliveryAddress = details.address;
-    if (details.deliveryTime) update.deliveryTime = details.deliveryTime;
-    if (details.contactPhone && !groupBookingMatch.customerPhone) {
-      update.customerPhone = details.contactPhone;
-    }
-    await db
-      .collection("businesses")
-      .doc(String(userId))
-      .collection("bookings")
-      .doc(String(groupBookingMatch.id))
-      .update(update);
-    console.log("[booking_details_attached]", {
+    if (!details.address && !details.deliveryTime && !details.contactPhone) {
+      if (isWeekdayOrDateOnlyMessage(message)) {
+        console.log("[booking_date_message_safe_handled]", {
           bookingId: groupBookingMatch.id,
-      source: "group_fallback",
-      matchReason: groupBooking.reason,
-      hasAddress: Boolean(details.address),
-      hasDeliveryTime: Boolean(details.deliveryTime),
-      hasContactPhone: Boolean(details.contactPhone),
-    });
-    console.log("[delivery_details_collected]", {
-              bookingId: groupBookingMatch.id,
-      source: "group_fallback",
-      hasAddress: Boolean(details.address || groupBookingMatch.deliveryAddress),
-      hasDeliveryTime: Boolean(details.deliveryTime || groupBookingMatch.deliveryTime),
-    });
-    const mergedAfterGroupUpdate = { ...groupBookingMatch, ...update };
-    const confirmed = isLogisticsComplete(
-      mergedAfterGroupUpdate,
-      logisticsCompletionPolicy
-    );
-    logLogisticsCompletionEvaluated({
-      bookingId: String(groupBookingMatch.id),
-      booking: mergedAfterGroupUpdate,
-      isComplete: confirmed,
-      source: "parser",
-    });
-    if (confirmed) {
-      await db
-        .collection("businesses")
-        .doc(String(userId))
-        .collection("bookings")
-        .doc(String(groupBookingMatch.id))
-        .update({
-          approvalStage: "delivery_details_collected",
-          deliveryDetailsCollectedAt: new Date(),
-          updatedAt: new Date(),
+          messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+          groupName: groupName || null,
+          chatKey: playwrightChatKey || null,
+          reason: "GROUP_DATE_MESSAGE_NO_PRIVATE_MUTATION",
         });
-      console.log("[booking_delivery_confirmed]", {
-      bookingId: groupBookingMatch.id,
-        source: "group_fallback",
-      });
+        return applyHybridOutboundResult(
+          {
+            reply: "Noted, main confirm kar ke bata deta hun.",
+            type: "AI_MESSAGE",
+            messageMeta: {
+              ...messageMetaForKnowledge(true),
+              bookingId: groupBookingMatch.id,
+              stage: groupBookingMatch.approvalStage ?? null,
+            },
+          },
+          routingCtx
+        );
+      }
+      return null;
     }
+    console.log("[group_logistics_mutation_blocked]", {
+      bookingId: groupBookingMatch.id,
+      attemptedFields: [
+        ...(details.address ? ["deliveryAddress"] : []),
+        ...(details.deliveryTime ? ["deliveryTime"] : []),
+        ...(details.contactPhone ? ["contactPhone"] : []),
+      ],
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      groupName: groupName || null,
+      chatKey: playwrightChatKey || null,
+      reason: "GROUP_BOOKING_DETAILS_FALLBACK_BLOCKED",
+    });
     return applyHybridOutboundResult(
       {
-        reply: buildDeliveryDetailReply({ booking: groupBookingMatch, updated: details }),
+        reply: groupSafeRequestReceivedReply({ itemAndDurationKnown: true }),
         type: "AI_MESSAGE",
-        messageMeta: messageMetaForKnowledge(true),
+        messageMeta: {
+          ...messageMetaForKnowledge(true),
+          bookingId: groupBookingMatch.id,
+          stage: groupBookingMatch.approvalStage ?? null,
+        },
       },
       routingCtx
     );
@@ -5084,6 +8272,11 @@ export async function processMessage({
     itemId,
     itemName,
     durationDays,
+    durationHours = null,
+    billingUnit = null,
+    billingRatePercentOfDaily = null,
+    calculatedPrice = null,
+    currency = null,
     ownerApprovalFirstRequest = false,
     memory = null,
   }) {
@@ -5104,49 +8297,22 @@ export async function processMessage({
     const safeDurationDays = Math.max(1, Number(durationDays) || 1);
     let finalText;
     if (ownerApprovalFirstRequest) {
-      const parsed = parseUserDuration(message);
-      const originalDurationText =
-        parsed && typeof parsed === "object" && Number.isFinite(Number(parsed.value)) && parsed.unit
-          ? `${Math.max(1, Math.floor(Number(parsed.value)))} ${String(parsed.unit).trim()}`
-          : null;
-      if (originalDurationText) {
-        const subject = safeItemName ? `${safeItemName} ` : "";
-        finalText =
-          conversationStyle === "casual_local"
-            ? `Perfect 👍 ${subject}${originalDurationText} ke liye note kar liya. City ke andar use karna hai ya outside city?`
-            : `Perfect 👍 I’ve noted ${subject}for ${originalDurationText}. Will you use it within the city or outside the city?`;
+      finalText = groupSafeRequestReceivedReply({
+        itemAndDurationKnown: true,
+        itemName: safeItemName === "your item" ? "" : safeItemName,
+        durationDays: safeDurationDays,
+        durationHours,
+        billingUnit,
+      });
       console.log("[booking_waiting_response_generated]", {
         bookingId: safeBookingId,
         eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
         responsePreview: String(finalText).slice(0, 160),
-          durationDisplay: originalDurationText,
         durationDays: safeDurationDays,
-        });
-      } else {
-        const waitingEvent = {
-          eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
-          itemName: safeItemName,
-          durationDays: safeDurationDays,
-          privacyMode: "group_safe",
-          nextStep: "ask_qualifying_question_while_waiting",
-        };
-        console.log("[booking_waiting_event_built]", {
-          bookingId: safeBookingId,
-          event: waitingEvent,
-        });
-        finalText = buildBookingWaitingEngagement(waitingEvent, conversationStyle);
-        console.log("[booking_waiting_response_generated]", {
-          bookingId: safeBookingId,
-          eventType: waitingEvent.eventType,
-          responsePreview: finalText.slice(0, 160),
-        });
-      }
+        publicLogisticsPromptSuppressed: true,
+      });
       if (memory && typeof memory === "object") {
-        memory.pendingEngagementState = buildPendingQualifierState({
-          bookingId: safeBookingId,
-          qualifierKey: "usage_area",
-          allowedValues: ["inside_city", "outside_city"],
-        });
+        delete memory.pendingEngagementState;
       }
     } else {
       finalText = conversationStyle === "casual_local"
@@ -5171,6 +8337,27 @@ export async function processMessage({
           bookingId: safeBookingId,
           itemName: safeItemName,
           durationDays: safeDurationDays,
+          ...(durationHours != null && Number.isFinite(Number(durationHours))
+            ? { durationHours: Math.max(1, Math.floor(Number(durationHours))) }
+            : {}),
+          ...(billingUnit != null && String(billingUnit).trim() !== ""
+            ? { billingUnit: String(billingUnit).trim() }
+            : {}),
+          ...(billingRatePercentOfDaily != null &&
+          Number.isFinite(Number(billingRatePercentOfDaily))
+            ? {
+                billingRatePercentOfDaily: Math.max(
+                  1,
+                  Math.min(100, Math.floor(Number(billingRatePercentOfDaily)))
+                ),
+              }
+            : {}),
+          ...(calculatedPrice != null && Number.isFinite(Number(calculatedPrice))
+            ? { calculatedPrice: Math.round(Number(calculatedPrice)) }
+            : {}),
+          ...(currency != null && String(currency).trim() !== ""
+            ? { currency: String(currency).trim().toUpperCase() }
+            : {}),
         },
         messageMeta: {
           bookingCreated: {
@@ -5178,6 +8365,27 @@ export async function processMessage({
             itemId: String(itemId ?? "").trim() || null,
             itemName: safeItemName,
             durationDays: safeDurationDays,
+            ...(durationHours != null && Number.isFinite(Number(durationHours))
+              ? { durationHours: Math.max(1, Math.floor(Number(durationHours))) }
+              : {}),
+            ...(billingUnit != null && String(billingUnit).trim() !== ""
+              ? { billingUnit: String(billingUnit).trim() }
+              : {}),
+            ...(billingRatePercentOfDaily != null &&
+            Number.isFinite(Number(billingRatePercentOfDaily))
+              ? {
+                  billingRatePercentOfDaily: Math.max(
+                    1,
+                    Math.min(100, Math.floor(Number(billingRatePercentOfDaily)))
+                  ),
+                }
+              : {}),
+            ...(calculatedPrice != null && Number.isFinite(Number(calculatedPrice))
+              ? { calculatedPrice: Math.round(Number(calculatedPrice)) }
+              : {}),
+            ...(currency != null && String(currency).trim() !== ""
+              ? { currency: String(currency).trim().toUpperCase() }
+              : {}),
             status: "pending_approval",
             ...(ownerApprovalFirstRequest
               ? { approvalStage: "pending_owner_approval" }
@@ -5234,59 +8442,7 @@ export async function processMessage({
       /^(yes|yeah|yep|han|haan|ji|jee|ok|okay|done|outside|inside|andar|bahar)$/i.test(raw)
     );
   }
-  function buildBookingBlockedResponse({
-    itemName,
-    memory,
-    itemId = null,
-    message: blockedMessage = message,
-    extractedDurationDays = extracted?.durationDays ?? null,
-    contactValid = contactParts?.isValid,
-    events: blockedEvents = events,
-  } = {}) {
-    const blockedItemId =
-      normalizeId(itemId) ||
-      normalizeId(memory?.bookingState?.itemId) ||
-      normalizeId(memory?.lastItem?.id);
-    const continuation = isSameSessionBookingContinuation({
-      memory,
-      emilySessionKey,
-      itemId: blockedItemId,
-      message: blockedMessage,
-      extractedDurationDays,
-      contactValid,
-      events: blockedEvents,
-    });
-    if (continuation) {
-      const itemLabel = String(itemName ?? "").trim();
-      const text = buildSameSessionContinuationReply({
-        memory,
-        itemName: itemLabel,
-        style: conversationStyle,
-      });
-      console.log("[final_reply_source]", {
-        source: "BOOKING_CONTINUATION_ALREADY_NOTED",
-      });
-      console.log("[booking_continuation_same_session_reply]", {
-        bookingId: String(memory?.bookingState?.bookingId ?? "").trim() || null,
-        itemId: blockedItemId || null,
-      });
-      return applyHybridOutboundResult(
-        {
-          reply: text,
-          text,
-          type: "AI_MESSAGE",
-          meta: {
-            bookingContinuation: true,
-            reason: "SAME_SESSION_ACTIVE_BOOKING",
-          },
-          messageMeta: {
-            bookingContinuation: true,
-            reason: "SAME_SESSION_ACTIVE_BOOKING",
-          },
-        },
-        routingCtx
-      );
-    }
+  function buildBookingBlockedResponse({ itemName, memory }) {
     resetBookingMemoryAfterBlock(memory);
     const itemLabel = String(itemName ?? "").trim();
     const text = buildUnavailableReply({
@@ -5314,13 +8470,9 @@ export async function processMessage({
       routingCtx
     );
   }
-  function buildBookingBlockedOutbound(memory, itemName, blockContext = {}) {
+  function buildBookingBlockedOutbound(memory, itemName) {
     console.log("[BOOKING BLOCKED] ITEM_ALREADY_BOOKED");
-    return buildBookingBlockedResponse({
-      itemName,
-      memory,
-      ...blockContext,
-    });
+    return buildBookingBlockedResponse({ itemName, memory });
   }
   globalThis.__chatContext = globalThis.__chatContext || {};
   const normalizedPlaywrightChatKey = normalizeText(
@@ -5367,6 +8519,7 @@ export async function processMessage({
    * phone or DM route) so User A / User B do not share one session state.
    */
   const emilySessionKey = chatSessionKey(userId, chatContextKey);
+  routingCtx.emilySessionKey = emilySessionKey;
   const pendingTopicReset = Boolean(resetTopicContext);
   if (isGroupInbound && !sourceParticipantKey && isStatefulShortGroupReply(message)) {
     console.warn("[participant_short_reply_without_context_blocked]", {
@@ -5393,26 +8546,6 @@ export async function processMessage({
   });
   if (pendingEngagementResult) {
     return pendingEngagementResult;
-  }
-  const pendingCommitQualifierResult =
-    await maybeHandlePendingEngagementCommitWithoutQualifier({
-      message,
-      memory: pendingEngagementMemory,
-      routingCtx,
-      knowledgeMeta: messageMetaForKnowledge(true),
-    });
-  if (pendingCommitQualifierResult) {
-    return pendingCommitQualifierResult;
-  }
-  const slotCaptureResult = await maybeHandleGroupBookingSlotCapture({
-    userId,
-    message,
-    memory: pendingEngagementMemory,
-    routingCtx,
-    isGroupInbound: Boolean(isGroupInbound),
-  });
-  if (slotCaptureResult) {
-    return slotCaptureResult;
   }
 
   globalThis.__topicEntityBySession =
@@ -5482,6 +8615,7 @@ export async function processMessage({
     ]);
     knowledge = typeof knowledgeResult === "string" ? knowledgeResult : "";
     businessProfile = profileResult;
+    routingCtx.businessProfile = businessProfile?.rawBusinessProfile ?? businessProfile?.profileData ?? businessProfile;
   } catch (e) {
     console.error("[processor] knowledge / profile error:", e);
     knowledge = "";
@@ -5577,32 +8711,61 @@ export async function processMessage({
     { userId: uidCat }
   );
   const catalogSourceForTurn = "db";
-  const normalizedCatalogForTurn = catalogRowsThisTurn
+  const normalizedCatalogRowsForTurn = catalogRowsThisTurn
     .filter((row) => row && typeof row === "object" && !Array.isArray(row))
     .map((row) =>
       normalizeCatalogItem(/** @type {Record<string, unknown>} */ (row))
+    );
+  const normalizedCatalogForTurn = mergeBusinessProfileItemFactsIntoCatalog(
+    normalizedCatalogRowsForTurn,
+    businessProfile
   );
   if (normalizedCatalogForTurn.length === 0) {
     console.error("❌ No catalog items found in DB");
   }
-  let currentTurnAuthority = resolveCurrentTurnAuthority({
-    originalMessage: message,
-    participantName,
-    catalogItems: normalizedCatalogForTurn,
-    memory: getEmilySessionState(emilySessionKey),
-    itemContext: null,
-  });
-  const messageForItemResolution =
-    currentTurnAuthority.cleanedMessageForItemResolution || message;
-  const buildUnavailableReplyForTurn = ({ itemLabel, style, branch = "unknown" }) =>
-    buildUnavailableReplyWithAuthorityGate({
-      buildUnavailableReply,
-      authoritativeItemForTurn: currentTurnAuthority?.authoritativeItemForTurn ?? null,
-      itemLabel,
-      style,
-      messagePreview: String(message ?? "").slice(0, 120),
-      branch,
+
+  const inboundMessageRawForFuzzy = String(rawInboundMessage ?? "").trim();
+  /** @type {import("./fuzzyTurnNormalizer.js").FuzzyTurnResult | null} */
+  let fuzzyTurnNormalization = null;
+  if (inboundMessageRawForFuzzy && normalizedCatalogForTurn.length > 0) {
+    fuzzyTurnNormalization = normalizeFuzzyTurn({
+      rawText: inboundMessageRawForFuzzy,
+      catalogItems: normalizedCatalogForTurn,
+      traceId,
     });
+    const topCorrectionConfidence =
+      fuzzyTurnNormalization.corrections.length > 0
+        ? Math.max(...fuzzyTurnNormalization.corrections.map((c) => c.confidence))
+        : null;
+    console.log("[fuzzy_turn_normalized]", {
+      traceId: traceId || null,
+      rawTextPreview: inboundMessageRawForFuzzy.slice(0, 160) || null,
+      normalizedTextPreview:
+        String(fuzzyTurnNormalization.normalizedText ?? "").slice(0, 160) || null,
+      corrections: fuzzyTurnNormalization.corrections,
+      ambiguity: fuzzyTurnNormalization.ambiguity,
+      catalogConfidence: fuzzyTurnNormalization.catalogConfidence ?? null,
+      catalogRankedCandidates: (
+        fuzzyTurnNormalization.catalogRankedCandidates ?? []
+      ).slice(0, 5),
+      needsCatalogConfirmation: Boolean(
+        fuzzyTurnNormalization.needsCatalogConfirmation
+      ),
+      selectedCatalogItemId:
+        normalizeId(
+          fuzzyTurnNormalization.catalogCandidate?.id ??
+            fuzzyTurnNormalization.catalogCandidate?.itemId
+        ) || null,
+      requestedFieldCandidate: fuzzyTurnNormalization.requestedFieldCandidate,
+      confidence: topCorrectionConfidence,
+    });
+    if (
+      fuzzyTurnNormalization.normalizedText &&
+      fuzzyTurnNormalization.normalizedText !== inboundMessageRawForFuzzy
+    ) {
+      message = fuzzyTurnNormalization.normalizedText;
+    }
+  }
   const businessContextForRuntime =
     businessContext != null && typeof businessContext === "object"
       ? {
@@ -5739,6 +8902,875 @@ export async function processMessage({
     }
   }
 
+  async function hydrateCatalogItemForPendingAction(candidate) {
+    const candidateObj =
+      candidate && typeof candidate === "object" && !Array.isArray(candidate)
+        ? candidate
+        : null;
+    const itemId = normalizeId(candidateObj?.itemId ?? candidateObj?.id);
+    if (itemId) {
+      try {
+        const row = await findItemById(userId, itemId);
+        if (row) {
+          return {
+            ...row,
+            itemId: String(row.id ?? itemId).trim(),
+            id: String(row.id ?? itemId).trim(),
+            displayLabel: buildDisplayLabel(row) || String(row.name ?? "").trim(),
+          };
+        }
+      } catch (err) {
+        console.warn("[pending_action_item_hydration_failed]", {
+          itemId,
+          reason: String(err?.message ?? err ?? "UNKNOWN"),
+        });
+      }
+    }
+    return candidateObj;
+  }
+
+  async function executeAcceptShortBookingOffer(pendingAction, memoryForAction) {
+    const payload =
+      pendingAction?.payload && typeof pendingAction.payload === "object"
+        ? pendingAction.payload
+        : {};
+    const itemId = String(pendingAction?.itemId ?? payload.itemId ?? "").trim();
+    const itemName =
+      String(pendingAction?.itemDisplayLabel ?? "").trim() ||
+      String(payload.itemDisplayLabel ?? "").trim() ||
+      String(payload.itemName ?? "").trim() ||
+      "your item";
+    const minimumHours = Math.max(1, Math.floor(Number(payload.minimumHours)));
+    const billingUnit = String(payload.billingUnit ?? "half_day").trim() || "half_day";
+    const billingRatePercentOfDaily = Math.max(
+      1,
+      Math.min(100, Math.floor(Number(payload.billingRatePercentOfDaily ?? 80)))
+    );
+    const calculatedPrice =
+      payload.calculatedPrice != null && Number.isFinite(Number(payload.calculatedPrice))
+        ? Math.round(Number(payload.calculatedPrice))
+        : null;
+    const currency = String(payload.currency ?? "PKR").trim().toUpperCase() || "PKR";
+
+    const av = await getUserFacingAvailabilityForItem(itemId, itemName, "pending_action");
+    if (av?.isAvailable === false) {
+      clearPendingAction(memoryForAction, "ITEM_UNAVAILABLE");
+      return applyHybridOutboundResult(
+        {
+          reply: buildUnavailableReply({
+            itemLabel: itemName,
+            style: conversationStyle,
+          }),
+          type: "AI_MESSAGE",
+          messageMeta: {
+            ...messageMetaForKnowledge(hasUsefulBusinessData),
+            bookingBlocked: true,
+            reason: "ALREADY_BOOKED",
+          },
+        },
+        routingCtx
+      );
+    }
+
+    const durationDaysForBooking = 1;
+    const duplicate = isDuplicateActiveBookingState(memoryForAction, {
+      itemId,
+      durationDays: durationDaysForBooking,
+      sessionKey: emilySessionKey,
+      channel: isGroupInbound ? "group" : "dm",
+    });
+    if (duplicate) {
+      clearPendingAction(memoryForAction, "DUPLICATE_ACTIVE_BOOKING");
+      return applyHybridOutboundResult(
+        {
+          reply: "Your booking has already been received. We’ll confirm it shortly.",
+          type: "AI_MESSAGE",
+          messageMeta: {
+            ...messageMetaForKnowledge(hasUsefulBusinessData),
+          },
+        },
+        routingCtx
+      );
+    }
+
+    const bookingResult = await createBookingFromValidatedIntent({
+      callerTag: "pending_action_accept_short_booking_offer",
+      isGroupInbound,
+      itemId,
+      itemName,
+      durationDays: durationDaysForBooking,
+      hasParticipantIdentity: Boolean(sourceParticipantKey),
+      ownerApprovalFirstRequest: true,
+      traceId,
+      userId,
+      ...bookingInboundGuard,
+      createBookingArgs: {
+        itemId,
+        itemName,
+        durationDays: durationDaysForBooking,
+        durationHours: minimumHours,
+        billingUnit,
+        billingRatePercentOfDaily,
+        ...(calculatedPrice != null ? { calculatedPrice } : {}),
+        currency,
+        source,
+        groupName,
+        sessionKey,
+        messageId,
+        participantName,
+        senderScope,
+        playwrightChatKey,
+        dmTargetPhone: dmTargetPhone || undefined,
+        dmTargetSource: dmTargetSource || undefined,
+        canDmCustomer,
+        approvalStage: "pending_owner_approval",
+        ...bookingSourceMessageMetadata,
+      },
+    });
+
+    if (!bookingResult?.ok && bookingErrorCode(bookingResult) === "ITEM_ALREADY_BOOKED") {
+      clearPendingAction(memoryForAction, "ITEM_ALREADY_BOOKED");
+      return buildBookingBlockedResponse({
+        itemName,
+        memory: memoryForAction,
+      });
+    }
+
+    if (
+      bookingResult?.ok &&
+      typeof bookingResult.id === "string" &&
+      bookingResult.id.trim() !== ""
+    ) {
+      clearPendingAction(memoryForAction, "EXECUTED");
+      memoryForAction.askedContact = false;
+      memoryForAction.stage = "pending_owner_approval";
+      const bookingCreated = {
+        id: bookingResult.id.trim(),
+        itemId,
+        itemName,
+        durationDays: durationDaysForBooking,
+        durationHours: minimumHours,
+        billingUnit,
+        billingRatePercentOfDaily,
+        ...(calculatedPrice != null ? { calculatedPrice } : {}),
+        currency,
+        status: "pending_approval",
+        approvalStage: "pending_owner_approval",
+      };
+      setStructuredBookingState(memoryForAction, {
+        ...bookingCreated,
+        sessionKey: emilySessionKey,
+        channel: isGroupInbound ? "group" : "dm",
+      });
+      console.log("[pending_action_executed]", {
+        type: PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER,
+        bookingId: bookingCreated.id,
+        itemId,
+        durationHours: minimumHours,
+      });
+      return buildBookingFinalOutbound({
+        bookingId: bookingCreated.id,
+        itemId,
+        itemName,
+        durationDays: durationDaysForBooking,
+        durationHours: minimumHours,
+        billingUnit,
+        billingRatePercentOfDaily,
+        ...(calculatedPrice != null ? { calculatedPrice } : {}),
+        currency,
+        ownerApprovalFirstRequest: true,
+        memory: memoryForAction,
+      });
+    }
+
+    clearPendingAction(memoryForAction, "BOOKING_CREATE_FAILED");
+    return applyHybridOutboundResult(
+      {
+        reply: "I have your request details, but I couldn't create the booking right now. Please try again shortly.",
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+      },
+      routingCtx
+    );
+  }
+
+  async function executeCollectDuration(pendingAction, memoryForAction, replyIntent) {
+    const parsedDuration =
+      replyIntent?.duration && typeof replyIntent.duration === "object"
+        ? replyIntent.duration
+        : parseUserDuration(message);
+    if (!parsedDuration) return null;
+
+    const itemId = String(pendingAction?.itemId ?? pendingAction?.payload?.itemId ?? "").trim();
+    const itemName =
+      String(pendingAction?.itemDisplayLabel ?? "").trim() ||
+      String(pendingAction?.payload?.itemDisplayLabel ?? "").trim() ||
+      String(pendingAction?.payload?.itemName ?? "").trim() ||
+      "your item";
+    if (!itemId) {
+      clearPendingAction(memoryForAction, "COLLECT_DURATION_MISSING_ITEM_ID");
+      return null;
+    }
+
+    const selectedItem = await hydrateCatalogItemForPendingAction({
+      itemId,
+      id: itemId,
+      name: itemName,
+      displayLabel: itemName,
+    });
+    const hydratedItem = await hydrateItemWithAvailability(
+      {
+        ...(selectedItem && typeof selectedItem === "object" ? selectedItem : {}),
+        itemId,
+        id: itemId,
+        name: String(selectedItem?.name ?? itemName).trim() || itemName,
+        displayLabel:
+          String(selectedItem?.displayLabel ?? "").trim() ||
+          buildDisplayLabel(selectedItem) ||
+          itemName,
+      },
+      "pending_action_collect_duration"
+    );
+    const displayLabel =
+      buildDisplayLabel(hydratedItem) ||
+      String(hydratedItem?.displayLabel ?? "").trim() ||
+      itemName;
+
+    if (hydratedItem?.isAvailable === false) {
+      clearPendingAction(memoryForAction, "ITEM_UNAVAILABLE");
+      return applyHybridOutboundResult(
+        {
+          reply: buildUnavailableReply({
+            itemLabel: displayLabel,
+            style: conversationStyle,
+          }),
+          type: "AI_MESSAGE",
+          messageMeta: {
+            ...messageMetaForKnowledge(hasUsefulBusinessData),
+            bookingBlocked: true,
+            reason: "ALREADY_BOOKED",
+          },
+        },
+        routingCtx
+      );
+    }
+
+    const shortBookingSelection = shortBookingSelectionFromParsedDuration(
+      parsedDuration,
+      businessProfile?.rawBusinessProfile ?? businessProfile?.profileData ?? businessProfile
+    );
+
+    if (shortBookingSelection?.type === "below_minimum") {
+      const planned = planBelowMinimumHoursTurn({
+        message,
+        selection: shortBookingSelection,
+        item: hydratedItem,
+        turnIntentShape: {
+          primaryIntent: "booking_request",
+          responsePolicy: "start_or_continue_booking",
+        },
+        isGroupInbound,
+        isAvailable: hydratedItem?.isAvailable !== false,
+        itemLabel: displayLabel,
+        alternativeItems: hydratedItem?.alternativeItems ?? [],
+        modeOverride: "booking",
+      });
+      if (planned.shouldStorePending) {
+        const pendingActionNext = buildPendingAction({
+          type: PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER,
+          expectedReplyType: "affirmation",
+          participantKey: sourceParticipantKey || "",
+          groupChatKey: normalizedPlaywrightChatKey || normalizedSessionKey || "",
+          sessionKey: emilySessionKey,
+          itemId,
+          itemDisplayLabel: displayLabel,
+          payload: {
+            itemId,
+            itemDisplayLabel: displayLabel,
+            originalRequestedHours: shortBookingSelection.requestedHours,
+            minimumHours: shortBookingSelection.minimumHours,
+            billingUnit: shortBookingSelection.billingUnit,
+            billingRatePercentOfDaily: shortBookingSelection.billingRatePercentOfDaily,
+            calculatedPrice: planned.calculatedPrice,
+            currency: currencyFromItem(hydratedItem),
+            explicitPriceIntent: planned.explicitPriceIntent,
+          },
+          sourceMessageId: messageId,
+          sourcePromptText: planned.reply,
+        });
+        storePendingAction(memoryForAction, pendingActionNext);
+      } else if (planned.offerCheckKarun) {
+        console.log("[pending_action_not_stored]", {
+          type: PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER,
+          reason: "BELOW_MINIMUM_UNAVAILABLE_OR_UNBOUND",
+        });
+      }
+      console.log("[pending_action_collect_duration_below_minimum]", {
+        itemId,
+        requestedHours: shortBookingSelection.requestedHours,
+        minimumHours: shortBookingSelection.minimumHours,
+        kind: planned.kind,
+        storedPending: planned.shouldStorePending,
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: planned.reply,
+          type: "AI_MESSAGE",
+          messageMeta: {
+            ...messageMetaForKnowledge(hasUsefulBusinessData),
+            bookingBlocked: true,
+            reason: "SHORT_BOOKING_BELOW_MINIMUM",
+            durationHoursRequested: shortBookingSelection.requestedHours,
+            durationHoursMinimum: shortBookingSelection.minimumHours,
+          },
+        },
+        routingCtx
+      );
+    }
+
+    const durationDaysForBooking = Number.isFinite(Number(parsedDuration.normalizedDays))
+      ? Math.max(1, Math.floor(Number(parsedDuration.normalizedDays)))
+      : Number.isFinite(Number(parsedDuration.value))
+        ? Math.max(1, Math.floor(Number(parsedDuration.value)))
+        : null;
+    if (durationDaysForBooking == null) return null;
+
+    const duplicate = isDuplicateActiveBookingState(memoryForAction, {
+      itemId,
+      durationDays: durationDaysForBooking,
+      sessionKey: emilySessionKey,
+      channel: isGroupInbound ? "group" : "dm",
+    });
+    if (duplicate) {
+      clearPendingAction(memoryForAction, "DUPLICATE_ACTIVE_BOOKING");
+      return applyHybridOutboundResult(
+        {
+          reply: "Your booking has already been received. We’ll confirm it shortly.",
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx
+      );
+    }
+
+    const shortBookingFields = shortBookingCreateFields(shortBookingSelection, hydratedItem);
+    const bookingResult = await createBookingFromValidatedIntent({
+      callerTag: "pending_action_collect_duration",
+      isGroupInbound,
+      itemId,
+      itemName: displayLabel,
+      durationDays: durationDaysForBooking,
+      hasParticipantIdentity: Boolean(sourceParticipantKey),
+      ownerApprovalFirstRequest: isGroupInbound,
+      traceId,
+      userId,
+      ...bookingInboundGuard,
+      createBookingArgs: {
+        itemId,
+        itemName: displayLabel,
+        durationDays: durationDaysForBooking,
+        ...shortBookingFields,
+        source,
+        groupName,
+        sessionKey,
+        messageId,
+        participantName,
+        senderScope,
+        playwrightChatKey,
+        dmTargetPhone: dmTargetPhone || undefined,
+        dmTargetSource: dmTargetSource || undefined,
+        canDmCustomer,
+        ...(isGroupInbound ? { approvalStage: "pending_owner_approval" } : {}),
+        ...bookingSourceMessageMetadata,
+      },
+    });
+
+    if (!bookingResult?.ok && bookingErrorCode(bookingResult) === "ITEM_ALREADY_BOOKED") {
+      clearPendingAction(memoryForAction, "ITEM_ALREADY_BOOKED");
+      return buildBookingBlockedResponse({
+        itemName: displayLabel,
+        memory: memoryForAction,
+      });
+    }
+
+    if (
+      bookingResult?.ok &&
+      typeof bookingResult.id === "string" &&
+      bookingResult.id.trim() !== ""
+    ) {
+      clearPendingAction(memoryForAction, "EXECUTED");
+      memoryForAction.askedContact = false;
+      if (isGroupInbound) memoryForAction.stage = "pending_owner_approval";
+      const bookingCreated = {
+        id: bookingResult.id.trim(),
+        itemId,
+        itemName: displayLabel,
+        durationDays: durationDaysForBooking,
+        ...shortBookingFields,
+        status: isGroupInbound ? "pending_approval" : "created",
+        ...(isGroupInbound ? { approvalStage: "pending_owner_approval" } : {}),
+      };
+      setStructuredBookingState(memoryForAction, {
+        ...bookingCreated,
+        sessionKey: emilySessionKey,
+        channel: isGroupInbound ? "group" : "dm",
+      });
+      console.log("[pending_action_executed]", {
+        type: PENDING_ACTION_TYPES.COLLECT_DURATION,
+        bookingId: bookingCreated.id,
+        itemId,
+        durationDays: durationDaysForBooking,
+        durationHours: shortBookingFields.durationHours ?? null,
+      });
+      return buildBookingFinalOutbound({
+        bookingId: bookingCreated.id,
+        itemId,
+        itemName: displayLabel,
+        durationDays: durationDaysForBooking,
+        ...shortBookingFields,
+        ownerApprovalFirstRequest: isGroupInbound,
+        memory: memoryForAction,
+      });
+    }
+
+    clearPendingAction(memoryForAction, "BOOKING_CREATE_FAILED");
+    return applyHybridOutboundResult(
+      {
+        reply: "I have the item and duration, but I couldn't create the booking right now. Please try again shortly.",
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+      },
+      routingCtx
+    );
+  }
+
+  async function executeConfirmFuzzyCatalog(pendingAction, memoryForAction) {
+    const payload =
+      pendingAction?.payload && typeof pendingAction.payload === "object"
+        ? pendingAction.payload
+        : {};
+    const itemId = normalizeId(pendingAction?.itemId ?? payload.itemId);
+    const itemDisplayLabel =
+      String(pendingAction?.itemDisplayLabel ?? payload.itemDisplayLabel ?? "").trim() ||
+      String(payload.itemDisplayLabel ?? "").trim();
+    const inferredIntent = String(payload.inferredIntent ?? "").trim();
+    const requestedField = String(payload.requestedField ?? "unknown").trim();
+
+    clearPendingAction(memoryForAction, "FUZZY_CATALOG_CONFIRMED");
+
+    if (!itemId) {
+      return applyHybridOutboundResult(
+        {
+          reply: buildPureAckNoOpReply(conversationStyle),
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx
+      );
+    }
+
+    const catalogRow = normalizedCatalogForTurn.find(
+      (row) => normalizeId(row?.id ?? row?.itemId) === itemId
+    );
+    const hydratedBase = catalogRow
+      ? {
+          ...normalizeCatalogItem(/** @type {Record<string, unknown>} */ (catalogRow)),
+          itemId,
+          id: itemId,
+          displayLabel: buildDisplayLabel(catalogRow) || itemDisplayLabel,
+          name: String(catalogRow.name ?? itemDisplayLabel).trim() || itemDisplayLabel,
+        }
+      : await hydrateCatalogItemForPendingAction({
+          itemId,
+          id: itemId,
+          name: itemDisplayLabel,
+          displayLabel: itemDisplayLabel,
+        });
+
+    if (!hydratedBase || typeof hydratedBase !== "object") {
+      return applyHybridOutboundResult(
+        {
+          reply: buildPureAckNoOpReply(conversationStyle),
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx
+      );
+    }
+
+    const displayLabel =
+      buildDisplayLabel(hydratedBase) ||
+      String(hydratedBase.displayLabel ?? hydratedBase.name ?? "").trim() ||
+      itemDisplayLabel;
+
+    memoryForAction.lastItem = {
+      id: itemId,
+      itemId,
+      name: displayLabel,
+      displayLabel,
+    };
+    memoryForAction.lastItemMentioned = displayLabel;
+    setLastResolvedItemId(memoryForAction, itemId);
+    memoryForAction.hasBookingIntent = false;
+
+    const hydratedItem = await hydrateItemWithAvailability(
+      {
+        ...hydratedBase,
+        itemId,
+        id: itemId,
+        name: displayLabel,
+        displayLabel,
+      },
+      "initial"
+    );
+
+    const styleKey =
+      conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+
+    if (inferredIntent === "availability_check") {
+      const blockingStatusesSeen = Array.isArray(hydratedItem?.blockingStatusesSeen)
+        ? hydratedItem.blockingStatusesSeen
+        : [];
+
+      if (hydratedItem?.isAvailable === false) {
+        /** @type {Array<{ id: string, name: string }>} */
+        let alternativeItems = [];
+        let alternativeSummarySkipped = false;
+        const MAX_CATALOG_FOR_ALT_SNAPSHOT = 400;
+        if (normalizedCatalogForTurn.length > MAX_CATALOG_FOR_ALT_SNAPSHOT) {
+          alternativeSummarySkipped = true;
+        } else if (normalizedCatalogForTurn.length > 0) {
+          const raw = await pickAlternativeAvailableItemsFromCatalogRows(
+            userId,
+            itemId,
+            displayLabel,
+            normalizedCatalogForTurn,
+            { limit: 5, maxRankedCandidates: 150 }
+          );
+          alternativeItems = raw.map((x) => ({
+            id: String(x.id ?? x.itemId ?? "").trim(),
+            name: String(x.name ?? "").trim(),
+          }));
+        } else {
+          const raw = await getAlternativeAvailableItems(userId, itemId, displayLabel, 5);
+          alternativeItems = raw.map(({ id, name }) => ({
+            id: String(id ?? "").trim(),
+            name: String(name ?? "").trim(),
+          }));
+        }
+
+        const composed = composeBookingUnavailableItemAvailabilityContextReply({
+          itemLabel: displayLabel,
+          reqId: itemId,
+          blockingStatusesSeen,
+          alternativeItems,
+          alternativeSummarySkipped,
+          catalogLength: normalizedCatalogForTurn.length,
+          styleKey,
+          normalizedCatalogForTurn,
+        });
+        console.log("[fuzzy_catalog_confirmed_availability]", {
+          itemId,
+          result: "unavailable",
+          inferredIntent,
+        });
+        console.log("[final_reply_source]", { source: "FUZZY_CATALOG_CONFIRMED_AVAILABILITY" });
+        return applyHybridOutboundResult(
+          {
+            reply: composed.reply,
+            type: "AI_MESSAGE",
+            messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+          },
+          routingCtx
+        );
+      }
+
+      const availabilityCtx = buildAvailabilityContextSkeleton({
+        intent: "item_availability",
+        requestedItem: {
+          itemId,
+          displayLabel,
+          availabilityStatus: "available",
+          blockingReason: null,
+        },
+        inventorySummary: {
+          status: "fresh",
+          totalItems: normalizedCatalogForTurn.length,
+          availableCount: 1,
+          unavailableCount: 0,
+          topAvailableItems: [],
+          maxItemsShown: 5,
+        },
+        policy: {},
+      });
+      const reply = await resolveAvailabilityCustomerReply({
+        availabilityCtx,
+        userMessage: message || "available",
+        styleKey,
+        __availabilityAiCompletionForTests,
+      });
+      console.log("[fuzzy_catalog_confirmed_availability]", {
+        itemId,
+        result: "available",
+        inferredIntent,
+      });
+      console.log("[final_reply_source]", { source: "FUZZY_CATALOG_CONFIRMED_AVAILABILITY" });
+      return applyHybridOutboundResult(
+        {
+          reply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaWithOutboundTrace(
+            hasUsefulBusinessData,
+            buildOutboundTrace({
+              finalReplySource: "FUZZY_CATALOG_CONFIRMED_AVAILABILITY",
+              composedAnswerSource: "structured_availability",
+            })
+          ),
+        },
+        routingCtx
+      );
+    }
+
+    if (inferredIntent === "pricing_question") {
+      const composerItem = mergeComposerCatalogItem(hydratedItem, normalizedCatalogForTurn);
+      let askedField = requestedField;
+      if (!askedField || askedField === "unknown") {
+        askedField = "price";
+      }
+      const answer = composeInformationalAnswer({
+        message: `${displayLabel} price`,
+        draftReply: "",
+        item: composerItem,
+        askedField,
+      });
+      console.log("[fuzzy_catalog_confirmed_pricing]", {
+        itemId,
+        field: answer.field,
+        source: answer.source,
+      });
+      if (
+        shouldStoreLastVerifiedCatalogAnswer({
+          composedAnswer: answer,
+          composerItem,
+        })
+      ) {
+        storeLastVerifiedCatalogAnswer({
+          memory: memoryForAction,
+          item: composerItem,
+          composedAnswer: answer,
+          requestedField: askedField,
+          participantKey: sourceParticipantKey || "",
+          chatContextKey,
+          sessionKey: emilySessionKey,
+          traceId,
+        });
+      }
+      console.log("[final_reply_source]", { source: "FUZZY_CATALOG_CONFIRMED_PRICING" });
+      return applyHybridOutboundResult(
+        {
+          reply: answer.reply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaWithOutboundTrace(
+            hasUsefulBusinessData,
+            buildOutboundTrace({
+              finalReplySource: "FUZZY_CATALOG_CONFIRMED_PRICING",
+              composedAnswerSource: answer.source ?? "verified_catalog",
+              askedField: answer.field ?? null,
+            })
+          ),
+        },
+        routingCtx
+      );
+    }
+
+    const generalAnswer = composeInformationalAnswer({
+      message: displayLabel,
+      draftReply: "",
+      item: mergeComposerCatalogItem(hydratedItem, normalizedCatalogForTurn),
+      askedField: requestedField !== "unknown" ? requestedField : "details",
+    });
+    console.log("[fuzzy_catalog_confirmed_general]", { itemId, inferredIntent });
+    console.log("[final_reply_source]", { source: "FUZZY_CATALOG_CONFIRMED_GENERAL" });
+    return applyHybridOutboundResult(
+      {
+        reply: generalAnswer.reply,
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaWithOutboundTrace(
+          hasUsefulBusinessData,
+          buildOutboundTrace({
+            finalReplySource: "FUZZY_CATALOG_CONFIRMED_GENERAL",
+            composedAnswerSource: generalAnswer.source ?? null,
+            askedField: generalAnswer.field ?? null,
+          })
+        ),
+      },
+      routingCtx
+    );
+  }
+
+  async function maybeConsumePendingAction() {
+    const memoryForAction = getEmilySessionState(emilySessionKey);
+    const pendingAction = memoryForAction?.pendingAction;
+    if (!pendingAction) return null;
+
+    const replyIntent = inferPendingActionReplyIntent(message, { pendingAction });
+    if (
+      pendingAction.type === PENDING_ACTION_TYPES.COLLECT_DURATION ||
+      pendingAction.type === PENDING_ACTION_TYPES.CONFIRM_FUZZY_CATALOG
+    ) {
+      const explicitOtherItem = hasExplicitNewItemMention(
+        message,
+        normalizedCatalogForTurn,
+        pendingAction.itemId
+      );
+      if (explicitOtherItem.found) {
+        clearPendingAction(
+          memoryForAction,
+          pendingAction.type === PENDING_ACTION_TYPES.CONFIRM_FUZZY_CATALOG
+            ? "EXPLICIT_NEW_ITEM"
+            : "EXPLICIT_NEW_ITEM"
+        );
+        console.log("[pending_action_overridden_by_explicit_item]", {
+          type: String(pendingAction.type ?? "").trim() || null,
+          previousItemId: String(pendingAction.itemId ?? "").trim() || null,
+          newItemId: explicitOtherItem.itemId,
+          newItemLabel: explicitOtherItem.itemLabel,
+        });
+        return null;
+      }
+    }
+    if (
+      pendingAction.type === PENDING_ACTION_TYPES.COLLECT_DURATION &&
+      isPureAckMessage(message)
+    ) {
+      const reask = buildCollectDurationReaskReply(pendingAction, conversationStyle);
+      console.log("[collect_duration_pure_ack_reask]", {
+        pendingActionId: String(pendingAction?.id ?? "").trim() || null,
+        itemId: String(pendingAction?.itemId ?? "").trim() || null,
+      });
+      console.log("[final_reply_source]", { source: "COLLECT_DURATION_REASK" });
+      return applyHybridOutboundResult(
+        {
+          reply: reask,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaWithOutboundTrace(
+            hasUsefulBusinessData,
+            buildOutboundTrace({
+              kind: ASSISTANT_OUTBOUND_KIND.ACTIONABLE_PROMPT,
+              finalReplySource: "COLLECT_DURATION_REASK",
+              pendingActionTypeStored: PENDING_ACTION_TYPES.COLLECT_DURATION,
+              collectDurationPrompt: true,
+            })
+          ),
+        },
+        routingCtx
+      );
+    }
+
+    const validation = validatePendingActionBinding({
+      pendingAction,
+      replyIntent,
+      participantKey: sourceParticipantKey || "",
+      groupChatKey: normalizedPlaywrightChatKey || normalizedSessionKey || "",
+      sessionKey: emilySessionKey,
+    });
+    console.log("[pending_action_binding_decision]", {
+      pendingActionId: String(pendingAction?.id ?? "").trim() || null,
+      type: String(pendingAction?.type ?? "").trim() || null,
+      replyIntent: replyIntent.type,
+      confidence: replyIntent.confidence,
+      ok: validation.ok,
+      reason: validation.reason || "OK",
+    });
+
+    if (!validation.ok) {
+      if (validation.rejected) {
+        clearPendingAction(memoryForAction, "REJECTED_BY_USER");
+        return applyHybridOutboundResult(
+          {
+            reply: "Theek hai 👍",
+            type: "AI_MESSAGE",
+            messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+          },
+          routingCtx
+        );
+      }
+      if (validation.clear) {
+        clearPendingAction(memoryForAction, validation.reason || "BINDING_FAILED");
+      }
+      return null;
+    }
+
+    if (pendingAction.type === PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER) {
+      return executeAcceptShortBookingOffer(pendingAction, memoryForAction);
+    }
+    if (pendingAction.type === PENDING_ACTION_TYPES.COLLECT_DURATION) {
+      return executeCollectDuration(pendingAction, memoryForAction, replyIntent);
+    }
+    if (pendingAction.type === PENDING_ACTION_TYPES.CONFIRM_FUZZY_CATALOG) {
+      return executeConfirmFuzzyCatalog(pendingAction, memoryForAction);
+    }
+    clearPendingAction(memoryForAction, "ACTION_NOT_WIRED");
+    return null;
+  }
+
+  const pendingActionResult = await maybeConsumePendingAction();
+  if (pendingActionResult) {
+    return pendingActionResult;
+  }
+
+  if (isPureAckMessage(message)) {
+    const memoryAfterPending = getEmilySessionState(emilySessionKey);
+    const pureAckBindingCtx = {
+      participantKey: sourceParticipantKey || "",
+      groupChatKey: normalizedPlaywrightChatKey || normalizedSessionKey || "",
+      sessionKey: emilySessionKey,
+    };
+    if (canResolvePureAckWithoutConsumablePending(memoryAfterPending, message, pureAckBindingCtx)) {
+      const ackOutcome = resolvePureAckNoOutbound({
+        memory: memoryAfterPending,
+        conversationStyle,
+      });
+      if (ackOutcome.type === "silent") {
+        console.log("[pure_ack_silent_guard]", {
+          traceId: traceId || null,
+          messagePreview: String(message ?? "").trim().slice(0, 40) || null,
+          priorKind: memoryAfterPending?.lastAssistantOutbound?.kind ?? null,
+          priorFinalReplySource:
+            memoryAfterPending?.lastAssistantOutbound?.finalReplySource ?? null,
+        });
+        console.log("[final_reply_source]", { source: "PURE_ACK_SILENT" });
+        return applyHybridOutboundResult(
+          {
+            reply: "",
+            type: "AI_MESSAGE",
+            messageMeta: buildIntentionalSilentNoopMessageMeta(hasUsefulBusinessData),
+            sendVia: "NONE",
+          },
+          routingCtx
+        );
+      }
+      const ackReply = ackOutcome.reply;
+      console.log("[pure_ack_noop_guard]", {
+        traceId: traceId || null,
+        messagePreview: String(message ?? "").trim().slice(0, 40) || null,
+        replyPreview: ackReply,
+      });
+      console.log("[final_reply_source]", { source: "PURE_ACK_NOOP" });
+      return applyHybridOutboundResult(
+        {
+          reply: ackReply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaWithOutboundTrace(hasUsefulBusinessData, {
+            finalReplySource: "PURE_ACK_NOOP",
+            kind: "ack_noop",
+          }),
+        },
+        routingCtx
+      );
+    }
+  }
+
   if (DEBUG_EXTRACT) {
     const servicesList = businessContext?.servicesList;
     console.log("[DEBUG] Business data:", {
@@ -5760,12 +9792,7 @@ export async function processMessage({
   }
 
   const extractionStartedAt = Date.now();
-  const memForCatalogInputRaw = getEmilySessionState(emilySessionKey);
-  const memForCatalogInput = applyTurnAuthorityMask({
-    memory: memForCatalogInputRaw,
-    itemContext: null,
-    authority: currentTurnAuthority,
-  }).memory;
+  const memForCatalogInput = getEmilySessionState(emilySessionKey);
 
   // Intent classification is needed for safe routing decisions. We cache it so
   // we can compute it early (before any early-booking returns) and reuse later
@@ -5813,7 +9840,7 @@ export async function processMessage({
       ? String(inboundEntity).trim()
       : null;
   const blockPinnedEntity = shouldBlockPinnedEntityForFollowup({
-    message: messageForItemResolution,
+    message,
     pinnedEntityName: rawPinnedEntityName,
     currentItem: currentFocusedItemForPinnedGuard,
   });
@@ -5832,7 +9859,7 @@ export async function processMessage({
   }
   const pinnedEntityName = blockPinnedEntity ? null : rawPinnedEntityName;
   const detailEntityGuard = shouldSkipEntityExtractionForDetailQuestion(
-    messageForItemResolution,
+    message,
     normalizedCatalogForTurn
   );
   if (detailEntityGuard.skip) {
@@ -5842,23 +9869,7 @@ export async function processMessage({
       reason: "DETAIL_FIELD_WITHOUT_ITEM",
     });
   }
-  const slotCaptureEntityGuard =
-    isAwaitingBookingContactCapture(memForCatalogInput) &&
-    !isExplicitPricingOrDetailsQuestion(message);
-  if (slotCaptureEntityGuard) {
-    console.log("[entity_extraction_skipped_for_slot_capture]", {
-      messagePreview: String(message ?? "").slice(0, 80),
-      reason: "AWAITING_BOOKING_CONTACT",
-    });
-  }
-  const entityResult = slotCaptureEntityGuard
-    ? {
-        name: null,
-        confidence: 0,
-        entityType: "person",
-        source: "slot_capture_guard",
-      }
-    : detailEntityGuard.skip
+  const entityResult = detailEntityGuard.skip
     ? {
         name: null,
         confidence: 0,
@@ -5872,59 +9883,14 @@ export async function processMessage({
         entityType: "item",
         source: "pinned_inbound",
       }
-    : { ...extractEntity(messageForItemResolution), source: "user_message" };
+    : { ...extractEntity(message), source: "user_message" };
   const confThreshold = getEntityConfidenceThreshold(entityResult.name);
-  let extractedEntity =
+  const extractedEntity =
     entityResult.name != null &&
     entityResult.confidence > 0.8 &&
     entityResult.confidence >= confThreshold
       ? entityResult.name
       : null;
-  const fuzzyCatalogMentionForTurn = findConservativeFuzzyCatalogMention(
-    messageForItemResolution,
-    normalizedCatalogForTurn
-  );
-  if (
-    !extractedEntity &&
-    fuzzyCatalogMentionForTurn.found &&
-    !fuzzyCatalogMentionForTurn.ambiguous &&
-    fuzzyCatalogMentionForTurn.itemId
-  ) {
-    const fuzzyRow = normalizedCatalogForTurn.find(
-      (r) => normalizeId(r?.id) === normalizeId(fuzzyCatalogMentionForTurn.itemId)
-    );
-    const fuzzyName =
-      String(fuzzyRow?.name ?? fuzzyCatalogMentionForTurn.itemLabel ?? "").trim();
-    if (fuzzyName) {
-      extractedEntity = fuzzyName;
-      console.log("[entity_fuzzy_catalog_match]", {
-        messagePreview: String(message ?? "").slice(0, 80),
-        itemId: fuzzyCatalogMentionForTurn.itemId,
-        itemLabel: fuzzyName,
-      });
-    }
-  }
-  const explicitCatalogOnMessage = hasExplicitNewItemMention(
-    messageForItemResolution,
-    normalizedCatalogForTurn,
-    null
-  );
-  if (
-    extractedEntity &&
-    isCommitActionEntityLabel(extractedEntity) &&
-    !explicitCatalogOnMessage.found
-  ) {
-    console.log("[commit_phrase_entity_suppressed]", {
-      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
-      suppressedEntity: String(extractedEntity).trim(),
-      reason: "COMMIT_ACTION_FRAGMENT_NOT_CATALOG_ITEM",
-    });
-    extractedEntity = null;
-  }
-  const bookingCommitOnlyThisTurn = isBookingCommitOnlyMessage(
-    messageForItemResolution,
-    normalizedCatalogForTurn
-  );
   console.log("[entity_extraction]", {
     extractedEntity: entityResult.name ?? null,
     acceptedEntity: extractedEntity ?? null,
@@ -5954,31 +9920,86 @@ export async function processMessage({
         ) || String(currentFocusedItemForPinnedGuard?.name ?? "").trim() || null,
     });
   }
+  let parsedDurationPreference = parseUserDuration(message);
   const extracted = extractDuration(message);
   let durationDays = extracted.durationDays ?? null;
   const bareDurationMessage = isBareDurationMessage(message);
-  const durationMemoryCandidate =
+  let durationMemoryCandidate =
     memForCatalogInput?.lastItem && typeof memForCatalogInput.lastItem === "object"
       ? memForCatalogInput.lastItem
       : null;
   let turnLockedItem = null;
+  const recentAssistantRepliesForDuration = getRecentAssistantReplies(
+    userId,
+    3,
+    sessionKey
+  );
   const previousAssistantAskedDuration = bareDurationMessage
     ? previousAssistantAskedDurationForItem(
         history,
-        getRecentAssistantReplies(userId, 3, sessionKey),
+        recentAssistantRepliesForDuration,
         durationMemoryCandidate
       )
     : true;
-  let durationContextAllowed =
-    !bareDurationMessage ||
-    (previousAssistantAskedDuration &&
-      normalizeId(durationMemoryCandidate?.id) != null);
-  let durationContextReason = durationContextAllowed
-    ? "OK"
-    : !previousAssistantAskedDuration
-      ? "PREVIOUS_ASSISTANT_DID_NOT_ASK_DURATION"
-      : "ACTIVE_ITEM_MISSING";
+  const durationContextPolicy = resolveDurationContextPolicy({
+    message,
+    bareDurationMessage,
+    previousAssistantAskedDuration,
+    durationMemoryCandidate,
+    catalogItems: normalizedCatalogForTurn,
+    memory: memForCatalogInput,
+    recentAssistantReplies: recentAssistantRepliesForDuration,
+    participantKey: sourceParticipantKey || "",
+    chatContextKey,
+    sessionKey: emilySessionKey,
+    traceId,
+  });
+  let durationContextAllowed = durationContextPolicy.durationContextAllowed;
+  let durationContextReason = durationContextPolicy.durationContextReason;
+  const priceDurationFollowupWithSafeItem =
+    durationContextPolicy.priceDurationFollowupWithSafeItem === true;
+  if (
+    priceDurationFollowupWithSafeItem &&
+    durationContextPolicy.priceFollowupCatalogItem &&
+    typeof durationContextPolicy.priceFollowupCatalogItem === "object"
+  ) {
+    const followupItem = durationContextPolicy.priceFollowupCatalogItem;
+    const followupItemId = normalizeId(followupItem.id ?? followupItem.itemId);
+    if (followupItemId) {
+      durationMemoryCandidate = {
+        ...(durationMemoryCandidate && typeof durationMemoryCandidate === "object"
+          ? durationMemoryCandidate
+          : {}),
+        ...followupItem,
+        id: followupItemId,
+        itemId: followupItemId,
+      };
+      if (memForCatalogInput) {
+        memForCatalogInput.lastItem = durationMemoryCandidate;
+        setLastResolvedItemId(memForCatalogInput, followupItemId);
+      }
+    }
+  }
   const activeDurationItemId = normalizeId(durationMemoryCandidate?.id);
+  if (priceDurationFollowupWithSafeItem) {
+    const parsedFollowupDuration = parseUserDuration(message);
+    console.log("[price_duration_followup_allowed]", {
+      traceId,
+      itemId: activeDurationItemId || null,
+      itemDisplayLabel:
+        buildDisplayLabel(
+          durationMemoryCandidate && typeof durationMemoryCandidate === "object"
+            ? durationMemoryCandidate
+            : {}
+        ) || null,
+      reason:
+        durationContextPolicy.safePreviousProofSource || "LAST_VERIFIED_CATALOG_ANSWER",
+      duration: parsedFollowupDuration?.normalizedDays ?? null,
+      requestedField: resolveItemlessPriceDurationAskedField(message),
+      participantKey: sourceParticipantKey || null,
+      chatContextKey,
+    });
+  }
   const activeDurationItemLabel =
     buildDisplayLabel(
       durationMemoryCandidate && typeof durationMemoryCandidate === "object"
@@ -5996,7 +10017,12 @@ export async function processMessage({
       emilySessionKey,
     });
   }
-  if (bareDurationMessage && durationContextAllowed && activeDurationItemId) {
+  if (
+    bareDurationMessage &&
+    durationContextAllowed &&
+    activeDurationItemId &&
+    !priceDurationFollowupWithSafeItem
+  ) {
     const activeAvailability = await getUserFacingAvailabilityForItem(
       activeDurationItemId,
       activeDurationItemLabel,
@@ -6031,10 +10057,9 @@ export async function processMessage({
   if (bareDurationMessage && durationContextReason === "ACTIVE_ITEM_UNAVAILABLE") {
     return applyHybridOutboundResult(
       {
-        reply: buildUnavailableReplyForTurn({
+        reply: buildUnavailableReply({
           itemLabel: activeDurationItemLabel,
           style: conversationStyle,
-          branch: "BARE_DURATION_ACTIVE_ITEM_UNAVAILABLE",
         }),
         type: "AI_MESSAGE",
         messageMeta: {
@@ -6046,29 +10071,150 @@ export async function processMessage({
       routingCtx
     );
   }
-  if (extracted.durationDays != null && durationContextAllowed) {
-    memForCatalogInput.lastDuration = extracted.durationDays;
-  } else if (extracted.durationDays != null && !durationContextAllowed) {
-    durationDays = null;
-    memForCatalogInput.lastDuration = null;
-    memForCatalogInput.durationPreference = null;
-  }
   const contactPartsEarly = extractBookingContactParts(message);
   logContactParse(contactPartsEarly);
   const extractedContactEarly = contactPartsEarly.isValid
     ? String(contactPartsEarly.normalizedPhone || contactPartsEarly.phone || "").trim()
     : null;
-  if (isValidContactValue(extractedContactEarly)) {
+  if (isValidContactValue(extractedContactEarly) && !isGroupInbound) {
     memForCatalogInput.contact = extractedContactEarly;
     if (contactPartsEarly.name) {
       memForCatalogInput.customerName = contactPartsEarly.name;
     }
+  } else if (isValidContactValue(extractedContactEarly) && isGroupInbound) {
+    console.log("[group_logistics_mutation_blocked]", {
+      attemptedFields: ["contactPhone", ...(contactPartsEarly.name ? ["customerName"] : [])],
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      groupName: groupName || null,
+      chatKey: playwrightChatKey || null,
+      reason: "GROUP_PRIVATE_DETAIL_MUTATION_BLOCKED",
+    });
   }
-  const hasContactForBookingEarly = isValidContactValue(extractedContactEarly)
+  const hasContactForBookingEarly = !isGroupInbound && isValidContactValue(extractedContactEarly)
     ? true
-    : isValidContactValue(memForCatalogInput?.contact)
+    : !isGroupInbound && isValidContactValue(memForCatalogInput?.contact)
       ? true
       : false;
+  const deterministicDurationAlreadySucceeded = parsedDurationPreference != null;
+  if (!deterministicDurationAlreadySucceeded) {
+    let shouldRunGenericSlotProposal = typeof __genericSlotProposalForTests === "function";
+    let slotIntent = null;
+    if (!shouldRunGenericSlotProposal) {
+      const { prioritizedIntentCached: slotPriority } = await computeIntentPriorityIfNeeded({
+        selectedItem: currentFocusedItemForPinnedGuard,
+      });
+      slotIntent = slotPriority;
+      shouldRunGenericSlotProposal =
+        slotPriority?.confidence === "high" ||
+        ["booking", "price", "details", "availability", "delivery"].includes(
+          String(slotPriority?.priorityIntent ?? slotPriority?.primaryIntent ?? "").trim().toLowerCase()
+        );
+    }
+    if (shouldRunGenericSlotProposal) {
+      const requestedSlots = [
+        "duration",
+        "itemReference",
+        "requestedField",
+        "deliveryLocationHint",
+        "deliveryMethod",
+        "dateOrTime",
+      ];
+      console.log("[slot_proposal_started]", {
+        requestedSlots,
+        messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+        isGroupInbound,
+        deterministicParserAlreadySucceeded: false,
+        intent: String(slotIntent?.priorityIntent ?? slotIntent?.primaryIntent ?? inboundIntent ?? "").trim() || null,
+      });
+      try {
+        const proposal =
+          typeof __genericSlotProposalForTests === "function"
+            ? await __genericSlotProposalForTests({
+                messageText: message,
+                requestedSlots,
+                context: {
+                  intent: slotIntent?.priorityIntent ?? slotIntent?.primaryIntent ?? inboundIntent ?? null,
+                  askedField: slotIntent?.askedField ?? null,
+                  hasCurrentItem: Boolean(normalizeId(durationMemoryCandidate?.id)),
+                  isGroupInbound,
+                },
+              })
+            : await extractGenericSlotsWithLLM({
+                messageText: message,
+                requestedSlots,
+                context: {
+                  intent: slotIntent?.priorityIntent ?? slotIntent?.primaryIntent ?? null,
+                  askedField: slotIntent?.askedField ?? null,
+                  hasCurrentItem: Boolean(normalizeId(durationMemoryCandidate?.id)),
+                  isGroupInbound,
+                },
+              });
+        console.log("[slot_proposal_result]", {
+          proposedSlots: Object.entries(proposal?.slots || {})
+            .filter(([, value]) => value != null)
+            .map(([key]) => key),
+          rejectedForbiddenFields: proposal?.rejectedForbiddenFields || [],
+          rejectedUnknownSlotKeys: proposal?.rejectedUnknownSlotKeys || [],
+          reason: String(proposal?.reason ?? "").slice(0, 160) || null,
+          isGroupInbound,
+          deterministicParserAlreadySucceeded: false,
+        });
+        const validation = await validateGenericSlotProposalForTurn({
+          proposal,
+          messageText: message,
+          deterministicSlots: { duration: parsedDurationPreference },
+          currentItem: durationMemoryCandidate,
+          hasExplicitEntity: Boolean(extractedEntity),
+          isGroupInbound,
+          resolveCatalogItem: (raw) => resolveCatalogThisTurn(raw, memForCatalogInput),
+        });
+        if (validation.accepted.duration) {
+          parsedDurationPreference = validation.accepted.duration;
+          extracted.durationDays = validation.accepted.duration.normalizedDays;
+          durationDays = extracted.durationDays ?? null;
+          console.log("[duration_slot_proposal_applied]", {
+            value: validation.accepted.duration.value,
+            unit: validation.accepted.duration.unit,
+            normalizedDays: validation.accepted.duration.normalizedDays,
+            normalizedHours: validation.accepted.duration.normalizedHours ?? null,
+            isGroupInbound,
+          });
+        }
+      } catch (err) {
+        console.log("[slot_proposal_rejected]", {
+          slotType: "generic",
+          rawText: String(message ?? "").trim().slice(0, 160) || null,
+          proposedValue: null,
+          proposedUnit: null,
+          confidence: null,
+          validatorResult: "rejected",
+          rejectionReason: String(err?.message ?? err ?? "slot_proposal_failed").slice(0, 160),
+          isGroupInbound,
+          deterministicParserAlreadySucceeded: false,
+        });
+      }
+    }
+  }
+  const shortBookingSelection = shortBookingSelectionFromParsedDuration(
+    parsedDurationPreference,
+    businessProfile?.rawBusinessProfile ?? businessProfile?.profileData ?? businessProfile
+  );
+  if (
+    extracted.durationDays != null &&
+    durationContextAllowed &&
+    !priceDurationFollowupWithSafeItem &&
+    shortBookingSelection?.type !== "below_minimum"
+  ) {
+    memForCatalogInput.lastDuration = extracted.durationDays;
+  } else if (shortBookingSelection?.type === "below_minimum") {
+    durationDays = null;
+    memForCatalogInput.lastDuration = null;
+    memForCatalogInput.durationPreference = null;
+  } else if (extracted.durationDays != null && !durationContextAllowed) {
+    durationDays = null;
+    memForCatalogInput.lastDuration = null;
+    memForCatalogInput.durationPreference = null;
+  }
   if (
     !turnLockedItem &&
     isValidContactValue(extractedContactEarly) &&
@@ -6166,10 +10312,9 @@ export async function processMessage({
     ) {
       return applyHybridOutboundResult(
         {
-          reply: buildUnavailableReplyForTurn({
+          reply: buildUnavailableReply({
             itemLabel: turnLockedItem.itemLabel,
             style: conversationStyle,
-            branch: "TURN_LOCKED_ITEM_UNAVAILABLE",
           }),
           type: "AI_MESSAGE",
           messageMeta: {
@@ -6183,25 +10328,13 @@ export async function processMessage({
     }
   }
 
-  if (
-    currentTurnAuthority?.hasExplicitItemThisTurn &&
-    currentTurnAuthority?.authoritativeItemForTurn &&
-    !turnLockedItem &&
-    !itemContext
-  ) {
-    const authItem = currentTurnAuthority.authoritativeItemForTurn;
-    const authId = normalizeId(authItem.id);
-    if (authId) {
-      itemContext = await hydrateItemWithAvailability(
-        {
-          itemId: authId,
-          id: authId,
-          name: authItem.name,
-          displayLabel: authItem.displayLabel || authItem.name,
-        },
-        "current_turn_authority"
-      );
-    }
+  if (shortBookingSelection?.type === "accepted") {
+    console.log("[booking_duration_half_day_selected]", {
+      durationHours: shortBookingSelection.durationHours,
+      billingUnit: shortBookingSelection.billingUnit,
+      billingRatePercentOfDaily: shortBookingSelection.billingRatePercentOfDaily,
+      isGroupInbound,
+    });
   }
 
   if (extractedEntity && entityType !== "category") {
@@ -6249,14 +10382,32 @@ export async function processMessage({
         : { isAvailable: true };
       /** @type {Array<{ id: string, name: string }>} */
       let alternativeItems = [];
+      let alternativeSummarySkipped = false;
+      const MAX_CATALOG_FOR_ALT_SNAPSHOT = 400;
       if (av.isAvailable === false) {
+        if (normalizedCatalogForTurn.length > MAX_CATALOG_FOR_ALT_SNAPSHOT) {
+          alternativeSummarySkipped = true;
+        } else if (normalizedCatalogForTurn.length > 0) {
+          const raw = await pickAlternativeAvailableItemsFromCatalogRows(
+            userId,
+            String(row.id).trim(),
+            String(row.name ?? "").trim(),
+            normalizedCatalogForTurn,
+            { limit: 5, maxRankedCandidates: 150 }
+          );
+          alternativeItems = raw.map((x) => ({
+            id: String(x.id ?? x.itemId ?? "").trim(),
+            name: String(x.name ?? "").trim(),
+          }));
+        } else {
           const raw = await getAlternativeAvailableItems(
             userId,
             row.id,
             row.name,
-          3
+            5
           );
           alternativeItems = raw.map(({ id, name }) => ({ id, name }));
+        }
       }
       itemContext = {
         itemId: row.id,
@@ -6274,6 +10425,7 @@ export async function processMessage({
         ...(av.nextAvailableAt != null && {
           nextAvailableAt: new Date(av.nextAvailableAt).toISOString(),
         }),
+        ...(alternativeSummarySkipped ? { alternativeSummarySkipped: true } : {}),
         ...(alternativeItems.length > 0 && { alternativeItems }),
       };
     }
@@ -6437,118 +10589,6 @@ export async function processMessage({
       null;
     hasDuration = durationDays != null;
   }
-  if (bookingCommitOnlyThisTurn) {
-    const memoryItem =
-      memForCatalogInput?.lastItem && typeof memForCatalogInput.lastItem === "object"
-        ? memForCatalogInput.lastItem
-        : null;
-    const memoryItemId = normalizeId(memoryItem?.id);
-    const memoryItemName =
-      String(memoryItem?.name ?? memoryItem?.displayLabel ?? "").trim() || null;
-    const memoryDuration =
-      durationDays != null
-        ? durationDays
-        : memForCatalogInput?.lastDuration != null &&
-            Number.isFinite(Number(memForCatalogInput.lastDuration))
-          ? Number(memForCatalogInput.lastDuration)
-          : null;
-    const hasItem = Boolean(memoryItemId);
-    const hasDurationForCommit = memoryDuration != null;
-    console.log("[booking_commit_phrase_detected]", {
-      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
-      matchedPhrase: matchedCommitPhrasePreview(message) || null,
-      hasExplicitCatalogItem: explicitCatalogOnMessage.found,
-      hasItem,
-      itemName: memoryItemName,
-      itemId: memoryItemId || null,
-      hasDuration: hasDurationForCommit,
-      durationDays: hasDurationForCommit ? memoryDuration : null,
-    });
-    if (hasItem && hasDurationForCommit) {
-      console.log("[booking_commit_context_used]", {
-        itemName: memoryItemName,
-        itemId: memoryItemId || null,
-        durationDays: memoryDuration,
-        sourceItem: "session_memory",
-        sourceDuration: extracted.durationDays != null ? "current_message" : "session_memory",
-      });
-    } else {
-      console.log("[booking_commit_missing_context]", {
-        missingItem: !hasItem,
-        missingDuration: !hasDurationForCommit,
-        messagePreview: String(message ?? "").trim().slice(0, 160) || null,
-      });
-      const recovered = await recoverBookingCommitContext({
-        message: messageForItemResolution,
-        catalogItems: normalizedCatalogForTurn,
-        historyText: history,
-        memory: memForCatalogInput,
-        turnAuthorityItem: currentTurnAuthority?.authoritativeItemForTurn ?? null,
-        resolveCatalogRow: (name) => resolveCatalogThisTurn(name, memForCatalogInput),
-      });
-      if (recovered && (recovered.itemId || recovered.itemName)) {
-        const recoveredId = normalizeId(recovered.itemId);
-        const recoveredName =
-          String(recovered.itemName ?? recovered.displayLabel ?? "").trim() || null;
-        if (recoveredId || recoveredName) {
-          memForCatalogInput.lastItem = {
-            id: recoveredId || String(memForCatalogInput?.lastItem?.id ?? "").trim() || undefined,
-            name: recoveredName,
-            displayLabel:
-              String(recovered.displayLabel ?? recoveredName ?? "").trim() || recoveredName,
-          };
-          if (recoveredId) {
-            memForCatalogInput.lastResolvedItemId = recoveredId;
-            setLastResolvedItemId(memForCatalogInput, recoveredId);
-          }
-          if (recoveredName) {
-            memForCatalogInput.lastItemMentioned = recoveredName;
-          }
-        }
-        if (recovered.durationDays != null && Number.isFinite(Number(recovered.durationDays))) {
-          const recoveredDur = Math.max(1, Math.floor(Number(recovered.durationDays)));
-          durationDays = recoveredDur;
-          hasDuration = true;
-          memForCatalogInput.lastDuration = recoveredDur;
-          memForCatalogInput.durationPreference = {
-            value: recoveredDur,
-            unit: "days",
-            normalizedDays: recoveredDur,
-          };
-          nextChatContext.lastDuration = recoveredDur;
-          globalThis.__chatContext[chatContextKey] = nextChatContext;
-        }
-        patchEmilySessionState(emilySessionKey, memForCatalogInput);
-        events = {
-          ...events,
-          bookingIntent: true,
-          transactionalIntent: true,
-          confirmationIntent: true,
-        };
-        if (!itemContext && recoveredId) {
-          itemContext = await hydrateItemWithAvailability(
-            {
-              itemId: recoveredId,
-              id: recoveredId,
-              name: recoveredName,
-              displayLabel:
-                String(recovered.displayLabel ?? recoveredName ?? "").trim() || recoveredName,
-            },
-            "booking_commit_recovery"
-          );
-        }
-        if (!recovered.partial && recoveredId && recovered.durationDays != null) {
-          console.log("[booking_commit_context_used]", {
-            itemName: recoveredName,
-            itemId: recoveredId || null,
-            durationDays: recovered.durationDays,
-            sourceItem: recovered.sourceItem ?? null,
-            sourceDuration: recovered.sourceDuration ?? null,
-          });
-        }
-      }
-    }
-  }
   if (isGroupInbound && contextSanitizerResult.itemChanged) {
     console.log("[participant_scoped_context_sanitized]", {
       chatContextKey,
@@ -6616,6 +10656,22 @@ export async function processMessage({
   };
 
   let events = detectBookingEvent(message);
+  if (
+    isPricingOrDetailsFieldQuestion(message, {
+      hasDuration: durationDays != null,
+      hasContact: contactPartsEarly.isValid,
+      itemMentioned: Boolean(extractedEntity),
+    })
+  ) {
+    events = {
+      ...events,
+      bookingIntent: false,
+      transactionalIntent: Boolean(events.orderIntent || events.confirmationIntent),
+    };
+    console.log("[intent_shape_early_pricing_field_override]", {
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+    });
+  }
   if (
     events.confirmationIntent === true &&
     memForCatalogInput?.lastItem &&
@@ -6710,9 +10766,7 @@ export async function processMessage({
    * `lastItem.name` alone (weak for ambiguous SKUs).
    */
   const catalogMatchInput =
-    !bookingCommitOnlyThisTurn &&
-    extractedEntity != null &&
-    String(extractedEntity).trim() !== ""
+    extractedEntity != null && String(extractedEntity).trim() !== ""
       ? String(extractedEntity).trim()
       : nameForBooking != null && String(nameForBooking).trim() !== ""
         ? String(nameForBooking).trim()
@@ -6720,9 +10774,7 @@ export async function processMessage({
             lastItemMentionedEarly != null &&
             lastItemMentionedEarly.length >= 3
           ? lastItemMentionedEarly
-          : bookingCommitOnlyThisTurn && memoryHadItemId
-            ? memoryLastItemNameEarly
-            : null;
+          : null;
 
   if (catalogMatchInput && !itemContext && !memoryHadItemId) {
     resolvedItemFromCatalog = await resolveCatalogThisTurn(
@@ -6864,19 +10916,9 @@ export async function processMessage({
         explicitAvailabilityOrInfoQuestion,
         usedSignals: ["keyword_regex"],
       });
-      const sameSessionContinuation = isSameSessionBookingContinuation({
-        memory: memForCatalogInput,
-        emilySessionKey,
-        itemId: row?.id,
-        message,
-        extractedDurationDays: extracted.durationDays ?? durationDays ?? null,
-        contactValid: contactPartsEarly.isValid,
-        events,
-      });
-      const explicitRestartOrNewBooking = isExplicitRestartOrNewBookingMessage(
-        msgLower,
-        { sameSessionContinuation }
-      );
+      const explicitRestartOrNewBooking =
+        /\b(new|another|koi\s+aur|different)\b/i.test(msgLower) ||
+        /\b(book|booking|reserve|confirm|mujhe\s+chahiye|need|want)\b/i.test(msgLower);
       const likelyFollowupAnswer =
         !explicitNewItemMention &&
         !explicitAvailabilityOrInfoQuestion &&
@@ -6884,12 +10926,11 @@ export async function processMessage({
         String(message ?? "").trim().length <= 80;
 
       const sameUserContinuation =
-        sameSessionContinuation ||
-        (Boolean(structuredBookingId) &&
-          sameParticipantSession &&
-          activeStatus &&
-          sameItem &&
-          likelyFollowupAnswer);
+        Boolean(structuredBookingId) &&
+        sameParticipantSession &&
+        activeStatus &&
+        sameItem &&
+        likelyFollowupAnswer;
 
       if (sameUserContinuation) {
         console.log("[booking_continuation_same_user_detected]", {
@@ -6940,27 +10981,63 @@ export async function processMessage({
             memForCatalogInput?.lastItem ??
             null,
         });
-      const isInformationalIntent = isInformationalPriorityIntent(
-        earlyPrioritizedIntent?.priorityIntent
-      );
+      const earlyTurnIntentShape = resolveTurnIntentShape({
+        message,
+        prioritizedIntent: earlyPrioritizedIntent,
+        llmIntentClassification: llmIntentClassificationCached,
+        hasDuration: durationDays != null,
+        hasContact: hasContactForBookingEarly,
+        itemMentioned: Boolean(row?.id ?? row?.itemId),
+      });
+      const isInformationalIntent =
+        isInformationalPriorityIntent(earlyPrioritizedIntent?.priorityIntent) ||
+        isAnswerRequestedFieldPolicy(earlyTurnIntentShape);
 
       if (!sameUserContinuation && !av.isAvailable && !isInformationalIntent) {
         const itemLabel = buildDisplayLabel(row) || String(row.name ?? "").trim();
+        const styleKey =
+          conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+        let structuredReply = null;
+        try {
+          structuredReply = await buildBookingDurationUnavailableStructuredCustomerReply({
+            userId,
+            catalogRow: row,
+            availabilitySnapshot: av,
+            normalizedCatalogForTurn,
+            styleKey,
+            traceId,
+            memory: memForCatalogInput,
+          });
+        } catch (err) {
+          console.warn("[booking_unavailable_availability_context_failed]", {
+            traceId: traceId || null,
+            error: String(err?.message ?? err),
+          });
+        }
+        const replyText =
+          String(structuredReply ?? "").trim() ||
+          buildUnavailableReply({
+            itemLabel,
+            style: conversationStyle,
+          });
+        if (!String(structuredReply ?? "").trim()) {
+          console.log("[booking_unavailable_availability_context_missing]", {
+            traceId: traceId || null,
+            requestedItemId: String(row?.id ?? row?.itemId ?? "").trim() || null,
+            reason: "STRUCTURED_REPLY_EMPTY_OR_HELPER_NULL",
+            catalogCount: Array.isArray(normalizedCatalogForTurn)
+              ? normalizedCatalogForTurn.length
+              : 0,
+            summaryStatus: null,
+          });
+        }
         console.log("[final_reply_source]", {
           source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
         });
         return applyHybridOutboundResult(
           {
-            reply: buildUnavailableReplyForTurn({
-              itemLabel,
-              style: conversationStyle,
-              branch: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
-            }),
-            text: buildUnavailableReplyForTurn({
-              itemLabel,
-              style: conversationStyle,
-              branch: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
-            }),
+            reply: replyText,
+            text: replyText,
             type: "AI_MESSAGE",
             messageMeta: {
               ...messageMetaForKnowledge(hasUsefulBusinessData),
@@ -7017,6 +11094,38 @@ export async function processMessage({
         hasDuration &&
         hasContactForBookingEarly
       ) {
+        const styleKeyEarly =
+          conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+        const hydrationBlock = await blockCustomerBookingIfHydratedUnavailable({
+          userId,
+          catalogRow: row,
+          earlyAvailabilitySnapshot: av,
+          normalizedCatalogForTurn,
+          styleKey: styleKeyEarly,
+          conversationStyle,
+          traceId,
+          logKind: "booking_unavailable",
+          memory: memForCatalogInput,
+          hydrationSource: "early_booking_create",
+        });
+        if (hydrationBlock.blocked) {
+          console.log("[final_reply_source]", {
+            source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
+          });
+          return applyHybridOutboundResult(
+            {
+              reply: hydrationBlock.reply,
+              text: hydrationBlock.reply,
+              type: "AI_MESSAGE",
+              messageMeta: {
+                ...messageMetaForKnowledge(hasUsefulBusinessData),
+                bookingBlocked: true,
+                reason: "ALREADY_BOOKED",
+              },
+            },
+            routingCtx
+          );
+        }
         const duplicateEarly = isDuplicateActiveBookingState(memForCatalogInput, {
           itemId: row.id,
           durationDays,
@@ -7074,6 +11183,7 @@ export async function processMessage({
             itemId: row.id,
             itemName: row.name,
             durationDays: durationDays,
+            ...shortBookingCreateFields(shortBookingSelection, row),
             customerName:
               contactPartsEarly.name || String(memForCatalogInput?.customerName ?? "").trim() || undefined,
             customerPhone:
@@ -7096,7 +11206,6 @@ export async function processMessage({
           return buildBookingBlockedResponse({
             itemName: row.name,
             memory: memForCatalogInput,
-            itemId: row.id,
           });
         }
         if (!r.ok) {
@@ -7145,14 +11254,32 @@ export async function processMessage({
                 )
               : { isAvailable: true };
             let alternativeItems = [];
+            let alternativeSummarySkipped = false;
+            const MAX_CATALOG_FOR_ALT_SNAPSHOT = 400;
             if (av2.isAvailable === false) {
+              if (normalizedCatalogForTurn.length > MAX_CATALOG_FOR_ALT_SNAPSHOT) {
+                alternativeSummarySkipped = true;
+              } else if (normalizedCatalogForTurn.length > 0) {
+                const raw = await pickAlternativeAvailableItemsFromCatalogRows(
+                  userId,
+                  String(row.id).trim(),
+                  String(row.name ?? "").trim(),
+                  normalizedCatalogForTurn,
+                  { limit: 5, maxRankedCandidates: 150 }
+                );
+                alternativeItems = raw.map((x) => ({
+                  id: String(x.id ?? x.itemId ?? "").trim(),
+                  name: String(x.name ?? "").trim(),
+                }));
+              } else {
                 const raw = await getAlternativeAvailableItems(
                   userId,
                   row.id,
                   row.name,
-                3
+                  5
                 );
                 alternativeItems = raw.map(({ id, name }) => ({ id, name }));
+              }
             }
             itemContext = {
               itemId: row.id,
@@ -7166,6 +11293,7 @@ export async function processMessage({
               ...(av2.nextAvailableAt != null && {
                 nextAvailableAt: new Date(av2.nextAvailableAt).toISOString(),
               }),
+              ...(alternativeSummarySkipped ? { alternativeSummarySkipped: true } : {}),
               ...(alternativeItems.length > 0 && { alternativeItems }),
             };
           }
@@ -7265,10 +11393,54 @@ export async function processMessage({
     reason: prioritizedIntent.reason,
   });
 
+  const turnIntentShape = resolveTurnIntentShape({
+    message,
+    prioritizedIntent,
+    llmIntentClassification,
+    hasDuration:
+      durationDays != null ||
+      (fuzzyTurnNormalization?.durationCandidate?.normalizedDays != null &&
+        Number.isFinite(Number(fuzzyTurnNormalization.durationCandidate.normalizedDays))),
+    hasContact: hasContactForBookingEarly,
+    itemMentioned: Boolean(
+      extractedEntity ||
+        fuzzyTurnNormalization?.catalogCandidate ||
+        memForCatalogInput?.lastItem?.id ||
+        itemContext?.itemId
+    ),
+    requestedFieldCandidate: fuzzyTurnNormalization?.requestedFieldCandidate ?? null,
+  });
+  console.log("[turn_intent_shape_resolved]", {
+    primaryIntent: turnIntentShape.primaryIntent,
+    requestedField: turnIntentShape.requestedField,
+    responsePolicy: turnIntentShape.responsePolicy,
+    confidence: turnIntentShape.confidence,
+    priceAsk: turnIntentShape.signals.priceAsk,
+    bookingCommitment: turnIntentShape.signals.bookingCommitment,
+    durationMentioned: turnIntentShape.signals.durationMentioned,
+  });
+
+  if (isAnswerRequestedFieldPolicy(turnIntentShape)) {
+    events = {
+      ...events,
+      bookingIntent: false,
+      transactionalIntent: Boolean(events.orderIntent || events.confirmationIntent),
+    };
+    console.log("[intent_shape_pricing_field_override]", {
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      primaryIntent: turnIntentShape.primaryIntent,
+    });
+  }
+
   let detectedIntent = detectIntent(message);
   if (prioritizedIntent.priorityIntent === "availability") {
     detectedIntent = "availability";
-  } else if (prioritizedIntent.priorityIntent === "price") {
+  } else if (
+    prioritizedIntent.priorityIntent === "price" ||
+    turnIntentShape.primaryIntent === "pricing_question" ||
+    turnIntentShape.primaryIntent === "details_question" ||
+    turnIntentShape.primaryIntent === "photo_question"
+  ) {
     detectedIntent = "pricing";
   } else if (prioritizedIntent.priorityIntent === "booking") {
     detectedIntent = "booking";
@@ -7366,6 +11538,72 @@ export async function processMessage({
     }
     console.log("[GREETING GUARD] Skipping item resolution and clearing lastItem memory");
   }
+  if (!skipItemResolutionForGreeting && fuzzyTurnNormalization) {
+    const fuzzyOutbound = resolveFuzzyCatalogOutbound(fuzzyTurnNormalization);
+    const blockFuzzyOutboundForBooking =
+      turnIntentShape.primaryIntent === "booking_request" ||
+      turnIntentShape.primaryIntent === "browse_options" ||
+      events.bookingIntent === true;
+    if (fuzzyOutbound.shouldIntercept && fuzzyOutbound.reply && !blockFuzzyOutboundForBooking) {
+      console.log("[fuzzy_catalog_outbound]", {
+        traceId: traceId || null,
+        source: fuzzyOutbound.source,
+        catalogConfidence: fuzzyTurnNormalization.catalogConfidence,
+        needsCatalogConfirmation: Boolean(
+          fuzzyTurnNormalization.needsCatalogConfirmation
+        ),
+        requestedField: fuzzyTurnNormalization.requestedFieldCandidate,
+        candidateCount: (fuzzyTurnNormalization.catalogRankedCandidates ?? []).length,
+        topCandidates: (fuzzyTurnNormalization.catalogRankedCandidates ?? []).slice(0, 4),
+        replyPreview: String(fuzzyOutbound.reply).slice(0, 160),
+      });
+      console.log("[final_reply_source]", { source: fuzzyOutbound.source });
+      if (fuzzyOutbound.source === "FUZZY_CATALOG_CONFIRMATION") {
+        const topCandidate = (fuzzyTurnNormalization.catalogRankedCandidates ?? [])[0];
+        const pendingItemId = normalizeId(topCandidate?.itemId);
+        const pendingItemLabel = String(topCandidate?.displayLabel ?? "").trim();
+        if (pendingItemId && pendingItemLabel) {
+          const memoryForFuzzyPending = getEmilySessionState(emilySessionKey);
+          const fuzzyPendingAction = buildPendingAction({
+            type: PENDING_ACTION_TYPES.CONFIRM_FUZZY_CATALOG,
+            expectedReplyType: "affirmation",
+            participantKey: sourceParticipantKey || "",
+            groupChatKey: normalizedPlaywrightChatKey || normalizedSessionKey || "",
+            sessionKey: emilySessionKey,
+            itemId: pendingItemId,
+            itemDisplayLabel: pendingItemLabel,
+            payload: {
+              itemId: pendingItemId,
+              itemDisplayLabel: pendingItemLabel,
+              inferredIntent: mapFuzzyPendingInferredIntent(fuzzyTurnNormalization),
+              requestedField: String(
+                fuzzyTurnNormalization.requestedFieldCandidate ?? "unknown"
+              ).trim(),
+            },
+            sourceMessageId: messageId,
+            sourcePromptText: String(fuzzyOutbound.reply ?? ""),
+          });
+          storePendingAction(memoryForFuzzyPending, fuzzyPendingAction);
+          console.log("[fuzzy_catalog_pending_action_stored]", {
+            traceId: traceId || null,
+            itemId: pendingItemId,
+            itemDisplayLabel: pendingItemLabel,
+            inferredIntent: fuzzyPendingAction.payload.inferredIntent,
+            requestedField: fuzzyPendingAction.payload.requestedField,
+            expiresAt: fuzzyPendingAction.expiresAt,
+          });
+        }
+      }
+      return applyHybridOutboundResult(
+        {
+          reply: fuzzyOutbound.reply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx
+      );
+    }
+  }
   const durationValue = extractDurationFromMessage(message);
   const existingFocusKey = normalizeText(
     String(existingChatContext.lastFocusedItem ?? "")
@@ -7410,7 +11648,7 @@ export async function processMessage({
   const earlyCatalogMatch = skipItemResolutionForGreeting
     ? null
     : matchCatalogAgainstMessage({
-        message: messageForItemResolution,
+        message,
         items: normalizedCatalogForTurn,
         services:
           businessProfile?.rawBusinessProfile &&
@@ -7430,18 +11668,14 @@ export async function processMessage({
         detectedIntent,
         shouldResetTopicContext,
         nextChatContext,
+        catalogRowsForStaleFocusGuard: normalizedCatalogForTurn,
       }).matchedItemForReply;
   if (!skipItemResolutionForGreeting) {
     itemContext = await ensureItemContextFromMatchedItemReply(
       userId,
       itemContext,
       matchedItemForReplyEarly,
-      resolveCatalogThisTurn,
-      {
-        explicitCatalogSwitch: Boolean(
-          earlyCatalogMatch?.matchedItem || extractedEntity
-        ),
-      }
+      resolveCatalogThisTurn
     );
     await ensureItemContextItemId(userId, itemContext, resolveCatalogThisTurn);
     if (earlyCatalogMatch?.matchedItem) {
@@ -7466,11 +11700,6 @@ export async function processMessage({
     itemContext,
   });
   const conversationMemory = getEmilySessionState(emilySessionKey);
-  const effectiveMemoryForTurn = applyTurnAuthorityMask({
-    memory: conversationMemory,
-    itemContext,
-    authority: currentTurnAuthority,
-  }).memory;
 
   // Group privacy: after owner approval, logistics collection should happen in private chat.
   if (isGroupInbound) {
@@ -7535,6 +11764,8 @@ export async function processMessage({
   }
 
   if (detectedIntent === "browse_options") {
+    conversationMemory.browseAllUnavailableFresh = false;
+    clearAvailabilityFreshNoOtherOptionsStructured(conversationMemory);
     console.log("[browse_options_intent_detected]", {
       messagePreview: String(message ?? "").trim().slice(0, 160) || null,
       classifierPrimary: llmIntentClassification?.primaryIntent ?? null,
@@ -7567,28 +11798,73 @@ export async function processMessage({
     const wantsServices =
       /\b(service|services)\b/i.test(String(message ?? "")) ||
       /\b(khidmat|khidmaat|service)\b/i.test(String(message ?? ""));
-    const availableOptions = [];
-    for (const row of normalizedCatalogForTurn) {
-      if (!row || typeof row !== "object") continue;
-      const rowId = normalizeId(row.id);
-      if (!rowId) continue;
-      if (wantsOther && previousItemId && rowId === previousItemId) continue;
-      const rowName = String(row.name ?? "").trim();
-      const av = await getUserFacingAvailabilityForItem(
-        rowId,
-        rowName,
-        "fallback"
-      );
-      if (av?.isAvailable === false) continue;
-      availableOptions.push(row);
-      if (availableOptions.length >= 5) break;
-    }
     const services =
       businessProfile?.rawBusinessProfile &&
       typeof businessProfile.rawBusinessProfile === "object" &&
       Array.isArray(businessProfile.rawBusinessProfile.services)
         ? businessProfile.rawBusinessProfile.services
         : [];
+
+    let catalogSliceForBrowse = normalizedCatalogForTurn;
+    if (wantsOther && previousItemId) {
+      catalogSliceForBrowse = normalizedCatalogForTurn.filter(
+        (row) => normalizeId(row.id) !== previousItemId
+      );
+    }
+
+    const browseSummary = await summarizeBrowseAvailabilityFromCatalogRows(
+      userId,
+      catalogSliceForBrowse,
+      { maxScan: 300, maxList: 5 }
+    );
+
+    let reply = "";
+    if (
+      browseSummary.availableCount === 0 &&
+      wantsServices &&
+      Array.isArray(services) &&
+      services.length > 0
+    ) {
+      reply = buildBrowseOfferingsReply({
+        items: [],
+        services,
+        style: conversationStyle,
+      });
+    } else {
+      const topItems = browseSummary.topAvailableRows.map((r) =>
+        catalogRowToTopAvailabilityItem(
+          /** @type {Record<string, unknown>} */ (r),
+          buildDisplayLabel
+        )
+      );
+      const styleKey =
+        conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+      const availabilityCtx = buildAvailabilityContextSkeleton({
+        intent: "browse_available_options",
+        inventorySummary: {
+          status: browseSummary.summaryStatus,
+          totalItems: catalogSliceForBrowse.length,
+          availableCount: browseSummary.availableCount,
+          unavailableCount: null,
+          topAvailableItems: topItems,
+          maxItemsShown: 5,
+        },
+        policy: {},
+        servicesOnlyBrowse: false,
+      });
+      reply = await resolveAvailabilityCustomerReply({
+        availabilityCtx,
+        userMessage: message,
+        styleKey,
+        __availabilityAiCompletionForTests,
+      });
+      console.log("[availability_context_built]", {
+        intent: availabilityCtx.intent,
+        summaryStatus: availabilityCtx.inventorySummary.status,
+        availableCount: availabilityCtx.inventorySummary.availableCount,
+        topItemCount: availabilityCtx.inventorySummary.topAvailableItems.length,
+      });
+    }
 
     conversationMemory.stage = "BROWSING";
     conversationMemory.hasBookingIntent = false;
@@ -7612,28 +11888,22 @@ export async function processMessage({
       memoryLastItemBefore,
       memoryLastItemAfter,
     });
-    let reply;
-    if (
-      availableOptions.length === 0 &&
-      normalizedCatalogForTurn.length > 0 &&
-      !wantsServices
-    ) {
-      reply =
-        conversationStyle === "casual_local"
-          ? "Abhi sab options booked/pending hain. Aap koi specific option poochna chahenge?"
-          : "All options are currently booked or pending. Would you like to ask about a specific option?";
-    } else {
-      reply = buildBrowseOfferingsReply({
-        items: availableOptions,
-        services: wantsServices || availableOptions.length === 0 ? services : [],
-        style: conversationStyle,
-      });
-    }
     console.log("[browse_options_reply_built]", {
-      optionCount: availableOptions.length,
+      optionCount: browseSummary.availableCount,
       serviceCount: Array.isArray(services) ? services.length : 0,
       replyPreview: String(reply ?? "").slice(0, 180) || null,
     });
+    if (browseSummary.summaryStatus === "fresh" && browseSummary.availableCount === 0) {
+      clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptions({
+        chatContextKey,
+        nextChatContext,
+        source: "browse_options",
+        availableCount: 0,
+        summaryStatus: "fresh",
+        reason: "BROWSE_GLOBAL_ZERO_FRESH",
+      });
+      conversationMemory.browseAllUnavailableFresh = true;
+    }
     console.log("[final_reply_source]", { source: "PHRASE_ENGINE" });
     return applyHybridOutboundResult(
       {
@@ -7734,6 +12004,7 @@ export async function processMessage({
         detectedIntent,
         shouldResetTopicContext,
         nextChatContext,
+        catalogRowsForStaleFocusGuard: normalizedCatalogForTurn,
       });
   let { matchedItemForReply, fallbackScopedLabel } = matchedForReplyState;
   if (turnLockedItem) {
@@ -7757,12 +12028,7 @@ export async function processMessage({
       userId,
       itemContext,
       matchedItemForReply,
-      resolveCatalogThisTurn,
-      {
-        explicitCatalogSwitch: Boolean(
-          emilyTurn.match?.matchedItem || extractedEntity
-        ),
-      }
+      resolveCatalogThisTurn
     );
     if (emilyTurn.match?.matchedItem) {
       runLateContextSanitizer({
@@ -7905,82 +12171,195 @@ export async function processMessage({
   if (turnLockedItem) {
     await applyTurnLockedItemContext("duration");
   }
-  console.log("🧪 ITEM CONTEXT FULL:", itemContext);
-
-  const catalogExplicitForAuthority = hasExplicitNewItemMention(
-    message,
-    normalizedCatalogForTurn,
-    null
-  );
-  const fuzzyCatalogForAuthority = findConservativeFuzzyCatalogMention(
-    message,
-    normalizedCatalogForTurn
-  );
-  if (
-    fuzzyCatalogForAuthority.ambiguous &&
-    isExplicitPricingOrDetailsQuestion(message) &&
-    !catalogExplicitForAuthority.found &&
-    !extractedEntity
-  ) {
-    const optionLabels = fuzzyCatalogForAuthority.candidates
-      .map((c) => String(c.itemLabel ?? "").trim())
-      .filter(Boolean)
-      .slice(0, 5);
-    const clarify =
-      conversationStyle === "casual_local"
-        ? `Kaun si gaari ke baray mein poochna chahenge? ${optionLabels.join(", ")}`
-        : `Which car would you like to ask about? ${optionLabels.join(", ")}`;
-    console.log("[pricing_fuzzy_ambiguous_clarify]", {
-      messagePreview: String(message ?? "").slice(0, 80),
-      optionCount: optionLabels.length,
+  if (shortBookingSelection?.type === "below_minimum") {
+    const belowMinCatalogItem = await hydrateCatalogItemForPendingAction(
+      itemContext || durationMemoryCandidate || memForCatalogInput?.lastItem || null
+    );
+    const belowMinHydratedItem = belowMinCatalogItem
+      ? await hydrateItemWithAvailability(belowMinCatalogItem, "duration")
+      : null;
+    const belowMinAvailabilityKnown =
+      typeof belowMinHydratedItem?.isAvailable === "boolean" ||
+      typeof itemContext?.isAvailable === "boolean";
+    const belowMinIsAvailable =
+      belowMinHydratedItem?.isAvailable === false || itemContext?.isAvailable === false
+        ? false
+        : belowMinAvailabilityKnown;
+    const belowMinAlternatives =
+      itemContext?.alternativeItems ?? belowMinHydratedItem?.alternativeItems ?? [];
+    const belowMinTurnShape = resolveTurnIntentShape({
+      message,
+      itemMentioned: Boolean(
+        extractedEntity ||
+          itemContext ||
+          durationMemoryCandidate ||
+          memForCatalogInput?.lastItem
+      ),
+      hasDuration: true,
     });
-    console.log("[final_reply_source]", { source: "PRICING_FUZZY_CLARIFY" });
+    const belowMinItemLabel =
+      buildDisplayLabel(belowMinHydratedItem) ||
+      String(belowMinHydratedItem?.displayLabel ?? "").trim() ||
+      String(belowMinHydratedItem?.name ?? "").trim() ||
+      buildDisplayLabel(itemContext) ||
+      String(itemContext?.displayLabel ?? itemContext?.name ?? "").trim();
+    const belowMinPlanned = planBelowMinimumHoursTurn({
+      message,
+      selection: shortBookingSelection,
+      item: belowMinHydratedItem || belowMinCatalogItem,
+      turnIntentShape: belowMinTurnShape,
+      isGroupInbound,
+      isAvailable: belowMinIsAvailable,
+      itemLabel: belowMinItemLabel,
+      alternativeItems: belowMinAlternatives,
+    });
+    let belowMinPendingStored = false;
+    const belowMinPendingItemId = normalizeId(
+      belowMinHydratedItem?.itemId ??
+        belowMinHydratedItem?.id ??
+        belowMinCatalogItem?.itemId ??
+        belowMinCatalogItem?.id ??
+        itemContext?.itemId ??
+        itemContext?.id
+    );
+    if (belowMinPlanned.shouldStorePending && belowMinPendingItemId) {
+      const belowMinPendingAction = buildPendingAction({
+        type: PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER,
+        expectedReplyType: "affirmation",
+        participantKey: sourceParticipantKey || "",
+        groupChatKey: normalizedPlaywrightChatKey || normalizedSessionKey || "",
+        sessionKey: emilySessionKey,
+        itemId: belowMinPendingItemId,
+        itemDisplayLabel: belowMinItemLabel,
+        payload: {
+          itemId: belowMinPendingItemId,
+          itemDisplayLabel: belowMinItemLabel,
+          originalRequestedHours: shortBookingSelection.requestedHours,
+          minimumHours: shortBookingSelection.minimumHours,
+          billingUnit: shortBookingSelection.billingUnit,
+          billingRatePercentOfDaily: shortBookingSelection.billingRatePercentOfDaily,
+          calculatedPrice: belowMinPlanned.calculatedPrice,
+          currency: currencyFromItem(belowMinHydratedItem || belowMinCatalogItem),
+          explicitPriceIntent: belowMinPlanned.explicitPriceIntent,
+        },
+        sourceMessageId: messageId,
+        sourcePromptText: belowMinPlanned.reply,
+      });
+      storePendingAction(memForCatalogInput, belowMinPendingAction);
+      belowMinPendingStored = true;
+    } else if (belowMinPlanned.offerCheckKarun) {
+      console.log("[pending_action_not_stored]", {
+        type: PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER,
+        reason: belowMinPendingItemId ? "BELOW_MINIMUM_UNAVAILABLE_OR_UNBOUND" : "MISSING_ITEM_ID",
+      });
+    }
+    console.log("[below_minimum_duration_handled]", {
+      kind: belowMinPlanned.kind,
+      requestedHours: shortBookingSelection.requestedHours,
+      minimumHours: shortBookingSelection.minimumHours,
+      calculatedPrice: belowMinPlanned.calculatedPrice,
+      isAvailable: belowMinIsAvailable,
+      availabilityKnown: belowMinAvailabilityKnown,
+      storedPending: belowMinPendingStored,
+      itemId: belowMinPendingItemId || null,
+    });
     return applyHybridOutboundResult(
       {
-        reply: clarify,
+        reply: belowMinPlanned.reply,
         type: "AI_MESSAGE",
-        messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        messageMeta: {
+          ...messageMetaWithOutboundTrace(
+            hasUsefulBusinessData,
+            buildOutboundTrace({
+              kind:
+                belowMinPlanned.kind === "informational"
+                  ? ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO
+                  : belowMinPendingStored
+                    ? ASSISTANT_OUTBOUND_KIND.ACTIONABLE_PROMPT
+                    : ASSISTANT_OUTBOUND_KIND.TERMINAL_INFO,
+              finalReplySource: belowMinPendingStored
+                ? "BELOW_MINIMUM_BOOKING_OFFER"
+                : "BELOW_MINIMUM_INFORMATIONAL",
+              pendingActionTypeStored: belowMinPendingStored
+                ? PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER
+                : null,
+            })
+          ),
+          bookingBlocked: true,
+          reason: "SHORT_BOOKING_BELOW_MINIMUM",
+          durationHoursRequested: shortBookingSelection.requestedHours,
+          durationHoursMinimum: shortBookingSelection.minimumHours,
+        },
       },
       routingCtx
     );
   }
-  let explicitResolvedItemForAuthority = null;
+  console.log("🧪 ITEM CONTEXT FULL:", itemContext);
+  const currentTurnMatchedItemId =
+    emilyTurn.match?.matchedItem && typeof emilyTurn.match.matchedItem === "object"
+      ? normalizeId(emilyTurn.match.matchedItem.id ?? emilyTurn.match.matchedItem.itemId)
+      : "";
+  const currentTurnItemContextId = normalizeId(itemContext?.itemId ?? itemContext?.id);
+  const currentTurnVerifiedCatalogItemForSelection =
+    currentTurnItemContextId &&
+    currentTurnMatchedItemId &&
+    currentTurnItemContextId === currentTurnMatchedItemId &&
+    itemContext &&
+    typeof itemContext === "object"
+      ? { ...itemContext, itemId: currentTurnItemContextId, id: currentTurnItemContextId }
+      : null;
+
   if (
-    extractedEntity ||
-    catalogExplicitForAuthority.found ||
-    (fuzzyCatalogForAuthority.found && !fuzzyCatalogForAuthority.ambiguous)
+    fuzzyTurnNormalization?.catalogCandidate &&
+    fuzzyTurnNormalization.catalogConfidence === "high" &&
+    !fuzzyTurnNormalization.ambiguity &&
+    !skipItemResolutionForGreeting
   ) {
-    const resolveName =
-      (extractedEntity ? String(extractedEntity).trim() : "") ||
-      String(catalogExplicitForAuthority.itemLabel ?? "").trim() ||
-      String(fuzzyCatalogForAuthority.itemLabel ?? "").trim();
-    if (resolveName) {
-      const resolved = await resolveCatalogThisTurn(resolveName, null);
-      if (resolved?.id) {
-        explicitResolvedItemForAuthority = resolved;
+    const fuzzyRow = fuzzyTurnNormalization.catalogCandidate;
+    const fuzzyId = normalizeId(fuzzyRow.id ?? fuzzyRow.itemId);
+    if (fuzzyId) {
+      const fuzzyName = String(fuzzyRow.name ?? "").trim();
+      const fuzzyLabel =
+        String(fuzzyRow.displayLabel ?? "").trim() || buildDisplayLabel(fuzzyRow) || fuzzyName;
+      if (!resolvedItemFromCatalog) {
+        resolvedItemFromCatalog = { ...fuzzyRow, id: fuzzyId, itemId: fuzzyId };
       }
-    } else if (catalogExplicitForAuthority.itemId) {
-      const row = normalizedCatalogForTurn.find(
-        (r) =>
-          normalizeId(r?.id) === normalizeId(catalogExplicitForAuthority.itemId)
-      );
-      if (row && typeof row === "object") {
-        explicitResolvedItemForAuthority = row;
+      if (!itemContext) {
+        itemContext = {
+          ...fuzzyRow,
+          itemId: fuzzyId,
+          id: fuzzyId,
+          name: fuzzyName,
+          displayLabel: fuzzyLabel,
+        };
       }
-    } else if (fuzzyCatalogForAuthority.itemId) {
-      const row = normalizedCatalogForTurn.find(
-        (r) => normalizeId(r?.id) === normalizeId(fuzzyCatalogForAuthority.itemId)
-      );
-      if (row && typeof row === "object") {
-        explicitResolvedItemForAuthority = row;
+      if (!matchedItemForReply) {
+        matchedItemForReply = {
+          name: fuzzyName,
+          displayLabel: fuzzyLabel,
+          id: fuzzyId,
+          itemId: fuzzyId,
+        };
       }
+      console.log("[fuzzy_catalog_seeded_for_authority]", {
+        itemId: fuzzyId,
+        itemLabel: fuzzyLabel || null,
+      });
     }
   }
+
+  const explicitResolvedItemForAuthority = extractedEntity
+    ? itemContext ?? resolvedItemFromCatalog ?? matchedItemForReply ?? null
+    : fuzzyTurnNormalization?.catalogCandidate &&
+        fuzzyTurnNormalization.catalogConfidence === "high" &&
+        !fuzzyTurnNormalization.ambiguity
+      ? itemContext ?? resolvedItemFromCatalog ?? matchedItemForReply ?? null
+      : null;
   const isItemFollowupForAuthority =
     isDetailFollowupWithoutExplicitEntity(message) ||
     (!extractedEntity && detectedIntent === "availability") ||
     (wantsImages && !extractedEntity);
-  const authoritativeItemForTurn = resolveAuthoritativeItemForTurn({
+  let authoritativeItemForTurn = resolveAuthoritativeItemForTurn({
     userText: message,
     explicitResolvedItem: explicitResolvedItemForAuthority,
     turnLockedItem: lockedItemAsContext(),
@@ -7988,6 +12367,39 @@ export async function processMessage({
     isFollowup: isItemFollowupForAuthority,
     catalogItems: normalizedCatalogForTurn,
   });
+  const fuzzyHighCatalogOverride =
+    fuzzyTurnNormalization?.catalogConfidence === "high" &&
+    fuzzyTurnNormalization.catalogCandidate &&
+    !fuzzyTurnNormalization.ambiguity &&
+    fuzzyTurnNormalization.corrections.some((c) => c.type === "catalog_item");
+  if (fuzzyHighCatalogOverride) {
+    const fuzzyRow = fuzzyTurnNormalization.catalogCandidate;
+    const fuzzyId = normalizeId(fuzzyRow.id ?? fuzzyRow.itemId);
+    const memoryId = normalizeId(
+      conversationMemory?.lastItem?.id ?? conversationMemory?.lastItem?.itemId
+    );
+    const authorityId = normalizeId(
+      authoritativeItemForTurn?.id ?? authoritativeItemForTurn?.itemId
+    );
+    if (fuzzyId && memoryId && authorityId && fuzzyId !== authorityId) {
+      console.log("[fuzzy_catalog_overrides_memory]", {
+        fuzzyItemId: fuzzyId,
+        memoryItemId: memoryId,
+        authorityItemId: authorityId,
+        reason: "HIGH_CONFIDENCE_TYPO_CATALOG_MATCH",
+      });
+    }
+    if (fuzzyId && (!authorityId || authorityId !== fuzzyId)) {
+      authoritativeItemForTurn = {
+        ...fuzzyRow,
+        id: fuzzyId,
+        itemId: fuzzyId,
+        name: String(fuzzyRow.name ?? "").trim(),
+        displayLabel:
+          String(fuzzyRow.displayLabel ?? "").trim() || buildDisplayLabel(fuzzyRow),
+      };
+    }
+  }
   if (authoritativeItemForTurn) {
     const authorityId = normalizeId(
       authoritativeItemForTurn.id ?? authoritativeItemForTurn.itemId
@@ -8587,20 +12999,28 @@ export async function processMessage({
     conversationMemory?.durationPreference
   );
   const memoryBookingItemId =
-    normalizeId(effectiveMemoryForTurn?.lastItem?.id) ||
-    normalizeId(effectiveMemoryForTurn?.lastResolvedItemId);
-  const memoryBookingItemName = String(effectiveMemoryForTurn?.lastItem?.name ?? "").trim();
+    normalizeId(conversationMemory?.lastItem?.id) ||
+    normalizeId(conversationMemory?.lastResolvedItemId);
+  const memoryBookingItemName = String(conversationMemory?.lastItem?.name ?? "").trim();
   const contactParts = extractBookingContactParts(message);
   const isContactMessage = contactParts.isValid;
   const memory = conversationMemory;
   const extractedContact = isContactMessage
     ? String(contactParts.normalizedPhone || contactParts.phone || "").trim()
     : null;
-  if (isValidContactValue(extractedContact)) {
+  if (isValidContactValue(extractedContact) && !isGroupInbound) {
     memory.contact = extractedContact;
     if (contactParts.name) {
       memory.customerName = contactParts.name;
     }
+  } else if (isValidContactValue(extractedContact) && isGroupInbound) {
+    console.log("[group_logistics_mutation_blocked]", {
+      attemptedFields: ["contactPhone", ...(contactParts.name ? ["customerName"] : [])],
+      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
+      groupName: groupName || null,
+      chatKey: playwrightChatKey || null,
+      reason: "GROUP_PRIVATE_DETAIL_MUTATION_BLOCKED",
+    });
   }
   const bookingDurationDays =
     Number.isFinite(durationDays)
@@ -8653,10 +13073,20 @@ export async function processMessage({
   }
   let stage = null;
 
-  if (hasItem && !hasDurationSignal && isRelevantMessage && !wasAwaitingContact) {
+  if (hasItem && !hasDurationSignal && isRelevantMessage) {
     stage = "availability";
   } else if (hasItem && hasDurationSignal && !hasContact) {
     stage = "askContact";
+  }
+  if (stage === "askContact" && isGroupInbound) {
+    console.warn("[group_ask_contact_stage_blocked]", {
+      groupName: groupName || null,
+      chatKey: playwrightChatKey || null,
+      itemId: memoryBookingItemId || String(itemContext?.itemId ?? "").trim() || null,
+      hasDuration: hasDurationSignal,
+      reason: "PRIVATE_CONTACT_PROMPT_IN_GROUP_BLOCKED",
+    });
+    stage = null;
   }
   console.log("[intent_debug]", {
     intent,
@@ -8689,6 +13119,11 @@ export async function processMessage({
     );
   }
 
+  const alreadyAskedContact = memory?.askedContact === true;
+  if (stage === "askContact" && alreadyAskedContact) {
+    stage = null;
+  }
+
   const validStages = ["availability", "askContact"];
 
   if (!validStages.includes(stage)) {
@@ -8700,7 +13135,6 @@ export async function processMessage({
     return buildBookingBlockedResponse({
       itemName: memoryBookingItemName,
       memory: conversationMemory,
-      itemId: memoryBookingItemId,
     });
   }
   if (
@@ -8769,6 +13203,7 @@ export async function processMessage({
         itemId: memoryBookingItemId,
         itemName: memoryBookingItemName || undefined,
         durationDays: bookingDurationDays,
+        ...shortBookingCreateFields(shortBookingSelection, itemContext || memForCatalogInput?.lastItem),
         customerName:
           contactParts.name || String(memory?.customerName ?? "").trim() || undefined,
         customerPhone:
@@ -8791,7 +13226,6 @@ export async function processMessage({
       return buildBookingBlockedResponse({
         itemName: memoryBookingItemName,
         memory: conversationMemory,
-        itemId: memoryBookingItemId,
       });
     }
     if (bookingResult?.ok && typeof bookingResult.id === "string" && bookingResult.id.trim() !== "") {
@@ -8832,7 +13266,8 @@ export async function processMessage({
   }
   const blockAiForBooking =
     resolvedEmilyIntent === "booking" &&
-    Boolean(matchedItemForReply || memoryBookingItemId);
+    Boolean(matchedItemForReply || memoryBookingItemId) &&
+    !isAnswerRequestedFieldPolicy(turnIntentShape);
   if (blockAiForBooking) {
     console.log("[BLOCKING AI → booking flow]");
   }
@@ -8901,40 +13336,21 @@ export async function processMessage({
             : "fallback"
     );
   }
-  if (!skipItemResolutionForGreeting) {
-    const reconciledBeforeAvailability =
-      await reconcileItemContextWithExplicitMessage({
-        message: messageForItemResolution,
-        itemContext,
-        catalogItems: normalizedCatalogForTurn,
-        resolveCatalog: resolveCatalogThisTurn,
-        hydrateFn: hydrateItemWithAvailability,
-      });
-    if (reconciledBeforeAvailability) {
-      itemContext = reconciledBeforeAvailability;
-      syncLastItemFromItemContextIfMissing(conversationMemory, itemContext);
-    }
-  }
-  const explicitSwitchOnMessage = hasExplicitNewItemMention(
-    messageForItemResolution,
-    normalizedCatalogForTurn,
-    normalizeId(turnLockedItem?.itemId ?? turnLockedItem?.id)
-  );
-  if (turnLockedItem && !explicitSwitchOnMessage.found) {
+  if (turnLockedItem) {
     await applyTurnLockedItemContext(
       turnLockedItem.reason === "CONTACT_AFTER_ASK_CONTACT" ? "memory" : "duration"
     );
     resolvedItem = lockedItemAsContext();
   }
-  const safeItemCandidate =
-    itemContext ?? resolvedItem ?? effectiveMemoryForTurn?.lastItem ?? null;
+  const currentTurnVerifiedItem = itemContext ?? resolvedItem ?? null;
+  const safeItemCandidate = currentTurnVerifiedItem ?? memory?.lastItem ?? null;
   if (
-    safeItemCandidate === effectiveMemoryForTurn?.lastItem &&
+    safeItemCandidate === memory?.lastItem &&
     isDetailFollowupWithoutExplicitEntity(message)
   ) {
     console.log("[resolved_item_from_memory_followup]", {
-      itemId: normalizeId(effectiveMemoryForTurn?.lastItem?.id),
-      itemName: String(effectiveMemoryForTurn?.lastItem?.name ?? "").trim() || null,
+      itemId: normalizeId(memory?.lastItem?.id),
+      itemName: String(memory?.lastItem?.name ?? "").trim() || null,
     });
   }
   safeItem =
@@ -8946,52 +13362,364 @@ export async function processMessage({
             extractYearFromName(safeItemCandidate.name),
         }
       : null;
-  const explicitUnlistedCheck = !skipItemResolutionForGreeting
-    ? await resolveExplicitUnlistedMention({
-        message: messageForItemResolution,
-        itemContext,
-        catalogItems: normalizedCatalogForTurn,
-        resolveCatalog: resolveCatalogThisTurn,
-        extractedEntity: extractedEntity ?? null,
-      })
-    : null;
-  if (explicitUnlistedCheck?.notInCatalog) {
-    if (isAwaitingBookingContactCapture(conversationMemory)) {
-      console.log("[explicit_unlisted_skipped_slot_collection]", {
-        label: explicitUnlistedCheck.label,
-        reason: "AWAITING_BOOKING_CONTACT",
-      });
-    } else {
-    console.log("[explicit_unlisted_overrides_stale_memory]", explicitUnlistedCheck);
-    console.log("[final_reply_source]", {
-      source: "EXPLICIT_UNLISTED_NOT_STALE_MEMORY",
+  const safeItemSource = resolveSafeItemSource({
+    itemContext,
+    resolvedItem,
+    memory,
+    safeItem,
+  });
+  const previousAssistantOfferedAlternative = (() => {
+    const assistantReplies = mergeAssistantReplyListsForNorm(
+      extractRecentAssistantTextsFromPromptBlock(history, 4),
+      getRecentAssistantReplies(userId, 4, sessionKey),
+      6
+    );
+    return assistantReplies.some((reply) =>
+      assistantReplySignalsCatalogSelectionPrompt(String(reply ?? ""))
+    );
+  })();
+  const collectDurationSelectionContext =
+    previousAssistantOfferedAlternative ||
+    /^(?:browsing|browse|options?|select_item|item_selection)$/i.test(
+      String(memory?.stage ?? "")
+    ) ||
+    /^(?:browsing|browse|options?|select_item|item_selection)$/i.test(
+      String(memoryPreEmily?.stage ?? "")
+    ) ||
+    String(memoryPreEmily?.bookingBlockedReason ?? "") === "ITEM_ALREADY_BOOKED" ||
+    String(memory?.bookingBlockedReason ?? "") === "ITEM_ALREADY_BOOKED";
+  async function resolveCollectDurationCurrentTurnItem() {
+    if (currentTurnVerifiedCatalogItemForSelection) {
+      return currentTurnVerifiedCatalogItemForSelection;
+    }
+    const latestSeg = getLatestUserSegmentForGuard(message);
+    const normalizedQuery = computeCollectDurationCatalogQuery(message);
+    const legacyWholeMessageStrip = String(message ?? "")
+      .replace(/[?؟!.,]+$/g, "")
+      .trim();
+    console.log("[collect_duration_resolver_input]", {
+      rawMessagePreview: String(message ?? "").trim().slice(0, 220) || null,
+      latestUserSegment: latestSeg || null,
+      normalizedSelectionQuery: normalizedQuery || null,
+      legacyWholeMessageStripPreview: legacyWholeMessageStrip.slice(0, 220) || null,
     });
-    logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
-      source: "EXPLICIT_UNLISTED_NOT_STALE_MEMORY",
+    if (normalizedQuery.length < 2) return null;
+    const resolved = await resolveCatalogThisTurn(normalizedQuery, null);
+    if (!resolved?.id) return null;
+    const itemId = normalizeId(resolved.id);
+    if (!itemId) return null;
+    return hydrateItemWithAvailability(
+      {
+        ...resolved,
+        id: itemId,
+        itemId,
+        name: String(resolved.name ?? "").trim(),
+        displayLabel:
+          String(resolved.displayLabel ?? "").trim() ||
+          buildDisplayLabel(resolved) ||
+          String(resolved.name ?? "").trim(),
+      },
+      "verified_item_selection"
+    );
+  }
+
+  function ambiguousCollectDurationCandidateLabels() {
+    const query = computeCollectDurationCatalogQuery(message);
+    const inputTokens = tokenizeCatalogMatch(query).filter((token) => token.length >= 3);
+    if (inputTokens.length === 0) return [];
+    const matches = [];
+    for (const row of normalizedCatalogForTurn) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+      const label = buildDisplayLabel(row) || String(row.name ?? "").trim();
+      if (!label) continue;
+      const labelTokens = tokenizeCatalogMatch(label);
+      const allInputTokensMatch = inputTokens.every((inputToken) =>
+        labelTokens.some((labelToken) => catalogTokensLikelySameWord(inputToken, labelToken))
+      );
+      if (allInputTokensMatch) matches.push(label);
+    }
+    return Array.from(new Set(matches)).slice(0, 5);
+  }
+
+  async function maybeStoreCollectDurationFromVerifiedSelection(route) {
+    const routeName = String(route ?? "").trim() || "unknown";
+    const resolvedSelectionItem = await resolveCollectDurationCurrentTurnItem();
+    const hasParticipantSession = Boolean(
+      sourceParticipantKey &&
+        (normalizedPlaywrightChatKey || normalizedSessionKey) &&
+        emilySessionKey
+    );
+    const collectDurationAvailabilityQuestion =
+      isAvailabilityQuestionForCollectDurationGuard(message);
+    const decision = collectDurationSelectionGuardDecision({
+      message,
+      item: resolvedSelectionItem,
+      route: routeName,
+      isAlternativeContext: collectDurationSelectionContext,
+      hasParticipantSession,
+      hasDurationSignal,
+      isContactMessage,
+      isAvailabilityQuestion: collectDurationAvailabilityQuestion,
+    });
+    console.log("[collect_duration_candidate_detected]", {
+      itemId: decision.itemId,
+      itemDisplayLabel: decision.itemDisplayLabel,
+      route: decision.route,
+      isAlternativeContext: decision.isAlternativeContext,
+      isInformationalQuestion: decision.isInformationalQuestion,
+      hasParticipantSession: decision.hasParticipantSession,
+      availabilityStatus: decision.availabilityStatus,
+    });
+    if (
+      !resolvedSelectionItem &&
+      decision.reason === "NO_VERIFIED_CURRENT_TURN_ITEM" &&
+      decision.isAlternativeContext &&
+      decision.hasParticipantSession &&
+      !decision.isInformationalQuestion &&
+      !hasDurationSignal &&
+      !isContactMessage &&
+      !collectDurationAvailabilityQuestion
+    ) {
+      const ambiguousLabels = ambiguousCollectDurationCandidateLabels();
+      if (ambiguousLabels.length > 1) {
+        const inputLabel = computeCollectDurationCatalogQuery(message);
+        console.log("[collect_duration_candidate_skipped]", {
+          reason: "AMBIGUOUS_ITEM_SELECTION",
+          itemId: null,
+          itemDisplayLabel: null,
+          route: decision.route,
+          hasStableItemId: false,
+          hasAvailability: false,
+          isAlternativeContext: decision.isAlternativeContext,
+          isInformationalQuestion: decision.isInformationalQuestion,
+          hasParticipantSession: decision.hasParticipantSession,
+          candidateLabels: ambiguousLabels,
+        });
+        return applyHybridOutboundResult(
+          {
+            reply: inputLabel
+              ? `Kaunsi ${inputLabel} chahiye?`
+              : "Kaunsa option chahiye?",
+            type: "AI_MESSAGE",
+            messageMeta: {
+              ...messageMetaForKnowledge(hasUsefulBusinessData),
+              pendingActionType: null,
+              itemSelectionAmbiguous: true,
+            },
+          },
+          routingCtx,
+          aiRouteModeFromModel
+        );
+      }
+    }
+    if (
+      !decision.ok &&
+      decision.reason === "ITEM_UNAVAILABLE" &&
+      collectDurationSelectionContext &&
+      resolvedSelectionItem &&
+      typeof resolvedSelectionItem === "object" &&
+      normalizeId(resolvedSelectionItem.id ?? resolvedSelectionItem.itemId) &&
+      !decision.isInformationalQuestion &&
+      !collectDurationAvailabilityQuestion
+    ) {
+      const itemLabel =
+        decision.itemDisplayLabel ||
+        buildDisplayLabel(resolvedSelectionItem) ||
+        String(resolvedSelectionItem.name ?? "").trim() ||
+        "yeh option";
+      const styleKey =
+        conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+      console.log("[collect_duration_option_selection_unavailable]", {
+        itemId: normalizeId(resolvedSelectionItem.id ?? resolvedSelectionItem.itemId) || null,
+        itemDisplayLabel: itemLabel,
+        route: decision.route,
+      });
+      const replyText = await resolveStructuredUnavailableCustomerReply({
+        userId,
+        catalogRow: resolvedSelectionItem,
+        availabilitySnapshot: {
+          blockingStatusesSeen: Array.isArray(resolvedSelectionItem.blockingStatusesSeen)
+            ? resolvedSelectionItem.blockingStatusesSeen
+            : [],
+        },
+        normalizedCatalogForTurn,
+        styleKey,
+        conversationStyle,
+        traceId,
+        logKind: "booking_blocked",
+        memory,
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: replyText,
+          type: "AI_MESSAGE",
+          messageMeta: {
+            ...messageMetaForKnowledge(hasUsefulBusinessData),
+            pendingActionType: null,
+            bookingBlocked: true,
+            reason: "ALREADY_BOOKED",
+          },
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
+    }
+    if (
+      !decision.ok &&
+      decision.reason === "AVAILABILITY_UNKNOWN" &&
+      collectDurationSelectionContext &&
+      resolvedSelectionItem &&
+      typeof resolvedSelectionItem === "object" &&
+      normalizeId(resolvedSelectionItem.id ?? resolvedSelectionItem.itemId) &&
+      !decision.isInformationalQuestion &&
+      !collectDurationAvailabilityQuestion
+    ) {
+      const itemLabel =
+        decision.itemDisplayLabel ||
+        buildDisplayLabel(resolvedSelectionItem) ||
+        String(resolvedSelectionItem.name ?? "").trim() ||
+        "";
+      console.log("[collect_duration_option_selection_availability_unknown]", {
+        itemId: normalizeId(resolvedSelectionItem.id ?? resolvedSelectionItem.itemId) || null,
+        itemDisplayLabel: itemLabel || null,
+        route: decision.route,
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: buildCollectDurationAvailabilityUnknownReply({
+            itemLabel,
+            style: conversationStyle,
+          }),
+          type: "AI_MESSAGE",
+          messageMeta: {
+            ...messageMetaForKnowledge(hasUsefulBusinessData),
+            pendingActionType: null,
+          },
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
+    }
+    if (!decision.ok) {
+      console.log("[collect_duration_candidate_skipped]", {
+        reason: decision.reason,
+        itemId: decision.itemId,
+        itemDisplayLabel: decision.itemDisplayLabel,
+        route: decision.route,
+        hasStableItemId: decision.hasStableItemId,
+        hasAvailability: decision.hasAvailability,
+        isAlternativeContext: decision.isAlternativeContext,
+        isInformationalQuestion: decision.isInformationalQuestion,
+        hasParticipantSession: decision.hasParticipantSession,
+      });
+      return null;
+    }
+
+    const itemId = decision.itemId;
+    const itemDisplayLabel = decision.itemDisplayLabel;
+    const memoryItem = {
+      ...(resolvedSelectionItem && typeof resolvedSelectionItem === "object"
+        ? resolvedSelectionItem
+        : {}),
+      id: itemId,
+      itemId,
+      name: itemDisplayLabel,
+      displayLabel: itemDisplayLabel,
+    };
+    memory.lastItem = memoryItem;
+    memory.lastItemMentioned = itemDisplayLabel;
+    setLastResolvedItemId(memory, itemId);
+    memory.stage = "awaiting_duration";
+    memory.hasBookingIntent = true;
+    memory.askedContact = false;
+
+    const reply = `${itemDisplayLabel} available hai. Kitne time ke liye chahiye?`;
+    const pendingAction = buildPendingAction({
+      type: PENDING_ACTION_TYPES.COLLECT_DURATION,
+      expectedReplyType: "duration",
+      participantKey: sourceParticipantKey || "",
+      groupChatKey: normalizedPlaywrightChatKey || normalizedSessionKey || "",
+      sessionKey: emilySessionKey,
+      itemId,
+      itemDisplayLabel,
+      payload: {
+        source: "verified_item_selection",
+        availabilityStatus: decision.availabilityStatus,
+        explicitPriceIntent: false,
+      },
+      sourceMessageId: messageId,
+      sourcePromptText: reply,
+    });
+    const stored = storePendingAction(memory, pendingAction);
+    console.log("[collect_duration_pending_action_stored]", {
+      itemId,
+      itemDisplayLabel,
+      participantKey: sourceParticipantKey || null,
+      groupChatKey: normalizedPlaywrightChatKey || normalizedSessionKey || null,
+      sessionKey: emilySessionKey,
+      expiresAt: stored?.expiresAt ?? null,
     });
     return applyHybridOutboundResult(
       {
-        reply: buildNotListedReply({
-          itemLabel: explicitUnlistedCheck.label,
-          style: conversationStyle,
-          catalogItems: normalizedCatalogForTurn,
-        }),
+        reply,
         type: "AI_MESSAGE",
-        messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        messageMeta: {
+          ...messageMetaWithOutboundTrace(
+            hasUsefulBusinessData,
+            buildOutboundTrace({
+              kind: ASSISTANT_OUTBOUND_KIND.ACTIONABLE_PROMPT,
+              finalReplySource: "COLLECT_DURATION_PROMPT",
+              pendingActionTypeStored: PENDING_ACTION_TYPES.COLLECT_DURATION,
+              collectDurationPrompt: true,
+            })
+          ),
+          pendingActionType: PENDING_ACTION_TYPES.COLLECT_DURATION,
+          itemContext: {
+            itemId,
+            itemName: itemDisplayLabel,
+          },
+        },
       },
       routingCtx,
       aiRouteModeFromModel
     );
-    }
   }
   if (
     isAvailabilityQuestion &&
     itemContext != null &&
     typeof itemContext === "object" &&
     itemContext.isAvailable === false &&
-    !explicitUnlistedCheck?.contextMismatch &&
-    !isAwaitingBookingContactCapture(conversationMemory)
+    !isAnswerRequestedFieldPolicy(turnIntentShape)
   ) {
+    const earlyTimingTurn = availabilityTimingUnknownTurnIfRouted({
+      message,
+      memory,
+      prioritizedIntent,
+      llmIntentClassification,
+      conversationHistory,
+      userId,
+      sessionKey: emilySessionKey,
+      normalizedCatalogForTurn,
+      emilyTurn,
+      conversationStyle,
+      safeItemSource,
+      routeLogSource: "pre_early_stock_availability",
+    });
+    if (earlyTimingTurn) {
+      console.log("[final_reply_source]", { source: "AVAILABILITY_TIMING_UNKNOWN" });
+      logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
+        source: "AVAILABILITY_TIMING_UNKNOWN",
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: earlyTimingTurn.reply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
+    }
     const itemLabel =
       buildDisplayLabel(itemContext) ||
       String(itemContext.name ?? "").trim() ||
@@ -8999,6 +13727,70 @@ export async function processMessage({
     const blockingStatusesSeen = Array.isArray(itemContext.blockingStatusesSeen)
       ? itemContext.blockingStatusesSeen
       : [];
+    const reqId = String(itemContext.itemId ?? "").trim() || null;
+    const altRows = Array.isArray(itemContext.alternativeItems)
+      ? itemContext.alternativeItems
+      : [];
+    const topItems = altRows
+      .map((a) => {
+        const id = String(a.id ?? "").trim();
+        const match = normalizedCatalogForTurn.find(
+          (r) => String(r.id ?? r.itemId ?? "").trim() === id
+        );
+        return match
+          ? catalogRowToTopAvailabilityItem(
+              /** @type {Record<string, unknown>} */ (match),
+              buildDisplayLabel
+            )
+          : {
+              itemId: id,
+              displayLabel: String(a.name ?? "").trim(),
+              priceDaily: null,
+              category: null,
+              tags: [],
+            };
+      })
+      .slice(0, 5);
+    const summarySkipped = itemContext.alternativeSummarySkipped === true;
+    const summaryStatus = summarySkipped ? "missing" : "fresh";
+    const otherAvailableCount = summarySkipped ? 0 : altRows.length;
+    const styleKey =
+      conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+    const availabilityCtx = buildAvailabilityContextSkeleton({
+      intent: "item_availability",
+      requestedItem: {
+        itemId: reqId,
+        displayLabel: itemLabel,
+        availabilityStatus: "unavailable",
+        blockingReason:
+          blockingStatusesSeen.length > 0
+            ? String(blockingStatusesSeen[0])
+            : "ALREADY_BOOKED",
+      },
+      inventorySummary: {
+        status: summaryStatus,
+        totalItems: normalizedCatalogForTurn.length,
+        availableCount: otherAvailableCount,
+        unavailableCount: null,
+        topAvailableItems: topItems,
+        maxItemsShown: 5,
+      },
+      policy: {},
+      alternativeSummarySkipped: summarySkipped,
+    });
+    const reply = await resolveAvailabilityCustomerReply({
+      availabilityCtx,
+      userMessage: message,
+      styleKey,
+      __availabilityAiCompletionForTests,
+    });
+    console.log("[availability_context_built]", {
+      intent: availabilityCtx.intent,
+      summaryStatus: availabilityCtx.inventorySummary.status,
+      availableCount: availabilityCtx.inventorySummary.availableCount,
+      topItemCount: availabilityCtx.inventorySummary.topAvailableItems.length,
+      requestedItemId: availabilityCtx.requestedItem?.itemId ?? null,
+    });
     console.log("[availability_check_initial]", {
       itemId: String(itemContext.itemId ?? "").trim() || null,
       itemLabel: itemLabel || null,
@@ -9012,13 +13804,20 @@ export async function processMessage({
     logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
       source: "AVAILABILITY_BLOCKED_EARLY",
     });
+    if (!summarySkipped && summaryStatus === "fresh" && otherAvailableCount === 0) {
+      clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptions({
+        chatContextKey,
+        nextChatContext,
+        source: "item_availability_unavailable",
+        availableCount: 0,
+        summaryStatus: "fresh",
+        reason: "ITEM_UNAVAILABLE_NO_ALTERNATIVES_FRESH",
+      });
+      markAvailabilityFreshNoOtherOptionsStructured(memory);
+    }
     return applyHybridOutboundResult(
       {
-        reply: buildUnavailableReplyForTurn({
-          itemLabel,
-          style: conversationStyle,
-          branch: "AVAILABILITY_BLOCKED_EARLY",
-        }),
+        reply,
         type: "AI_MESSAGE",
         messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
       },
@@ -9047,7 +13846,7 @@ export async function processMessage({
     });
   }
 
-  const conversationRoute = decideConversationRoute({
+  let conversationRoute = decideConversationRoute({
     message,
     selectedItem: safeItem,
     memory,
@@ -9056,6 +13855,28 @@ export async function processMessage({
     isApprovalAction: false,
     intentClassification: prioritizedIntent,
   });
+  if (isAnswerRequestedFieldPolicy(turnIntentShape)) {
+    const detectedFieldForRoute =
+      resolveItemlessPriceDurationAskedField(message) || detectAskedField(message);
+    const shapeAskedField =
+      turnIntentShape.requestedField === "photo"
+        ? "media"
+        : detectedFieldForRoute === "price_with_duration"
+          ? "price_with_duration"
+          : turnIntentShape.requestedField === "price"
+            ? "price"
+            : turnIntentShape.requestedField ?? "unknown";
+    conversationRoute = {
+      routeType: "INFORMATIONAL_QUESTION",
+      selectedItem: safeItem,
+      shouldBypassPhraseEngine: true,
+      shouldContinueFlow: false,
+      missingFields: [],
+      reason: "intent_shape_answer_requested_field",
+      askedField: shapeAskedField,
+    };
+  }
+  routeTypeForProcessMessageLog = String(conversationRoute?.routeType ?? "").trim() || null;
   console.log("[conversation_route_decided]", {
     routeType: conversationRoute.routeType,
     shouldBypassPhraseEngine: conversationRoute.shouldBypassPhraseEngine,
@@ -9082,6 +13903,36 @@ export async function processMessage({
     explicitPricingOrDetailsQuestion: isExplicitPricingOrDetailsQuestion(message),
   });
 
+  const globalTimingTurn = availabilityTimingUnknownTurnIfRouted({
+    message,
+    memory,
+    prioritizedIntent,
+    llmIntentClassification,
+    conversationHistory,
+    userId,
+    sessionKey: emilySessionKey,
+    normalizedCatalogForTurn,
+    emilyTurn,
+    conversationStyle,
+    safeItemSource,
+    routeLogSource: "global_route_order",
+  });
+  if (globalTimingTurn) {
+    console.log("[final_reply_source]", { source: "AVAILABILITY_TIMING_UNKNOWN" });
+    logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
+      source: "AVAILABILITY_TIMING_UNKNOWN",
+    });
+    return applyHybridOutboundResult(
+      {
+        reply: globalTimingTurn.reply,
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+      },
+      routingCtx,
+      aiRouteModeFromModel
+    );
+  }
+
   const explicitPricingOrDetailsQuestionRoute =
     isExplicitPricingOrDetailsQuestion(message);
   const strongBookingCommitForShortcut =
@@ -9095,21 +13946,13 @@ export async function processMessage({
     );
   const ownerApprovalBlockedByPricingIntent =
     explicitPricingOrDetailsQuestionRoute && !strongBookingCommitForShortcut;
-  const commitOnlyReadyForOwnerApproval =
-    bookingCommitOnlyThisTurn &&
-    Boolean(
-      normalizeId(itemContext?.itemId) ||
-        memoryBookingItemId ||
-        normalizeId(conversationMemory?.lastItem?.id)
-    ) &&
-    hasDurationSignal === true;
   const shouldRunGroupOwnerApprovalAfterDuration =
     ownerApprovalFirst &&
     Boolean(isGroupInbound) &&
     !bookingCreated &&
     hasDurationSignal === true &&
     !hasContact &&
-    (bookingContinuationShapedForShortcut || commitOnlyReadyForOwnerApproval) &&
+    bookingContinuationShapedForShortcut &&
     !ownerApprovalBlockedByPricingIntent;
 
   if (
@@ -9163,58 +14006,22 @@ export async function processMessage({
     reason: ownerShortcutReason,
   });
 
-  if (bookingCommitOnlyThisTurn && !bookingCreated) {
-    const commitItemId =
-      normalizeId(itemContext?.itemId) ||
-      memoryBookingItemId ||
-      normalizeId(conversationMemory?.lastItem?.id);
-    const commitDuration =
-      Number.isFinite(bookingDurationDays) && bookingDurationDays != null
-        ? Math.max(1, Math.floor(Number(bookingDurationDays)))
-        : Number.isFinite(durationDays)
-          ? Math.max(1, Math.floor(Number(durationDays)))
-          : conversationMemory?.lastDuration != null &&
-              Number.isFinite(Number(conversationMemory.lastDuration))
-            ? Math.max(1, Math.floor(Number(conversationMemory.lastDuration)))
-            : null;
-    const missingCommitItem = !commitItemId;
-    const missingCommitDuration = commitDuration == null;
-    if (missingCommitItem || missingCommitDuration) {
-      console.log("[booking_commit_ai_fallback_blocked]", {
-        messagePreview: String(message ?? "").trim().slice(0, 160) || null,
-        reason: "COMMIT_ONLY_STRUCTURED_CONTEXT_REQUIRED",
-        missingItem: missingCommitItem,
-        missingDuration: missingCommitDuration,
-      });
-      const commitReply = buildCommitOnlyMissingContextReply({
-        missingItem: missingCommitItem,
-        missingDuration: missingCommitDuration,
-        style: conversationStyle,
-        catalogItems: normalizedCatalogForTurn,
-      });
-      if (commitReply) {
-        return applyHybridOutboundResult(
-          {
-            reply: commitReply,
-            text: commitReply,
-            type: "AI_MESSAGE",
-            messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
-          },
-          routingCtx
-        );
-      }
-    }
-  }
-
   if (
     isConversationAiRoute(conversationRoute) &&
-    !shouldRunGroupOwnerApprovalAfterDuration &&
-    !bookingCommitOnlyThisTurn
+    !shouldRunGroupOwnerApprovalAfterDuration
   ) {
     console.log("[phrase_engine_bypassed]", {
       routeType: conversationRoute.routeType,
       reason: conversationRoute.reason,
     });
+    if (isInformationalRoute(conversationRoute)) {
+      const collectDurationSelection = await maybeStoreCollectDurationFromVerifiedSelection(
+        conversationRoute.routeType
+      );
+      if (collectDurationSelection) {
+        return collectDurationSelection;
+      }
+    }
     const routerContextData = {
       ...contextData,
       requiresDuration: false,
@@ -9305,14 +14112,104 @@ export async function processMessage({
     let composedAnswer = null;
     const replyBeforeComposer = finalRoutedReply;
     if (isInformationalRoute(conversationRoute)) {
-      const composerItem = mergeComposerCatalogItem(safeItem, normalizedCatalogForTurn);
+      const initialComposerItem = mergeComposerCatalogItem(
+        safeItem,
+        normalizedCatalogForTurn
+      );
+      let composerItem = initialComposerItem;
+      const upgradeResult = maybeUpgradePartialItemFromCatalog({
+        partialItem: initialComposerItem ?? safeItem,
+        catalogItems: normalizedCatalogForTurn,
+        userMessage: message,
+        memoryContext: memory,
+      });
+      if (upgradeResult.status === "matched") {
+        composerItem = mergeComposerCatalogItem(
+          upgradeResult.item,
+          normalizedCatalogForTurn
+        );
+        console.log("[composer_item_upgraded_from_catalog]", {
+          hadItemIdBefore:
+            normalizeId(initialComposerItem?.itemId ?? initialComposerItem?.id) !== "",
+          hasItemIdAfter:
+            normalizeId(composerItem?.itemId ?? composerItem?.id) !== "",
+          hadPricingBefore: itemHasPricingData(initialComposerItem),
+          hasPricingAfter: itemHasPricingData(composerItem),
+          matchReason: upgradeResult.matchReason,
+          ambiguityCount: 0,
+          itemName:
+            String(composerItem?.displayLabel ?? composerItem?.name ?? "").trim() ||
+            null,
+          itemId: normalizeId(composerItem?.itemId ?? composerItem?.id) || null,
+        });
+      } else if (upgradeResult.status === "ambiguous") {
+        const matches = Array.isArray(upgradeResult.matches)
+          ? upgradeResult.matches
+          : [];
+        console.log("[composer_item_upgrade_ambiguous]", {
+          queryPreview: String(message ?? "").slice(0, 120),
+          candidateCount: matches.length,
+          candidateNames: matches
+            .map((candidate) =>
+              String(candidate?.displayLabel ?? candidate?.name ?? "").trim()
+            )
+            .filter(Boolean)
+            .slice(0, 8),
+          reason: upgradeResult.reason,
+        });
+      }
+      const askedFieldForComposer = String(
+        conversationRoute.askedField ?? prioritizedIntent.askedField ?? ""
+      )
+        .trim()
+        .toLowerCase();
+      let composedViaOptionGate = false;
+      if (
+        collectDurationSelectionContext &&
+        askedFieldForComposer === "model" &&
+        isBareCatalogSelectionMessageShapeForComposer(message) &&
+        composerItem &&
+        normalizeId(composerItem.itemId ?? composerItem.id)
+      ) {
+        const hydratedForGate =
+          typeof composerItem.isAvailable === "boolean"
+            ? composerItem
+            : await hydrateItemWithAvailability(composerItem, "fallback");
+        if (hydratedForGate && hydratedForGate.isAvailable === false) {
+          const itemLabel =
+            buildDisplayLabel(hydratedForGate) ||
+            String(hydratedForGate.displayLabel ?? hydratedForGate.name ?? "").trim() ||
+            "yeh option";
+          composedAnswer = {
+            reply: buildUnavailableReply({
+              itemLabel,
+              style: conversationStyle,
+            }),
+            field: "availability",
+            source: "option_selection_unavailable_gate",
+            unknownHumanized: false,
+            finalAuthority: true,
+            answerKnown: true,
+          };
+          composedViaOptionGate = true;
+          console.log("[answer_composer_option_selection_unavailable]", {
+            itemId: normalizeId(hydratedForGate.itemId ?? hydratedForGate.id) || null,
+            itemLabel,
+          });
+        }
+      }
+      if (!composedViaOptionGate) {
         composedAnswer = composeInformationalAnswer({
           message,
           draftReply: finalRoutedReply,
           item: composerItem,
           businessContext,
-        askedField: conversationRoute.askedField ?? prioritizedIntent.askedField,
+          askedField:
+            priceDurationFollowupWithSafeItem
+              ? resolveItemlessPriceDurationAskedField(message) || "price_with_duration"
+              : conversationRoute.askedField ?? prioritizedIntent.askedField,
         });
+      }
       finalRoutedReply = composedAnswer.reply;
       console.log("[answer_composer_applied]", {
         field: composedAnswer.field,
@@ -9337,6 +14234,26 @@ export async function processMessage({
       if (composedAnswer.unknownHumanized) {
         console.log("[unknown_answer_humanized]", {
           field: composedAnswer.field,
+        });
+      }
+      if (
+        shouldStoreLastVerifiedCatalogAnswer({
+          composedAnswer,
+          composerItem,
+          conversationRoute,
+        })
+      ) {
+        storeLastVerifiedCatalogAnswer({
+          memory: conversationMemory,
+          item: composerItem,
+          composedAnswer,
+          requestedField: normalizeVerifiedCatalogPricingRequestedField(
+            conversationRoute.askedField ?? prioritizedIntent.askedField ?? composedAnswer.field
+          ),
+          participantKey: sourceParticipantKey || "",
+          chatContextKey,
+          sessionKey: emilySessionKey,
+          traceId,
         });
       }
     }
@@ -9458,39 +14375,21 @@ export async function processMessage({
       routeType: conversationRoute.routeType,
       chars: String(finalRoutedReply ?? "").length,
     });
-    const informationalPersistSource =
-      composedAnswer?.field === "price" || composedAnswer?.field === "pricing"
-        ? "pricing"
-        : composedAnswer?.field === "availability"
-          ? "availability"
-          : "informational";
-    if (isInformationalRoute(conversationRoute)) {
-      scheduleBookingCommitContextPersist(routingCtx, {
-        memory: conversationMemory,
-        itemContext,
-        durationDays:
-          Number.isFinite(bookingDurationDays) && bookingDurationDays != null
-            ? bookingDurationDays
-            : Number.isFinite(durationDays)
-              ? durationDays
-              : conversationMemory?.lastDuration != null &&
-                  Number.isFinite(Number(conversationMemory.lastDuration))
-                ? Math.max(1, Math.floor(Number(conversationMemory.lastDuration)))
-                : null,
-        sessionKey: emilySessionKey,
-        source: informationalPersistSource,
-        messagePreview: String(message ?? "").slice(0, 120) || null,
-        detectedIntent,
-        catalogItems: normalizedCatalogForTurn,
-        replyText: String(finalRoutedReply ?? "").slice(0, 200) || null,
-      });
-    }
     return applyHybridOutboundResult(
       {
         reply: finalRoutedReply,
         text: finalRoutedReply,
         type: "AI_MESSAGE",
-        messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        messageMeta: messageMetaWithOutboundTrace(
+          hasUsefulBusinessData,
+          buildOutboundTrace({
+            finalReplySource: "INFORMATIONAL_COMPOSER",
+            routeType: conversationRoute.routeType,
+            responsePolicy: turnIntentShape?.responsePolicy ?? null,
+            askedField: composedAnswer?.field ?? conversationRoute.askedField ?? null,
+            composedAnswerSource: composedAnswer?.source ?? null,
+          })
+        ),
       },
       routingCtx,
       routedMode
@@ -9505,48 +14404,65 @@ export async function processMessage({
     const approvalDurationDays = Number.isFinite(bookingDurationDays)
       ? Math.max(1, Math.floor(Number(bookingDurationDays)))
       : null;
-    const approvalContinuation = isSameSessionBookingContinuation({
-      memory: conversationMemory,
-      emilySessionKey,
-      itemId: approvalItemId,
-      message,
-      extractedDurationDays: extracted.durationDays ?? bookingDurationDays ?? null,
-      contactValid: contactParts.isValid,
-      events,
-    });
-    const inventoryBlockedForApproval =
+    const approvalHydratedAvailable =
       itemContext != null &&
       typeof itemContext === "object" &&
-      itemContext.isAvailable === false;
-    const approvalAvailable = !inventoryBlockedForApproval || approvalContinuation;
+      itemContext.isAvailable === true;
     console.log("[group_contact_request_blocked]", {
       itemId: approvalItemId,
       hasDuration: approvalDurationDays != null,
       hasContact,
-      isAvailable: approvalAvailable,
-      approvalContinuation,
+      isAvailable: approvalHydratedAvailable,
       reason: "OWNER_APPROVAL_FIRST",
     });
 
     if (
       approvalItemId &&
       approvalDurationDays != null &&
-      approvalContinuation &&
-      inventoryBlockedForApproval
+      itemContext != null &&
+      typeof itemContext === "object" &&
+      itemContext.isAvailable === false
     ) {
-      const approvalItemName =
-        buildDisplayLabel(itemContext) ||
-        String(itemContext?.name ?? "").trim() ||
-        memoryBookingItemName ||
-        undefined;
-      return buildBookingBlockedResponse({
-        itemName: approvalItemName,
+      const styleKeyApproval =
+        conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+      const approvalBlockReply = await resolveStructuredUnavailableCustomerReply({
+        userId,
+        catalogRow: itemContext,
+        availabilitySnapshot: {
+          blockingStatusesSeen: Array.isArray(itemContext.blockingStatusesSeen)
+            ? itemContext.blockingStatusesSeen
+            : [],
+        },
+        normalizedCatalogForTurn,
+        styleKey: styleKeyApproval,
+        conversationStyle,
+        traceId,
+        logKind: "booking_blocked",
         memory: conversationMemory,
-        itemId: approvalItemId,
       });
+      console.log("[group_owner_approval_blocked_hydrated_unavailable]", {
+        itemId: approvalItemId,
+        durationDays: approvalDurationDays,
+      });
+      console.log("[final_reply_source]", {
+        source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: approvalBlockReply,
+          type: "AI_MESSAGE",
+          messageMeta: {
+            ...messageMetaForKnowledge(hasUsefulBusinessData),
+            bookingBlocked: true,
+            reason: "ALREADY_BOOKED",
+          },
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
     }
 
-    if (approvalItemId && approvalDurationDays != null && approvalAvailable) {
+    if (approvalItemId && approvalDurationDays != null && approvalHydratedAvailable) {
       const duplicateApproval = isDuplicateActiveBookingState(memory, {
         itemId: approvalItemId,
         durationDays: approvalDurationDays,
@@ -9593,6 +14509,10 @@ export async function processMessage({
         String(itemContext?.name ?? "").trim() ||
         memoryBookingItemName ||
         undefined;
+      const approvalShortBookingFields = shortBookingCreateFields(
+        shortBookingSelection,
+        itemContext || memForCatalogInput?.lastItem
+      );
       const approvalResult = await createBookingFromValidatedIntent({
         callerTag: "group_owner_approval_flow",
         isGroupInbound,
@@ -9608,6 +14528,7 @@ export async function processMessage({
           itemId: approvalItemId,
           itemName: approvalItemName,
           durationDays: approvalDurationDays,
+          ...approvalShortBookingFields,
           source,
           groupName,
           sessionKey,
@@ -9628,7 +14549,6 @@ export async function processMessage({
         return buildBookingBlockedResponse({
           itemName: approvalItemName,
           memory: conversationMemory,
-          itemId: approvalItemId,
         });
       }
 
@@ -9644,6 +14564,7 @@ export async function processMessage({
           itemId: approvalItemId,
           itemName: approvalItemName,
           durationDays: approvalDurationDays,
+          ...approvalShortBookingFields,
           status: "pending_approval",
           approvalStage: "pending_owner_approval",
         };
@@ -9674,6 +14595,7 @@ export async function processMessage({
           itemId: approvalItemId,
           itemName: approvalItemName,
           durationDays: approvalDurationDays,
+          ...approvalShortBookingFields,
           ownerApprovalFirstRequest: true,
           memory: conversationMemory,
         });
@@ -9735,48 +14657,85 @@ export async function processMessage({
           buildDisplayLabel(itemContext) ||
           String(itemContext?.name ?? "").trim() ||
           memoryBookingItemName;
-        const askContactContinuation = isSameSessionBookingContinuation({
-          memory: conversationMemory,
-          emilySessionKey,
-          itemId: guardItemId,
-          message,
-          extractedDurationDays: extracted.durationDays ?? bookingDurationDays ?? null,
-          contactValid: contactParts.isValid,
-          events,
-        });
-        if (askContactContinuation) {
-          const reply = buildSameSessionContinuationReply({
-            memory: conversationMemory,
-            itemName: itemLabel,
+        const styleKey =
+          conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+        const ic = itemContext && typeof itemContext === "object" ? itemContext : null;
+        const catalogRow =
+          ic &&
+          normalizeId(ic.itemId ?? ic.id)
+            ? {
+                ...ic,
+                id: String(ic.itemId ?? ic.id ?? "").trim(),
+                itemId: String(ic.itemId ?? ic.id ?? "").trim(),
+                name: String(ic.name ?? "").trim() || String(itemLabel ?? "").trim(),
+              }
+            : null;
+        if (
+          /^true$/i.test(String(process.env.AVAILABILITY_PATH_MISMATCH_LOG ?? "").trim())
+        ) {
+          console.log("[availability_path_mismatch_detected]", {
+            traceId: traceId || null,
+            itemId: guardItemId,
+            earlyBookingAvailable: null,
+            hydratedAvailable: false,
+            earlyBlockingStatusesSeen: null,
+            hydratedBlockingStatusesSeen: Array.isArray(ic?.blockingStatusesSeen)
+              ? ic.blockingStatusesSeen
+              : [],
+            earlyReason: null,
+            hydratedReason: ic?.availabilityReason ?? null,
+            requestedStart: null,
+            requestedEnd: null,
+            note: "ask_contact_guard_hydrated_unavailable_no_early_snapshot",
+          });
+        }
+        let structuredReply = null;
+        if (catalogRow) {
+          try {
+            structuredReply = await buildBookingDurationUnavailableStructuredCustomerReply({
+              userId,
+              catalogRow,
+              availabilitySnapshot: {
+                blockingStatusesSeen: Array.isArray(ic?.blockingStatusesSeen)
+                  ? ic.blockingStatusesSeen
+                  : [],
+              },
+              normalizedCatalogForTurn,
+              styleKey,
+              traceId,
+              logKind: "booking_blocked",
+              memory,
+            });
+          } catch (err) {
+            console.warn("[booking_blocked_availability_context_failed]", {
+              traceId: traceId || null,
+              error: String(err?.message ?? err),
+            });
+          }
+        }
+        const replyText =
+          String(structuredReply ?? "").trim() ||
+          buildUnavailableReply({
+            itemLabel,
             style: conversationStyle,
           });
-          console.log("[final_reply_source]", {
-            source: "BOOKING_CONTINUATION_ALREADY_NOTED",
+        if (!String(structuredReply ?? "").trim()) {
+          console.log("[booking_blocked_availability_context_missing]", {
+            traceId: traceId || null,
+            requestedItemId: guardItemId,
+            reason: catalogRow ? "STRUCTURED_REPLY_EMPTY_OR_HELPER_NULL" : "MISSING_CATALOG_ROW",
+            catalogCount: Array.isArray(normalizedCatalogForTurn)
+              ? normalizedCatalogForTurn.length
+              : 0,
+            summaryStatus: null,
           });
-          return applyHybridOutboundResult(
-            {
-              reply,
-              type: "AI_MESSAGE",
-              messageMeta: {
-                ...messageMetaForKnowledge(hasUsefulBusinessData),
-                bookingContinuation: true,
-                reason: "SAME_SESSION_ACTIVE_BOOKING",
-              },
-            },
-            routingCtx,
-            aiRouteModeFromModel
-          );
         }
         console.log("[final_reply_source]", {
           source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
         });
         return applyHybridOutboundResult(
           {
-            reply: buildUnavailableReplyForTurn({
-              itemLabel,
-              style: conversationStyle,
-              branch: "BOOKING_BLOCKED_AVAILABILITY_CHECK_LATE",
-            }),
+            reply: replyText,
             type: "AI_MESSAGE",
             messageMeta: {
               ...messageMetaForKnowledge(hasUsefulBusinessData),
@@ -9793,23 +14752,6 @@ export async function processMessage({
   }
 
   if (
-    !skipItemResolutionForGreeting &&
-    (isAvailabilityQuestion || hasDurationSignal || events.transactionalIntent)
-  ) {
-    const reconciledLate = await reconcileItemContextWithExplicitMessage({
-      message,
-      itemContext,
-      catalogItems: normalizedCatalogForTurn,
-      resolveCatalog: resolveCatalogThisTurn,
-      hydrateFn: hydrateItemWithAvailability,
-    });
-    if (reconciledLate) {
-      itemContext = reconciledLate;
-      syncLastItemFromItemContextIfMissing(conversationMemory, itemContext);
-    }
-  }
-
-  if (
     itemContext != null &&
     typeof itemContext === "object" &&
     itemContext.isAvailable === false &&
@@ -9819,57 +14761,154 @@ export async function processMessage({
       buildDisplayLabel(itemContext) ||
       String(itemContext?.name ?? "").trim() ||
       memoryBookingItemName;
-    const lateContinuation = isSameSessionBookingContinuation({
-      memory: conversationMemory,
-      emilySessionKey,
-      itemId: itemContext?.itemId ?? memoryBookingItemId,
-      message,
-      extractedDurationDays: extracted.durationDays ?? bookingDurationDays ?? null,
-      contactValid: contactParts.isValid,
-      events,
-    });
-    if (lateContinuation) {
-      const reply = buildSameSessionContinuationReply({
-        memory: conversationMemory,
-        itemName: itemLabel,
-        style: conversationStyle,
+    if (isAvailabilityQuestion) {
+      const timingShape =
+        messageLooksLikeGenericAvailabilityTimingFollowup(message) ||
+        intentReasonSuggestsAvailabilityTimeframe(prioritizedIntent?.reason) ||
+        intentReasonSuggestsAvailabilityTimeframe(llmIntentClassification?.reason);
+      if (timingShape) {
+        const explicitHit = hasExplicitNewItemMention(message, normalizedCatalogForTurn, null);
+        const explicitLabel =
+          (explicitHit.found && explicitHit.itemLabel) ||
+          String(labelFromMatchedItem(emilyTurn?.match?.matchedItem) ?? "").trim() ||
+          "";
+        const globalNoOptions = computeAvailabilityTimingGlobalNoOptions({
+          memory,
+          explicitItemLabel: explicitLabel,
+          conversationHistory,
+          userId,
+          sessionKey: emilySessionKey,
+        });
+        const timingReply = buildAvailabilityTimingUnknownReply({
+          style: conversationStyle,
+          explicitItemLabel: explicitLabel || null,
+          globalNoOptions,
+        });
+        console.log("[availability_timing_followup_routed]", {
+          rawTextPreview: String(message ?? "").trim().slice(0, 160) || null,
+          classifierReason: String(llmIntentClassification?.reason ?? "").slice(0, 200) || null,
+          askedField: prioritizedIntent?.askedField ?? null,
+          selectedItemSource: safeItemSource,
+          hasExplicitCatalogItem: Boolean(
+            String(labelFromMatchedItem(emilyTurn?.match?.matchedItem) ?? "").trim() ||
+              explicitHit.found
+          ),
+          replyType: explicitLabel ? "EXPLICIT_ITEM_TIMING_UNKNOWN" : "GENERIC_TIMING_UNKNOWN",
+          source: "unavailable_item_availability_question",
+        });
+        console.log("[final_reply_source]", { source: "AVAILABILITY_TIMING_UNKNOWN" });
+        logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
+          source: "AVAILABILITY_TIMING_UNKNOWN",
+        });
+        return applyHybridOutboundResult(
+          {
+            reply: timingReply,
+            type: "AI_MESSAGE",
+            messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+          },
+          routingCtx,
+          aiRouteModeFromModel
+        );
+      }
+      const styleKeyAvailQ =
+        conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+      const availQReply = await resolveStructuredUnavailableCustomerReply({
+        userId,
+        catalogRow: itemContext,
+        availabilitySnapshot: {
+          blockingStatusesSeen: Array.isArray(itemContext.blockingStatusesSeen)
+            ? itemContext.blockingStatusesSeen
+            : [],
+        },
+        normalizedCatalogForTurn,
+        styleKey: styleKeyAvailQ,
+        conversationStyle,
+        traceId,
+        logKind: "booking_blocked",
+        memory,
       });
       console.log("[final_reply_source]", {
-        source: "BOOKING_CONTINUATION_ALREADY_NOTED",
+        source: "AVAILABILITY_BLOCKED_EARLY",
+      });
+      logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
+        source: "AVAILABILITY_BLOCKED_EARLY",
       });
       return applyHybridOutboundResult(
         {
-          reply,
+          reply: availQReply,
           type: "AI_MESSAGE",
           messageMeta: {
             ...messageMetaForKnowledge(hasUsefulBusinessData),
-            bookingContinuation: true,
-            reason: "SAME_SESSION_ACTIVE_BOOKING",
+            bookingBlocked: true,
+            reason: "ALREADY_BOOKED",
           },
         },
         routingCtx,
         aiRouteModeFromModel
       );
     }
-      console.log("[final_reply_source]", {
-      source: isAvailabilityQuestion
-        ? "AVAILABILITY_BLOCKED_EARLY"
-        : "BOOKING_BLOCKED_AVAILABILITY_CHECK",
-      });
-      logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
-      source: isAvailabilityQuestion
-        ? "AVAILABILITY_BLOCKED_EARLY"
-        : "BOOKING_BLOCKED_AVAILABILITY_CHECK",
-      });
-      return applyHybridOutboundResult(
-        {
-        reply: buildUnavailableReplyForTurn({
+    const styleKey =
+      conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+    const ic = itemContext;
+    const catalogRow =
+      ic && normalizeId(ic.itemId ?? ic.id)
+        ? {
+            ...ic,
+            id: String(ic.itemId ?? ic.id ?? "").trim(),
+            itemId: String(ic.itemId ?? ic.id ?? "").trim(),
+            name: String(ic.name ?? "").trim() || String(itemLabel ?? "").trim(),
+          }
+        : null;
+    let structuredReply = null;
+    if (catalogRow) {
+      try {
+        structuredReply = await buildBookingDurationUnavailableStructuredCustomerReply({
+          userId,
+          catalogRow,
+          availabilitySnapshot: {
+            blockingStatusesSeen: Array.isArray(ic?.blockingStatusesSeen)
+              ? ic.blockingStatusesSeen
+              : [],
+          },
+          normalizedCatalogForTurn,
+          styleKey,
+          traceId,
+          logKind: "booking_blocked",
+          memory,
+        });
+      } catch (err) {
+        console.warn("[booking_blocked_availability_context_failed]", {
+          traceId: traceId || null,
+          error: String(err?.message ?? err),
+        });
+      }
+    }
+    const replyText =
+      String(structuredReply ?? "").trim() ||
+      buildUnavailableReply({
         itemLabel,
         style: conversationStyle,
-        branch: isAvailabilityQuestion
-          ? "AVAILABILITY_BLOCKED_EARLY_LATE"
-          : "BOOKING_BLOCKED_AVAILABILITY_CHECK_LATE",
-        }),
+      });
+    if (!String(structuredReply ?? "").trim()) {
+      console.log("[booking_blocked_availability_context_missing]", {
+        traceId: traceId || null,
+        requestedItemId: String(ic?.itemId ?? ic?.id ?? "").trim() || null,
+        reason: catalogRow ? "STRUCTURED_REPLY_EMPTY_OR_HELPER_NULL" : "MISSING_CATALOG_ROW",
+        catalogCount: Array.isArray(normalizedCatalogForTurn)
+          ? normalizedCatalogForTurn.length
+          : 0,
+        summaryStatus: null,
+      });
+    }
+    console.log("[final_reply_source]", {
+      source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
+    });
+    logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
+      source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
+    });
+    return applyHybridOutboundResult(
+      {
+        reply: replyText,
         type: "AI_MESSAGE",
         messageMeta: {
           ...messageMetaForKnowledge(hasUsefulBusinessData),
@@ -9880,6 +14919,76 @@ export async function processMessage({
       routingCtx,
       aiRouteModeFromModel
     );
+  }
+
+  if (stage === "availability") {
+    const phraseElig = computeAskDurationPhraseEligibility({
+      stage,
+      itemContext,
+      safeItemSource,
+      message,
+      normalizedCatalogForTurn,
+      emilyTurn,
+      prioritizedIntent,
+      llmIntentClassification,
+    });
+    if (!phraseElig.eligible) {
+      const explicitHit = hasExplicitNewItemMention(
+        message,
+        normalizedCatalogForTurn,
+        null
+      );
+      const explicitLabel =
+        (explicitHit.found && explicitHit.itemLabel) ||
+        String(labelFromMatchedItem(emilyTurn?.match?.matchedItem) ?? "").trim() ||
+        "";
+      console.log("[availability_phrase_engine_blocked_unverified]", {
+        rawTextPreview: String(message ?? "").trim().slice(0, 160) || null,
+        selectedItemId: normalizeId(safeItem?.itemId ?? safeItem?.id) || null,
+        selectedItemSource: safeItemSource,
+        hasItemContext: Boolean(itemContext && typeof itemContext === "object"),
+        itemContextAvailable:
+          itemContext && typeof itemContext === "object"
+            ? itemContext.isAvailable === true
+            : null,
+        reason: phraseElig.reason,
+      });
+      const timingReply = buildAvailabilityTimingUnknownReply({
+        style: conversationStyle,
+        explicitItemLabel: explicitLabel || null,
+        globalNoOptions: computeAvailabilityTimingGlobalNoOptions({
+          memory,
+          explicitItemLabel: explicitLabel,
+          conversationHistory,
+          userId,
+          sessionKey: emilySessionKey,
+        }),
+      });
+      console.log("[availability_timing_followup_routed]", {
+        rawTextPreview: String(message ?? "").trim().slice(0, 160) || null,
+        classifierReason: String(llmIntentClassification?.reason ?? "").slice(0, 200) || null,
+        askedField: prioritizedIntent?.askedField ?? null,
+        selectedItemSource: safeItemSource,
+        hasExplicitCatalogItem: Boolean(
+          String(labelFromMatchedItem(emilyTurn?.match?.matchedItem) ?? "").trim() ||
+            explicitHit.found
+        ),
+        replyType: explicitLabel ? "EXPLICIT_ITEM_TIMING_UNKNOWN" : "GENERIC_TIMING_UNKNOWN",
+      });
+      console.log("[final_reply_source]", { source: "AVAILABILITY_TIMING_UNKNOWN" });
+      logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
+        source: "AVAILABILITY_TIMING_UNKNOWN",
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: timingReply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(hasUsefulBusinessData),
+        },
+        routingCtx,
+        aiRouteModeFromModel
+      );
+    }
   }
 
   if (stage && !bookingCreated) {
@@ -9918,22 +15027,6 @@ export async function processMessage({
       if (stage === "askContact") {
         memory.askedContact = true;
       }
-      if (stage === "availability" || stage === "askContact") {
-        scheduleBookingCommitContextPersist(routingCtx, {
-          memory: conversationMemory,
-          itemContext,
-          durationDays:
-            stage === "askContact" && Number.isFinite(bookingDurationDays)
-              ? bookingDurationDays
-              : null,
-          sessionKey: emilySessionKey,
-          source: stage === "availability" ? "availability" : "duration",
-          messagePreview: String(message ?? "").slice(0, 120) || null,
-          detectedIntent,
-          catalogItems: normalizedCatalogForTurn,
-          replyText: String(phraseReply ?? "").slice(0, 200) || null,
-        });
-      }
 
       return applyHybridOutboundResult(
         {
@@ -9963,39 +15056,18 @@ export async function processMessage({
       (hasDurationSignal || memoryDurationValue != null) &&
       !hasContact
     ) {
-      aiReply = "Great, please share your contact number so I can complete the booking request.";
+      aiReply = isGroupInbound
+        ? groupSafeRequestReceivedReply({
+            itemAndDurationKnown: Boolean(memoryBookingItemName && bookingDurationDays),
+            itemName: memoryBookingItemName,
+            durationDays: bookingDurationDays,
+          })
+        : "Great, please share your contact number so I can complete the booking request.";
     } else {
       aiReply = "";
     }
     logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
       source: blockAiForBooking ? "BOOKING_FLOW_NO_AI" : "DELAYED_COMMITMENT",
-    });
-  } else if (bookingCommitOnlyThisTurn && !bookingCreated) {
-    const commitItemId =
-      normalizeId(itemContext?.itemId) ||
-      memoryBookingItemId ||
-      normalizeId(conversationMemory?.lastItem?.id);
-    const commitDuration =
-      Number.isFinite(bookingDurationDays) && bookingDurationDays != null
-        ? Math.max(1, Math.floor(Number(bookingDurationDays)))
-        : null;
-    const missingCommitItem = !commitItemId;
-    const missingCommitDuration = commitDuration == null;
-    console.log("[booking_commit_ai_fallback_blocked]", {
-      messagePreview: String(message ?? "").trim().slice(0, 160) || null,
-      reason: "COMMIT_ONLY_AI_GENERAL_SUPPRESSED",
-      missingItem: missingCommitItem,
-      missingDuration: missingCommitDuration,
-    });
-    const commitReply = buildCommitOnlyMissingContextReply({
-      missingItem: missingCommitItem,
-      missingDuration: missingCommitDuration,
-      style: conversationStyle,
-      catalogItems: normalizedCatalogForTurn,
-    });
-    aiReply = commitReply || "";
-    logTiming("AI/phrase decision", aiPhraseDecisionStartedAt, {
-      source: "BOOKING_COMMIT_NO_AI",
     });
   } else {
     const durationFromExtraction = Number.isFinite(durationDays);
@@ -10167,14 +15239,22 @@ export async function processMessage({
     hasStructuredItemForAvailability
   ) {
     console.warn("⚠️ Item unavailable — overriding AI response");
-    const itemLabel =
-      buildDisplayLabel(itemContext) ||
-      String(itemContext?.name ?? "").trim() ||
-      memoryBookingItemName;
-    finalReply = buildUnavailableReplyForTurn({
-      itemLabel,
-      style: conversationStyle,
-      branch: "AVAILABILITY_BLOCKED_FINAL_OVERRIDE",
+    const styleKeyPostAi =
+      conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+    finalReply = await resolveStructuredUnavailableCustomerReply({
+      userId,
+      catalogRow: itemContext,
+      availabilitySnapshot: {
+        blockingStatusesSeen: Array.isArray(itemContext.blockingStatusesSeen)
+          ? itemContext.blockingStatusesSeen
+          : [],
+      },
+      normalizedCatalogForTurn,
+      styleKey: styleKeyPostAi,
+      conversationStyle,
+      traceId,
+      logKind: "booking_blocked",
+      memory: conversationMemory,
     });
     console.log("[final_reply_source]", {
       source: "AVAILABILITY_BLOCKED_EARLY",
@@ -10328,6 +15408,38 @@ export async function processMessage({
             }),
           },
         });
+        const styleKeyCommit =
+          conversationStyle === "casual_local" ? "casual_local" : "neutral_english";
+        const commitHydrationBlock = await blockCustomerBookingIfHydratedUnavailable({
+          userId,
+          catalogRow: commitRow,
+          earlyAvailabilitySnapshot: commitAv,
+          normalizedCatalogForTurn,
+          styleKey: styleKeyCommit,
+          conversationStyle,
+          traceId,
+          logKind: "booking_blocked",
+          memory: conversationMemory,
+          hydrationSource: "commit_trigger_booking",
+        });
+        if (commitHydrationBlock.blocked) {
+          finalReply = commitHydrationBlock.reply;
+          console.log("[final_reply_source]", {
+            source: "BOOKING_BLOCKED_AVAILABILITY_CHECK",
+          });
+          return applyHybridOutboundResult(
+            {
+              reply: finalReply,
+              type: "AI_MESSAGE",
+              messageMeta: {
+                ...messageMetaForKnowledge(hasUsefulBusinessData),
+                bookingBlocked: true,
+                reason: "ALREADY_BOOKED",
+              },
+            },
+            routingCtx
+          );
+        }
         const commitBooking = await createBookingFromValidatedIntent({
           callerTag: "commit_trigger_booking",
           isGroupInbound,
@@ -10343,6 +15455,7 @@ export async function processMessage({
             itemId: commitRow.id,
             itemName: commitRow.name,
             durationDays: memoryDurationDays,
+            ...shortBookingCreateFields(shortBookingSelection, commitRow),
             customerName: String(conversationMemory?.customerName ?? "").trim() || undefined,
             customerPhone: String(conversationMemory?.contact ?? "").trim() || undefined,
             source,
@@ -10360,9 +15473,7 @@ export async function processMessage({
         });
         if (!commitBooking?.ok && bookingErrorCode(commitBooking) === "ITEM_ALREADY_BOOKED") {
           console.log("[BOOKING RETRY BLOCKED]");
-          return buildBookingBlockedOutbound(conversationMemory, commitRow.name, {
-            itemId: commitRow.id,
-          });
+          return buildBookingBlockedOutbound(conversationMemory);
         }
         if (commitBooking?.ok && typeof commitBooking.id === "string" && commitBooking.id.trim()) {
           bookingCreated = {
@@ -10423,6 +15534,11 @@ export async function processMessage({
       itemId: bookingCreated.itemId,
       itemName: bookingCreated.itemName,
       durationDays: bookingCreated.durationDays,
+      durationHours: bookingCreated.durationHours,
+      billingUnit: bookingCreated.billingUnit,
+      billingRatePercentOfDaily: bookingCreated.billingRatePercentOfDaily,
+      calculatedPrice: bookingCreated.calculatedPrice,
+      currency: bookingCreated.currency,
     });
     if (bookingFinal?.meta?.bookingCreated === true) {
       conversationMemory.askedContact = false;
@@ -10547,7 +15663,30 @@ export async function processMessage({
 
   return outFinal;
   } catch (err) {
+    const rawPreview = String(inboundRaw ?? "").trim().slice(0, 220) || null;
+    const selectedAi = selectLatestInboundForAi(inboundRaw);
+    const latestSeg =
+      selectedAi != null && String(selectedAi).trim() !== ""
+        ? getLatestUserSegmentForGuard(selectedAi)
+        : getLatestUserSegmentForGuard(String(inboundRaw ?? ""));
+    const stackSnippet = String(err?.stack ?? "")
+      .split("\n")
+      .slice(0, 5)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join(" | ");
     console.error("❌ processMessage crash:", err);
+    console.error("[process_message_crash_caught]", {
+      traceId,
+      rawMessagePreview: rawPreview,
+      latestUserSegment: latestSeg || null,
+      routeType: routeTypeForProcessMessageLog,
+      participantKey: String(participantKey ?? "").trim() || null,
+      sessionKey: String(sessionKey ?? "").trim() || null,
+      errName: err?.name ?? null,
+      errMessage: String(err?.message ?? err ?? "").slice(0, 500) || null,
+      stackSnippet: stackSnippet || null,
+    });
     return applyHybridOutboundResult(
       {
         reply: "Sorry, I didn’t catch that properly. Could you please try again?",
@@ -10603,28 +15742,131 @@ export function __buildGroupWaitingEngagementForTests({
   itemName = "Civic",
   conversationStyle = "casual_local",
 } = {}) {
-  const safeItemName = String(itemName ?? "").trim() || "your item";
+  void message;
+  void itemName;
+  void conversationStyle;
+  return groupSafeRequestReceivedReply({ itemAndDurationKnown: true });
+}
+
+export function __formatCustomerDurationForTests(args = {}) {
+  return formatCustomerDuration(args);
+}
+
+export function __groupSafeRequestReceivedReplyForTests(args = {}) {
+  return groupSafeRequestReceivedReply(args);
+}
+
+export function __groupPrivatePromptGuardForTests(reply, meta = {}) {
+  const blocked = isPrivateDetailPromptText(reply);
+  return {
+    blocked,
+    ...groupPrivateDetailBlockDiagnostics(reply),
+    reply: blocked
+      ? groupSafeRequestReceivedReply({
+          itemAndDurationKnown: Boolean(meta.bookingCreated || meta.durationDays || meta.durationHours),
+        })
+      : String(reply ?? ""),
+  };
+}
+
+export function __applyHybridOutboundResultForTests(result = {}, routingCtx = {}, aiStructuredMode) {
+  return applyHybridOutboundResult(result, routingCtx, aiStructuredMode);
+}
+
+export function __numericDailyRateFromItemForTests(item = {}) {
+  return numericDailyRateFromItem(item);
+}
+
+export function __classifyBelowMinimumTurnKindForTests(message, turnIntentShape = null) {
+  return classifyBelowMinimumTurnKind(message, turnIntentShape);
+}
+
+export function __planBelowMinimumHoursTurnForTests(args = {}) {
+  return planBelowMinimumHoursTurn(args);
+}
+
+export function __shortBookingPolicyForTests(
+  message,
+  item = {},
+  businessProfile = null,
+  options = {}
+) {
   const parsed = parseUserDuration(message);
-  const originalDurationText =
-    parsed && typeof parsed === "object" && Number.isFinite(Number(parsed.value)) && parsed.unit
-      ? `${Math.max(1, Math.floor(Number(parsed.value)))} ${String(parsed.unit).trim()}`
-      : null;
-  if (originalDurationText) {
-    const subject = safeItemName ? `${safeItemName} ` : "";
-    return conversationStyle === "casual_local"
-      ? `Perfect 👍 ${subject}${originalDurationText} ke liye note kar liya. City ke andar use karna hai ya outside city?`
-      : `Perfect 👍 I’ve noted ${subject}for ${originalDurationText}. Will you use it within the city or outside the city?`;
+  const selection = shortBookingSelectionFromParsedDuration(parsed, businessProfile);
+  if (!selection) return { parsed, selection: null, reply: null };
+  if (selection.type === "below_minimum") {
+    const turnIntentShape =
+      options.turnIntentShape ??
+      resolveTurnIntentShape({
+        message,
+        itemMentioned: true,
+        hasDuration: true,
+      });
+    return {
+      parsed,
+      selection,
+      ...planBelowMinimumHoursTurn({
+        message,
+        selection,
+        item,
+        turnIntentShape,
+        isGroupInbound: options.isGroupInbound ?? false,
+        isAvailable: options.isAvailable ?? true,
+        itemLabel:
+          options.itemLabel ??
+          (buildDisplayLabel(item) || String(item?.name ?? "").trim()),
+        alternativeItems: options.alternativeItems ?? [],
+        modeOverride: options.mode ?? null,
+      }),
+    };
   }
-  return buildBookingWaitingEngagement(
-    {
-      eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
-      itemName: safeItemName,
-      durationDays: 14,
-      privacyMode: "group_safe",
-      nextStep: "ask_qualifying_question_while_waiting",
-    },
-    conversationStyle
-  );
+  return {
+    parsed,
+    selection,
+    createFields: shortBookingCreateFields(selection, item),
+  };
+}
+
+export function __shortBookingPolicyForParsedDurationForTests(
+  parsed,
+  item = {},
+  businessProfile = null,
+  options = {}
+) {
+  const selection = shortBookingSelectionFromParsedDuration(parsed, businessProfile);
+  if (!selection) return { parsed, selection: null, reply: null };
+  if (selection.type === "below_minimum") {
+    const message = options.message ?? `${parsed?.value ?? ""} ${parsed?.unit ?? "hours"}`;
+    const turnIntentShape =
+      options.turnIntentShape ??
+      resolveTurnIntentShape({
+        message,
+        itemMentioned: true,
+        hasDuration: true,
+      });
+    return {
+      parsed,
+      selection,
+      ...planBelowMinimumHoursTurn({
+        message,
+        selection,
+        item,
+        turnIntentShape,
+        isGroupInbound: options.isGroupInbound ?? false,
+        isAvailable: options.isAvailable ?? true,
+        itemLabel:
+          options.itemLabel ??
+          (buildDisplayLabel(item) || String(item?.name ?? "").trim()),
+        alternativeItems: options.alternativeItems ?? [],
+        modeOverride: options.mode ?? null,
+      }),
+    };
+  }
+  return {
+    parsed,
+    selection,
+    createFields: shortBookingCreateFields(selection, item),
+  };
 }
 
 export function __antiRepetitionMayOverrideForTests({
@@ -10649,12 +15891,280 @@ export function __buildBrowseOfferingsReplyForTests({ items = [], services = [],
   return buildBrowseOfferingsReply({ items, services, style });
 }
 
-export function __buildBrowseOptionsReplyForTests(items, style, options = {}) {
-  return buildBrowseOptionsReply(items, style, options);
+export function __pendingActionReplyIntentForTests(message, pendingAction = null) {
+  return inferPendingActionReplyIntent(message, { pendingAction });
 }
 
-export function __buildNotListedReplyForTests(opts = {}) {
-  return buildNotListedReply(opts);
+export function __isPureAckMessageForTests(message) {
+  return isPureAckMessage(message);
+}
+
+export function __buildPureAckNoOpReplyForTests(conversationStyle = "casual_local") {
+  return buildPureAckNoOpReply(conversationStyle);
+}
+
+export function __classifyAssistantOutboundKindForTests(trace = {}) {
+  return classifyAssistantOutboundKind(trace);
+}
+
+export function __buildOutboundTraceForTests(args = {}) {
+  return buildOutboundTrace(args);
+}
+
+export function __buildIntentionalSilentNoopMessageMetaForTests(
+  hasUsefulBusinessData = false
+) {
+  return buildIntentionalSilentNoopMessageMeta(hasUsefulBusinessData);
+}
+
+export function __recordLastAssistantOutboundForTests(memory, trace) {
+  recordLastAssistantOutbound(memory, trace);
+}
+
+export function __resolvePureAckNoOutboundForTests(args = {}) {
+  return resolvePureAckNoOutbound(args);
+}
+
+export function __wasPreviousAssistantTurnTerminalInfoForTests(memory) {
+  return wasPreviousAssistantTurnTerminalInfo(memory);
+}
+
+export function __canResolvePureAckWithoutConsumablePendingForTests(
+  memory,
+  message,
+  bindingCtx
+) {
+  return canResolvePureAckWithoutConsumablePending(memory, message, bindingCtx);
+}
+
+export function __buildCollectDurationReaskReplyForTests(pendingAction, conversationStyle) {
+  return buildCollectDurationReaskReply(pendingAction, conversationStyle);
+}
+
+export function __mapFuzzyPendingInferredIntentForTests(fuzzyTurnNormalization) {
+  return mapFuzzyPendingInferredIntent(fuzzyTurnNormalization);
+}
+
+export function __validateConfirmFuzzyCatalogPayloadForTests(pendingAction = {}) {
+  return validateConfirmFuzzyCatalogPayload(pendingAction);
+}
+
+export function __buildPendingActionForTests(args = {}) {
+  return buildPendingAction(args);
+}
+
+export function __validatePendingActionBindingForTests(args = {}) {
+  return validatePendingActionBinding(args);
+}
+
+export function __collectDurationSelectionGuardForTests(args = {}) {
+  return collectDurationSelectionGuardDecision(args);
+}
+
+export function __buildCollectDurationAvailabilityUnknownReplyForTests(args = {}) {
+  return buildCollectDurationAvailabilityUnknownReply(args);
+}
+
+export async function __blockCustomerBookingIfHydratedUnavailableForTests(args = {}) {
+  return blockCustomerBookingIfHydratedUnavailable(args);
+}
+
+export async function __resolveStructuredUnavailableCustomerReplyForTests(args = {}) {
+  return resolveStructuredUnavailableCustomerReply(args);
+}
+
+export function __getLatestUserSegmentForGuardForTests(message) {
+  return getLatestUserSegmentForGuard(message);
+}
+
+export function __normalizeBareCatalogSelectionQueryForTests(segment) {
+  return normalizeBareCatalogSelectionQuery(segment);
+}
+
+export function __computeCollectDurationCatalogQueryForTests(message) {
+  return computeCollectDurationCatalogQuery(message);
+}
+
+export async function __resolveItemFromCatalogForTests(userId, rawInput, catalogItems) {
+  return resolveItemFromCatalog(userId, String(rawInput ?? "").trim(), {
+    catalogItems: Array.isArray(catalogItems) ? catalogItems : [],
+    catalogSource: "test",
+  });
+}
+
+export function __isAvailabilityQuestionForCollectDurationGuardForTests(message) {
+  return isAvailabilityQuestionForCollectDurationGuard(message);
+}
+
+export function __isItemlessPriceDurationFollowupForTests(message, catalogItems = []) {
+  return isItemlessPriceDurationFollowup(message, catalogItems);
+}
+
+export function __resolveItemlessPriceDurationAskedFieldForTests(message) {
+  return resolveItemlessPriceDurationAskedField(message);
+}
+
+export function __hasSafePreviousCatalogItemForPriceFollowupForTests(args = {}) {
+  return hasSafePreviousCatalogItemForPriceFollowup(args);
+}
+
+export function __resolveDurationContextPolicyForTests(args = {}) {
+  return resolveDurationContextPolicy(args);
+}
+
+export function __shouldStoreLastVerifiedCatalogAnswerForTests(args = {}) {
+  return shouldStoreLastVerifiedCatalogAnswer(args);
+}
+
+export function __storeLastVerifiedCatalogAnswerForTests(args = {}) {
+  return storeLastVerifiedCatalogAnswer(args);
+}
+
+export function __resolveLastVerifiedCatalogAnswerForPriceFollowupForTests(args = {}) {
+  return resolveLastVerifiedCatalogAnswerForPriceFollowup(args);
+}
+
+export function __assistantReplySignalsCatalogSelectionPromptForTests(text) {
+  return assistantReplySignalsCatalogSelectionPrompt(text);
+}
+
+export function __isBareCatalogSelectionMessageShapeForComposerForTests(message) {
+  return isBareCatalogSelectionMessageShapeForComposer(message);
+}
+
+export function __finalizeBookingFsmCustomerReplyForTests(text) {
+  return finalizeBookingFsmCustomerReply(text);
+}
+
+export function __pendingActionPolicyForTests({
+  message = "",
+  item = {},
+  businessProfile = null,
+  isGroupInbound = false,
+  isAvailable = true,
+  mode = null,
+} = {}) {
+  const parsed = parseUserDuration(message);
+  const selection = shortBookingSelectionFromParsedDuration(parsed, businessProfile);
+  if (selection?.type !== "below_minimum") {
+    return { parsed, selection, pendingAction: null, reply: null };
+  }
+  const turnIntentShape = resolveTurnIntentShape({
+    message,
+    itemMentioned: true,
+    hasDuration: true,
+  });
+  const planned = planBelowMinimumHoursTurn({
+    message,
+    selection,
+    item,
+    turnIntentShape,
+    isGroupInbound,
+    isAvailable,
+    itemLabel: buildDisplayLabel(item) || String(item?.name ?? "Test Item").trim(),
+    alternativeItems: item?.alternativeItems ?? [],
+    modeOverride: mode,
+  });
+  const itemId = String(item?.itemId ?? item?.id ?? "").trim() || "test-item";
+  const itemDisplayLabel =
+    buildDisplayLabel(item) ||
+    String(item?.displayLabel ?? item?.name ?? "Test Item").trim();
+  const pendingAction = planned.shouldStorePending
+    ? buildPendingAction({
+        type: PENDING_ACTION_TYPES.ACCEPT_SHORT_BOOKING_OFFER,
+        expectedReplyType: "affirmation",
+        participantKey: "participant-test",
+        groupChatKey: "group-test",
+        sessionKey: "session-test",
+        itemId,
+        itemDisplayLabel,
+        payload: {
+          itemId,
+          itemDisplayLabel,
+          originalRequestedHours: selection.requestedHours,
+          minimumHours: selection.minimumHours,
+          billingUnit: selection.billingUnit,
+          billingRatePercentOfDaily: selection.billingRatePercentOfDaily,
+          calculatedPrice: planned.calculatedPrice,
+          currency: currencyFromItem(item),
+          explicitPriceIntent: planned.explicitPriceIntent,
+        },
+        sourcePromptText: planned.reply,
+      })
+    : null;
+  return {
+    parsed,
+    selection,
+    pendingAction,
+    reply: planned.reply,
+    kind: planned.kind,
+    shouldStorePending: planned.shouldStorePending,
+  };
+}
+
+export function __shouldSuppressBookingDmGenericFallbackForTests({
+  messageText = "",
+  weakMessageAuthority = false,
+  oldMessage = false,
+  logisticsComplete = false,
+  attachmentFailed = false,
+  hasActiveBookingContext = true,
+} = {}) {
+  if (!String(messageText ?? "").trim()) return true;
+  if (weakMessageAuthority) return true;
+  if (oldMessage) return true;
+  if (logisticsComplete) return true;
+  if (attachmentFailed) return true;
+  if (!hasActiveBookingContext) return true;
+  return false;
+}
+
+export function __messageLooksLikeGenericAvailabilityTimingFollowupForTests(message) {
+  return messageLooksLikeGenericAvailabilityTimingFollowup(message);
+}
+
+export function __intentReasonSuggestsAvailabilityTimeframeForTests(reasonRaw) {
+  return intentReasonSuggestsAvailabilityTimeframe(reasonRaw);
+}
+
+export function __resolveSafeItemSourceForTests(p) {
+  return resolveSafeItemSource(p);
+}
+
+export function __buildAvailabilityTimingUnknownReplyForTests(p) {
+  return buildAvailabilityTimingUnknownReply(p);
+}
+
+export function __computeAskDurationPhraseEligibilityForTests(p) {
+  return computeAskDurationPhraseEligibility(p);
+}
+
+export function __computeAvailabilityTimingGlobalNoOptionsForTests(p) {
+  return computeAvailabilityTimingGlobalNoOptions(p);
+}
+
+export function __shouldRouteAvailabilityTimingUnknownAfterNoOptionsContextForTests(p) {
+  return shouldRouteAvailabilityTimingUnknownAfterNoOptionsContext(p);
+}
+
+export function __availabilityTimingUnknownTurnIfRoutedForTests(p) {
+  return availabilityTimingUnknownTurnIfRouted(p);
+}
+
+export function __matchedItemForReplyFromCatalogStateForTests(opts) {
+  return matchedItemForReplyFromCatalogState(opts);
+}
+
+export function __composeBookingUnavailableItemAvailabilityContextReplyForTests(p) {
+  return composeBookingUnavailableItemAvailabilityContextReply(p);
+}
+
+export async function __buildBookingDurationUnavailableStructuredCustomerReplyForTests(p) {
+  return buildBookingDurationUnavailableStructuredCustomerReply(p);
+}
+
+export function __clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptionsForTests(p) {
+  return clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptions(p);
 }
 
 export {

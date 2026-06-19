@@ -1,6 +1,7 @@
 import { sendViaPlaywright } from "./adapters/playwrightAdapter.js";
 import { sendViaCloudAPI } from "./adapters/cloudApiAdapter.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import { logOutboundLifecycle } from "./outboundLifecycleLog.js";
 
 function clean(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
@@ -51,6 +52,7 @@ function getCurrentOpenChatTitle() {
  *     dedupeWindowMs: number,
  *     lastPlaywrightTextSends: Map<string, { hash: string, timestamp: number }>,
  *     guaranteeKey?: string,
+ *     outboundLifecycle?: Record<string, unknown>,
  *   }
  * }} p
  * @returns {Promise<{ ok: boolean, groupSendFailed?: boolean }>}
@@ -95,7 +97,13 @@ export async function sendOutboundMessage({
     dedupeWindowMs,
     lastPlaywrightTextSends,
     guaranteeKey,
+    outboundLifecycle,
   } = context;
+
+  const lifecycleBase =
+    outboundLifecycle && typeof outboundLifecycle === "object"
+      ? outboundLifecycle
+      : {};
 
   console.log("📤 Sending message via:", sendVia);
 
@@ -155,6 +163,11 @@ export async function sendOutboundMessage({
       ((mode === "PLAYWRIGHT" && (isGroupMessage === true || playwrightWebInbound)) ||
         allowPlaywrightDmOutbound));
 
+  logOutboundLifecycle("messaging_service_start", {
+    ...lifecycleBase,
+    sendVia: mode || String(sendVia ?? "").trim() || null,
+  });
+
   if (usePlaywrightWebSend) {
     const result = await sendViaPlaywright({
       reply,
@@ -165,7 +178,8 @@ export async function sendOutboundMessage({
         messageHash,
         dedupeWindowMs,
         lastPlaywrightTextSends,
-        guaranteeKey: String(context.guaranteeKey ?? "").trim(),
+        guaranteeKey: String(guaranteeKey ?? context.guaranteeKey ?? "").trim(),
+        outboundLifecycle: lifecycleBase,
       },
     });
     return normalizeAdapterResult(result);
@@ -231,4 +245,3 @@ export async function sendOutboundMessage({
   });
   return { ok: false, groupSendFailed: false };
 }
-

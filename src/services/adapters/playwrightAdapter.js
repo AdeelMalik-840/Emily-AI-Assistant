@@ -3,6 +3,7 @@ import {
   sendPlaywrightGroupText,
 } from "../playwrightOutboundBridge.js";
 import { registerPlaywrightOutboundChunks } from "../playwrightOutboundRegistry.js";
+import { logOutboundLifecycle } from "../outboundLifecycleLog.js";
 
 function playwrightGuaranteeTextDedupeMap() {
   if (!(globalThis.__playwrightTextSentForGuarantee instanceof Map)) {
@@ -29,6 +30,8 @@ export function __clearPlaywrightGuaranteeTextDedupeForTests() {
  *     dedupeWindowMs: number,
  *     lastPlaywrightTextSends: Map<string, { hash: string, timestamp: number }>,
  *     guaranteeKey?: string,
+ *     outboundLifecycle?: Record<string, unknown>,
+ *     sourceInboundMessageId?: string,
  *   }
  * }} p
  * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
@@ -44,7 +47,13 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
     dedupeWindowMs,
     lastPlaywrightTextSends,
     guaranteeKey,
+    outboundLifecycle,
   } = context;
+
+  const lifecycleBase =
+    outboundLifecycle && typeof outboundLifecycle === "object"
+      ? outboundLifecycle
+      : {};
 
   if (!groupNameResolved.length) {
     console.error("BLOCKED SEND — NO CHAT NAME (Playwright title)", {
@@ -73,15 +82,46 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
       Array.isArray(messageMeta?.whatsappImageUrls) &&
       messageMeta.whatsappImageUrls.length > 0;
     let imagesDelivered = !wantsImages;
+    const activeHeaderTitle = String(
+      globalThis.__currentOpenChatTitle ?? groupNameResolved ?? ""
+    ).trim();
+
     if (textAlreadySentRecently || textAlreadySentForGuarantee) {
       console.log(
         textAlreadySentForGuarantee
           ? "[playwright_guarantee_text_skip] text already sent for guarantee retry; skipping text resend"
           : "[whatsappInboundBuffer] text already sent for this inbound; skipping text resend"
       );
+      logOutboundLifecycle("duplicate_send_skipped", {
+        ...lifecycleBase,
+        reason: "playwright_text_hash_window",
+        outboundReplyDelivered: true,
+      });
+      logOutboundLifecycle("playwright_send_result", {
+        ...lifecycleBase,
+        ok: true,
+        activeHeaderTitle: activeHeaderTitle || null,
+      });
     } else {
-      ok = await sendPlaywrightGroupText(reply, {
-        expectedChat: groupNameResolved,
+      logOutboundLifecycle("playwright_send_start", {
+        ...lifecycleBase,
+        activeHeaderTitle: activeHeaderTitle || null,
+      });
+      let sendError = null;
+      try {
+        ok = await sendPlaywrightGroupText(reply, {
+          expectedChat: groupNameResolved,
+          outboundLifecycle: lifecycleBase,
+        });
+      } catch (sendErr) {
+        sendError = sendErr;
+        ok = false;
+      }
+      logOutboundLifecycle("playwright_send_result", {
+        ...lifecycleBase,
+        ok: ok === true,
+        error: sendError ? String(sendError?.message ?? sendError) : null,
+        activeHeaderTitle: activeHeaderTitle || null,
       });
       if (ok) {
         console.log("🧵 Text sent complete");
@@ -161,4 +201,3 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
     console.log("🔓 Outbound lock RELEASED");
   }
 }
-

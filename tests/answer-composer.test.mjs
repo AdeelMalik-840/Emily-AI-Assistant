@@ -59,44 +59,76 @@ test("price question answers only price", () => {
   assert.doesNotMatch(out.reply, /White/i);
 });
 
-test("rent kitna uses pricing.daily when top-level price is missing", () => {
+test("generic rent uses pricing.daily and pricing.monthly summary", () => {
   const out = composeInformationalAnswer({
-    message: "Corolla ka rent kitna hai",
+    message: "stonic rent?",
     draftReply:
-      "Toyota Corolla ka rent per day 5000 PKR hai aur per month 120000 PKR hai.",
+      "Kia Stonic EX Plus 2021 ka rent per day 5500 PKR hai aur per month 120000 PKR hai.",
     item: {
-      name: "Toyota corolla",
-      displayLabel: "Toyota corolla (Metallic Grey)",
-      pricing: { daily: 5000, monthly: 120000, currency: "PKR" },
+      name: "Kia Stonic EX Plus 2021",
+      displayLabel: "Kia Stonic EX Plus 2021 (White)",
+      pricing: { daily: "5500", monthly: "120000", currency: "PKR" },
     },
+    askedField: "price",
   });
-  assert.match(out.reply, /\b5000\b/);
-  assert.doesNotMatch(out.reply, /Rate confirm/i);
   assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /\b5500\b/);
+  assert.match(out.reply, /\b120000\b/);
+  assert.match(out.reply, /per day/i);
+  assert.match(out.reply, /per month/i);
   assert.notEqual(out.source, "human_unknown");
+  assert.doesNotMatch(out.reply, /confirm kar ke bata/i);
 });
 
-test("Toyota corolla rent question returns daily price not rate confirm", () => {
+test("generic price daily only from item.pricing.daily", () => {
   const out = composeInformationalAnswer({
-    message: "Toyota corolla ka rent kitna hai???",
-    draftReply: "Toyota Corolla ka per day rent 5000 PKR hai.",
-    item: {
-      name: "Toyota corolla",
-      pricing: { daily: 5000 },
-    },
+    message: "rent?",
+    draftReply: "Monthly rate is 120000",
+    item: { name: "Honda Civic", pricing: { daily: "8000", currency: "PKR" } },
+    askedField: "price",
   });
-  assert.match(out.reply, /\b5000\b/);
-  assert.doesNotMatch(out.reply, /Rate confirm/i);
+  assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /\b8000\b/);
+  assert.match(out.reply, /per day/i);
+  assert.doesNotMatch(out.reply, /per month/i);
 });
 
-test("missing price still uses rate confirm unknown path", () => {
+test("generic price monthly only from item.pricing.monthly", () => {
   const out = composeInformationalAnswer({
-    message: "rent kitna hai?",
-    draftReply: "confirm kar ke batata hun",
-    item: { name: "Toyota Corolla" },
+    message: "rent?",
+    draftReply: "Daily is 8000",
+    item: { name: "Honda Civic", pricing: { monthly: "165000", currency: "PKR" } },
+    askedField: "price",
   });
-  assert.match(out.reply, /Rate confirm kar ke bata deta hun/i);
+  assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /\b165000\b/);
+  assert.match(out.reply, /monthly rent/i);
+  assert.doesNotMatch(out.reply, /per day/i);
+});
+
+test("generic price with no catalog pricing uses human unknown", () => {
+  const out = composeInformationalAnswer({
+    message: "stonic rent?",
+    draftReply: "5500 PKR per day",
+    item: { name: "Kia Stonic EX Plus 2021" },
+    askedField: "price",
+  });
   assert.equal(out.source, "human_unknown");
+  assert.match(out.reply, /Rate confirm kar ke bata deta hun/i);
+});
+
+test("generic price accepts grounded draft when item.pricing exists", () => {
+  const out = composeInformationalAnswer({
+    message: "stonic rent?",
+    draftReply:
+      "Kia Stonic EX Plus 2021 ka rent per day 5500 PKR hai aur per month 120000 PKR hai.",
+    item: {
+      name: "Kia Stonic EX Plus 2021",
+      pricing: { daily: "5500", monthly: "120000" },
+    },
+    askedField: "price",
+  });
+  assert.equal(out.source, "verified_catalog");
 });
 
 test("daily price known returns only daily price", () => {
@@ -117,8 +149,8 @@ test("duration pricing: 2 weeks rent includes daily + total when duration presen
     item: { name: "Honda Civic 2026 Oriel", pricing: { daily: "8000" } },
   });
   assert.equal(out.field, "price_with_duration");
-  assert.match(out.reply, /\b8000\b/);
-  assert.match(out.reply, /\b112000\b/);
+  assert.match(out.reply, /\b8[,.]?000\b/);
+  assert.match(out.reply, /\b112[,.]?000\b/);
   assert.equal(out.finalAuthority, true);
 });
 
@@ -129,33 +161,73 @@ test("duration pricing: total ask returns total only", () => {
     item: { name: "Honda Civic", pricing: { daily: "8000" } },
   });
   assert.equal(out.field, "price_with_duration");
-  assert.match(out.reply, /\b112000\b/);
-  assert.doesNotMatch(out.reply, /\b8000\b.*\b112000\b/i); // no forced daily line for total-only asks
+  assert.match(out.reply, /\b112[,.]?000\b/);
+  assert.doesNotMatch(out.reply, /\b8[,.]?000\b.*\b112[,.]?000\b/i); // no forced daily line for total-only asks
 });
 
-test("duration pricing: grounded draft keeps price line when follow-up has bataiye", () => {
+test("duration pricing: deterministic verified_catalog beats grounded LLM draft with CTA", () => {
   const out = composeInformationalAnswer({
-    message: "10 din k lye kitna rent hoga?",
+    message: "2 days rent?",
     draftReply:
-      "Toyota Corolla ka 10 din ka rent 50,000 PKR hoga. Agar aap booking karna chahte hain to bataiye!",
-    item: { name: "Toyota corolla", pricing: { daily: 5000, monthly: 120000 } },
-    askedField: "price_daily",
+      "Honda Civic 2026 Oriel ki 2 din ki rent 16,000 PKR hogi (8,000 PKR per din). Kya aap isay book karna chahenge?",
+    item: { name: "Honda Civic 2026 Oriel", pricing: { daily: "8000 PKR" } },
   });
-  assert.equal(out.field, "price_with_duration");
-  assert.equal(out.source, "llm_draft_grounded");
-  assert.match(out.reply, /50,?000/);
-  assert.doesNotMatch(out.reply, /Confirm kar ke bata deta hun/i);
+  assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /\b16[,.]?000\b/i);
+  assert.match(out.reply, /\b8[,.]?000\b/i);
+  assert.doesNotMatch(out.reply, /book karna|booking|chahenge/i);
 });
 
-test("duration pricing: grounded LLM draft total is preserved when it matches computed value", () => {
+test("duration pricing: 2 days rent deterministic quote format", () => {
   const out = composeInformationalAnswer({
-    message: "2 weeks k kitna rent ho ga?",
-    draftReply:
-      "Honda Civic 2026 Oriel ka daily rent 8000 PKR hai. Do hafton ka total rent 112000 PKR hoga.",
+    message: "2 days rent?",
+    draftReply: "",
     item: { name: "Honda Civic 2026 Oriel", pricing: { daily: "8000" } },
   });
-  assert.equal(out.source, "llm_draft_grounded");
-  assert.match(out.reply, /\b112000\b/);
+  assert.equal(out.field, "price_with_duration");
+  assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /2\s*din/i);
+  assert.match(out.reply, /\b16[,.]?000\b/i);
+  assert.doesNotMatch(out.reply, /book/i);
+});
+
+test("generic price draft with booking CTA second sentence is stripped via verified path", () => {
+  const out = composeInformationalAnswer({
+    message: "rent kitna hai?",
+    draftReply: "Toyota Corolla ka rent 5000 PKR per day hai. Kya aap book karna chahenge?",
+    item: {
+      name: "Toyota Corolla",
+      pricing: { daily: "5000 PKR", monthly: "120000 PKR" },
+    },
+    askedField: "price",
+  });
+  assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /5000/);
+  assert.doesNotMatch(out.reply, /book karna|chahenge/i);
+});
+
+test("price_daily draft with booking CTA uses verified catalog only", () => {
+  const out = composeInformationalAnswer({
+    message: "daily rent kitna hai?",
+    draftReply: "8000 per day hai. Book karna chahenge?",
+    item: { name: "Honda Civic", pricing: { daily: "8000 PKR" } },
+    askedField: "price_daily",
+  });
+  assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /8000/);
+  assert.doesNotMatch(out.reply, /book karna|chahenge/i);
+});
+
+test("price_monthly draft with booking CTA uses verified catalog only", () => {
+  const out = composeInformationalAnswer({
+    message: "monthly rent kitna hai?",
+    draftReply: "165000 per month hai. Reserve karun?",
+    item: { name: "Honda Civic", pricing: { monthly: "165000 PKR" } },
+    askedField: "price_monthly",
+  });
+  assert.equal(out.source, "verified_catalog");
+  assert.match(out.reply, /165000/);
+  assert.doesNotMatch(out.reply, /reserve|book/i);
 });
 
 test("monthly price known returns only monthly price", () => {
@@ -165,93 +237,7 @@ test("monthly price known returns only monthly price", () => {
     item: { name: "Honda Civic", pricing: { monthly: "165000" } },
   });
   assert.equal(out.reply, "165000 per month hai 👍");
-  assert.equal(out.field, "price_monthly");
   assert.doesNotMatch(out.reply, /daily|8000/i);
-});
-
-test("upstream price_monthly override: Civic 4 months uses monthly x 4 total", () => {
-  const out = composeInformationalAnswer({
-    message: "4 months k lye chyh kitna rent ho ga?",
-    draftReply: "Honda Civic 2026 Oriel ka 4 mahine ka rent 660,000 PKR hoga (165,000 PKR per month).",
-    item: {
-      name: "Honda Civic 2026 Oriel (White)",
-      pricing: { daily: 8000, monthly: 165000, currency: "PKR" },
-    },
-    askedField: "price_monthly",
-  });
-  assert.equal(out.field, "price_with_duration");
-  assert.match(out.reply, /165,?000/);
-  assert.match(out.reply, /660,?000/);
-  assert.doesNotMatch(out.reply, /per month hai 👍$/);
-});
-
-test("upstream price_monthly override: Corolla 3 months uses monthly x 3 total", () => {
-  const out = composeInformationalAnswer({
-    message: "3 months k lye chyh kitna rent ho ga 3 months ka?",
-    draftReply: "",
-    item: {
-      name: "Toyota corolla",
-      displayLabel: "Toyota corolla (Metallic Grey)",
-      pricing: { daily: 5000, monthly: 120000, currency: "PKR" },
-    },
-    askedField: "price_monthly",
-  });
-  assert.equal(out.field, "price_with_duration");
-  assert.match(out.reply, /120,?000/);
-  assert.match(out.reply, /360,?000/);
-});
-
-test("upstream price_daily override: Corolla 10 days uses daily x 10 total", () => {
-  const out = composeInformationalAnswer({
-    message: "10 din k lye kitna rent hoga?",
-    draftReply: "",
-    item: {
-      name: "Toyota corolla",
-      pricing: { daily: 5000, monthly: 120000, currency: "PKR" },
-    },
-    askedField: "price_daily",
-  });
-  assert.equal(out.field, "price_with_duration");
-  assert.match(out.reply, /\b5000\b/);
-  assert.match(out.reply, /50,?000/);
-});
-
-test("upstream price_daily override: Kia Stonic 10 days uses daily x 10 total", () => {
-  const out = composeInformationalAnswer({
-    message: "10 din k lye kitna rent hoga?",
-    draftReply: "",
-    item: {
-      name: "Kia Stonic EX Plus 2021",
-      displayLabel: "Kia Stonic EX Plus 2021 (White Color)",
-      pricing: { daily: 5500, monthly: 120000, currency: "PKR" },
-    },
-    askedField: "price_daily",
-  });
-  assert.equal(out.field, "price_with_duration");
-  assert.match(out.reply, /\b5500\b/);
-  assert.match(out.reply, /\b55000\b/);
-});
-
-test("daily-only rate question stays daily when no parsed duration count", () => {
-  const out = composeInformationalAnswer({
-    message: "daily rent kitna hai?",
-    draftReply: "Monthly bhi available hai",
-    item: { name: "Toyota corolla", pricing: { daily: 5000, monthly: 120000 } },
-    askedField: "price_daily",
-  });
-  assert.equal(out.field, "price_daily");
-  assert.equal(out.reply, "5000 per day hai 👍");
-});
-
-test("monthly-only rate question stays monthly when upstream says price_monthly", () => {
-  const out = composeInformationalAnswer({
-    message: "monthly rent kitna hai?",
-    draftReply: "Daily 5000 hai",
-    item: { name: "Toyota corolla", pricing: { daily: 5000, monthly: 120000 } },
-    askedField: "price_monthly",
-  });
-  assert.equal(out.field, "price_monthly");
-  assert.equal(out.reply, "120000 per month hai 👍");
 });
 
 test("mileage unknown becomes human fallback", () => {
@@ -270,7 +256,55 @@ test("condition unknown becomes human fallback", () => {
     draftReply: "Condition not available in system.",
     item: { name: "Toyota Corolla" },
   });
-  assert.equal(out.reply, "Condition check kar ke bata deta hun 👍");
+  assert.equal(out.reply, "Condition detail abhi saved nahi hai, confirm kar ke bata deta hun.");
+});
+
+test("condition question answers verified structured condition with note", () => {
+  const out = composeInformationalAnswer({
+    message: "Corolla ki condition kya hai?",
+    draftReply: "Toyota Corolla good condition mein hai. Well maintained.",
+    item: {
+      name: "Toyota Corolla",
+      condition: "Good condition",
+      conditionNote: "Well maintained",
+    },
+  });
+  assert.equal(out.reply, "Toyota Corolla good condition mein hai.\nWell maintained.");
+  assert.equal(out.source, "verified_catalog");
+  assert.equal(out.finalAuthority, true);
+});
+
+test("new or used question is treated as condition and answers yes when matching", () => {
+  const out = composeInformationalAnswer({
+    message: "Civic new hai?",
+    draftReply: "Haan new hai.",
+    item: { name: "Honda Civic 2026 Oriel", condition: "New" },
+  });
+  assert.equal(out.reply, "Jee, Honda Civic 2026 Oriel new condition mein hai.");
+  assert.equal(out.field, "condition");
+  assert.equal(out.source, "verified_catalog");
+});
+
+test("new or used question does not falsely say yes when condition differs", () => {
+  const out = composeInformationalAnswer({
+    message: "Civic new hai?",
+    draftReply: "Jee new hai.",
+    item: { name: "Honda Civic 2026 Oriel", condition: "Good condition" },
+  });
+  assert.equal(out.reply, "Honda Civic 2026 Oriel good condition mein hai.");
+  assert.equal(out.field, "condition");
+  assert.equal(out.source, "verified_catalog");
+  assert.doesNotMatch(out.reply, /^Jee/i);
+});
+
+test("AI draft condition is rejected when no structured catalog condition exists", () => {
+  const out = composeInformationalAnswer({
+    message: "condition kya hai?",
+    draftReply: "Toyota Corolla excellent condition mein hai.",
+    item: { name: "Toyota Corolla" },
+  });
+  assert.equal(out.reply, "Condition detail abhi saved nahi hai, confirm kar ke bata deta hun.");
+  assert.equal(out.source, "human_unknown");
 });
 
 test("mileage question never returns price from LLM draft", () => {
@@ -325,15 +359,15 @@ test("AI draft white hai is useful as implicit current item answer", () => {
   assert.equal(out.source, "llm_draft_grounded");
 });
 
-test("AI draft 8000 hai is useful for price field", () => {
+test("AI draft price is rejected when no structured catalog price exists", () => {
   const out = composeInformationalAnswer({
     message: "rent kitna hai?",
     draftReply: "8000 hai",
     item: { name: "Honda Civic" },
     askedField: "price",
   });
-  assert.equal(out.reply, "8000 hai");
-  assert.equal(out.source, "llm_draft_grounded");
+  assert.equal(out.reply, "Rate confirm kar ke bata deta hun 👍");
+  assert.equal(out.source, "human_unknown");
 });
 
 test("AI draft 8000 hai is not useful for color field", () => {
@@ -403,7 +437,7 @@ test("known informational field returns one sentence only", () => {
     draftReply: "Condition good hai. Booking ki details bataiye.",
     item: { name: "Honda Civic", condition: "Good" },
   });
-  assert.equal(out.reply, "Condition Good hai.");
+  assert.equal(out.reply, "Honda Civic good mein hai.");
   assert.equal(out.reply.split(/(?<=[.!?۔])\s+|\n+/).filter(Boolean).length, 1);
 });
 

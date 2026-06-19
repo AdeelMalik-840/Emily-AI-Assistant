@@ -50,6 +50,35 @@ const EMPTY_BOOKING_SLOTS = {
   reason: "unavailable",
 };
 
+const EMPTY_GENERIC_SLOT_PROPOSAL = {
+  slots: {
+    duration: null,
+    itemReference: null,
+    requestedField: null,
+    deliveryLocationHint: null,
+    deliveryMethod: null,
+    dateOrTime: null,
+  },
+  rejectedForbiddenFields: [],
+  rejectedUnknownSlotKeys: [],
+  reason: "unavailable",
+};
+
+const FORBIDDEN_GENERIC_SLOT_KEYS = new Set([
+  "contactPhone",
+  "customerName",
+  "price",
+  "bookingId",
+  "approvalStatus",
+  "bookingStatus",
+  "ownerApproval",
+  "mutation",
+  "mutations",
+  "updates",
+  "bookingUpdate",
+  "bookingMutation",
+]);
+
 function normalizeConfidenceLabel(v) {
   const s = String(v ?? "").trim().toLowerCase();
   return s === "high" || s === "medium" || s === "low" ? s : "low";
@@ -92,6 +121,101 @@ function normalizeBookingSlotPayload(value) {
       contactPhone: normalizeConfidenceLabel(confRaw.contactPhone),
     },
     reason: String(obj.reason ?? "").slice(0, 160) || "ok",
+  };
+}
+
+function cleanSlotText(value, max = 160) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, max) : "";
+}
+
+function normalizeGenericSlotProposalPayload(value) {
+  const obj = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const slotsRaw =
+    obj.slots && typeof obj.slots === "object" && !Array.isArray(obj.slots) ? obj.slots : {};
+  const allowedSlotKeys = new Set(Object.keys(EMPTY_GENERIC_SLOT_PROPOSAL.slots));
+  const rejectedForbiddenFields = [];
+  const rejectedUnknownSlotKeys = [];
+  for (const key of [...Object.keys(obj), ...Object.keys(slotsRaw)]) {
+    if (FORBIDDEN_GENERIC_SLOT_KEYS.has(key)) rejectedForbiddenFields.push(key);
+  }
+  for (const key of Object.keys(slotsRaw)) {
+    if (!allowedSlotKeys.has(key)) rejectedUnknownSlotKeys.push(key);
+  }
+
+  const confidence = (slot) => normalizeConfidenceLabel(slot?.confidence);
+  const durationRaw = slotsRaw.duration && typeof slotsRaw.duration === "object" ? slotsRaw.duration : null;
+  const durationUnit = String(durationRaw?.unitGuess ?? "").trim().toLowerCase();
+  const durationValue = Number(durationRaw?.value);
+  const itemRaw = slotsRaw.itemReference && typeof slotsRaw.itemReference === "object" ? slotsRaw.itemReference : null;
+  const itemType = String(itemRaw?.referenceType ?? "").trim();
+  const fieldRaw = slotsRaw.requestedField && typeof slotsRaw.requestedField === "object" ? slotsRaw.requestedField : null;
+  const field = String(fieldRaw?.field ?? "").trim().toLowerCase();
+  const locationRaw =
+    slotsRaw.deliveryLocationHint && typeof slotsRaw.deliveryLocationHint === "object"
+      ? slotsRaw.deliveryLocationHint
+      : null;
+  const methodRaw = slotsRaw.deliveryMethod && typeof slotsRaw.deliveryMethod === "object" ? slotsRaw.deliveryMethod : null;
+  const method = String(methodRaw?.value ?? "").trim().toLowerCase();
+  const dateRaw = slotsRaw.dateOrTime && typeof slotsRaw.dateOrTime === "object" ? slotsRaw.dateOrTime : null;
+  const dateType = String(dateRaw?.type ?? "").trim().toLowerCase();
+
+  return {
+    slots: {
+      duration: durationRaw
+        ? {
+            rawText: cleanSlotText(durationRaw.rawText),
+            value: Number.isFinite(durationValue) ? durationValue : null,
+            unitGuess: ["hours", "days", "weeks", "months"].includes(durationUnit) ? durationUnit : null,
+            confidence: confidence(durationRaw),
+          }
+        : null,
+      itemReference: itemRaw
+        ? {
+            rawText: cleanSlotText(itemRaw.rawText),
+            referenceType: ["explicit_item", "current_item", "unknown"].includes(itemType)
+              ? itemType
+              : "unknown",
+            value: cleanSlotText(itemRaw.value) || null,
+            confidence: confidence(itemRaw),
+          }
+        : null,
+      requestedField: fieldRaw
+        ? {
+            rawText: cleanSlotText(fieldRaw.rawText),
+            field: ["price", "condition", "color", "model", "mileage", "photos", "availability", "unknown"].includes(field)
+              ? field
+              : "unknown",
+            confidence: confidence(fieldRaw),
+          }
+        : null,
+      deliveryLocationHint: locationRaw
+        ? {
+            rawText: cleanSlotText(locationRaw.rawText),
+            value: cleanSlotText(locationRaw.value) || null,
+            isCompleteAddress: locationRaw.isCompleteAddress === true,
+            confidence: confidence(locationRaw),
+          }
+        : null,
+      deliveryMethod: methodRaw
+        ? {
+            rawText: cleanSlotText(methodRaw.rawText),
+            value: method === "pickup" || method === "delivery" ? method : null,
+            confidence: confidence(methodRaw),
+          }
+        : null,
+      dateOrTime: dateRaw
+        ? {
+            rawText: cleanSlotText(dateRaw.rawText),
+            value: cleanSlotText(dateRaw.value) || null,
+            type: ["date", "time", "weekday", "unknown"].includes(dateType) ? dateType : "unknown",
+            confidence: confidence(dateRaw),
+          }
+        : null,
+    },
+    rejectedForbiddenFields: Array.from(new Set(rejectedForbiddenFields)),
+    rejectedUnknownSlotKeys: Array.from(new Set(rejectedUnknownSlotKeys)),
+    reason: cleanSlotText(obj.reason, 160) || "ok",
   };
 }
 
@@ -176,6 +300,90 @@ Rules:
   const raw = resp?.choices?.[0]?.message?.content ?? "";
   const parsed = JSON.parse(String(raw || "{}"));
   return normalizeBookingSlotPayload(parsed);
+}
+
+/**
+ * Generic proposal-only slot extraction. Callers must validate every proposed slot
+ * before using it for booking, memory, pricing, or reply composition.
+ * @param {{ messageText: string, requestedSlots?: string[], context?: any, __completionForTests?: ((args: any) => Promise<any>) }} p
+ * @returns {Promise<ReturnType<typeof normalizeGenericSlotProposalPayload>>}
+ */
+export async function extractGenericSlotsWithLLM({
+  messageText,
+  requestedSlots = [],
+  context = null,
+  __completionForTests = null,
+} = {}) {
+  const message = String(messageText ?? "").replace(/\s+/g, " ").trim();
+  if (!message) {
+    return { ...EMPTY_GENERIC_SLOT_PROPOSAL, reason: "empty_input" };
+  }
+
+  const completionFn =
+    typeof __completionForTests === "function"
+      ? __completionForTests
+      : openai
+        ? (args) => openai.chat.completions.create(args)
+        : null;
+
+  if (!completionFn) {
+    return { ...EMPTY_GENERIC_SLOT_PROPOSAL, reason: "llm_unavailable" };
+  }
+
+  const system = `You propose structured slots from one WhatsApp customer message.
+Return JSON ONLY with this exact shape:
+{
+  "slots": {
+    "duration": {"rawText": string, "value": number|null, "unitGuess": "hours"|"days"|"weeks"|"months"|null, "confidence": "low"|"medium"|"high"} | null,
+    "itemReference": {"rawText": string, "referenceType": "explicit_item"|"current_item"|"unknown", "value": string|null, "confidence": "low"|"medium"|"high"} | null,
+    "requestedField": {"rawText": string, "field": "price"|"condition"|"color"|"model"|"mileage"|"photos"|"availability"|"unknown", "confidence": "low"|"medium"|"high"} | null,
+    "deliveryLocationHint": {"rawText": string, "value": string|null, "isCompleteAddress": boolean, "confidence": "low"|"medium"|"high"} | null,
+    "deliveryMethod": {"rawText": string, "value": "pickup"|"delivery"|null, "confidence": "low"|"medium"|"high"} | null,
+    "dateOrTime": {"rawText": string, "value": string|null, "type": "date"|"time"|"weekday"|"unknown", "confidence": "low"|"medium"|"high"} | null
+  },
+  "reason": "short"
+}
+
+Rules:
+- Propose slots only when the message clearly contains them, including Roman Urdu, typos, and shorthand.
+- rawText must be copied from the user's message.
+- Do NOT include customer names, phone numbers, prices, booking ids, approval state, booking status, or update instructions.
+- Do NOT generate replies.
+- Do NOT decide booking creation, pricing, availability, or state transitions.
+- If unsure, return null for that slot or confidence low.`;
+
+  const user = JSON.stringify({
+    latestMessage: message,
+    requestedSlots: Array.isArray(requestedSlots) ? requestedSlots.filter(Boolean) : [],
+    context:
+      context && typeof context === "object"
+        ? {
+            intent: context.intent ?? null,
+            askedField: context.askedField ?? null,
+            hasCurrentItem: Boolean(context.hasCurrentItem),
+            isGroupInbound: Boolean(context.isGroupInbound),
+          }
+        : null,
+  });
+
+  const resp = await completionFn({
+    model: resolveOpenAiChatModel(),
+    temperature: 0,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_tokens: 320,
+  });
+
+  const raw = resp?.choices?.[0]?.message?.content ?? "";
+  const parsed = JSON.parse(String(raw || "{}"));
+  return normalizeGenericSlotProposalPayload(parsed);
+}
+
+export function __normalizeGenericSlotProposalForTests(value) {
+  return normalizeGenericSlotProposalPayload(value);
 }
 
 function normalizeConversationIntentPayload(value) {

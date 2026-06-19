@@ -1,4 +1,5 @@
 import admin from "firebase-admin";
+import { createHash } from "node:crypto";
 
 import db from "../config/firebase.js";
 import { buildCustomerApprovalContinuation } from "./customerApprovalContinuation.js";
@@ -9,6 +10,9 @@ import {
 } from "./replyPrivateUiController.js";
 
 const FieldValue = admin.firestore.FieldValue;
+const REPLY_PRIVATE_NOTIFICATION_PURPOSE = "owner_approved_customer_handoff";
+const OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT =
+  "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT";
 
 let pollRunning = false;
 const replyPrivateQueue = [];
@@ -19,13 +23,56 @@ function clean(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
+function notificationKeyForBooking(bookingId) {
+  const id = clean(bookingId);
+  return id ? `${id}::${REPLY_PRIVATE_NOTIFICATION_PURPOSE}` : "";
+}
+
+function hashMessage(value) {
+  const text = clean(value);
+  if (!text) return "";
+  return createHash("sha256").update(text).digest("hex").slice(0, 24);
+}
+
+function sourceDiagnosticsPatch({ sourceMessage = {}, message = "" } = {}) {
+  return {
+    replyPrivateNotificationPurpose: REPLY_PRIVATE_NOTIFICATION_PURPOSE,
+    ...(clean(sourceMessage?.sourceRowKey)
+      ? { replyPrivateSourceRowKey: clean(sourceMessage.sourceRowKey) }
+      : {}),
+    ...(clean(sourceMessage?.sourceMessageId)
+      ? { replyPrivateSourceMessageId: clean(sourceMessage.sourceMessageId) }
+      : {}),
+    ...(clean(message) ? { replyPrivateMessageHash: hashMessage(message) } : {}),
+  };
+}
+
+function logReplyPrivateState(event, data = {}) {
+  console.log(event, {
+    bookingId: clean(data.bookingId) || null,
+    notificationPurpose:
+      clean(data.notificationPurpose) || REPLY_PRIVATE_NOTIFICATION_PURPOSE,
+    notificationKey: clean(data.notificationKey) || null,
+    approvalCustomerNotificationStatus:
+      clean(data.approvalCustomerNotificationStatus) || null,
+    dmSendAttempted: data.dmSendAttempted === true,
+    verificationPassed: data.verificationPassed === true,
+    retryable: data.retryable === true,
+    reason: clean(data.reason) || null,
+  });
+}
+
 function buildCustomerNotificationPatchFromReplyPrivateResult(result, base = {}) {
   const r = result && typeof result === "object" ? result : {};
   const ok = r.ok === true && r.verificationPassed === true;
   const dmOpened = r.dmOpened === true;
   const dmMessageSentRaw = r.dmMessageSent === true;
-  const retryable = r.retryable !== false;
-  const errorCode = clean(r.errorCode ?? r.failureStage ?? r.reason ?? "") || "REPLY_PRIVATE_FAILED";
+  const sendActionAttempted = r.sendActionAttempted === true;
+  const unverifiedAfterAttempt = sendActionAttempted && !ok;
+  const retryable = unverifiedAfterAttempt ? false : r.retryable !== false;
+  const errorCode = unverifiedAfterAttempt
+    ? OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT
+    : clean(r.errorCode ?? r.failureStage ?? r.reason ?? "") || "REPLY_PRIVATE_FAILED";
 
   /** Invariant: never persist failed + dmMessageSent true. */
   const dmMessageSent = ok ? true : false;
@@ -44,6 +91,8 @@ function buildCustomerNotificationPatchFromReplyPrivateResult(result, base = {})
     dmAttempted: true,
     dmOpened,
     dmMessageSent,
+    dmSendAttempted: sendActionAttempted,
+    dmSendVerificationPassed: ok,
     approvalCustomerNotificationError: ok ? null : errorCode,
     approvalCustomerNotificationRetryable: ok ? false : retryable,
     approvalCustomerNotificationTerminalFailure: ok ? false : !retryable,
@@ -59,6 +108,16 @@ function buildCustomerNotificationPatchFromReplyPrivateResult(result, base = {})
     patch.approvalCustomerNotificationStatus = "failed";
     patch.approvalCustomerNotificationFailedAt = FieldValue.serverTimestamp();
     patch.approvalCustomerNotificationFailedAtMs = Date.now();
+    if (unverifiedAfterAttempt) {
+      patch.requiresManualReview = true;
+      patch.approvalCustomerNotificationNextRetryAtMs = null;
+      Object.assign(
+        patch,
+        terminalFailurePatch({
+          errorCode: OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT,
+        })
+      );
+    }
   }
 
   console.log("[customer_notification_patch_built]", {
@@ -66,6 +125,7 @@ function buildCustomerNotificationPatchFromReplyPrivateResult(result, base = {})
     verificationPassed: r.verificationPassed === true,
     dmOpened,
     dmMessageSent,
+    dmSendAttempted: sendActionAttempted,
     errorCode: ok ? null : errorCode,
     retryable: ok ? false : retryable,
   });
@@ -74,6 +134,7 @@ function buildCustomerNotificationPatchFromReplyPrivateResult(result, base = {})
     approvalCustomerNotificationStatus: patch.approvalCustomerNotificationStatus,
     dmOpened: patch.dmOpened === true,
     dmMessageSent: patch.dmMessageSent === true,
+    dmSendAttempted: patch.dmSendAttempted === true,
     verificationPassed: r.verificationPassed === true,
     errorCode: patch.approvalCustomerNotificationError || null,
     retryable: patch.approvalCustomerNotificationRetryable !== false,
@@ -109,6 +170,14 @@ function buildOwnerApprovedBookingCustomerEvent(booking) {
     durationDays:
       booking?.durationDays != null && Number.isFinite(Number(booking.durationDays))
         ? Math.max(1, Math.floor(Number(booking.durationDays)))
+        : null,
+    durationHours:
+      booking?.durationHours != null && Number.isFinite(Number(booking.durationHours))
+        ? Math.max(1, Math.floor(Number(booking.durationHours)))
+        : null,
+    billingUnit:
+      booking?.billingUnit != null && String(booking.billingUnit).trim() !== ""
+        ? String(booking.billingUnit).trim()
         : null,
     approvalStage: "owner_approved_waiting_customer_details",
     canDmCustomer: true,
@@ -312,8 +381,11 @@ function isRetryableReplyPrivateErrorCode(errorCode) {
     "SOURCE_PARTICIPANT_MISSING",
     "SOURCE_MESSAGE_ANCHOR_MISSING",
     "INVALID_DM_TARGET",
+    "REPLY_PRIVATE_DM_TARGET_MISMATCH",
+    "REPLY_PRIVATE_WRONG_HEADER",
     "REPLY_PRIVATE_NOT_ELIGIBLE",
     "NOT_PLAYWRIGHT_GROUP",
+    OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT,
   ].includes(code);
 }
 
@@ -720,6 +792,22 @@ function claimDecision(data) {
   }
   const status = clean(data.approvalCustomerNotificationStatus);
   if (status === "sent") return { ok: false, reason: "ALREADY_SENT" };
+  if (data?.dmMessageSent === true) {
+    return { ok: false, reason: "ALREADY_DM_MESSAGE_SENT" };
+  }
+  if (
+    data?.approvalCustomerNotificationTerminalFailure === true &&
+    data?.dmSendAttempted === true
+  ) {
+    return { ok: false, reason: "ALREADY_SEND_ATTEMPTED_TERMINAL" };
+  }
+  if (
+    clean(data?.replyPrivateCustomerNotificationKey) &&
+    data?.dmSendAttempted === true &&
+    data?.requiresManualReview === true
+  ) {
+    return { ok: false, reason: "ALREADY_SEND_ATTEMPTED_MANUAL_REVIEW" };
+  }
   if (status === "failed") {
     const decision = failedRetryDecision(data);
     if (!decision.ok) return { ok: false, reason: decision.reason };
@@ -813,6 +901,7 @@ async function processPendingApproval({
     buildOwnerApprovedBookingCustomerEvent(booking),
     resolveApprovalResponseStyle(booking)
   );
+  const notificationKey = notificationKeyForBooking(bookingId);
 
   console.log("[local_approval_reply_private_started]", {
     bookingId,
@@ -858,6 +947,28 @@ async function processPendingApproval({
   try {
     const claim = await claimBookingForReplyPrivate(dbInstance, bookingRef, bookingId);
     if (!claim.ok) {
+      const alreadySent =
+        claim.reason === "ALREADY_SENT" || claim.reason === "ALREADY_DM_MESSAGE_SENT";
+      const alreadyAttempted =
+        claim.reason === "ALREADY_SEND_ATTEMPTED_TERMINAL" ||
+        claim.reason === "ALREADY_SEND_ATTEMPTED_MANUAL_REVIEW";
+      logReplyPrivateState(
+        alreadySent
+          ? "[reply_private_send_skipped_already_sent]"
+          : alreadyAttempted
+            ? "[reply_private_send_skipped_already_attempted]"
+            : "[reply_private_idempotency_check]",
+        {
+          bookingId,
+          notificationKey,
+          approvalCustomerNotificationStatus:
+            clean(booking?.approvalCustomerNotificationStatus) || null,
+          dmSendAttempted: booking?.dmSendAttempted === true,
+          verificationPassed: booking?.dmSendVerificationPassed === true,
+          retryable: false,
+          reason: claim.reason,
+        }
+      );
       console.log("[local_approval_reply_private_failed]", {
         bookingId,
         reason: claim.reason,
@@ -865,6 +976,24 @@ async function processPendingApproval({
       return;
     }
     const claimedBooking = claim.booking || booking;
+    const sourceMessage = buildSourceMessageForReplyPrivately(claimedBooking);
+    const idempotencyPatch = {
+      replyPrivateCustomerNotificationKey: notificationKey,
+      ...sourceDiagnosticsPatch({ sourceMessage, message }),
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+    console.log("[reply_private_idempotency_check]", {
+      bookingId,
+      notificationPurpose: REPLY_PRIVATE_NOTIFICATION_PURPOSE,
+      notificationKey,
+      approvalCustomerNotificationStatus:
+        clean(claimedBooking?.approvalCustomerNotificationStatus) || null,
+      dmSendAttempted: claimedBooking?.dmSendAttempted === true,
+      verificationPassed: claimedBooking?.dmSendVerificationPassed === true,
+      retryable: true,
+      reason: "CLAIMED_BEFORE_SEND",
+    });
+    await bookingRef.update(idempotencyPatch);
     globalThis.__UI_HARD_LOCK = true;
     globalThis.__OUTBOUND_BUSY__ = true;
     const result = await replyPrivately({
@@ -872,22 +1001,29 @@ async function processPendingApproval({
       groupName: groupName || null,
       playwrightChatKey: playwrightChatKey || null,
       message,
-      sourceMessage: buildSourceMessageForReplyPrivately(claimedBooking),
+      sourceMessage,
       disallowedChatTitles: [groupName, ...ownerDisallowedChatTitles()].filter(Boolean),
       replyPrivateLockHeld: true,
     });
 
     if (!result?.ok) {
-      const reason = clean(result?.errorCode ?? result?.failureStage ?? result?.reason) || "REPLY_PRIVATELY_FAILED";
+      const sendActionAttempted = result?.sendActionAttempted === true;
+      const reason = sendActionAttempted
+        ? OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT
+        : clean(result?.errorCode ?? result?.failureStage ?? result?.reason) ||
+          "REPLY_PRIVATELY_FAILED";
       const nowMs = Date.now();
       const retryCount = resolveRetryCount(booking) + 1;
-      const retryable = isRetryableReplyPrivateErrorCode(reason);
+      const retryable =
+        result?.retryable === false ? false : isRetryableReplyPrivateErrorCode(reason);
       const nextRetryAtMs = (() => {
         const backoffMs = retryBackoffMs(retryCount + 1);
         return backoffMs ? nowMs + backoffMs : null;
       })();
       const patch = buildCustomerNotificationPatchFromReplyPrivateResult(result, {
         bookingId,
+        replyPrivateCustomerNotificationKey: notificationKey,
+        ...sourceDiagnosticsPatch({ sourceMessage, message }),
         approvalCustomerNotificationFailedAtMs: nowMs,
         approvalCustomerNotificationNextRetryAtMs: retryable ? nextRetryAtMs : null,
         ...(retryable ? {} : terminalFailurePatch({ errorCode: reason })),
@@ -895,6 +1031,31 @@ async function processPendingApproval({
       patch.approvalCustomerNotificationError = reason;
       patch.approvalCustomerNotificationRetryable = retryable;
       patch.approvalCustomerNotificationTerminalFailure = !retryable;
+      if (sendActionAttempted && result?.verificationPassed !== true) {
+        patch.requiresManualReview = true;
+        patch.dmSendAttempted = true;
+        patch.dmSendVerificationPassed = false;
+        patch.approvalCustomerNotificationNextRetryAtMs = null;
+        logReplyPrivateState("[reply_private_unverified_terminal_failure]", {
+          bookingId,
+          notificationKey,
+          approvalCustomerNotificationStatus: patch.approvalCustomerNotificationStatus,
+          dmSendAttempted: true,
+          verificationPassed: false,
+          retryable: false,
+          reason,
+        });
+      } else if (retryable) {
+        logReplyPrivateState("[reply_private_retry_allowed_before_send_action]", {
+          bookingId,
+          notificationKey,
+          approvalCustomerNotificationStatus: patch.approvalCustomerNotificationStatus,
+          dmSendAttempted: false,
+          verificationPassed: false,
+          retryable: true,
+          reason,
+        });
+      }
       console.log("[reply_private_state_transition]", {
         bookingId,
         from: clean(booking?.approvalCustomerNotificationStatus) || null,
@@ -914,6 +1075,17 @@ async function processPendingApproval({
     const patch = buildCustomerNotificationPatchFromReplyPrivateResult(result, {
       bookingId,
       dmOpenMethod: "reply_privately",
+      replyPrivateCustomerNotificationKey: notificationKey,
+      ...sourceDiagnosticsPatch({ sourceMessage, message }),
+    });
+    logReplyPrivateState("[reply_private_sent_verified]", {
+      bookingId,
+      notificationKey,
+      approvalCustomerNotificationStatus: patch.approvalCustomerNotificationStatus,
+      dmSendAttempted: true,
+      verificationPassed: true,
+      retryable: false,
+      reason: "VERIFICATION_PASSED",
     });
     console.log("[reply_private_state_transition]", {
       bookingId,
