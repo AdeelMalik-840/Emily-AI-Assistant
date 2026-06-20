@@ -2457,6 +2457,35 @@ export function __freshDeltaAnchorMissingForTests(sorted, freshState, chatKey) {
 }
 
 /**
+ * Text-only assistant/echo classification shared by fresh-delta admission and brain v2 contract tests.
+ * @param {unknown} text
+ * @param {string} [chatKey]
+ */
+export function evaluateAssistantLikeUserText(text, chatKey = "") {
+  const raw = String(text ?? "").trim();
+  if (!raw) {
+    return { assistantLike: true, reason: "empty_text" };
+  }
+  if (isEmilyAssistantPricingStatement(raw)) {
+    return { assistantLike: true, reason: "assistant_pricing_statement" };
+  }
+  if (isEmilyBookingEngagementStatement(raw)) {
+    return { assistantLike: true, reason: "assistant_booking_engagement" };
+  }
+  if (isLikelyAssistantOutboundCopy(raw)) {
+    return { assistantLike: true, reason: "assistant_copy_template" };
+  }
+  if (looksLikeAssistantTemplateSubstring(raw)) {
+    return { assistantLike: true, reason: "assistant_template_substring" };
+  }
+  const ck = String(chatKey ?? "").trim();
+  if (ck && isRegisteredPlaywrightOutboundEcho(ck, raw)) {
+    return { assistantLike: true, reason: "outbound_echo_registry" };
+  }
+  return { assistantLike: false, reason: null };
+}
+
+/**
  * TEMPORARY DIAGNOSTIC — row-level admission tracing (no behavior change).
  * @param {object} m
  * @param {string} chatKey
@@ -2470,10 +2499,8 @@ function freshDeltaAssistantLikeDetail(m, chatKey) {
     return { assistantLike: true, reason: "non_user_sender" };
   }
   const text = String(m.text ?? "").trim();
-  if (!text) {
-    return { assistantLike: true, reason: "empty_text" };
-  }
-  if (isRegisteredPlaywrightOutboundEcho(chatKey, text)) {
+  const assistantLike = evaluateAssistantLikeUserText(text, chatKey);
+  if (assistantLike.assistantLike && assistantLike.reason === "outbound_echo_registry") {
     console.log("[outbound_echo_blocked]", {
       chatKey,
       stableId: null,
@@ -2482,21 +2509,8 @@ function freshDeltaAssistantLikeDetail(m, chatKey) {
       reason: "outbound_echo_registry",
       matchedOutboundPreview: text.slice(0, 120),
     });
-    return { assistantLike: true, reason: "outbound_echo_registry" };
   }
-  if (isEmilyAssistantPricingStatement(text)) {
-    return { assistantLike: true, reason: "assistant_pricing_statement" };
-  }
-  if (isEmilyBookingEngagementStatement(text)) {
-    return { assistantLike: true, reason: "assistant_booking_engagement" };
-  }
-  if (isLikelyAssistantOutboundCopy(text)) {
-    return { assistantLike: true, reason: "assistant_copy_template" };
-  }
-  if (looksLikeAssistantTemplateSubstring(text)) {
-    return { assistantLike: true, reason: "assistant_template_substring" };
-  }
-  return { assistantLike: false, reason: null };
+  return assistantLike;
 }
 
 /**
