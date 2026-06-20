@@ -233,3 +233,53 @@ test("J: duration-only follow-up allows old active item", () => {
   assert.equal(masked.memory.lastItem.id, stonic.id);
   assert.equal(masked.blocked, false);
 });
+
+test("K: latest explicit item wins when Civic then Corolla appear in one message", () => {
+  const authority = resolveCurrentTurnAuthority({
+    originalMessage: "Civic available? Corolla available?",
+    catalogItems: catalog,
+    memory: staleStonicMemory(),
+  });
+  assert.equal(authority.authoritativeItemForTurn?.id, corolla.id);
+});
+
+test("L: latest explicit item wins when Corolla then Civic appear in one message", () => {
+  const authority = resolveCurrentTurnAuthority({
+    originalMessage: "Corolla available? Civic available?",
+    catalogItems: catalog,
+    memory: staleStonicMemory(),
+  });
+  assert.equal(authority.authoritativeItemForTurn?.id, civic.id);
+});
+
+test("M: fresh Corolla beats stale Civic memory", () => {
+  const authority = resolveCurrentTurnAuthority({
+    originalMessage: "Corolla available?",
+    catalogItems: catalog,
+    memory: {
+      lastItem: { id: civic.id, name: civic.name, displayLabel: civic.displayLabel },
+      lastResolvedItemId: civic.id,
+    },
+  });
+  assert.equal(authority.authoritativeItemForTurn?.id, corolla.id);
+});
+
+test("N: fresh Civic beats stale Corolla memory", () => {
+  const authority = resolveCurrentTurnAuthority({
+    originalMessage: "Civic available?",
+    catalogItems: catalog,
+    memory: staleCorollaMemory(),
+  });
+  assert.equal(authority.authoritativeItemForTurn?.id, civic.id);
+});
+
+test("O: duration follow-up keeps Corolla memory without explicit item", () => {
+  const memory = staleCorollaMemory();
+  const authority = resolveCurrentTurnAuthority({
+    originalMessage: "3 din k lye",
+    catalogItems: catalog,
+    memory,
+  });
+  assert.equal(authority.hasExplicitItemThisTurn, false);
+  assert.equal(authority.blockStaleSessionItem, false);
+});
