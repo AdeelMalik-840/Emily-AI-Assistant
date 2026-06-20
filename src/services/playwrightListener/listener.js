@@ -59,6 +59,12 @@ import {
 } from "../participantIdentity.js";
 import { loadPlaywrightInboundCursor } from "../playwrightInboundCursorStore.js";
 import {
+  canMergeBurstRowPair,
+  isBurstMergeContinuationText as isBurstMergeContinuationTextPolicy,
+  resolveBurstMergeCatalogItems,
+  shouldBurstSupersedeOlderRow,
+} from "./burstMergePolicy.js";
+import {
   getBookingLogisticsCompletionState,
   resolveLogisticsCompletionPolicy,
 } from "../bookingDmFlow.js";
@@ -1377,9 +1383,11 @@ export function attachBurstMergeContinuations(
   burstMs,
   tickFirstSeenByStableId,
   extractedMessages,
-  chatKey
+  chatKey,
+  catalogItems
 ) {
   if (!anchorMsg) return null;
+  const catalog = resolveBurstMergeCatalogItems(catalogItems);
   const anchorPos = Number(anchorMsg?.__position);
   if (!Number.isFinite(anchorPos)) return anchorMsg;
   const byPos = new Map(
@@ -1425,7 +1433,17 @@ export function attachBurstMergeContinuations(
       }
       break;
     }
-    break;
+    if (!canMergeBurstRowPair(run[run.length - 1], nextRow, catalog)) {
+      console.log("[burst_merge_rejected_different_items]", {
+        chatKey,
+        textPreviewA: String(run[run.length - 1]?.text ?? "").slice(0, 60),
+        textPreviewB: String(nextRow?.text ?? "").slice(0, 60),
+      });
+      break;
+    }
+    run.push(nextRow);
+    lastPos = nextPos;
+    continue;
   }
   return mergeParticipantBurstMessages(run, extractedMessages);
 }
@@ -1445,6 +1463,7 @@ export function buildParticipantForwardCandidate(p) {
     anchorIndex = -1,
     burstMs = PLAYWRIGHT_FRESH_DELTA_BURST_MS,
     tickFirstSeenByStableId,
+    catalogItems,
   } = p;
   const ordered = [...(participantMessages || [])].sort(
     (a, b) => (Number(a?.__position) || 0) - (Number(b?.__position) || 0)
@@ -1526,6 +1545,8 @@ export function buildParticipantForwardCandidate(p) {
       : globalThis.__playwrightFreshDeltaState?.[String(chatKey ?? "").trim()]
           ?.tickFirstSeenByStableId;
 
+  const burstCatalog = resolveBurstMergeCatalogItems(catalogItems);
+
   if (guaranteeFirst) {
     const burstSource =
       Array.isArray(allParticipantUserRows) && allParticipantUserRows.length > 0
@@ -1540,7 +1561,8 @@ export function buildParticipantForwardCandidate(p) {
         burstMs,
         tickMap instanceof Map ? tickMap : new Map(),
         extractedMessages,
-        String(chatKey ?? "").trim()
+        String(chatKey ?? "").trim(),
+        burstCatalog
       );
       const guard = evaluateReplyAfterGuard(
         withBurst,
@@ -1548,6 +1570,40 @@ export function buildParticipantForwardCandidate(p) {
         normalizedGroupChatKeyForCompare
       );
       if (guard.skip && guard.reason === "superseded_by_newer_same_participant") {
+        const pos = Number(withBurst?.__position);
+        let newerSameParticipantRow = null;
+        if (Number.isFinite(pos)) {
+          const lastCmp = participantComparableForGuard(
+            withBurst,
+            normalizedGroupChatKeyForCompare
+          );
+          for (let j = pos + 1; j < sortedList.length; j++) {
+            if (sortedList[j]?.sender !== "user") continue;
+            const other = participantComparableForGuard(
+              sortedList[j],
+              normalizedGroupChatKeyForCompare
+            );
+            if (isSameParticipant(lastCmp, other)) {
+              newerSameParticipantRow = sortedList[j];
+              break;
+            }
+          }
+        }
+        if (
+          newerSameParticipantRow &&
+          !shouldBurstSupersedeOlderRow(
+            withBurst,
+            newerSameParticipantRow,
+            burstCatalog
+          )
+        ) {
+          logGuaranteeFirstSelection(
+            String(chatKey ?? "").trim(),
+            withBurst,
+            extractedMessages
+          );
+          return withBurst;
+        }
         continue;
       }
       logGuaranteeFirstSelection(
@@ -1567,13 +1623,24 @@ export function buildParticipantForwardCandidate(p) {
       burstMs,
       tickMap instanceof Map ? tickMap : new Map(),
       extractedMessages,
-      String(chatKey ?? "").trim()
+      String(chatKey ?? "").trim(),
+      burstCatalog
     );
     const lastRun = runs.length > 0 ? runs[runs.length - 1] : pending;
     return mergeParticipantBurstMessages(lastRun, extractedMessages);
   }
 
-  return mergeParticipantBurstMessages(pending, extractedMessages);
+  const runs = splitBurstMergeRuns(
+    pending,
+    sorted || [],
+    burstMs,
+    tickMap instanceof Map ? tickMap : new Map(),
+    extractedMessages,
+    String(chatKey ?? "").trim(),
+    burstCatalog
+  );
+  const lastRun = runs.length > 0 ? runs[runs.length - 1] : pending;
+  return mergeParticipantBurstMessages(lastRun, extractedMessages);
 }
 
 /**
@@ -2502,8 +2569,7 @@ export function isListenerInboundNoise(text) {
  * @param {unknown} text
  */
 export function isBurstMergeContinuationText(text) {
-  const trimmed = String(text ?? "").trim();
-  return trimmed === "?";
+  return isBurstMergeContinuationTextPolicy(text);
 }
 
 /**
@@ -3364,9 +3430,11 @@ export function splitBurstMergeRuns(
   burstMs,
   tickFirstSeenByStableId,
   extractedList,
-  chatKey
+  chatKey,
+  catalogItems
 ) {
   if (!Array.isArray(pending) || pending.length === 0) return [];
+  const catalog = resolveBurstMergeCatalogItems(catalogItems);
   /** @type {Array<Array<object>>} */
   const runs = [];
   let currentRun = [pending[0]];
@@ -3387,6 +3455,16 @@ export function splitBurstMergeRuns(
         chatKey,
         gapMs,
         burstMs,
+        textPreviewA: String(prev?.text ?? "").slice(0, 60),
+        textPreviewB: String(next?.text ?? "").slice(0, 60),
+      });
+      runs.push(currentRun);
+      currentRun = [next];
+      continue;
+    }
+    if (!canMergeBurstRowPair(prev, next, catalog)) {
+      console.log("[burst_merge_rejected_different_items]", {
+        chatKey,
         textPreviewA: String(prev?.text ?? "").slice(0, 60),
         textPreviewB: String(next?.text ?? "").slice(0, 60),
       });

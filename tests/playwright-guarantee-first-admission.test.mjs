@@ -64,7 +64,7 @@ test("noise includes lone ? (aligned with inbound gate garbage_message)", () => 
   assert.equal(isListenerInboundNoise("?"), true);
   assert.equal(isListenerInboundNoise("???"), true);
   assert.equal(isBurstMergeContinuationText("?"), true);
-  assert.equal(isBurstMergeContinuationText("???"), false);
+  assert.equal(isBurstMergeContinuationText("???"), true);
 });
 
 test("guarantee-first: civic at ack index survives while guarantee idle", () => {
@@ -211,8 +211,8 @@ test("attachBurstMergeContinuations merges civic + ? only", () => {
     sorted,
     CHAT
   );
-  assert.equal(merged.text, "Civic available? ?");
-  assert.equal(merged.__burstMergedCount, 2);
+  assert.equal(merged.text, "Civic available? ? ???");
+  assert.equal(merged.__burstMergedCount, 3);
 });
 
 test("guarantee cursor skips done rows and picks next oldest", () => {
