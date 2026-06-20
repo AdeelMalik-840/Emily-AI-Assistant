@@ -417,6 +417,7 @@ export async function reconcileItemContextWithExplicitMessage({
 
 export async function resolveExplicitUnlistedMention({
   message,
+  rawMessage = null,
   itemContext,
   catalogItems = [],
   resolveCatalog,
@@ -457,11 +458,22 @@ export async function resolveExplicitUnlistedMention({
 
   const contextId = normalizeId(itemContext?.itemId ?? itemContext?.id);
   const durationParsed = parseUserDuration(message);
+  const pricingGuardMessage = String(rawMessage ?? message ?? "").trim() || message;
+  const guardDuration =
+    parseUserDuration(pricingGuardMessage) ?? durationParsed;
+  const normalizedPricingGuardMessage = String(pricingGuardMessage ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ");
+  const labelAppearsInPricingGuard =
+    normLabel && normalizedPricingGuardMessage.includes(normLabel);
   if (
     contextId &&
-    isExplicitPricingOrDetailsQuestion(message) &&
-    durationParsed != null &&
-    !explicit.found
+    !explicit.found &&
+    !labelAppearsInPricingGuard &&
+    isExplicitPricingOrDetailsQuestion(pricingGuardMessage) &&
+    guardDuration != null
   ) {
     return null;
   }

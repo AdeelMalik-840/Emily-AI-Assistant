@@ -62,7 +62,7 @@ function hasBookingCommitmentSignal(text) {
   if (
     /\d+\s*(?:din|deen|dino|day|days|ghanty|ghante|ghanta|hour|hours)\s+k\s*(?:lye|liye|lie|keliye)\b/i.test(
       text.replace(/\s+/g, " ")
-    )
+    ) && !explicitlyAsksAmount(text)
   ) {
     return true;
   }

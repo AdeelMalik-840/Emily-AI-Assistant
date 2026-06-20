@@ -13534,6 +13534,7 @@ export async function processMessage({
   const explicitUnlistedCheck = !skipItemResolutionForGreeting
     ? await resolveExplicitUnlistedMention({
         message,
+        rawMessage: inboundMessageRawForFuzzy,
         itemContext,
         catalogItems: normalizedCatalogForTurn,
         resolveCatalog: resolveCatalogThisTurn,
