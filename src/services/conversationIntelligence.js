@@ -99,6 +99,18 @@ export function getEmilySessionState(sessionKey) {
 }
 
 /**
+ * Read existing session state without initializing or mutating the session store.
+ * @param {string} sessionKey
+ * @returns {ReturnType<typeof defaultState> | null}
+ */
+export function peekEmilySessionState(sessionKey) {
+  const k = String(sessionKey ?? "").trim() || "_default";
+  return /** @type {ReturnType<typeof defaultState> | null} */ (
+    stateBySession.get(k) ?? null
+  );
+}
+
+/**
  * @param {string} sessionKey
  * @param {Partial<ReturnType<typeof defaultState>> & { entities?: Record<string, unknown> }} patch
  */
