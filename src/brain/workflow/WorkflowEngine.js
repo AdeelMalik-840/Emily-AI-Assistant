@@ -2,6 +2,8 @@
  * Workflow arbitration — first rule: pricing_with_duration beats open collect_duration
  * unless there is an explicit booking commitment.
  */
+import { isGreeting, normalizeText } from "../../services/preAiRouting.js";
+import { extractContactPhoneFromText } from "../../services/messageProcessor.js";
 import {
   isAvailabilityInquiryIntent,
   isBrowseWorkflowIntent,
@@ -55,6 +57,38 @@ function isBookingRequestContinuation(understanding) {
 }
 
 /**
+ * @param {TurnContext} turnContext
+ * @returns {boolean}
+ */
+function isAwaitingBookingContact(turnContext) {
+  const memory =
+    turnContext?.memorySnapshot && typeof turnContext.memorySnapshot === "object"
+      ? /** @type {Record<string, unknown>} */ (turnContext.memorySnapshot)
+      : null;
+  const stage = String(memory?.stage ?? "").trim();
+  const pending =
+    memory?.pendingAction && typeof memory.pendingAction === "object"
+      ? /** @type {Record<string, unknown>} */ (memory.pendingAction)
+      : null;
+  const pendingType = String(pending?.type ?? "").trim();
+  return stage === "AWAITING_BOOKING_CONTACT" || pendingType === "ASK_CONTACT";
+}
+
+/**
+ * @param {TurnUnderstanding} understanding
+ * @param {string} message
+ * @returns {boolean}
+ */
+function isExplicitBookingRequest(understanding, message) {
+  if (understanding.signals?.bookingCommitment) return true;
+  const text = String(message ?? "").toLowerCase();
+  if (/\bbook\b|\bbooking\b|\bconfirm\b|\bkr\s*do\b|\bkar\s*do\b/i.test(text)) {
+    return Boolean(understanding.resolvedItemId);
+  }
+  return false;
+}
+
+/**
  * @param {{
  *   understanding: TurnUnderstanding,
  *   turnContext: TurnContext,
@@ -64,6 +98,31 @@ function isBookingRequestContinuation(understanding) {
  */
 export function selectWorkflow({ understanding, turnContext, message = "" }) {
   const inboundText = String(message ?? "").trim();
+  const normalized = normalizeText(inboundText);
+
+  if (isGreeting(normalized)) {
+    return {
+      workflowType: "greeting",
+      reason: "deterministic_greeting",
+      priority: 95,
+    };
+  }
+
+  if (isAwaitingBookingContact(turnContext)) {
+    const phone = extractContactPhoneFromText(inboundText);
+    if (phone) {
+      return {
+        workflowType: "contact_collection",
+        reason: "contact_phone_detected",
+        priority: 90,
+      };
+    }
+    return {
+      workflowType: "contact_request",
+      reason: "awaiting_booking_contact",
+      priority: 88,
+    };
+  }
 
   if (hasOpenCollectDurationPending(turnContext)) {
     if (isPricingWithDurationInterrupt(understanding)) {
@@ -120,8 +179,52 @@ export function selectWorkflow({ understanding, turnContext, message = "" }) {
     };
   }
 
+  if (isPricingWithDurationInterrupt(understanding) && understanding.resolvedItemId) {
+    return {
+      workflowType: "pricing_with_duration",
+      reason:
+        understanding.itemSource === "explicit"
+          ? "explicit_item_price_with_duration"
+          : "trusted_item_price_with_duration",
+      priority: 85,
+    };
+  }
+
+  if (
+    understanding.signals?.priceAsk &&
+    understanding.resolvedItemId &&
+    understanding.durationDays == null
+  ) {
+    return {
+      workflowType: "pricing_inquiry",
+      reason:
+        understanding.itemSource === "explicit"
+          ? "explicit_item_price_inquiry"
+          : "resolved_item_price_inquiry",
+      priority: 82,
+    };
+  }
+
+  if (isExplicitBookingRequest(understanding, inboundText) && understanding.resolvedItemId) {
+    return {
+      workflowType: "booking_request",
+      reason: understanding.signals?.bookingCommitment
+        ? "explicit_booking_commitment"
+        : "explicit_book_phrase_with_item",
+      priority: 86,
+    };
+  }
+
+  if (isBookingRequestContinuation(understanding) && understanding.resolvedItemId) {
+    return {
+      workflowType: "booking_request",
+      reason: "duration_booking_continuation",
+      priority: 84,
+    };
+  }
+
   return {
-    workflowType: "noop",
+    workflowType: "unknown_clarification",
     reason: "no_matching_workflow",
     priority: 0,
   };
