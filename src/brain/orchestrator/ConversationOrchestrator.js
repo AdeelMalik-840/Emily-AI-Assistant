@@ -1,6 +1,6 @@
 /**
- * Emily Brain v2 orchestrator — shadow/test mode only.
- * Produces decision artifacts; does not execute live channel actions.
+ * Emily Brain v2 orchestrator — produces decision artifacts and action plans.
+ * Live execution is delegated to Action Router + executors.
  */
 import {
   startTurnDecisionTrace,
@@ -11,11 +11,17 @@ import { understandTurn } from "../understanding/UnderstandingEngine.js";
 import { selectWorkflow } from "../workflow/WorkflowEngine.js";
 import {
   buildPricingWithDurationActionPlan,
+  buildPricingInquiryActionPlan,
   buildBookingRequestActionPlan,
   buildAvailabilityInquiryActionPlan,
   buildBrowseOptionsActionPlan,
   buildUnlistedItemActionPlan,
+  buildGreetingActionPlan,
+  buildClarificationActionPlan,
+  buildContactCollectionActionPlan,
+  buildContactRequestActionPlan,
 } from "../workflows/index.js";
+import { extractContactPhoneFromText } from "../../services/messageProcessor.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
@@ -45,6 +51,7 @@ import {
  *   admittedTurn: AdmittedTurn,
  *   turnContext: TurnContext,
  *   businessContext?: BusinessContext,
+ *   mode?: "shadow" | "live",
  * }} params
  * @returns {OrchestratorTurnResult}
  */
@@ -53,6 +60,7 @@ export function runConversationTurn({
   admittedTurn,
   turnContext,
   businessContext = {},
+  mode = "shadow",
 }) {
   const businessId = String(turnContext?.businessId ?? admittedTurn?.turn?.businessId ?? "").trim();
   if (!businessId) {
@@ -63,7 +71,7 @@ export function runConversationTurn({
     traceId,
     businessId,
     admittedTurn,
-    extras: { mode: "shadow_v2_candidate_only" },
+    extras: { mode: mode === "live" ? "brain_v2_live" : "shadow_v2_candidate_only" },
   });
   trace = patchTurnDecisionTrace(trace, { turnContext });
 
@@ -85,7 +93,11 @@ export function runConversationTurn({
 
   /** @type {ActionPlan | null} */
   let actionPlan = null;
-  if (workflowDecision.workflowType === "pricing_with_duration") {
+  const wf = workflowDecision.workflowType;
+
+  if (wf === "greeting") {
+    actionPlan = buildGreetingActionPlan();
+  } else if (wf === "pricing_with_duration") {
     actionPlan = buildPricingWithDurationActionPlan({
       admittedTurn,
       turnContext,
@@ -93,28 +105,51 @@ export function runConversationTurn({
       catalogItems,
       businessContext: businessContext.businessProfile ?? null,
     });
-  } else if (workflowDecision.workflowType === "booking_request") {
+  } else if (wf === "pricing_inquiry") {
+    actionPlan = buildPricingInquiryActionPlan({
+      admittedTurn,
+      understanding,
+      catalogItems,
+      businessContext: businessContext.businessProfile ?? null,
+    });
+  } else if (wf === "booking_request") {
     actionPlan = buildBookingRequestActionPlan({
       admittedTurn,
       turnContext,
       understanding,
     });
-  } else if (workflowDecision.workflowType === "availability_inquiry") {
+  } else if (wf === "availability_inquiry") {
     actionPlan = buildAvailabilityInquiryActionPlan({
       admittedTurn,
       understanding,
       catalogItems,
       businessContext: businessContext.businessProfile ?? null,
     });
-  } else if (workflowDecision.workflowType === "browse_options") {
+  } else if (wf === "browse_options") {
     actionPlan = buildBrowseOptionsActionPlan({
       catalogItems,
       conversationStyle: businessContext.conversationStyle ?? "casual_local",
     });
-  } else if (workflowDecision.workflowType === "unlisted_item") {
+  } else if (wf === "unlisted_item") {
     actionPlan = buildUnlistedItemActionPlan({
       understanding,
       conversationStyle: businessContext.conversationStyle ?? "casual_local",
+    });
+  } else if (wf === "clarification") {
+    actionPlan = buildClarificationActionPlan({
+      reason: workflowDecision.reason ?? "collect_duration_pending",
+    });
+  } else if (wf === "contact_collection") {
+    const phone = extractContactPhoneFromText(String(admittedTurn?.turn?.text ?? ""));
+    actionPlan = buildContactCollectionActionPlan({
+      admittedTurn,
+      contactPhone: phone ?? "",
+    });
+  } else if (wf === "contact_request") {
+    actionPlan = buildContactRequestActionPlan();
+  } else if (wf === "unknown_clarification" || wf === "noop") {
+    actionPlan = buildClarificationActionPlan({
+      reason: workflowDecision.reason ?? "unknown",
     });
   }
 

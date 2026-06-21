@@ -6819,6 +6819,8 @@ async function resolveAvailabilityCustomerReply({
  * @param {Function | null} [opts.__availabilityAiCompletionForTests] - mock OpenAI chat.completions.create for narrow availability AI tests
  * @param {string} [opts.traceId] - booking-flow trace id (from executeWhatsAppAiPipeline)
  */
+// Deprecated live brain. Do not add new decision logic.
+// V2 live path must not call this when EMILY_BRAIN_V2_LIVE is enabled.
 export async function processMessage({
   traceId: traceIdIn,
   userId,

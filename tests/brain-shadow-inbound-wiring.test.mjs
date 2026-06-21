@@ -101,13 +101,17 @@ test("disabled shadow preparation loads nothing and mutates nothing", async () =
   assert.equal(dependencyCalls, 0);
 });
 
-test("shadow scheduling is positioned only after legacy processMessage resolves", () => {
+test("shadow scheduling follows brain processing (legacy or v2 live)", () => {
   const source = executeWhatsAppAiPipeline.toString();
-  const legacyCall = source.indexOf("await processMessage({");
+  const legacyCall = source.indexOf("await processMessageFn({");
+  const v2LiveSelected = source.indexOf("[brain_v2_live_selected]");
   const shadowCall = source.indexOf("await scheduleEmilyBrainV2ShadowAfterLegacy({");
 
-  assert.ok(legacyCall >= 0, "legacy processMessage call must exist");
-  assert.ok(shadowCall > legacyCall, "shadow scheduling must follow legacy processing");
+  assert.ok(v2LiveSelected >= 0, "v2 live selection marker must exist");
+  assert.ok(shadowCall > v2LiveSelected, "shadow scheduling must follow v2 live gate");
+  if (legacyCall >= 0) {
+    assert.ok(shadowCall > legacyCall, "shadow scheduling must follow legacy processing when present");
+  }
 });
 
 test("shadow scheduler failure is swallowed and returns control", async () => {

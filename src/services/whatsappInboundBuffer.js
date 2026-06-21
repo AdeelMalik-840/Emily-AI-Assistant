@@ -157,6 +157,150 @@ export function isEmilyBrainV2ShadowQuickGate(businessId) {
 }
 
 /**
+ * Fast gate for v2 informational live — avoids importing src/brain when disabled.
+ * @param {string | null | undefined} businessId
+ */
+export function isEmilyBrainV2InfoLiveQuickGate(businessId) {
+  if (!envTruthyFlag("EMILY_BRAIN_V2_INFO_LIVE")) return false;
+  if (
+    !envTruthyFlag("EMILY_BRAIN_V2_PRODUCTION_ALLOW") &&
+    String(process.env.NODE_ENV ?? "").trim() === "production"
+  ) {
+    return false;
+  }
+  const uid = String(businessId ?? "").trim();
+  if (!uid) return false;
+  const allowlist = String(process.env.EMILY_BRAIN_V2_INFO_BUSINESSES ?? "")
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!allowlist.length) return false;
+  return allowlist.includes(uid);
+}
+
+/**
+ * Fast gate for v2 full live brain — avoids importing src/brain when disabled.
+ * @param {string | null | undefined} businessId
+ */
+export function isEmilyBrainV2LiveQuickGate(businessId) {
+  if (!envTruthyFlag("EMILY_BRAIN_V2_LIVE")) return false;
+  if (
+    !envTruthyFlag("EMILY_BRAIN_V2_PRODUCTION_ALLOW") &&
+    String(process.env.NODE_ENV ?? "").trim() === "production"
+  ) {
+    return false;
+  }
+  const uid = String(businessId ?? "").trim();
+  if (!uid) return false;
+  const allowlist = String(process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES ?? "")
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!allowlist.length) return false;
+  return allowlist.includes(uid);
+}
+
+/**
+ * @param {{
+ *   businessId: string,
+ *   isPlaywrightDmWithIdentity?: boolean,
+ *   bookingHint?: unknown,
+ * }} p
+ * @returns {"v2_live" | "info_live" | "legacy"}
+ */
+export function evaluateInboundBrainRoute(p) {
+  if (isEmilyBrainV2LiveQuickGate(p.businessId)) return "v2_live";
+  if (
+    !p.isPlaywrightDmWithIdentity &&
+    !p.bookingHint &&
+    isEmilyBrainV2InfoLiveQuickGate(p.businessId)
+  ) {
+    return "info_live";
+  }
+  return "legacy";
+}
+
+/**
+ * Attempt v2 full live routing — never falls back to legacy unless explicit rollback flag.
+ * @param {Record<string, unknown>} params
+ */
+export async function tryBrainV2LiveBeforeLegacy(params) {
+  try {
+    const liveModule = await import("../brain/live/brainV2LivePipeline.js");
+    const runLive = /** @type {typeof import("../brain/live/brainV2LivePipeline.js").runBrainV2LivePipeline} */ (
+      liveModule.runBrainV2LivePipeline
+    );
+    let resolveTrustedSessionItem = params.resolveTrustedSessionItem;
+    if (typeof resolveTrustedSessionItem !== "function") {
+      const mp = await import("./messageProcessor.js");
+      resolveTrustedSessionItem =
+        mp.__hasSafePreviousCatalogItemForPriceFollowupForTests;
+    }
+    return await runLive({
+      ...params,
+      resolveTrustedSessionItem:
+        typeof resolveTrustedSessionItem === "function"
+          ? (trustedArgs) => resolveTrustedSessionItem(trustedArgs)
+          : undefined,
+    });
+  } catch (err) {
+    console.warn("[brain_v2_live_failed]", {
+      traceId: params?.traceId,
+      businessId: params?.businessId,
+      error: String(err?.message ?? err ?? "").slice(0, 160),
+    });
+    if (envTruthyFlag("EMILY_BRAIN_V2_LEGACY_FALLBACK")) {
+      return { handled: false, reason: "V2_LIVE_ERROR", legacyBypassed: false };
+    }
+    return {
+      handled: true,
+      reply:
+        "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.",
+      sendVia: params?.isGroupInbound ? "GROUP" : "CLOUD_API",
+      messageMeta: {
+        brainV2Live: true,
+        outboundTrace: { finalReplySource: "BRAIN_V2_LIVE_ERROR" },
+      },
+      reason: "V2_LIVE_ERROR",
+      legacyBypassed: true,
+    };
+  }
+}
+
+/**
+ * Attempt v2 informational live routing before legacy processMessage.
+ * @param {Record<string, unknown>} params
+ */
+export async function tryBrainV2InfoLiveBeforeLegacy(params) {
+  try {
+    const liveModule = await import("../brain/live/brainV2InfoLiveAdapter.js");
+    const tryLive = /** @type {typeof import("../brain/live/brainV2InfoLiveAdapter.js").tryBrainV2InfoLiveTurn} */ (
+      liveModule.tryBrainV2InfoLiveTurn
+    );
+    let resolveTrustedSessionItem = params.resolveTrustedSessionItem;
+    if (typeof resolveTrustedSessionItem !== "function") {
+      const mp = await import("./messageProcessor.js");
+      resolveTrustedSessionItem =
+        mp.__hasSafePreviousCatalogItemForPriceFollowupForTests;
+    }
+    return await tryLive({
+      ...params,
+      resolveTrustedSessionItem:
+        typeof resolveTrustedSessionItem === "function"
+          ? (trustedArgs) => resolveTrustedSessionItem(trustedArgs)
+          : undefined,
+    });
+  } catch (err) {
+    console.warn("[emily_brain_v2_info_live_failed]", {
+      traceId: params?.traceId,
+      businessId: params?.businessId,
+      error: String(err?.message ?? err ?? "").slice(0, 160),
+    });
+    return { handled: false, reason: "INFO_LIVE_ERROR" };
+  }
+}
+
+/**
  * Capture pre-legacy state without initializing the Emily session store.
  * Dependencies are injectable so wiring safety can be tested without module mocks.
  *
@@ -1321,12 +1465,127 @@ export async function executeWhatsAppAiPipeline(p) {
   let reply;
   let sendVia;
   let dmRecipientPhone;
+  let messageMeta;
+  let handledByBrainV2Live = false;
+  let handledByBrainV2InfoLive = false;
+
+  const v2LiveEligible = isEmilyBrainV2LiveQuickGate(ownerUserId);
+  const infoLiveEligible =
+    !v2LiveEligible &&
+    !isPlaywrightDmWithIdentity &&
+    !p?.bookingHint &&
+    isEmilyBrainV2InfoLiveQuickGate(ownerUserId);
+
+  const sharedBrainParams = {
+    traceId,
+    businessId: ownerUserId,
+    message: normalizedInbound.message,
+    messageId: normalizedInbound.messageId,
+    channel: playwrightWebInbound ? "whatsapp_web" : "whatsapp_cloud",
+    chatType: isGroupInbound ? "group" : "dm",
+    chatId:
+      String(playwrightChatKeyRaw ?? "").trim() ||
+      String(groupNameResolved ?? "").trim() ||
+      sessionKey,
+    sessionKey: normalizedInbound.sessionKey,
+    participantKey: participantKeyRaw,
+    participantPhoneForDm:
+      String(participantPhoneForDmRaw ?? "").trim() || null,
+    playwrightChatKey: playwrightChatKeyRaw,
+    isGroupInbound,
+    isGroupMessage,
+    playwrightWebInbound,
+    isDmContinuation: isPlaywrightDmWithIdentity,
+    hasBookingHint: Boolean(p?.bookingHint),
+    memorySnapshot: shadowPreTurnMemorySnapshot,
+    conversationHistory,
+    sourceRowKey: sourceRowKeyRaw,
+    guaranteeKey: buildPlaywrightGuaranteeKey(groupNameResolved, messageIdRaw),
+    groupName: groupNameResolved || null,
+    whatsappRecipientType,
+    executionContext: {
+      traceId,
+      businessId: ownerUserId,
+      userId: ownerUserId,
+      db,
+      sessionKey: normalizedInbound.sessionKey,
+      participantKey: participantKeyRaw,
+      participantPhoneForDm:
+        String(participantPhoneForDmRaw ?? "").trim() || null,
+      sendCredentials,
+    },
+  };
+
+  if (v2LiveEligible) {
+    console.log("[brain_v2_live_selected]", {
+      traceId,
+      businessId: ownerUserId,
+      messagePreview: String(normalizedInbound.message ?? "").slice(0, 120),
+    });
+    const v2LiveStartedAt = Date.now();
+    const v2LiveResult = await tryBrainV2LiveBeforeLegacy(sharedBrainParams);
+    logLatency("brainV2Live", v2LiveStartedAt, {
+      handled: v2LiveResult?.handled === true,
+      reason: v2LiveResult?.reason ?? null,
+      workflowType: v2LiveResult?.workflowType ?? null,
+      legacyBypassed: v2LiveResult?.legacyBypassed === true,
+    });
+    if (v2LiveResult?.legacyBypassed === true || v2LiveResult?.handled === true) {
+      handledByBrainV2Live = true;
+      console.log("[legacy_brain_bypassed]", {
+        traceId,
+        businessId: ownerUserId,
+        workflowType: v2LiveResult?.workflowType ?? null,
+        reason: v2LiveResult?.reason ?? null,
+      });
+      reply = String(v2LiveResult.reply ?? "").trim();
+      messageMeta =
+        v2LiveResult.messageMeta && typeof v2LiveResult.messageMeta === "object"
+          ? v2LiveResult.messageMeta
+          : {};
+      sendVia = v2LiveResult.sendVia ?? (isGroupInbound ? "GROUP" : "WHATSAPP");
+      dmRecipientPhone = v2LiveResult.dmRecipientPhone ?? undefined;
+    }
+  }
+
+  if (!handledByBrainV2Live && infoLiveEligible) {
+    const infoLiveStartedAt = Date.now();
+    const infoLiveResult = await tryBrainV2InfoLiveBeforeLegacy({
+      ...sharedBrainParams,
+      participantKeyForTrusted:
+        participantKeyRaw != null && String(participantKeyRaw).trim() !== ""
+          ? String(participantKeyRaw).trim()
+          : null,
+      chatContextKey: String(playwrightChatKeyRaw ?? groupNameResolved ?? "").trim(),
+      traceIdForTrusted: traceId,
+    });
+    logLatency("brainV2InfoLive", infoLiveStartedAt, {
+      handled: infoLiveResult?.handled === true,
+      reason: infoLiveResult?.reason ?? null,
+      workflowType: infoLiveResult?.workflowType ?? null,
+    });
+    if (infoLiveResult?.handled === true) {
+      handledByBrainV2InfoLive = true;
+      reply = String(infoLiveResult.reply ?? "").trim();
+      messageMeta =
+        infoLiveResult.messageMeta && typeof infoLiveResult.messageMeta === "object"
+          ? infoLiveResult.messageMeta
+          : {};
+      sendVia = infoLiveResult.sendVia ?? (isGroupInbound ? "GROUP" : "WHATSAPP");
+      dmRecipientPhone = undefined;
+    }
+  }
+
+  const processMessageFn =
+    typeof p.__processMessageFn === "function" ? p.__processMessageFn : processMessage;
+
+  if (!handledByBrainV2Live && !handledByBrainV2InfoLive) {
   ({
     reply,
     messageMeta,
     sendVia,
     dmRecipientPhone,
-  } = await processMessage({
+  } = await processMessageFn({
     traceId,
     userId: normalizedInbound.userId,
     message: normalizedInbound.message,
@@ -1382,6 +1641,7 @@ export async function executeWhatsAppAiPipeline(p) {
         : null,
     inboundSourceOrigin: effectiveInboundSourceOrigin,
   }));
+  }
   const finalReplySourceFromMeta = String(
     messageMeta?.outboundTrace?.finalReplySource ?? ""
   ).trim();
@@ -1412,6 +1672,8 @@ export async function executeWhatsAppAiPipeline(p) {
     sendVia,
     hasReply: String(reply ?? "").trim() !== "",
     intentionalSilent,
+    skippedForBrainV2Live: handledByBrainV2Live,
+    skippedForBrainV2InfoLive: handledByBrainV2InfoLive,
   });
 
   await scheduleEmilyBrainV2ShadowAfterLegacy({
@@ -2658,3 +2920,6 @@ export async function __advancePlaywrightInboundCompletionForTests(gk, opts = {}
 /** Same as {@link __clearWhatsAppInboundBufferForTests} — public name for dev / HTTP / signals. */
 export const clearWhatsAppInboundMessageCaches =
   __clearWhatsAppInboundBufferForTests;
+
+/** @internal Tests — owner notification executor hook. */
+export { triggerBusinessBookingNotification as __triggerBusinessBookingNotificationForTests };
