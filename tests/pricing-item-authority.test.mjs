@@ -94,3 +94,40 @@ test("civic monthly fuzzy/explicit path resolves Civic", () => {
   assert.equal(fuzzy.found, true);
   assert.equal(fuzzy.itemId, "honda_civic_2026_oriel_white_7e961e31");
 });
+
+test("multi-item merged text picks latest explicit catalog item Corolla", () => {
+  const authority = resolveAuthoritativeItemForTurn({
+    userText: "Civic available? Corolla available?",
+    explicitResolvedItem: CATALOG[0],
+    turnLockedItem: null,
+    memoryItem: CATALOG[0],
+    isFollowup: true,
+    catalogItems: CATALOG,
+  });
+  assert.equal(authority?.id, "toyota_corolla_metallic_grey_0e2cd610");
+});
+
+test("multi-item merged text picks latest explicit catalog item Civic", () => {
+  const authority = resolveAuthoritativeItemForTurn({
+    userText: "Corolla available? Civic available?",
+    explicitResolvedItem: CATALOG[1],
+    turnLockedItem: null,
+    memoryItem: CATALOG[1],
+    isFollowup: true,
+    catalogItems: CATALOG,
+  });
+  assert.equal(authority?.id, "honda_civic_2026_oriel_white_7e961e31");
+});
+
+test("duration follow-up keeps memory when no explicit item in message", () => {
+  const corolla = CATALOG[1];
+  const authority = resolveAuthoritativeItemForTurn({
+    userText: "3 din k lye",
+    explicitResolvedItem: null,
+    turnLockedItem: null,
+    memoryItem: corolla,
+    isFollowup: true,
+    catalogItems: CATALOG,
+  });
+  assert.equal(authority?.id, corolla.id);
+});

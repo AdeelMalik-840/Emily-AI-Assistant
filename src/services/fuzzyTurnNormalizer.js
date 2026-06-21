@@ -143,6 +143,16 @@ const BOOKING_CUE = [
 
 const ACK_CUE = ["ok", "okay", "yes", "haan", "han", "jee", "ji"];
 
+/** Exact price/rent intent tokens — must not fuzzy-rewrite to availability on pricing turns. */
+const PROTECTED_PRICE_INTENT_TOKENS = new Set([
+  "kitna",
+  "kitni",
+  "kitne",
+  "rent",
+  "kiraya",
+  "kiraye",
+]);
+
 const STOP_CATALOG_TOKENS = new Set([
   "the",
   "and",
@@ -207,6 +217,33 @@ export function normalizeFuzzyText(s) {
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * @param {unknown} token
+ * @returns {boolean}
+ */
+export function isProtectedPriceIntentToken(token) {
+  return PROTECTED_PRICE_INTENT_TOKENS.has(String(token ?? "").trim().toLowerCase());
+}
+
+/**
+ * @param {unknown} rawText
+ * @returns {boolean}
+ */
+export function isPricingOrRentShapedMessage(rawText) {
+  const text = String(rawText ?? "").trim();
+  if (!text) return false;
+  const field = detectAskedField(text);
+  if (
+    field === "price_with_duration" ||
+    field === "price" ||
+    field === "price_daily" ||
+    field === "price_monthly"
+  ) {
+    return true;
+  }
+  return /\b(rent|kiraya|kiraye|kitna|kitni|kitne|rate|price|pricing)\b/i.test(text);
 }
 
 /**
@@ -923,6 +960,12 @@ export function normalizeFuzzyTurn(opts = {}) {
 
     for (const vocab of CONTROLLED_VOCABS) {
       if (correctedTokens.has(token)) break;
+      if (
+        isPricingOrRentShapedMessage(rawText) &&
+        isProtectedPriceIntentToken(token)
+      ) {
+        break;
+      }
       const match = bestVocabMatch(token, vocab.terms, vocab.type);
       if (!match || match.exact) continue;
       const minConf = minConfidenceForVocab(vocab.type, token, match.term);

@@ -141,7 +141,10 @@ import {
   decideResponseStrategy,
 } from "./responseStrategy.js";
 import { sanitizeContextForResolvedItemChange } from "./bookingContextSanitizer.js";
-import { findConservativeFuzzyCatalogMention } from "./currentTurnAuthority.js";
+import {
+  findConservativeFuzzyCatalogMention,
+  hasExplicitNewItemMention,
+} from "./currentTurnAuthority.js";
 import {
   buildSameSessionBookingContinuationReply,
   isAwaitingBookingContactCapture,
@@ -5110,32 +5113,6 @@ function clearParticipantLastFocusedItemAfterVerifiedGlobalNoOptions({
   });
 }
 
-function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
-  const msg = normalizeCatalogMatchText(message);
-  const lockedId = normalizeId(lockedItemId);
-  if (!msg || !Array.isArray(catalogItems)) {
-    return { found: false, itemId: null, itemLabel: null };
-  }
-  for (const row of catalogItems) {
-    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
-    const r = /** @type {Record<string, unknown>} */ (row);
-    const id = normalizeId(r.id);
-    if (!id || id === lockedId) continue;
-    const label = buildDisplayLabel(r) || String(r.name ?? "").trim();
-    const labelNorm = normalizeCatalogMatchText(label);
-    const nameNorm = normalizeCatalogMatchText(r.name);
-    const tokens = tokenizeCatalogMatch(label || r.name);
-    const mentioned =
-      (labelNorm && msg.includes(labelNorm)) ||
-      (nameNorm && msg.includes(nameNorm)) ||
-      tokens.some((t) => t.length >= 4 && msg.split(/\s+/).includes(t));
-    if (mentioned) {
-      return { found: true, itemId: id, itemLabel: label || null };
-    }
-  }
-  return { found: false, itemId: null, itemLabel: null };
-}
-
 /**
  * LLM intent `reason` (English) often distinguishes timeframe vs stock check.
  * @param {unknown} reasonRaw
@@ -5900,8 +5877,15 @@ export function resolveAuthoritativeItemForTurn({
   const explicitCatalogMention = hasExplicitNewItemMention(
     userText,
     Array.isArray(catalogItems) ? catalogItems : [],
-    normalizeId(lockedItem?.id ?? focusedMemoryItem?.id)
+    null
   );
+  const explicitCatalogItem = explicitCatalogMention.found
+    ? normalizeAuthorityItem(
+        catalogItems.find(
+          (row) => normalizeId(row?.id) === normalizeId(explicitCatalogMention.itemId)
+        )
+      )
+    : null;
   const fuzzyCatalogMention = findConservativeFuzzyCatalogMention(
     userText,
     catalogItems
@@ -5918,7 +5902,10 @@ export function resolveAuthoritativeItemForTurn({
 
   let selected = null;
   let source = "none";
-  if (explicitMention && explicitItem) {
+  if (explicitCatalogItem) {
+    selected = explicitCatalogItem;
+    source = "explicit_catalog";
+  } else if (explicitMention && explicitItem) {
     selected = explicitItem;
     source = "explicit";
     const previousId = normalizeId(lockedItem?.id ?? focusedMemoryItem?.id);
@@ -13534,6 +13521,7 @@ export async function processMessage({
   const explicitUnlistedCheck = !skipItemResolutionForGreeting
     ? await resolveExplicitUnlistedMention({
         message,
+        rawMessage: inboundMessageRawForFuzzy,
         itemContext,
         catalogItems: normalizedCatalogForTurn,
         resolveCatalog: resolveCatalogThisTurn,

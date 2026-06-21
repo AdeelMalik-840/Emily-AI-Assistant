@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-d-civic-over-corolla",
+  "title": "Explicit Civic beats stale Corolla memory",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "turns": [
+    {
+      "step": 1,
+      "message": "Civic available?",
+      "messageId": "golden-d-civic-turn-1"
+    }
+  ],
+  "expectations": {
+    "finalWorkflowType": "availability_inquiry",
+    "mustResolveItemId": "honda_civic_2026_oriel_white_7e961e31",
+    "mustResolveItemLabelContains": "Civic",
+    "mustResolveItemSource": "explicit",
+    "mustMentionResolvedItemInReply": true,
+    "mustNotMentionItemLabels": ["Corolla"],
+    "mustNotBrowse": true,
+    "mustNotCreateBooking": true,
+    "mustNotNotifyOwner": true
+  }
+}

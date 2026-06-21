@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-e",
+  "title": "Unlisted item availability question",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "turns": [
+    {
+      "step": 1,
+      "message": "Revo available hai?",
+      "messageId": "golden-e-turn-1"
+    }
+  ],
+  "expectations": {
+    "finalWorkflowType": "unlisted_item",
+    "mustNotHaveResolvedItem": true,
+    "mustNotCreateBooking": true,
+    "mustNotNotifyOwner": true,
+    "mustNotBrowse": true,
+    "mustNotUseGroupBookingAck": true
+  }
+}

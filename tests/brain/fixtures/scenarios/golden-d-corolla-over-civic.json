@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-d-corolla-over-civic",
+  "title": "Explicit Corolla beats stale Civic memory",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "turns": [
+    {
+      "step": 1,
+      "message": "Corolla available?",
+      "messageId": "golden-d-corolla-turn-1"
+    }
+  ],
+  "expectations": {
+    "finalWorkflowType": "availability_inquiry",
+    "mustResolveItemId": "toyota_corolla_metallic_grey_fixture",
+    "mustResolveItemLabelContains": "Corolla",
+    "mustResolveItemSource": "explicit",
+    "mustMentionResolvedItemInReply": true,
+    "mustNotMentionItemLabels": ["Civic"],
+    "mustNotBrowse": true,
+    "mustNotCreateBooking": true,
+    "mustNotNotifyOwner": true
+  }
+}
