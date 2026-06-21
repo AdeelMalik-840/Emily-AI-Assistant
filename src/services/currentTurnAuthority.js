@@ -69,27 +69,78 @@ function catalogTokensLikelyTypo(msgToken, catalogToken) {
   return false;
 }
 
-export function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
+function findLatestSubstringPosition(haystack, needle) {
+  const text = String(haystack ?? "");
+  const target = String(needle ?? "").trim();
+  if (!text || !target) return -1;
+  let latest = -1;
+  let idx = text.indexOf(target);
+  while (idx !== -1) {
+    latest = idx;
+    idx = text.indexOf(target, idx + target.length);
+  }
+  return latest;
+}
+
+function findLatestTokenWordPosition(haystack, token) {
+  const text = String(haystack ?? "");
+  const target = String(token ?? "").trim();
+  if (!text || !target) return -1;
+  let latest = -1;
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const idx = text.indexOf(target, searchFrom);
+    if (idx === -1) break;
+    const before = idx === 0 ? " " : text[idx - 1];
+    const after = idx + target.length >= text.length ? " " : text[idx + target.length];
+    if (/\s/.test(before) && /\s/.test(after)) {
+      latest = idx;
+    }
+    searchFrom = idx + Math.max(1, target.length);
+  }
+  return latest;
+}
+
+function resolveLatestExplicitCatalogMentionPosition(message, row) {
   const msg = normalizeCatalogMatchText(message);
+  if (!msg || !row || typeof row !== "object" || Array.isArray(row)) return -1;
+  const label = buildDisplayLabel(row) || String(row.name ?? "").trim();
+  const labelNorm = normalizeCatalogMatchText(label);
+  const nameNorm = normalizeCatalogMatchText(row.name);
+  const tokens = tokenizeCatalogMatch(label || row.name);
+  const positions = [];
+  if (labelNorm) positions.push(findLatestSubstringPosition(msg, labelNorm));
+  if (nameNorm) positions.push(findLatestSubstringPosition(msg, nameNorm));
+  for (const token of tokens) {
+    if (token.length >= 4) positions.push(findLatestTokenWordPosition(msg, token));
+  }
+  return positions.reduce((max, pos) => (pos >= 0 && pos > max ? pos : max), -1);
+}
+
+export function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
   const lockedId = normalizeId(lockedItemId);
-  if (!msg || !Array.isArray(catalogItems)) {
+  if (!String(message ?? "").trim() || !Array.isArray(catalogItems)) {
     return { found: false, itemId: null, itemLabel: null };
   }
+
+  let best = null;
+  let bestPos = -1;
+
   for (const row of catalogItems) {
     if (!row || typeof row !== "object" || Array.isArray(row)) continue;
     const id = normalizeId(row.id);
     if (!id || id === lockedId) continue;
     const label = buildDisplayLabel(row) || String(row.name ?? "").trim();
-    const labelNorm = normalizeCatalogMatchText(label);
-    const nameNorm = normalizeCatalogMatchText(row.name);
-    const tokens = tokenizeCatalogMatch(label || row.name);
-    const mentioned =
-      (labelNorm && msg.includes(labelNorm)) ||
-      (nameNorm && msg.includes(nameNorm)) ||
-      tokens.some((t) => t.length >= 4 && msg.split(/\s+/).includes(t));
-    if (mentioned) {
-      return { found: true, itemId: id, itemLabel: label || null };
+    const mentionPos = resolveLatestExplicitCatalogMentionPosition(message, row);
+    if (mentionPos < 0) continue;
+    if (mentionPos > bestPos) {
+      bestPos = mentionPos;
+      best = { itemId: id, itemLabel: label || null };
     }
+  }
+
+  if (best) {
+    return { found: true, itemId: best.itemId, itemLabel: best.itemLabel };
   }
   return { found: false, itemId: null, itemLabel: null };
 }

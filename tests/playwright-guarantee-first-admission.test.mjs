@@ -64,7 +64,7 @@ test("noise includes lone ? (aligned with inbound gate garbage_message)", () => 
   assert.equal(isListenerInboundNoise("?"), true);
   assert.equal(isListenerInboundNoise("???"), true);
   assert.equal(isBurstMergeContinuationText("?"), true);
-  assert.equal(isBurstMergeContinuationText("???"), false);
+  assert.equal(isBurstMergeContinuationText("???"), true);
 });
 
 test("guarantee-first: civic at ack index survives while guarantee idle", () => {
@@ -211,8 +211,8 @@ test("attachBurstMergeContinuations merges civic + ? only", () => {
     sorted,
     CHAT
   );
-  assert.equal(merged.text, "Civic available? ?");
-  assert.equal(merged.__burstMergedCount, 2);
+  assert.equal(merged.text, "Civic available? ? ???");
+  assert.equal(merged.__burstMergedCount, 3);
 });
 
 test("guarantee cursor skips done rows and picks next oldest", () => {
@@ -373,7 +373,7 @@ test("guarantee-first: logGuaranteeFirstSelection emits selection proof", () => 
   const logs = [];
   const orig = console.log;
   console.log = (...args) => {
-    if (args[0] === "[guarantee_first_selection]") logs.push(args[1]);
+    if (args[0] === "[guarantee_first_candidate]") logs.push(args[1]);
     orig(...args);
   };
   try {
@@ -382,7 +382,7 @@ test("guarantee-first: logGuaranteeFirstSelection emits selection proof", () => 
     console.log = orig;
   }
   assert.equal(logs.length, 1);
-  assert.equal(logs[0].selectedStableId, buildStableMessageKey(row, sorted).id);
+  assert.equal(logs[0].candidateStableId, buildStableMessageKey(row, sorted).id);
   assert.equal(logs[0].guaranteeState, "idle");
   assert.equal(logs[0].participantKey, "p1");
 });

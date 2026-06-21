@@ -44,7 +44,10 @@ import {
   normalizePlaywrightOutboundTrace,
   savePlaywrightInboundCursor,
 } from "./playwrightInboundCursorStore.js";
-import { getEmilySessionState } from "./conversationIntelligence.js";
+import {
+  getEmilySessionState,
+  peekEmilySessionState,
+} from "./conversationIntelligence.js";
 import { randomUUID } from "node:crypto";
 import { logBookingEvent } from "../utils/bookingLogger.js";
 import {
@@ -125,6 +128,116 @@ const REPLY_DEDUPE_WINDOW_MS = Math.max(
     ) || 8000
   )
 );
+
+function envTruthyFlag(name) {
+  const v = String(process.env[name] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+/**
+ * Fast gate for log-only v2 shadow — avoids importing src/brain when disabled.
+ * @param {string | null | undefined} businessId
+ */
+export function isEmilyBrainV2ShadowQuickGate(businessId) {
+  if (!envTruthyFlag("EMILY_BRAIN_V2_SHADOW")) return false;
+  if (
+    !envTruthyFlag("EMILY_BRAIN_V2_SHADOW_ALLOW_PRODUCTION") &&
+    String(process.env.NODE_ENV ?? "").trim() === "production"
+  ) {
+    return false;
+  }
+  const uid = String(businessId ?? "").trim();
+  if (!uid) return false;
+  const allowlist = String(process.env.EMILY_BRAIN_V2_SHADOW_BUSINESSES ?? "")
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!allowlist.length) return false;
+  return allowlist.includes(uid);
+}
+
+/**
+ * Capture pre-legacy state without initializing the Emily session store.
+ * Dependencies are injectable so wiring safety can be tested without module mocks.
+ *
+ * @param {{
+ *   shadowEligible: boolean,
+ *   businessId: string,
+ *   ownerUserId?: string,
+ *   sessionKey?: string,
+ *   participantKey?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   isGroupInbound?: boolean,
+ *   resolveSessionKey?: (p: Record<string, unknown>) => string,
+ *   peekSessionState?: (sessionKey: string) => Record<string, unknown> | null,
+ *   loadShadowModule?: () => Promise<Record<string, unknown>>,
+ *   traceId?: string,
+ * }} p
+ */
+export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
+  if (!p.shadowEligible) return null;
+  try {
+    let resolveSessionKey = p.resolveSessionKey;
+    if (typeof resolveSessionKey !== "function") {
+      const shadowModule = await (p.loadShadowModule ?? (() =>
+        import("../brain/shadow/brainShadowHook.js")))();
+      resolveSessionKey = /** @type {(p: Record<string, unknown>) => string} */ (
+        shadowModule.resolveShadowEmilySessionKey
+      );
+    }
+    const emilySessionKey = resolveSessionKey({
+      businessId: p.businessId,
+      ownerUserId: p.ownerUserId,
+      sessionKey: p.sessionKey,
+      participantKey: p.participantKey,
+      playwrightChatKey: p.playwrightChatKey,
+      isGroupInbound: p.isGroupInbound,
+    });
+    const existingState = (p.peekSessionState ?? peekEmilySessionState)(
+      emilySessionKey
+    );
+    return existingState == null ? null : structuredClone(existingState);
+  } catch (shadowPrepErr) {
+    console.log("[emily_brain_shadow_prep_failed]", {
+      traceId: p.traceId,
+      businessId: p.businessId,
+      error: String(shadowPrepErr?.message ?? shadowPrepErr ?? "").slice(0, 160),
+    });
+    return null;
+  }
+}
+
+/**
+ * Schedule shadow evaluation after legacy processing; failures never escape.
+ *
+ * @param {{
+ *   shadowEligible: boolean,
+ *   params: Record<string, unknown>,
+ *   loadShadowModule?: () => Promise<Record<string, unknown>>,
+ * }} p
+ */
+export async function scheduleEmilyBrainV2ShadowAfterLegacy(p) {
+  if (!p.shadowEligible) return false;
+  try {
+    const shadowModule = await (p.loadShadowModule ?? (() =>
+      import("../brain/shadow/brainShadowHook.js")))();
+    const schedule = /** @type {(params: Record<string, unknown>) => unknown} */ (
+      shadowModule.scheduleEmilyBrainV2ShadowEvaluation
+    );
+    await schedule(p.params);
+    return true;
+  } catch (shadowScheduleErr) {
+    console.log("[emily_brain_shadow_schedule_failed]", {
+      traceId: p.params?.traceId,
+      businessId: p.params?.businessId,
+      error: String(shadowScheduleErr?.message ?? shadowScheduleErr ?? "").slice(
+        0,
+        160
+      ),
+    });
+    return false;
+  }
+}
 
 /** @type {Map<string, BufferEntry>} */
 const messageBuffer = new Map();
@@ -1148,6 +1261,19 @@ export async function executeWhatsAppAiPipeline(p) {
   const isGroupInbound =
     isGroupMessage === true && String(userPhone ?? "").trim() === "unknown";
 
+  /** @type {Record<string, unknown> | null} */
+  const shadowEligible = isEmilyBrainV2ShadowQuickGate(ownerUserId);
+  const shadowPreTurnMemorySnapshot = await prepareEmilyBrainV2ShadowMemorySnapshot({
+    shadowEligible,
+    traceId,
+    businessId: ownerUserId,
+    ownerUserId,
+    sessionKey,
+    participantKey: participantKeyRaw,
+    playwrightChatKey: playwrightChatKeyRaw,
+    isGroupInbound,
+  });
+
   logBookingEvent({
     traceId,
     step: "pipeline_start",
@@ -1287,6 +1413,33 @@ export async function executeWhatsAppAiPipeline(p) {
     hasReply: String(reply ?? "").trim() !== "",
     intentionalSilent,
   });
+
+  await scheduleEmilyBrainV2ShadowAfterLegacy({
+    shadowEligible,
+    params: {
+      traceId,
+      businessId: ownerUserId,
+      message: normalizedInbound.message,
+      messageId: normalizedInbound.messageId,
+      channelId: playwrightWebInbound ? "whatsapp_web" : "whatsapp_cloud",
+      chatKey:
+        String(playwrightChatKeyRaw ?? "").trim() || groupNameResolved || sessionKey,
+      participantKey: participantKeyRaw,
+      sessionKey,
+      playwrightChatKey: playwrightChatKeyRaw,
+      isGroupInbound,
+      playwrightWebInbound,
+      memorySnapshot: shadowPreTurnMemorySnapshot,
+      conversationHistory,
+      inboundSourceOrigin: effectiveInboundSourceOrigin,
+      legacyOutcome: {
+        reply,
+        messageMeta:
+          messageMeta && typeof messageMeta === "object" ? messageMeta : null,
+      },
+    },
+  });
+
   const bookingIdMeta =
     messageMeta?.bookingCreated &&
     typeof messageMeta.bookingCreated === "object" &&

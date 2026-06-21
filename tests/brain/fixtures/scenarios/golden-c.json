@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-c",
+  "title": "Civic availability then duration-only booking",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "turns": [
+    {
+      "step": 1,
+      "message": "Civic available?",
+      "messageId": "golden-c-turn-1"
+    },
+    {
+      "step": 2,
+      "message": "10 din k lye",
+      "messageId": "golden-c-turn-2"
+    }
+  ],
+  "expectations": {
+    "finalWorkflowType": "booking_request",
+    "mustCreateBooking": true,
+    "mustNotifyOwner": true,
+    "mustUseGroupBookingAck": true,
+    "mustNotIncludePriceQuote": false
+  }
+}

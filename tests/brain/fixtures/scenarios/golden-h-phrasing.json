@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-h-phrasing",
+  "title": "Golden H — availability vs browse phrasing variants",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "availabilityVariants": [
+    { "message": "Civic available?", "expectedItemId": "honda_civic_2026_oriel_white_7e961e31" },
+    { "message": "Civic hai?", "expectedItemId": "honda_civic_2026_oriel_white_7e961e31" },
+    { "message": "Civic options mein hai?", "expectedItemId": "honda_civic_2026_oriel_white_7e961e31" },
+    { "message": "Honda Civic available hai?", "expectedItemId": "honda_civic_2026_oriel_white_7e961e31" },
+    { "message": "Corolla hai?", "expectedItemId": "toyota_corolla_metallic_grey_fixture" },
+    { "message": "Corolla available hai?", "expectedItemId": "toyota_corolla_metallic_grey_fixture" }
+  ],
+  "browseVariants": [
+    "options kya hain?",
+    "konsi cars available hain?",
+    "available options bata dein",
+    "list dikha dein",
+    "kya kya available hai?"
+  ],
+  "priorityVariants": [
+    { "message": "Civic options mein hai?", "expectedItemId": "honda_civic_2026_oriel_white_7e961e31" },
+    { "message": "Corolla list mein hai?", "expectedItemId": "toyota_corolla_metallic_grey_fixture" }
+  ]
+}

@@ -4,6 +4,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { setMessageState } from "./messageState.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
@@ -27,6 +28,17 @@ const DEFAULT_LEDGER_PATH = path.join(
   ".cursor",
   "inbound-turn-ledger.json"
 );
+
+function resolveLedgerPath() {
+  const customPath = String(
+    process.env.PLAYWRIGHT_INBOUND_TURN_LEDGER_PATH ?? ""
+  ).trim();
+  if (customPath) return path.resolve(customPath);
+  if (String(process.env.NODE_ENV ?? "").trim() === "test") {
+    return path.join(os.tmpdir(), `inbound-turn-ledger-test-${process.pid}.json`);
+  }
+  return DEFAULT_LEDGER_PATH;
+}
 
 const LEDGER_RETENTION_MS = Math.max(
   24 * 60 * 60 * 1000,
@@ -53,7 +65,7 @@ const PROCESSING_STALE_MS = Math.max(
 /** @type {Map<string, InboundTurnLedgerEntry>} */
 const ledgerByKey = new Map();
 let persistLoaded = false;
-let ledgerPath = DEFAULT_LEDGER_PATH;
+let ledgerPath = resolveLedgerPath();
 
 function envTruthy(name) {
   const v = String(process.env[name] ?? "").trim().toLowerCase();
@@ -120,10 +132,7 @@ export function initInboundTurnLedger() {
   if (!isInboundTurnLedgerEnabled()) return;
   if (persistLoaded) return;
   persistLoaded = true;
-  const customPath = String(
-    process.env.PLAYWRIGHT_INBOUND_TURN_LEDGER_PATH ?? ""
-  ).trim();
-  if (customPath) ledgerPath = path.resolve(customPath);
+  ledgerPath = resolveLedgerPath();
   try {
     if (!existsSync(ledgerPath)) return;
     const raw = readFileSync(ledgerPath, "utf8");
@@ -462,7 +471,7 @@ export function markInboundTurnLedgerFailedForGuarantee(p) {
 
 /** @param {string} [customPath] */
 export function __setInboundTurnLedgerPathForTests(customPath) {
-  ledgerPath = customPath ? path.resolve(customPath) : DEFAULT_LEDGER_PATH;
+  ledgerPath = customPath ? path.resolve(customPath) : resolveLedgerPath();
   persistLoaded = false;
   ledgerByKey.clear();
 }
@@ -482,6 +491,11 @@ export function __clearInboundTurnLedgerForTests() {
   } catch {
     // ignore
   }
+}
+
+/** @returns {string} */
+export function __getInboundTurnLedgerPathForTests() {
+  return ledgerPath;
 }
 
 initInboundTurnLedger();

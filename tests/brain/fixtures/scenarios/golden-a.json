@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-a",
+  "title": "Civic availability — item-specific, not browse",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "turns": [
+    {
+      "step": 1,
+      "message": "Civic available?",
+      "messageId": "golden-a-turn-1"
+    }
+  ],
+  "expectations": {
+    "finalWorkflowType": "availability_inquiry",
+    "mustResolveItemId": "honda_civic_2026_oriel_white_7e961e31",
+    "mustResolveItemLabelContains": "Civic",
+    "mustMentionResolvedItemInReply": true,
+    "mustNotBrowse": true,
+    "mustNotCreateBooking": true,
+    "mustNotNotifyOwner": true,
+    "mustNotUseGroupBookingAck": true
+  }
+}

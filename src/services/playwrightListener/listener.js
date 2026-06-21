@@ -59,6 +59,16 @@ import {
 } from "../participantIdentity.js";
 import { loadPlaywrightInboundCursor } from "../playwrightInboundCursorStore.js";
 import {
+  candidateRowsAfterNormalizedCursor,
+  decideParticipantForwardTurn,
+} from "./forwardDecision.js";
+import {
+  canMergeBurstRowPair,
+  isBurstMergeContinuationText as isBurstMergeContinuationTextPolicy,
+  resolveBurstMergeCatalogItems,
+  shouldBurstSupersedeOlderRow,
+} from "./burstMergePolicy.js";
+import {
   getBookingLogisticsCompletionState,
   resolveLogisticsCompletionPolicy,
 } from "../bookingDmFlow.js";
@@ -1052,51 +1062,18 @@ function candidateRowsAfterCursor({
   extractedMessages,
   persistedCursor,
   sidebarHasSignal = false,
+  chatKey = "",
   now = Date.now(),
 } = {}) {
-  const rows = Array.isArray(participantMessages)
-    ? participantMessages.filter((m) => m?.sender === "user" && String(m?.text ?? "").trim())
-    : [];
-  if (rows.length === 0) return [];
-
-  const lastProcessedInboundId = String(
-    persistedCursor?.lastProcessedInboundId ?? ""
-  ).trim();
-  const lastProcessedSourceMessageIndex = Number(
-    persistedCursor?.lastProcessedSourceMessageIndex
-  );
-  const hasSourceIndexCursor = Number.isFinite(lastProcessedSourceMessageIndex);
-
-  if (lastProcessedInboundId) {
-    const cursorIdx = rows.findIndex(
-      (row) =>
-        buildExtractedMessageId(row, extractedMessages).id ===
-        lastProcessedInboundId
-    );
-    if (cursorIdx >= 0) return rows.slice(cursorIdx + 1);
-    if (hasSourceIndexCursor) {
-      return rows.filter((row) => {
-        const idx = Number(row?.sourceMessageIndex ?? row?.__position);
-        return Number.isFinite(idx) && idx > lastProcessedSourceMessageIndex;
-      });
-    }
-    return sidebarHasSignal ? [rows[rows.length - 1]] : [];
-  }
-
-  if (!sidebarHasSignal) {
-    return rows.filter((row) => rowFreshEnoughForStartup(row, now));
-  }
-
-  let lastAssistantPosition = -1;
-  for (const row of extractedMessages || []) {
-    if (row?.sender === "me" && Number.isFinite(Number(row?.__position))) {
-      lastAssistantPosition = Math.max(lastAssistantPosition, Number(row.__position));
-    }
-  }
-  const afterLastAssistant = rows.filter(
-    (row) => Number(row?.__position ?? -1) > lastAssistantPosition
-  );
-  return afterLastAssistant.length ? afterLastAssistant : [rows[rows.length - 1]];
+  return candidateRowsAfterNormalizedCursor({
+    participantMessages,
+    extractedMessages,
+    persistedCursor,
+    sidebarHasSignal,
+    chatKey,
+    now,
+    buildExtractedMessageId,
+  }).rows;
 }
 
 function collapseRowsForForward(rows) {
@@ -1351,10 +1328,10 @@ export function logGuaranteeFirstSelection(chatKey, candidate, extractedMessages
   ).trim();
   const guaranteeKey = stableId ? playwrightGuaranteeKeyForStableId(ck, stableId) : "";
   const st = guaranteeKey ? getMessageState(guaranteeKey) : null;
-  console.log("[guarantee_first_selection]", {
+  console.log("[guarantee_first_candidate]", {
     chatKey: ck || null,
     participantKey: String(candidate?.participantKey ?? "").trim() || null,
-    selectedStableId: stableId || null,
+    candidateStableId: stableId || null,
     guaranteeState: st?.state || "idle",
     guaranteeKey: guaranteeKey || null,
     textPreview: String(candidate?.text ?? "").slice(0, 120) || null,
@@ -1377,9 +1354,11 @@ export function attachBurstMergeContinuations(
   burstMs,
   tickFirstSeenByStableId,
   extractedMessages,
-  chatKey
+  chatKey,
+  catalogItems
 ) {
   if (!anchorMsg) return null;
+  const catalog = resolveBurstMergeCatalogItems(catalogItems);
   const anchorPos = Number(anchorMsg?.__position);
   if (!Number.isFinite(anchorPos)) return anchorMsg;
   const byPos = new Map(
@@ -1425,7 +1404,17 @@ export function attachBurstMergeContinuations(
       }
       break;
     }
-    break;
+    if (!canMergeBurstRowPair(run[run.length - 1], nextRow, catalog)) {
+      console.log("[burst_merge_rejected_different_items]", {
+        chatKey,
+        textPreviewA: String(run[run.length - 1]?.text ?? "").slice(0, 60),
+        textPreviewB: String(nextRow?.text ?? "").slice(0, 60),
+      });
+      break;
+    }
+    run.push(nextRow);
+    lastPos = nextPos;
+    continue;
   }
   return mergeParticipantBurstMessages(run, extractedMessages);
 }
@@ -1445,6 +1434,7 @@ export function buildParticipantForwardCandidate(p) {
     anchorIndex = -1,
     burstMs = PLAYWRIGHT_FRESH_DELTA_BURST_MS,
     tickFirstSeenByStableId,
+    catalogItems,
   } = p;
   const ordered = [...(participantMessages || [])].sort(
     (a, b) => (Number(a?.__position) || 0) - (Number(b?.__position) || 0)
@@ -1526,6 +1516,8 @@ export function buildParticipantForwardCandidate(p) {
       : globalThis.__playwrightFreshDeltaState?.[String(chatKey ?? "").trim()]
           ?.tickFirstSeenByStableId;
 
+  const burstCatalog = resolveBurstMergeCatalogItems(catalogItems);
+
   if (guaranteeFirst) {
     const burstSource =
       Array.isArray(allParticipantUserRows) && allParticipantUserRows.length > 0
@@ -1540,7 +1532,8 @@ export function buildParticipantForwardCandidate(p) {
         burstMs,
         tickMap instanceof Map ? tickMap : new Map(),
         extractedMessages,
-        String(chatKey ?? "").trim()
+        String(chatKey ?? "").trim(),
+        burstCatalog
       );
       const guard = evaluateReplyAfterGuard(
         withBurst,
@@ -1548,6 +1541,40 @@ export function buildParticipantForwardCandidate(p) {
         normalizedGroupChatKeyForCompare
       );
       if (guard.skip && guard.reason === "superseded_by_newer_same_participant") {
+        const pos = Number(withBurst?.__position);
+        let newerSameParticipantRow = null;
+        if (Number.isFinite(pos)) {
+          const lastCmp = participantComparableForGuard(
+            withBurst,
+            normalizedGroupChatKeyForCompare
+          );
+          for (let j = pos + 1; j < sortedList.length; j++) {
+            if (sortedList[j]?.sender !== "user") continue;
+            const other = participantComparableForGuard(
+              sortedList[j],
+              normalizedGroupChatKeyForCompare
+            );
+            if (isSameParticipant(lastCmp, other)) {
+              newerSameParticipantRow = sortedList[j];
+              break;
+            }
+          }
+        }
+        if (
+          newerSameParticipantRow &&
+          !shouldBurstSupersedeOlderRow(
+            withBurst,
+            newerSameParticipantRow,
+            burstCatalog
+          )
+        ) {
+          logGuaranteeFirstSelection(
+            String(chatKey ?? "").trim(),
+            withBurst,
+            extractedMessages
+          );
+          return withBurst;
+        }
         continue;
       }
       logGuaranteeFirstSelection(
@@ -1567,13 +1594,24 @@ export function buildParticipantForwardCandidate(p) {
       burstMs,
       tickMap instanceof Map ? tickMap : new Map(),
       extractedMessages,
-      String(chatKey ?? "").trim()
+      String(chatKey ?? "").trim(),
+      burstCatalog
     );
     const lastRun = runs.length > 0 ? runs[runs.length - 1] : pending;
     return mergeParticipantBurstMessages(lastRun, extractedMessages);
   }
 
-  return mergeParticipantBurstMessages(pending, extractedMessages);
+  const runs = splitBurstMergeRuns(
+    pending,
+    sorted || [],
+    burstMs,
+    tickMap instanceof Map ? tickMap : new Map(),
+    extractedMessages,
+    String(chatKey ?? "").trim(),
+    burstCatalog
+  );
+  const lastRun = runs.length > 0 ? runs[runs.length - 1] : pending;
+  return mergeParticipantBurstMessages(lastRun, extractedMessages);
 }
 
 /**
@@ -2419,6 +2457,35 @@ export function __freshDeltaAnchorMissingForTests(sorted, freshState, chatKey) {
 }
 
 /**
+ * Text-only assistant/echo classification shared by fresh-delta admission and brain v2 contract tests.
+ * @param {unknown} text
+ * @param {string} [chatKey]
+ */
+export function evaluateAssistantLikeUserText(text, chatKey = "") {
+  const raw = String(text ?? "").trim();
+  if (!raw) {
+    return { assistantLike: true, reason: "empty_text" };
+  }
+  if (isEmilyAssistantPricingStatement(raw)) {
+    return { assistantLike: true, reason: "assistant_pricing_statement" };
+  }
+  if (isEmilyBookingEngagementStatement(raw)) {
+    return { assistantLike: true, reason: "assistant_booking_engagement" };
+  }
+  if (isLikelyAssistantOutboundCopy(raw)) {
+    return { assistantLike: true, reason: "assistant_copy_template" };
+  }
+  if (looksLikeAssistantTemplateSubstring(raw)) {
+    return { assistantLike: true, reason: "assistant_template_substring" };
+  }
+  const ck = String(chatKey ?? "").trim();
+  if (ck && isRegisteredPlaywrightOutboundEcho(ck, raw)) {
+    return { assistantLike: true, reason: "outbound_echo_registry" };
+  }
+  return { assistantLike: false, reason: null };
+}
+
+/**
  * TEMPORARY DIAGNOSTIC — row-level admission tracing (no behavior change).
  * @param {object} m
  * @param {string} chatKey
@@ -2432,10 +2499,8 @@ function freshDeltaAssistantLikeDetail(m, chatKey) {
     return { assistantLike: true, reason: "non_user_sender" };
   }
   const text = String(m.text ?? "").trim();
-  if (!text) {
-    return { assistantLike: true, reason: "empty_text" };
-  }
-  if (isRegisteredPlaywrightOutboundEcho(chatKey, text)) {
+  const assistantLike = evaluateAssistantLikeUserText(text, chatKey);
+  if (assistantLike.assistantLike && assistantLike.reason === "outbound_echo_registry") {
     console.log("[outbound_echo_blocked]", {
       chatKey,
       stableId: null,
@@ -2444,21 +2509,8 @@ function freshDeltaAssistantLikeDetail(m, chatKey) {
       reason: "outbound_echo_registry",
       matchedOutboundPreview: text.slice(0, 120),
     });
-    return { assistantLike: true, reason: "outbound_echo_registry" };
   }
-  if (isEmilyAssistantPricingStatement(text)) {
-    return { assistantLike: true, reason: "assistant_pricing_statement" };
-  }
-  if (isEmilyBookingEngagementStatement(text)) {
-    return { assistantLike: true, reason: "assistant_booking_engagement" };
-  }
-  if (isLikelyAssistantOutboundCopy(text)) {
-    return { assistantLike: true, reason: "assistant_copy_template" };
-  }
-  if (looksLikeAssistantTemplateSubstring(text)) {
-    return { assistantLike: true, reason: "assistant_template_substring" };
-  }
-  return { assistantLike: false, reason: null };
+  return assistantLike;
 }
 
 /**
@@ -2502,8 +2554,7 @@ export function isListenerInboundNoise(text) {
  * @param {unknown} text
  */
 export function isBurstMergeContinuationText(text) {
-  const trimmed = String(text ?? "").trim();
-  return trimmed === "?";
+  return isBurstMergeContinuationTextPolicy(text);
 }
 
 /**
@@ -3364,9 +3415,11 @@ export function splitBurstMergeRuns(
   burstMs,
   tickFirstSeenByStableId,
   extractedList,
-  chatKey
+  chatKey,
+  catalogItems
 ) {
   if (!Array.isArray(pending) || pending.length === 0) return [];
+  const catalog = resolveBurstMergeCatalogItems(catalogItems);
   /** @type {Array<Array<object>>} */
   const runs = [];
   let currentRun = [pending[0]];
@@ -3387,6 +3440,16 @@ export function splitBurstMergeRuns(
         chatKey,
         gapMs,
         burstMs,
+        textPreviewA: String(prev?.text ?? "").slice(0, 60),
+        textPreviewB: String(next?.text ?? "").slice(0, 60),
+      });
+      runs.push(currentRun);
+      currentRun = [next];
+      continue;
+    }
+    if (!canMergeBurstRowPair(prev, next, catalog)) {
+      console.log("[burst_merge_rejected_different_items]", {
+        chatKey,
         textPreviewA: String(prev?.text ?? "").slice(0, 60),
         textPreviewB: String(next?.text ?? "").slice(0, 60),
       });
@@ -6860,169 +6923,66 @@ async function runListenerBody() {
               persistedCursor = null;
             }
 
-            const cursorCandidateRows = candidateRowsAfterCursor({
-              participantMessages,
-              extractedMessages,
-              persistedCursor,
-              sidebarHasSignal: sidebarHasSignalForSelection,
-            });
-            const cursorRowsForForward = collapseRowsForForward(cursorCandidateRows);
-            if (cursorRowsForForward.length === 0) {
-              if (anchorMsg) {
-                const extractedIdBuilt =
-                  anchorMsg.sender === "user"
-                    ? buildExtractedMessageId(anchorMsg, extractedMessages)
-                    : { id: "", strategy: "NONE" };
-                const lastUserMsgId = String(extractedIdBuilt?.id ?? "").trim();
-                const lastProcessedUserMsgId = String(
-                  globalThis.__lastProcessedUserMsg?.[cursorKey] ?? ""
-                ).trim();
-                console.log("[participant_message_skipped_already_processed]", {
-                  chatKey,
-                  participantKey: anchorMsg?.participantKey || null,
-                  cursorKey,
-                  lastUserMsgId,
-                  lastProcessedUserMsgId,
-                  textPreview: String(anchorMsg?.text ?? "").slice(0, 80),
-                  persistedCursorPresent: Boolean(persistedCursor),
-                });
-              }
-              continue;
-            }
-
             const lastProcessedUserMsgId = String(
               globalThis.__lastProcessedUserMsg?.[cursorKey] ?? ""
             ).trim();
 
-            const candidate = buildParticipantForwardCandidate({
-              participantMessages: cursorRowsForForward,
+            const forwardDecision = decideParticipantForwardTurn({
+              chatKey,
+              cursorKey,
+              participantKey,
+              participantMessages,
               allParticipantUserRows: guaranteeFirst
                 ? allParticipantBuckets.get(participantKey) || participantMessages
                 : undefined,
-              lastProcessedUserMsgId,
-              chatKey,
               extractedMessages,
               sorted: sortedWithPos,
+              persistedCursor,
+              lastProcessedUserMsgId,
+              sidebarHasSignal: sidebarHasSignalForSelection,
               normalizedGroupChatKeyForCompare,
-              anchorIndex: guaranteeFirst ? -1 : freshDeltaAcknowledgedAnchorIndex,
+              guaranteeFirst,
+              anchorIndex: freshDeltaAcknowledgedAnchorIndex,
               tickFirstSeenByStableId: freshState?.tickFirstSeenByStableId,
+              deps: {
+                buildExtractedMessageId,
+                buildStableMessageKey,
+                buildParticipantForwardCandidate,
+                evaluateReplyAfterGuard,
+                collapseRowsForForward,
+                isGroupMessageSuppressed,
+                suppressGroupMessageSelection,
+                maybeSuppressGroupMessageSelection,
+                isParticipantMessageInflightOrDone,
+                isRegisteredPlaywrightOutboundEcho,
+              },
             });
-            if (!candidate) {
+
+            if (forwardDecision.action !== "forward" || !forwardDecision.candidate) {
               continue;
             }
 
-            const { id: stableId, strategy: idStrategy } = buildStableMessageKey(
-              candidate,
-              extractedMessages
-            );
-            const lastUserMsgId = String(stableId ?? "").trim();
-              if (!lastUserMsgId || lastUserMsgId === lastProcessedUserMsgId) {
-                continue;
-              }
+            const candidate = forwardDecision.candidate;
+            const lastUserMsgId = String(forwardDecision.stableId ?? "").trim();
+            const idStrategy = forwardDecision.idStrategy || "UNKNOWN";
 
-              if (isGroupMessageSuppressed(cursorKey, lastUserMsgId)) {
-                if (TRACE_DEBUG) {
-                  console.log("[group_message_selection_skipped_suppressed]", {
-                    cursorKey,
-                    messageId: lastUserMsgId,
-                  });
-                }
-                continue;
-              }
-
-            if (
-              isParticipantMessageInflightOrDone(
-                chatKey,
-                candidate,
-                extractedMessages
-              )
-            ) {
-              console.log("[stable_key_inflight_or_done_skip]", {
-                chatKey,
-                cursorKey,
-                stableId: lastUserMsgId,
-                burstMerged: Boolean(candidate.__burstMerged),
-              });
-              continue;
-            }
-
-            if (
-              !persistedCursor &&
-              isGroupMessageStale(getRowTimestampMs(candidate))
-            ) {
-                console.warn("[stale_group_message_reply_blocked]", {
-                  groupChatKey: chatKey,
-                  participantKey: candidate.participantKey || null,
-                  messageId: lastUserMsgId,
-                  timestamp: candidate.timestamp ?? null,
-                });
-                suppressGroupMessageSelection(cursorKey, lastUserMsgId, "stale");
-                console.log("[REPLY_AFTER_BLOCKED_CURSOR_ADVANCE]", {
-                  cursorKey,
-                  messageId: lastUserMsgId,
-                  reason: "stale",
-                });
-                continue;
-              }
-
-            const guard = evaluateReplyAfterGuard(
-              candidate,
-              sorted,
-                    normalizedGroupChatKeyForCompare
-                  );
-              console.log("[REPLY_AFTER_GUARD_EVALUATION]", {
-                chatKey,
-                cursorKey,
-                lastUserMsgId,
-              hasReplyAfter: guard.hasReplyAfter,
-              hasNewerSameParticipantUserAfter:
-                guard.hasNewerSameParticipantUserAfter,
-              decision: guard.skip ? "skip" : "process",
-              reason: guard.reason,
-              burstMerged: Boolean(candidate.__burstMerged),
-            });
-            if (guard.skip) {
-              if (guard.reason === "superseded_by_newer_same_participant") {
-                continue;
-              }
-              if (guard.reason === "reply_after") {
-                maybeSuppressGroupMessageSelection(
-                  cursorKey,
-                  lastUserMsgId,
-                  candidate.text,
-                  "reply_after"
-                );
-                console.log("[REPLY_AFTER_BLOCKED_CURSOR_ADVANCE]", {
-                  cursorKey,
-                  messageId: lastUserMsgId,
-                  reason: "reply_after",
-                });
-                console.log(
-                  "⛔ Reply-after guard — suppressing selection (no cursor advance)"
-                );
-                continue;
-              }
-            }
-
-            candidate.__persistedCursor = persistedCursor || null;
-            candidate.__listenerInboundId = lastUserMsgId;
-            candidate.__suppressAckNoopOutbound =
-              cursorCandidateRows.length > 1;
-            candidate.__startupCatchup = Boolean(persistedCursor);
-
-              newUserMessages.push(candidate);
-              console.log("[participant_new_message_selected]", {
-                chatKey,
-                participantKey: candidate.participantKey || null,
-                cursorKey,
-                lastUserMsgId,
-                idStrategy,
+            newUserMessages.push(candidate);
+            console.log("[participant_new_message_selected]", {
+              chatKey,
+              participantKey: candidate.participantKey || null,
+              cursorKey,
+              lastUserMsgId,
+              idStrategy,
+              forwardDecisionReason: forwardDecision.reason,
               burstMerged: Boolean(candidate.__burstMerged),
               burstCount: candidate.__burstMergedCount ?? 1,
               mergedRowCount: candidate.__catchupMergedRowCount || 1,
-              persistedCursorPresent: Boolean(persistedCursor),
+              persistedCursorPresent: Boolean(
+                forwardDecision.normalizedCursor || persistedCursor
+              ),
+              indexDriftRecovered: Boolean(forwardDecision.indexDriftRecovered),
               textPreview: String(candidate.text ?? "").slice(0, 120),
-              });
+            });
           }
           newUserMessages.sort(
             (a, b) => (Number(a?.__ts) || 0) - (Number(b?.__ts) || 0)
