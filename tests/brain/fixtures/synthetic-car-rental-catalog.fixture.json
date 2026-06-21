@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "synthetic-car-rental-catalog-v1",
+  "businessId": "synthetic-car-rental-business-001",
+  "businessName": "Synthetic Car Rental",
+  "categoryId": "automotive",
+  "groupChatKey": "car rental queries",
+  "groupDisplayName": "Synthetic Car Rental Test Group",
+  "participantKey": "customer-alpha::first-seen-1",
+  "participantDisplayName": "Customer Alpha",
+  "conversationStyle": "casual_local",
+  "items": [
+    {
+      "id": "honda_civic_2026_oriel_white_7e961e31",
+      "name": "Honda Civic 2026 Oriel",
+      "displayLabel": "Honda Civic 2026 Oriel (White)",
+      "pricing": {
+        "daily": 8000,
+        "monthly": 165000,
+        "currency": "PKR"
+      },
+      "availability": true,
+      "images": [
+        "https://example.com/fixtures/civic-white.jpg"
+      ]
+    },
+    {
+      "id": "toyota_corolla_metallic_grey_fixture",
+      "name": "Toyota corolla",
+      "displayLabel": "Toyota corolla (Metallic Grey)",
+      "pricing": {
+        "daily": 5000,
+        "monthly": 120000,
+        "currency": "PKR"
+      },
+      "availability": true
+    },
+    {
+      "id": "kia_stonic_ex_plus_2021_white_fixture",
+      "name": "Kia Stonic EX Plus 2021",
+      "displayLabel": "Kia Stonic EX Plus 2021 (White Color)",
+      "pricing": {
+        "daily": 7000,
+        "monthly": 140000,
+        "currency": "PKR"
+      },
+      "availability": false
+    }
+  ]
+}

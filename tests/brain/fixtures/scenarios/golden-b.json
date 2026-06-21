@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-b",
+  "title": "Civic availability then price with duration",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "turns": [
+    {
+      "step": 1,
+      "message": "Civic available?",
+      "messageId": "golden-b-turn-1"
+    },
+    {
+      "step": 2,
+      "message": "10 din k lye rent kitna hai?",
+      "messageId": "golden-b-turn-2"
+    }
+  ],
+  "expectations": {
+    "finalWorkflowType": "pricing_with_duration",
+    "mustIncludePrice": true,
+    "mustNotCreateBooking": true,
+    "mustNotNotifyOwner": true,
+    "mustNotUseGroupBookingAck": true
+  }
+}

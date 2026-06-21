@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "synthetic-hotel-catalog-v1",
+  "businessId": "synthetic-hotel-business-001",
+  "businessName": "Synthetic Stay",
+  "categoryId": "hospitality",
+  "groupChatKey": "hotel booking queries",
+  "groupDisplayName": "Hotel Booking Queries",
+  "participantKey": "guest-alpha::first-seen-1",
+  "participantDisplayName": "Guest Alpha",
+  "conversationStyle": "casual_local",
+  "items": [
+    {
+      "id": "deluxe_room_fixture_001",
+      "name": "Deluxe Room",
+      "displayLabel": "Deluxe Room (City View)",
+      "pricing": {
+        "daily": 12000,
+        "monthly": 250000,
+        "currency": "PKR"
+      },
+      "availability": true
+    }
+  ]
+}

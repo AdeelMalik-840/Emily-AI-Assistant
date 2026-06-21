@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-browse",
+  "title": "Generic browse ask — list available options",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "turns": [
+    {
+      "step": 1,
+      "message": "konsi cars available hain?",
+      "messageId": "golden-browse-turn-1"
+    }
+  ],
+  "expectations": {
+    "finalWorkflowType": "browse_options",
+    "mustListAvailableOptions": true,
+    "mustListItemLabels": ["Civic", "Corolla"],
+    "mustNotListItemLabels": ["Stonic"],
+    "mustNotCreateBooking": true,
+    "mustNotNotifyOwner": true,
+    "mustNotUseGroupBookingAck": true
+  }
+}

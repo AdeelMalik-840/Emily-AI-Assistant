@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "golden-i-burst",
+  "title": "Golden I — rapid burst / sequencing",
+  "fixtureRef": "synthetic-car-rental-catalog.fixture.json",
+  "channelId": "whatsapp_web",
+  "rapidAvailabilityForward": ["Civic available?", "Corolla available?"],
+  "rapidAvailabilityReverse": ["Corolla available?", "Civic available?"],
+  "mergedAvailabilityCandidate": "Civic available? Corolla available?",
+  "pricingAfterSwitchSequence": ["Civic available?", "Corolla available?", "3 din k lye rent kitna hai?"],
+  "bookingAfterSwitchSequence": ["Civic available?", "Corolla available?", "3 din k lye"],
+  "itemIds": {
+    "civic": "honda_civic_2026_oriel_white_7e961e31",
+    "corolla": "toyota_corolla_metallic_grey_fixture"
+  },
+  "corollaThreeDayTotal": 15000
+}
