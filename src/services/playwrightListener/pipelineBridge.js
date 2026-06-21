@@ -80,6 +80,22 @@ function groupSenderScopeFromAnchor(groupKey, senderAnchor) {
     .slice(0, 16);
 }
 
+function unresolvedParticipantTurnScope(groupKey, adapted) {
+  const turnIdentity = [
+    adapted?.messageId,
+    adapted?.sourceRowKey,
+    adapted?.sourceMessageIndex,
+    adapted?.timestamp,
+    adapted?.text,
+  ]
+    .map((value) => String(value ?? "").trim())
+    .join("::");
+  return createHash("sha256")
+    .update(`${String(groupKey ?? "").trim().toLowerCase()}::${turnIdentity}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
 /**
  * Build schedule payload; returns null if forwarding cannot run.
  * @param {{
@@ -154,24 +170,14 @@ async function buildPlaywrightSchedulePayload(adapted) {
   const normalizedGroupChatKey = playwrightChatKey || groupName;
 
   const senderName = String(adapted?.senderName ?? adapted?.sender ?? "user").trim() || "user";
-  const uniqueSenderIdRaw =
-    adapted?.participantPhoneForDm ||
-    adapted?.messageSender ||
-    adapted?.userPhone ||
-    adapted?.conversationCustomerNumber ||
-    adapted?.playwrightChatKey ||
-    "";
-  const anonBase = normalizeSenderId(adapted?.senderName || adapted?.sender || "unknown");
-  const anonId = createHash("sha256")
-    .update(`${anonBase}::${groupName}`, "utf8")
-    .digest("hex")
-    .slice(0, 6);
-  const uniqueSenderId =
-    normalizeSenderId(uniqueSenderIdRaw) ||
-    `anon::${anonBase}::${anonId}`;
+  // Only a DOM sender anchor scoped to this group, or a verified participant
+  // phone, is trusted for reusable participant memory. Display names,
+  // first-seen keys and the group chat key are not participant identities.
   const senderScope =
     groupSenderScopeFromAnchor(normalizedGroupChatKey, adapted?.senderAnchor) ||
-    groupParticipantScope(uniqueSenderId);
+    (adapted?.participantPhoneForDm
+      ? groupParticipantScope(adapted.participantPhoneForDm)
+      : "");
   const participantIdentity = resolveParticipantIdentity({
     participantPhone: adapted?.participantPhoneForDm,
     participantKey: adapted?.participantKey,
@@ -183,10 +189,9 @@ async function buildPlaywrightSchedulePayload(adapted) {
     senderScope: senderScope ? String(senderScope).trim() : "",
   });
   const participantPhoneForDm = participantIdentity.participantPhone || "";
-  // CRITICAL: group follow-ups (e.g. "12 din") rely on participant-scoped session memory.
-  // If we fail to provide a stable participantKey, messageProcessor will fail-closed and clear duration.
-  // Fallback to a deterministic senderScope key (stable for the same sender in the same group).
-  const participantKey = senderScope ? `scope::${senderScope}` : (participantIdentity.participantKey || "");
+  // Group follow-ups rely on participant-scoped memory. An unresolved identity
+  // must not inherit name-based or group-wide memory.
+  const participantKey = senderScope ? `scope::${senderScope}` : "";
   if (participantKey) {
     console.log("[participant_identity_stable_key_selected]", {
       groupChatKey: String(normalizedGroupChatKey ?? "").trim() || null,
@@ -205,12 +210,18 @@ async function buildPlaywrightSchedulePayload(adapted) {
     groupChatKey: playwrightChatKey || groupName || groupSessionKey,
     participantKey,
   });
-  const sessionKey = participantSessionKey || `${groupSessionKey}::participant::missing`;
+  const unresolvedTurnScope = participantKey
+    ? ""
+    : unresolvedParticipantTurnScope(normalizedGroupChatKey, adapted);
+  const sessionKey =
+    participantSessionKey ||
+    `${groupSessionKey}::participant::unresolved::${unresolvedTurnScope}`;
   if (!participantKey) {
-    console.warn("[participant_identity_missing_group_state_blocked]", {
+    console.warn("[participant_identity_unresolved_fail_closed]", {
       groupChatKey: playwrightChatKey || null,
       participantName: senderName || null,
-      reason: "MISSING_PARTICIPANT_KEY",
+      messageId: adapted?.messageId ?? null,
+      reason: "MISSING_STABLE_SENDER_ANCHOR_OR_PHONE",
     });
   } else if (!participantIdentity.participantKey) {
     console.log("[participant_identity_fallback_key_used]", {
@@ -258,7 +269,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
   }
 
   const conversationCustomerNumber = `grp${createHash("sha256")
-    .update(`${groupName}::${senderScope}`, "utf8")
+    .update(`${groupName}::${senderScope || `unresolved::${unresolvedTurnScope}`}`, "utf8")
     .digest("hex")
     .slice(0, 24)}`;
   const hadPhoneLookingSenderName = looksLikePhoneLabel(senderName);
