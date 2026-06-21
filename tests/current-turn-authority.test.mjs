@@ -93,6 +93,27 @@ test("B: unprefixed civic beats stale Corolla memory", () => {
   assert.equal(authority.authoritativeItemForTurn?.id, civic.id);
 });
 
+test("itemless price/duration turn does not pick fuzzy catalog authority", () => {
+  const authority = resolveCurrentTurnAuthority({
+    originalMessage: "10 din k lye rent kitna hai?",
+    catalogItems: catalog,
+    memory: staleStonicMemory(),
+  });
+  assert.equal(authority.hasExplicitItemThisTurn, false);
+  assert.equal(authority.authoritativeItem, null);
+  assert.equal(authority.fuzzyCatalog.found, false);
+});
+
+test("explicit Stonic pricing turn keeps explicit authority", () => {
+  const authority = resolveCurrentTurnAuthority({
+    originalMessage: "Stonic 10 din ka rent kitna hai?",
+    catalogItems: catalog,
+    memory: staleCorollaMemory(),
+  });
+  assert.equal(authority.hasExplicitItemThisTurn, true);
+  assert.equal(authority.authoritativeItem?.id, stonic.id);
+});
+
 // C. Stale Corolla memory + Stonic
 test("C: stonic beats stale Corolla memory", () => {
   const authority = resolveCurrentTurnAuthority({

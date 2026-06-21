@@ -146,6 +146,11 @@ import {
   hasExplicitNewItemMention,
 } from "./currentTurnAuthority.js";
 import {
+  resolveTurnContext,
+  isItemlessPriceDurationFollowup as isItemlessPriceDurationFollowupShape,
+  ITEMLESS_PRICE_CLARIFICATION_REPLY,
+} from "./turnContextAuthority.js";
+import {
   buildSameSessionBookingContinuationReply,
   isAwaitingBookingContactCapture,
   isSameSessionBookingContinuation,
@@ -4383,18 +4388,17 @@ function resolveItemlessPriceDurationAskedField(message) {
   return null;
 }
 
+function buildItemlessPriceDurationClarificationReply() {
+  return ITEMLESS_PRICE_CLARIFICATION_REPLY;
+}
+
 /**
- * Itemless duration + rent/price quote (e.g. "3 day rent?") — informational, not booking slot-fill.
+ * Itemless duration + rent/price quote — delegated to turn-level authority contract.
  * @param {unknown} message
  * @param {unknown[]} catalogItems
  */
 function isItemlessPriceDurationFollowup(message, catalogItems) {
-  if (!isBareDurationMessage(message)) return false;
-  if (!resolveItemlessPriceDurationAskedField(message)) return false;
-  if (!isExplicitPricingOrDetailsQuestion(message)) return false;
-  if (hasStrongBookingCommitPhrase(message)) return false;
-  if (hasExplicitNewItemMention(message, catalogItems, null).found) return false;
-  return true;
+  return isItemlessPriceDurationFollowupShape(message, catalogItems);
 }
 
 /**
@@ -4564,7 +4568,24 @@ function resolveLastVerifiedCatalogAnswerForPriceFollowup(p) {
   }
   const currentParticipantKey = String(p.participantKey ?? "").trim();
   const storedParticipantKey = String(ctx.participantKey ?? "").trim();
-  if (storedParticipantKey && currentParticipantKey && storedParticipantKey !== currentParticipantKey) {
+  if (p.isGroupInbound === true) {
+    if (!currentParticipantKey) {
+      return logReject("MISSING_STABLE_PARTICIPANT_SESSION");
+    }
+    if (!storedParticipantKey || storedParticipantKey !== currentParticipantKey) {
+      return logReject(
+        storedParticipantKey ? "PARTICIPANT_MISMATCH" : "UNTRUSTED_STORED_PARTICIPANT",
+        {
+          participantKey: currentParticipantKey,
+          storedParticipantKey: storedParticipantKey || null,
+        }
+      );
+    }
+  } else if (
+    storedParticipantKey &&
+    currentParticipantKey &&
+    storedParticipantKey !== currentParticipantKey
+  ) {
     return logReject("PARTICIPANT_MISMATCH", {
       participantKey: currentParticipantKey,
       storedParticipantKey,
@@ -4659,6 +4680,7 @@ function recentAssistantVerifiedPriceAnswerForItem(recentAssistantReplies, item)
  *   chatContextKey?: string | null,
  *   sessionKey?: string | null,
  *   traceId?: string | null,
+ *   isGroupInbound?: boolean,
  * }} p
  */
 function hasSafePreviousCatalogItemForPriceFollowup(p) {
@@ -4689,6 +4711,7 @@ function hasSafePreviousCatalogItemForPriceFollowup(p) {
     chatContextKey: p.chatContextKey,
     sessionKey: p.sessionKey,
     traceId: p.traceId,
+    isGroupInbound: p.isGroupInbound === true,
   });
   if (structured.ok) {
     return {
@@ -4712,6 +4735,16 @@ function hasSafePreviousCatalogItemForPriceFollowup(p) {
       proofSource: null,
     };
   }
+  const participantKey = String(p.participantKey ?? "").trim();
+  if (p.isGroupInbound === true && !participantKey) {
+    return {
+      ok: false,
+      reason: "MISSING_STABLE_PARTICIPANT_SESSION",
+      itemId: null,
+      item: null,
+      proofSource: null,
+    };
+  }
   const itemId =
     normalizeId(memory?.lastItem?.id) || normalizeId(memory?.lastResolvedItemId);
   if (!itemId) {
@@ -4721,24 +4754,12 @@ function hasSafePreviousCatalogItemForPriceFollowup(p) {
     memory?.lastItem && typeof memory.lastItem === "object"
       ? memory.lastItem
       : { id: itemId };
-  const recentAssistantReplies = Array.isArray(p.recentAssistantReplies)
-    ? p.recentAssistantReplies
-    : [];
-  if (!recentAssistantVerifiedPriceAnswerForItem(recentAssistantReplies, item)) {
-    return {
-      ok: false,
-      reason: "NO_RECENT_VERIFIED_PRICE_ANSWER",
-      itemId,
-      item,
-      proofSource: null,
-    };
-  }
   return {
     ok: true,
-    reason: "OK",
+    reason: "SAME_PARTICIPANT_SESSION_MEMORY",
     itemId,
     item,
-    proofSource: "RECENT_ASSISTANT_REPLY",
+    proofSource: "PARTICIPANT_SESSION_MEMORY",
   };
 }
 
@@ -4755,6 +4776,7 @@ function hasSafePreviousCatalogItemForPriceFollowup(p) {
  *   chatContextKey?: string | null,
  *   sessionKey?: string | null,
  *   traceId?: string | null,
+ *   isGroupInbound?: boolean,
  * }} p
  */
 function resolveDurationContextPolicy(p) {
@@ -4767,13 +4789,13 @@ function resolveDurationContextPolicy(p) {
   const safePrevious = itemlessPriceDurationFollowup
     ? hasSafePreviousCatalogItemForPriceFollowup({
         memory: p.memory,
-        recentAssistantReplies: p.recentAssistantReplies,
         message: p.message,
         catalogItems: p.catalogItems,
         participantKey: p.participantKey,
         chatContextKey: p.chatContextKey,
         sessionKey: p.sessionKey,
         traceId: p.traceId,
+        isGroupInbound: p.isGroupInbound === true,
       })
     : { ok: false, reason: null, proofSource: null, item: null, itemId: null };
   const priceDurationFollowupWithSafeItem =
@@ -5865,6 +5887,7 @@ export function resolveAuthoritativeItemForTurn({
   memoryItem,
   isFollowup,
   catalogItems = [],
+  itemlessPriceDurationFollowup = false,
 } = {}) {
   const explicitItem = normalizeAuthorityItem(explicitResolvedItem);
   const lockedItem = normalizeAuthorityItem(turnLockedItem);
@@ -5886,10 +5909,12 @@ export function resolveAuthoritativeItemForTurn({
         )
       )
     : null;
-  const fuzzyCatalogMention = findConservativeFuzzyCatalogMention(
-    userText,
-    catalogItems
-  );
+  const fuzzyCatalogMention = itemlessPriceDurationFollowup
+    ? { found: false, ambiguous: false, itemId: null, itemLabel: null, candidates: [] }
+    : findConservativeFuzzyCatalogMention(
+        userText,
+        catalogItems
+      );
   const explicitMention =
     Boolean(explicitItem) &&
     (hasExplicitEntity ||
@@ -7962,10 +7987,15 @@ export async function processMessage({
     senderAnchor: senderScope,
     groupChatKey: playwrightChatKey || groupName,
   });
-  const sourceParticipantKey =
-    String(participantKey ?? "").trim() ||
-    participantIdentity.participantKey ||
-    null;
+  const explicitParticipantKey = String(participantKey ?? "").trim();
+  const preserveUnresolvedPlaywrightGroupIdentity =
+    Boolean(playwrightWebInbound) &&
+    Boolean(isGroupInbound) &&
+    !explicitParticipantKey &&
+    !String(senderScope ?? "").trim();
+  const sourceParticipantKey = preserveUnresolvedPlaywrightGroupIdentity
+    ? null
+    : explicitParticipantKey || participantIdentity.participantKey || null;
   if (isGroupInbound && !sourceParticipantKey) {
     console.warn("[participant_identity_missing_group_state_blocked]", {
       groupChatKey: String(playwrightChatKey ?? groupName ?? "").trim() || null,
@@ -8498,16 +8528,6 @@ export async function processMessage({
     }
     return cleared;
   }
-  function isStatefulShortGroupReply(text) {
-    const raw = String(text ?? "").trim();
-    if (!raw) return false;
-    const words = raw.split(/\s+/).filter(Boolean);
-    return (
-      words.length <= 4 ||
-      /\b\d+\s*(din|day|days|roz|hafta|week|weeks)\b/i.test(raw) ||
-      /^(yes|yeah|yep|han|haan|ji|jee|ok|okay|done|outside|inside|andar|bahar)$/i.test(raw)
-    );
-  }
   function buildBookingBlockedResponse({
     itemName,
     memory,
@@ -8641,21 +8661,8 @@ export async function processMessage({
   const emilySessionKey = chatSessionKey(userId, chatContextKey);
   routingCtx.emilySessionKey = emilySessionKey;
   const pendingTopicReset = Boolean(resetTopicContext);
-  if (isGroupInbound && !sourceParticipantKey && isStatefulShortGroupReply(message)) {
-    console.warn("[participant_short_reply_without_context_blocked]", {
-      groupChatKey: normalizedPlaywrightChatKey || null,
-      messagePreview: String(message ?? "").slice(0, 80),
-      reason: "MISSING_PARTICIPANT_IDENTITY",
-    });
-    return applyHybridOutboundResult(
-      {
-        reply: "Kis item ke liye keh rahe hain?",
-        type: "AI_MESSAGE",
-        messageMeta: messageMetaForKnowledge(false),
-      },
-      routingCtx
-    );
-  }
+  /** @type {import("./turnContextAuthority.js").ReturnType<typeof resolveTurnContext> | null} */
+  let turnContext = null;
   const pendingEngagementMemory = getEmilySessionState(emilySessionKey);
   const pendingEngagementResult = await maybeHandlePendingEngagementQualifier({
     userId,
@@ -8867,6 +8874,43 @@ export async function processMessage({
   }
 
   const inboundMessageRawForFuzzy = String(rawInboundMessage ?? "").trim();
+  if (inboundMessageRawForFuzzy && normalizedCatalogForTurn.length > 0) {
+    turnContext = resolveTurnContext({
+      message: inboundMessageRawForFuzzy,
+      catalogItems: normalizedCatalogForTurn,
+      participantKey: sourceParticipantKey,
+      isGroupInbound,
+      memory: getEmilySessionState(emilySessionKey),
+      traceId,
+      resolveTrustedSessionItem: (p) =>
+        hasSafePreviousCatalogItemForPriceFollowup({
+          memory: p.memory,
+          message: p.message,
+          catalogItems: p.catalogItems,
+          participantKey: p.participantKey,
+          chatContextKey,
+          sessionKey: emilySessionKey,
+          traceId,
+          isGroupInbound,
+        }),
+    });
+    if (turnContext.shouldClarifyItem && turnContext.clarificationReply) {
+      console.warn("[turn_context_clarification_outbound]", {
+        traceId,
+        reason: turnContext.clarificationReason,
+        turnShape: turnContext.turnShape,
+        participantIdentity: turnContext.participantIdentity,
+      });
+      return applyHybridOutboundResult(
+        {
+          reply: turnContext.clarificationReply,
+          type: "AI_MESSAGE",
+          messageMeta: messageMetaForKnowledge(false),
+        },
+        routingCtx
+      );
+    }
+  }
   /** @type {import("./fuzzyTurnNormalizer.js").FuzzyTurnResult | null} */
   let fuzzyTurnNormalization = null;
   if (inboundMessageRawForFuzzy && normalizedCatalogForTurn.length > 0) {
@@ -10095,11 +10139,32 @@ export async function processMessage({
     chatContextKey,
     sessionKey: emilySessionKey,
     traceId,
+    isGroupInbound,
   });
   let durationContextAllowed = durationContextPolicy.durationContextAllowed;
   let durationContextReason = durationContextPolicy.durationContextReason;
   const priceDurationFollowupWithSafeItem =
     durationContextPolicy.priceDurationFollowupWithSafeItem === true;
+  if (
+    durationContextPolicy.itemlessPriceDurationFollowup &&
+    !priceDurationFollowupWithSafeItem
+  ) {
+    console.warn("[price_duration_followup_clarification_required]", {
+      traceId,
+      participantKey: sourceParticipantKey || null,
+      chatContextKey,
+      sessionKey: emilySessionKey,
+      reason: durationContextPolicy.safePreviousReason || "NO_SAFE_ITEM",
+    });
+    return applyHybridOutboundResult(
+      {
+        reply: buildItemlessPriceDurationClarificationReply(),
+        type: "AI_MESSAGE",
+        messageMeta: messageMetaForKnowledge(false),
+      },
+      routingCtx
+    );
+  }
   if (
     priceDurationFollowupWithSafeItem &&
     durationContextPolicy.priceFollowupCatalogItem &&
@@ -11681,7 +11746,13 @@ export async function processMessage({
     console.log("[GREETING GUARD] Skipping item resolution and clearing lastItem memory");
   }
   if (!skipItemResolutionForGreeting && fuzzyTurnNormalization) {
-    const fuzzyOutbound = resolveFuzzyCatalogOutbound(fuzzyTurnNormalization);
+    const fuzzyOutbound =
+      turnContext?.suppressFuzzyCatalog === true
+        ? { shouldIntercept: false, reply: null, source: null }
+        : resolveFuzzyCatalogOutbound(fuzzyTurnNormalization, {
+            rawText: inboundMessageRawForFuzzy,
+            catalogItems: normalizedCatalogForTurn,
+          });
     const blockFuzzyOutboundForBooking =
       turnIntentShape.primaryIntent === "booking_request" ||
       turnIntentShape.primaryIntent === "browse_options" ||
@@ -12508,8 +12579,13 @@ export async function processMessage({
     memoryItem: conversationMemory?.lastItem ?? memForCatalogInput?.lastItem ?? null,
     isFollowup: isItemFollowupForAuthority,
     catalogItems: normalizedCatalogForTurn,
+    itemlessPriceDurationFollowup:
+      turnContext?.itemlessPriceDurationFollowup === true ||
+      durationContextPolicy.itemlessPriceDurationFollowup === true,
   });
   const fuzzyHighCatalogOverride =
+    turnContext?.suppressFuzzyCatalog !== true &&
+    !durationContextPolicy.itemlessPriceDurationFollowup &&
     fuzzyTurnNormalization?.catalogConfidence === "high" &&
     fuzzyTurnNormalization.catalogCandidate &&
     !fuzzyTurnNormalization.ambiguity &&
@@ -16289,6 +16365,10 @@ export function __isItemlessPriceDurationFollowupForTests(message, catalogItems 
 
 export function __resolveItemlessPriceDurationAskedFieldForTests(message) {
   return resolveItemlessPriceDurationAskedField(message);
+}
+
+export function __buildItemlessPriceDurationClarificationReplyForTests() {
+  return buildItemlessPriceDurationClarificationReply();
 }
 
 export function __hasSafePreviousCatalogItemForPriceFollowupForTests(args = {}) {

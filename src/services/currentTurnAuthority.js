@@ -2,6 +2,7 @@ import {
   extractEntity,
   getEntityConfidenceThreshold,
 } from "./entityExtraction.js";
+import { shouldSuppressItemlessPriceDurationCatalogMatch } from "./fuzzyTurnNormalizer.js";
 
 function buildDisplayLabel(row) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return "";
@@ -292,6 +293,10 @@ export function resolveCurrentTurnAuthority({
   const explicitCatalog = hasExplicitNewItemMention(cleanedMessage, items, null);
   const fuzzyCatalog = findConservativeFuzzyCatalogMention(cleanedMessage, items);
   const extracted = extractEntity(cleanedMessage);
+  const itemlessPriceDurationShape = shouldSuppressItemlessPriceDurationCatalogMatch(
+    cleanedMessage,
+    items
+  );
 
   let authoritativeItem = null;
   let source = "none";
@@ -301,7 +306,12 @@ export function resolveCurrentTurnAuthority({
     authoritativeItem = normalizeAuthorityItem(catalogRowById(items, explicitCatalog.itemId));
     source = "explicit_catalog";
     confidence = 1;
-  } else if (fuzzyCatalog.found && !fuzzyCatalog.ambiguous && fuzzyCatalog.itemId) {
+  } else if (
+    !itemlessPriceDurationShape &&
+    fuzzyCatalog.found &&
+    !fuzzyCatalog.ambiguous &&
+    fuzzyCatalog.itemId
+  ) {
     authoritativeItem = normalizeAuthorityItem(catalogRowById(items, fuzzyCatalog.itemId));
     source = "fuzzy_catalog";
     confidence = 0.92;

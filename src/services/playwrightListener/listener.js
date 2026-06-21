@@ -3877,6 +3877,36 @@ export function getExtractedWhatsAppDataId(msg) {
 }
 
 /**
+ * Stable participant JID from inbound WhatsApp Web `data-id` (`false_*` only).
+ * Examples: `false_923001112233@c.us_ABC` → `923001112233@c.us`, `false_123@lid` → `123@lid`.
+ * Outbound `true_*` rows never produce an anchor.
+ * @param {unknown} dataId
+ * @returns {string}
+ */
+export function participantAnchorFromWhatsAppDataId(dataId) {
+  const raw = String(dataId ?? "").trim();
+  if (!raw || !raw.toLowerCase().startsWith("false_")) return "";
+  const rest = raw.slice("false_".length);
+  if (!rest) return "";
+  const match = rest.match(/^([^\s@]+@[^\s_]+)(?:_.+)?$/i);
+  if (!match) return "";
+  const jid = String(match[1] ?? "").trim().toLowerCase();
+  if (!jid || !/@(?:c\.us|lid)$/i.test(jid)) return "";
+  return jid;
+}
+
+/**
+ * DOM sender anchor when present; otherwise inbound participant JID from `data-id`.
+ * @param {object} m
+ * @returns {string}
+ */
+function resolveExtractedSenderAnchor(m) {
+  const domAnchor = String(m?.senderAnchor ?? "").trim();
+  if (domAnchor) return domAnchor;
+  return participantAnchorFromWhatsAppDataId(getExtractedWhatsAppDataId(m));
+}
+
+/**
  * @param {object | null | undefined} freshState
  */
 function ensureFreshDeltaIdentityPins(freshState) {
@@ -5472,12 +5502,13 @@ async function extractIncomingMessages(page, opts = {}) {
 
   for (const m of newMessages) {
     const normalizedGroupChatKey = normalizeTitle(groupName) || groupName;
+    const senderAnchor = resolveExtractedSenderAnchor(m);
     const senderScope =
-      groupSenderScopeFromAnchor(normalizedGroupChatKey, m.senderAnchor) || "";
+      groupSenderScopeFromAnchor(normalizedGroupChatKey, senderAnchor) || "";
     const identity = resolveParticipantIdentity({
       participantPhone: m.participantPhone,
       participantName: m.participantName,
-      senderAnchor: m.senderAnchor,
+      senderAnchor,
       groupChatKey: normalizedGroupChatKey,
       senderScope,
     });
@@ -5505,6 +5536,7 @@ async function extractIncomingMessages(page, opts = {}) {
 
   return newMessages.map((m) => {
     const dataId = getExtractedWhatsAppDataId(m);
+    const senderAnchor = resolveExtractedSenderAnchor(m);
     const prePlainText =
       m.prePlainText != null && String(m.prePlainText).trim() !== ""
         ? String(m.prePlainText).trim()
@@ -5525,6 +5557,7 @@ async function extractIncomingMessages(page, opts = {}) {
         m.participantKey != null && String(m.participantKey).trim() !== ""
           ? String(m.participantKey).trim()
           : null,
+      senderAnchor: senderAnchor || null,
       prePlainText,
       dataId: dataId || null,
       ...(dataId ? { id: { _serialized: dataId } } : {}),
@@ -7660,6 +7693,43 @@ export function isLikelyAssistantOutboundCopy(text) {
     return true;
   }
   return false;
+}
+
+/** @internal Tests — same mapping as extractIncomingMessages return rows. */
+export function __mapExtractedIncomingMessageForTests(m, groupName = "Test Group") {
+  const dataId = getExtractedWhatsAppDataId(m);
+  const senderAnchor = resolveExtractedSenderAnchor(m);
+  const prePlainText =
+    m.prePlainText != null && String(m.prePlainText).trim() !== ""
+      ? String(m.prePlainText).trim()
+      : null;
+  return {
+    text: m.text,
+    raw: m.text,
+    sender: m.sender,
+    participantName:
+      m.participantName != null && String(m.participantName).trim() !== ""
+        ? String(m.participantName).trim()
+        : null,
+    participantPhone:
+      m.participantPhone != null && String(m.participantPhone).trim() !== ""
+        ? String(m.participantPhone).trim()
+        : null,
+    participantKey:
+      m.participantKey != null && String(m.participantKey).trim() !== ""
+        ? String(m.participantKey).trim()
+        : null,
+    senderAnchor: senderAnchor || null,
+    prePlainText,
+    dataId: dataId || null,
+    ...(dataId ? { id: { _serialized: dataId } } : {}),
+    timestamp: m.timestamp ?? null,
+    sourceMessageIndex:
+      m.sourceMessageIndex != null && Number.isFinite(Number(m.sourceMessageIndex))
+        ? Number(m.sourceMessageIndex)
+        : null,
+    groupName,
+  };
 }
 
 /** @internal Tests — mirrors browser `playwrightMessageRowSender`. */

@@ -6,6 +6,7 @@
 
 import { detectAskedField } from "./answerComposer.js";
 import { parseUserDuration } from "../duration/parseDuration.js";
+import { hasExplicitNewItemMention } from "./currentTurnAuthority.js";
 import { normalizeCatalogItem } from "./inventoryService.js";
 
 /** @typedef {"catalog_item"|"field_intent"|"duration_unit"|"availability_cue"|"booking_cue"|"ack_cue"} FuzzyCorrectionType */
@@ -851,8 +852,17 @@ export function buildFuzzyCatalogClarificationReply(fuzzyResult) {
  *   source: "FUZZY_CATALOG_CONFIRMATION" | "FUZZY_CATALOG_CLARIFICATION" | null,
  * }}
  */
-export function resolveFuzzyCatalogOutbound(fuzzyResult) {
+export function resolveFuzzyCatalogOutbound(fuzzyResult, opts = {}) {
   if (!fuzzyResult) {
+    return { shouldIntercept: false, reply: null, source: null };
+  }
+
+  const rawText = String(opts.rawText ?? "").trim();
+  const catalogItems = Array.isArray(opts.catalogItems) ? opts.catalogItems : [];
+  if (
+    rawText &&
+    shouldSuppressItemlessPriceDurationCatalogMatch(rawText, catalogItems)
+  ) {
     return { shouldIntercept: false, reply: null, source: null };
   }
 
@@ -928,6 +938,45 @@ function applyCorrectionsToText(rawText, corrections) {
   });
 }
 
+function buildEmptyCatalogRank(ambiguityReason = "suppressed") {
+  return {
+    ranked: [],
+    top: null,
+    confidence: "low",
+    ambiguity: false,
+    ambiguityReason,
+    needsCatalogConfirmation: false,
+    margin: 0,
+  };
+}
+
+export function shouldSuppressItemlessPriceDurationCatalogMatch(rawText, catalogItems) {
+  const text = String(rawText ?? "").trim();
+  if (!text) return false;
+  if (hasExplicitNewItemMention(text, catalogItems, null).found) return false;
+  const requestedField = String(detectAskedField(text) ?? "").trim().toLowerCase();
+  const durationParsed = parseUserDuration(text);
+  const hasDuration =
+    durationParsed != null && Number.isFinite(Number(durationParsed.normalizedDays));
+  const priceCue =
+    /\b(rent|rate|kiraya|kiraye|kitna|kitni|kitne|price|charges?|per\s*day|per\s*month|daily|monthly)\b/i.test(
+      text
+    );
+  const durationCue =
+    hasDuration ||
+    /\b(?:day|days|din|dino|week|weeks|month|months|hour|hours|hr|hrs|ghanta|ghantay|ghante)\b/i.test(
+      text
+    );
+  return (
+    (requestedField === "price_with_duration" ||
+      requestedField === "price" ||
+      requestedField === "price_daily" ||
+      requestedField === "price_monthly") &&
+    priceCue &&
+    durationCue
+  );
+}
+
 /**
  * @param {{
  *   rawText: string,
@@ -982,7 +1031,13 @@ export function normalizeFuzzyTurn(opts = {}) {
   }
 
   const provisionalField = detectAskedField(rawText);
-  const catalogRank = rankCatalogCandidates(messageTokens, entries, provisionalField);
+  const suppressCatalogRank = shouldSuppressItemlessPriceDurationCatalogMatch(
+    rawText,
+    catalogItems
+  );
+  const catalogRank = suppressCatalogRank
+    ? buildEmptyCatalogRank("itemless_price_duration_followup")
+    : rankCatalogCandidates(messageTokens, entries, provisionalField);
 
   console.log("[fuzzy_catalog_ranked]", {
     traceId: opts.traceId ?? null,
@@ -993,6 +1048,7 @@ export function normalizeFuzzyTurn(opts = {}) {
     ambiguityReason: catalogRank.ambiguityReason,
     topMargin: catalogRank.margin ?? null,
     candidates: catalogRank.ranked.slice(0, 5),
+    suppressedForItemlessPriceDuration: suppressCatalogRank,
   });
 
   for (const token of messageTokens) {
@@ -1048,20 +1104,27 @@ export function normalizeFuzzyTurn(opts = {}) {
     entries,
     requestedFieldCandidate
   );
+  const finalSuppressCatalogRank = shouldSuppressItemlessPriceDurationCatalogMatch(
+    normalizedText,
+    catalogItems
+  );
+  const finalReranked = finalSuppressCatalogRank
+    ? buildEmptyCatalogRank("itemless_price_duration_followup")
+    : reranked;
 
-  const autoAccept = reranked.confidence === "high" && !reranked.ambiguity;
-  const catalogCandidate = autoAccept && reranked.top ? reranked.top.item : null;
+  const autoAccept = finalReranked.confidence === "high" && !finalReranked.ambiguity;
+  const catalogCandidate = autoAccept && finalReranked.top ? finalReranked.top.item : null;
 
   return {
     normalizedText,
     corrections,
     catalogCandidate,
-    catalogConfidence: reranked.confidence,
-    catalogRankedCandidates: reranked.ranked,
-    needsCatalogConfirmation: reranked.needsCatalogConfirmation,
+    catalogConfidence: finalReranked.confidence,
+    catalogRankedCandidates: finalReranked.ranked,
+    needsCatalogConfirmation: finalReranked.needsCatalogConfirmation,
     requestedFieldCandidate,
     durationCandidate,
-    ambiguity: reranked.ambiguity || reranked.confidence === "ambiguous",
-    ambiguityReason: reranked.ambiguity ? reranked.ambiguityReason : null,
+    ambiguity: finalReranked.ambiguity || finalReranked.confidence === "ambiguous",
+    ambiguityReason: finalReranked.ambiguity ? finalReranked.ambiguityReason : null,
   };
 }

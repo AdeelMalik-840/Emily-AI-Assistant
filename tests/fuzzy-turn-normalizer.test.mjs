@@ -46,15 +46,14 @@ test("generic similarity: orolla~corolla, pice~price, dys~days", () => {
   assert.ok(tokenSimilarity("dys", "days") >= 0.82);
 });
 
-test("1. orolla per day rent? → corolla + price_daily", () => {
+test("1. orolla per day rent? now fails closed without explicit item", () => {
   const f = fuzzy("orolla per day rent?");
-  assert.match(f.normalizedText, /corolla per day rent/);
-  assert.equal(f.catalogCandidate?.id, "corolla-1");
-  assert.equal(f.ambiguity, false);
+  assert.equal(f.catalogCandidate, null);
+  assert.equal(f.catalogConfidence, "low");
+  assert.equal(f.catalogRankedCandidates.length, 0);
   assert.equal(f.requestedFieldCandidate, "price_daily");
-  const s = shapeFromFuzzy(f);
-  assert.equal(s.primaryIntent, "pricing_question");
-  assert.equal(s.responsePolicy, "answer_requested_field");
+  const out = resolveFuzzyCatalogOutbound(f);
+  assert.equal(out.shouldIntercept, false);
 });
 
 test("2. corolla pice? → price field", () => {
@@ -131,9 +130,9 @@ test("ranked catalog: ovic avalable scores Honda Civic", () => {
 });
 
 test("catalog confidence: high auto-accept, medium needs confirmation", () => {
-  const high = fuzzy("orolla per day rent?");
+  const high = fuzzy("Stonic 3 dys rent?");
   assert.equal(high.catalogConfidence, "high");
-  assert.equal(high.catalogCandidate?.id, "corolla-1");
+  assert.equal(high.catalogCandidate?.id, "stonic-1");
   assert.equal(high.needsCatalogConfirmation, false);
 
   const mediumRank = rankCatalogCandidates(
@@ -195,6 +194,30 @@ test("4b. ambiguous rola with two Corolla variants asks choice", () => {
 test("5b. low-confidence nonsense does not force catalog intercept", () => {
   const f = fuzzy("xyz qwerty ???");
   const out = resolveFuzzyCatalogOutbound(f);
+  assert.equal(out.shouldIntercept, false);
+});
+
+test("5c. itemless duration pricing does not fuzzy-select Stonic", () => {
+  const f = fuzzy("10 din k lye rent kitna hai?");
+  const out = resolveFuzzyCatalogOutbound(f, {
+    rawText: "10 din k lye rent kitna hai?",
+    catalogItems: singleCatalog,
+  });
+  assert.equal(f.catalogCandidate, null);
+  assert.equal(f.catalogConfidence, "low");
+  assert.equal(f.catalogRankedCandidates.length, 0);
+  assert.equal(out.shouldIntercept, false);
+  assert.equal(out.source, null);
+  assert.doesNotMatch(f.normalizedText, /Stonic/i);
+});
+
+test("5d. explicit item mention still resolves Stonic pricing", () => {
+  const f = fuzzy("Stonic 10 din ka rent kitna hai?");
+  const out = resolveFuzzyCatalogOutbound(f);
+  assert.ok(f.catalogCandidate);
+  assert.equal(f.catalogCandidate?.id, "stonic-1");
+  assert.notEqual(f.catalogConfidence, "low");
+  assert.match(f.normalizedText, /stonic/i);
   assert.equal(out.shouldIntercept, false);
 });
 

@@ -9,6 +9,8 @@ import {
   isPricingOrRentShapedMessage,
   isProtectedPriceIntentToken,
   normalizeFuzzyTurn,
+  resolveFuzzyCatalogOutbound,
+  shouldSuppressItemlessPriceDurationCatalogMatch,
 } from "../src/services/fuzzyTurnNormalizer.js";
 import { resolveTurnIntentShape } from "../src/services/intentShapeResolver.js";
 
@@ -124,6 +126,18 @@ test("F: real Revo availability remains unlisted", async () => {
 
   assert.equal(result?.notInCatalog, true);
   assert.equal(result?.label, "Revo");
+});
+
+test("F: itemless pricing shape suppresses fuzzy catalog outbound intercept", () => {
+  const message = "10 din k lye rent kitna hai?";
+  assert.equal(shouldSuppressItemlessPriceDurationCatalogMatch(message, catalog), true);
+  const normalized = normalizeFuzzyTurn({ rawText: message, catalogItems: catalog });
+  const outbound = resolveFuzzyCatalogOutbound(normalized, {
+    rawText: message,
+    catalogItems: catalog,
+  });
+  assert.equal(outbound.shouldIntercept, false);
+  assert.equal(outbound.source, null);
 });
 
 test("G: named unknown pricing item is not hidden by active Civic memory", async () => {
