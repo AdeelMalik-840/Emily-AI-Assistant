@@ -14,6 +14,8 @@ import { resolveActionPolicyFacts } from "./resolveActionPolicyFacts.js";
 import { resolveBusinessProfileFacts } from "./resolveBusinessProfileFacts.js";
 import { logCanonicalFactsResolved } from "./logCanonicalFacts.js";
 import { getBookingsForItem } from "../../services/inventoryService.js";
+import { resolveCatalogBrowseAvailabilityFacts } from "./resolveCatalogBrowseAvailabilityFacts.js";
+import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
 
 /**
  * @param {unknown} message
@@ -24,6 +26,17 @@ function normalizeMessage(message) {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+/**
+ * @param {string} rawMessage
+ * @param {{ browseAsk?: boolean }} signals
+ * @param {{ intentsRanked?: string[] } | null | undefined} understanding
+ */
+function shouldResolveCatalogBrowse(rawMessage, signals, understanding) {
+  if (Boolean(signals.browseAsk)) return true;
+  if (understanding?.intentsRanked?.[0] === "browse_options") return true;
+  return isGenericBrowseListAsk(rawMessage);
 }
 
 /**
@@ -139,6 +152,14 @@ export async function resolveBusinessTurnContext(params) {
     getBookingsForItemFn: params.getBookingsForItemFn,
   });
 
+  const catalogBrowseFacts = shouldResolveCatalogBrowse(rawMessage, signals, understanding)
+    ? await resolveCatalogBrowseAvailabilityFacts({
+        businessId,
+        catalogItems,
+        getBookingsForItemFn: params.getBookingsForItemFn,
+      })
+    : null;
+
   const businessFacts = await resolveBusinessProfileFacts(
     businessId,
     params.getBusinessProfileFn
@@ -169,6 +190,7 @@ export async function resolveBusinessTurnContext(params) {
     signals: {
       priceAsk: Boolean(signals.priceAsk),
       availabilityAsk: Boolean(signals.availabilityAsk),
+      browseAsk: Boolean(signals.browseAsk),
       bookingCommitment: Boolean(signals.bookingCommitment),
       photoAsk: Boolean(signals.photoAsk),
       contactProvided: Boolean(turnContextInput?.contact),
@@ -193,6 +215,7 @@ export async function resolveBusinessTurnContext(params) {
       pricing: pricingFacts.pricing,
       priceQuote: pricingFacts.priceQuote,
       availability: availabilityFacts.availability,
+      catalogBrowse: catalogBrowseFacts?.catalogBrowse ?? null,
       media: mediaFacts.media,
     },
 
