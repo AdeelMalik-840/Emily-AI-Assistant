@@ -130,6 +130,7 @@ export function runConversationTurn({
     actionPlan = buildBrowseOptionsActionPlan({
       catalogItems,
       conversationStyle: businessContext.conversationStyle ?? "casual_local",
+      businessContext,
     });
   } else if (wf === "unlisted_item") {
     actionPlan = buildUnlistedItemActionPlan({

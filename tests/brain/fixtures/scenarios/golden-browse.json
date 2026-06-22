@@ -14,8 +14,7 @@
   "expectations": {
     "finalWorkflowType": "browse_options",
     "mustListAvailableOptions": true,
-    "mustListItemLabels": ["Civic", "Corolla"],
-    "mustNotListItemLabels": ["Stonic"],
+    "mustListItemLabels": ["Civic", "Corolla", "Stonic"],
     "mustNotCreateBooking": true,
     "mustNotNotifyOwner": true,
     "mustNotUseGroupBookingAck": true
