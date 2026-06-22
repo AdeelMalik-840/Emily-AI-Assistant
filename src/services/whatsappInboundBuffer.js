@@ -61,6 +61,14 @@ import {
   markBookingNotificationQueued,
   markBookingNotificationSending,
 } from "./bookingNotificationState.js";
+import {
+  evaluateBrainRouteGate,
+  buildBrainRouteGateLogPayload,
+  isLegacyProcessMessageAllowed,
+  shouldLogBrainV2ExpectedButNotSelected,
+  buildHardBlockedPipelineResult,
+  BRAIN_V2_HARD_BLOCKED_CUSTOMER_REPLY,
+} from "../brain/live/brainRouteGate.js";
 
 /** Pauses Playwright chat loop during group text + image outbound (see listener `runChatLoop`). */
 globalThis.__OUTBOUND_BUSY__ = false;
@@ -183,21 +191,8 @@ export function isEmilyBrainV2InfoLiveQuickGate(businessId) {
  * @param {string | null | undefined} businessId
  */
 export function isEmilyBrainV2LiveQuickGate(businessId) {
-  if (!envTruthyFlag("EMILY_BRAIN_V2_LIVE")) return false;
-  if (
-    !envTruthyFlag("EMILY_BRAIN_V2_PRODUCTION_ALLOW") &&
-    String(process.env.NODE_ENV ?? "").trim() === "production"
-  ) {
-    return false;
-  }
-  const uid = String(businessId ?? "").trim();
-  if (!uid) return false;
-  const allowlist = String(process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES ?? "")
-    .split(/[,;\s]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (!allowlist.length) return false;
-  return allowlist.includes(uid);
+  const gate = evaluateBrainRouteGate({ businessId });
+  return gate.selected === "v2_live";
 }
 
 /**
@@ -209,14 +204,17 @@ export function isEmilyBrainV2LiveQuickGate(businessId) {
  * @returns {"v2_live" | "info_live" | "legacy"}
  */
 export function evaluateInboundBrainRoute(p) {
-  if (isEmilyBrainV2LiveQuickGate(p.businessId)) return "v2_live";
+  const gate = evaluateBrainRouteGate({ businessId: p.businessId });
+  if (gate.selected === "v2_live") return "v2_live";
   if (
+    gate.selected === "legacy" &&
     !p.isPlaywrightDmWithIdentity &&
     !p.bookingHint &&
     isEmilyBrainV2InfoLiveQuickGate(p.businessId)
   ) {
     return "info_live";
   }
+  if (gate.selected === "blocked") return "blocked";
   return "legacy";
 }
 
@@ -300,6 +298,24 @@ export async function tryBrainV2InfoLiveBeforeLegacy(params) {
   }
 }
 
+/**
+ * Capture pre-legacy state without initializing the Emily session store.
+ * Dependencies are injectable so wiring safety can be tested without module mocks.
+ *
+ * @param {{
+ *   shadowEligible: boolean,
+ *   businessId: string,
+ *   ownerUserId?: string,
+ *   sessionKey?: string,
+ *   participantKey?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   isGroupInbound?: boolean,
+ *   resolveSessionKey?: (p: Record<string, unknown>) => string,
+ *   peekSessionState?: (sessionKey: string) => Record<string, unknown> | null,
+ *   loadShadowModule?: () => Promise<Record<string, unknown>>,
+ *   traceId?: string,
+ * }} p
+ */
 /**
  * Load Emily session memory for v2 live/shadow paths (no shadow flag required).
  * @param {{
@@ -1477,13 +1493,34 @@ export async function executeWhatsAppAiPipeline(p) {
   let messageMeta;
   let handledByBrainV2Live = false;
   let handledByBrainV2InfoLive = false;
+  let handledByBrainV2HardBlock = false;
 
-  const v2LiveEligible = isEmilyBrainV2LiveQuickGate(ownerUserId);
-  const infoLiveEligible =
-    !v2LiveEligible &&
-    !isPlaywrightDmWithIdentity &&
-    !p?.bookingHint &&
-    isEmilyBrainV2InfoLiveQuickGate(ownerUserId);
+  const pipelineChatId =
+    String(playwrightChatKeyRaw ?? "").trim() ||
+    String(groupNameResolved ?? "").trim() ||
+    String(sessionKey ?? "").trim() ||
+    null;
+
+  const routeGate = evaluateBrainRouteGate({
+    businessId: ownerUserId,
+    chatId: pipelineChatId,
+  });
+
+  console.log(
+    "[brain_route_gate_evaluated]",
+    buildBrainRouteGateLogPayload(routeGate, {
+      traceId,
+      ownerUserId: String(ownerUserId ?? "").trim() || null,
+    })
+  );
+  if (routeGate.allowlistConfigError) {
+    console.warn("[brain_route_gate_config_error]", {
+      traceId,
+      businessId: ownerUserId,
+      rejectReason: routeGate.rejectReason,
+      allowlistRaw: routeGate.allowlistRaw,
+    });
+  }
 
   const sharedBrainParams = {
     traceId,
@@ -1525,7 +1562,32 @@ export async function executeWhatsAppAiPipeline(p) {
     },
   };
 
-  if (v2LiveEligible) {
+  const v2LiveEligible = routeGate.selected === "v2_live";
+  const infoLiveEligible =
+    routeGate.selected === "legacy" &&
+    !isPlaywrightDmWithIdentity &&
+    !p?.bookingHint &&
+    isEmilyBrainV2InfoLiveQuickGate(ownerUserId);
+
+  if (routeGate.selected === "blocked") {
+    handledByBrainV2HardBlock = true;
+    const blocked = buildHardBlockedPipelineResult(true);
+    reply = blocked.reply;
+    messageMeta = blocked.messageMeta;
+    sendVia = isGroupInbound ? "GROUP" : "CLOUD_API";
+    dmRecipientPhone = null;
+    if (shouldLogBrainV2ExpectedButNotSelected({ routeGate, handledByBrainV2Live: false })) {
+      console.warn("[brain_v2_expected_but_not_selected]", {
+        traceId,
+        businessId: ownerUserId,
+        rejectReason: routeGate.rejectReason,
+        route: routeGate.route,
+        selected: routeGate.selected,
+        businessAllowlisted: routeGate.businessAllowlisted,
+        hasV2LivePipeline: routeGate.hasV2LivePipeline,
+      });
+    }
+  } else if (v2LiveEligible) {
     console.log("[brain_v2_live_selected]", {
       traceId,
       businessId: ownerUserId,
@@ -1554,6 +1616,26 @@ export async function executeWhatsAppAiPipeline(p) {
           : {};
       sendVia = v2LiveResult.sendVia ?? (isGroupInbound ? "GROUP" : "WHATSAPP");
       dmRecipientPhone = v2LiveResult.dmRecipientPhone ?? undefined;
+    } else if (
+      shouldLogBrainV2ExpectedButNotSelected({
+        routeGate,
+        handledByBrainV2Live: false,
+      })
+    ) {
+      handledByBrainV2HardBlock = true;
+      const blocked = buildHardBlockedPipelineResult(true);
+      console.warn("[brain_v2_expected_but_not_selected]", {
+        traceId,
+        businessId: ownerUserId,
+        rejectReason: "V2_PIPELINE_DID_NOT_HANDLE",
+        v2ResultReason: v2LiveResult?.reason ?? null,
+        legacyBypassed: v2LiveResult?.legacyBypassed ?? null,
+        route: routeGate.route,
+      });
+      reply = blocked.reply;
+      messageMeta = blocked.messageMeta;
+      sendVia = isGroupInbound ? "GROUP" : "CLOUD_API";
+      dmRecipientPhone = null;
     }
   }
 
@@ -1588,7 +1670,29 @@ export async function executeWhatsAppAiPipeline(p) {
   const processMessageFn =
     typeof p.__processMessageFn === "function" ? p.__processMessageFn : processMessage;
 
-  if (!handledByBrainV2Live && !handledByBrainV2InfoLive) {
+  const legacyAllowed = isLegacyProcessMessageAllowed({
+    routeGate,
+    handledByBrainV2Live,
+    handledByBrainV2InfoLive,
+  });
+
+  if (!legacyAllowed && !handledByBrainV2Live && !handledByBrainV2InfoLive && !handledByBrainV2HardBlock) {
+    handledByBrainV2HardBlock = true;
+    const blocked = buildHardBlockedPipelineResult(true);
+    console.warn("[brain_v2_expected_but_not_selected]", {
+      traceId,
+      businessId: ownerUserId,
+      rejectReason: "LEGACY_BLOCKED_BY_HARD_V2_MODE",
+      route: routeGate.route,
+      selected: routeGate.selected,
+    });
+    reply = blocked.reply;
+    messageMeta = blocked.messageMeta;
+    sendVia = isGroupInbound ? "GROUP" : "CLOUD_API";
+    dmRecipientPhone = null;
+  }
+
+  if (legacyAllowed && !handledByBrainV2Live && !handledByBrainV2InfoLive && !handledByBrainV2HardBlock) {
   ({
     reply,
     messageMeta,
@@ -1683,6 +1787,9 @@ export async function executeWhatsAppAiPipeline(p) {
     intentionalSilent,
     skippedForBrainV2Live: handledByBrainV2Live,
     skippedForBrainV2InfoLive: handledByBrainV2InfoLive,
+    skippedForBrainV2HardBlock: handledByBrainV2HardBlock,
+    brainRouteSelected: routeGate.selected,
+    brainRouteRejectReason: routeGate.rejectReason,
   });
 
   await scheduleEmilyBrainV2ShadowAfterLegacy({
@@ -2932,3 +3039,10 @@ export const clearWhatsAppInboundMessageCaches =
 
 /** @internal Tests — owner notification executor hook. */
 export { triggerBusinessBookingNotification as __triggerBusinessBookingNotificationForTests };
+
+export {
+  evaluateBrainRouteGate,
+  isLegacyProcessMessageAllowed,
+  isHardV2LiveMode,
+  BRAIN_V2_HARD_BLOCKED_CUSTOMER_REPLY,
+} from "../brain/live/brainRouteGate.js";
