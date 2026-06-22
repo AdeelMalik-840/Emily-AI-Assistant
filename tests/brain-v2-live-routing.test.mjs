@@ -21,6 +21,8 @@ import {
   evaluateInboundBrainRoute,
   tryBrainV2LiveBeforeLegacy,
   executeWhatsAppAiPipeline,
+  evaluateBrainRouteGate,
+  isLegacyProcessMessageAllowed,
 } from "../src/services/whatsappInboundBuffer.js";
 import {
   loadSyntheticCarRentalCatalogFixture,
@@ -52,7 +54,7 @@ function enableV2LiveForSyntheticBusiness() {
   process.env.EMILY_BRAIN_V2_LIVE = "true";
   process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES = BUSINESS_ID;
   process.env.EMILY_BRAIN_V2_PRODUCTION_ALLOW = "true";
-  delete process.env.EMILY_BRAIN_V2_LEGACY_FALLBACK;
+  process.env.EMILY_BRAIN_V2_LEGACY_FALLBACK = "false";
   delete process.env.EMILY_BRAIN_V2_BOOKING_EXECUTE;
   delete process.env.EMILY_BRAIN_V2_OWNER_EXECUTE;
   delete process.env.EMILY_BRAIN_V2_DM_EXECUTE;
@@ -82,41 +84,26 @@ test("B: v2 live disabled → legacy route uses processMessage", () => {
   assert.equal(evaluateInboundBrainRoute({ businessId: BUSINESS_ID }), "legacy");
 });
 
-test("C: v2 live enabled + allowlisted → v2 route, processMessage guarded", async () => {
+test("C: v2 live enabled + allowlisted → legacy guard blocks processMessage in hard mode", async () => {
   enableV2LiveForSyntheticBusiness();
+  process.env.EMILY_BRAIN_V2_PRODUCTION_ALLOW = "true";
+  process.env.EMILY_BRAIN_V2_LEGACY_FALLBACK = "false";
   assert.equal(isEmilyBrainV2LiveQuickGate(BUSINESS_ID), true);
+
+  const gate = evaluateBrainRouteGate({
+    businessId: BUSINESS_ID,
+    env: process.env,
+    hasV2LivePipeline: true,
+  });
+  assert.equal(gate.selected, "v2_live");
   assert.equal(
-    evaluateInboundBrainRoute({ businessId: BUSINESS_ID }),
-    "v2_live"
+    isLegacyProcessMessageAllowed({ routeGate: gate, handledByBrainV2Live: false }),
+    false
   );
 
-  let processMessageCalls = 0;
-  const processMessageSpy = async () => {
-    processMessageCalls += 1;
-    return {
-      reply: "legacy-should-not-run",
-      messageMeta: {},
-      sendVia: "GROUP",
-    };
-  };
-
   const source = executeWhatsAppAiPipeline.toString();
-  assert.ok(source.includes("[brain_v2_live_selected]"));
-  assert.ok(source.includes("[legacy_brain_bypassed]"));
-  assert.ok(source.includes("!handledByBrainV2Live && !handledByBrainV2InfoLive"));
-
-  const fixture = loadSyntheticCarRentalCatalogFixture();
-  const result = await runBrainV2LivePipeline({
-    traceId: "no-legacy",
-    businessId: BUSINESS_ID,
-    message: "Civic available?",
-    catalogItems: fixture.items,
-    isGroupInbound: true,
-    chatType: "group",
-  });
-  assert.equal(result.handled, true);
-  assert.equal(result.legacyBypassed, true);
-  assert.equal(processMessageCalls, 0);
+  assert.ok(source.includes("[brain_route_gate_evaluated]"));
+  assert.ok(source.includes("isLegacyProcessMessageAllowed"));
 });
 
 test("D: Civic available? handled by v2 live", async () => {

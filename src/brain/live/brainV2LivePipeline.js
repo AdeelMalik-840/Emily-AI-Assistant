@@ -15,6 +15,7 @@ import {
 import { buildShadowTurnContext } from "../shadow/brainShadowHook.js";
 import { runConversationTurn } from "../orchestrator/ConversationOrchestrator.js";
 import { executeOutboundReply } from "../../services/executors/outboundReplyExecutor.js";
+import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -60,6 +61,7 @@ const SAFE_CLARIFICATION =
  *   executionContext?: Record<string, unknown>,
  *   resolveTrustedSessionItem?: (p: Record<string, unknown>) => { ok: boolean, item?: Record<string, unknown> | null, reason?: string | null },
  *   __testOrchestratorFn?: (args: Record<string, unknown>) => unknown,
+ *   getBookingsForItemFn?: (businessId: string, itemId: string, itemName?: string | null) => Promise<unknown[]>,
  * }} params
  * @returns {Promise<BrainV2LivePipelineResult>}
  */
@@ -102,6 +104,14 @@ export async function runBrainV2LivePipeline(params) {
     });
 
     if (turnContextInput.shouldClarifyItem && turnContextInput.clarificationReply) {
+      await resolveBusinessTurnContext({
+        traceId,
+        businessId,
+        rawMessage: message,
+        turnContextInput,
+        catalogItems,
+        flags,
+      });
       return finalizeLivePipelineResult({
         params,
         turnContextInput,
@@ -152,6 +162,18 @@ export async function runBrainV2LivePipeline(params) {
       brainTurnContext.lastResolvedItemId = String(turnContextInput.authoritativeItem.id).trim();
     }
 
+    const resolvedBusinessTurnContext = await resolveBusinessTurnContext({
+      traceId,
+      businessId,
+      rawMessage: message,
+      turnContextInput,
+      turnContext: brainTurnContext,
+      catalogItems,
+      admittedTurn: admission.admittedTurn,
+      flags,
+      getBookingsForItemFn: params.getBookingsForItemFn,
+    });
+
     const orchestratorInput = {
       traceId: `${traceId}::v2_live`,
       admittedTurn: admission.admittedTurn,
@@ -159,6 +181,7 @@ export async function runBrainV2LivePipeline(params) {
       businessContext: {
         catalogItems,
         conversationStyle: "casual_local",
+        resolvedBusinessTurnContext,
       },
       mode: "live",
     };

@@ -36,6 +36,7 @@ import { defaultMessageChannel } from "./services/messageFeedback.js";
 import { parseAndValidateManualWhatsAppPhone } from "./lib/validateManualWhatsAppPhone.js";
 import { getWhatsAppEnv, validateWhatsAppEnv } from "./utils/env.js";
 import { metaCloudFromIsGroupThread } from "./utils/waMetaThreadMarkers.js";
+import { logBrainV2LiveStartupSnapshot } from "./brain/live/brainRouteGate.js";
 
 console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 console.log("[build_marker] whatsapp_cloud_token_fix_v1_loaded");
@@ -62,6 +63,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 validateWhatsAppEnv();
 const { isConfigured } = getWhatsAppEnv();
+logBrainV2LiveStartupSnapshot();
 console.log("[server] WhatsApp env:", {
   configured: isConfigured,
   env: process.env.NODE_ENV,
