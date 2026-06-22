@@ -104,14 +104,14 @@ export function runConversationTurn({
       turnContext,
       understanding,
       catalogItems,
-      businessContext: businessContext.businessProfile ?? null,
+      businessContext,
     });
   } else if (wf === "pricing_inquiry") {
     actionPlan = buildPricingInquiryActionPlan({
       admittedTurn,
       understanding,
       catalogItems,
-      businessContext: businessContext.businessProfile ?? null,
+      businessContext,
     });
   } else if (wf === "booking_request") {
     actionPlan = buildBookingRequestActionPlan({
