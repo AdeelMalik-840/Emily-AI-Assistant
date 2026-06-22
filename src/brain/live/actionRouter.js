@@ -35,6 +35,7 @@ export const LIVE_ALLOWED_WORKFLOW_TYPES = new Set([
 const SIDE_EFFECT_ACTION_TYPES = [
   "CREATE_BOOKING",
   "NOTIFY_OWNER",
+  "AVAILABILITY_OWNER_CHECK_REQUIRED",
   "HANDOFF_DM",
   "DM_CUSTOMER",
   "UPDATE_STATE",
@@ -51,6 +52,8 @@ function sideEffectAllowed(type, flags) {
       return flags.bookingExecute === true || flags.bookingLive === true;
     case "NOTIFY_OWNER":
       return flags.ownerExecute === true || flags.ownerLive === true;
+    case "AVAILABILITY_OWNER_CHECK_REQUIRED":
+      return flags.availabilityOwnerCheckExecute === true;
     case "HANDOFF_DM":
     case "DM_CUSTOMER":
       return flags.dmExecute === true || flags.dmLive === true;

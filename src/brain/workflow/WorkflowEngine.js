@@ -3,7 +3,7 @@
  * unless there is an explicit booking commitment.
  */
 import { isGreeting, normalizeText } from "../../services/preAiRouting.js";
-import { extractContactPhoneFromText } from "../../services/messageProcessor.js";
+import { extractContactPhoneFromText } from "../../utils/extractContactPhoneFromText.js";
 import {
   isAvailabilityInquiryIntent,
   isBrowseWorkflowIntent,
@@ -212,6 +212,18 @@ export function selectWorkflow({ understanding, turnContext, message = "" }) {
         ? "explicit_booking_commitment"
         : "explicit_book_phrase_with_item",
       priority: 86,
+    };
+  }
+
+  if (
+    Boolean(understanding.signals?.availabilityAsk) &&
+    understanding.resolvedItemId &&
+    !understanding.signals?.priceAsk
+  ) {
+    return {
+      workflowType: "availability_inquiry",
+      reason: "availability_ask_blocks_booking_continuation",
+      priority: 84,
     };
   }
 

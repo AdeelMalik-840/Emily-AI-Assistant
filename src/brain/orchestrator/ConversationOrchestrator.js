@@ -21,7 +21,7 @@ import {
   buildContactCollectionActionPlan,
   buildContactRequestActionPlan,
 } from "../workflows/index.js";
-import { extractContactPhoneFromText } from "../../services/messageProcessor.js";
+import { extractContactPhoneFromText } from "../../utils/extractContactPhoneFromText.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */

@@ -53,21 +53,31 @@ function makeUnderstanding(overrides = {}) {
   };
 }
 
-function canonicalContext(availability, itemOverrides = {}) {
+function canonicalContext(availability, itemOverrides = {}, turnOverrides = {}) {
   return Object.freeze({
     schemaVersion: "v1",
     resolvedItem: {
       id: CIVIC_ID,
+      name: "Honda Civic 2026 Oriel",
       displayLabel: "Honda Civic 2026 Oriel (White)",
       ...itemOverrides,
     },
+    turn: {
+      durationDays: turnOverrides.durationDays ?? null,
+    },
     verified: Object.freeze({
       availability: Object.freeze({ ...availability }),
+      priceQuote: Object.freeze({
+        status: "not_requested",
+        durationDays: null,
+        total: null,
+        currency: "PKR",
+      }),
     }),
   });
 }
 
-test("1: AvailabilityWorkflow uses canonical availability when present", () => {
+test("1: AvailabilityWorkflow asks duration when canonical item has no duration", () => {
   const plan = buildAvailabilityInquiryActionPlan({
     admittedTurn: makeAdmittedTurn("Civic available?"),
     understanding: makeUnderstanding(),
@@ -84,11 +94,12 @@ test("1: AvailabilityWorkflow uses canonical availability when present", () => {
       }),
     },
   });
-  assert.equal(plan.actions[0]?.payload?.source, "canonical_verified_availability");
-  assert.match(String(plan.replyDraft ?? ""), /Available hai/i);
+  assert.equal(plan.actions[0]?.payload?.source, "canonical_owner_check_ask_duration");
+  assert.match(String(plan.replyDraft ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Available hai/i);
 });
 
-test("2+6: availability:false + empty bookings → available reply via live pipeline", async () => {
+test("2+6: availability:false + empty bookings → ask duration via live pipeline", async () => {
   const items = fixture.items.map((row) =>
     row.id === CIVIC_ID ? { ...row, availability: false } : row
   );
@@ -110,11 +121,11 @@ test("2+6: availability:false + empty bookings → available reply via live pipe
 
   assert.equal(result.handled, true);
   assert.equal(result.workflowType, "availability_inquiry");
-  assert.match(String(result.reply ?? ""), /Available hai/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /available nahi/i);
+  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /Available hai/i);
 });
 
-test("3: active blocking booking → unavailable reply", async () => {
+test("3: active blocking booking → ask duration before owner check", async () => {
   const result = await runBrainV2LivePipeline({
     traceId: "phase2a-blocked",
     businessId: BUSINESS_ID,
@@ -127,10 +138,11 @@ test("3: active blocking booking → unavailable reply", async () => {
       { id: "b-block", itemId: CIVIC_ID, status: "approved" },
     ],
   });
-  assert.match(String(result.reply ?? ""), /available nahi/i);
+  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /available nahi/i);
 });
 
-test("4: blocking booking with endAt uses nextAvailableAt in reply", async () => {
+test("4: blocking booking with endAt still asks duration when date missing from ask", async () => {
   const endAt = new Date("2026-08-15T12:00:00.000Z");
   const result = await runBrainV2LivePipeline({
     traceId: "phase2a-with-end",
@@ -150,8 +162,8 @@ test("4: blocking booking with endAt uses nextAvailableAt in reply", async () =>
       },
     ],
   });
-  assert.match(String(result.reply ?? ""), /Expected availability/i);
-  assert.match(String(result.reply ?? ""), /Aug/i);
+  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /Expected availability/i);
 });
 
 test("5: missing booking end date does not invent date in reply", async () => {
@@ -176,7 +188,7 @@ test("5: missing booking end date does not invent date in reply", async () => {
       { id: "b-no-end", itemId: CIVIC_ID, status: "approved" },
     ],
   });
-  assert.match(String(result.reply ?? ""), /available nahi/i);
+  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
   assert.doesNotMatch(String(result.reply ?? ""), /Expected availability/i);
 });
 
@@ -314,9 +326,10 @@ test("12: brain module has no OpenAI imports", async () => {
   }
 });
 
-test("13: booking/owner/DM execution remains disabled in flags", () => {
+test("13: booking/owner/DM/availability owner-check execution remains disabled in flags", () => {
   const liveFlags = getEmilyBrainV2LiveFlagSnapshot();
   assert.equal(liveFlags.bookingExecute, false);
   assert.equal(liveFlags.ownerExecute, false);
   assert.equal(liveFlags.dmExecute, false);
+  assert.equal(liveFlags.availabilityOwnerCheckExecute, false);
 });

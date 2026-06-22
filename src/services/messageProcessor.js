@@ -1,4 +1,9 @@
 import {
+  extractContactPhoneFromText,
+  looksSyntheticPhoneSource,
+  normalizePhoneDigits,
+} from "../utils/extractContactPhoneFromText.js";
+import {
   classifyConversationIntentWithLLM,
   extractBookingSlotsWithLLM,
   extractGenericSlotsWithLLM,
@@ -737,11 +742,6 @@ export function extractDeliveryTime(text) {
   return { timeText: null, confidence: "low" };
 }
 
-function normalizePhoneDigits(value) {
-  const digits = String(value ?? "").replace(/\D/g, "");
-  return digits.length >= 10 && digits.length <= 15 ? digits : "";
-}
-
 function isMeaningfulDeliveryAddressToken(raw) {
   const t = String(raw ?? "").trim();
   if (!t) return false;
@@ -1389,12 +1389,6 @@ export async function validateGenericSlotProposalForTurn({
   return { accepted, rejected, forbiddenFields, unknownSlotKeys };
 }
 
-function looksSyntheticPhoneSource(raw) {
-  const s = String(raw ?? "").trim().toLowerCase();
-  if (!s) return false;
-  return /\b(grp|group|dm|participant|first[\s_-]*seen)\b/i.test(s);
-}
-
 /**
  * Resolve a booking/customer contact phone with a strict priority order.
  * Returns normalized digits only (10–15). Rejects synthetic/group identifiers.
@@ -1440,23 +1434,7 @@ export function resolveBookingContactPhone({
   return { phone: null, source: "none" };
 }
 
-/**
- * Best-effort contact phone extraction from raw user message (rule-based).
- * @param {string} text
- * @returns {string | null}
- */
-export function extractContactPhoneFromText(text) {
-  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
-  if (!raw) return null;
-  if (looksSyntheticPhoneSource(raw)) return null;
-  const matches =
-    raw.match(/(?:\+?\d[\d\s().-]{8,}\d|0\d[\d\s().-]{8,}\d)/g) || [];
-  for (const m of matches) {
-    const phone = normalizePhoneDigits(m);
-    if (phone) return phone;
-  }
-  return null;
-}
+export { extractContactPhoneFromText };
 
 /**
  * Apply LLM slot extraction (optional) for booking states, while keeping state transitions deterministic.

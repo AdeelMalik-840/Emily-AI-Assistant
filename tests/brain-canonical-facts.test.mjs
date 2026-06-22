@@ -308,7 +308,7 @@ test("18-20: v2 live replies unchanged; legacy bypassed; pipeline still works", 
   const cases = [
     {
       message: "Civic available?",
-      expect: /Available hai/i,
+      expect: /Kitne din ke liye chahiye/i,
     },
     {
       message: "Civic 3 din ka rent kitna hai?",
