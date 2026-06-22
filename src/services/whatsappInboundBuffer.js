@@ -301,11 +301,8 @@ export async function tryBrainV2InfoLiveBeforeLegacy(params) {
 }
 
 /**
- * Capture pre-legacy state without initializing the Emily session store.
- * Dependencies are injectable so wiring safety can be tested without module mocks.
- *
+ * Load Emily session memory for v2 live/shadow paths (no shadow flag required).
  * @param {{
- *   shadowEligible: boolean,
  *   businessId: string,
  *   ownerUserId?: string,
  *   sessionKey?: string,
@@ -318,8 +315,7 @@ export async function tryBrainV2InfoLiveBeforeLegacy(params) {
  *   traceId?: string,
  * }} p
  */
-export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
-  if (!p.shadowEligible) return null;
+export async function loadBrainV2SessionMemorySnapshot(p) {
   try {
     let resolveSessionKey = p.resolveSessionKey;
     if (typeof resolveSessionKey !== "function") {
@@ -341,14 +337,24 @@ export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
       emilySessionKey
     );
     return existingState == null ? null : structuredClone(existingState);
-  } catch (shadowPrepErr) {
-    console.log("[emily_brain_shadow_prep_failed]", {
+  } catch (err) {
+    console.log("[brain_v2_memory_prep_failed]", {
       traceId: p.traceId,
       businessId: p.businessId,
-      error: String(shadowPrepErr?.message ?? shadowPrepErr ?? "").slice(0, 160),
+      error: String(err?.message ?? err ?? "").slice(0, 160),
     });
     return null;
   }
+}
+
+/** @param {Parameters<typeof loadBrainV2SessionMemorySnapshot>[0]} p */
+export async function prepareBrainV2LiveMemorySnapshot(p) {
+  return loadBrainV2SessionMemorySnapshot(p);
+}
+
+export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
+  if (!p.shadowEligible) return null;
+  return loadBrainV2SessionMemorySnapshot(p);
 }
 
 /**
@@ -1405,10 +1411,9 @@ export async function executeWhatsAppAiPipeline(p) {
   const isGroupInbound =
     isGroupMessage === true && String(userPhone ?? "").trim() === "unknown";
 
-  /** @type {Record<string, unknown> | null} */
   const shadowEligible = isEmilyBrainV2ShadowQuickGate(ownerUserId);
-  const shadowPreTurnMemorySnapshot = await prepareEmilyBrainV2ShadowMemorySnapshot({
-    shadowEligible,
+  const v2LiveMemoryNeeded = isEmilyBrainV2LiveQuickGate(ownerUserId);
+  const memorySnapshotParams = {
     traceId,
     businessId: ownerUserId,
     ownerUserId,
@@ -1416,7 +1421,11 @@ export async function executeWhatsAppAiPipeline(p) {
     participantKey: participantKeyRaw,
     playwrightChatKey: playwrightChatKeyRaw,
     isGroupInbound,
-  });
+  };
+  const shadowPreTurnMemorySnapshot =
+    v2LiveMemoryNeeded || shadowEligible
+      ? await loadBrainV2SessionMemorySnapshot(memorySnapshotParams)
+      : null;
 
   logBookingEvent({
     traceId,

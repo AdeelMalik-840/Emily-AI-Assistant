@@ -15,6 +15,7 @@ import {
 import { buildShadowTurnContext } from "../shadow/brainShadowHook.js";
 import { runConversationTurn } from "../orchestrator/ConversationOrchestrator.js";
 import { executeOutboundReply } from "../../services/executors/outboundReplyExecutor.js";
+import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -102,6 +103,14 @@ export async function runBrainV2LivePipeline(params) {
     });
 
     if (turnContextInput.shouldClarifyItem && turnContextInput.clarificationReply) {
+      await resolveBusinessTurnContext({
+        traceId,
+        businessId,
+        rawMessage: message,
+        turnContextInput,
+        catalogItems,
+        flags,
+      });
       return finalizeLivePipelineResult({
         params,
         turnContextInput,
@@ -151,6 +160,17 @@ export async function runBrainV2LivePipeline(params) {
     if (turnContextInput.authoritativeItem?.id) {
       brainTurnContext.lastResolvedItemId = String(turnContextInput.authoritativeItem.id).trim();
     }
+
+    await resolveBusinessTurnContext({
+      traceId,
+      businessId,
+      rawMessage: message,
+      turnContextInput,
+      turnContext: brainTurnContext,
+      catalogItems,
+      admittedTurn: admission.admittedTurn,
+      flags,
+    });
 
     const orchestratorInput = {
       traceId: `${traceId}::v2_live`,
