@@ -78,6 +78,62 @@ function hasCanonicalAvailability(availability) {
 }
 
 /**
+ * @param {Record<string, unknown> | null | undefined} resolvedItem
+ * @returns {string}
+ */
+function conversationalItemLabelFromResolvedItem(resolvedItem) {
+  const display = String(resolvedItem?.displayLabel ?? "").trim();
+  const name = String(resolvedItem?.name ?? "").trim();
+  const base = name || display.replace(/\([^)]*\)/g, "").trim();
+  if (!base) return "item";
+  const parts = base.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return parts[1];
+  }
+  return parts[0] || "item";
+}
+
+/**
+ * @param {number | null | undefined} durationDays
+ * @returns {string}
+ */
+function formatDurationPhrase(durationDays) {
+  const days = Number(durationDays);
+  if (!Number.isFinite(days) || days < 1) return "";
+  const n = Math.max(1, Math.floor(days));
+  return `${n} din`;
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} businessContext
+ * @returns {Record<string, unknown> | null}
+ */
+function readResolvedBusinessTurnContext(businessContext) {
+  const ctx = businessContext?.resolvedBusinessTurnContext;
+  return ctx && typeof ctx === "object" && !Array.isArray(ctx)
+    ? /** @type {Record<string, unknown>} */ (ctx)
+    : null;
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} canonical
+ * @returns {boolean}
+ */
+function hasCanonicalOwnerCheckContext(canonical) {
+  const itemId = String(canonical?.resolvedItem?.id ?? "").trim();
+  return Boolean(itemId);
+}
+
+/**
+ * @param {number | null | undefined} durationDays
+ * @returns {boolean}
+ */
+function hasRequestedDuration(durationDays) {
+  const days = Number(durationDays);
+  return Number.isFinite(days) && days >= 1;
+}
+
+/**
  * @param {string} itemLabel
  * @param {Record<string, unknown>} availability
  * @returns {string}
@@ -128,6 +184,51 @@ export function logCanonicalAvailabilityUsed(p) {
 }
 
 /**
+ * @param {{
+ *   itemId?: string | null,
+ *   itemLabel?: string | null,
+ *   durationDays?: number | null,
+ *   canonicalAvailability?: Record<string, unknown> | null,
+ *   execute?: boolean,
+ * }} p
+ */
+export function logAvailabilityOwnerCheckPlanned(p) {
+  console.log("[availability_owner_check_planned]", {
+    workflowType: "availability_inquiry",
+    itemId: String(p.itemId ?? "").trim() || null,
+    itemLabel: String(p.itemLabel ?? "").trim() || null,
+    durationDays:
+      p.durationDays != null && Number.isFinite(Number(p.durationDays))
+        ? Math.max(1, Math.floor(Number(p.durationDays)))
+        : null,
+    availabilityStatus: p.canonicalAvailability?.status ?? null,
+    execute: p.execute === true,
+  });
+}
+
+/**
+ * @param {string} conversationalLabel
+ * @returns {string}
+ */
+export function buildAskDurationAvailabilityReply(conversationalLabel) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  return `${label} ka mai check kar leta hun. Kitne din ke liye chahiye?`;
+}
+
+/**
+ * @param {string} conversationalLabel
+ * @param {number} durationDays
+ * @returns {string}
+ */
+export function buildOwnerCheckDeferralReply(conversationalLabel, durationDays) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  const durationPhrase = formatDurationPhrase(durationDays);
+  return durationPhrase
+    ? `${label} ${durationPhrase} ke liye mai confirm kar leta hun.`
+    : `${label} ke liye mai confirm kar leta hun.`;
+}
+
+/**
  * Candidate action plan only — does not send, book, or notify owner.
  *
  * @param {{
@@ -145,20 +246,110 @@ export function buildAvailabilityInquiryActionPlan({
   businessContext = null,
 }) {
   const message = String(admittedTurn?.turn?.text ?? "");
+  const canonical = readResolvedBusinessTurnContext(businessContext);
+
+  if (hasCanonicalOwnerCheckContext(canonical)) {
+    const resolvedItem = /** @type {Record<string, unknown>} */ (canonical.resolvedItem);
+    const itemId = String(resolvedItem.id ?? "").trim() || null;
+    const itemLabel = String(resolvedItem.displayLabel ?? resolvedItem.name ?? "").trim() || "item";
+    const conversationalLabel = conversationalItemLabelFromResolvedItem(resolvedItem);
+    const durationDays = canonical.turn?.durationDays ?? null;
+    const canonicalAvailability = canonical.verified?.availability ?? null;
+    const canonicalPriceQuote = canonical.verified?.priceQuote ?? null;
+    const participant = canonical.participant ?? null;
+
+    if (!hasRequestedDuration(durationDays)) {
+      const replyDraft = buildAskDurationAvailabilityReply(conversationalLabel);
+      return Object.freeze({
+        planId: randomUUID(),
+        replyDraft,
+        actions: Object.freeze([
+          Object.freeze({
+            type: "REPLY",
+            payload: Object.freeze({
+              channel: "whatsapp_web",
+              text: replyDraft,
+              field: "availability",
+              itemId,
+              itemLabel,
+              source: "canonical_owner_check_ask_duration",
+              execute: false,
+            }),
+          }),
+        ]),
+        persistenceIntent: Object.freeze({
+          rememberResolvedItem: true,
+          itemId,
+          execute: false,
+        }),
+      });
+    }
+
+    const durationN = Math.max(1, Math.floor(Number(durationDays)));
+    const replyDraft = buildOwnerCheckDeferralReply(conversationalLabel, durationN);
+    logAvailabilityOwnerCheckPlanned({
+      itemId,
+      itemLabel,
+      durationDays: durationN,
+      canonicalAvailability:
+        canonicalAvailability && typeof canonicalAvailability === "object"
+          ? /** @type {Record<string, unknown>} */ (canonicalAvailability)
+          : null,
+      execute: false,
+    });
+
+    return Object.freeze({
+      planId: randomUUID(),
+      replyDraft,
+      actions: Object.freeze([
+        Object.freeze({
+          type: "REPLY",
+          payload: Object.freeze({
+            channel: "whatsapp_web",
+            text: replyDraft,
+            field: "availability",
+            itemId,
+            itemLabel,
+            source: "canonical_owner_check_deferral",
+            execute: false,
+          }),
+        }),
+        Object.freeze({
+          type: "AVAILABILITY_OWNER_CHECK_REQUIRED",
+          payload: Object.freeze({
+            itemId,
+            itemLabel,
+            durationDays: durationN,
+            canonicalAvailability:
+              canonicalAvailability && typeof canonicalAvailability === "object"
+                ? Object.freeze({ ...canonicalAvailability })
+                : null,
+            canonicalPriceQuote:
+              canonicalPriceQuote && typeof canonicalPriceQuote === "object"
+                ? Object.freeze({ ...canonicalPriceQuote })
+                : null,
+            participant:
+              participant && typeof participant === "object"
+                ? Object.freeze({ ...participant })
+                : null,
+            execute: false,
+          }),
+        }),
+      ]),
+      persistenceIntent: Object.freeze({
+        rememberResolvedItem: true,
+        itemId,
+        ownerCheckPlanned: true,
+        execute: false,
+      }),
+    });
+  }
+
   const rawItem = findCatalogItemById(catalogItems, understanding.resolvedItemId);
   const itemLabel =
-    String(
-      businessContext?.resolvedBusinessTurnContext?.resolvedItem?.displayLabel ??
-        understanding.resolvedItemLabel ??
-        rawItem?.displayLabel ??
-        rawItem?.name ??
-        ""
-    ).trim() || "item";
-  const itemId = String(
-    understanding.resolvedItemId ??
-      businessContext?.resolvedBusinessTurnContext?.resolvedItem?.id ??
-      ""
-  ).trim() || null;
+    String(understanding.resolvedItemLabel ?? rawItem?.displayLabel ?? rawItem?.name ?? "").trim() ||
+    "item";
+  const itemId = String(understanding.resolvedItemId ?? "").trim() || null;
 
   const canonicalAvailability =
     businessContext?.resolvedBusinessTurnContext?.verified?.availability ?? null;
