@@ -61,6 +61,7 @@ const SAFE_CLARIFICATION =
  *   executionContext?: Record<string, unknown>,
  *   resolveTrustedSessionItem?: (p: Record<string, unknown>) => { ok: boolean, item?: Record<string, unknown> | null, reason?: string | null },
  *   __testOrchestratorFn?: (args: Record<string, unknown>) => unknown,
+ *   getBookingsForItemFn?: (businessId: string, itemId: string, itemName?: string | null) => Promise<unknown[]>,
  * }} params
  * @returns {Promise<BrainV2LivePipelineResult>}
  */
@@ -161,7 +162,7 @@ export async function runBrainV2LivePipeline(params) {
       brainTurnContext.lastResolvedItemId = String(turnContextInput.authoritativeItem.id).trim();
     }
 
-    await resolveBusinessTurnContext({
+    const resolvedBusinessTurnContext = await resolveBusinessTurnContext({
       traceId,
       businessId,
       rawMessage: message,
@@ -170,6 +171,7 @@ export async function runBrainV2LivePipeline(params) {
       catalogItems,
       admittedTurn: admission.admittedTurn,
       flags,
+      getBookingsForItemFn: params.getBookingsForItemFn,
     });
 
     const orchestratorInput = {
@@ -179,6 +181,7 @@ export async function runBrainV2LivePipeline(params) {
       businessContext: {
         catalogItems,
         conversationStyle: "casual_local",
+        resolvedBusinessTurnContext,
       },
       mode: "live",
     };

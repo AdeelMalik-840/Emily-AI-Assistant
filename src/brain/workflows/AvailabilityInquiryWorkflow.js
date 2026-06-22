@@ -49,6 +49,85 @@ function ensureItemSpecificAvailabilityReply(label, reply) {
 }
 
 /**
+ * @param {string | null | undefined} iso
+ * @returns {string | null}
+ */
+function formatExpectedAvailabilityDate(iso) {
+  const raw = String(iso ?? "").trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (!Number.isFinite(d.getTime())) return null;
+  return d.toLocaleDateString("en-PK", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {boolean}
+ */
+function hasCanonicalAvailability(availability) {
+  return (
+    availability != null &&
+    typeof availability === "object" &&
+    !Array.isArray(availability) &&
+    ("status" in availability || "isAvailable" in availability)
+  );
+}
+
+/**
+ * @param {string} itemLabel
+ * @param {Record<string, unknown>} availability
+ * @returns {string}
+ */
+export function buildAvailabilityReplyFromCanonical(itemLabel, availability) {
+  const label = String(itemLabel ?? "").trim() || "item";
+  const status = String(availability?.status ?? "").trim().toLowerCase();
+  const isAvailable = availability?.isAvailable;
+  const nextAvailableAt = availability?.nextAvailableAt ?? null;
+
+  if (isAvailable === true || status === "available") {
+    return `${label} Available hai 👍`;
+  }
+
+  if (isAvailable === false || status === "unavailable") {
+    const dateLabel = formatExpectedAvailabilityDate(
+      typeof nextAvailableAt === "string" ? nextAvailableAt : null
+    );
+    if (dateLabel) {
+      return `${label} abhi available nahi hai. Expected availability ${dateLabel} se hai.`;
+    }
+    return `${label} Abhi available nahi hai.`;
+  }
+
+  return `${label} ki availability confirm karni hogi.`;
+}
+
+/**
+ * @param {{
+ *   itemId?: string | null,
+ *   itemLabel?: string | null,
+ *   availability: Record<string, unknown>,
+ * }} p
+ */
+export function logCanonicalAvailabilityUsed(p) {
+  console.log("[canonical_availability_used]", {
+    itemId: String(p.itemId ?? "").trim() || null,
+    itemLabel: String(p.itemLabel ?? "").trim() || null,
+    status: p.availability?.status ?? null,
+    isAvailable: p.availability?.isAvailable ?? null,
+    source: p.availability?.source ?? null,
+    bookingAware: p.availability?.bookingAware ?? null,
+    blockingBookingCount: p.availability?.blockingBookingCount ?? null,
+    nextAvailableAt: p.availability?.nextAvailableAt ?? null,
+    staleCatalogAvailability: p.availability?.staleCatalogAvailability ?? null,
+    workflowType: "availability_inquiry",
+  });
+}
+
+/**
  * Candidate action plan only — does not send, book, or notify owner.
  *
  * @param {{
@@ -67,23 +146,52 @@ export function buildAvailabilityInquiryActionPlan({
 }) {
   const message = String(admittedTurn?.turn?.text ?? "");
   const rawItem = findCatalogItemById(catalogItems, understanding.resolvedItemId);
-  const item = rawItem ? normalizeItemForComposer(rawItem) : null;
   const itemLabel =
-    String(understanding.resolvedItemLabel ?? rawItem?.displayLabel ?? rawItem?.name ?? "").trim() ||
-    "item";
+    String(
+      businessContext?.resolvedBusinessTurnContext?.resolvedItem?.displayLabel ??
+        understanding.resolvedItemLabel ??
+        rawItem?.displayLabel ??
+        rawItem?.name ??
+        ""
+    ).trim() || "item";
+  const itemId = String(
+    understanding.resolvedItemId ??
+      businessContext?.resolvedBusinessTurnContext?.resolvedItem?.id ??
+      ""
+  ).trim() || null;
 
-  const composed = composeInformationalAnswer({
-    message,
-    draftReply: "",
-    item,
-    businessContext,
-    askedField: "availability",
-  });
+  const canonicalAvailability =
+    businessContext?.resolvedBusinessTurnContext?.verified?.availability ?? null;
 
-  const replyDraft = ensureItemSpecificAvailabilityReply(
-    itemLabel,
-    String(composed?.reply ?? "").trim()
-  );
+  let replyDraft = "";
+  let source = "verified_catalog";
+
+  if (hasCanonicalAvailability(canonicalAvailability)) {
+    logCanonicalAvailabilityUsed({
+      itemId,
+      itemLabel,
+      availability: /** @type {Record<string, unknown>} */ (canonicalAvailability),
+    });
+    replyDraft = buildAvailabilityReplyFromCanonical(itemLabel, canonicalAvailability);
+    source = "canonical_verified_availability";
+  } else {
+    const item = rawItem ? normalizeItemForComposer(rawItem) : null;
+    const composed = composeInformationalAnswer({
+      message,
+      draftReply: "",
+      item,
+      businessContext:
+        businessContext?.businessProfile != null
+          ? businessContext.businessProfile
+          : businessContext,
+      askedField: "availability",
+    });
+    replyDraft = ensureItemSpecificAvailabilityReply(
+      itemLabel,
+      String(composed?.reply ?? "").trim()
+    );
+    source = composed?.source ?? "verified_catalog";
+  }
 
   return Object.freeze({
     planId: randomUUID(),
@@ -95,16 +203,16 @@ export function buildAvailabilityInquiryActionPlan({
           channel: "whatsapp_web",
           text: replyDraft,
           field: "availability",
-          itemId: understanding.resolvedItemId ?? null,
+          itemId,
           itemLabel,
-          source: composed?.source ?? "verified_catalog",
+          source,
           execute: false,
         }),
       }),
     ]),
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
-      itemId: understanding.resolvedItemId ?? null,
+      itemId,
       execute: false,
     }),
   });

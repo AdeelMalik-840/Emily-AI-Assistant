@@ -35,6 +35,7 @@ import { extractContactPhoneFromText } from "../../services/messageProcessor.js"
  * @property {unknown[]} [catalogItems]
  * @property {Record<string, unknown>} [businessProfile]
  * @property {string} [conversationStyle]
+ * @property {Readonly<Record<string, unknown>>} [resolvedBusinessTurnContext]
  */
 
 /**
@@ -123,7 +124,7 @@ export function runConversationTurn({
       admittedTurn,
       understanding,
       catalogItems,
-      businessContext: businessContext.businessProfile ?? null,
+      businessContext,
     });
   } else if (wf === "browse_options") {
     actionPlan = buildBrowseOptionsActionPlan({
