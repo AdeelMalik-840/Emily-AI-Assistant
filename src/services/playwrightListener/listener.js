@@ -148,42 +148,30 @@ async function ensureWhatsAppConversationOpen(page) {
   }
 
   const visibleChats = await getTopChats(page, 30);
-  const preferredChatKeys = [];
-  const pushKey = (value) => {
-    const key = normalizeTitle(String(value ?? "").trim());
-    if (!key || preferredChatKeys.includes(key)) return;
-    preferredChatKeys.push(key);
-  };
-
-  pushKey(activeChatLockKey());
-  pushKey(globalThis.__ACTIVE_PROCESSING_CHAT);
-  pushKey(globalThis.__forceNextChat);
-  if (globalThis.__pendingChats instanceof Set) {
-    for (const pendingKey of globalThis.__pendingChats) {
-      pushKey(pendingKey);
-    }
-  }
-  pushKey(globalThis.__activeChatInFocus);
-  pushKey(globalThis.__activeChatTitle);
-  pushKey(globalThis.__currentOpenChatTitle);
-
-  const recoveryTargets = preferredChatKeys
-    .map((key) => visibleChats.find((name) => normalizeTitle(name) === key))
-    .filter(Boolean);
+  const recoveryPlan = resolveConversationRecoveryTargetsForVisibleChats({
+    visibleChats,
+    trustedTargets: [
+      activeChatLockKey(),
+      globalThis.__ACTIVE_PROCESSING_CHAT,
+      globalThis.__forceNextChat,
+      ...(globalThis.__pendingChats instanceof Set
+        ? Array.from(globalThis.__pendingChats)
+        : []),
+      globalThis.__activeChatInFocus,
+      globalThis.__activeChatTitle,
+      globalThis.__currentOpenChatTitle,
+    ],
+    configuredGroupTargets: resolveTargetGroups(),
+    allowedTitles: resolvePlaywrightAllowedChatTitles(),
+  });
+  const recoveryTargets = recoveryPlan.targets;
 
   if (recoveryTargets.length === 0) {
-    const fallbackAllowed = visibleChats.find(
-      (name) =>
-        isValidBusinessChat(name) &&
-        isAllowedChat(name)
-    );
-    if (fallbackAllowed) {
-      recoveryTargets.push(fallbackAllowed);
-    }
-  }
-
-  if (recoveryTargets.length === 0) {
-    console.error("🚫 Empty pane recovery failed — no valid target chat found");
+    console.error("🚫 Empty pane recovery failed — no trusted recovery target found");
+    console.warn("[playwright_recovery_skipped_no_trusted_target]", {
+      allowlistConfigured: recoveryPlan.allowlistConfigured,
+      visibleChatCount: visibleChats.length,
+    });
     return false;
   }
 
@@ -201,18 +189,114 @@ async function ensureWhatsAppConversationOpen(page) {
     if (!target) continue;
     console.log("🧭 Recovery target:", target);
     const reopened = await openChatAndConfirm(page, target);
-  if (!reopened) {
+    if (!reopened) {
       continue;
     }
     headerTitle = await readMainHeaderSpanTitle(page);
     if (headerTitle) {
       setCurrentOpenChatTitleFromSidebar(target);
-    return true;
+      return true;
     }
   }
 
   console.error("🚫 Chat still not open — all recovery targets failed");
   return false;
+}
+
+/**
+ * Resolve trusted recovery targets for an open WhatsApp conversation pane.
+ * @internal Tests
+ */
+export function __resolveConversationRecoveryTargetsForTests({
+  visibleChats = [],
+  trustedTargets = [],
+  configuredGroupTargets = [],
+  allowedTitles = [],
+} = {}) {
+  return resolveConversationRecoveryTargetsForVisibleChats({
+    visibleChats,
+    trustedTargets,
+    configuredGroupTargets,
+    allowedTitles,
+  });
+}
+
+function resolveConversationRecoveryTargetsForVisibleChats({
+  visibleChats = [],
+  trustedTargets = [],
+  configuredGroupTargets = [],
+  allowedTitles = [],
+} = {}) {
+  const normalizedVisibleChats = Array.isArray(visibleChats) ? visibleChats : [];
+  const normalizedTrustedTargets = Array.isArray(trustedTargets) ? trustedTargets : [];
+  const normalizedConfiguredGroupTargets = Array.isArray(configuredGroupTargets)
+    ? configuredGroupTargets
+    : [];
+  const normalizedAllowedTitles = Array.isArray(allowedTitles) ? allowedTitles : [];
+  const allowlistConfigured = normalizedAllowedTitles.length > 0;
+  const allowedSet = new Set(
+    normalizedAllowedTitles.map((title) => normalizeTitle(String(title ?? "").trim())).filter(Boolean)
+  );
+  const configuredGroupSet = new Set(
+    normalizedConfiguredGroupTargets
+      .map((title) => normalizeTitle(String(title ?? "").trim()))
+      .filter(Boolean)
+  );
+  const trustedKeys = [];
+  for (const value of normalizedTrustedTargets) {
+    const key = normalizeTitle(String(value ?? "").trim());
+    if (!key || trustedKeys.includes(key)) continue;
+    trustedKeys.push(key);
+  }
+
+  if (configuredGroupSet.size === 0 && !allowlistConfigured) {
+    return {
+      targets: [],
+      allowlistConfigured,
+      source: "none",
+    };
+  }
+
+  const configuredVisibleChats = normalizedVisibleChats.filter((name) => {
+    const key = normalizeTitle(name);
+    return (
+      isValidBusinessChat(name) &&
+      (configuredGroupSet.has(key) || allowedSet.has(key))
+    );
+  });
+
+  const trustedMatches = trustedKeys
+    .map((key) => configuredVisibleChats.find((name) => normalizeTitle(name) === key))
+    .filter((name) => isValidBusinessChat(name));
+
+  if (trustedMatches.length > 0) {
+    return {
+      targets: trustedMatches,
+      allowlistConfigured,
+      source: "trusted",
+    };
+  }
+
+  const configuredGroupMatches = configuredVisibleChats.filter((name) =>
+    configuredGroupSet.has(normalizeTitle(name))
+  );
+  if (configuredGroupMatches.length > 0) {
+    return {
+      targets: configuredGroupMatches,
+      allowlistConfigured,
+      source: "configured_group",
+    };
+  }
+
+  const allowedVisibleChats = configuredVisibleChats.filter((name) =>
+    allowedSet.has(normalizeTitle(name))
+  );
+
+  return {
+    targets: allowedVisibleChats,
+    allowlistConfigured,
+    source: allowedVisibleChats.length > 0 ? "allowlist" : "allowlist_empty",
+  };
 }
 
 /** Set PLAYWRIGHT_DEBUG=1 (or true) for verbose poll / dedupe logs. */
