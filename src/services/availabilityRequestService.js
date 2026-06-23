@@ -391,3 +391,193 @@ export async function markAvailabilityRequestOwnerNotificationFailed({
     ownerNotificationError,
   });
 }
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   status: "approved" | "rejected",
+ *   ownerDecisionBy?: string | null,
+ *   ownerDecisionAt?: unknown,
+ *   approvalCustomerNotificationStatus?: "not_started" | "pending" | "processing" | "sent" | "failed" | "skipped",
+ * }} params
+ * @returns {Promise<boolean>}
+ */
+export async function updateAvailabilityRequestDecisionState({
+  db: connection,
+  businessId,
+  requestId,
+  status,
+  ownerDecisionBy,
+  ownerDecisionAt,
+  approvalCustomerNotificationStatus,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  const nextStatus = clean(status, 40);
+  if (!ref || (nextStatus !== "approved" && nextStatus !== "rejected")) return false;
+
+  const update = {
+    status: nextStatus,
+    updatedAt: new Date(),
+  };
+  if (ownerDecisionBy != null) {
+    const decisionBy = clean(ownerDecisionBy, 80);
+    if (decisionBy) update.ownerDecisionBy = decisionBy;
+  }
+  if (ownerDecisionAt != null) {
+    update.ownerDecisionAt = ownerDecisionAt;
+  }
+  if (approvalCustomerNotificationStatus != null) {
+    const customerStatus = clean(approvalCustomerNotificationStatus, 40);
+    if (customerStatus) update.approvalCustomerNotificationStatus = customerStatus;
+  }
+
+  try {
+    await ref.update(update);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   approvalCustomerNotificationStatus: "not_started" | "pending" | "processing" | "sent" | "failed" | "skipped",
+ *   approvalCustomerNotificationAt?: unknown,
+ *   approvalCustomerNotificationError?: string | null,
+ *   approvalCustomerNotificationMethod?: string | null,
+ *   approvalCustomerNotificationProcessingStartedAt?: unknown,
+ *   approvalCustomerNotificationProcessingStartedAtMs?: number | null,
+ * }} params
+ * @returns {Promise<boolean>}
+ */
+export async function updateAvailabilityRequestCustomerNotificationState({
+  db: connection,
+  businessId,
+  requestId,
+  approvalCustomerNotificationStatus,
+  approvalCustomerNotificationAt,
+  approvalCustomerNotificationError,
+  approvalCustomerNotificationMethod,
+  approvalCustomerNotificationProcessingStartedAt,
+  approvalCustomerNotificationProcessingStartedAtMs,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  const status = clean(approvalCustomerNotificationStatus, 40);
+  if (!ref || !status) return false;
+
+  const update = {
+    approvalCustomerNotificationStatus: status,
+    updatedAt: new Date(),
+  };
+  if (approvalCustomerNotificationAt != null) {
+    update.approvalCustomerNotificationAt = approvalCustomerNotificationAt;
+  }
+  if (approvalCustomerNotificationError != null) {
+    const error = clean(approvalCustomerNotificationError, 400);
+    if (error) update.approvalCustomerNotificationError = error;
+  }
+  if (approvalCustomerNotificationMethod != null) {
+    const method = clean(approvalCustomerNotificationMethod, 80);
+    if (method) update.approvalCustomerNotificationMethod = method;
+  }
+  if (approvalCustomerNotificationProcessingStartedAt != null) {
+    update.approvalCustomerNotificationProcessingStartedAt =
+      approvalCustomerNotificationProcessingStartedAt;
+  }
+  if (approvalCustomerNotificationProcessingStartedAtMs != null) {
+    const startedMs = Number(approvalCustomerNotificationProcessingStartedAtMs);
+    if (Number.isFinite(startedMs)) {
+      update.approvalCustomerNotificationProcessingStartedAtMs = startedMs;
+    }
+  }
+
+  try {
+    await ref.update(update);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function markAvailabilityRequestCustomerNotificationPending({
+  db: connection,
+  businessId,
+  requestId,
+}) {
+  return updateAvailabilityRequestCustomerNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    approvalCustomerNotificationStatus: "pending",
+  });
+}
+
+export async function markAvailabilityRequestCustomerNotificationProcessing({
+  db: connection,
+  businessId,
+  requestId,
+}) {
+  return updateAvailabilityRequestCustomerNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    approvalCustomerNotificationStatus: "processing",
+    approvalCustomerNotificationProcessingStartedAt: new Date(),
+    approvalCustomerNotificationProcessingStartedAtMs: Date.now(),
+  });
+}
+
+export async function markAvailabilityRequestCustomerNotificationSent({
+  db: connection,
+  businessId,
+  requestId,
+  approvalCustomerNotificationMethod,
+}) {
+  return updateAvailabilityRequestCustomerNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    approvalCustomerNotificationStatus: "sent",
+    approvalCustomerNotificationAt: new Date(),
+    approvalCustomerNotificationMethod,
+  });
+}
+
+export async function markAvailabilityRequestCustomerNotificationFailed({
+  db: connection,
+  businessId,
+  requestId,
+  approvalCustomerNotificationError,
+  approvalCustomerNotificationMethod,
+}) {
+  return updateAvailabilityRequestCustomerNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    approvalCustomerNotificationStatus: "failed",
+    approvalCustomerNotificationError,
+    approvalCustomerNotificationMethod,
+  });
+}
+
+export async function markAvailabilityRequestCustomerNotificationSkipped({
+  db: connection,
+  businessId,
+  requestId,
+  approvalCustomerNotificationError,
+  approvalCustomerNotificationMethod,
+}) {
+  return updateAvailabilityRequestCustomerNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    approvalCustomerNotificationStatus: "skipped",
+    approvalCustomerNotificationError,
+    approvalCustomerNotificationMethod,
+  });
+}

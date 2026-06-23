@@ -51,6 +51,7 @@ import {
 } from "../inboundTurnLedger.js";
 import { clearWhatsAppInboundMessageCaches } from "../whatsappInboundBuffer.js";
 import { pollLocalApprovalContinuations } from "../localApprovalContinuationPoller.js";
+import { pollLocalAvailabilityContinuations } from "../localAvailabilityContinuationPoller.js";
 import { isReplyPrivateLockActive } from "../replyPrivateUiController.js";
 import {
   buildParticipantCursorKey,
@@ -1852,6 +1853,8 @@ let heartbeatTimer = null;
 let interruptPollTimer = null;
 /** @type {ReturnType<typeof setInterval> | null} */
 let localApprovalContinuationTimer = null;
+/** @type {ReturnType<typeof setInterval> | null} */
+let localAvailabilityContinuationTimer = null;
 let listenerStarted = false;
 let isStopping = false;
 let playwrightRelaunchPending = false;
@@ -7519,6 +7522,18 @@ async function runListenerBody() {
     });
   }, 5_000);
 
+  localAvailabilityContinuationTimer = setInterval(() => {
+    if (isStopping) return;
+    void pollLocalAvailabilityContinuations().catch((err) => {
+      if (!isStopping) {
+        console.warn(
+          "[local_availability_customer_notification_failed]",
+          { bookingId: null, reason: err?.message || String(err) }
+        );
+      }
+    });
+  }, 5_000);
+
   if (isPlaywrightChatLoopEnabled()) {
     if (globalThis.chatLoopInterval != null) {
       clearInterval(globalThis.chatLoopInterval);
@@ -7803,6 +7818,10 @@ export async function stopPlaywrightListener() {
   if (localApprovalContinuationTimer) {
     clearInterval(localApprovalContinuationTimer);
     localApprovalContinuationTimer = null;
+  }
+  if (localAvailabilityContinuationTimer) {
+    clearInterval(localAvailabilityContinuationTimer);
+    localAvailabilityContinuationTimer = null;
   }
 
   if (pollTimer) {
