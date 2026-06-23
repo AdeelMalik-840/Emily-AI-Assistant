@@ -81,6 +81,11 @@ export function isEmilyBrainV2AvailabilityOwnerNotifyExecuteEnabled() {
   return envTruthy("EMILY_BRAIN_V2_AVAILABILITY_OWNER_NOTIFY_EXECUTE");
 }
 
+/** @returns {boolean} */
+export function isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled() {
+  return envTruthy("EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE");
+}
+
 /**
  * @returns {{
  *   live: boolean,
@@ -92,6 +97,7 @@ export function isEmilyBrainV2AvailabilityOwnerNotifyExecuteEnabled() {
  *   dmExecute: boolean,
  *   availabilityOwnerCheckExecute: boolean,
  *   availabilityOwnerNotifyExecute: boolean,
+ *   availabilityCustomerDmExecute: boolean,
  * }}
  */
 export function getEmilyBrainV2LiveFlagSnapshot() {
@@ -105,5 +111,6 @@ export function getEmilyBrainV2LiveFlagSnapshot() {
     dmExecute: isEmilyBrainV2DmExecuteEnabled(),
     availabilityOwnerCheckExecute: isEmilyBrainV2AvailabilityOwnerCheckExecuteEnabled(),
     availabilityOwnerNotifyExecute: isEmilyBrainV2AvailabilityOwnerNotifyExecuteEnabled(),
+    availabilityCustomerDmExecute: isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled(),
   };
 }

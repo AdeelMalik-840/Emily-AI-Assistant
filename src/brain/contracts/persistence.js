@@ -44,7 +44,7 @@
  * @property {string} businessId
  * @property {string} itemId
  * @property {string} [itemLabel]
- * @property {"pending" | "processing" | "completed" | "failed" | "expired"} status
+ * @property {"pending" | "approved" | "rejected" | "processing" | "completed" | "failed" | "expired"} status
  * @property {number | null} [requestedDuration]
  * @property {string[]} [requestedDates]
  * @property {string | null} [canonicalAvailabilityStatus]
@@ -52,9 +52,18 @@
  * @property {"not_started" | "queued" | "sending" | "sent" | "failed"} ownerNotificationStatus
  * @property {unknown} [ownerNotificationAt]
  * @property {string | null} [ownerNotificationError]
+ * @property {string | null} [ownerNotificationProviderMessageId]
  * @property {string | null} [ownerTarget]
- * @property {"not_started" | "queued" | "sent" | "failed"} approvalCustomerNotificationStatus
+ * @property {"not_started" | "pending" | "processing" | "sent" | "failed" | "skipped"} approvalCustomerNotificationStatus
+ * @property {unknown} [approvalCustomerNotificationAt]
+ * @property {string | null} [approvalCustomerNotificationMethod]
+ * @property {string | null} [approvalCustomerNotificationError]
+ * @property {unknown} [approvalCustomerNotificationProcessingStartedAt]
+ * @property {number | null} [approvalCustomerNotificationProcessingStartedAtMs]
+ * @property {string | null} [ownerDecisionBy]
+ * @property {unknown} [ownerDecisionAt]
  * @property {Record<string, unknown> | null} [sourceIdentity]
+ * @property {string | null} [sourceTurnKey]
  * @property {unknown} [createdAt]
  * @property {unknown} [updatedAt]
  * @property {unknown} [expiresAt]

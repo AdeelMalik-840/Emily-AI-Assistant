@@ -22,6 +22,11 @@ import { scheduleBufferedWhatsAppInbound } from "./services/whatsappInboundBuffe
 import { webhookPayloadIndicatesGroupMessage } from "./services/whatsappGroupInboundGate.js";
 import { sendWhatsAppMessage } from "./services/whatsappCloud.js";
 import {
+  handleAvailabilityRequestApproval,
+  parseAvailabilityApprovalButtonId,
+  parseAvailabilityApprovalMessage,
+} from "./services/availabilityApprovalService.js";
+import {
   handleBookingApproval,
   parseApprovalButtonId,
 } from "./services/bookingApprovalService.js";
@@ -243,6 +248,8 @@ app.post("/webhook", async (req, res) => {
     const interactiveButtonId = String(
       message.interactive?.button_reply?.id ?? ""
     ).trim();
+    const parsedAvailabilityApprovalButton =
+      parseAvailabilityApprovalButtonId(interactiveButtonId);
     const parsedApprovalButton = parseApprovalButtonId(interactiveButtonId);
     if (message.type === "interactive" && !interactiveButtonId) {
       console.warn("[owner_button_reply_received]", {
@@ -255,9 +262,16 @@ app.post("/webhook", async (req, res) => {
     } else if (interactiveButtonId) {
       console.log("[owner_button_reply_received]", {
         buttonIdPreview: interactiveButtonId.slice(0, 80),
-        hasParsedAction: Boolean(parsedApprovalButton),
+        hasParsedAction: Boolean(
+          parsedApprovalButton || parsedAvailabilityApprovalButton
+        ),
       });
-      if (parsedApprovalButton) {
+      if (parsedAvailabilityApprovalButton) {
+        console.log(
+          "[owner_button_action_parsed]",
+          parsedAvailabilityApprovalButton
+        );
+      } else if (parsedApprovalButton) {
         console.log("[owner_button_action_parsed]", parsedApprovalButton);
       } else {
         console.warn("[owner_button_action_parsed]", {
@@ -274,6 +288,9 @@ app.post("/webhook", async (req, res) => {
         message.interactive?.button_reply?.title ??
         ""
     ).trim();
+    const parsedAvailabilityApprovalMessage = parseAvailabilityApprovalMessage(
+      inboundText
+    );
     const inboundMessageId = String(message.id ?? "").trim();
 
     console.log("WHATSAPP INCOMING:", {
@@ -308,7 +325,11 @@ app.post("/webhook", async (req, res) => {
 
     console.log("📱 phone_number_id:", phoneNumberId || "(none)");
 
-    if (!inboundText && !parsedApprovalButton) {
+    if (
+      !inboundText &&
+      !parsedApprovalButton &&
+      !parsedAvailabilityApprovalButton
+    ) {
       console.log("⚠️ Missing inbound text; skipping AI", {
         isGroupMessage,
         whatsappGroupDebug,
@@ -560,6 +581,22 @@ app.post("/webhook", async (req, res) => {
         0
       )
     );
+
+    if (parsedAvailabilityApprovalButton || parsedAvailabilityApprovalMessage) {
+      const parsedAvailabilityApproval =
+        parsedAvailabilityApprovalButton || parsedAvailabilityApprovalMessage;
+      console.log("🛠 Availability approval command detected:", parsedAvailabilityApproval);
+      await handleAvailabilityRequestApproval({
+        db,
+        userId: ownerUserId,
+        businessId: ownerUserId,
+        requestId: parsedAvailabilityApproval.requestId,
+        senderPhone: conversationCustomerNumber,
+        messageText: parsedAvailabilityApprovalMessage ? inboundText : null,
+        buttonId: parsedAvailabilityApprovalButton ? interactiveButtonId : null,
+      });
+      return res.sendStatus(200);
+    }
 
     if (parsedApprovalButton) {
       console.log("🛠 Owner approval button command detected:", parsedApprovalButton);

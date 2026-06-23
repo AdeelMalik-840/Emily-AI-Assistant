@@ -15,6 +15,10 @@ import {
 } from "./whatsappCloud.js";
 import { sendOutboundMessage } from "./messagingService.js";
 import {
+  handleAvailabilityRequestApproval,
+  parseAvailabilityApprovalMessage,
+} from "./availabilityApprovalService.js";
+import {
   handleBookingApproval,
   parseApprovalMessage,
 } from "./bookingApprovalService.js";
@@ -1370,8 +1374,22 @@ export async function executeWhatsAppAiPipeline(p) {
     const { customerId, channel } = normalizeWhatsAppInboundContext(userPhone);
 
     console.log("📩 Approval message received:", combinedMessage);
+    const parsedAvailabilityApproval =
+      parseAvailabilityApprovalMessage(combinedMessage);
     const parsedApproval = parseApprovalMessage(combinedMessage);
     console.log("🧠 Parsed approval:", parsedApproval);
+    if (parsedAvailabilityApproval) {
+      console.log("🛠 Availability approval command detected:", parsedAvailabilityApproval);
+      await handleAvailabilityRequestApproval({
+        db,
+        userId: ownerUserId,
+        businessId: ownerUserId,
+        senderPhone: conversationCustomerNumber,
+        messageText: combinedMessage,
+      });
+      processingSuccess = true;
+      return;
+    }
     if (parsedApproval) {
       console.log("🛠 Owner approval command detected:", parsedApproval);
       await handleBookingApproval({
