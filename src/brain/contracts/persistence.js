@@ -39,6 +39,24 @@
  */
 
 /**
+ * @typedef {Object} AvailabilityRequestState
+ * @property {string} requestId
+ * @property {string} businessId
+ * @property {string} itemId
+ * @property {string} [itemLabel]
+ * @property {"pending" | "processing" | "completed" | "failed" | "expired"} status
+ * @property {number | null} [requestedDuration]
+ * @property {string[]} [requestedDates]
+ * @property {string | null} [canonicalAvailabilityStatus]
+ * @property {Record<string, unknown> | null} [priceQuote]
+ * @property {"not_started" | "queued" | "sent" | "failed"} ownerNotificationStatus
+ * @property {"not_started" | "queued" | "sent" | "failed"} approvalCustomerNotificationStatus
+ * @property {Record<string, unknown> | null} [sourceIdentity]
+ * @property {unknown} [createdAt]
+ * @property {unknown} [expiresAt]
+ */
+
+/**
  * @param {unknown} value
  * @returns {value is PersistenceCommit}
  */

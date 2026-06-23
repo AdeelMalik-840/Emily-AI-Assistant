@@ -223,8 +223,10 @@ test("13-14: action policy blocked + forbidden claims when execute flags false",
   });
   assert.equal(facts.actions.bookingExecute, false);
   assert.equal(facts.actions.ownerExecute, false);
+  assert.equal(facts.actions.availabilityOwnerCheckExecute, false);
   assert.equal(facts.actions.dmExecute, false);
   assert.ok(facts.actions.blocked.includes("CREATE_BOOKING"));
+  assert.ok(facts.actions.blocked.includes("AVAILABILITY_OWNER_CHECK_REQUIRED"));
   assert.ok(facts.forbiddenClaims.includes("booking_created"));
   assert.ok(facts.forbiddenClaims.includes("owner_notified"));
   assert.ok(facts.forbiddenClaims.includes("dm_sent"));

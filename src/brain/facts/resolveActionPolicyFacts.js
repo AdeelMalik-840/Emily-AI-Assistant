@@ -5,6 +5,7 @@
 const SIDE_EFFECT_ACTIONS = Object.freeze([
   "CREATE_BOOKING",
   "NOTIFY_OWNER",
+  "AVAILABILITY_OWNER_CHECK_REQUIRED",
   "DM_CUSTOMER",
   "HANDOFF_DM",
   "SEND_IMAGES",
@@ -16,6 +17,7 @@ const SIDE_EFFECT_ACTIONS = Object.freeze([
 export function resolveActionPolicyFacts(flags) {
   const bookingExecute = flags?.bookingExecute === true;
   const ownerExecute = flags?.ownerExecute === true;
+  const availabilityOwnerCheckExecute = flags?.availabilityOwnerCheckExecute === true;
   const dmExecute = flags?.dmExecute === true;
 
   const allowed = ["REPLY"];
@@ -26,6 +28,9 @@ export function resolveActionPolicyFacts(flags) {
 
   if (ownerExecute) allowed.push("NOTIFY_OWNER");
   else blocked.push("NOTIFY_OWNER");
+
+  if (availabilityOwnerCheckExecute) allowed.push("AVAILABILITY_OWNER_CHECK_REQUIRED");
+  else blocked.push("AVAILABILITY_OWNER_CHECK_REQUIRED");
 
   if (dmExecute) {
     allowed.push("DM_CUSTOMER", "HANDOFF_DM");
@@ -45,6 +50,7 @@ export function resolveActionPolicyFacts(flags) {
     actions: {
       bookingExecute,
       ownerExecute,
+      availabilityOwnerCheckExecute,
       dmExecute,
       allowed,
       blocked: [...new Set([...blocked, ...SIDE_EFFECT_ACTIONS.filter((a) => !allowed.includes(a))])],
@@ -54,6 +60,7 @@ export function resolveActionPolicyFacts(flags) {
       actions: {
         bookingExecute,
         ownerExecute,
+        availabilityOwnerCheckExecute,
         dmExecute,
         allowed,
         blocked,

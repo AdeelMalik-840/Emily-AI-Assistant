@@ -3,6 +3,7 @@
  * Side-effect actions remain blocked unless their dedicated execute flags are enabled.
  */
 import { patchEmilySessionState } from "../../services/conversationIntelligence.js";
+import { executeAvailabilityOwnerCheck } from "../../services/executors/availabilityOwnerCheckExecutor.js";
 import { executeCreateBooking } from "../../services/executors/createBookingExecutor.js";
 import { executeOwnerNotification } from "../../services/executors/ownerNotificationExecutor.js";
 import { executeReplyPrivate } from "../../services/executors/replyPrivateExecutor.js";
@@ -203,6 +204,12 @@ export async function executeLiveSideEffects(p) {
       });
       sideEffectResults.CREATE_BOOKING = result;
       if (result?.booking) bookingCreated = /** @type {Record<string, unknown>} */ (result.booking);
+    } else if (type === "AVAILABILITY_OWNER_CHECK_REQUIRED") {
+      sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED =
+        await executeAvailabilityOwnerCheck({
+          payload,
+          executionContext: p.executionContext,
+        });
     } else if (type === "NOTIFY_OWNER") {
       if (!bookingCreated?.id) {
         throw new Error("live_owner_notification_without_booking");

@@ -41,6 +41,7 @@
  * @property {number | null} [duration]
  * @property {string | null} [contact]
  * @property {string | null} sourceMessageId
+ * @property {string | null} [sourceRowKey]
  * @property {string | null} guaranteeKey
  * @property {boolean} shouldClarifyItem
  * @property {string | null} clarificationReply

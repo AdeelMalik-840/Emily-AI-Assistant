@@ -87,6 +87,7 @@ export async function tryBrainV2InfoLiveTurn(params) {
     memorySnapshot: params.memorySnapshot,
     catalogItems,
     sourceMessageId: params.messageId,
+    sourceRowKey: params.sourceRowKey,
     guaranteeKey: params.guaranteeKey,
     traceId,
     resolveTrustedSessionItem: params.resolveTrustedSessionItem,

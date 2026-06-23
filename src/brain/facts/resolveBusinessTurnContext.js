@@ -134,10 +134,25 @@ export async function resolveBusinessTurnContext(params) {
   });
 
   const participantFacts = resolveParticipantFacts(turnContextInput);
+  const sourceMessageId = String(turnContextInput?.sourceMessageId ?? "").trim() || null;
+  const sourceRowKey = String(turnContextInput?.sourceRowKey ?? "").trim() || null;
+  const guaranteeKey = String(turnContextInput?.guaranteeKey ?? "").trim() || null;
+  const sourceTurnKey = guaranteeKey || sourceRowKey || sourceMessageId || null;
+  const sourceIdentity = {
+    participantKey: participantFacts.participant.key,
+    participantIdentity: participantFacts.participant.identity,
+    chatId: String(turnContextInput?.chatId ?? "").trim() || null,
+    chatType: turnContextInput?.chatType ?? null,
+    sourceMessageId,
+    sourceRowKey,
+    guaranteeKey,
+    sourceTurnKey,
+  };
 
   const flags = params.flags ?? {
     bookingExecute: false,
     ownerExecute: false,
+    availabilityOwnerCheckExecute: false,
     dmExecute: false,
   };
   const actionFacts = resolveActionPolicyFacts(flags);
@@ -185,6 +200,10 @@ export async function resolveBusinessTurnContext(params) {
         understanding?.askedField ?? turnContextInput?.requestedField ?? null,
       durationDays: understanding?.durationDays ?? turnContextInput?.duration ?? null,
       confidence: understanding?.itemConfidence ?? null,
+      sourceMessageId,
+      sourceRowKey,
+      guaranteeKey,
+      sourceTurnKey,
     },
 
     signals: {
@@ -197,6 +216,7 @@ export async function resolveBusinessTurnContext(params) {
     },
 
     participant: participantFacts.participant,
+    sourceIdentity,
 
     resolvedItem: {
       status: itemFacts.status,
@@ -248,6 +268,13 @@ export async function resolveBusinessTurnContext(params) {
       availability: availabilityFacts.sourceEvidence,
       media: mediaFacts.sourceEvidence,
       participant: participantFacts.sourceEvidence,
+      turn: {
+        sourceMessageId,
+        sourceRowKey,
+        guaranteeKey,
+        sourceTurnKey,
+      },
+      sourceIdentity,
       actions: actionFacts.sourceEvidence,
       business: businessFacts.sourceEvidence,
     },
