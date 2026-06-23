@@ -269,3 +269,125 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     created: true,
   };
 }
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   ownerNotificationStatus?: "not_started" | "queued" | "sending" | "sent" | "failed",
+ *   ownerNotificationAt?: unknown,
+ *   ownerNotificationError?: string | null,
+ *   ownerTarget?: string | null,
+ *   ownerNotificationProviderMessageId?: string | null,
+ * }} params
+ * @returns {Promise<boolean>}
+ */
+export async function updateAvailabilityRequestNotificationState({
+  db: connection,
+  businessId,
+  requestId,
+  ownerNotificationStatus,
+  ownerNotificationAt,
+  ownerNotificationError,
+  ownerTarget,
+  ownerNotificationProviderMessageId,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  const status = clean(ownerNotificationStatus, 80);
+  if (!ref || !status) return false;
+
+  const update = {
+    ownerNotificationStatus: status,
+    updatedAt: new Date(),
+  };
+  if (ownerNotificationAt != null) {
+    update.ownerNotificationAt = ownerNotificationAt;
+  }
+  if (ownerNotificationError != null) {
+    const error = clean(ownerNotificationError, 400);
+    if (error) update.ownerNotificationError = error;
+  }
+  if (ownerTarget != null) {
+    const target = clean(ownerTarget, 80);
+    if (target) update.ownerTarget = target;
+  }
+  if (ownerNotificationProviderMessageId != null) {
+    const provider = clean(ownerNotificationProviderMessageId, 160);
+    if (provider) update.ownerNotificationProviderMessageId = provider;
+  }
+
+  try {
+    await ref.update(update);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function markAvailabilityRequestOwnerNotificationQueued({
+  db: connection,
+  businessId,
+  requestId,
+  ownerTarget,
+}) {
+  return updateAvailabilityRequestNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    ownerNotificationStatus: "queued",
+    ownerNotificationAt: new Date(),
+    ownerTarget,
+  });
+}
+
+export async function markAvailabilityRequestOwnerNotificationSending({
+  db: connection,
+  businessId,
+  requestId,
+  ownerTarget,
+}) {
+  return updateAvailabilityRequestNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    ownerNotificationStatus: "sending",
+    ownerTarget,
+  });
+}
+
+export async function markAvailabilityRequestOwnerNotificationSent({
+  db: connection,
+  businessId,
+  requestId,
+  ownerTarget,
+  ownerNotificationAt,
+  ownerNotificationProviderMessageId,
+}) {
+  return updateAvailabilityRequestNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    ownerNotificationStatus: "sent",
+    ownerNotificationAt,
+    ownerTarget,
+    ownerNotificationProviderMessageId,
+  });
+}
+
+export async function markAvailabilityRequestOwnerNotificationFailed({
+  db: connection,
+  businessId,
+  requestId,
+  ownerTarget,
+  ownerNotificationError,
+}) {
+  return updateAvailabilityRequestNotificationState({
+    db: connection,
+    businessId,
+    requestId,
+    ownerNotificationStatus: "failed",
+    ownerTarget,
+    ownerNotificationError,
+  });
+}

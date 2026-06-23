@@ -153,6 +153,7 @@ export async function resolveBusinessTurnContext(params) {
     bookingExecute: false,
     ownerExecute: false,
     availabilityOwnerCheckExecute: false,
+    availabilityOwnerNotifyExecute: false,
     dmExecute: false,
   };
   const actionFacts = resolveActionPolicyFacts(flags);

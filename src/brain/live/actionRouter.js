@@ -4,6 +4,7 @@
  */
 import { patchEmilySessionState } from "../../services/conversationIntelligence.js";
 import { executeAvailabilityOwnerCheck } from "../../services/executors/availabilityOwnerCheckExecutor.js";
+import { executeAvailabilityOwnerNotification } from "../../services/executors/availabilityOwnerNotificationExecutor.js";
 import { executeCreateBooking } from "../../services/executors/createBookingExecutor.js";
 import { executeOwnerNotification } from "../../services/executors/ownerNotificationExecutor.js";
 import { executeReplyPrivate } from "../../services/executors/replyPrivateExecutor.js";
@@ -205,11 +206,56 @@ export async function executeLiveSideEffects(p) {
       sideEffectResults.CREATE_BOOKING = result;
       if (result?.booking) bookingCreated = /** @type {Record<string, unknown>} */ (result.booking);
     } else if (type === "AVAILABILITY_OWNER_CHECK_REQUIRED") {
-      sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED =
-        await executeAvailabilityOwnerCheck({
-          payload,
-          executionContext: p.executionContext,
-        });
+      const availabilityCheckResult = await executeAvailabilityOwnerCheck({
+        payload,
+        executionContext: p.executionContext,
+      });
+      sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = availabilityCheckResult;
+
+      if (
+        p.flags?.availabilityOwnerNotifyExecute === true &&
+        availabilityCheckResult?.ok === true
+      ) {
+        const availabilityRequest = availabilityCheckResult?.request ?? null;
+        sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION =
+          await executeAvailabilityOwnerNotification({
+            payload: {
+              ...payload,
+              requestId:
+                String(
+                  availabilityCheckResult?.requestId ??
+                    availabilityRequest?.requestId ??
+                    payload?.requestId ??
+                    ""
+                ).trim() || null,
+              businessId:
+                String(
+                  availabilityRequest?.businessId ??
+                    payload?.businessId ??
+                    p.executionContext?.businessId ??
+                    p.executionContext?.userId ??
+                    ""
+                ).trim() || null,
+              availabilityRequest,
+            },
+            executionContext: {
+              ...p.executionContext,
+              availabilityRequest,
+              requestId:
+                String(
+                  availabilityCheckResult?.requestId ??
+                    availabilityRequest?.requestId ??
+                    payload?.requestId ??
+                    ""
+                ).trim() || null,
+              availabilityOwnerNotifyExecute: true,
+              sendWhatsAppMessageFn:
+                p.executionContext?.sendWhatsAppMessageFn ??
+                p.executionContext?.sendMessageFn ??
+                undefined,
+            },
+          });
+      }
     } else if (type === "NOTIFY_OWNER") {
       if (!bookingCreated?.id) {
         throw new Error("live_owner_notification_without_booking");
