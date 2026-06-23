@@ -49,10 +49,14 @@
  * @property {string[]} [requestedDates]
  * @property {string | null} [canonicalAvailabilityStatus]
  * @property {Record<string, unknown> | null} [priceQuote]
- * @property {"not_started" | "queued" | "sent" | "failed"} ownerNotificationStatus
+ * @property {"not_started" | "queued" | "sending" | "sent" | "failed"} ownerNotificationStatus
+ * @property {unknown} [ownerNotificationAt]
+ * @property {string | null} [ownerNotificationError]
+ * @property {string | null} [ownerTarget]
  * @property {"not_started" | "queued" | "sent" | "failed"} approvalCustomerNotificationStatus
  * @property {Record<string, unknown> | null} [sourceIdentity]
  * @property {unknown} [createdAt]
+ * @property {unknown} [updatedAt]
  * @property {unknown} [expiresAt]
  */
 
