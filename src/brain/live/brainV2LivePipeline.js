@@ -98,6 +98,7 @@ export async function runBrainV2LivePipeline(params) {
       memorySnapshot: params.memorySnapshot,
       catalogItems,
       sourceMessageId: params.messageId,
+      sourceRowKey: params.sourceRowKey,
       guaranteeKey: params.guaranteeKey,
       traceId,
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
@@ -226,6 +227,11 @@ export async function runBrainV2LivePipeline(params) {
         sessionKey: params.sessionKey,
         participantKey: params.participantKey,
         participantPhoneForDm: params.participantPhoneForDm,
+        messageId: params.messageId,
+        sourceRowKey: params.sourceRowKey,
+        guaranteeKey: params.guaranteeKey,
+        chatId: params.chatId,
+        chatType,
       }
     );
 

@@ -117,6 +117,17 @@ function readResolvedBusinessTurnContext(businessContext) {
 
 /**
  * @param {Record<string, unknown> | null | undefined} canonical
+ * @returns {Record<string, unknown> | null}
+ */
+function readSourceIdentity(canonical) {
+  const sourceIdentity = canonical?.sourceIdentity;
+  return sourceIdentity && typeof sourceIdentity === "object" && !Array.isArray(sourceIdentity)
+    ? /** @type {Record<string, unknown>} */ (sourceIdentity)
+    : null;
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} canonical
  * @returns {boolean}
  */
 function hasCanonicalOwnerCheckContext(canonical) {
@@ -257,6 +268,12 @@ export function buildAvailabilityInquiryActionPlan({
     const canonicalAvailability = canonical.verified?.availability ?? null;
     const canonicalPriceQuote = canonical.verified?.priceQuote ?? null;
     const participant = canonical.participant ?? null;
+    const sourceIdentity = readSourceIdentity(canonical);
+    const sourceMessageId = String(canonical.turn?.sourceMessageId ?? "").trim() || null;
+    const sourceRowKey = String(canonical.turn?.sourceRowKey ?? "").trim() || null;
+    const guaranteeKey = String(canonical.turn?.guaranteeKey ?? "").trim() || null;
+    const sourceTurnKey = String(canonical.turn?.sourceTurnKey ?? "").trim() || null;
+    const execute = canonical.actions?.availabilityOwnerCheckExecute === true;
 
     if (!hasRequestedDuration(durationDays)) {
       const replyDraft = buildAskDurationAvailabilityReply(conversationalLabel);
@@ -317,9 +334,11 @@ export function buildAvailabilityInquiryActionPlan({
         Object.freeze({
           type: "AVAILABILITY_OWNER_CHECK_REQUIRED",
           payload: Object.freeze({
+            businessId: canonical.businessId ?? null,
             itemId,
             itemLabel,
             durationDays: durationN,
+            requestedDuration: durationN,
             canonicalAvailability:
               canonicalAvailability && typeof canonicalAvailability === "object"
                 ? Object.freeze({ ...canonicalAvailability })
@@ -332,7 +351,20 @@ export function buildAvailabilityInquiryActionPlan({
               participant && typeof participant === "object"
                 ? Object.freeze({ ...participant })
                 : null,
-            execute: false,
+            sourceIdentity:
+              sourceIdentity && typeof sourceIdentity === "object"
+                ? Object.freeze({ ...sourceIdentity })
+                : null,
+            sourceMessageId,
+            sourceRowKey,
+            guaranteeKey,
+            sourceTurnKey,
+            sourceChatId: sourceIdentity?.chatId ?? null,
+            sourceChatType: sourceIdentity?.chatType ?? null,
+            customerParticipantId: sourceIdentity?.participantKey ?? null,
+            customerDmTarget: null,
+            ownerTarget: null,
+            execute,
           }),
         }),
       ]),
@@ -340,7 +372,7 @@ export function buildAvailabilityInquiryActionPlan({
         rememberResolvedItem: true,
         itemId,
         ownerCheckPlanned: true,
-        execute: false,
+        execute,
       }),
     });
   }

@@ -21,6 +21,7 @@ import { chatSessionKey } from "../../services/memory.js";
  *   memorySnapshot?: Record<string, unknown> | null,
  *   catalogItems?: unknown[],
  *   sourceMessageId?: string | null,
+ *   sourceRowKey?: string | null,
  *   guaranteeKey?: string | null,
  *   traceId?: string | null,
  *   resolveTrustedSessionItem?: (p: {
@@ -99,6 +100,7 @@ export function buildTurnContextInput(p) {
     duration,
     contact: memContact != null ? String(memContact).trim() || null : null,
     sourceMessageId: String(p.sourceMessageId ?? "").trim() || null,
+    sourceRowKey: String(p.sourceRowKey ?? "").trim() || null,
     guaranteeKey: String(p.guaranteeKey ?? "").trim() || null,
     shouldClarifyItem: authority.shouldClarifyItem,
     clarificationReply: authority.clarificationReply,
