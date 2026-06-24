@@ -1,4 +1,5 @@
 import {
+  isPlaywrightNoSendEnabled,
   sendPlaywrightGroupImages,
   sendPlaywrightGroupText,
 } from "../playwrightOutboundBridge.js";
@@ -54,6 +55,34 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
     outboundLifecycle && typeof outboundLifecycle === "object"
       ? outboundLifecycle
       : {};
+
+  if (isPlaywrightNoSendEnabled()) {
+    const wantsImages =
+      Array.isArray(messageMeta?.whatsappImageUrls) &&
+      messageMeta.whatsappImageUrls.length > 0;
+    const imageCount = wantsImages ? messageMeta.whatsappImageUrls.length : 0;
+    const activeHeaderTitle = String(
+      globalThis.__currentOpenChatTitle ?? groupNameResolved ?? ""
+    ).trim();
+    console.log("[playwright_no_send_adapter_would_send]", {
+      dryRun: true,
+      noSend: true,
+      messageType: wantsImages ? "text_and_media" : "text",
+      expectedChat: String(groupNameResolved ?? "").trim() || null,
+      activeHeaderTitle: activeHeaderTitle || null,
+      previewText: String(reply ?? "").replace(/\s+/g, " ").trim().slice(0, 160),
+      imageCount,
+      guaranteeKey: String(guaranteeKey ?? "").trim() || null,
+    });
+    logOutboundLifecycle("playwright_no_send_dry_run", {
+      ...lifecycleBase,
+      dryRun: true,
+      outboundReplyDelivered: true,
+      activeHeaderTitle: activeHeaderTitle || null,
+      imageCount,
+    });
+    return { ok: true, groupSendFailed: false, dryRun: true };
+  }
 
   if (!groupNameResolved.length) {
     console.error("BLOCKED SEND — NO CHAT NAME (Playwright title)", {

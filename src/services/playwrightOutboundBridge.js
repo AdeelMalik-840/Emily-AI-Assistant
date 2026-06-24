@@ -27,6 +27,27 @@ globalThis.__ACTIVE_PIPELINE__ =
 /** WhatsApp Web image upload/send in progress — listener defers switch_chat / interrupt only. */
 globalThis.__WA_MEDIA_SEND__ = globalThis.__WA_MEDIA_SEND__ === true;
 
+function envTruthy(value) {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+}
+
+export function isPlaywrightNoSendEnabled() {
+  return envTruthy(process.env.PLAYWRIGHT_NO_SEND);
+}
+
+function previewText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
+function logPlaywrightNoSendWouldSend(event, payload = {}) {
+  console.log(event, {
+    dryRun: true,
+    noSend: true,
+    ...payload,
+  });
+}
+
 /** @param {number} minMs @param {number} maxMs */
 function randomBetweenMs(minMs, maxMs) {
   const lo = Math.min(minMs, maxMs);
@@ -555,6 +576,20 @@ async function sendTextViaComposeBoxes(page, body) {
 }
 
 export async function sendPlaywrightActiveChatText(text, opts = {}) {
+  const body = String(text ?? "").replace(/\n{3,}/g, "\n\n").trim();
+  if (isPlaywrightNoSendEnabled()) {
+    logPlaywrightNoSendWouldSend("[playwright_no_send_text_would_send]", {
+      messageType: "text",
+      route: opts.replyPrivateContext === true ? "active_chat_reply_private" : "active_chat",
+      expectedChat: String(opts.expectedHeaderTitle ?? "").trim() || null,
+      expectedChatKey: String(opts.expectedChatKey ?? "").trim() || null,
+      activeChatTitle: String(globalThis.__currentOpenChatTitle ?? "").trim() || null,
+      previewText: previewText(body),
+      chars: body.length,
+    });
+    return true;
+  }
+
   const page = outboundPage;
   if (!page || (typeof page.isClosed === "function" && page.isClosed())) {
     console.warn("[playwrightOutbound] no active page");
@@ -581,7 +616,6 @@ export async function sendPlaywrightActiveChatText(text, opts = {}) {
       return false;
     }
   }
-  const body = String(text ?? "").replace(/\n{3,}/g, "\n\n").trim();
   if (!body) return false;
   if (isReplyPrivateLockActive() && opts.allowReplyPrivate !== true) {
     console.log("⛔ Skip switching — reply private flow active");
@@ -620,8 +654,28 @@ export async function sendPlaywrightActiveChatText(text, opts = {}) {
  * @returns {Promise<boolean>}
  */
 export async function sendPlaywrightGroupText(text, opts = {}) {
-  const page = outboundPage;
   let result = false;
+
+  const enforceSingleMessage = (value) =>
+    String(value ?? "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  const body = enforceSingleMessage(text);
+
+  if (isPlaywrightNoSendEnabled()) {
+    logPlaywrightNoSendWouldSend("[playwright_no_send_text_would_send]", {
+      messageType: "text",
+      route: "group",
+      expectedChat: String(opts.expectedChat ?? "").trim() || null,
+      activeChatTitle: String(globalThis.__currentOpenChatTitle ?? "").trim() || null,
+      previewText: previewText(body),
+      chars: body.length,
+    });
+    console.log("📤 Send result:", true, "(dry-run)");
+    return true;
+  }
+
+  const page = outboundPage;
 
   if (!page || (typeof page.isClosed === "function" && page.isClosed())) {
     console.warn("[playwrightOutbound] no active page");
@@ -629,11 +683,6 @@ export async function sendPlaywrightGroupText(text, opts = {}) {
     return false;
   }
 
-  const enforceSingleMessage = (value) =>
-    String(value ?? "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  const body = enforceSingleMessage(text);
   if (!body) {
     console.log("📤 Send result:", false);
     return false;
@@ -3224,6 +3273,20 @@ export async function sendPlaywrightGroupImages(
   caption,
   opts = {}
 ) {
+  if (isPlaywrightNoSendEnabled()) {
+    const raw = Array.isArray(imageUrls) ? imageUrls : [];
+    logPlaywrightNoSendWouldSend("[playwright_no_send_media_would_send]", {
+      messageType: "media",
+      route: "group",
+      expectedChat: String(opts.expectedChat ?? "").trim() || null,
+      activeChatTitle: String(globalThis.__currentOpenChatTitle ?? "").trim() || null,
+      imageCount: raw.length,
+      captionPreview: previewText(caption),
+      imageSendJobId: String(opts.imageSendJobId ?? "").trim() || null,
+    });
+    return true;
+  }
+
   return sendPlaywrightGroupImagesWithPage(
     outboundPage,
     imageUrls,
