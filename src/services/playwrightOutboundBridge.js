@@ -1439,6 +1439,22 @@ async function verifyMediaSendCommitted(page, baseline, opts = {}) {
   return false;
 }
 
+function buildMediaSendResult({
+  ok,
+  clicked,
+  verified,
+  status,
+  imageSendJobId,
+} = {}) {
+  return {
+    ok: ok === true,
+    clicked: clicked === true,
+    verified: verified === true,
+    status: String(status ?? "").trim() || "failed",
+    imageSendJobId: String(imageSendJobId ?? "").trim() || null,
+  };
+}
+
 /**
  * Resolves the best Send control for media preview (multi-image album UI often needs scoping).
  * @param {import("playwright").Page} page
@@ -2880,7 +2896,13 @@ async function sendImageBody(page, filePath, caption, opts = {}) {
   }
 
   if (!clicked) {
-    throw new Error("MEDIA_SEND_BUTTON_NOT_FOUND");
+    return buildMediaSendResult({
+      ok: false,
+      clicked: false,
+      verified: false,
+      status: "not_clicked",
+      imageSendJobId: opts.imageSendJobId || null,
+    });
   }
 
   const verified = await verifyMediaSendCommitted(page, commitBaseline, {
@@ -2890,10 +2912,28 @@ async function sendImageBody(page, filePath, caption, opts = {}) {
     timeoutMs: 15_000,
   });
   if (!verified) {
-    throw new Error("❌ FAILED: send click did not close preview");
+    console.warn("[media_send_verification_inconclusive_after_confirmed_click]", {
+      imageSendJobId: opts.imageSendJobId || null,
+      index: opts.index ?? null,
+      total: opts.total ?? null,
+    });
+    return buildMediaSendResult({
+      ok: true,
+      clicked: true,
+      verified: false,
+      status: "verification_inconclusive_after_confirmed_click",
+      imageSendJobId: opts.imageSendJobId || null,
+    });
   }
 
   console.log("✅ IMAGE SENT SUCCESSFULLY");
+  return buildMediaSendResult({
+    ok: true,
+    clicked: true,
+    verified: true,
+    status: "verified_sent",
+    imageSendJobId: opts.imageSendJobId || null,
+  });
   } finally {
     if (normalizedPath) {
       // Defer unlink: Playwright may read the path asynchronously after setInputFiles.
@@ -2928,7 +2968,7 @@ async function uploadAndSendOneImage(page, filePath, captionForFirst, isFirst, o
       ? String(captionForFirst).trim()
       : undefined;
 
-  await sendImage(page, filePath, cap, opts);
+  return sendImage(page, filePath, cap, opts);
 }
 
 /**
@@ -3179,7 +3219,7 @@ async function sendPlaywrightGroupImagesWithPage(
         let lastErr;
         try {
           await enforceStrictSendLock(page);
-          await uploadAndSendOneImage(
+          const mediaResult = await uploadAndSendOneImage(
             page,
             paths[0],
             captionForFirstOnly,
@@ -3190,7 +3230,10 @@ async function sendPlaywrightGroupImagesWithPage(
               total: 1,
             }
           );
-          sent = true;
+          sent = mediaResult?.ok === true || mediaResult === true;
+          if (mediaResult?.clicked === true && mediaResult?.verified === false) {
+            return mediaResult;
+          }
         } catch (e) {
           lastErr = e;
           if (isIdentitySendBlockError(e)) {
@@ -3241,7 +3284,21 @@ async function sendPlaywrightGroupImagesWithPage(
         return true;
       }
 
-      return anyOk;
+      return anyOk
+        ? buildMediaSendResult({
+            ok: true,
+            clicked: true,
+            verified: true,
+            status: "verified_sent",
+            imageSendJobId,
+          })
+        : buildMediaSendResult({
+            ok: false,
+            clicked: false,
+            verified: false,
+            status: "failed",
+            imageSendJobId,
+          });
     } finally {
       for (const d of downloads) {
         try {
@@ -3284,7 +3341,13 @@ export async function sendPlaywrightGroupImages(
       captionPreview: previewText(caption),
       imageSendJobId: String(opts.imageSendJobId ?? "").trim() || null,
     });
-    return true;
+    return buildMediaSendResult({
+      ok: true,
+      clicked: false,
+      verified: false,
+      status: "dry_run",
+      imageSendJobId: String(opts.imageSendJobId ?? "").trim() || null,
+    });
   }
 
   return sendPlaywrightGroupImagesWithPage(

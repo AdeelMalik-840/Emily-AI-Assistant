@@ -3,7 +3,12 @@ import {
   sendPlaywrightGroupImages,
   sendPlaywrightGroupText,
 } from "../playwrightOutboundBridge.js";
-import { registerPlaywrightOutboundChunks } from "../playwrightOutboundRegistry.js";
+import {
+  hasPlaywrightOutboundMediaClick,
+  hashPlaywrightMediaSet,
+  registerPlaywrightOutboundChunks,
+  registerPlaywrightOutboundMediaClick,
+} from "../playwrightOutboundRegistry.js";
 import { logOutboundLifecycle } from "../outboundLifecycleLog.js";
 
 function playwrightGuaranteeTextDedupeMap() {
@@ -20,6 +25,34 @@ export function __clearPlaywrightGuaranteeTextDedupeForTests() {
   }
 }
 
+function normalizeMediaSendResult(result, imageSendJobId) {
+  if (result === true) {
+    return {
+      ok: true,
+      clicked: true,
+      verified: true,
+      status: "verified_sent",
+      imageSendJobId,
+    };
+  }
+  if (!result || typeof result !== "object") {
+    return {
+      ok: false,
+      clicked: false,
+      verified: false,
+      status: "failed",
+      imageSendJobId,
+    };
+  }
+  return {
+    ok: result.ok === true,
+    clicked: result.clicked === true,
+    verified: result.verified === true,
+    status: String(result.status ?? "").trim() || (result.ok === true ? "verified_sent" : "failed"),
+    imageSendJobId: String(result.imageSendJobId ?? imageSendJobId ?? "").trim() || null,
+  };
+}
+
 /**
  * @param {{
  *   reply: string,
@@ -33,6 +66,8 @@ export function __clearPlaywrightGuaranteeTextDedupeForTests() {
  *     guaranteeKey?: string,
  *     outboundLifecycle?: Record<string, unknown>,
  *     sourceInboundMessageId?: string,
+ *     __testSendPlaywrightGroupText?: Function,
+ *     __testSendPlaywrightGroupImages?: Function,
  *   }
  * }} p
  * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
@@ -138,7 +173,11 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
       });
       let sendError = null;
       try {
-        ok = await sendPlaywrightGroupText(reply, {
+        const textSendFn =
+          typeof context?.__testSendPlaywrightGroupText === "function"
+            ? context.__testSendPlaywrightGroupText
+            : sendPlaywrightGroupText;
+        ok = await textSendFn(reply, {
           expectedChat: groupNameResolved,
           outboundLifecycle: lifecycleBase,
         });
@@ -176,33 +215,83 @@ export async function sendViaPlaywright({ reply, messageMeta, context }) {
         const imageUrlCount = Array.isArray(messageMeta?.whatsappImageUrls)
           ? messageMeta.whatsappImageUrls.length
           : 0;
+        const imageUrls = Array.isArray(messageMeta?.whatsappImageUrls)
+          ? messageMeta.whatsappImageUrls
+          : [];
+        const mediaHash = hashPlaywrightMediaSet(imageUrls);
+        if (
+          guaranteeGk &&
+          mediaHash &&
+          hasPlaywrightOutboundMediaClick(groupNameResolved, {
+            guaranteeKey: guaranteeGk,
+            imageUrls,
+          })
+        ) {
+          imagesDelivered = true;
+          console.log("[media_duplicate_skipped]", {
+            guaranteeKey: guaranteeGk,
+            mediaHash,
+            imageUrlCount,
+            reason: "durable_media_click_marker",
+          });
+          logOutboundLifecycle("media_duplicate_skipped", {
+            ...lifecycleBase,
+            guaranteeKey: guaranteeGk,
+            mediaHash,
+            imageUrlCount,
+            outboundReplyDelivered: true,
+          });
+        } else {
         console.log("📸 Starting image send after text");
         console.log("🧵 Starting image send", {
           imageSendJobId,
           imageUrlCount,
+          mediaHash: mediaHash || null,
         });
-        const imgOk = await sendPlaywrightGroupImages(
-          messageMeta.whatsappImageUrls,
+        const imageSendFn =
+          typeof context?.__testSendPlaywrightGroupImages === "function"
+            ? context.__testSendPlaywrightGroupImages
+            : sendPlaywrightGroupImages;
+        const imgResult = normalizeMediaSendResult(
+          await imageSendFn(
+          imageUrls,
           undefined,
           {
             expectedChat: groupNameResolved,
             imageSendJobId,
           }
+          ),
+          imageSendJobId
         );
-        if (imgOk) {
+        if (imgResult.ok || imgResult.clicked) {
+          if (guaranteeGk && mediaHash) {
+            registerPlaywrightOutboundMediaClick(groupNameResolved, {
+              guaranteeKey: guaranteeGk,
+              imageUrls,
+              imageSendJobId: imgResult.imageSendJobId || imageSendJobId,
+              status: imgResult.status,
+            });
+          }
           imagesDelivered = true;
           console.log("✅ Image send complete", {
             imageSendJobId,
             imageUrlCount,
-            ok: imgOk,
+            ok: imgResult.ok,
+            clicked: imgResult.clicked,
+            verified: imgResult.verified,
+            status: imgResult.status,
           });
         } else {
           imagesDelivered = false;
           console.error("❌ Image send failed", {
             imageSendJobId,
             imageUrlCount,
-            ok: imgOk,
+            ok: imgResult.ok,
+            clicked: imgResult.clicked,
+            verified: imgResult.verified,
+            status: imgResult.status,
           });
+        }
         }
       } catch (imgErr) {
         imagesDelivered = false;

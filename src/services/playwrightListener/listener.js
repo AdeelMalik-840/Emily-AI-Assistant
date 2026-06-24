@@ -41,7 +41,6 @@ import {
   setMessageState,
 } from "../messageState.js";
 import {
-  clearInboundTurnLedgerBaselineAbsorbed,
   hydrateInboundTurnLedgerIntoMessageState,
   isInboundTurnLedgerEnabled,
   isInboundTurnLedgerDone,
@@ -1161,9 +1160,62 @@ function candidateRowsAfterCursor({
   }).rows;
 }
 
-function collapseRowsForForward(rows) {
+function stableIdAllowedForCurrentMerge(stableId, currentFreshAdmittedStableIds) {
+  const sid = String(stableId ?? "").trim();
+  if (!sid) return false;
+  if (!(currentFreshAdmittedStableIds instanceof Set)) return true;
+  return currentFreshAdmittedStableIds.has(sid);
+}
+
+function isFreshMergeSourceAllowed({
+  row,
+  stableId,
+  chatKey,
+  currentFreshAdmittedStableIds,
+  baselineSeenStableIds,
+}) {
+  const sid = String(stableId ?? "").trim();
+  if (!sid) return false;
+  if (row?.sender !== "user") return false;
+  if (isListenerInboundNoise(row?.text)) return false;
+  if (!stableIdAllowedForCurrentMerge(sid, currentFreshAdmittedStableIds)) {
+    return false;
+  }
+  if (baselineSeenStableIds instanceof Set && baselineSeenStableIds.has(sid)) {
+    return false;
+  }
+  const guaranteeKey = playwrightGuaranteeKeyForStableId(chatKey, sid);
+  const st = guaranteeKey ? getMessageState(guaranteeKey) : null;
+  if (st?.state === "done" || st?.state === "processing") return false;
+  const ledgerBlock = resolveInboundTurnAdmissionBlock({
+    chatKey,
+    stableId: sid,
+    textPreview: String(row?.text ?? "").slice(0, 120),
+  });
+  return ledgerBlock.blocked !== true;
+}
+
+function collapseRowsForForward(rows, opts = {}) {
+  const currentFreshAdmittedStableIds =
+    opts?.currentFreshAdmittedStableIds instanceof Set
+      ? opts.currentFreshAdmittedStableIds
+      : null;
+  const chatKey = String(opts?.chatKey ?? "").trim();
+  const baselineSeenStableIds =
+    opts?.baselineSeenStableIds instanceof Set ? opts.baselineSeenStableIds : null;
   const cleanRows = Array.isArray(rows)
-    ? rows.filter((row) => row?.sender === "user" && String(row?.text ?? "").trim())
+    ? rows.filter((row) => {
+        if (row?.sender !== "user" || !String(row?.text ?? "").trim()) return false;
+        if (!currentFreshAdmittedStableIds) return true;
+        const stableId = buildExtractedMessageId(row, rows).id;
+        return isFreshMergeSourceAllowed({
+          row,
+          stableId,
+          chatKey,
+          currentFreshAdmittedStableIds,
+          baselineSeenStableIds,
+        });
+      })
     : [];
   if (cleanRows.length <= 1) return cleanRows;
   const latest = cleanRows[cleanRows.length - 1];
@@ -1195,8 +1247,8 @@ export function __candidateRowsAfterCursorForTests(args) {
 }
 
 /** @internal Tests — merge last two catch-up user rows for one forward. */
-export function __collapseRowsForForwardForTests(rows) {
-  return collapseRowsForForward(rows);
+export function __collapseRowsForForwardForTests(rows, opts = {}) {
+  return collapseRowsForForward(rows, opts);
 }
 
 /**
@@ -1440,14 +1492,53 @@ export function attachBurstMergeContinuations(
   tickFirstSeenByStableId,
   extractedMessages,
   chatKey,
-  catalogItems
+  catalogItems,
+  opts = {}
 ) {
   if (!anchorMsg) return null;
   const catalog = resolveBurstMergeCatalogItems(catalogItems);
   const anchorPos = Number(anchorMsg?.__position);
   if (!Number.isFinite(anchorPos)) return anchorMsg;
+  const currentFreshAdmittedStableIds =
+    opts?.currentFreshAdmittedStableIds instanceof Set
+      ? opts.currentFreshAdmittedStableIds
+      : null;
+  const baselineSeenStableIds =
+    opts?.baselineSeenStableIds instanceof Set ? opts.baselineSeenStableIds : null;
+  const anchorStableId = getMessageIdFromExtracted(anchorMsg, extractedMessages);
+  if (
+    currentFreshAdmittedStableIds &&
+    !isFreshMergeSourceAllowed({
+      row: anchorMsg,
+      stableId: anchorStableId,
+      chatKey,
+      currentFreshAdmittedStableIds,
+      baselineSeenStableIds,
+    })
+  ) {
+    return anchorMsg;
+  }
+  const anchorParticipantKey = String(anchorMsg?.participantKey ?? "").trim();
+  const allowMultiRowMerge = Boolean(anchorParticipantKey);
   const byPos = new Map(
-    (allParticipantUserRows || []).map((row) => [Number(row?.__position), row])
+    (allParticipantUserRows || [])
+      .filter((row) => {
+        if (row?.sender !== "user") return false;
+        if (!String(row?.text ?? "").trim()) return false;
+        if (!allowMultiRowMerge) return row === anchorMsg;
+        const participantKey = String(row?.participantKey ?? "").trim();
+        if (participantKey !== anchorParticipantKey) return false;
+        if (!currentFreshAdmittedStableIds) return true;
+        const stableId = getMessageIdFromExtracted(row, extractedMessages);
+        return isFreshMergeSourceAllowed({
+          row,
+          stableId,
+          chatKey,
+          currentFreshAdmittedStableIds,
+          baselineSeenStableIds,
+        });
+      })
+      .map((row) => [Number(row?.__position), row])
   );
   const run = [anchorMsg];
   let lastPos = anchorPos;
@@ -1520,6 +1611,8 @@ export function buildParticipantForwardCandidate(p) {
     burstMs = PLAYWRIGHT_FRESH_DELTA_BURST_MS,
     tickFirstSeenByStableId,
     catalogItems,
+    currentFreshAdmittedStableIds,
+    baselineSeenStableIds,
   } = p;
   const ordered = [...(participantMessages || [])].sort(
     (a, b) => (Number(a?.__position) || 0) - (Number(b?.__position) || 0)
@@ -1604,6 +1697,10 @@ export function buildParticipantForwardCandidate(p) {
   const burstCatalog = resolveBurstMergeCatalogItems(catalogItems);
 
   if (guaranteeFirst) {
+    const admittedIds =
+      currentFreshAdmittedStableIds instanceof Set
+        ? currentFreshAdmittedStableIds
+        : null;
     const burstSource =
       Array.isArray(allParticipantUserRows) && allParticipantUserRows.length > 0
         ? allParticipantUserRows
@@ -1618,7 +1715,12 @@ export function buildParticipantForwardCandidate(p) {
         tickMap instanceof Map ? tickMap : new Map(),
         extractedMessages,
         String(chatKey ?? "").trim(),
-        burstCatalog
+        burstCatalog,
+        {
+          currentFreshAdmittedStableIds: admittedIds,
+          baselineSeenStableIds:
+            baselineSeenStableIds instanceof Set ? baselineSeenStableIds : null,
+        }
       );
       const guard = evaluateReplyAfterGuard(
         withBurst,
@@ -6616,14 +6718,6 @@ async function runListenerBody() {
               freshState.baselineTailAnchor = tailAnchor;
               freshState.currentTailAnchor = tailAnchor;
               const anchorIndex = sortedWithPos.length - 1;
-              const anchorRow = sortedWithPos[anchorIndex] || null;
-              const tailDeferral = resolveBaselineTailUserDeferral({
-                anchorRow,
-                anchorIndex,
-                chatKey,
-                sortedWithPos,
-              });
-              const deferredTailStableId = tailDeferral?.stableId ?? null;
               const baselineSeen = new Set();
               for (const msg of sortedWithPos) {
                 const sender = String(msg?.sender ?? "").trim() || "unknown";
@@ -6635,11 +6729,7 @@ async function runListenerBody() {
                   0,
                   sortedWithPos
                 );
-                const isDeferredTail =
-                  deferredTailStableId &&
-                  stableId &&
-                  stableId === deferredTailStableId;
-                if (stableId && !isDeferredTail) {
+                if (stableId) {
                   baselineSeen.add(stableId);
                   if (isInboundTurnLedgerEnabled()) {
                     markInboundTurnLedgerBaselineAbsorbed({
@@ -6658,19 +6748,6 @@ async function runListenerBody() {
                     assistantLike: assistantDetail.assistantLike,
                     reason: assistantDetail.reason || "startup_visible_row",
                   });
-                } else if (isDeferredTail) {
-                  if (isInboundTurnLedgerEnabled()) {
-                    clearInboundTurnLedgerBaselineAbsorbed(chatKey, stableId);
-                  }
-                  console.log("[baseline_tail_user_deferred]", {
-                    chatKey,
-                    stableId,
-                    rowKey: String(msg?.__rowKey ?? "").trim() || null,
-                    textPreview,
-                    sender,
-                    anchorIndex,
-                    reason: "TAIL_USER_NOT_BASELINE_ABSORBED",
-                  });
                 } else {
                   console.log("[startup_baseline_row_absorbed]", {
                     chatKey,
@@ -6687,13 +6764,8 @@ async function runListenerBody() {
               freshState.baselineSnapshotHash = String(computeSnapshotHash(userMessages) ?? "");
               freshState.baselineEstablishedAtMs = Date.now();
               freshState.acknowledgedAnchorIndex = anchorIndex;
-              if (tailDeferral?.hold) {
-                freshState.anchorHoldUserForward = { ...tailDeferral.hold };
-                freshState.baselineDeferredTailUser = { ...tailDeferral.hold };
-              } else {
-                freshState.anchorHoldUserForward = null;
-                freshState.baselineDeferredTailUser = null;
-              }
+              freshState.anchorHoldUserForward = null;
+              freshState.baselineDeferredTailUser = null;
               recordSessionVisibilityLedger(
                 freshState,
                 sortedWithPos,
@@ -6882,10 +6954,20 @@ async function runListenerBody() {
 
           const participantBuckets = new Map();
           const allParticipantBuckets = new Map();
+          const currentFreshAdmittedStableIds = new Set();
+          const currentFreshAdmittedStableIdsByParticipant = new Map();
           for (const msg of freshVerifiedUserRows) {
             const key = String(msg.participantKey ?? "").trim() || "(missing)";
             if (!participantBuckets.has(key)) participantBuckets.set(key, []);
             participantBuckets.get(key).push(msg);
+            const stableId = getMessageIdFromExtracted(msg, sortedWithPos);
+            if (stableId) {
+              currentFreshAdmittedStableIds.add(stableId);
+              if (!currentFreshAdmittedStableIdsByParticipant.has(key)) {
+                currentFreshAdmittedStableIdsByParticipant.set(key, new Set());
+              }
+              currentFreshAdmittedStableIdsByParticipant.get(key).add(stableId);
+            }
           }
           if (isPlaywrightGuaranteeFirstAdmissionEnabled()) {
             for (const msg of userMessages) {
@@ -7064,6 +7146,13 @@ async function runListenerBody() {
               guaranteeFirst,
               anchorIndex: freshDeltaAcknowledgedAnchorIndex,
               tickFirstSeenByStableId: freshState?.tickFirstSeenByStableId,
+              currentFreshAdmittedStableIds:
+                currentFreshAdmittedStableIdsByParticipant.get(participantKey) ||
+                currentFreshAdmittedStableIds,
+              baselineSeenStableIds:
+                freshState?.baselineSeenStableIds instanceof Set
+                  ? freshState.baselineSeenStableIds
+                  : null,
               deps: {
                 buildExtractedMessageId,
                 buildStableMessageKey,

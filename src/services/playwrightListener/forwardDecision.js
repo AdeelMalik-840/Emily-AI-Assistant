@@ -369,6 +369,8 @@ export function decideParticipantForwardTurn(p) {
     guaranteeFirst = false,
     anchorIndex = -1,
     tickFirstSeenByStableId,
+    currentFreshAdmittedStableIds,
+    baselineSeenStableIds,
     now = Date.now(),
     deps,
   } = p;
@@ -428,7 +430,15 @@ export function decideParticipantForwardTurn(p) {
     };
   }
 
-  const cursorRowsForForward = collapseRowsForForward(cursorCandidateRows);
+  const cursorRowsForForward = collapseRowsForForward(cursorCandidateRows, {
+    currentFreshAdmittedStableIds:
+      currentFreshAdmittedStableIds instanceof Set
+        ? currentFreshAdmittedStableIds
+        : null,
+    baselineSeenStableIds:
+      baselineSeenStableIds instanceof Set ? baselineSeenStableIds : null,
+    chatKey,
+  });
   const candidate = buildParticipantForwardCandidate({
     participantMessages: cursorRowsForForward,
     allParticipantUserRows: guaranteeFirst ? allParticipantUserRows : undefined,
@@ -439,6 +449,12 @@ export function decideParticipantForwardTurn(p) {
     normalizedGroupChatKeyForCompare,
     anchorIndex: guaranteeFirst ? -1 : anchorIndex,
     tickFirstSeenByStableId,
+    currentFreshAdmittedStableIds:
+      currentFreshAdmittedStableIds instanceof Set
+        ? currentFreshAdmittedStableIds
+        : null,
+    baselineSeenStableIds:
+      baselineSeenStableIds instanceof Set ? baselineSeenStableIds : null,
   });
 
   if (!candidate) {

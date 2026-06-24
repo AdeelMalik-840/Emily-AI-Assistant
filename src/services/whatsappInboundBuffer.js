@@ -42,6 +42,8 @@ import {
 import {
   markInboundTurnLedgerDoneForGuarantee,
   markInboundTurnLedgerFailedForGuarantee,
+  markInboundTurnLedgerOutboundLockedForGuarantee,
+  resolveInboundTurnAdmissionBlock,
 } from "./inboundTurnLedger.js";
 import { setMessageState } from "./messageState.js";
 import {
@@ -794,6 +796,20 @@ function hashCombinedInbound(combinedMessage, sessionKey) {
     .digest("hex");
 }
 
+export function shouldOutboundLockPlaywrightGroupSend({
+  isTabInbound,
+  isGroupMessage,
+  unknownPhone,
+  playwrightNoSend,
+} = {}) {
+  return Boolean(
+    isTabInbound === true &&
+      isGroupMessage === true &&
+      unknownPhone === true &&
+      playwrightNoSend !== true
+  );
+}
+
 /**
  * @typedef {{
  *   db: import("firebase-admin/firestore").Firestore,
@@ -1077,6 +1093,7 @@ export async function executeWhatsAppAiPipeline(p) {
     inboundEntity: inboundEntityRaw = null,
     resetTopicContext: resetTopicContextRaw = false,
     playwrightChatKey: playwrightChatKeyRaw = null,
+    playwrightForwardedAt: playwrightForwardedAtRaw = null,
     sourceRowKey: sourceRowKeyRaw = null,
     sourceMessageIndex: sourceMessageIndexRaw = null,
     startupCatchup: startupCatchupRaw = false,
@@ -1362,6 +1379,36 @@ export async function executeWhatsAppAiPipeline(p) {
   const guaranteeKey = isPlaywrightWebTabInbound(p)
     ? String(buildPlaywrightGuaranteeKey(groupNameResolved, messageId) ?? "").trim()
     : "";
+
+  if (isPlaywrightWebTabInbound(p) && guaranteeKey) {
+    const ledgerBlock = resolveInboundTurnAdmissionBlock({
+      chatKey: groupNameResolved,
+      stableId: messageId,
+      textPreview: String(combinedMessage ?? "").slice(0, 120),
+      currentForwardedAtMs: Number(playwrightForwardedAtRaw),
+    });
+    if (ledgerBlock.blocked && ledgerBlock.reason === "recent_processing_duplicate") {
+      logOutboundLifecycle("inbound_turn_ledger_processing_existing_blocked", {
+        traceId,
+        guaranteeKey,
+        stableId: messageId,
+        existingState: ledgerBlock.existingState ?? null,
+        ageMs: ledgerBlock.ageMs ?? null,
+        reason: "recent_processing_duplicate",
+        outboundReplyDelivered: false,
+      });
+      const blockedChatKey = normalizeTitle(String(groupNameResolved ?? "").trim());
+      if (blockedChatKey) {
+        globalThis.__chatResponding =
+          globalThis.__chatResponding || Object.create(null);
+        globalThis.__chatResponding[blockedChatKey] = false;
+        if (globalThis.__processingChats instanceof Map) {
+          globalThis.__processingChats.delete(blockedChatKey);
+        }
+      }
+      return;
+    }
+  }
 
   console.time("TOTAL_RESPONSE");
   try {
@@ -2061,7 +2108,7 @@ export async function executeWhatsAppAiPipeline(p) {
       sentRecord.hash === messageHash &&
       beforeSend - sentRecord.timestamp < REPLY_DEDUPE_WINDOW_MS;
 
-    if (duplicateWithinWindow) {
+  if (duplicateWithinWindow) {
       console.log("[whatsappInboundBuffer] skip duplicate WhatsApp send (same inbound)", {
         sessionKey,
         messageHashPreview: messageHash.slice(0, 16),
@@ -2081,12 +2128,6 @@ export async function executeWhatsAppAiPipeline(p) {
         sendVia: String(sendVia ?? "").trim() || null,
       });
     } else {
-      console.log("📤 Sending reply");
-      logOutboundLifecycle("buffer_send_start", {
-        ...outboundLifecycleBase,
-        sendVia: String(sendVia ?? "").trim() || null,
-        finalReplySource: finalReplySourceForLifecycle || null,
-      });
       let groupSendFailed = false;
       let outboundStartedAt = 0;
       try {
@@ -2106,6 +2147,45 @@ export async function executeWhatsAppAiPipeline(p) {
             sendVia === "PLAYWRIGHT" &&
             unknownPhone &&
             (isGroupMessage === true || playwrightWebInbound));
+        const realPlaywrightGroupTabSend = shouldOutboundLockPlaywrightGroupSend({
+          isTabInbound,
+          isGroupMessage: isGroupMessage === true,
+          unknownPhone,
+          playwrightNoSend: /^(true|1|yes|on)$/i.test(
+            String(process.env.PLAYWRIGHT_NO_SEND ?? "").trim()
+          ),
+        });
+        if (realPlaywrightGroupTabSend && guaranteeKey) {
+          const pendingLock =
+            globalThis.__playwrightPendingByGuarantee?.get(guaranteeKey);
+          markInboundTurnLedgerOutboundLockedForGuarantee({
+            guaranteeKey,
+            burstStableIds: pendingLock?.burstStableIds,
+            textPreview: String(combinedMessage ?? "").slice(0, 120),
+            replyPreview: replyText.slice(0, 160),
+            outboundLockStage: "buffer_send_start",
+            sendVia: "PLAYWRIGHT",
+            dryRun: false,
+            traceId,
+            groupChatKey:
+              (playwrightChatKeyRaw != null && String(playwrightChatKeyRaw).trim() !== ""
+                ? String(playwrightChatKeyRaw).trim()
+                : null) ||
+              (groupNameResolved ? normalizeTitle(groupNameResolved) : null),
+            messageHash,
+            replyHash: hashCombinedInbound(replyText, guaranteeKey || sessionKey),
+            sourceMessageIndex:
+              sourceMessageIndexRaw != null && Number.isFinite(Number(sourceMessageIndexRaw))
+                ? Number(sourceMessageIndexRaw)
+                : null,
+          });
+        }
+        console.log("📤 Sending reply");
+        logOutboundLifecycle("buffer_send_start", {
+          ...outboundLifecycleBase,
+          sendVia: String(sendVia ?? "").trim() || null,
+          finalReplySource: finalReplySourceForLifecycle || null,
+        });
         outboundStartedAt = Date.now();
         const sendResult = await sendOutboundMessage({
           sendVia,
@@ -2737,6 +2817,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     inboundEntity: inboundEntityPayload = null,
     resetTopicContext: resetTopicContextPayload = false,
     playwrightChatKey: playwrightChatKeyPayload = null,
+    playwrightForwardedAt: playwrightForwardedAtPayload = null,
     sourceRowKey: sourceRowKeyPayload = null,
     sourceMessageIndex: sourceMessageIndexPayload = null,
   } = payload;
@@ -2908,6 +2989,14 @@ export function scheduleBufferedWhatsAppInbound(payload) {
         : entry.context?.playwrightChatKey != null &&
             String(entry.context.playwrightChatKey).trim() !== ""
           ? String(entry.context.playwrightChatKey).trim()
+          : null,
+    playwrightForwardedAt:
+      playwrightForwardedAtPayload != null &&
+      Number.isFinite(Number(playwrightForwardedAtPayload))
+        ? Number(playwrightForwardedAtPayload)
+        : entry.context?.playwrightForwardedAt != null &&
+            Number.isFinite(Number(entry.context.playwrightForwardedAt))
+          ? Number(entry.context.playwrightForwardedAt)
           : null,
     sourceRowKey:
       sourceRowKeyPayload != null && String(sourceRowKeyPayload).trim() !== ""
