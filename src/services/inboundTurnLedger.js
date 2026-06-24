@@ -9,7 +9,7 @@ import path from "node:path";
 import { setMessageState } from "./messageState.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
 
-/** @typedef {"processing" | "done" | "failed" | "baseline_absorbed"} InboundTurnLedgerState */
+/** @typedef {"processing" | "done" | "failed" | "baseline_absorbed" | "outbound_locked"} InboundTurnLedgerState */
 
 /** @typedef {{
  *   chatKey: string,
@@ -17,6 +17,19 @@ import { normalizeTitle } from "./playwrightTitleNormalize.js";
  *   guaranteeKey?: string | null,
  *   state: InboundTurnLedgerState,
  *   textPreview?: string,
+ *   replyPreview?: string,
+ *   autoRetryAllowed?: boolean,
+ *   deliveryStatus?: string,
+ *   outboundLockedAt?: number | null,
+ *   outboundLockStage?: string | null,
+ *   sendVia?: string | null,
+ *   dryRun?: boolean,
+ *   traceId?: string | null,
+ *   groupChatKey?: string | null,
+ *   messageHash?: string | null,
+ *   replyHash?: string | null,
+ *   sourceMessageIndex?: number | null,
+ *   lastError?: string | null,
  *   replySent?: boolean,
  *   replySentAt?: number | null,
  *   processingAt?: number | null,
@@ -168,7 +181,7 @@ export function hydrateInboundTurnLedgerIntoMessageState() {
       String(entry.guaranteeKey ?? "").trim() ||
       buildInboundTurnLedgerKey(entry.chatKey, entry.stableId);
     if (!gk) continue;
-    if (entry.state === "done") {
+    if (entry.state === "done" || entry.state === "outbound_locked") {
       setMessageState(gk, "done");
       continue;
     }
@@ -223,6 +236,35 @@ export function markInboundTurnLedgerProcessing(p) {
   const guaranteeKey =
     String(p.guaranteeKey ?? "").trim() || key;
   const textPreview = String(p.textPreview ?? "").slice(0, 120);
+  const existing = ledgerByKey.get(key);
+  if (existing?.state === "outbound_locked" || existing?.state === "done") {
+    console.log("[inbound_turn_ledger_processing_existing_preserved]", {
+      chatKey,
+      stableId,
+      guaranteeKey: String(existing.guaranteeKey ?? guaranteeKey).trim() || guaranteeKey,
+      existingState: existing.state,
+      ageMs: null,
+      reason: existing.state,
+      textPreview,
+    });
+    return;
+  }
+  if (existing?.state === "processing") {
+    const started = Number(existing.processingAt ?? existing.updatedAt ?? 0);
+    const ageMs = Number.isFinite(started) ? Date.now() - started : null;
+    if (Number.isFinite(started) && ageMs != null && ageMs <= PROCESSING_STALE_MS) {
+      console.log("[inbound_turn_ledger_processing_existing_preserved]", {
+        chatKey,
+        stableId,
+        guaranteeKey: String(existing.guaranteeKey ?? guaranteeKey).trim() || guaranteeKey,
+        existingState: existing.state,
+        ageMs,
+        reason: "recent_processing_duplicate",
+        textPreview,
+      });
+      return;
+    }
+  }
   upsertEntry(key, {
     chatKey,
     stableId,
@@ -284,7 +326,7 @@ export function markInboundTurnLedgerFailed(p) {
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
   if (!key) return;
   const existing = ledgerByKey.get(key);
-  if (existing?.state === "done") return;
+  if (existing?.state === "done" || existing?.state === "outbound_locked") return;
   const guaranteeKey =
     String(p.guaranteeKey ?? "").trim() || key;
   upsertEntry(key, {
@@ -311,7 +353,7 @@ export function markInboundTurnLedgerBaselineAbsorbed(p) {
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
   if (!key) return;
   const existing = ledgerByKey.get(key);
-  if (existing?.state === "done") return;
+  if (existing?.state === "done" || existing?.state === "outbound_locked") return;
   const textPreview = String(p.textPreview ?? "").slice(0, 120);
   upsertEntry(key, {
     chatKey,
@@ -347,13 +389,87 @@ export function clearInboundTurnLedgerBaselineAbsorbed(chatKey, stableId) {
  */
 export function isInboundTurnLedgerDone(chatKey, stableId) {
   const entry = getInboundTurnLedgerEntry(chatKey, stableId);
-  return entry?.state === "done" && entry.replySent !== false;
+  return (
+    (entry?.state === "done" && entry.replySent !== false) ||
+    entry?.state === "outbound_locked"
+  );
+}
+
+/**
+ * Mark that a real Playwright outbound attempt has consumed the one automatic
+ * send attempt for this inbound. This state is done-like for admission, but
+ * visible as manual-review required until a clean success overwrites it.
+ * @param {{
+ *   chatKey: string,
+ *   stableId: string,
+ *   guaranteeKey?: string,
+ *   textPreview?: string,
+ *   replyPreview?: string,
+ *   outboundLockStage?: string,
+ *   sendVia?: string,
+ *   dryRun?: boolean,
+ *   traceId?: string,
+ *   groupChatKey?: string,
+ *   messageHash?: string,
+ *   replyHash?: string,
+ *   sourceMessageIndex?: number | null,
+ *   lastError?: string,
+ * }} p
+ */
+export function markInboundTurnLedgerOutboundLocked(p) {
+  if (!isInboundTurnLedgerEnabled()) return;
+  initInboundTurnLedger();
+  const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
+  const stableId = String(p.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return;
+  const guaranteeKey = String(p.guaranteeKey ?? "").trim() || key;
+  const existing = ledgerByKey.get(key);
+  if (existing?.state === "done") return;
+  const now = Date.now();
+  upsertEntry(key, {
+    chatKey,
+    stableId,
+    guaranteeKey,
+    state: "outbound_locked",
+    autoRetryAllowed: false,
+    deliveryStatus: "manual_review_required",
+    outboundLockedAt: Number(existing?.outboundLockedAt ?? 0) > 0
+      ? Number(existing.outboundLockedAt)
+      : now,
+    outboundLockStage:
+      String(p.outboundLockStage ?? existing?.outboundLockStage ?? "").trim() ||
+      "buffer_send_start",
+    sendVia: String(p.sendVia ?? existing?.sendVia ?? "PLAYWRIGHT").trim() || "PLAYWRIGHT",
+    dryRun: p.dryRun === true,
+    traceId: String(p.traceId ?? existing?.traceId ?? "").trim() || null,
+    groupChatKey: String(p.groupChatKey ?? existing?.groupChatKey ?? "").trim() || null,
+    textPreview: String(p.textPreview ?? existing?.textPreview ?? "").slice(0, 120),
+    replyPreview: String(p.replyPreview ?? existing?.replyPreview ?? "").slice(0, 160),
+    messageHash: String(p.messageHash ?? existing?.messageHash ?? "").trim() || null,
+    replyHash: String(p.replyHash ?? existing?.replyHash ?? "").trim() || null,
+    sourceMessageIndex:
+      p.sourceMessageIndex != null && Number.isFinite(Number(p.sourceMessageIndex))
+        ? Number(p.sourceMessageIndex)
+        : existing?.sourceMessageIndex ?? null,
+    lastError: String(p.lastError ?? existing?.lastError ?? "").slice(0, 160) || null,
+    processingAt: null,
+  });
+  console.log("[inbound_turn_ledger_outbound_locked]", {
+    chatKey,
+    stableId,
+    guaranteeKey,
+    outboundLockStage:
+      String(p.outboundLockStage ?? "").trim() || "buffer_send_start",
+    sendVia: String(p.sendVia ?? "").trim() || "PLAYWRIGHT",
+    traceId: String(p.traceId ?? "").trim() || null,
+  });
 }
 
 /**
  * Admission gate: durable replay protection.
- * @param {{ chatKey: string, stableId: string, textPreview?: string }} p
- * @returns {{ blocked: boolean, reason?: string, logEvent?: string, previousReplyAt?: number | null }}
+ * @param {{ chatKey: string, stableId: string, textPreview?: string, currentForwardedAtMs?: number | null }} p
+ * @returns {{ blocked: boolean, reason?: string, logEvent?: string, previousReplyAt?: number | null, stableId?: string, guaranteeKey?: string | null, existingState?: InboundTurnLedgerState, ageMs?: number | null }}
  */
 export function resolveInboundTurnAdmissionBlock(p) {
   if (!isInboundTurnLedgerEnabled()) {
@@ -405,9 +521,41 @@ export function resolveInboundTurnAdmissionBlock(p) {
     };
   }
 
+  if (entry.state === "outbound_locked") {
+    const guaranteeKey =
+      String(entry.guaranteeKey ?? "").trim() ||
+      buildInboundTurnLedgerKey(chatKey, stableId) ||
+      null;
+    console.log("[inbound_turn_ledger_outbound_locked_blocked]", {
+      chatKey,
+      stableId,
+      guaranteeKey,
+      existingState: entry.state,
+      reason: "outbound_locked",
+      deliveryStatus: entry.deliveryStatus || "manual_review_required",
+      outboundLockedAt: entry.outboundLockedAt ?? entry.updatedAt ?? null,
+      outboundLockStage: entry.outboundLockStage || null,
+      textPreview,
+    });
+    return {
+      blocked: true,
+      reason: "outbound_locked",
+      logEvent: "inbound_turn_ledger_outbound_locked_blocked",
+      stableId,
+      guaranteeKey,
+      existingState: entry.state,
+    };
+  }
+
   if (entry.state === "processing") {
     const started = Number(entry.processingAt ?? entry.updatedAt ?? 0);
     const now = Date.now();
+    const ageMs = Number.isFinite(started) ? now - started : null;
+    const currentForwardedAtMs = Number(p.currentForwardedAtMs ?? NaN);
+    const handoffAgeMs =
+      Number.isFinite(currentForwardedAtMs) && Number.isFinite(started)
+        ? currentForwardedAtMs - started
+        : null;
     if (Number.isFinite(started) && now - started > PROCESSING_STALE_MS) {
       markInboundTurnLedgerFailed({
         chatKey,
@@ -417,7 +565,35 @@ export function resolveInboundTurnAdmissionBlock(p) {
       });
       return { blocked: false, reason: "processing_stale_recovered" };
     }
-    return { blocked: true, reason: "ledger_processing", logEvent: "inbound_replay_blocked_processing" };
+    if (
+      handoffAgeMs != null &&
+      handoffAgeMs >= 0 &&
+      handoffAgeMs <= 30_000
+    ) {
+      return { blocked: false, reason: "current_processing_handoff" };
+    }
+    const guaranteeKey =
+      String(entry.guaranteeKey ?? "").trim() ||
+      buildInboundTurnLedgerKey(chatKey, stableId) ||
+      null;
+    console.log("[inbound_turn_ledger_processing_existing_blocked]", {
+      chatKey,
+      stableId,
+      guaranteeKey,
+      existingState: entry.state,
+      ageMs,
+      reason: "recent_processing_duplicate",
+      textPreview,
+    });
+    return {
+      blocked: true,
+      reason: "recent_processing_duplicate",
+      logEvent: "inbound_turn_ledger_processing_existing_blocked",
+      stableId,
+      guaranteeKey,
+      existingState: entry.state,
+      ageMs,
+    };
   }
 
   return { blocked: false };
@@ -459,12 +635,58 @@ export function markInboundTurnLedgerFailedForGuarantee(p) {
   const ids = new Set([stableId, ...burst]);
   for (const sid of ids) {
     const existing = getInboundTurnLedgerEntry(chatKey, sid);
-    if (existing?.state === "done") continue;
+    if (existing?.state === "done" || existing?.state === "outbound_locked") continue;
     markInboundTurnLedgerFailed({
       chatKey,
       stableId: sid,
       guaranteeKey: buildInboundTurnLedgerKey(chatKey, sid),
       textPreview: p.textPreview,
+    });
+  }
+}
+
+/**
+ * Mark outbound_locked for all burst stable ids attached to a guarantee key.
+ * @param {{
+ *   guaranteeKey: string,
+ *   burstStableIds?: string[],
+ *   textPreview?: string,
+ *   replyPreview?: string,
+ *   outboundLockStage?: string,
+ *   sendVia?: string,
+ *   dryRun?: boolean,
+ *   traceId?: string,
+ *   groupChatKey?: string,
+ *   messageHash?: string,
+ *   replyHash?: string,
+ *   sourceMessageIndex?: number | null,
+ *   lastError?: string,
+ * }} p
+ */
+export function markInboundTurnLedgerOutboundLockedForGuarantee(p) {
+  if (!isInboundTurnLedgerEnabled()) return;
+  const { chatKey, stableId } = parseGuaranteeKeyParts(p.guaranteeKey);
+  if (!chatKey || !stableId) return;
+  const burst = Array.isArray(p.burstStableIds)
+    ? p.burstStableIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+    : [];
+  const ids = new Set([stableId, ...burst]);
+  for (const sid of ids) {
+    markInboundTurnLedgerOutboundLocked({
+      chatKey,
+      stableId: sid,
+      guaranteeKey: buildInboundTurnLedgerKey(chatKey, sid),
+      textPreview: p.textPreview,
+      replyPreview: p.replyPreview,
+      outboundLockStage: p.outboundLockStage,
+      sendVia: p.sendVia,
+      dryRun: p.dryRun,
+      traceId: p.traceId,
+      groupChatKey: p.groupChatKey,
+      messageHash: p.messageHash,
+      replyHash: p.replyHash,
+      sourceMessageIndex: p.sourceMessageIndex,
+      lastError: p.lastError,
     });
   }
 }

@@ -1,32 +1,41 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
 import path from "node:path";
 
+process.env.NODE_ENV = "test";
 process.env.OPENAI_API_KEY ||= "test-key";
 process.env.PLAYWRIGHT_INBOUND_TURN_LEDGER = "true";
 process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+process.env.PLAYWRIGHT_INBOUND_TURN_LEDGER_PATH = path.join(
+  os.tmpdir(),
+  `inbound-turn-ledger-forward-decision-${process.pid}-${Date.now()}.json`
+);
 
-import {
+const {
   buildExtractedMessageId,
   buildParticipantForwardCandidate,
   buildStableMessageKey,
   evaluateReplyAfterGuard,
   isPlaywrightGuaranteeFirstAdmissionEnabled,
   __collapseRowsForForwardForTests,
-} from "../src/services/playwrightListener/listener.js";
-import {
+} = await import("../src/services/playwrightListener/listener.js");
+const {
   candidateRowsAfterNormalizedCursor,
   decideParticipantForwardTurn,
   normalizePersistedCursor,
-} from "../src/services/playwrightListener/forwardDecision.js";
-import {
+} = await import("../src/services/playwrightListener/forwardDecision.js");
+const {
   __clearInboundTurnLedgerForTests,
   __getInboundTurnLedgerPathForTests,
   __reloadInboundTurnLedgerForTests,
   markInboundTurnLedgerDone,
-} from "../src/services/inboundTurnLedger.js";
-import { initPlaywrightGuaranteeMaps } from "../src/services/playwrightGuaranteeBridge.js";
-import { setMessageState } from "../src/services/messageState.js";
+  markInboundTurnLedgerOutboundLocked,
+} = await import("../src/services/inboundTurnLedger.js");
+const { initPlaywrightGuaranteeMaps } = await import(
+  "../src/services/playwrightGuaranteeBridge.js"
+);
+const { setMessageState } = await import("../src/services/messageState.js");
 
 const CHAT_KEY = "car rental queries";
 const PARTICIPANT_KEY = "customer-alpha::first-seen-1";
@@ -213,6 +222,48 @@ test("D. ledger done rows are skipped with explicit reason", () => {
   );
 });
 
+test("D1. outbound_locked row is skipped during cursor recovery", () => {
+  initPlaywrightGuaranteeMaps();
+  __clearInboundTurnLedgerForTests();
+  __reloadInboundTurnLedgerForTests();
+
+  const locked = waRow(
+    "Civic ki picture share kr dn live media fix test",
+    18,
+    "3EB0BAD991659865AE1D6B"
+  );
+  markInboundTurnLedgerOutboundLocked({
+    chatKey: CHAT_KEY,
+    stableId: "wa::3EB0BAD991659865AE1D6B",
+    guaranteeKey: `${CHAT_KEY}::wa::3EB0BAD991659865AE1D6B`,
+    textPreview: locked.text,
+    outboundLockStage: "buffer_send_start",
+    sendVia: "PLAYWRIGHT",
+  });
+
+  const decision = decideParticipantForwardTurn({
+    chatKey: CHAT_KEY,
+    cursorKey: CURSOR_KEY,
+    participantKey: PARTICIPANT_KEY,
+    participantMessages: [locked],
+    allParticipantUserRows: [locked],
+    extractedMessages: [locked],
+    sorted: [locked],
+    persistedCursor: {
+      lastProcessedInboundId: "wa::MISSING_FROM_DOM",
+      lastProcessedSourceMessageIndex: 99,
+    },
+    lastProcessedUserMsgId: "wa::MISSING_FROM_DOM",
+    sidebarHasSignal: true,
+    normalizedGroupChatKeyForCompare: CHAT_KEY,
+    guaranteeFirst: true,
+    deps: forwardDeps(),
+  });
+
+  assert.equal(decision.action, "skip");
+  assert.equal(decision.reason, "LEDGER_OUTBOUND_LOCKED");
+});
+
 test("D2. outbound echo stable id is not forwarded", () => {
   const row = waRow("echo bubble", 19, "3EB0ECHOECHOECHO");
   const decision = decideParticipantForwardTurn({
@@ -315,4 +366,89 @@ test("E. car rental queries fixture: 3 din k lye forwards after corolla cursor i
   assert.equal(decision.action, "forward");
   assert.equal(decision.stableId, "wa::3EB03806A62BF9C295012F");
   assert.equal(decision.candidate?.text, "3 din k lye");
+});
+
+test("F. cursor recovery does not collapse old visible row with current fresh row", () => {
+  initPlaywrightGuaranteeMaps();
+  __clearInboundTurnLedgerForTests();
+  __reloadInboundTurnLedgerForTests();
+
+  const old1517 = waRow(
+    "Civic ki picture share kr dn live false test 1517",
+    17,
+    "3EB0AEA166FBF6193271CC"
+  );
+  const fresh1522 = waRow(
+    "Civic ki picture share kr dn no-send outbound lock test 1522",
+    18,
+    "3EB0FD02048DC01DFFE070"
+  );
+  const extracted = [old1517, fresh1522];
+  const freshId = buildExtractedMessageId(fresh1522, extracted).id;
+
+  const decision = decideParticipantForwardTurn({
+    chatKey: CHAT_KEY,
+    cursorKey: CURSOR_KEY,
+    participantKey: PARTICIPANT_KEY,
+    participantMessages: [old1517, fresh1522],
+    allParticipantUserRows: [old1517, fresh1522],
+    extractedMessages: extracted,
+    sorted: extracted,
+    persistedCursor: {
+      lastProcessedInboundId: "wa::MISSING_FROM_DOM",
+      lastProcessedSourceMessageIndex: 99,
+    },
+    lastProcessedUserMsgId: "wa::MISSING_FROM_DOM",
+    sidebarHasSignal: true,
+    normalizedGroupChatKeyForCompare: CHAT_KEY,
+    guaranteeFirst: true,
+    currentFreshAdmittedStableIds: new Set([freshId]),
+    deps: forwardDeps(),
+  });
+
+  assert.equal(decision.action, "forward");
+  assert.equal(decision.stableId, freshId);
+  assert.equal(
+    decision.candidate?.text,
+    "Civic ki picture share kr dn no-send outbound lock test 1522"
+  );
+  assert.equal(decision.candidate?.__catchupMergedRowCount, undefined);
+  assert.equal(decision.candidate?.__burstMerged, undefined);
+});
+
+test("G. cursor recovery may collapse only rows proven current-fresh", () => {
+  initPlaywrightGuaranteeMaps();
+  __clearInboundTurnLedgerForTests();
+  __reloadInboundTurnLedgerForTests();
+
+  const civic = waRow("Civic", 30, "3EB0FRESH_A");
+  const picture = waRow("picture bhej do", 31, "3EB0FRESH_B");
+  const extracted = [civic, picture];
+  const currentFresh = new Set(
+    extracted.map((row) => buildExtractedMessageId(row, extracted).id)
+  );
+
+  const decision = decideParticipantForwardTurn({
+    chatKey: CHAT_KEY,
+    cursorKey: CURSOR_KEY,
+    participantKey: PARTICIPANT_KEY,
+    participantMessages: extracted,
+    allParticipantUserRows: extracted,
+    extractedMessages: extracted,
+    sorted: extracted,
+    persistedCursor: {
+      lastProcessedInboundId: "wa::MISSING_FROM_DOM",
+      lastProcessedSourceMessageIndex: 99,
+    },
+    lastProcessedUserMsgId: "wa::MISSING_FROM_DOM",
+    sidebarHasSignal: true,
+    normalizedGroupChatKeyForCompare: CHAT_KEY,
+    guaranteeFirst: true,
+    currentFreshAdmittedStableIds: currentFresh,
+    deps: forwardDeps(),
+  });
+
+  assert.equal(decision.action, "forward");
+  assert.equal(decision.candidate?.text, "Civic | picture bhej do");
+  assert.equal(decision.candidate?.__catchupMergedRowCount, 2);
 });

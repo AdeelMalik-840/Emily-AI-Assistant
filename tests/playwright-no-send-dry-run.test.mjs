@@ -152,7 +152,11 @@ test("direct sendPlaywrightGroupImages dry-run returns success before upload or 
       })
     );
 
-    assert.equal(result, true);
+    assert.equal(result?.ok, true);
+    assert.equal(result?.clicked, false);
+    assert.equal(result?.verified, false);
+    assert.equal(result?.status, "dry_run");
+    assert.equal(result?.imageSendJobId, "imgjob-test");
     assert.ok(
       calls.some(
         ([event, payload]) =>
