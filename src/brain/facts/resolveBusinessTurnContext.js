@@ -29,6 +29,178 @@ function normalizeMessage(message) {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function hasValue(value) {
+  return String(value ?? "").trim().length > 0;
+}
+
+/**
+ * @param {string} normalizedMessage
+ * @returns {string[]}
+ */
+function collectWeakContextSignals(normalizedMessage) {
+  const out = [];
+  if (/\b(chahiye|chahye|chaiye|chaahiye|chyh)\b/i.test(normalizedMessage)) {
+    out.push("need_context");
+  }
+  if (/\b(final|done|proceed)\b/i.test(normalizedMessage)) {
+    out.push("weak_commitment_keyword");
+  }
+  if (/\d+\s*(?:din|deen|dino|day|days|ghanty|ghante|ghanta|hour|hours)\b/i.test(normalizedMessage)) {
+    out.push("duration_context");
+  }
+  if (/\b(?:kal|tomorrow)\b/i.test(normalizedMessage)) {
+    out.push("date_context");
+  }
+  if (/\bk\s*(?:lye|liye|lie|keliye)\b/i.test(normalizedMessage)) {
+    out.push("for_context");
+  }
+  return [...new Set(out)];
+}
+
+/**
+ * @param {Record<string, unknown>} p
+ */
+function buildContextToPersist(p) {
+  if (p.memoryAllowed !== true || !hasValue(p.resolvedItemId)) {
+    return Object.freeze({
+      memoryAllowed: Boolean(p.memoryAllowed),
+      rememberResolvedItem: false,
+      itemId: null,
+      rememberDuration: false,
+      durationDays: null,
+    });
+  }
+  const durationDays = Number(p.durationDays);
+  const rememberDuration = Number.isFinite(durationDays) && durationDays >= 1;
+  return Object.freeze({
+    memoryAllowed: true,
+    rememberResolvedItem: true,
+    itemId: String(p.resolvedItemId),
+    rememberDuration,
+    durationDays: rememberDuration ? Math.max(1, Math.floor(durationDays)) : null,
+  });
+}
+
+/**
+ * @param {{
+ *   normalizedMessage: string,
+ *   understanding: Record<string, unknown> | null,
+ *   signals: Record<string, unknown>,
+ *   itemFacts: Record<string, unknown>,
+ *   participantFacts: Record<string, unknown>,
+ * }} p
+ */
+function resolveBusinessDecision(p) {
+  const signals = p.signals ?? {};
+  const understanding = p.understanding ?? {};
+  const resolvedItemId = hasValue(p.itemFacts?.id) ? String(p.itemFacts.id) : null;
+  const durationDays =
+    understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
+      ? Math.max(1, Math.floor(Number(understanding.durationDays)))
+      : null;
+  const requestedField =
+    String(understanding?.askedField ?? signals.askedFieldRaw ?? signals.askedField ?? "").trim() || null;
+  const weakContextSignals = collectWeakContextSignals(p.normalizedMessage);
+  const strongBookingCommand = Boolean(signals.strongBookingCommitment);
+  const memoryAllowed = p.participantFacts?.participant?.memoryAllowed === true;
+  const hasResolvedItem = hasValue(resolvedItemId);
+  const unlistedMentionLabel = String(understanding?.unlistedMentionLabel ?? "").trim() || null;
+  const clearBusinessIntentWithoutResolvedItem =
+    !hasResolvedItem &&
+    Boolean(unlistedMentionLabel) &&
+    (signals.photoAsk || signals.priceAsk || signals.availabilityAsk || strongBookingCommand);
+  const secondaryIntents = [];
+  if (weakContextSignals.length > 0) secondaryIntents.push("context_capture");
+  if (signals.availabilityAsk && signals.priceAsk) secondaryIntents.push("availability_context");
+  if (durationDays != null) secondaryIntents.push("duration_context");
+
+  let primaryIntent = "unknown";
+  let workflowType = "unknown_clarification";
+  let replyType = "clarification";
+  let confidence = hasResolvedItem ? "medium" : "low";
+  let reason = "no_matching_business_decision";
+  let sideEffectsAllowed = [];
+
+  if (signals.photoAsk && hasResolvedItem) {
+    primaryIntent = "image_catalog_request";
+    workflowType = "image_catalog_request";
+    replyType = "image_catalog";
+    confidence = "high";
+    reason = "explicit_media_request_wins";
+  } else if (signals.priceAsk && hasResolvedItem && durationDays != null) {
+    primaryIntent = "pricing_with_duration";
+    workflowType = "pricing_with_duration";
+    replyType = "price_answer";
+    confidence = "high";
+    reason =
+      weakContextSignals.length > 0
+        ? "explicit_rent_question_wins_over_weak_need_duration_context"
+        : "explicit_rent_question_with_duration";
+  } else if (signals.priceAsk && hasResolvedItem) {
+    primaryIntent = "pricing_inquiry";
+    workflowType = "pricing_inquiry";
+    replyType = "price_answer";
+    confidence = "high";
+    reason =
+      weakContextSignals.length > 0
+        ? "explicit_price_question_wins_over_weak_context"
+        : "explicit_price_question";
+  } else if (signals.availabilityAsk && hasResolvedItem) {
+    primaryIntent = "availability_inquiry";
+    workflowType = "availability_inquiry";
+    replyType = "availability_answer";
+    confidence = "high";
+    reason = "explicit_availability_question";
+  } else if (strongBookingCommand && hasResolvedItem) {
+    primaryIntent = "booking_request";
+    workflowType = "booking_request";
+    replyType = "booking_ack";
+    confidence = "high";
+    reason = "strong_booking_command";
+    sideEffectsAllowed = ["booking_request"];
+  } else if (clearBusinessIntentWithoutResolvedItem) {
+    primaryIntent = "unlisted_item";
+    workflowType = "unlisted_item";
+    replyType = "unlisted_item_clarification";
+    confidence = "medium";
+    reason = "clear_business_intent_item_not_offered";
+  } else if (
+    hasResolvedItem &&
+    durationDays != null &&
+    /\b(?:kya|kitna|kitni|kitne|ktna|ho\s*ga|hoga|hogi|banega|banta)\b/i.test(p.normalizedMessage)
+  ) {
+    primaryIntent = "pricing_with_duration";
+    workflowType = "pricing_with_duration";
+    replyType = "price_answer";
+    confidence = "medium";
+    reason = "item_context_duration_amount_followup";
+  }
+
+  return Object.freeze({
+    primaryIntent,
+    secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
+    workflowType,
+    replyType,
+    requestedField,
+    resolvedItemId,
+    durationDays,
+    strongBookingCommand,
+    weakContextSignals: Object.freeze(weakContextSignals),
+    sideEffectsAllowed: Object.freeze(sideEffectsAllowed),
+    contextToPersist: buildContextToPersist({
+      memoryAllowed,
+      resolvedItemId,
+      durationDays,
+    }),
+    confidence,
+    reason,
+  });
+}
+
+/**
  * @param {string} rawMessage
  * @param {{ browseAsk?: boolean }} signals
  * @param {{ intentsRanked?: string[] } | null | undefined} understanding
@@ -281,6 +453,14 @@ export async function resolveBusinessTurnContext(params) {
       business: businessFacts.sourceEvidence,
     },
   };
+
+  resolved.decision = resolveBusinessDecision({
+    normalizedMessage,
+    understanding,
+    signals,
+    itemFacts,
+    participantFacts,
+  });
 
   if (params.log !== false) {
     logCanonicalFactsResolved(resolved);

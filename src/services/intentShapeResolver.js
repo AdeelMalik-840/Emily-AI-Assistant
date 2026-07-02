@@ -42,23 +42,45 @@ function isRentAvailabilityCompound(text) {
  * @param {string} text
  */
 function hasStrongBookingCommitPhraseLocal(text) {
-  if (/\b(book|booking|bookings|reserve|reservation|confirm(?:ed)?)\b/i.test(text)) {
+  const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (/\b(book|booking|bookings|reserve|reservation)\b/i.test(normalized)) {
     return true;
   }
-  if (/\b(done|finalize|final(?:ise|ize)?|proceed)\b/i.test(text)) return true;
-  if (/\b(kar\s*do|kardo|karwa(?:do| den)?)\b/i.test(text)) return true;
-  if (/\b(chahiye|chahye|chaiye|chaahiye)\b/i.test(text)) return true;
-  if (/\b(chahta|chahti)\b/i.test(text)) return true;
-  if (/^(haan|han|yes|jee|ji)\b/i.test(text.trim()) && /\d/.test(text)) return true;
+  if (
+    /\b(?:confirm(?:ed)?|final(?:ize|ise|ize)?|reserve|proceed)\s+(?:kar|kr|kardo|kar\s*do|kr\s*do|kar\s*dein|kr\s*dein|karna|karni|karen|karein)\b/i.test(
+      normalized
+    )
+  ) {
+    return true;
+  }
+  if (/\b(?:isko|is\s+ko|yeh|ye)\s+(?:book|confirm|reserve)\s+kar\s*(?:do|dein)\b/i.test(normalized)) {
+    return true;
+  }
+  if (/\b(chahta|chahti)\b/i.test(normalized)) return true;
+  if (/^(haan|han|yes|jee|ji)\b/i.test(normalized) && /\d/.test(normalized)) return true;
   return false;
 }
 
 /**
  * @param {string} text
  */
-function hasBookingCommitmentSignal(text) {
+function hasWeakCommitmentKeyword(text) {
+  return /\b(done|final|proceed)\b/i.test(String(text ?? ""));
+}
+
+/**
+ * @param {string} text
+ * @param {{ explicitMediaAsk?: boolean, priceAsk?: boolean, availabilityAsk?: boolean, detailsAsk?: boolean }} [signals]
+ */
+function hasBookingCommitmentSignal(text, signals = {}) {
   if (hasStrongBookingCommitPhraseLocal(text)) return true;
-  if (/\b(chahiye|chahye|chaiye|chaahiye)\b/i.test(text)) return true;
+  const hasExplicitFieldIntent =
+    Boolean(signals.explicitMediaAsk) ||
+    Boolean(signals.priceAsk) ||
+    Boolean(signals.availabilityAsk) ||
+    Boolean(signals.detailsAsk);
+  if (hasWeakCommitmentKeyword(text) && !hasExplicitFieldIntent) return true;
+  if (/\b(chahiye|chahye|chaiye|chaahiye|chyh)\b/i.test(text) && !hasExplicitFieldIntent) return true;
   if (
     /\d+\s*(?:din|deen|dino|day|days|ghanty|ghante|ghanta|hour|hours)\s+k\s*(?:lye|liye|lie|keliye)\b/i.test(
       text.replace(/\s+/g, " ")
@@ -66,7 +88,11 @@ function hasBookingCommitmentSignal(text) {
   ) {
     return true;
   }
-  if (/\bk\s*(?:lye|liye|lie|keliye)\b/i.test(text) && /\b(chahiye|chahye|chaiye)\b/i.test(text)) {
+  if (
+    /\bk\s*(?:lye|liye|lie|keliye)\b/i.test(text) &&
+    /\b(chahiye|chahye|chaiye|chyh)\b/i.test(text) &&
+    !hasExplicitFieldIntent
+  ) {
     return true;
   }
   if (/\brent\s+(kar|karna|lena|leni)\b/i.test(text)) return true;
@@ -78,8 +104,27 @@ function hasBookingCommitmentSignal(text) {
  * @param {string} text
  */
 function explicitlyAsksAmount(text) {
-  return /\b(price|rate|cost|charges?|amount|quote|quotation|kitna|kitni|kitne|how much|per\s*day|daily|monthly|mahina|maheena|mahine|\/day)\b/i.test(
+  return /\b(price|rate|cost|charges?|amount|quote|quotation|kitna|kitni|kitne|ktna|how much|per\s*day|daily|monthly|mahina|maheena|mahine|\/day)\b/i.test(
     text
+  );
+}
+
+/**
+ * @param {string} text
+ * @param {string | null} askedField
+ */
+function hasExplicitMediaAsk(text, askedField) {
+  if (isPhotoField(askedField)) return true;
+  const normalized = String(text ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  const mediaWord =
+    /\b(picture|pictures|photo|photos|image|images|pic|pics|tasveer|tasveeren|tasveerain|tasweer|tasweeren|tasweerain)\b/i.test(
+      normalized
+    );
+  if (!mediaWord) return false;
+  return (
+    /\b(bhejo|bhej\s*(?:do|dn|den|dain)|share\s*(?:karo|kar\s*do|kr\s*do|kar\s*dn|kr\s*dn)|dikha\s*(?:do|dn|den|dain)|dikhao|show\s*karo|send\s*karo)\b/i.test(
+      normalized
+    ) || isPhotoField(askedField)
   );
 }
 
@@ -148,10 +193,11 @@ export function extractTurnSignals(p) {
       text
     ) &&
       !rentAvailabilityCompound) ||
-    (/\b(price|rate|cost|charges?|rent|kiraya|kitna|kitni|kitne)\b/i.test(text) &&
+    (/\b(price|rate|cost|charges?|rent|kiraya|kitna|kitni|kitne|ktna)\b/i.test(text) &&
       !rentAvailabilityCompound);
 
-  const photoAsk = isPhotoField(askedField);
+  const explicitMediaAsk = hasExplicitMediaAsk(text, askedField);
+  const photoAsk = explicitMediaAsk;
   const detailsAsk =
     isDetailsField(askedField) ||
     /\b(detail|details|spec|specs|info|information|features?)\b/i.test(text);
@@ -169,7 +215,14 @@ export function extractTurnSignals(p) {
     (parseUserDuration(text) != null &&
       Number.isFinite(Number(parseUserDuration(text)?.normalizedDays)));
 
-  const bookingCommitment = hasBookingCommitmentSignal(text);
+  const strongBookingCommitment = hasStrongBookingCommitPhraseLocal(text);
+  const weakCommitmentKeyword = hasWeakCommitmentKeyword(text);
+  const bookingCommitment = hasBookingCommitmentSignal(text, {
+    explicitMediaAsk,
+    priceAsk,
+    availabilityAsk,
+    detailsAsk,
+  });
   const logisticsMentioned =
     Boolean(p.hasContact) ||
     hasContactInMessage(p.message) ||
@@ -190,6 +243,9 @@ export function extractTurnSignals(p) {
     availabilityAsk,
     durationMentioned,
     bookingCommitment,
+    strongBookingCommitment,
+    weakCommitmentKeyword,
+    explicitMediaAsk,
     logisticsMentioned,
     browseAsk,
     rentAvailabilityCompound,
@@ -234,7 +290,7 @@ export function resolveTurnIntentShape(p) {
     (signals.priceAsk &&
       signals.durationMentioned &&
       (explicitlyAsksAmount(text) ||
-        /\b(total|overall|kitna|banega|banayega|batao|bata)\b/i.test(text)));
+        /\b(total|overall|kitna|ktna|banega|banayega|batao|bata)\b/i.test(text)));
 
   if (signals.browseAsk || priorityIntent === "browse_options" || llmPrimary === "browse_options") {
     primaryIntent = "browse_options";
@@ -271,7 +327,7 @@ export function resolveTurnIntentShape(p) {
     (signals.priceAsk || signals.detailsAsk || signals.photoAsk) &&
     !signals.bookingCommitment &&
     !signals.logisticsMentioned &&
-    (!signals.durationMentioned || explicitlyAsksAmount(text) || /\b(rent|rate|price|kitna)\b/i.test(text))
+    (!signals.durationMentioned || explicitlyAsksAmount(text) || /\b(rent|rate|price|kitna|ktna)\b/i.test(text))
   ) {
     if (signals.photoAsk) {
       primaryIntent = "photo_question";

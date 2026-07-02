@@ -93,12 +93,27 @@ function isExplicitBookingRequest(understanding, message) {
  *   understanding: TurnUnderstanding,
  *   turnContext: TurnContext,
  *   message?: string,
+ *   resolvedBusinessTurnContext?: Record<string, unknown> | null,
  * }} params
  * @returns {WorkflowDecision}
  */
-export function selectWorkflow({ understanding, turnContext, message = "" }) {
+export function selectWorkflow({ understanding, turnContext, message = "", resolvedBusinessTurnContext = null }) {
   const inboundText = String(message ?? "").trim();
   const normalized = normalizeText(inboundText);
+  const decision =
+    resolvedBusinessTurnContext?.decision &&
+    typeof resolvedBusinessTurnContext.decision === "object" &&
+    !Array.isArray(resolvedBusinessTurnContext.decision)
+      ? /** @type {Record<string, unknown>} */ (resolvedBusinessTurnContext.decision)
+      : null;
+  const decisionWorkflowType = String(decision?.workflowType ?? "").trim();
+  if (decisionWorkflowType && decisionWorkflowType !== "unknown_clarification") {
+    return {
+      workflowType: decisionWorkflowType,
+      reason: String(decision?.reason ?? "resolved_business_turn_context_decision"),
+      priority: 100,
+    };
+  }
 
   if (isGreeting(normalized)) {
     return {

@@ -44,7 +44,6 @@ for (const msg of pricingCases) {
 }
 
 const bookingCases = [
-  "Corolla rent k lye chahiye",
   "Corolla 3 din k lye",
   "Corolla book karni hai",
   "Corolla kal chahiye",
@@ -81,3 +80,70 @@ test("pricing after civic memory context: Corolla rent?", () => {
   assert.equal(s.primaryIntent, "pricing_question");
   assert.equal(s.responsePolicy, "answer_requested_field");
 });
+
+test("explicit rent beats weak chahiye context", () => {
+  const s = shape("Corolla rent k lye chahiye");
+  assert.equal(s.primaryIntent, "pricing_question");
+  assert.equal(s.responsePolicy, "answer_requested_field");
+  assert.equal(s.signals.bookingCommitment, false);
+});
+
+const imageWithWeakCommitmentCases = [
+  "Civic ki picture share kr dn live image final test 1529",
+  "Civic ki picture share kr dn final test",
+  "Civic ki picture share kr dn",
+  "Civic ki picture share kr dn no-send outbound lock test 1522",
+  "Civic picture bhejo final karne se pehle",
+  "Civic ki tasveer bhej do",
+  "picture bhejo",
+  "photo dikha do",
+  "image share kr do",
+  "pic bhejo",
+];
+
+for (const msg of imageWithWeakCommitmentCases) {
+  test(`image shape beats weak commitment: ${msg}`, () => {
+    const s = shape(msg);
+    assert.equal(s.primaryIntent, "photo_question", msg);
+    assert.equal(s.responsePolicy, "answer_requested_field", msg);
+    assert.equal(s.requestedField, "photo", msg);
+    assert.equal(s.signals.photoAsk, true, msg);
+    assert.equal(s.signals.bookingCommitment, false, msg);
+  });
+}
+
+const strongBookingCases = [
+  "Civic final kar do",
+  "Civic final kr do",
+  "Civic finalize kar do",
+  "Civic book kar do",
+  "Civic confirm kar do",
+  "Civic reserve kar do",
+  "Civic proceed kar do",
+  "Isko book kar dein",
+  "Isko confirm kar dein",
+];
+
+for (const msg of strongBookingCases) {
+  test(`strong booking shape: ${msg}`, () => {
+    const s = shape(msg);
+    assert.equal(s.primaryIntent, "booking_request", msg);
+    assert.equal(s.responsePolicy, "start_or_continue_booking", msg);
+    assert.equal(s.signals.bookingCommitment, true, msg);
+  });
+}
+
+const finalPricingCases = [
+  "Civic final price kya hai?",
+  "Civic final rate?",
+  "Civic ka rent final hai?",
+];
+
+for (const msg of finalPricingCases) {
+  test(`final pricing is not booking: ${msg}`, () => {
+    const s = shape(msg);
+    assert.equal(s.primaryIntent, "pricing_question", msg);
+    assert.equal(s.responsePolicy, "answer_requested_field", msg);
+    assert.equal(s.signals.bookingCommitment, false, msg);
+  });
+}

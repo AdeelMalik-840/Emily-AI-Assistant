@@ -263,11 +263,10 @@ test("9. unclear field token p? → no price guess", () => {
   assert.equal(s.primaryIntent, "casual_or_unclear");
 });
 
-test("10 regression: Corolla rent k lye chahiye → booking", () => {
+test("10 regression: Corolla rent k lye chahiye → pricing", () => {
   const f = fuzzy("Corolla rent k lye chahiye");
   const s = shapeFromFuzzy(f);
-  assert.equal(s.primaryIntent, "booking_request");
-  assert.equal(detectBookingEvent(f.normalizedText).bookingIntent, true);
+  assert.equal(s.primaryIntent, "pricing_question");
 });
 
 test("11 regression: Corolla rent? → pricing", () => {
