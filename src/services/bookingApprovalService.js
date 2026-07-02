@@ -40,6 +40,13 @@ function bookingOwnerApprovalFirstEnabled() {
   return /^true$/i.test(String(process.env.BOOKING_OWNER_APPROVAL_FIRST ?? "").trim());
 }
 
+function isPlaywrightGroupCustomerHandoffEligible(booking) {
+  return (
+    String(booking?.bookingSource ?? "").trim() === "PLAYWRIGHT_GROUP" &&
+    booking?.playwrightReplyPrivateEligible === true
+  );
+}
+
 function updateSessionBookingStateFromApproval({ userId, bookingId, booking, status, approvalStage }) {
   const contextKey = String(booking?.playwrightChatKey ?? booking?.sessionKey ?? "").trim();
   const uid = String(userId ?? "").trim();
@@ -325,9 +332,12 @@ export async function handleBookingApproval({
     }
 
     const newStatus = action === "approve" ? "approved" : "rejected";
+    const playwrightGroupCustomerHandoffEligible =
+      isPlaywrightGroupCustomerHandoffEligible(data);
     const ownerApprovalFirst =
       bookingOwnerApprovalFirstEnabled() ||
-      String(data?.approvalStage ?? "") === "pending_owner_approval";
+      String(data?.approvalStage ?? "") === "pending_owner_approval" ||
+      playwrightGroupCustomerHandoffEligible;
     await bookingRef.update({
       status: newStatus,
       businessId: uid,
@@ -340,6 +350,7 @@ export async function handleBookingApproval({
                 : "rejected",
           }
         : {}),
+      ...(playwrightGroupCustomerHandoffEligible ? { canDmCustomer: true } : {}),
       updatedAt: new Date(),
       approvedBy: String(senderPhone ?? "").trim() || null,
     });
@@ -405,7 +416,7 @@ export async function handleBookingApproval({
       }
     }
 
-    if (newStatus === "approved") {
+    if (ownerApprovalFirst && (newStatus === "approved" || newStatus === "rejected")) {
       const notificationStatus = String(
         data?.approvalCustomerNotificationStatus ?? ""
       ).trim();
@@ -418,6 +429,7 @@ export async function handleBookingApproval({
         console.log("[approval_customer_notify_started]", { bookingId: bid });
         await bookingRef.update({
           approvalCustomerNotificationStatus: "pending",
+          ...(playwrightGroupCustomerHandoffEligible ? { canDmCustomer: true } : {}),
           updatedAt: new Date(),
         });
       }
