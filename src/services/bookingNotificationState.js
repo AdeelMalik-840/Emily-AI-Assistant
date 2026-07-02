@@ -31,6 +31,8 @@ export async function updateBookingNotificationState({
   notificationSent,
   providerMessageId,
   notificationError,
+  bookingStatus,
+  approvalStage,
 }) {
   const ref = bookingRef(db, userId, bookingId);
   const status = safeString(notificationStatus, 80);
@@ -50,6 +52,14 @@ export async function updateBookingNotificationState({
   if (notificationError != null) {
     update.notificationError = safeString(notificationError, 400);
   }
+  const nextBookingStatus = safeString(bookingStatus, 80);
+  if (nextBookingStatus) {
+    update.status = nextBookingStatus;
+  }
+  const nextApprovalStage = safeString(approvalStage, 80);
+  if (nextApprovalStage) {
+    update.approvalStage = nextApprovalStage;
+  }
 
   try {
     await ref.update(update);
@@ -60,6 +70,8 @@ export async function updateBookingNotificationState({
         typeof notificationSent === "boolean" ? notificationSent : undefined,
       hasProviderMessageId: Boolean(providerId),
       hasError: notificationError != null,
+      bookingStatus: nextBookingStatus || undefined,
+      approvalStage: nextApprovalStage || undefined,
     });
     return true;
   } catch (err) {
@@ -110,7 +122,7 @@ export async function markBookingNotificationProviderAccepted({
     userId,
     bookingId,
     notificationStatus: "sent_to_provider",
-    notificationSent: false,
+    notificationSent: true,
     providerMessageId,
   });
   const stateRef = notificationStateRef(db, userId, bookingId);
@@ -119,7 +131,7 @@ export async function markBookingNotificationProviderAccepted({
     await stateRef.set({
       bookingId: safeString(bookingId),
       notificationStatus: "sent_to_provider",
-      notificationSent: false,
+      notificationSent: true,
       providerMessageId: safeString(providerMessageId, 160) || null,
       sentToProviderAt: new Date(),
     });
@@ -148,6 +160,8 @@ export async function markBookingNotificationFailed({
     notificationStatus: "failed",
     notificationSent: false,
     notificationError,
+    bookingStatus: "notification_failed",
+    approvalStage: "owner_notification_failed",
   });
 }
 

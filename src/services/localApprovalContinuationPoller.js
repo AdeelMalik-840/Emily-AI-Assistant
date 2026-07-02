@@ -2,7 +2,10 @@ import admin from "firebase-admin";
 import { createHash } from "node:crypto";
 
 import db from "../config/firebase.js";
-import { buildCustomerApprovalContinuation } from "./customerApprovalContinuation.js";
+import {
+  buildCustomerApprovalContinuation,
+  buildCustomerUnavailableContinuation,
+} from "./customerApprovalContinuation.js";
 import { replyPrivatelyToLatestUserMessage } from "./playwrightReplyPrivatelyBridge.js";
 import {
   releaseReplyPrivateLock,
@@ -184,6 +187,10 @@ function buildOwnerApprovedBookingCustomerEvent(booking) {
     privacyMode: "dm",
     requiredCustomerAction: "share_pickup_or_delivery_details_in_private_chat",
   };
+}
+
+function isFinalCustomerNotificationStatus(status) {
+  return status === "approved" || status === "rejected";
 }
 
 function buildSourceMessageForReplyPrivately(booking) {
@@ -436,7 +443,9 @@ function resolveNextRetryAtMs(data) {
 
 function failedRetryDecision(data) {
   if (!data) return { ok: false, reason: "BOOKING_MISSING" };
-  if (clean(data.status) !== "approved") return { ok: false, reason: "BOOKING_NOT_APPROVED" };
+  if (!isFinalCustomerNotificationStatus(clean(data.status))) {
+    return { ok: false, reason: "BOOKING_NOT_FINAL_STATUS" };
+  }
   if (data?.playwrightReplyPrivateEligible !== true) return { ok: false, reason: "REPLY_PRIVATE_NOT_ELIGIBLE" };
   if (data?.approvalCustomerNotificationTerminalFailure === true) {
     return { ok: false, reason: "TERMINAL_FAILURE" };
@@ -485,18 +494,19 @@ function extractFirestoreIndexUrl(error) {
   return match ? match[0] : null;
 }
 
-function replyPrivatePollerFilters(statusFilter) {
+function replyPrivatePollerFilters(statusFilter, bookingStatus = "approved") {
   return {
-    status: "approved",
+    status: bookingStatus,
     approvalCustomerNotificationStatus: statusFilter,
     bookingSource: "PLAYWRIGHT_GROUP",
     playwrightReplyPrivateEligible: true,
   };
 }
 
-async function runReplyPrivatePollerQuery(collection, statusFilter, limit) {
-  const filters = replyPrivatePollerFilters(statusFilter);
+async function runReplyPrivatePollerQuery(collection, statusFilter, limit, bookingStatus = "approved") {
+  const filters = replyPrivatePollerFilters(statusFilter, bookingStatus);
   console.log("[reply_private_poller_query_started]", {
+    bookingStatus,
     statusFilter,
     filters,
   });
@@ -514,6 +524,7 @@ async function runReplyPrivatePollerQuery(collection, statusFilter, limit) {
       .get();
     const docs = snap?.docs ?? [];
     console.log("[reply_private_poller_query_result]", {
+      bookingStatus,
       statusFilter,
       count: docs.length,
       bookingIds: docs.map((doc) => doc.id),
@@ -521,6 +532,7 @@ async function runReplyPrivatePollerQuery(collection, statusFilter, limit) {
     return snap;
   } catch (error) {
     console.warn("[reply_private_poller_query_failed]", {
+      bookingStatus,
       statusFilter,
       code: error?.code || null,
       message: error?.message || String(error),
@@ -536,14 +548,27 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
     .collection("businesses")
     .doc(ownerUserId)
     .collection("bookings");
-  const pendingSnap = await runReplyPrivatePollerQuery(collection, "pending", limit);
-  const processingSnap = await runReplyPrivatePollerQuery(collection, "processing", limit);
-  const failedSnap = await runReplyPrivatePollerQuery(collection, "failed", limit);
+  const statusBuckets = ["approved", "rejected"];
+  const pendingSnaps = await Promise.all(
+    statusBuckets.map((bookingStatus) =>
+      runReplyPrivatePollerQuery(collection, "pending", limit, bookingStatus)
+    )
+  );
+  const processingSnaps = await Promise.all(
+    statusBuckets.map((bookingStatus) =>
+      runReplyPrivatePollerQuery(collection, "processing", limit, bookingStatus)
+    )
+  );
+  const failedSnaps = await Promise.all(
+    statusBuckets.map((bookingStatus) =>
+      runReplyPrivatePollerQuery(collection, "failed", limit, bookingStatus)
+    )
+  );
 
   const seen = new Set();
-  const pendingDocs = pendingSnap.docs ?? [];
-  const processingDocs = processingSnap.docs ?? [];
-  const failedDocs = failedSnap.docs ?? [];
+  const pendingDocs = pendingSnaps.flatMap((snap) => snap.docs ?? []);
+  const processingDocs = processingSnaps.flatMap((snap) => snap.docs ?? []);
+  const failedDocs = failedSnaps.flatMap((snap) => snap.docs ?? []);
   const eligible = [...pendingDocs, ...processingDocs].map((doc) => ({
     id: doc.id,
     ref: doc.ref,
@@ -787,8 +812,8 @@ async function fetchPendingPlaywrightApprovals(dbInstance, ownerUserId, limit = 
 
 function claimDecision(data) {
   if (!data) return { ok: false, reason: "BOOKING_MISSING" };
-  if (clean(data.status) !== "approved") {
-    return { ok: false, reason: "BOOKING_NOT_APPROVED" };
+  if (!isFinalCustomerNotificationStatus(clean(data.status))) {
+    return { ok: false, reason: "BOOKING_NOT_FINAL_STATUS" };
   }
   const status = clean(data.approvalCustomerNotificationStatus);
   if (status === "sent") return { ok: false, reason: "ALREADY_SENT" };
@@ -897,10 +922,11 @@ async function processPendingApproval({
   const playwrightChatKey = clean(
     booking?.sourcePlaywrightChatKey ?? booking?.playwrightChatKey ?? booking?.chatKey
   );
-  const message = buildCustomerApprovalContinuation(
-    buildOwnerApprovedBookingCustomerEvent(booking),
-    resolveApprovalResponseStyle(booking)
-  );
+  const customerEvent = buildOwnerApprovedBookingCustomerEvent(booking);
+  const message =
+    clean(booking?.status) === "rejected"
+      ? buildCustomerUnavailableContinuation(customerEvent, resolveApprovalResponseStyle(booking))
+      : buildCustomerApprovalContinuation(customerEvent, resolveApprovalResponseStyle(booking));
   const notificationKey = notificationKeyForBooking(bookingId);
 
   console.log("[local_approval_reply_private_started]", {

@@ -348,6 +348,67 @@ test("send attempted but unverified is terminal manual review and not retryable"
   assert.equal(typeof booking.replyPrivateMessageHash, "string");
 });
 
+test("successful reply privately verification persists dmMessageSent true", async () => {
+  const fake = createFakeDb({
+    bookings: [
+      {
+        id: "b_verified",
+        data: baseApprovedBooking({
+          approvalCustomerNotificationStatus: "pending",
+          approvalCustomerNotificationTerminalFailure: false,
+          itemName: "Honda Civic 2026 Oriel (White)",
+          durationDays: 4,
+          groupName: "Leads",
+          playwrightChatKey: "leads",
+          sourceText: "[Adeel malik] Honda civic 4 din k lye book karni hai",
+          sourceMessageId: "wa::3EB0000000000000000001",
+          sourceRowKey: "real:3EB0000000000000000001#1",
+          sourceIdentity: {
+            participantDisplayName: "Adeel malik",
+            participantKey: "scope::abc",
+            sourceRowKey: "real:3EB0000000000000000001#1",
+            sourceMessageId: "wa::3EB0000000000000000001",
+            sourceTextPreview: "Honda civic 4 din k lye book karni hai",
+            sourceMessageIndex: 1,
+          },
+        }),
+      },
+    ],
+  });
+
+  let calls = 0;
+  const replyPrivately = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      verificationPassed: true,
+      dmOpened: true,
+      dmMessageSent: true,
+      sendActionAttempted: true,
+      dmChatTitle: "Adeel Malik",
+      dmPlaywrightChatKey: "adeel malik",
+    };
+  };
+
+  await pollLocalApprovalContinuations({
+    dbInstance: fake.db,
+    ownerUserId: "owner1",
+    replyPrivately,
+  });
+
+  assert.equal(calls, 1);
+  const booking = fake.store.businesses.owner1.bookings.b_verified.data;
+  assert.equal(booking.approvalCustomerNotificationStatus, "sent");
+  assert.equal(booking.dmAttempted, true);
+  assert.equal(booking.dmOpened, true);
+  assert.equal(booking.dmMessageSent, true);
+  assert.equal(booking.dmSendAttempted, true);
+  assert.equal(booking.dmSendVerificationPassed, true);
+  assert.equal(booking.approvalCustomerNotificationError, null);
+  assert.equal(booking.approvalCustomerNotificationRetryable, false);
+  assert.equal(booking.approvalCustomerNotificationTerminalFailure, false);
+});
+
 test("send attempted terminal manual review is not retried", async () => {
   const fake = createFakeDb({
     bookings: [
@@ -441,4 +502,3 @@ test("compose failure before send action remains retryable", async () => {
   assert.equal(booking.approvalCustomerNotificationTerminalFailure, false);
   assert.equal(booking.dmSendAttempted, false);
 });
-
