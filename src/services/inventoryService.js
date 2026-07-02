@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import db from "../config/firebase.js";
 import admin from "firebase-admin";
 import { logBookingEvent } from "../utils/bookingLogger.js";
@@ -60,6 +61,38 @@ function normalizeFuzzy(s) {
     .replace(/[^a-z0-9\u0600-\u06FF\s]/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function cleanSourceKey(value) {
+  return String(value ?? "").trim();
+}
+
+export function __resolveBookingSourceDedupeKeyForTests({
+  sourceTurnKey,
+  guaranteeKey,
+  sourceMessageId,
+  sourceRowKey,
+} = {}) {
+  const turn = cleanSourceKey(sourceTurnKey);
+  if (turn) return { field: "sourceTurnKey", value: turn, reason: "sourceTurnKey" };
+  const guarantee = cleanSourceKey(guaranteeKey);
+  if (guarantee) return { field: "guaranteeKey", value: guarantee, reason: "guaranteeKey" };
+  const message = cleanSourceKey(sourceMessageId);
+  if (message) return { field: "sourceMessageId", value: message, reason: "sourceMessageId" };
+  const row = cleanSourceKey(sourceRowKey);
+  if (row) return { field: "sourceRowKey", value: row, reason: "sourceRowKey" };
+  return null;
+}
+
+export function __resolveBookingSourceLockIdForTests(sourceDedupeKey) {
+  const field = cleanSourceKey(sourceDedupeKey?.field).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const value = cleanSourceKey(sourceDedupeKey?.value);
+  if (!field || !value) return "";
+  const hash = createHash("sha256")
+    .update(`${field}\u0000${value}`)
+    .digest("hex")
+    .slice(0, 48);
+  return `${field}_${hash}`;
 }
 
 function levenshtein(a, b) {
@@ -152,6 +185,7 @@ export const BLOCKING_BOOKING_STATUSES = [
 export const NON_BLOCKING_BOOKING_STATUSES = [
   "cancelled",
   "completed",
+  "notification_failed",
   "rejected",
 ];
 const nonBlockingStatuses = NON_BLOCKING_BOOKING_STATUSES;
@@ -930,7 +964,7 @@ export function __displayNameFromParticipantKeyForTests(value) {
 /**
  * @param {string} traceId - Correlates with pipeline / processMessage logs
  * @param {string} userId
- * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null }} opts
+ * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceTurnKey?: string | null, guaranteeKey?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null, dbOverride?: unknown }} opts
  */
 export async function createBooking(
   traceId,
@@ -960,6 +994,8 @@ export async function createBooking(
     sourceGroupName,
     sourcePlaywrightChatKey,
     sourceMessageId,
+    sourceTurnKey,
+    guaranteeKey,
     sourceText,
     sourceTimestamp,
     sourceSenderScope,
@@ -970,6 +1006,7 @@ export async function createBooking(
     sourceRowKey,
     sourceMessageIndex,
     originalUserMessageText,
+    dbOverride,
   }
 ) {
   logAvailabilityPolicyOnce();
@@ -1101,6 +1138,12 @@ export async function createBooking(
       String(sourceMessageId ?? "").trim() ||
       String(messageId ?? "").trim()
   );
+  const sourceDedupeKey = __resolveBookingSourceDedupeKeyForTests({
+    sourceTurnKey,
+    guaranteeKey,
+    sourceMessageId: String(sourceMessageId ?? messageId ?? "").trim(),
+    sourceRowKey,
+  });
   const isPlaywrightGroupSource = Boolean(
     String(source ?? "").trim().toLowerCase() === "playwright" &&
       (String(groupName ?? sourceGroupName ?? "").trim() ||
@@ -1140,13 +1183,83 @@ export async function createBooking(
   });
 
   try {
-    const bookingsRef = db
+    const firestoreDb =
+      dbOverride && typeof dbOverride === "object"
+        ? /** @type {{ collection: Function, runTransaction: Function }} */ (dbOverride)
+        : db;
+    const bookingsRef = firestoreDb
       .collection("businesses")
       .doc(userId)
       .collection("bookings");
+    const sourceLocksRef = firestoreDb
+      .collection("businesses")
+      .doc(userId)
+      .collection("bookingSourceKeys");
+    const sourceLockRef = sourceDedupeKey
+      ? sourceLocksRef.doc(__resolveBookingSourceLockIdForTests(sourceDedupeKey))
+      : null;
     let createdBookingId = "";
+    let existingSourceBooking = null;
 
-    await db.runTransaction(async (tx) => {
+    await firestoreDb.runTransaction(async (tx) => {
+      if (sourceDedupeKey && sourceLockRef) {
+        const sourceLockSnap = await tx.get(sourceLockRef);
+        if (sourceLockSnap?.exists === true) {
+          const lockData = sourceLockSnap.data() || {};
+          const lockedBookingId = String(lockData?.bookingId ?? "").trim();
+          createdBookingId = lockedBookingId;
+          let bookingData = {};
+          if (lockedBookingId) {
+            const bookingSnap = await tx.get(bookingsRef.doc(lockedBookingId));
+            if (bookingSnap?.exists !== true) {
+              throw new Error("BOOKING_SOURCE_LOCK_MISSING_BOOKING");
+            }
+            bookingData = bookingSnap.data() || {};
+          }
+          existingSourceBooking = {
+            ...bookingData,
+            ok: true,
+            id: lockedBookingId || bookingData.id || undefined,
+            sourceIdempotencyKey: sourceDedupeKey.value,
+            sourceIdempotencyField: sourceDedupeKey.field,
+            sourceLockId: String(sourceLockRef.id ?? "").trim() || null,
+            duplicateSourceTurn: true,
+          };
+          return;
+        }
+
+        const existingSourceSnap = await tx.get(
+          bookingsRef.where(sourceDedupeKey.field, "==", sourceDedupeKey.value).limit(1)
+        );
+        const existingDoc = existingSourceSnap.docs?.[0] ?? null;
+        if (existingDoc) {
+          const data = existingDoc.data() || {};
+          createdBookingId = String(existingDoc.id ?? "").trim();
+          existingSourceBooking = {
+            ...data,
+            ok: true,
+            id: createdBookingId || data.id || undefined,
+            sourceIdempotencyKey: sourceDedupeKey.value,
+            sourceIdempotencyField: sourceDedupeKey.field,
+            sourceLockId: String(sourceLockRef.id ?? "").trim() || null,
+            duplicateSourceTurn: true,
+          };
+          const lockData = {
+            bookingId: createdBookingId || null,
+            sourceField: sourceDedupeKey.field,
+            sourceValue: sourceDedupeKey.value,
+            businessId: userId,
+            createdAt: FieldValue.serverTimestamp(),
+          };
+          if (typeof tx.create === "function") {
+            tx.create(sourceLockRef, lockData);
+          } else {
+            tx.set(sourceLockRef, lockData);
+          }
+          return;
+        }
+      }
+
       const existingSnap = await tx.get(bookingsRef.where("itemId", "==", id));
       const hasActiveBooking = existingSnap.docs.some((docSnap) => {
         const data = docSnap.data() || {};
@@ -1221,6 +1334,19 @@ export async function createBooking(
         ...(sourceMessageId != null && String(sourceMessageId).trim() !== ""
           ? { sourceMessageId: String(sourceMessageId).trim() }
           : {}),
+        ...(sourceTurnKey != null && String(sourceTurnKey).trim() !== ""
+          ? { sourceTurnKey: String(sourceTurnKey).trim() }
+          : {}),
+        ...(guaranteeKey != null && String(guaranteeKey).trim() !== ""
+          ? { guaranteeKey: String(guaranteeKey).trim() }
+          : {}),
+        ...(sourceDedupeKey
+          ? {
+              sourceIdempotencyField: sourceDedupeKey.field,
+              sourceIdempotencyKey: sourceDedupeKey.value,
+              sourceLockId: sourceLockRef ? String(sourceLockRef.id ?? "").trim() : null,
+            }
+          : {}),
         ...(sourceText != null && String(sourceText).trim() !== ""
           ? { sourceText: String(sourceText).trim() }
           : {}),
@@ -1291,7 +1417,42 @@ export async function createBooking(
         status: "pending_approval",
         createdAt: FieldValue.serverTimestamp(),
       });
+      if (sourceDedupeKey && sourceLockRef) {
+        const lockData = {
+          bookingId: createdBookingId || null,
+          sourceField: sourceDedupeKey.field,
+          sourceValue: sourceDedupeKey.value,
+          businessId: userId,
+          createdAt: FieldValue.serverTimestamp(),
+        };
+        if (typeof tx.create === "function") {
+          tx.create(sourceLockRef, lockData);
+        } else {
+          tx.set(sourceLockRef, lockData);
+        }
+      }
     });
+
+    if (existingSourceBooking) {
+      console.log("[booking_source_idempotency_hit]", {
+        bookingId: createdBookingId || null,
+        sourceField: sourceDedupeKey?.field ?? null,
+        sourceReason: sourceDedupeKey?.reason ?? null,
+      });
+      logBookingEvent({
+        traceId: tid,
+        step: "booking_creation",
+        status: "success",
+        data: {
+          result: "idempotent_existing",
+          itemId: id,
+          durationDays: days,
+          bookingId: createdBookingId || null,
+          sourceField: sourceDedupeKey?.field ?? null,
+        },
+      });
+      return existingSourceBooking;
+    }
 
     console.log("[booking_source_message_metadata_stored]", {
       bookingId: createdBookingId || null,
@@ -1346,6 +1507,13 @@ export async function createBooking(
       });
     }
 
+    const storedBookingSnap =
+      createdBookingId && bookingsRef?.doc
+        ? await bookingsRef.doc(createdBookingId).get().catch(() => null)
+        : null;
+    const storedBookingData =
+      storedBookingSnap?.exists === true ? storedBookingSnap.data() || {} : {};
+
     logBookingEvent({
       traceId: tid,
       step: "booking_creation",
@@ -1357,7 +1525,7 @@ export async function createBooking(
         bookingId: createdBookingId || null,
       },
     });
-    return { ok: true, id: createdBookingId || undefined };
+    return { ...storedBookingData, ok: true, id: createdBookingId || undefined };
   } catch (e) {
     if (String(e?.message ?? "") === "ITEM_ALREADY_BOOKED") {
       console.warn("[inventoryService] createBooking: item already booked", {

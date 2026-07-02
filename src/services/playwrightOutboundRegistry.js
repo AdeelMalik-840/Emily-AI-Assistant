@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 /** @typedef {{
+ *   kind?: "text" | "media_click",
  *   hash: string,
  *   textPreview: string,
  *   registeredAt: number,
@@ -10,14 +11,21 @@ import path from "node:path";
  *   messageId?: string | null,
  *   guaranteeKey?: string | null,
  *   sourceInboundMessageId?: string | null,
+ *   mediaHash?: string | null,
+ *   imageCount?: number,
+ *   imageSendJobId?: string | null,
+ *   status?: string | null,
  * }} OutboundChunkEntry */
 
 const OUTBOUND_REGISTRY_TTL_MS = 24 * 60 * 60 * 1000;
 const OUTBOUND_REGISTRY_MAX_PER_CHAT = 120;
 const PERSIST_PATH = path.join(
-  process.cwd(),
-  ".cursor",
-  "playwright-outbound-registry.json"
+  String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH ?? "").trim()
+    ? path.dirname(String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH).trim())
+    : path.join(process.cwd(), ".cursor"),
+  String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH ?? "").trim()
+    ? path.basename(String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH).trim())
+    : "playwright-outbound-registry.json"
 );
 
 /** @type {Map<string, OutboundChunkEntry[]>} */
@@ -42,6 +50,15 @@ function hashOutboundText(text) {
   return `ob:${norm.length}:${hash}`;
 }
 
+function simpleHash(prefix, value) {
+  const body = String(value ?? "");
+  let hash = 0;
+  for (let i = 0; i < body.length; i += 1) {
+    hash = (hash * 31 + body.charCodeAt(i)) | 0;
+  }
+  return `${prefix}:${body.length}:${hash}`;
+}
+
 /** @param {string} norm */
 function isNormalizedAssistantPriceReply(norm) {
   return (
@@ -56,6 +73,25 @@ function normalizeChatKey(chatKey) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ");
+}
+
+function normalizeImageUrls(imageUrls) {
+  const raw = Array.isArray(imageUrls) ? imageUrls : [];
+  const seen = new Set();
+  const out = [];
+  for (const entry of raw) {
+    const url = String(entry ?? "").trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out.sort();
+}
+
+export function hashPlaywrightMediaSet(imageUrls) {
+  const urls = normalizeImageUrls(imageUrls);
+  if (urls.length === 0) return "";
+  return simpleHash("media", urls.join("\n"));
 }
 
 /**
@@ -121,7 +157,7 @@ function pruneChatEntries(chatKey) {
   const list = registryByChat.get(key);
   if (!list || list.length === 0) return;
   const now = Date.now();
-  const fresh = list.filter((entry) => now - entry.registeredAt < OUTBOUND_REGISTRY_TTL_MS);
+  const fresh = list.filter((entry) => now - Number(entry.registeredAt ?? 0) < OUTBOUND_REGISTRY_TTL_MS);
   registryByChat.set(key, fresh.slice(-OUTBOUND_REGISTRY_MAX_PER_CHAT));
 }
 
@@ -156,6 +192,7 @@ export function registerPlaywrightOutboundChunks(chatKey, text, meta = {}) {
     const hash = hashOutboundText(chunk);
     if (list.some((entry) => entry.hash === hash)) continue;
     list.push({
+      kind: "text",
       hash,
       textPreview: chunk.slice(0, 160),
       registeredAt: now,
@@ -178,6 +215,82 @@ export function registerPlaywrightOutboundChunks(chatKey, text, meta = {}) {
 }
 
 /**
+ * Register that a WhatsApp media send button was confirmed/clicked for a guarantee/media set.
+ * This is intentionally separate from text echo chunks.
+ * @param {string} chatKey
+ * @param {{ guaranteeKey?: string | null, imageUrls?: string[], imageSendJobId?: string | null, status?: string | null }} meta
+ */
+export function registerPlaywrightOutboundMediaClick(chatKey, meta = {}) {
+  ensurePersistLoaded();
+  const key = normalizeChatKey(chatKey);
+  const guaranteeKey = String(meta.guaranteeKey ?? "").trim();
+  const imageUrls = normalizeImageUrls(meta.imageUrls);
+  const mediaHash = hashPlaywrightMediaSet(imageUrls);
+  if (!key || !guaranteeKey || !mediaHash) return null;
+  pruneChatEntries(key);
+  const list = registryByChat.get(key) ?? [];
+  const existing = list.find(
+    (entry) =>
+      entry?.kind === "media_click" &&
+      String(entry.guaranteeKey ?? "").trim() === guaranteeKey &&
+      String(entry.mediaHash ?? entry.hash ?? "").trim() === mediaHash
+  );
+  const now = Date.now();
+  if (existing) {
+    existing.registeredAt = now;
+    existing.imageSendJobId = String(meta.imageSendJobId ?? existing.imageSendJobId ?? "").trim() || null;
+    existing.status = String(meta.status ?? existing.status ?? "").trim() || "clicked";
+  } else {
+    list.push({
+      kind: "media_click",
+      hash: mediaHash,
+      mediaHash,
+      textPreview: `media:${imageUrls.length}`,
+      registeredAt: now,
+      chatKey: key,
+      guaranteeKey,
+      imageCount: imageUrls.length,
+      imageSendJobId: String(meta.imageSendJobId ?? "").trim() || null,
+      status: String(meta.status ?? "").trim() || "clicked",
+      rowKey: null,
+      messageId: null,
+      sourceInboundMessageId: null,
+    });
+  }
+  registryByChat.set(key, list.slice(-OUTBOUND_REGISTRY_MAX_PER_CHAT));
+  persistRegistry();
+  console.log("[playwright_media_click_registered]", {
+    chatKey: key,
+    guaranteeKey,
+    mediaHash,
+    imageCount: imageUrls.length,
+    imageSendJobId: String(meta.imageSendJobId ?? "").trim() || null,
+    status: String(meta.status ?? "").trim() || "clicked",
+  });
+  return { guaranteeKey, mediaHash, imageCount: imageUrls.length };
+}
+
+/**
+ * @param {string} chatKey
+ * @param {{ guaranteeKey?: string | null, imageUrls?: string[] }} meta
+ */
+export function hasPlaywrightOutboundMediaClick(chatKey, meta = {}) {
+  ensurePersistLoaded();
+  const key = normalizeChatKey(chatKey);
+  const guaranteeKey = String(meta.guaranteeKey ?? "").trim();
+  const mediaHash = hashPlaywrightMediaSet(meta.imageUrls);
+  if (!key || !guaranteeKey || !mediaHash) return false;
+  pruneChatEntries(key);
+  const list = registryByChat.get(key) ?? [];
+  return list.some(
+    (entry) =>
+      entry?.kind === "media_click" &&
+      String(entry.guaranteeKey ?? "").trim() === guaranteeKey &&
+      String(entry.mediaHash ?? entry.hash ?? "").trim() === mediaHash
+  );
+}
+
+/**
  * @param {string} chatKey
  * @param {string} text
  */
@@ -190,11 +303,12 @@ export function isRegisteredPlaywrightOutboundEcho(chatKey, text) {
   pruneChatEntries(key);
   const list = registryByChat.get(key) ?? [];
   const hash = hashOutboundText(text);
-  if (list.some((entry) => entry.hash === hash)) return true;
+  const textEntries = list.filter((entry) => !entry?.kind || entry.kind === "text");
+  if (textEntries.some((entry) => entry.hash === hash)) return true;
   if (isNormalizedAssistantPriceReply(norm)) {
     const amount = norm.split(/\s+/)[0];
     if (
-      list.some((entry) => {
+      textEntries.some((entry) => {
         const entryNorm = normalizeOutboundText(entry.textPreview);
         return (
           isNormalizedAssistantPriceReply(entryNorm) &&
@@ -205,7 +319,7 @@ export function isRegisteredPlaywrightOutboundEcho(chatKey, text) {
       return true;
     }
   }
-  return list.some((entry) => {
+  return textEntries.some((entry) => {
     const entryNorm = normalizeOutboundText(entry.textPreview);
     if (!entryNorm) return false;
     if (entryNorm === norm) return true;
@@ -230,4 +344,11 @@ export function __clearPlaywrightOutboundRegistryForTests() {
   } catch {
     /* ignore */
   }
+}
+
+/** @internal */
+export function __reloadPlaywrightOutboundRegistryForTests() {
+  registryByChat.clear();
+  persistLoaded = false;
+  ensurePersistLoaded();
 }

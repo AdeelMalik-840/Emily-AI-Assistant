@@ -41,7 +41,6 @@ import {
   setMessageState,
 } from "../messageState.js";
 import {
-  clearInboundTurnLedgerBaselineAbsorbed,
   hydrateInboundTurnLedgerIntoMessageState,
   isInboundTurnLedgerEnabled,
   isInboundTurnLedgerDone,
@@ -1161,10 +1160,69 @@ function candidateRowsAfterCursor({
   }).rows;
 }
 
-function collapseRowsForForward(rows) {
+function stableIdAllowedForCurrentMerge(stableId, currentFreshAdmittedStableIds) {
+  const sid = String(stableId ?? "").trim();
+  if (!sid) return false;
+  if (!(currentFreshAdmittedStableIds instanceof Set)) return false;
+  return currentFreshAdmittedStableIds.has(sid);
+}
+
+function isFreshMergeSourceAllowed({
+  row,
+  stableId,
+  chatKey,
+  currentFreshAdmittedStableIds,
+  baselineSeenStableIds,
+}) {
+  const sid = String(stableId ?? "").trim();
+  if (!sid) return false;
+  if (row?.sender !== "user") return false;
+  if (isListenerInboundNoise(row?.text)) return false;
+  if (!stableIdAllowedForCurrentMerge(sid, currentFreshAdmittedStableIds)) {
+    return false;
+  }
+  if (baselineSeenStableIds instanceof Set && baselineSeenStableIds.has(sid)) {
+    return false;
+  }
+  const guaranteeKey = playwrightGuaranteeKeyForStableId(chatKey, sid);
+  const st = guaranteeKey ? getMessageState(guaranteeKey) : null;
+  if (st?.state === "done" || st?.state === "processing") return false;
+  const ledgerBlock = resolveInboundTurnAdmissionBlock({
+    chatKey,
+    stableId: sid,
+    textPreview: String(row?.text ?? "").slice(0, 120),
+  });
+  return ledgerBlock.blocked !== true;
+}
+
+function collapseRowsForForward(rows, opts = {}) {
+  const currentFreshAdmittedStableIds =
+    opts?.currentFreshAdmittedStableIds instanceof Set
+      ? opts.currentFreshAdmittedStableIds
+      : null;
+  const chatKey = String(opts?.chatKey ?? "").trim();
+  const baselineSeenStableIds =
+    opts?.baselineSeenStableIds instanceof Set ? opts.baselineSeenStableIds : null;
   const cleanRows = Array.isArray(rows)
-    ? rows.filter((row) => row?.sender === "user" && String(row?.text ?? "").trim())
+    ? rows.filter((row) => {
+        if (row?.sender !== "user" || !String(row?.text ?? "").trim()) return false;
+        if (!currentFreshAdmittedStableIds) return false;
+        const stableId = buildExtractedMessageId(row, rows).id;
+        return isFreshMergeSourceAllowed({
+          row,
+          stableId,
+          chatKey,
+          currentFreshAdmittedStableIds,
+          baselineSeenStableIds,
+        });
+      })
     : [];
+  if (!currentFreshAdmittedStableIds && Array.isArray(rows)) {
+    const latest = [...rows]
+      .filter((row) => row?.sender === "user" && String(row?.text ?? "").trim())
+      .pop();
+    return latest ? [latest] : [];
+  }
   if (cleanRows.length <= 1) return cleanRows;
   const latest = cleanRows[cleanRows.length - 1];
   const mergedText = cleanRows
@@ -1195,8 +1253,8 @@ export function __candidateRowsAfterCursorForTests(args) {
 }
 
 /** @internal Tests — merge last two catch-up user rows for one forward. */
-export function __collapseRowsForForwardForTests(rows) {
-  return collapseRowsForForward(rows);
+export function __collapseRowsForForwardForTests(rows, opts = {}) {
+  return collapseRowsForForward(rows, opts);
 }
 
 /**
@@ -1440,14 +1498,54 @@ export function attachBurstMergeContinuations(
   tickFirstSeenByStableId,
   extractedMessages,
   chatKey,
-  catalogItems
+  catalogItems,
+  opts = {}
 ) {
   if (!anchorMsg) return null;
   const catalog = resolveBurstMergeCatalogItems(catalogItems);
   const anchorPos = Number(anchorMsg?.__position);
   if (!Number.isFinite(anchorPos)) return anchorMsg;
+  const currentFreshAdmittedStableIds =
+    opts?.currentFreshAdmittedStableIds instanceof Set
+      ? opts.currentFreshAdmittedStableIds
+      : null;
+  const baselineSeenStableIds =
+    opts?.baselineSeenStableIds instanceof Set ? opts.baselineSeenStableIds : null;
+  const anchorStableId = getMessageIdFromExtracted(anchorMsg, extractedMessages);
+  if (!currentFreshAdmittedStableIds) {
+    return anchorMsg;
+  }
+  if (
+    !isFreshMergeSourceAllowed({
+      row: anchorMsg,
+      stableId: anchorStableId,
+      chatKey,
+      currentFreshAdmittedStableIds,
+      baselineSeenStableIds,
+    })
+  ) {
+    return anchorMsg;
+  }
+  const anchorParticipantKey = String(anchorMsg?.participantKey ?? "").trim();
+  const allowMultiRowMerge = Boolean(anchorParticipantKey);
   const byPos = new Map(
-    (allParticipantUserRows || []).map((row) => [Number(row?.__position), row])
+    (allParticipantUserRows || [])
+      .filter((row) => {
+        if (row?.sender !== "user") return false;
+        if (!String(row?.text ?? "").trim()) return false;
+        if (!allowMultiRowMerge) return row === anchorMsg;
+        const participantKey = String(row?.participantKey ?? "").trim();
+        if (participantKey !== anchorParticipantKey) return false;
+        const stableId = getMessageIdFromExtracted(row, extractedMessages);
+        return isFreshMergeSourceAllowed({
+          row,
+          stableId,
+          chatKey,
+          currentFreshAdmittedStableIds,
+          baselineSeenStableIds,
+        });
+      })
+      .map((row) => [Number(row?.__position), row])
   );
   const run = [anchorMsg];
   let lastPos = anchorPos;
@@ -1520,6 +1618,8 @@ export function buildParticipantForwardCandidate(p) {
     burstMs = PLAYWRIGHT_FRESH_DELTA_BURST_MS,
     tickFirstSeenByStableId,
     catalogItems,
+    currentFreshAdmittedStableIds,
+    baselineSeenStableIds,
   } = p;
   const ordered = [...(participantMessages || [])].sort(
     (a, b) => (Number(a?.__position) || 0) - (Number(b?.__position) || 0)
@@ -1574,6 +1674,12 @@ export function buildParticipantForwardCandidate(p) {
     if (guaranteeFirst && isListenerInboundNoise(text)) return false;
     const stableId = getMessageIdFromExtracted(m, extractedMessages);
     if (!stableId) return false;
+    if (
+      currentFreshAdmittedStableIds instanceof Set &&
+      !currentFreshAdmittedStableIds.has(stableId)
+    ) {
+      return false;
+    }
     const gk = playwrightGuaranteeKeyForStableId(chatKey, stableId);
     const st = getMessageState(gk);
             if (st?.state === "done" || st?.state === "processing") return false;
@@ -1594,6 +1700,9 @@ export function buildParticipantForwardCandidate(p) {
   });
 
   if (pending.length === 0) return null;
+  if (!(currentFreshAdmittedStableIds instanceof Set)) {
+    return null;
+  }
 
   const tickMap =
     tickFirstSeenByStableId instanceof Map
@@ -1604,6 +1713,10 @@ export function buildParticipantForwardCandidate(p) {
   const burstCatalog = resolveBurstMergeCatalogItems(catalogItems);
 
   if (guaranteeFirst) {
+    const admittedIds =
+      currentFreshAdmittedStableIds instanceof Set
+        ? currentFreshAdmittedStableIds
+        : null;
     const burstSource =
       Array.isArray(allParticipantUserRows) && allParticipantUserRows.length > 0
         ? allParticipantUserRows
@@ -1618,7 +1731,12 @@ export function buildParticipantForwardCandidate(p) {
         tickMap instanceof Map ? tickMap : new Map(),
         extractedMessages,
         String(chatKey ?? "").trim(),
-        burstCatalog
+        burstCatalog,
+        {
+          currentFreshAdmittedStableIds: admittedIds,
+          baselineSeenStableIds:
+            baselineSeenStableIds instanceof Set ? baselineSeenStableIds : null,
+        }
       );
       const guard = evaluateReplyAfterGuard(
         withBurst,
@@ -2841,6 +2959,11 @@ function logFreshDeltaRowDecisionTrace(p) {
  * @param {object} p
  */
 export function filterGuaranteeFirstEligibleUserRows(p) {
+  const resolvedAnchorIndex = Number(p?.resolvedAnchorIndex);
+  const acknowledgedAnchorIndex = Number(p?.acknowledgedAnchorIndex);
+  if (Number.isFinite(resolvedAnchorIndex) || Number.isFinite(acknowledgedAnchorIndex)) {
+    return resolveFreshAdmittedTurns(p);
+  }
   const {
     userMessages,
     freshState,
@@ -3000,12 +3123,13 @@ export function filterGuaranteeFirstEligibleUserRows(p) {
 
   console.log("[guarantee_first_tick_summary]", {
     chatKey,
-    inputCount: userMessages.length,
+    inputCount: Array.isArray(userMessages) ? userMessages.length : 0,
     survivorCount: survivors.length,
     droppedAssistant: droppedAssistant.length,
     droppedNoise: droppedNoise.length,
     droppedDone: droppedDone.length,
     droppedBaseline: droppedBaseline.length,
+    droppedPreAnchor: 0,
     admissionMode: "guarantee_and_baseline_only",
   });
 
@@ -3020,11 +3144,338 @@ export function filterGuaranteeFirstEligibleUserRows(p) {
 }
 
 /**
+ * Single listener authority for WhatsApp rows that may enter Brain.
+ * DOM rows, ledger state, baseline, anchors, and guarantee state are evidence;
+ * only rows returned here as admitted turns are current-fresh input.
+ * @param {object} p
+ */
+export function resolveFreshAdmittedTurns(p) {
+  const {
+    userMessages,
+    freshState,
+    chatKey,
+    extractedList,
+    acknowledgedAnchorIndex,
+    resolvedAnchorIndex,
+    tickMs = Date.now(),
+  } = p;
+  const droppedAssistant = [];
+  const droppedNoise = [];
+  const droppedDone = [];
+  const droppedBaseline = [];
+  const droppedPreAnchor = [];
+  /** @type {any[]} */
+  const survivors = [];
+  const rejectedTurns = [];
+  const admittedTurns = [];
+  const currentFreshAdmittedStableIds = new Set();
+  const currentFreshAdmittedStableIdsByParticipant = new Map();
+  const resolvedIndex = Number(resolvedAnchorIndex);
+  const acknowledgedIndex = Number(acknowledgedAnchorIndex);
+  const effectiveAnchorIndex = Number.isFinite(resolvedIndex)
+    ? resolvedIndex
+    : Number.isFinite(acknowledgedIndex)
+      ? acknowledgedIndex
+      : null;
+  const anchorProof = {
+    effectiveAnchorIndex,
+    source: Number.isFinite(resolvedIndex)
+      ? "resolvedAnchorIndex"
+      : Number.isFinite(acknowledgedIndex)
+        ? "acknowledgedAnchorIndex"
+        : "missing",
+    resolvedAnchorIndex: Number.isFinite(resolvedIndex) ? resolvedIndex : null,
+    acknowledgedAnchorIndex: Number.isFinite(acknowledgedIndex)
+      ? acknowledgedIndex
+      : null,
+  };
+
+  const recordRejected = ({
+    msg,
+    stableId = null,
+    sortedIndex,
+    dropReason,
+    ledgerState = null,
+  }) => {
+    rejectedTurns.push({
+      stableId: stableId || null,
+      textPreview: String(msg?.text ?? "").slice(0, 120),
+      sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+      dropReason,
+      anchorProof,
+      ledgerState,
+    });
+  };
+
+  if (!freshState.tickFirstSeenByStableId) {
+    freshState.tickFirstSeenByStableId = new Map();
+  }
+  const tickFirstSeen = freshState.tickFirstSeenByStableId;
+
+  for (const msg of userMessages) {
+    const sortedIndex = Number(msg?.__position);
+    if (!isVerifiedFreshDeltaUserRow(msg, chatKey)) {
+      const assistantDetail = freshDeltaAssistantLikeDetail(msg, chatKey);
+      if (droppedAssistant.length < 3) {
+        droppedAssistant.push(String(msg?.text ?? "").slice(0, 120));
+      }
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId: getMessageIdFromExtracted(msg, extractedList) || null,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+        finalDecision: "drop",
+        dropReason: assistantDetail.reason || "assistant_or_unverified_user_row",
+        guaranteeState: null,
+      });
+      recordRejected({
+        msg,
+        sortedIndex,
+        dropReason: assistantDetail.reason || "assistant_or_unverified_user_row",
+      });
+      continue;
+    }
+    if (isListenerInboundNoise(msg?.text)) {
+      if (droppedNoise.length < 3) {
+        droppedNoise.push(String(msg?.text ?? "").slice(0, 80));
+      }
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId: getMessageIdFromExtracted(msg, extractedList) || null,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 80),
+        finalDecision: "drop",
+        dropReason: "inbound_noise_row",
+        guaranteeState: null,
+      });
+      recordRejected({ msg, sortedIndex, dropReason: "inbound_noise_row" });
+      continue;
+    }
+
+    const { stableId, guaranteeKey } = resolvePlaywrightForwardIdentity(
+      chatKey,
+      msg,
+      0,
+      extractedList
+    );
+    if (!stableId) {
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId: null,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+        finalDecision: "drop",
+        dropReason: "missing_stable_id",
+        guaranteeState: null,
+      });
+      recordRejected({ msg, sortedIndex, dropReason: "missing_stable_id" });
+      continue;
+    }
+
+    if (isInboundTurnLedgerEnabled()) {
+      const ledgerBlock = resolveInboundTurnAdmissionBlock({
+        chatKey,
+        stableId,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+      });
+      if (ledgerBlock.blocked) {
+        if (droppedDone.length < 3) droppedDone.push(stableId);
+        console.log("[guarantee_first_row_decision]", {
+          chatKey,
+          stableId,
+          sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+          textPreview: String(msg?.text ?? "").slice(0, 120),
+          finalDecision: "drop",
+          dropReason: ledgerBlock.reason || "inbound_turn_ledger_blocked",
+          guaranteeState: ledgerBlock.logEvent || "ledger",
+        });
+        recordRejected({
+          msg,
+          stableId,
+          sortedIndex,
+          dropReason: ledgerBlock.reason || "inbound_turn_ledger_blocked",
+          ledgerState: ledgerBlock.reason || ledgerBlock.logEvent || "ledger",
+        });
+        continue;
+      }
+    }
+
+    const st = getMessageState(guaranteeKey);
+    if (st?.state === "done" || st?.state === "processing") {
+      if (droppedDone.length < 3) droppedDone.push(stableId);
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+        finalDecision: "drop",
+        dropReason: `guarantee_${st?.state || "inflight"}`,
+        guaranteeState: st.state,
+      });
+      recordRejected({
+        msg,
+        stableId,
+        sortedIndex,
+        dropReason: `guarantee_${st?.state || "inflight"}`,
+        ledgerState: st.state,
+      });
+      continue;
+    }
+
+    const seenBaseline =
+      freshState?.baselineSeenStableIds instanceof Set &&
+      freshState.baselineSeenStableIds.has(stableId);
+    if (seenBaseline) {
+      if (droppedBaseline.length < 3) {
+        droppedBaseline.push({
+          stableId,
+          textPreview: String(msg?.text ?? "").slice(0, 80),
+        });
+      }
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+        finalDecision: "drop",
+        dropReason: "baseline_seen_stable_id",
+        guaranteeState: st?.state || "idle",
+      });
+      recordRejected({
+        msg,
+        stableId,
+        sortedIndex,
+        dropReason: "baseline_seen_stable_id",
+        ledgerState: "baseline_seen",
+      });
+      continue;
+    }
+
+    const isStrictlyPostAnchor =
+      Number.isFinite(sortedIndex) &&
+      effectiveAnchorIndex != null &&
+      sortedIndex > effectiveAnchorIndex;
+    if (!isStrictlyPostAnchor) {
+      if (droppedPreAnchor.length < 3) {
+        droppedPreAnchor.push({
+          stableId,
+          textPreview: String(msg?.text ?? "").slice(0, 80),
+          reason: "NOT_CURRENT_FRESH_POST_ANCHOR",
+        });
+      }
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        acknowledgedAnchorIndex: Number.isFinite(acknowledgedIndex)
+          ? acknowledgedIndex
+          : null,
+        resolvedAnchorIndex: Number.isFinite(resolvedIndex) ? resolvedIndex : null,
+        effectiveAnchorIndex,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+        finalDecision: "drop",
+        dropReason:
+          effectiveAnchorIndex == null
+            ? "missing_current_anchor_proof"
+            : "not_current_fresh_post_anchor",
+        guaranteeState: st?.state || "idle",
+      });
+      recordRejected({
+        msg,
+        stableId,
+        sortedIndex,
+        dropReason:
+          effectiveAnchorIndex == null
+            ? "missing_current_anchor_proof"
+            : "not_current_fresh_post_anchor",
+        ledgerState: st?.state || "idle",
+      });
+      continue;
+    }
+
+    if (!tickFirstSeen.has(stableId)) {
+      tickFirstSeen.set(stableId, tickMs);
+    }
+
+    survivors.push(msg);
+    const participantKey = String(msg?.participantKey ?? "").trim() || "(missing)";
+    currentFreshAdmittedStableIds.add(stableId);
+    if (!currentFreshAdmittedStableIdsByParticipant.has(participantKey)) {
+      currentFreshAdmittedStableIdsByParticipant.set(participantKey, new Set());
+    }
+    currentFreshAdmittedStableIdsByParticipant.get(participantKey).add(stableId);
+    admittedTurns.push({
+      stableId,
+      text: String(msg?.text ?? ""),
+      participantKey: msg?.participantKey || null,
+      participantName: msg?.participantName || null,
+      sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+      sourceMessageId: stableId,
+      sourceRowKey: String(msg?.__rowKey ?? "").trim() || null,
+      guaranteeKey,
+      freshnessProof: {
+        kind: "post_current_anchor",
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        effectiveAnchorIndex,
+      },
+      anchorProof,
+      ledgerState: st?.state || "idle",
+      originalRow: msg,
+    });
+    if (freshState.admittedFreshStableIds instanceof Set) {
+      freshState.admittedFreshStableIds.add(stableId);
+    }
+    if (matchesBaselineDeferredTailUser(msg, freshState, extractedList)) {
+      console.log("[baseline_tail_user_admitted]", {
+        chatKey,
+        stableId,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+      });
+    }
+    console.log("[guarantee_first_row_decision]", {
+      chatKey,
+      stableId,
+      sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+      textPreview: String(msg?.text ?? "").slice(0, 120),
+      finalDecision: "survivor",
+      dropReason: null,
+      guaranteeState: st?.state || "idle",
+    });
+  }
+
+  console.log("[guarantee_first_tick_summary]", {
+    chatKey,
+    inputCount: userMessages.length,
+    survivorCount: survivors.length,
+    droppedAssistant: droppedAssistant.length,
+    droppedNoise: droppedNoise.length,
+    droppedDone: droppedDone.length,
+    droppedBaseline: droppedBaseline.length,
+    droppedPreAnchor: droppedPreAnchor.length,
+    admissionMode: "guarantee_and_baseline_only",
+  });
+
+  return {
+    survivors,
+    admittedTurns,
+    rejectedTurns,
+    currentFreshAdmittedStableIds,
+    currentFreshAdmittedStableIdsByParticipant,
+    droppedAssistant,
+    droppedBaseline,
+    droppedDone,
+    droppedPreAnchor,
+    droppedNoise,
+  };
+}
+
+/**
  * @param {object} p
  */
 export function filterPostAnchorFreshUserRows(p) {
   if (isPlaywrightGuaranteeFirstAdmissionEnabled()) {
-    return filterGuaranteeFirstEligibleUserRows(p);
+    return resolveFreshAdmittedTurns(p);
   }
   const {
     userMessages,
@@ -6602,6 +7053,8 @@ async function runListenerBody() {
           // --- Fresh delta filter (MUST run before participant buckets / burst merge) ---
           /** @type {any[]} */
           let freshVerifiedUserRows = userMessages;
+          let freshAdmittedTurns = [];
+          let freshAdmissionResult = null;
           let freshDeltaTailAnchorIndex = -1;
           let freshDeltaAcknowledgedAnchorIndex = -1;
           const sortedWithPos = sorted.map((m, idx) => ({ ...m, __position: idx }));
@@ -6616,14 +7069,6 @@ async function runListenerBody() {
               freshState.baselineTailAnchor = tailAnchor;
               freshState.currentTailAnchor = tailAnchor;
               const anchorIndex = sortedWithPos.length - 1;
-              const anchorRow = sortedWithPos[anchorIndex] || null;
-              const tailDeferral = resolveBaselineTailUserDeferral({
-                anchorRow,
-                anchorIndex,
-                chatKey,
-                sortedWithPos,
-              });
-              const deferredTailStableId = tailDeferral?.stableId ?? null;
               const baselineSeen = new Set();
               for (const msg of sortedWithPos) {
                 const sender = String(msg?.sender ?? "").trim() || "unknown";
@@ -6635,11 +7080,7 @@ async function runListenerBody() {
                   0,
                   sortedWithPos
                 );
-                const isDeferredTail =
-                  deferredTailStableId &&
-                  stableId &&
-                  stableId === deferredTailStableId;
-                if (stableId && !isDeferredTail) {
+                if (stableId) {
                   baselineSeen.add(stableId);
                   if (isInboundTurnLedgerEnabled()) {
                     markInboundTurnLedgerBaselineAbsorbed({
@@ -6658,19 +7099,6 @@ async function runListenerBody() {
                     assistantLike: assistantDetail.assistantLike,
                     reason: assistantDetail.reason || "startup_visible_row",
                   });
-                } else if (isDeferredTail) {
-                  if (isInboundTurnLedgerEnabled()) {
-                    clearInboundTurnLedgerBaselineAbsorbed(chatKey, stableId);
-                  }
-                  console.log("[baseline_tail_user_deferred]", {
-                    chatKey,
-                    stableId,
-                    rowKey: String(msg?.__rowKey ?? "").trim() || null,
-                    textPreview,
-                    sender,
-                    anchorIndex,
-                    reason: "TAIL_USER_NOT_BASELINE_ABSORBED",
-                  });
                 } else {
                   console.log("[startup_baseline_row_absorbed]", {
                     chatKey,
@@ -6687,13 +7115,8 @@ async function runListenerBody() {
               freshState.baselineSnapshotHash = String(computeSnapshotHash(userMessages) ?? "");
               freshState.baselineEstablishedAtMs = Date.now();
               freshState.acknowledgedAnchorIndex = anchorIndex;
-              if (tailDeferral?.hold) {
-                freshState.anchorHoldUserForward = { ...tailDeferral.hold };
-                freshState.baselineDeferredTailUser = { ...tailDeferral.hold };
-              } else {
-                freshState.anchorHoldUserForward = null;
-                freshState.baselineDeferredTailUser = null;
-              }
+              freshState.anchorHoldUserForward = null;
+              freshState.baselineDeferredTailUser = null;
               recordSessionVisibilityLedger(
                 freshState,
                 sortedWithPos,
@@ -6781,6 +7204,7 @@ async function runListenerBody() {
               extractedList: sortedWithPos,
               tickMs: nowMs,
             });
+            freshAdmissionResult = filterResult;
 
             if (filterResult.droppedAssistant.length) {
               console.log("[fresh_delta_assistant_row_dropped]", {
@@ -6811,14 +7235,20 @@ async function runListenerBody() {
               });
             }
 
-            freshVerifiedUserRows = filterResult.survivors;
+            freshAdmittedTurns = Array.isArray(filterResult.admittedTurns)
+              ? filterResult.admittedTurns
+              : [];
+            freshVerifiedUserRows = freshAdmittedTurns.map((turn) => turn.originalRow);
 
             if (inCatchup && filterResult.survivors.length > 0) {
               const catchupKeep = [];
+              const catchupKeepStableIds = new Set();
               const catchupSuppress = [];
-              for (const msg of filterResult.survivors) {
+              for (const turn of freshAdmittedTurns) {
+                const msg = turn.originalRow;
                 if (matchesBaselineDeferredTailUser(msg, freshState, sortedWithPos)) {
                   catchupKeep.push(msg);
+                  if (turn.stableId) catchupKeepStableIds.add(turn.stableId);
                 } else {
                   catchupSuppress.push(msg);
                 }
@@ -6851,6 +7281,9 @@ async function runListenerBody() {
                 });
               }
               freshVerifiedUserRows = catchupKeep;
+              freshAdmittedTurns = freshAdmittedTurns.filter((turn) =>
+                catchupKeepStableIds.has(turn.stableId)
+              );
               if (catchupSuppress.length > 0 || catchupKeep.length > 0) {
                 console.log("[baseline_catchup_forward_suppressed]", {
                   chatKey,
@@ -6882,15 +7315,47 @@ async function runListenerBody() {
 
           const participantBuckets = new Map();
           const allParticipantBuckets = new Map();
-          for (const msg of freshVerifiedUserRows) {
-            const key = String(msg.participantKey ?? "").trim() || "(missing)";
+          const currentFreshAdmittedStableIds =
+            freshAdmissionResult?.currentFreshAdmittedStableIds instanceof Set
+              ? new Set(freshAdmissionResult.currentFreshAdmittedStableIds)
+              : new Set();
+          const currentFreshAdmittedStableIdsByParticipant = new Map();
+          if (
+            freshAdmissionResult?.currentFreshAdmittedStableIdsByParticipant instanceof
+            Map
+          ) {
+            for (const [key, set] of freshAdmissionResult.currentFreshAdmittedStableIdsByParticipant.entries()) {
+              currentFreshAdmittedStableIdsByParticipant.set(key, new Set(set));
+            }
+          }
+          if (freshAdmittedTurns.length > 0) {
+            const allowedAfterCatchup = new Set(
+              freshAdmittedTurns.map((turn) => turn.stableId).filter(Boolean)
+            );
+            for (const sid of [...currentFreshAdmittedStableIds]) {
+              if (!allowedAfterCatchup.has(sid)) currentFreshAdmittedStableIds.delete(sid);
+            }
+            for (const [key, set] of currentFreshAdmittedStableIdsByParticipant.entries()) {
+              for (const sid of [...set]) {
+                if (!allowedAfterCatchup.has(sid)) set.delete(sid);
+              }
+              if (set.size === 0) currentFreshAdmittedStableIdsByParticipant.delete(key);
+            }
+          } else {
+            currentFreshAdmittedStableIds.clear();
+            currentFreshAdmittedStableIdsByParticipant.clear();
+          }
+          for (const turn of freshAdmittedTurns) {
+            const msg = turn.originalRow;
+            const key = String(turn.participantKey ?? msg?.participantKey ?? "").trim() || "(missing)";
             if (!participantBuckets.has(key)) participantBuckets.set(key, []);
             participantBuckets.get(key).push(msg);
           }
           if (isPlaywrightGuaranteeFirstAdmissionEnabled()) {
-            for (const msg of userMessages) {
+            for (const turn of freshAdmittedTurns) {
+              const msg = turn.originalRow;
               if (!isVerifiedFreshDeltaUserRow(msg, chatKey)) continue;
-              const key = String(msg.participantKey ?? "").trim() || "(missing)";
+              const key = String(turn.participantKey ?? msg?.participantKey ?? "").trim() || "(missing)";
               if (!allParticipantBuckets.has(key)) allParticipantBuckets.set(key, []);
               allParticipantBuckets.get(key).push(msg);
             }
@@ -7064,6 +7529,13 @@ async function runListenerBody() {
               guaranteeFirst,
               anchorIndex: freshDeltaAcknowledgedAnchorIndex,
               tickFirstSeenByStableId: freshState?.tickFirstSeenByStableId,
+              currentFreshAdmittedStableIds:
+                currentFreshAdmittedStableIdsByParticipant.get(participantKey) ||
+                currentFreshAdmittedStableIds,
+              baselineSeenStableIds:
+                freshState?.baselineSeenStableIds instanceof Set
+                  ? freshState.baselineSeenStableIds
+                  : null,
               deps: {
                 buildExtractedMessageId,
                 buildStableMessageKey,

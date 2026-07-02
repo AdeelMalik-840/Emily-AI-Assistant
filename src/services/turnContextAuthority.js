@@ -237,6 +237,12 @@ export function resolveTurnContext(opts = {}) {
     message,
     catalogItems
   );
+  const requestedField = String(detectAskedField(message) ?? "").trim().toLowerCase();
+  const itemlessTrustedContextFollowup =
+    !hasExplicitItem &&
+    (itemlessPriceDurationFollowup ||
+      messageLooksLikeAvailabilityQuery(message) ||
+      requestedField === "media");
 
   const turnShape = classifyTurnShape({
     message,
@@ -250,7 +256,7 @@ export function resolveTurnContext(opts = {}) {
   let trustedSessionRejectReason = null;
 
   if (
-    itemlessPriceDurationFollowup &&
+    itemlessTrustedContextFollowup &&
     memoryAllowed &&
     typeof opts.resolveTrustedSessionItem === "function"
   ) {

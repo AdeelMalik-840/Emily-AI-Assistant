@@ -45,6 +45,7 @@ const SAFE_CLARIFICATION =
  *   chatId?: string | null,
  *   sessionKey?: string | null,
  *   participantKey?: string | null,
+ *   participantName?: string | null,
  *   participantPhoneForDm?: string | null,
  *   playwrightChatKey?: string | null,
  *   isGroupInbound?: boolean,
@@ -55,6 +56,7 @@ const SAFE_CLARIFICATION =
  *   conversationHistory?: string,
  *   catalogItems?: unknown[],
  *   sourceRowKey?: string | null,
+ *   sourceMessageIndex?: number | null,
  *   guaranteeKey?: string | null,
  *   groupName?: string | null,
  *   whatsappRecipientType?: string | null,
@@ -62,6 +64,7 @@ const SAFE_CLARIFICATION =
  *   resolveTrustedSessionItem?: (p: Record<string, unknown>) => { ok: boolean, item?: Record<string, unknown> | null, reason?: string | null },
  *   __testOrchestratorFn?: (args: Record<string, unknown>) => unknown,
  *   getBookingsForItemFn?: (businessId: string, itemId: string, itemName?: string | null) => Promise<unknown[]>,
+ *   getBusinessProfileFn?: (uid: string) => Promise<unknown>,
  * }} params
  * @returns {Promise<BrainV2LivePipelineResult>}
  */
@@ -112,6 +115,8 @@ export async function runBrainV2LivePipeline(params) {
         turnContextInput,
         catalogItems,
         flags,
+        getBusinessProfileFn: params.getBusinessProfileFn,
+        getBookingsForItemFn: params.getBookingsForItemFn,
       });
       return finalizeLivePipelineResult({
         params,
@@ -173,6 +178,7 @@ export async function runBrainV2LivePipeline(params) {
       admittedTurn: admission.admittedTurn,
       flags,
       getBookingsForItemFn: params.getBookingsForItemFn,
+      getBusinessProfileFn: params.getBusinessProfileFn,
     });
 
     const orchestratorInput = {
@@ -226,12 +232,20 @@ export async function runBrainV2LivePipeline(params) {
         message,
         sessionKey: params.sessionKey,
         participantKey: params.participantKey,
+        participantName: params.participantName,
         participantPhoneForDm: params.participantPhoneForDm,
         messageId: params.messageId,
         sourceRowKey: params.sourceRowKey,
+        sourceMessageIndex: params.sourceMessageIndex,
         guaranteeKey: params.guaranteeKey,
         chatId: params.chatId,
         chatType,
+        groupName: params.groupName ?? null,
+        sourceGroupName: params.groupName ?? null,
+        playwrightChatKey: params.playwrightChatKey ?? params.chatId ?? null,
+        sourcePlaywrightChatKey: params.playwrightChatKey ?? params.chatId ?? null,
+        source: params.playwrightWebInbound === true ? "playwright" : channel,
+        isGroupInbound: params.isGroupInbound,
       }
     );
 

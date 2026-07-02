@@ -65,6 +65,17 @@ function sideEffectAllowed(type, flags) {
 }
 
 /**
+ * @param {string} type
+ * @param {Record<string, unknown> | null} plan
+ */
+function actionPlanAllowsExecutableAction(type, plan) {
+  const workflowType = String(plan?.workflowType ?? "").trim();
+  if (type === "CREATE_BOOKING") return workflowType === "booking_request";
+  if (type === "NOTIFY_OWNER") return workflowType === "booking_request";
+  return true;
+}
+
+/**
  * @param {ActionPlan | null | undefined} actionPlan
  * @param {LiveFlags | Record<string, unknown>} flags
  * @returns {{
@@ -111,6 +122,9 @@ export function routeLiveActionPlan(actionPlan, flags) {
       if (execute && !allowed) hasDisallowedExecute = true;
     }
     if (execute && !allowed) hasDisallowedExecute = true;
+    if (execute && !actionPlanAllowsExecutableAction(type, plan)) {
+      hasDisallowedExecute = true;
+    }
 
     return {
       type,
@@ -149,11 +163,6 @@ export function assertLiveActionPlanIsSafe(actionPlan, flags) {
   if (routed.hasDisallowedExecute) {
     throw new Error("live_action_plan_execute_true");
   }
-  for (const action of routed.actions) {
-    if (action.execute === true && action.type !== "REPLY" && action.type !== "NO_OP") {
-      throw new Error(`live_side_effect_execute:${action.type}`);
-    }
-  }
   if (!routed.intentionallySilent && !routed.reply) {
     const hasReplyAction = routed.actions.some((a) => a.type === "REPLY" && a.text);
     if (!hasReplyAction) {
@@ -161,6 +170,39 @@ export function assertLiveActionPlanIsSafe(actionPlan, flags) {
     }
   }
   return routed;
+}
+
+/**
+ * @param {ActionPlan | null | undefined} actionPlan
+ */
+function hasExecutableCreateBooking(actionPlan) {
+  const actions = Array.isArray(actionPlan?.actions) ? actionPlan.actions : [];
+  return actions.some(
+    (a) => String(a?.type ?? "").trim() === "CREATE_BOOKING" && a?.payload?.execute === true
+  );
+}
+
+/**
+ * @param {ActionPlan | null | undefined} actionPlan
+ */
+function executableCreateBookingPayload(actionPlan) {
+  const actions = Array.isArray(actionPlan?.actions) ? actionPlan.actions : [];
+  const action = actions.find(
+    (a) => String(a?.type ?? "").trim() === "CREATE_BOOKING" && a?.payload?.execute === true
+  );
+  return action?.payload && typeof action.payload === "object" ? action.payload : null;
+}
+
+/**
+ * @param {string} reply
+ */
+function suppressFailedBookingConfirmation(reply) {
+  const text = String(reply ?? "").trim();
+  if (!text) return "Theek hai, mai check kr k btata hun.";
+  if (/note kar liya|confirm kar ke|booking confirm|request receive ho gayi/i.test(text)) {
+    return "Theek hai, mai check kr k btata hun.";
+  }
+  return text;
 }
 
 /** @deprecated use routeLiveActionPlan */

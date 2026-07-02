@@ -43,6 +43,13 @@ export function applySessionMemoryFromActionPlan(p) {
     }
   }
 
+  if (persistence?.rememberDuration === true) {
+    const durationDays = Number(persistence?.durationDays);
+    if (Number.isFinite(durationDays) && durationDays >= 1) {
+      patch.lastDurationDays = Math.max(1, Math.floor(durationDays));
+    }
+  }
+
   if (Object.keys(patch).length > 0) {
     patchEmilySessionState(sessionKey, patch);
   }

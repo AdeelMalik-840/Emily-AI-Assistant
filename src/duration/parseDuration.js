@@ -11,7 +11,7 @@ export const MAX_BARE_DURATION_DAYS = 90;
 
 /** Longer tokens before shorter prefixes (e.g. dino before din). */
 const DURATION_UNIT_PATTERN =
-  "hours?|hrs?|ghanta|ghantay|ghanty|ghantey?|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gantey?|days?|dino|din|deen|weeks?|wk|hafta|haftay|months?|mahina|mahinay";
+  "hours?|hrs?|ghanta|ghantay|ghanty|ghantey?|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gantey?|days?|dino|duna|din|deen|weeks?|wk|hafta|haftay|months?|mahina|mahinay";
 
 const DURATION_WITH_UNIT_RE = new RegExp(
   `(\\d+)\\s*(${DURATION_UNIT_PATTERN})\\b`,
@@ -25,7 +25,7 @@ const DURATION_WITH_UNIT_RE = new RegExp(
 function resolveCanonicalUnit(unitLower) {
   const u = String(unitLower ?? "").toLowerCase().trim();
   if (/^(hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey)$/.test(u)) return "hours";
-  if (/^(day|days|din|dino|deen)$/.test(u)) return "days";
+  if (/^(day|days|din|dino|duna|deen)$/.test(u)) return "days";
   if (/^(week|weeks|wk|hafta|haftay)$/.test(u)) return "weeks";
   if (/^(month|months|mahina|mahinay)$/.test(u)) return "months";
   return null;
@@ -143,7 +143,7 @@ export function getNormalizedDaysFromDurationPreference(pref) {
     pref.unit != null
   ) {
     const u = String(pref.unit).toLowerCase();
-    if (/^(day|days|din|dino|deen)$/.test(u)) {
+    if (/^(day|days|din|dino|duna|deen)$/.test(u)) {
       return Math.max(1, Math.floor(pref.value));
     }
     if (/^(hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey)$/.test(u)) {

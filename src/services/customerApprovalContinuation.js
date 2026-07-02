@@ -63,10 +63,6 @@ export function formatCustomerDuration({
  */
 export function buildCustomerApprovalContinuation(event, style = "neutral_english") {
   const itemName = cleanText(event?.itemName) || "your booking";
-  const privacyMode =
-    event?.privacyMode === "dm" || event?.canDmCustomer === true
-      ? "dm"
-      : "group_safe";
   const local = isLocalStyle(style);
   const durationLabel = formatCustomerDuration({
     durationDays: event?.durationDays,
@@ -75,27 +71,31 @@ export function buildCustomerApprovalContinuation(event, style = "neutral_englis
     local,
   });
 
-  if (local) {
-    const duration = durationLabel ? `${durationLabel} ke liye ` : "";
-    if (privacyMode === "dm") {
-      return cleanText(
-        `Perfect 👍 ${itemName} ${duration}confirm hai. Delivery ya pickup details share kar dein.`
-      );
-    }
-    return cleanText(
-      `Perfect 👍 ${duration}${itemName} confirm hai. Delivery ya pickup details private chat mein share kar dein.`
-    );
-  }
+  const duration = durationLabel ? `${durationLabel} ke liye ` : "";
+  return cleanText(`${itemName} ${duration}available hai. Booking confirm ho gayi hai.`);
+}
 
-  const duration = durationLabel ? ` for ${durationLabel}` : "";
-  if (privacyMode === "dm") {
-    return cleanText(
-      `Perfect 👍 ${itemName} is confirmed${duration}. Please share your delivery or pickup details.`
-    );
-  }
-  return cleanText(
-    `Perfect 👍 ${itemName} is confirmed${duration}. Please share your delivery or pickup details in private chat.`
-  );
+/**
+ * @param {{
+ *   itemName?: string | null,
+ *   durationDays?: number | string | null,
+ *   durationHours?: number | string | null,
+ *   billingUnit?: string | null,
+ * }} event
+ * @param {string | null | undefined} style
+ * @returns {string}
+ */
+export function buildCustomerUnavailableContinuation(event, style = "neutral_english") {
+  const itemName = cleanText(event?.itemName) || "Yeh option";
+  const local = isLocalStyle(style);
+  const durationLabel = formatCustomerDuration({
+    durationDays: event?.durationDays,
+    durationHours: event?.durationHours,
+    billingUnit: event?.billingUnit,
+    local,
+  });
+  const duration = durationLabel ? `${durationLabel} ke liye ` : "";
+  return cleanText(`${itemName} ${duration}available nahi hai. Koi aur car check kar dun?`);
 }
 
 /**
@@ -115,26 +115,5 @@ export function buildCustomerApprovalContinuation(event, style = "neutral_englis
  * @returns {string}
  */
 export function buildBookingWaitingEngagement(event, style = "neutral_english") {
-  const itemName = cleanText(event?.itemName);
-  const local = isLocalStyle(style);
-  const durationLabel = formatCustomerDuration({
-    durationDays: event?.durationDays,
-    durationHours: event?.durationHours,
-    billingUnit: event?.billingUnit,
-    local,
-  });
-
-  if (local) {
-    const subject = itemName ? `${itemName} ` : "";
-    const duration = durationLabel ? `${durationLabel} ke liye ` : "";
-    return cleanText(
-      `Perfect 👍 ${subject}${duration}note kar liya. City ke andar use karna hai ya outside city?`
-    );
-  }
-
-  const subject = itemName ? `${itemName} ` : "";
-  const duration = durationLabel ? `for ${durationLabel} ` : "";
-  return cleanText(
-    `Perfect 👍 I’ve noted ${subject}${duration}. Will you use it within the city or outside the city?`
-  );
+  return "Theek hai, mai check kr k btata hun.";
 }

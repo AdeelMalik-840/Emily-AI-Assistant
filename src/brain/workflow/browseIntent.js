@@ -120,11 +120,16 @@ export function isUnlistedAvailabilityIntent(understanding, message) {
   if (isBrowseWorkflowIntent(understanding, message)) return false;
   if (understanding.resolvedItemId) return false;
 
-  const availabilitySignal =
+  const clearBusinessIntentSignal =
     Boolean(understanding.signals?.availabilityAsk) ||
+    Boolean(understanding.signals?.priceAsk) ||
+    Boolean(understanding.signals?.bookingCommitment) ||
+    Boolean(understanding.signals?.photoAsk) ||
     understanding.askedField === "availability" ||
+    String(understanding.askedField ?? "").startsWith("price") ||
+    understanding.askedField === "media" ||
     understanding.intentsRanked?.[0] === "availability_check";
 
-  if (!availabilitySignal) return false;
+  if (!clearBusinessIntentSignal) return false;
   return Boolean(String(understanding.unlistedMentionLabel ?? "").trim());
 }

@@ -336,6 +336,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
       inboundEntity,
       resetTopicContext,
       playwrightChatKey,
+      playwrightForwardedAt: Date.now(),
       sourceRowKey:
         adapted?.sourceRowKey != null && String(adapted.sourceRowKey).trim() !== ""
           ? String(adapted.sourceRowKey).trim()
@@ -445,6 +446,7 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
         inboundEntity: built.payload.inboundEntity,
         resetTopicContext: built.payload.resetTopicContext,
         playwrightChatKey: built.payload.playwrightChatKey,
+        playwrightForwardedAt: built.payload.playwrightForwardedAt,
         sourceRowKey: built.payload.sourceRowKey,
         sourceMessageIndex: built.payload.sourceMessageIndex,
       });

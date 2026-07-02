@@ -115,7 +115,7 @@ async function getBooking(db, bookingId) {
   return snap.data();
 }
 
-test("send success sets sent_to_provider, not final delivered", async () => {
+test("send success sets sent_to_provider and marks notification sent", async () => {
   const db = new FakeDb();
   await seedBooking(db, "b1");
 
@@ -128,7 +128,7 @@ test("send success sets sent_to_provider, not final delivered", async () => {
 
   const booking = await getBooking(db, "b1");
   assert.equal(booking.notificationStatus, "sent_to_provider");
-  assert.equal(booking.notificationSent, false);
+  assert.equal(booking.notificationSent, true);
   assert.equal(booking.providerMessageId, "wamid.ok");
 });
 
@@ -169,9 +169,12 @@ test("delivered webhook sets delivered", async () => {
   assert.equal(booking.notificationSent, true);
 });
 
-test("send throw sets failed", async () => {
+test("send throw sets failed and moves booking to non-blocking notification_failed", async () => {
   const db = new FakeDb();
-  await seedBooking(db, "b4");
+  await seedBooking(db, "b4", {
+    status: "pending_approval",
+    approvalStage: "pending_owner_approval",
+  });
 
   await markBookingNotificationFailed({
     db,
@@ -181,6 +184,8 @@ test("send throw sets failed", async () => {
   });
 
   const booking = await getBooking(db, "b4");
+  assert.equal(booking.status, "notification_failed");
+  assert.equal(booking.approvalStage, "owner_notification_failed");
   assert.equal(booking.notificationStatus, "failed");
   assert.equal(booking.notificationSent, false);
   assert.equal(booking.notificationError, "network timeout");

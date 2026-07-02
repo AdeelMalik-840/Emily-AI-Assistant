@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   handleBookingApproval,
@@ -9,6 +10,7 @@ import {
 import {
   buildBookingWaitingEngagement,
   buildCustomerApprovalContinuation,
+  buildCustomerUnavailableContinuation,
 } from "../src/services/customerApprovalContinuation.js";
 import {
   isSameParticipantIdentity,
@@ -375,6 +377,12 @@ function createFakePageForLocatorResolution(messageIns = []) {
   function clean(value) {
     return String(value ?? "").replace(/\s+/g, " ").trim();
   }
+  const rendered = new Set(
+    messageIns
+      .map((_, index) => index)
+      .filter((index) => messageIns[index]?.rendered !== false)
+  );
+  const renderedNodes = () => messageIns.filter((_, index) => rendered.has(index));
 
   class Locator {
     constructor(nodes, description) {
@@ -382,6 +390,37 @@ function createFakePageForLocatorResolution(messageIns = []) {
       this.description = description || "";
     }
     locator(selector) {
+      const selectorText = String(selector || "");
+      const exactConvMsgMatch = selectorText.match(/\[data-testid="conv-msg-([^"]+)"\]/i);
+      if (exactConvMsgMatch) {
+        const needle = clean(exactConvMsgMatch[1]);
+        return new Locator(
+          messageIns.filter(
+            (n) => clean(n.messageId) === needle && (n.rowType === "conv-msg" || n.dataTestid === `conv-msg-${needle}`)
+          ),
+          selector
+        );
+      }
+      if (selectorText === '[data-testid^="conv-msg-"]') {
+        return new Locator(
+          renderedNodes().filter((n) => n.rowType === "conv-msg" && clean(n.messageId)),
+          selector
+        );
+      }
+      if (selectorText === '[data-testid="msg-container"]') {
+        return new Locator(
+          renderedNodes().filter((n) => n.rowType === "msg-container"),
+          selector
+        );
+      }
+      if (
+        selectorText.includes('div.message-in') ||
+        selectorText.includes('div.message-out') ||
+        selectorText.includes('[data-testid="msg-container"]') ||
+        selectorText.includes('[data-testid^="conv-msg-"]')
+      ) {
+        return new Locator(renderedNodes(), selector);
+      }
       return new Locator(this.nodes, selector);
     }
     filter(opts = {}) {
@@ -395,7 +434,11 @@ function createFakePageForLocatorResolution(messageIns = []) {
         });
       }
       if (opts.has != null) {
-        filtered = [];
+        const selector = String(opts.has.description ?? "");
+        const idMatches = [...selector.matchAll(/data-id(?:\*?)="([^"]+)"/g)].map((m) => m[1]);
+        filtered = filtered.filter((n) =>
+          idMatches.some((id) => clean(n.messageId).includes(id))
+        );
       }
       return new Locator(filtered, this.description);
     }
@@ -411,21 +454,7 @@ function createFakePageForLocatorResolution(messageIns = []) {
     async evaluate(fn, arg) {
       const node = this.nodes[0];
       if (!node) throw new Error("no node");
-      const row = {
-        isConnected: true,
-        innerText: node.visibleText ?? node.text,
-        getAttribute: () => "",
-        querySelector: (sel) => {
-          if (sel === "div.copyable-text") return null;
-          if (sel === "span.selectable-text span" || sel === "span.selectable-text") {
-            return { textContent: node.text };
-          }
-          return null;
-        },
-        getBoundingClientRect: () => ({ width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 }),
-        ownerDocument: node.ownerDocument,
-      };
-      return fn(row, arg);
+      return fn(node.__element, arg);
     }
     async evaluateAll(fn, arg) {
       const nodes = this.nodes.map((n) => n.__element);
@@ -435,86 +464,1391 @@ function createFakePageForLocatorResolution(messageIns = []) {
 
   const doc = {
     querySelectorAll(selector) {
-      if (selector !== "div.message-in") return [];
-      return messageIns.map((n) => n.__element);
+      if (selector === "div.message-in") {
+        return renderedNodes()
+          .flatMap((n) => [
+            n.__messageInElement ||
+              (n.direction !== "out" && n.className !== "" && n.rowType !== "msg-container"
+                ? n.__element
+                : null),
+            ...(Array.isArray(n.__siblingMessageInElements)
+              ? n.__siblingMessageInElements
+              : []),
+          ])
+          .filter(Boolean);
+      }
+      if (selector === "div.message-out") {
+        return renderedNodes()
+          .flatMap((n) => [
+            n.__messageOutElement ||
+              (n.direction === "out" && n.className !== "" ? n.__element : null),
+            ...(Array.isArray(n.__siblingMessageOutElements)
+              ? n.__siblingMessageOutElements
+              : []),
+          ])
+          .filter(Boolean);
+      }
+      if (selector === '[data-testid^="conv-msg-"]') {
+        return renderedNodes().filter((n) => n.rowType === "conv-msg" && clean(n.messageId));
+      }
+      const exactConvMsgMatch = String(selector || "").match(/\[data-testid="conv-msg-([^"]+)"\]/i);
+      if (exactConvMsgMatch) {
+        const needle = clean(exactConvMsgMatch[1]);
+        return messageIns.filter(
+          (n) => clean(n.messageId) === needle && (n.rowType === "conv-msg" || n.dataTestid === `conv-msg-${needle}`)
+        );
+      }
+      if (selector === 'div.message-in, [data-testid="msg-container"]') {
+        return renderedNodes().map((n) => n.__element);
+      }
+      return [];
     },
   };
   for (let i = 0; i < messageIns.length; i += 1) {
     const n = messageIns[i];
+    const copyable = n.prePlainText
+      ? {
+          innerText: n.text,
+          getAttribute: (attr) => (attr === "data-pre-plain-text" ? n.prePlainText : ""),
+        }
+      : null;
+    const parent = n.parentMessageId || n.siblingDirection || n.siblingMessageInCount || n.siblingMessageOutCount
+      ? {
+          parentElement: null,
+          className: "",
+          classList: { contains: () => false },
+          innerText: n.visibleText ?? n.text,
+          textContent: n.visibleText ?? n.text,
+          getAttribute: (attr) => (attr === "data-id" ? clean(n.parentMessageId) : ""),
+          matches: () => false,
+          querySelector: (sel) => {
+            if (sel === ".message-in, [class*='message-in']") {
+              return n.__siblingMessageInElements?.[0] || null;
+            }
+            if (sel === ".message-out, [class*='message-out']") {
+              return n.__siblingMessageOutElements?.[0] || null;
+            }
+            return null;
+          },
+          querySelectorAll: (sel) => {
+            if (sel === ".message-in, [class*='message-in']") {
+              return n.__siblingMessageInElements || [];
+            }
+            if (sel === ".message-out, [class*='message-out']") {
+              return n.__siblingMessageOutElements || [];
+            }
+            return [];
+          },
+        }
+      : null;
+    const childDataNodes = [
+      ...(n.childMessageId ? [n.childMessageId] : []),
+      ...(Array.isArray(n.childMessageIds) ? n.childMessageIds : []),
+    ].map((id) => ({ getAttribute: (attr) => (attr === "data-id" ? id : "") }));
+    const defaultNestedMessageInCount =
+      n.rowType === "msg-container" && n.direction !== "out" ? 1 : 0;
+    const nestedMessageInCount = Number(
+      n.nestedMessageInCount ??
+        (n.nestedDirection === "in" ? 1 : defaultNestedMessageInCount)
+    );
+    const nestedMessageOutCount = Number(n.nestedMessageOutCount ?? (n.nestedDirection === "out" ? 1 : 0));
+    const className =
+      n.className != null
+        ? n.className
+        : n.rowType === "msg-container"
+        ? ""
+        : n.direction === "out"
+          ? "message-out"
+          : "message-in";
     const el = {
       __domIndex: i,
       ownerDocument: doc,
       innerText: n.visibleText ?? n.text,
-      getAttribute: () => "",
+      textContent: n.visibleText ?? n.text,
+      parentElement: parent,
+      className,
+      classList: {
+        contains: (cls) => String(className).split(/\s+/).includes(cls),
+      },
+      getAttribute: (attr) => {
+        if (attr === "data-id") return n.idLocation === "self" || n.idLocation == null ? clean(n.messageId) : "";
+        if (attr === "data-testid") {
+          if (n.rowType === "msg-container") return "msg-container";
+          if (n.rowType === "conv-msg" && clean(n.messageId)) return `conv-msg-${clean(n.messageId)}`;
+          return "";
+        }
+        if (attr === "data-pre-plain-text") return n.prePlainOnSelf ? n.prePlainText : "";
+        if (attr === "data-sender") return n.participantAttr || "";
+        return "";
+      },
+      matches: (selector) => selector === "div.message-in" && n.direction !== "out",
       querySelector: (sel) => {
-        if (sel === "div.copyable-text") return null;
+        if (sel === "div.copyable-text") return copyable;
         if (sel === "span.selectable-text span" || sel === "span.selectable-text") {
           return { textContent: n.text };
         }
+        if (sel === "[data-pre-plain-text]") return copyable;
+        if (sel === ".message-in, [class*='message-in']" && nestedMessageInCount > 0) {
+          return n.__messageInElement || { className: "message-in" };
+        }
+        if (sel === ".message-out, [class*='message-out']" && (nestedMessageOutCount > 0 || n.direction === "out")) {
+          return n.__messageOutElement || { className: "message-out" };
+        }
         return null;
+      },
+      querySelectorAll: (sel) => {
+        if (sel === "[data-id]") return childDataNodes;
+        if (sel === ".message-in, [class*='message-in']") {
+          return Array.from({ length: Math.max(0, nestedMessageInCount) }, (_, index) =>
+            index === 0 && n.__messageInElement ? n.__messageInElement : { className: "message-in" }
+          );
+        }
+        if (sel === ".message-out, [class*='message-out']") {
+          return Array.from({ length: Math.max(0, nestedMessageOutCount) }, (_, index) =>
+            index === 0 && n.__messageOutElement ? n.__messageOutElement : { className: "message-out" }
+          );
+        }
+        return [];
       },
       getBoundingClientRect: () => ({ width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 }),
     };
+    if (nestedMessageInCount > 0) {
+      n.__messageInElement = {
+        ownerDocument: doc,
+        parentElement: el,
+        innerText: n.visibleText ?? n.text,
+        textContent: n.visibleText ?? n.text,
+        className: "message-in",
+        classList: { contains: (cls) => cls === "message-in" },
+        getAttribute: () => "",
+        matches: (selector) => selector.includes("message-in"),
+        querySelector: el.querySelector,
+        querySelectorAll: (sel) => (sel === "[data-id]" ? [] : []),
+        getBoundingClientRect: () => ({ width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 }),
+      };
+    }
+    if (nestedMessageOutCount > 0) {
+      n.__messageOutElement = {
+        ownerDocument: doc,
+        parentElement: el,
+        innerText: n.visibleText ?? n.text,
+        textContent: n.visibleText ?? n.text,
+        className: "message-out",
+        classList: { contains: (cls) => cls === "message-out" },
+        getAttribute: () => "",
+        matches: (selector) => selector.includes("message-out"),
+        querySelector: el.querySelector,
+        querySelectorAll: (sel) => (sel === "[data-id]" ? [] : []),
+        getBoundingClientRect: () => ({ width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 }),
+      };
+    }
+    const makeSiblingBubble = (direction, index = 0) => ({
+      ownerDocument: doc,
+      parentElement: parent,
+      innerText: n.siblingVisibleText ?? n.visibleText ?? n.text,
+      textContent: n.siblingVisibleText ?? n.visibleText ?? n.text,
+      className: direction === "out" ? "message-out" : "message-in",
+      classList: {
+        contains: (cls) => cls === (direction === "out" ? "message-out" : "message-in"),
+      },
+      getAttribute: () => "",
+      matches: (selector) =>
+        selector.includes(direction === "out" ? "message-out" : "message-in"),
+      querySelector: (sel) => {
+        if (sel === "div.copyable-text") {
+          return {
+            innerText: n.siblingText ?? n.text,
+            getAttribute: (attr) =>
+              attr === "data-pre-plain-text"
+                ? n.siblingPrePlainText ?? n.prePlainText ?? ""
+                : "",
+          };
+        }
+        if (sel === "span.selectable-text span" || sel === "span.selectable-text") {
+          return { textContent: n.siblingText ?? n.text };
+        }
+        if (sel === "[data-pre-plain-text]") {
+          return {
+            getAttribute: (attr) =>
+              attr === "data-pre-plain-text"
+                ? n.siblingPrePlainText ?? n.prePlainText ?? ""
+                : "",
+          };
+        }
+        return null;
+      },
+      querySelectorAll: (sel) => (sel === "[data-id]" ? [] : []),
+      getBoundingClientRect: () => ({
+        width: 10,
+        height: 10,
+        top: index,
+        left: 0,
+        right: 10,
+        bottom: index + 10,
+      }),
+    });
+    const siblingMessageInCount = Number(
+      n.siblingMessageInCount ?? (n.siblingDirection === "in" ? 1 : 0)
+    );
+    const siblingMessageOutCount = Number(
+      n.siblingMessageOutCount ?? (n.siblingDirection === "out" ? 1 : 0)
+    );
+    if (parent && siblingMessageInCount > 0) {
+      n.__siblingMessageInElements = Array.from(
+        { length: siblingMessageInCount },
+        (_, index) => makeSiblingBubble("in", index)
+      );
+    }
+    if (parent && siblingMessageOutCount > 0) {
+      n.__siblingMessageOutElements = Array.from(
+        { length: siblingMessageOutCount },
+        (_, index) => makeSiblingBubble("out", index)
+      );
+    }
     n.__element = el;
     n.ownerDocument = doc;
   }
 
   return {
-    locator(selector) {
-      if (selector === "div.message-in") return new Locator(messageIns, selector);
-      return new Locator([], selector);
+    async evaluate() {
+      const firstHidden = messageIns.findIndex((_, index) => !rendered.has(index));
+      if (firstHidden >= 0) rendered.add(firstHidden);
+      return { ok: true, before: firstHidden >= 0 ? 100 : 0, after: firstHidden >= 0 ? 0 : 0 };
     },
+    locator(selector) {
+      const selectorText = String(selector || "");
+      const exactConvMsgMatch = selectorText.match(/\[data-testid="conv-msg-([^"]+)"\]/i);
+      if (exactConvMsgMatch) {
+        const needle = clean(exactConvMsgMatch[1]);
+        return new Locator(
+          renderedNodes().filter(
+            (n) => clean(n.messageId) === needle && (n.rowType === "conv-msg" || n.dataTestid === `conv-msg-${needle}`)
+          ),
+          selector
+        );
+      }
+      if (selectorText === '[data-testid="msg-container"]') {
+        return new Locator(
+          renderedNodes().filter((n) => n.rowType === "msg-container"),
+          selector
+        );
+      }
+      if (
+        selectorText.includes('[data-testid^="conv-msg-"]') ||
+        selectorText.includes('div.message-in') ||
+        selectorText.includes('div.message-out') ||
+        selectorText.includes('[data-testid="msg-container"]')
+      ) {
+        return new Locator(renderedNodes(), selector);
+      }
+      if (selector === "div.message-in") {
+        return new Locator(
+          renderedNodes()
+            .flatMap((n) => {
+              const nodes = [];
+              if (n.__messageInElement) {
+                nodes.push({ ...n, __element: n.__messageInElement });
+              } else if (
+                n.direction !== "out" &&
+                n.className !== "" &&
+                n.rowType !== "msg-container"
+              ) {
+                nodes.push(n);
+              }
+              for (const sibling of n.__siblingMessageInElements || []) {
+                nodes.push({ ...n, __element: sibling });
+              }
+              return nodes;
+            })
+            .filter(Boolean),
+          selector
+        );
+      }
+      if (selector === 'div.message-in, [data-testid="msg-container"]') {
+        return new Locator(renderedNodes(), selector);
+      }
+      return new Locator(renderedNodes(), selector);
+    },
+    waitForTimeout: async () => {},
   };
+}
+
+function locatorDiagnosticFromLogs(logs, bookingId) {
+  for (const entry of logs) {
+    const line = String(entry?.[0] ?? "");
+    if (!line.startsWith("{") || !line.includes("reply_privately_source_locator_diagnostics")) {
+      continue;
+    }
+    const parsed = JSON.parse(line);
+    if (!bookingId || parsed?.data?.bookingId === bookingId) return parsed.data;
+  }
+  return null;
+}
+
+function sourceRowNotVisibleAggregateFromLogs(logs, bookingId) {
+  for (const entry of logs) {
+    const line = String(entry?.[0] ?? "");
+    if (
+      !line.startsWith("{") ||
+      !line.includes("reply_privately_source_row_not_visible_aggregate")
+    ) {
+      continue;
+    }
+    const parsed = JSON.parse(line);
+    if (!bookingId || parsed?.data?.bookingId === bookingId) return parsed.data;
+  }
+  return null;
+}
+
+function extractSourceSegment(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  if (start < 0) return "";
+  const end = source.indexOf(endMarker, start);
+  return end < 0 ? source.slice(start) : source.slice(start, end);
 }
 
 test("Reply Privately locator resolves using visible text participant + message text", async () => {
   const page = createFakePageForLocatorResolution([
     {
-      text: "4 din",
-      visibleText: "Hooria 4 din",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Hooria Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
     },
   ]);
   const sourceMessage = {
     participantName: "Hooria",
-    sourceText: "4 din",
+    sourceText: "[Hooria] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
   };
   const { result, logs, warns } = await captureConsole(() =>
     __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-x" })
   );
   assert.equal(result.ok, true);
   assert.ok(result.locator);
-  assert.ok(
-    logs.some((l) =>
-      String(l[0]).includes("[reply_privately_locator_visible_text_strategy_used]")
-    )
-  );
   assert.ok(logs.some((l) => String(l[0]).includes("[reply_privately_locator_verified]")));
   assert.equal(warns.length, 0);
 });
 
-test("Reply Privately locator disambiguates by latest matching candidate when participant+text matches multiple bubbles", async () => {
+test("Reply Privately locator fails closed when participant+text partially matches multiple bubbles", async () => {
   const page = createFakePageForLocatorResolution([
-    { text: "4 din", visibleText: "Hooria 4 din" },
-    { text: "4 din", visibleText: "Hooria 4 din" },
+    {
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Hooria Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+    {
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Hooria Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
   ]);
   const sourceMessage = {
     participantName: "Hooria",
-    sourceText: "4 din",
+    sourceText: "[Hooria] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
   };
   const { result, logs, warns } = await captureConsole(() =>
     __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-amb" })
   );
-  assert.equal(result.ok, true);
-  assert.ok(result.locator);
-  assert.ok(
-    logs.some((l) =>
-      String(l[0]).includes("[reply_privately_disambiguated_by_latest_candidate]")
-    )
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(
+    logs.some((l) => String(l[0]).includes("[reply_privately_disambiguated_by_latest_candidate]")),
+    false
   );
   assert.equal(
     warns.some((w) => String(w[0]).includes("[reply_privately_source_bubble_ambiguous]")),
     false
   );
+});
+
+test("Reply Privately locator matches wa-prefixed sourceMessageId to DOM data-id", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      messageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB03875D5C3C5F658A79B",
+    sourceParticipantName: "Adeel malik",
+    sourceParticipantKey: "adeel-malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-wa-id" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+  assert.ok(
+    logs.some((l) =>
+      String(l[0]).includes("[reply_privately_locator_verified]") &&
+      l[1]?.normalizedSourceMessageId === "3EB03875D5C3C5F658A79B"
+    )
+  );
+});
+
+test("Reply Privately locator matches wa-prefixed sourceMessageId to parent DOM data-id", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      idLocation: "parent",
+      parentMessageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB03875D5C3C5F658A79B",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-parent-id" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+});
+
+test("Reply Privately locator matches wa-prefixed sourceMessageId to msg-container wrapper data-id", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      messageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB03875D5C3C5F658A79B",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-wrapper-id" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+});
+
+test("Reply Privately locator resolves ancestor ID evidence to nested incoming bubble", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      messageId: "3EB031D84E2E540873F4CA",
+      text: "Civic 1 din k lye book karni hai",
+      visibleText: "Civic 1 din k lye book karni hai",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+      nestedDirection: "in",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB031D84E2E540873F4CA",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Civic 1 din k lye book karni hai",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-ancestor-in" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+  assert.equal(result.locator.description, "div.message-in");
+  assert.ok(
+    logs.some(
+      (l) =>
+        String(l[0]).includes("[reply_privately_source_candidate_checked]") &&
+        l[1]?.resolvedBubbleDirection === "in" &&
+        l[1]?.finalClickableResolvedToMessageIn === true
+    )
+  );
+});
+
+test("Reply Privately locator resolves conv-msg source anchor without div.message-in", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "conv-msg",
+      rendered: false,
+      messageId: "3EB07D557BD9BDB4D63A15",
+      text: "Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      visibleText: "Adeel malik Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB07D557BD9BDB4D63A15",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Honda Civic 4 din k lye book krni h TEST-DM-1701",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-conv-msg" })
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+  assert.equal(result.locator.description, '[data-testid="conv-msg-3EB07D557BD9BDB4D63A15"]');
+});
+
+test("Reply Privately direct conv-msg fast path fails closed on wrong text", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "conv-msg",
+      rendered: false,
+      messageId: "3EB07D557BD9BDB4D63A15",
+      text: "Honda Civic 3 din k lye book krni h TEST-DM-1701",
+      visibleText: "Adeel malik Honda Civic 3 din k lye book krni h TEST-DM-1701",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB07D557BD9BDB4D63A15",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Honda Civic 4 din k lye book krni h TEST-DM-1701",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-conv-msg-wrong-text" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(
+    ["DIRECT_CONV_MSG_IDENTITY_FAILED", "SOURCE_ROW_NOT_VISIBLE"].includes(String(result.reason || ""))
+  );
+  assert.ok(
+    logs.some((l) =>
+      String(l[0]).includes("[reply_privately_direct_conv_msg_lookup_attempt]") &&
+      l[1]?.exactRootCount === 1
+    )
+  );
+});
+
+test("Reply Privately direct conv-msg fast path fails closed on wrong participant", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "conv-msg",
+      rendered: false,
+      messageId: "3EB07D557BD9BDB4D63A15",
+      text: "Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      visibleText: "Hooria Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      prePlainText: "[8:15 PM] Hooria: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB07D557BD9BDB4D63A15",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Honda Civic 4 din k lye book krni h TEST-DM-1701",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-conv-msg-wrong-participant" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(
+    ["DIRECT_CONV_MSG_IDENTITY_FAILED", "SOURCE_ROW_NOT_VISIBLE"].includes(String(result.reason || ""))
+  );
+});
+
+test("Reply Privately direct conv-msg fast path fails closed on duplicate exact matches", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "conv-msg",
+      rendered: false,
+      messageId: "3EB07D557BD9BDB4D63A15",
+      text: "Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      visibleText: "Adeel malik Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+    {
+      rowType: "conv-msg",
+      rendered: false,
+      messageId: "3EB07D557BD9BDB4D63A15",
+      text: "Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      visibleText: "Adeel malik Honda Civic 4 din k lye book krni h TEST-DM-1701",
+      prePlainText: "[8:16 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB07D557BD9BDB4D63A15",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Honda Civic 4 din k lye book krni h TEST-DM-1701",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-conv-msg-duplicate" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(
+    ["DIRECT_CONV_MSG_AMBIGUOUS", "SOURCE_ROW_NOT_VISIBLE"].includes(String(result.reason || ""))
+  );
+});
+
+test("Reply Privately browser callbacks do not reference module-scope normalization helpers", () => {
+  const source = readFileSync(new URL("../src/services/playwrightReplyPrivatelyBridge.js", import.meta.url), "utf8");
+  const directCallback = extractSourceSegment(
+    source,
+    "const buildDirectConvMsgSnapshot = async",
+    "const tryDirectExactConvMsgLookup = async"
+  );
+  const broadScanCallback = extractSourceSegment(
+    source,
+    "const collectCandidateSnapshots = async",
+    "const evaluateCandidateSnapshot = (candidate) =>"
+  );
+
+  for (const callback of [directCallback, broadScanCallback]) {
+    assert.doesNotMatch(callback, /normalizeExactSourceText\s*\(|normalizeSourceBubbleTextForCompare\s*\(|normalizeParticipantKey\s*\(|stripLeadingParticipantPrefix\s*\(/);
+    assert.match(callback, /normalizeBrowserText|stripLeadingParticipantPrefixBrowser|normalizeId/);
+  }
+});
+
+test("Reply Privately locator resolves confirmed ancestor ID to sibling incoming bubble", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      idLocation: "parent",
+      parentMessageId: "3EB02CBB32552F2ED27729",
+      className: "",
+      direction: "unknown",
+      text: "Corolla 2 din k lye book krni h",
+      visibleText: "Corolla 2 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+      nestedMessageInCount: 0,
+      siblingDirection: "in",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB02CBB32552F2ED27729",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Corolla 2 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-sibling-in" })
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+  assert.equal(result.locator.description, "div.message-in");
+  assert.ok(
+    logs.some(
+      (l) =>
+        String(l[0]).includes("[reply_privately_source_candidate_checked]") &&
+        l[1]?.resolvedBubbleDirection === "in" &&
+        l[1]?.evidenceContainerRelation === "parent_scope_same_text_participant" &&
+        l[1]?.finalClickableResolvedToMessageIn === true
+    )
+  );
+});
+
+test("Reply Privately locator fails closed when confirmed ancestor has no clickable bubble", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      idLocation: "parent",
+      parentMessageId: "3EB02CBB32552F2ED27729",
+      className: "",
+      direction: "unknown",
+      text: "Corolla 2 din k lye book krni h",
+      visibleText: "Corolla 2 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+      nestedMessageInCount: 0,
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB02CBB32552F2ED27729",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Corolla 2 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-no-clickable" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-no-clickable");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(diagnostic.idMatchedCandidateRejectReason, "NOT_INCOMING_ROW");
+  assert.equal(diagnostic.idMatchedCandidateResolvedBubbleFound, false);
+  assert.equal(diagnostic.idMatchedCandidateFinalClickableResolvedToMessageIn, false);
+});
+
+test("Reply Privately locator rejects ancestor ID evidence resolved to outgoing bubble", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      direction: "out",
+      messageId: "3EB031D84E2E540873F4CA",
+      text: "Civic 1 din k lye book karni hai",
+      visibleText: "Civic 1 din k lye book karni hai",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+      nestedDirection: "out",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB031D84E2E540873F4CA",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Civic 1 din k lye book karni hai",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-ancestor-out" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-ancestor-out");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(diagnostic.idMatchedCandidateRejectReason, "OUTGOING_ROW");
+  assert.equal(diagnostic.idMatchedCandidateResolvedBubbleDirection, "out");
+});
+
+test("Reply Privately locator rejects confirmed ancestor ID with sibling outgoing bubble", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      idLocation: "parent",
+      parentMessageId: "3EB02CBB32552F2ED27729",
+      className: "",
+      direction: "unknown",
+      text: "Corolla 2 din k lye book krni h",
+      visibleText: "Corolla 2 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+      nestedMessageInCount: 0,
+      siblingDirection: "out",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB02CBB32552F2ED27729",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Corolla 2 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-sibling-out" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-sibling-out");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(diagnostic.idMatchedCandidateRejectReason, "OUTGOING_ROW");
+  assert.equal(diagnostic.idMatchedCandidateResolvedBubbleDirection, "out");
+});
+
+test("Reply Privately locator fails closed when ancestor contains multiple incoming bubbles", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      messageId: "3EB031D84E2E540873F4CA",
+      text: "Civic 1 din k lye book karni hai",
+      visibleText: "Civic 1 din k lye book karni hai",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+      nestedMessageInCount: 2,
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB031D84E2E540873F4CA",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Civic 1 din k lye book karni hai",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-ancestor-multi" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-ancestor-multi");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(diagnostic.idMatchedCandidateRejectReason, "AMBIGUOUS_MESSAGE_CONTAINER");
+  assert.equal(diagnostic.idMatchedCandidateEvidenceSplitAcrossContainers, true);
+});
+
+test("Reply Privately locator fails closed when confirmed ancestor has multiple sibling incoming bubbles", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rowType: "msg-container",
+      idLocation: "parent",
+      parentMessageId: "3EB02CBB32552F2ED27729",
+      className: "",
+      direction: "unknown",
+      text: "Corolla 2 din k lye book krni h",
+      visibleText: "Corolla 2 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+      nestedMessageInCount: 0,
+      siblingMessageInCount: 2,
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB02CBB32552F2ED27729",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Corolla 2 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-sibling-multi" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-sibling-multi");
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(diagnostic.idMatchedCandidateRejectReason, "AMBIGUOUS_MESSAGE_CONTAINER");
+  assert.equal(diagnostic.idMatchedCandidateEvidenceSplitAcrossContainers, true);
+});
+
+test("Reply Privately locator normalizes real sourceRowKey to DOM data-id", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      messageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+  ]);
+  const sourceMessage = {
+    sourceRowKey: "real:3EB03875D5C3C5F658A79B#1",
+    sourceParticipantName: "Adeel malik",
+    sourceParticipantKey: "adeel-malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-row-key" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+});
+
+test("Reply Privately locator reads participant from data-pre-plain-text", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-preplain" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "participant_text");
+  assert.ok(
+    logs.some((l) =>
+      String(l[0]).includes("[reply_privately_source_candidate_checked]") &&
+      l[1]?.participantPreview === "Adeel malik"
+    )
+  );
+});
+
+test("Reply Privately production fallback matches exact source text and participant without LIVE-E2E", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-prod-text" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceText_participant_unique");
+  assert.ok(
+    logs.some(
+      (l) =>
+        String(l[0]).includes("[reply_privately_locator_verified]") &&
+        l[1]?.strategy === "sourceText_participant_unique"
+    )
+  );
+});
+
+test("Reply Privately production fallback strips participant prefix and normalizes case/spacing", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      text: "  Corolla   5 DIN k lye   book krni h ",
+      visibleText: "  Corolla   5 DIN k lye   book krni h ",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-prod-space" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceText_participant_unique");
+});
+
+test("Reply Privately production fallback rejects wrong duration, wrong item, and partial text", async () => {
+  for (const [bookingId, text] of [
+    ["book-wrong-duration", "corolla 2 din k lye book krni h"],
+    ["book-wrong-item", "civic 5 din k lye book krni h"],
+    ["book-partial-corolla", "corolla 5 din"],
+  ]) {
+    const page = createFakePageForLocatorResolution([
+      {
+        text,
+        visibleText: text,
+        prePlainText: "[8:15 PM] Adeel malik: ",
+      },
+    ]);
+    const sourceMessage = {
+      sourceParticipantName: "Adeel malik",
+      sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+    };
+
+    const { result } = await captureConsole(() =>
+      __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId })
+    );
+
+    assert.equal(result.ok, false, `${bookingId} should fail closed`);
+  }
+});
+
+test("Reply Privately production fallback rejects same text from another participant", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Hooria: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-other-participant-text" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+});
+
+test("Reply Privately production fallback requires participant metadata", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "Adeel malik corolla 5 din k lye book krni h",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-no-participant-meta" })
+  );
+
+  assert.equal(result.ok, false);
+});
+
+test("Reply Privately production fallback fails closed on duplicate exact candidates", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:17 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-duplicate-prod" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(
+    logs.some(
+      (l) =>
+        String(l[0]).startsWith("{") &&
+        l[0].includes("reply_privately_source_locator_diagnostics") &&
+        l[0].includes("AMBIGUOUS_SOURCE_TEXT_PARTICIPANT")
+    )
+  );
+});
+
+test("Reply Privately production fallback aggregates scroll candidates before selecting", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rendered: false,
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+    {
+      text: "corolla available hai?",
+      visibleText: "corolla available hai?",
+      prePlainText: "[8:16 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-scroll-prod" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceText_participant_unique");
+  assert.ok(logs.some((l) => String(l[0]).includes("[reply_privately_source_scroll_step]")));
+});
+
+test("Reply Privately production fallback detects multiple matches across scroll and fails closed", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rendered: false,
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:16 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-scroll-ambiguous-prod" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(
+    logs.some(
+      (l) =>
+        String(l[0]).startsWith("{") &&
+        l[0].includes("reply_privately_source_locator_diagnostics") &&
+        l[0].includes("AMBIGUOUS_SOURCE_TEXT_PARTICIPANT")
+    )
+  );
+});
+
+test("Reply Privately diagnostics record ID matched candidate rejected because not incoming", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      className: "",
+      direction: "unknown",
+      messageId: "3EB01572C6272B8E9B0967",
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB01572C6272B8E9B0967",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-diag-not-incoming" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-diag-not-incoming");
+
+  assert.equal(result.ok, false);
+  assert.equal(diagnostic.idMatchedCandidateCount, 1);
+  assert.equal(diagnostic.idMatchedCandidateRejectReason, "NOT_INCOMING_ROW");
+  assert.equal(diagnostic.idMatchedCandidateDirection, "unknown");
+  assert.equal(diagnostic.idMatchedCandidateHasMessageIn, false);
+  assert.equal(diagnostic.idMatchedCandidateHasMessageOut, false);
+});
+
+test("Reply Privately diagnostics record ID matched candidate rejected because participant is missing", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      messageId: "3EB01572C6272B8E9B0967",
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB01572C6272B8E9B0967",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-diag-id-no-participant" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-diag-id-no-participant");
+
+  assert.equal(result.ok, false);
+  assert.equal(diagnostic.idMatchedCandidateCount, 1);
+  assert.equal(diagnostic.idMatchedCandidateRejectReason, "PARTICIPANT_MISMATCH");
+  assert.equal(diagnostic.idMatchedCandidateTextMatched, true);
+  assert.equal(diagnostic.idMatchedCandidateParticipantMatched, false);
+  assert.equal(diagnostic.idMatchedCandidateParticipantAvailable, true);
+});
+
+test("Reply Privately diagnostics record duplicate text participant candidates", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+    {
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:16 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-diag-duplicate" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-diag-duplicate");
+
+  assert.equal(result.ok, false);
+  assert.equal(diagnostic.sourceTextParticipantUniqueCandidateCount, 2);
+  assert.equal(diagnostic.textParticipantCandidateCount, 2);
+  assert.equal(diagnostic.ambiguityReason, "AMBIGUOUS_SOURCE_TEXT_PARTICIPANT");
+  assert.ok(Array.isArray(diagnostic.ambiguousCandidateSummaries));
+  assert.ok(diagnostic.ambiguousCandidateSummaries.length <= 5);
+});
+
+test("Reply Privately diagnostics record text participant candidate rejected because outgoing", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      direction: "out",
+      text: "corolla 5 din k lye book krni h",
+      visibleText: "corolla 5 din k lye book krni h",
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-diag-outgoing" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-diag-outgoing");
+
+  assert.equal(result.ok, false);
+  assert.equal(diagnostic.textParticipantCandidateCount, 1);
+  assert.equal(diagnostic.textParticipantCandidateRejectReason, "OUTGOING_ROW");
+  assert.equal(diagnostic.textParticipantCandidateDirection, "out");
+  assert.equal(diagnostic.textParticipantCandidateHasMessageOut, true);
+});
+
+test("Reply Privately diagnostics record exact text mismatch without full DOM dumps", async () => {
+  const longText =
+    "please corolla 5 din k lye book krni h with a very long suffix that should not be fully persisted in diagnostics";
+  const page = createFakePageForLocatorResolution([
+    {
+      text: longText,
+      visibleText: longText,
+      prePlainText: "[8:15 PM] Adeel malik: ",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] corolla 5 din k lye book krni h",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-diag-exact-mismatch" })
+  );
+  const diagnostic = locatorDiagnosticFromLogs(logs, "book-diag-exact-mismatch");
+  const summary = diagnostic.ambiguousCandidateSummaries[0];
+
+  assert.equal(result.ok, false);
+  assert.equal(diagnostic.textParticipantCandidateCount, 1);
+  assert.equal(diagnostic.textParticipantCandidateRejectReason, "INSUFFICIENT_SOURCE_PROOF");
+  assert.equal(summary.strippedTextMatched, true);
+  assert.equal(summary.exactTextMatched, false);
+  assert.ok(String(summary.textPreview || "").length <= 80);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /data-pre-plain-text|querySelector|localStorage|cookie|session/i);
+});
+
+test("Reply Privately locator selects correct bubble when source text and participant match", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      messageId: "old-id",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1563",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1563",
+    },
+    {
+      messageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-text" })
+  );
+
+  assert.equal(result.ok, true);
+});
+
+test("Reply Privately locator does not select assistant outgoing bubble", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      direction: "out",
+      messageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB03875D5C3C5F658A79B",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-out" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+});
+
+test("Reply Privately locator scrolls conversation panel upward and re-reads rows", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      rendered: false,
+      messageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+    {
+      messageId: "other-id",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-9999",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-9999",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB03875D5C3C5F658A79B",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-scroll" })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "sourceMessageId");
+  assert.ok(logs.some((l) => String(l[0]).includes("[reply_privately_source_scroll_step]")));
+  assert.ok(logs.some((l) => String(l[0]).includes("[reply_privately_source_scroll_search_found]")));
+});
+
+test("Reply Privately locator does not select old LIVE-E2E row", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      messageId: "old-id",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1563",
+      visibleText: "Adeel malik Toyota corolla 3 din ke liye book kar do LIVE-E2E-1563",
+    },
+  ]);
+  const sourceMessage = {
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-old-live" })
+  );
+
+  assert.equal(result.ok, false);
+});
+
+test("Reply Privately locator does not select different participant row", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      messageId: "3EB03875D5C3C5F658A79B",
+      text: "Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+      visibleText: "Hooria Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB03875D5C3C5F658A79B",
+    sourceParticipantName: "Adeel malik",
+    sourceParticipantKey: "adeel-malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-wrong-participant" })
+  );
+
+  assert.equal(result.ok, false);
+});
+
+test("Reply Privately locator fails closed when source bubble is missing", async () => {
+  const page = createFakePageForLocatorResolution([]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB03875D5C3C5F658A79B",
+    sourceParticipantName: "Adeel malik",
+    sourceText: "[Adeel malik] Toyota corolla 3 din ke liye book kar do LIVE-E2E-1564",
+  };
+
+  const startedAt = Date.now();
+  const { result, logs } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({ page, sourceMessage, bookingId: "book-missing" })
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "SOURCE_ROW_NOT_VISIBLE");
+  const aggregate = sourceRowNotVisibleAggregateFromLogs(logs, "book-missing");
+  assert.ok(aggregate);
+  assert.equal(aggregate.bookingId, "book-missing");
+  assert.equal(aggregate.normalizedSourceMessageId, "3EB03875D5C3C5F658A79B");
+  assert.equal(aggregate.conversationPanelFound, false);
+  assert.equal(aggregate.conversationPanelBodyFound, false);
+  assert.equal(aggregate.mainFound, false);
+  assert.equal(aggregate.convMsgExactGlobalCount, 0);
+  assert.equal(aggregate.convMsgPrefixGlobalCount, 0);
+  assert.equal(aggregate.convMsgExactRootCount, 0);
+  assert.equal(aggregate.convMsgPrefixRootCount, 0);
+  assert.equal(aggregate.messageInCount, 0);
+  assert.equal(aggregate.messageOutCount, 0);
+  assert.ok(Date.now() - startedAt < 3000);
 });
 
 test("parses approve button reply id", () => {
@@ -723,6 +2057,7 @@ test("approval leaves Playwright group continuation pending for local poller", a
       store.businesses.owner1.bookings["book-rp-1"].data.approvalCustomerNotificationStatus,
       "pending"
     );
+    assert.equal(store.businesses.owner1.bookings["book-rp-1"].data.canDmCustomer, true);
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.approvalCustomerNotificationMethod,
       undefined
@@ -1033,6 +2368,67 @@ test("local approval poller marks Reply Privately failure without owner fallback
   );
 });
 
+test("local approval poller sends rejected booking unavailable status privately", async () => {
+  const { db, store } = createFakeDb({
+    booking: {
+      id: "book-local-rejected",
+      data: {
+        status: "rejected",
+        approvalStage: "rejected",
+        approvalCustomerNotificationStatus: "pending",
+        ownerNotificationPhone: "+923331234567",
+        itemId: "item-a",
+        itemName: "Civic",
+        durationDays: 4,
+        bookingSource: "PLAYWRIGHT_GROUP",
+        playwrightReplyPrivateEligible: true,
+        groupName: "Rental Leads",
+        playwrightChatKey: "Rental Leads",
+        sourceText: "4 din",
+        sourceParticipantName: "Ali",
+        sourceRowKey: "row:1000:49075869#1",
+        sourceIdentity: {
+          groupChatKey: "Rental Leads",
+          groupName: "Rental Leads",
+          sourceRowKey: "row:1000:49075869#1",
+          sourceTextPreview: "4 din",
+          participantKey: "ali",
+          participantName: "Ali",
+          participantDisplayName: "Ali",
+        },
+      },
+    },
+  });
+  const messages = [];
+
+  await pollLocalApprovalContinuations({
+    dbInstance: db,
+    ownerUserId: "owner1",
+    replyPrivately: async (opts) => {
+      messages.push(opts.message);
+      return {
+        ok: true,
+        verificationPassed: true,
+        dmOpened: true,
+        dmMessageSent: true,
+      };
+    },
+  });
+
+  assert.deepEqual(messages, [
+    "Civic 4 din ke liye available nahi hai. Koi aur car check kar dun?",
+  ]);
+  assert.equal(
+    store.businesses.owner1.bookings["book-local-rejected"].data
+      .approvalCustomerNotificationStatus,
+    "sent"
+  );
+  assert.doesNotMatch(
+    messages[0],
+    /owner|approval|approved by owner|rejected by owner|pending approval|system|notification/i
+  );
+});
+
 test("local approval poller queues multiple approved group bookings sequentially", async () => {
   const base = {
     status: "approved",
@@ -1201,6 +2597,136 @@ test("Reply Privately menu opening uses locked DOM element + scoped menu button 
   assert.equal(menuButtonClicks, 1);
   assert.equal(mouseClicks, 0);
   assert.ok(scrollCalls >= 1);
+});
+
+test("Reply Privately direct conv-msg fast path works without debug tags", async () => {
+  const page = createFakePageForLocatorResolution([
+    {
+      messageId: "3EB0ABCDEF1234567890AA",
+      text: "Example vehicle 1 din k lye book krni h",
+      visibleText: "Customer One Example vehicle 1 din k lye book krni h",
+    },
+  ]);
+  const sourceMessage = {
+    sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+    sourceParticipantName: "Customer One",
+    sourceText: "[Customer One] Example vehicle 1 din k lye book krni h",
+  };
+
+  const { result } = await captureConsole(() =>
+    __locateVerifiedSourceBubbleLocatorForTests({
+      page,
+      sourceMessage,
+      bookingId: "book-prod-no-debug",
+    })
+  );
+
+  assert.equal(result.ok, true);
+});
+
+test("Reply Privately bubble verification prefers stripped source text from raw source metadata", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const page = {
+    waitForTimeout: async () => undefined,
+    waitForSelector: async (selector) =>
+      selector === '[role="menu"]' && menuVisibleRef.value ? {} : null,
+    getByText: () => ({
+      isVisible: async () => menuVisibleRef.value,
+      click: async () => {
+        menuVisibleRef.value = false;
+      },
+    }),
+    keyboard: { press: async () => undefined },
+    mouse: {
+      move: async () => undefined,
+      click: async () => assert.fail("mouse.click should not be used"),
+    },
+    locator: () => ({
+      filter: () => ({
+        first: () => ({
+          isVisible: async () => true,
+        }),
+      }),
+    }),
+  };
+
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Customer One",
+    text: "Example vehicle 1 din k lye book krni h",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+
+  const { result, logs } = await captureConsole(() =>
+    openBubbleMenu(page, bubbleLocator, {
+      bookingId: "book-prod-stripped",
+      sourceMessage: {
+        sourceText: "[Customer One] Example vehicle 1 din k lye book krni h",
+        sourceParticipantName: "Customer One",
+        sourceParticipantKey: "customer-one",
+      },
+    })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(menuButtonClicksRef.count, 1);
+  assert.ok(
+    logs.some(
+      (entry) =>
+        String(entry[0]).includes("[reply_privately_source_bubble_verification]") &&
+        entry[1]?.sourceBubbleVerificationNeedleType === "stripped_text"
+    )
+  );
+});
+
+test("Reply Privately bubble verification fails closed on wrong stripped source text", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const page = {
+    waitForTimeout: async () => undefined,
+    waitForSelector: async () => null,
+    getByText: () => ({
+      isVisible: async () => false,
+      click: async () => undefined,
+    }),
+    keyboard: { press: async () => undefined },
+    mouse: {
+      move: async () => undefined,
+      click: async () => assert.fail("mouse.click should not be used"),
+    },
+    locator: () => ({
+      filter: () => ({
+        first: () => ({
+          isVisible: async () => false,
+        }),
+      }),
+    }),
+  };
+
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Customer One",
+    text: "Example vehicle 1 din k lye book krni h",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+
+  const { result } = await captureConsole(() =>
+    openBubbleMenu(page, bubbleLocator, {
+      bookingId: "book-prod-wrong-text",
+      sourceMessage: {
+        sourceText: "[Customer One] Different vehicle 1 din k lye book krni h",
+        sourceParticipantName: "Customer One",
+        sourceParticipantKey: "customer-one",
+      },
+    })
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(menuButtonClicksRef.count, 0);
 });
 
 test("Reply Privately rejects arrow click when DOM bubble participant mismatches expected source", async () => {
@@ -1905,7 +3431,7 @@ test("approval customer notification starts for approved booking", async () => {
   assert.ok(logs.find((entry) => entry[0] === "[approval_customer_notify_started]"));
 });
 
-test("group_safe copy avoids internal approval/system wording", () => {
+test("customer approval continuation uses final availability copy without internal wording", () => {
   const copy = buildCustomerApprovalContinuation(
     {
       eventType: "OWNER_APPROVED_BOOKING",
@@ -1919,13 +3445,14 @@ test("group_safe copy avoids internal approval/system wording", () => {
     "neutral_english"
   );
 
-  assert.doesNotMatch(copy, /\b(owner|approved|AI|system)\b/i);
+  assert.doesNotMatch(copy, /\b(owner|approval|approved by owner|rejected by owner|pending approval|AI|system)\b/i);
   assert.match(copy, /Camera Kit/);
-  assert.match(copy, /2 days/);
-  assert.match(copy, /private chat/i);
+  assert.match(copy, /2 days ke liye available hai/);
+  assert.match(copy, /Booking confirm ho gayi hai/);
+  assert.doesNotMatch(copy, /private chat|Delivery|pickup/i);
 });
 
-test("DM approval continuation asks for pickup or delivery without asking user to DM", () => {
+test("DM approval continuation sends final approved status without asking for details", () => {
   const copy = buildCustomerApprovalContinuation(
     {
       eventType: "OWNER_APPROVED_BOOKING",
@@ -1939,9 +3466,29 @@ test("DM approval continuation asks for pickup or delivery without asking user t
   );
 
   assert.match(copy, /Projector/);
-  assert.match(copy, /3 days/);
-  assert.match(copy, /delivery or pickup/i);
+  assert.match(copy, /3 days ke liye available hai/);
+  assert.match(copy, /Booking confirm ho gayi hai/);
+  assert.doesNotMatch(copy, /delivery|pickup/i);
   assert.doesNotMatch(copy, /\bDM\b|private chat/i);
+});
+
+test("approved customer DM copy remains unchanged", () => {
+  const copy = buildCustomerApprovalContinuation(
+    {
+      eventType: "OWNER_APPROVED_BOOKING",
+      itemName: "Toyota corolla (Metallic Grey)",
+      durationDays: 3,
+      canDmCustomer: true,
+      privacyMode: "dm",
+      requiredCustomerAction: "share_pickup_or_delivery_details_in_private_chat",
+    },
+    "urdu-english"
+  );
+
+  assert.equal(
+    copy,
+    "Toyota corolla (Metallic Grey) 3 din ke liye available hai. Booking confirm ho gayi hai."
+  );
 });
 
 test("DM approval continuation displays half-day hours instead of one day", () => {
@@ -1961,7 +3508,9 @@ test("DM approval continuation displays half-day hours instead of one day", () =
 
   assert.match(copy, /12 ghantay/);
   assert.doesNotMatch(copy, /1 din/);
-  assert.match(copy, /Delivery ya pickup details share kar dein/);
+  assert.match(copy, /available hai/);
+  assert.match(copy, /Booking confirm ho gayi hai/);
+  assert.doesNotMatch(copy, /Delivery|pickup/i);
 });
 
 test("Urdu-English approval continuation style is supported", () => {
@@ -1979,11 +3528,40 @@ test("Urdu-English approval continuation style is supported", () => {
 
   assert.match(copy, /Camera Kit/);
   assert.match(copy, /2 din/);
-  assert.match(copy, /confirm hai/);
-  assert.match(copy, /private chat mein share kar dein/);
+  assert.match(copy, /available hai/);
+  assert.match(copy, /Booking confirm ho gayi hai/);
+  assert.doesNotMatch(copy, /owner|approval|rejected|private chat|Delivery|pickup/i);
 });
 
-test("owner-approval-first waiting engagement removes old internal phrase", () => {
+test("customer unavailable continuation uses DM-safe unavailable copy", () => {
+  const copy = buildCustomerUnavailableContinuation(
+    {
+      itemName: "Camera Kit",
+      durationDays: 2,
+    },
+    "urdu-english"
+  );
+
+  assert.equal(copy, "Camera Kit 2 din ke liye available nahi hai. Koi aur car check kar dun?");
+  assert.doesNotMatch(copy, /owner|approval|approved by owner|rejected by owner|pending approval|system|notification/i);
+});
+
+test("rejected customer DM copy remains unchanged", () => {
+  const copy = buildCustomerUnavailableContinuation(
+    {
+      itemName: "Toyota corolla (Metallic Grey)",
+      durationDays: 3,
+    },
+    "urdu-english"
+  );
+
+  assert.equal(
+    copy,
+    "Toyota corolla (Metallic Grey) 3 din ke liye available nahi hai. Koi aur car check kar dun?"
+  );
+});
+
+test("owner-approval-first waiting engagement uses lightweight group ack", () => {
   const copy = buildBookingWaitingEngagement(
     {
       eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
@@ -1995,16 +3573,11 @@ test("owner-approval-first waiting engagement removes old internal phrase", () =
     "urdu-english"
   );
 
-  assert.doesNotMatch(
-    copy,
-    /Great, request owner ko bhej di hai\. Main confirmation milte hi update kar dungi\./i
-  );
-  assert.doesNotMatch(copy, /\b(owner|request|approval|approved|confirmed|system|AI)\b/i);
-  assert.match(copy, /4 din/);
-  assert.equal((copy.match(/\?/g) || []).length, 1);
+  assert.equal(copy, "Theek hai, mai check kr k btata hun.");
+  assert.doesNotMatch(copy, /\b(owner|request|approval|approved|confirmed|system|AI|pickup|phone|date)\b/i);
 });
 
-test("owner-approval-first waiting engagement asks one qualifying question", () => {
+test("owner-approval-first waiting engagement does not ask details in group", () => {
   const copy = buildBookingWaitingEngagement(
     {
       eventType: "BOOKING_REQUEST_CREATED_WAITING_INTERNAL_CONFIRMATION",
@@ -2016,10 +3589,9 @@ test("owner-approval-first waiting engagement asks one qualifying question", () 
     "neutral_english"
   );
 
-  assert.doesNotMatch(copy, /\b(owner|request|approval|approved|confirmed|system|AI)\b/i);
-  assert.match(copy, /2 days/);
-  assert.equal((copy.match(/\?/g) || []).length, 1);
-  assert.match(copy, /within the city|outside the city/i);
+  assert.equal(copy, "Theek hai, mai check kr k btata hun.");
+  assert.doesNotMatch(copy, /\b(owner|request|approval|approved|confirmed|system|AI|pickup|phone|date)\b/i);
+  assert.equal((copy.match(/\?/g) || []).length, 0);
 });
 
 test("missing target remains pending for out-of-webhook continuation and does not send fallback", async () => {
@@ -2073,6 +3645,8 @@ test("reject button still works", async () => {
         approvalStage: "pending_owner_approval",
         ownerNotificationPhone: "+923331234567",
         itemId: "item-1",
+        bookingSource: "PLAYWRIGHT_GROUP",
+        playwrightReplyPrivateEligible: true,
         canDmCustomer: false,
         groupName: "Rental Leads",
       },
@@ -2090,7 +3664,9 @@ test("reject button still works", async () => {
       groupSends.push({ text, opts });
       return true;
     },
-    sendMessage: async () => ({ ok: true }),
+    sendMessage: async () => {
+      throw new Error("401");
+    },
     markUnavailable: async () => undefined,
   });
 
@@ -2098,5 +3674,10 @@ test("reject button still works", async () => {
   assert.equal(result.status, "rejected");
   assert.equal(store.businesses.owner1.bookings["book-4"].data.status, "rejected");
   assert.equal(store.businesses.owner1.bookings["book-4"].data.approvalStage, "rejected");
+  assert.equal(
+    store.businesses.owner1.bookings["book-4"].data.approvalCustomerNotificationStatus,
+    "pending"
+  );
+  assert.equal(store.businesses.owner1.bookings["book-4"].data.canDmCustomer, true);
   assert.equal(groupSends.length, 0);
 });

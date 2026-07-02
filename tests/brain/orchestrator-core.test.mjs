@@ -165,5 +165,8 @@ test("orchestrator: unlisted_item yields unlisted fallback reply plan", () => {
 
   assert.equal(result.workflowDecision.workflowType, "unlisted_item");
   assertReplyOnlyPlan(result.actionPlan);
-  assert.match(String(result.actionPlan?.replyDraft ?? ""), /hamari list mein nahi hai/i);
+  assert.equal(
+    result.actionPlan?.replyDraft,
+    "Revo filhal hamare paas nahi hai. Honda Civic 2026 Oriel mein se koi check kar dun?"
+  );
 });

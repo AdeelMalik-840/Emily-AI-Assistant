@@ -31,6 +31,49 @@ import { extractContactPhoneFromText } from "../../utils/extractContactPhoneFrom
 /** @typedef {import("../contracts/trace.js").TurnDecisionTrace} TurnDecisionTrace */
 
 /**
+ * @param {ActionPlan | null} actionPlan
+ * @param {Readonly<Record<string, unknown>> | null | undefined} resolvedBusinessTurnContext
+ * @returns {ActionPlan | null}
+ */
+function applyDecisionPersistenceIntent(actionPlan, resolvedBusinessTurnContext) {
+  if (!actionPlan || typeof actionPlan !== "object") return actionPlan;
+  const decision =
+    resolvedBusinessTurnContext?.decision &&
+    typeof resolvedBusinessTurnContext.decision === "object" &&
+    !Array.isArray(resolvedBusinessTurnContext.decision)
+      ? /** @type {Record<string, unknown>} */ (resolvedBusinessTurnContext.decision)
+      : null;
+  const contextToPersist =
+    decision?.contextToPersist &&
+    typeof decision.contextToPersist === "object" &&
+    !Array.isArray(decision.contextToPersist)
+      ? /** @type {Record<string, unknown>} */ (decision.contextToPersist)
+      : null;
+  if (!contextToPersist) return actionPlan;
+
+  return Object.freeze({
+    ...actionPlan,
+    persistenceIntent: Object.freeze({
+      ...(actionPlan.persistenceIntent ?? {}),
+      rememberResolvedItem:
+        actionPlan.persistenceIntent?.rememberResolvedItem === true ||
+        contextToPersist.rememberResolvedItem === true,
+      itemId:
+        actionPlan.persistenceIntent?.itemId ??
+        contextToPersist.itemId ??
+        null,
+      rememberDuration:
+        actionPlan.persistenceIntent?.rememberDuration === true ||
+        contextToPersist.rememberDuration === true,
+      durationDays:
+        actionPlan.persistenceIntent?.durationDays ??
+        contextToPersist.durationDays ??
+        null,
+    }),
+  });
+}
+
+/**
  * @typedef {Object} BusinessContext
  * @property {unknown[]} [catalogItems]
  * @property {Record<string, unknown>} [businessProfile]
@@ -90,6 +133,7 @@ export function runConversationTurn({
     understanding,
     turnContext,
     message: admittedTurn.turn.text,
+    resolvedBusinessTurnContext: businessContext.resolvedBusinessTurnContext,
   });
 
   /** @type {ActionPlan | null} */
@@ -118,6 +162,7 @@ export function runConversationTurn({
       admittedTurn,
       turnContext,
       understanding,
+      businessContext,
     });
   } else if (wf === "availability_inquiry") {
     actionPlan = buildAvailabilityInquiryActionPlan({
@@ -135,6 +180,7 @@ export function runConversationTurn({
   } else if (wf === "unlisted_item") {
     actionPlan = buildUnlistedItemActionPlan({
       understanding,
+      catalogItems,
       conversationStyle: businessContext.conversationStyle ?? "casual_local",
     });
   } else if (wf === "clarification") {
@@ -154,6 +200,11 @@ export function runConversationTurn({
       reason: workflowDecision.reason ?? "unknown",
     });
   }
+
+  actionPlan = applyDecisionPersistenceIntent(
+    actionPlan,
+    businessContext.resolvedBusinessTurnContext
+  );
 
   trace = patchTurnDecisionTrace(trace, {
     understanding,
