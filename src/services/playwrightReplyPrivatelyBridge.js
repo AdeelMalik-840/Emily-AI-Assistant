@@ -10,6 +10,7 @@ import {
   tryAcquireReplyPrivateLock,
 } from "./replyPrivateUiController.js";
 import db from "../config/firebase.js";
+import { logBookingEvent } from "../utils/bookingLogger.js";
 
 function clean(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
@@ -41,6 +42,98 @@ async function humanDelay(page) {
 
 function normalizeText(value) {
   return clean(value).toLowerCase();
+}
+
+function normalizeExactSourceText(value) {
+  return normalizeText(clean(value).replace(/\u00a0/g, " "));
+}
+
+function stripLeadingParticipantPrefix(value, participant = "") {
+  const text = clean(value);
+  if (!text) return "";
+  const expected = clean(participant);
+  if (expected) {
+    const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const withoutBracket = text.replace(new RegExp(`^\\[${escaped}\\]\\s*`, "i"), "");
+    if (withoutBracket !== text) return clean(withoutBracket);
+    const withoutName = text.replace(new RegExp(`^${escaped}\\s*[:\\-]?\\s*`, "i"), "");
+    if (withoutName !== text) return clean(withoutName);
+  }
+  return clean(text.replace(/^\[[^\]]+\]\s*/, ""));
+}
+
+function sourceBubbleTextNeedleFromSourceMessage(sourceMessage = {}) {
+  const rawSourceText = clean(
+    sourceMessage.sourceBubbleTextNeedle ??
+      sourceMessage.strippedSourceText ??
+      sourceMessage.sourceText ??
+      sourceMessage.sourceTextPreview ??
+      ""
+  );
+  const participant = clean(
+    sourceMessage.sourceParticipantName ??
+      sourceMessage.participantName ??
+      sourceMessage.sourceParticipantDisplayName ??
+      sourceMessage.participantDisplayName ??
+      ""
+  );
+  const stripped = stripLeadingParticipantPrefix(rawSourceText, participant);
+  return {
+    sourceBubbleTextNeedle: clean(stripped || rawSourceText),
+    sourceBubbleTextNeedleType: clean(sourceMessage.sourceBubbleTextNeedleType) ||
+      (stripped && stripped !== rawSourceText ? "stripped_text" : "raw_source_text"),
+  };
+}
+
+function normalizeWhatsAppMessageId(value) {
+  const raw = clean(value);
+  if (!raw) return "";
+  const withoutPrefix = raw.replace(/^wa::/i, "");
+  const rowMatch = withoutPrefix.match(/^real:([^#\s]+)(?:#\d+)?$/i);
+  const id = rowMatch ? rowMatch[1] : withoutPrefix;
+  return clean(id.replace(/^message::/i, ""));
+}
+
+function sourceMessageIdCandidates(sourceMessage = {}) {
+  const out = new Set();
+  const add = (value) => {
+    const normalized = normalizeWhatsAppMessageId(value);
+    if (normalized) out.add(normalized);
+  };
+  add(sourceMessage.sourceMessageId);
+  add(sourceMessage.messageId);
+  add(sourceMessage.sourceRowKey);
+  add(sourceMessage.originalMessageRowKey);
+  return [...out];
+}
+
+function sourceTextCandidates(sourceMessage = {}) {
+  const rawText = clean(
+    sourceMessage.sourceText ??
+      sourceMessage.originalUserMessageText ??
+      sourceMessage.sourceTextPreview ??
+      ""
+  );
+  const participant = clean(
+    sourceMessage.sourceParticipantName ??
+      sourceMessage.participantName ??
+      sourceMessage.sourceParticipantDisplayName ??
+      sourceMessage.participantDisplayName ??
+      ""
+  );
+  const out = new Set();
+  const add = (value) => {
+    const text = clean(value);
+    if (text) out.add(text);
+  };
+  add(rawText);
+  if (participant && rawText) {
+    add(rawText.replace(new RegExp(`^\\[${participant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]\\s*`, "i"), ""));
+    add(rawText.replace(new RegExp(`^${participant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[:\\-]?\\s*`, "i"), ""));
+  }
+  const liveTag = rawText.match(/\bLIVE-E2E-\d+\b/i)?.[0];
+  if (liveTag) add(liveTag);
+  return [...out];
 }
 
 function localHash(value) {
@@ -1134,6 +1227,9 @@ export async function openBubbleMenu(page, bubble, opts = {}) {
       ? opts.sourceMessage
       : null;
   const bookingId = clean(opts.bookingId);
+  const sourceBubbleTextNeedleInfo = sourceBubbleTextNeedleFromSourceMessage(
+    expectedSourceMessage || {}
+  );
   // Locator-only: `bubble` is expected to be a Playwright Locator for `div.message-in`.
   const bubbleLocator = bubble;
   const readDomBubbleVisibleText = async (outerRow) => {
@@ -1161,18 +1257,42 @@ export async function openBubbleMenu(page, bubble, opts = {}) {
         ""
     );
     const expectedNeedle = normalizeText(expectedParticipantVisible);
-    const expectedMsgNeedle = normalizeText(
-      expectedSourceMessage.sourceText || expectedSourceMessage.sourceTextPreview || ""
-    );
+    const expectedMsgNeedle = normalizeText(sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle);
+    const verificationLog = {
+      bookingId: bookingId || null,
+      sourceBubbleVerificationNeedle: expectedMsgNeedle ? expectedMsgNeedle.slice(0, 120) : null,
+      sourceBubbleVerificationNeedleType: sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType || null,
+      sourceBubbleVerificationUsedMessageId: clean(
+        expectedSourceMessage.sourceMessageId ??
+          expectedSourceMessage.messageId ??
+          expectedSourceMessage.sourceRowKey ??
+          ""
+      ) || null,
+      sourceBubbleVerificationUsedParticipant:
+        clean(
+          expectedSourceMessage.sourceParticipantName ??
+            expectedSourceMessage.participantName ??
+            expectedSourceMessage.sourceParticipantDisplayName ??
+            expectedSourceMessage.participantDisplayName ??
+            ""
+        ) || null,
+    };
     const hasParticipant = Boolean(expectedNeedle && visibleText.includes(expectedNeedle));
     const hasMessage = Boolean(expectedMsgNeedle && visibleText.includes(expectedMsgNeedle));
-    if (!hasParticipant || !hasMessage) {
-      return { ok: false, reason: "VISIBLE_TEXT_MISSING_EXPECTED_NEEDLES" };
+    const ok = Boolean(hasParticipant && hasMessage);
+    const reason = ok ? "VERIFIED" : "VISIBLE_TEXT_MISSING_EXPECTED_NEEDLES";
+    console.log("[reply_privately_source_bubble_verification]", {
+      ...verificationLog,
+      sourceBubbleVerificationPassed: ok,
+      sourceBubbleVerificationFailureReason: ok ? null : reason,
+    });
+    if (!ok) {
+      return { ok: false, reason };
     }
     console.log("[reply_privately_bubble_text_verification_passed]", {
       bookingId: bookingId || null,
     });
-    return { ok: true, reason: "VERIFIED" };
+    return { ok: true, reason };
   };
   const isElementConnected = async (handle) => {
     if (!handle || typeof handle.evaluate !== "function") return false;
@@ -2006,23 +2126,38 @@ function normalizeMessageTextForCompare(value) {
   return clean(value).replace(/\u00a0/g, " ");
 }
 
-async function snapshotOutgoingMessages(page) {
+const OUTGOING_VERIFICATION_INSPECT_LIMIT = 5;
+
+async function snapshotOutgoingMessages(
+  page,
+  limit = OUTGOING_VERIFICATION_INSPECT_LIMIT
+) {
+  const inspectLimit = Math.max(
+    1,
+    Number.isFinite(Number(limit)) ? Math.floor(Number(limit)) : OUTGOING_VERIFICATION_INSPECT_LIMIT
+  );
   return page
-    .evaluate(() => {
+    .evaluate((maxCandidates) => {
       const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
-    function textFor(node) {
-      const textNode =
-        node.querySelector("span.selectable-text span") ||
-        node.querySelector("span.selectable-text");
-        if (textNode) return clean(textNode.textContent);
-      const copyable = node.querySelector("div.copyable-text");
-      if (copyable) {
-          const lines = String(copyable.innerText || "")
-          .split("\n")
-            .map((line) => clean(line))
+      const lower = (v) => clean(v).toLowerCase();
+      const normalizeDirectionHint = (value) => lower(clean(value).replace(/\u00a0/g, " "));
+      function textFor(node) {
+        const selectableTexts = Array.from(node.querySelectorAll("span.selectable-text"))
+          .map((el) => clean(el?.textContent || ""))
           .filter(Boolean);
-        return lines[lines.length - 1] || "";
-      }
+        if (selectableTexts.length > 0) {
+          return selectableTexts[selectableTexts.length - 1];
+        }
+        const textNode = node.querySelector("span.selectable-text span") || node.querySelector("span.selectable-text");
+        if (textNode) return clean(textNode.textContent);
+        const copyable = node.querySelector("div.copyable-text");
+        if (copyable) {
+          const lines = String(copyable.innerText || "")
+            .split("\n")
+            .map((line) => clean(line))
+            .filter(Boolean);
+          return lines[lines.length - 1] || "";
+        }
         return clean(node.innerText || node.textContent || "");
       }
       function idFor(node) {
@@ -2032,19 +2167,122 @@ async function snapshotOutgoingMessages(page) {
           clean(node.id) ||
           ""
         );
-    }
-    const outgoing = Array.from(document.querySelectorAll("div.message-out"));
-    const last = outgoing[outgoing.length - 1] || null;
-      const count = outgoing.length;
-      const lastText = last ? textFor(last) : "";
-      const lastId = last ? idFor(last) : "";
-    return {
-        count,
-        lastText,
-        lastId,
-        lastSig: clean(`${lastId}::${lastText}`).slice(0, 220),
+      }
+      function dataPrePlainFor(node) {
+        const copyable = node.querySelector?.("div.copyable-text");
+        if (copyable?.getAttribute?.("data-pre-plain-text")) {
+          return clean(copyable.getAttribute("data-pre-plain-text"));
+        }
+        if (node.getAttribute?.("data-pre-plain-text")) {
+          return clean(node.getAttribute("data-pre-plain-text"));
+        }
+        const child = node.querySelector?.("[data-pre-plain-text]");
+        return clean(child?.getAttribute?.("data-pre-plain-text"));
+      }
+      function senderFromPrePlain(plain) {
+        const match = clean(plain).match(/^\[[^\]]+\]\s*([^:]+):\s*/);
+        return clean(match?.[1] || "");
+      }
+      function selectorTypeFor(node, dataTestid) {
+        if (node.classList?.contains?.("message-out") || /(^|\s)message-out(\s|$)/i.test(String(node.className || ""))) {
+          return "message-out";
+        }
+        if (/^conv-msg-[^\s]+$/i.test(dataTestid)) return "conv-msg";
+        if (clean(dataTestid) === "msg-container") return "msg-container";
+        return "unknown";
+      }
+      function hasOutgoingSignal(node, selectorType, prePlainText, visibleText, fullText) {
+        const sender = senderFromPrePlain(prePlainText);
+        const firstLine = clean(String(visibleText || fullText || "").split("\n")[0] || "");
+        const prePlainLower = normalizeDirectionHint(prePlainText);
+        const firstLineLower = normalizeDirectionHint(firstLine);
+        const senderLower = lower(sender);
+        return Boolean(
+          selectorType === "message-out" ||
+            senderLower === "you" ||
+            firstLineLower.startsWith("you") ||
+            prePlainLower.startsWith("you")
+        );
+      }
+      const selectors = [
+        "div.message-out",
+        '[data-testid^="conv-msg-"]',
+        '[data-testid="msg-container"]',
+      ];
+      const rawNodes = [];
+      const seen = new Set();
+      for (const selector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(selector))) {
+          if (!node || seen.has(node)) continue;
+          seen.add(node);
+          rawNodes.push(node);
+        }
+      }
+      const outgoing = rawNodes.filter((node) => {
+        const dataTestid = clean(node.getAttribute?.("data-testid") || "");
+        if (clean(dataTestid) !== "msg-container") return true;
+        try {
+          return !node.querySelector?.('div.message-out, [class*="message-out"], [data-testid^="conv-msg-"]');
+        } catch {
+          return true;
+        }
+      });
+      const allCandidates = outgoing
+        .slice()
+        .reverse()
+        .map((node, indexFromNewest) => {
+          const dataTestid = clean(node.getAttribute?.("data-testid") || "");
+          const selectorType = selectorTypeFor(node, dataTestid);
+          const id = idFor(node);
+          const text = textFor(node);
+          const fullText = clean(node.innerText || node.textContent || "");
+          const prePlainText = dataPrePlainFor(node);
+          const direction = hasOutgoingSignal(node, selectorType, prePlainText, text, fullText)
+            ? "out"
+            : "unknown";
+          const sig = clean(`${id}::${text}::${fullText}`).slice(0, 220);
+          return {
+            indexFromNewest,
+            id,
+            text,
+            fullText,
+            sig,
+            selectorType,
+            direction,
+            safeOutgoing: direction === "out",
+            dataTestid,
+            dataPrePlainText: prePlainText,
+            firstLine: clean(String(text || fullText || "").split("\n")[0] || ""),
+          };
+      });
+      const safeCandidates = allCandidates.filter((candidate) => candidate.safeOutgoing === true);
+      const newestSafe = safeCandidates[0] || null;
+      const newestRaw = allCandidates[0] || null;
+      const selectorTypes = [
+        ...new Set(allCandidates.map((candidate) => candidate.selectorType).filter(Boolean)),
+      ];
+      const selectorStrategy =
+        selectorTypes.length === 1
+          ? selectorTypes[0]
+          : selectorTypes.length > 1
+            ? "mixed"
+            : "unknown";
+      const candidateList = safeCandidates.slice(0, maxCandidates);
+      const last = candidateList[0] || newestSafe || newestRaw || null;
+      return {
+        rawCount: allCandidates.length,
+        safeCount: safeCandidates.length,
+        count: safeCandidates.length,
+        selectorStrategy,
+        candidates: candidateList,
+        lastText: last ? last.text : "",
+        lastFullText: last ? last.fullText : "",
+        lastId: last ? last.id : "",
+        lastSig: last ? last.sig : "",
+        rawLastSig: newestRaw ? newestRaw.sig : "",
+        safeLastSig: newestSafe ? newestSafe.sig : "",
       };
-    })
+    }, inspectLimit)
     .catch(() => null);
 }
 
@@ -2076,12 +2314,104 @@ export async function verifyReplyPrivatelyMessageSent(page, expectedMessage, opt
     typeof opts?.__snapshotOutgoingForTests === "function"
       ? opts.__snapshotOutgoingForTests
       : snapshotOutgoingMessages;
-  const pre = opts?.preSendSnapshot || (await snapshotOutgoing(page));
+  const waitForOutgoing =
+    typeof opts?.__waitForOutgoingForTests === "function"
+      ? opts.__waitForOutgoingForTests
+      : async (ms) => {
+          if (page && typeof page.waitForTimeout === "function") {
+            await page.waitForTimeout(ms);
+          }
+        };
+  const maxAttempts = Math.max(
+    1,
+    Number.isFinite(Number(opts?.__outgoingVerificationAttempts))
+      ? Math.floor(Number(opts.__outgoingVerificationAttempts))
+      : 4
+  );
+  const retryDelayMs = Math.max(
+    0,
+    Number.isFinite(Number(opts?.__outgoingVerificationDelayMs))
+      ? Math.floor(Number(opts.__outgoingVerificationDelayMs))
+      : 250
+  );
+  const inspectLimit = Math.max(
+    1,
+    Number.isFinite(Number(opts?.__outgoingVerificationInspectLimit))
+      ? Math.floor(Number(opts.__outgoingVerificationInspectLimit))
+      : OUTGOING_VERIFICATION_INSPECT_LIMIT
+  );
+  const normalizeOutgoingSnapshot = (snapshot) => {
+    const count = Number(snapshot?.count ?? 0);
+    const rawCount = Number(
+      Number.isFinite(Number(snapshot?.rawCount)) ? Math.floor(Number(snapshot.rawCount)) : count
+    );
+    const safeCount = Number(
+      Number.isFinite(Number(snapshot?.safeCount)) ? Math.floor(Number(snapshot.safeCount)) : count
+    );
+    const rawCandidates = Array.isArray(snapshot?.candidates) && snapshot.candidates.length > 0
+      ? snapshot.candidates
+      : [
+          {
+            indexFromNewest: 0,
+            id: snapshot?.lastId ?? "",
+            text: snapshot?.lastText ?? "",
+            fullText: snapshot?.lastFullText ?? "",
+            sig: snapshot?.lastSig ?? "",
+          },
+        ];
+    const candidates = rawCandidates
+      .slice(0, inspectLimit)
+      .map((candidate, index) => {
+        const id = clean(candidate?.id);
+        const text = normalizeMessageTextForCompare(candidate?.text ?? "");
+        const fullText = normalizeMessageTextForCompare(candidate?.fullText ?? "");
+        const sig = clean(candidate?.sig);
+        return {
+          indexFromNewest: Number.isFinite(Number(candidate?.indexFromNewest))
+            ? Math.max(0, Math.floor(Number(candidate.indexFromNewest)))
+            : index,
+          id,
+          text,
+          fullText,
+          sig,
+          selectorType: clean(candidate?.selectorType),
+          direction: clean(candidate?.direction),
+          safeOutgoing: Boolean(candidate?.safeOutgoing),
+          dataTestid: clean(candidate?.dataTestid),
+          dataPrePlainText: clean(candidate?.dataPrePlainText),
+        };
+      })
+      .filter((candidate) => candidate.id || candidate.text || candidate.fullText || candidate.sig);
+    const last = candidates[0] || null;
+    return {
+      count,
+      rawCount,
+      safeCount,
+      selectorStrategy: clean(snapshot?.selectorStrategy) || "unknown",
+      candidates,
+      lastText: last?.text || "",
+      lastFullText: last?.fullText || "",
+      lastId: last?.id || "",
+      lastSig: last?.sig || "",
+    };
+  };
+  const pre = normalizeOutgoingSnapshot(
+    opts?.preSendSnapshot || (await snapshotOutgoing(page, inspectLimit))
+  );
+  const preCandidateSigs = new Set(
+    pre.candidates.map((candidate) => clean(candidate?.sig)).filter(Boolean)
+  );
+  const preCandidateIds = new Set(
+    pre.candidates.map((candidate) => clean(candidate?.id)).filter(Boolean)
+  );
 
   console.log("[reply_privately_outgoing_pre_send_snapshot]", {
     expectedHeaderTitle: expectedHeaderTitle || null,
     expectedChatKey: expectedChatKey || null,
     outgoingCount: Number(pre?.count ?? 0),
+    outgoingCandidateRawCount: Number(pre?.rawCount ?? pre?.count ?? 0),
+    outgoingCandidateSafeCount: Number(pre?.safeCount ?? pre?.count ?? 0),
+    outgoingSelectorStrategy: pre?.selectorStrategy || "unknown",
     lastOutgoingSig: pre?.lastSig ?? null,
   });
 
@@ -2148,56 +2478,197 @@ export async function verifyReplyPrivatelyMessageSent(page, expectedMessage, opt
     }
   }
 
-  const post = await snapshotOutgoing(page);
-  const postCount = Number(post?.count ?? 0);
   const preCount = Number(pre?.count ?? 0);
-  const countIncreased = postCount > preCount;
+  const preSig = clean(pre?.lastSig);
+  let lastOutcome = null;
+  let sawAnyExpectedBodyCandidate = false;
+  let sawAnyNewOrChangedCandidate = false;
+  let sawAnyQuoteOnlyCandidate = false;
 
-  const postTextRaw = normalizeMessageTextForCompare(post?.lastText ?? "");
-  const postTextNorm = normalizeText(postTextRaw);
-  const includesExact = Boolean(postTextRaw && postTextRaw.includes(expectedRaw));
-  const matchesNormalized = Boolean(postTextNorm && postTextNorm === expectedNorm);
+  const matchesExpectedBody = (value) => {
+    const raw = normalizeMessageTextForCompare(value);
+    if (!raw) return false;
+    const norm = normalizeText(raw);
+    return Boolean(
+      raw.includes(expectedRaw) ||
+        norm === expectedNorm ||
+        norm.includes(expectedNorm)
+    );
+  };
 
-  const lastNonEmpty = Boolean(clean(postTextRaw));
-  const lastChanged = clean(post?.lastSig) && clean(post?.lastSig) !== clean(pre?.lastSig);
-
-  console.log("[reply_privately_outgoing_message_compare]", {
-    expectedHeaderTitle: expectedHeaderTitle || null,
-    outgoingCountBefore: preCount,
-    outgoingCountAfter: postCount,
-    countIncreased,
-    lastOutgoingNonEmpty: lastNonEmpty,
-    lastOutgoingChanged: lastChanged,
-    includesExact,
-    matchesNormalized,
-  });
-
-  if (includesExact || matchesNormalized) {
-  return { ok: true };
-  }
-
-  if (countIncreased && lastNonEmpty && lastChanged) {
-    console.log("[reply_privately_outgoing_send_verified_by_new_outgoing_bubble]", {
-      outgoingCountBefore: preCount,
-      outgoingCountAfter: postCount,
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const post = normalizeOutgoingSnapshot(await snapshotOutgoing(page, inspectLimit));
+    const postCount = Number(post?.count ?? 0);
+    const outgoingCountIncreased = postCount > preCount;
+    const outgoingSignatureChanged = Boolean(
+      clean(post?.lastSig) && clean(post?.lastSig) !== preSig
+    );
+    const postCandidates = Array.isArray(post?.candidates) ? post.candidates : [];
+    const candidateSummaries = postCandidates.map((candidate) => {
+      const candidateSig = clean(candidate?.sig);
+      const candidateId = clean(candidate?.id);
+      const candidateBodyRaw = normalizeMessageTextForCompare(candidate?.text ?? "");
+      const candidateFullRaw = normalizeMessageTextForCompare(candidate?.fullText ?? "");
+      const candidateBodyMatched = matchesExpectedBody(candidateBodyRaw);
+      const candidateFullMatched = matchesExpectedBody(candidateFullRaw);
+      const candidateMatchedExpectedBody = candidateBodyMatched || candidateFullMatched;
+      const candidateMatchedQuoteOnly =
+        !candidateBodyMatched && candidateFullMatched;
+      const candidateWasNewOrChanged =
+        Boolean(candidateSig && !preCandidateSigs.has(candidateSig)) ||
+        Boolean(candidateId && !preCandidateIds.has(candidateId));
+      return {
+        indexFromNewest: Number.isFinite(Number(candidate?.indexFromNewest))
+          ? Math.max(0, Math.floor(Number(candidate.indexFromNewest)))
+          : 0,
+        id: candidateId || null,
+        textPreview: candidateBodyRaw.slice(0, 120),
+        fullTextPreview: candidateFullRaw.slice(0, 160),
+        sig: candidateSig || null,
+        matchedExpectedBody: candidateMatchedExpectedBody,
+        matchedQuoteOnly: candidateMatchedQuoteOnly,
+        candidateWasNewOrChanged,
+      };
     });
-    console.log("[reply_privately_outgoing_text_mismatch_but_send_verified]", {
-      expected: expectedRaw.slice(0, 160),
-      actual: postTextRaw.slice(0, 160),
-    });
-    return { ok: true };
-  }
+    const bestCandidate = candidateSummaries.find(
+      (candidate) => candidate.matchedExpectedBody && candidate.candidateWasNewOrChanged
+    );
+    const postBodyRaw = bestCandidate ? bestCandidate.textPreview : normalizeMessageTextForCompare(post?.lastText ?? "");
+    const postFullRaw = bestCandidate ? bestCandidate.fullTextPreview : normalizeMessageTextForCompare(post?.lastFullText ?? "");
+    const outgoingVerificationMatchedExpectedBody =
+      candidateSummaries.some((candidate) => candidate.matchedExpectedBody);
+    const outgoingVerificationMatchedQuoteOnly = false;
+    const outgoingVerificationUsedNewBubble = Boolean(bestCandidate);
+    const outgoingVerificationCandidateCount = candidateSummaries.length;
+    const outgoingVerificationInspectedNewestCount = candidateSummaries.length;
+    const outgoingVerificationUsedSelector = clean(post?.selectorStrategy) || "unknown";
+    const outgoingCandidateRawCount = Number(post?.rawCount ?? postCount);
+    const outgoingCandidateSafeCount = Number(post?.safeCount ?? postCount);
+    const outgoingVerificationCandidatePreviews = candidateSummaries
+      .slice(0, inspectLimit)
+      .map((candidate) => ({
+        indexFromNewest: candidate.indexFromNewest,
+        id: candidate.id,
+        textPreview: candidate.textPreview,
+        fullTextPreview: candidate.fullTextPreview,
+        matchedExpectedBody: candidate.matchedExpectedBody,
+        matchedQuoteOnly: candidate.matchedQuoteOnly,
+        candidateWasNewOrChanged: candidate.candidateWasNewOrChanged,
+      }));
+    sawAnyExpectedBodyCandidate =
+      sawAnyExpectedBodyCandidate ||
+      candidateSummaries.some((candidate) => candidate.matchedExpectedBody);
+    sawAnyNewOrChangedCandidate =
+      sawAnyNewOrChangedCandidate ||
+      candidateSummaries.some((candidate) => candidate.candidateWasNewOrChanged);
+    sawAnyQuoteOnlyCandidate =
+      sawAnyQuoteOnlyCandidate ||
+      candidateSummaries.some((candidate) => candidate.matchedQuoteOnly);
 
-  // Only mismatch if text mismatch AND no new outgoing bubble appeared.
-  if (!countIncreased) {
-    return {
-      ok: false,
-      reason: "OUTGOING_MESSAGE_TEXT_MISMATCH",
-      actual: postTextRaw,
-      expected: expectedRaw,
+    const outgoingVerificationExpectedPreview = expectedRaw.slice(0, 160);
+    const outgoingVerificationActualPreview = (
+      postFullRaw || postBodyRaw || ""
+    ).slice(0, 160);
+
+    console.log("[reply_privately_outgoing_message_compare]", {
+      expectedHeaderTitle: expectedHeaderTitle || null,
+      outgoingPreCount: preCount,
+      outgoingPostCount: postCount,
+      outgoingCountIncreased,
+      outgoingSignatureChanged,
+      outgoingCandidateRawCount,
+      outgoingCandidateSafeCount,
+      outgoingSelectorStrategy: clean(post?.selectorStrategy) || "unknown",
+      outgoingVerificationUsedSelector,
+      outgoingVerificationCandidateCount,
+      outgoingVerificationInspectedNewestCount,
+      outgoingVerificationExpectedPreview,
+      outgoingVerificationActualPreview,
+      outgoingVerificationMatchedExpectedBody,
+      outgoingVerificationMatchedQuoteOnly,
+      outgoingVerificationUsedNewBubble,
+      outgoingVerificationCandidatePreviews,
+      attempt,
+    });
+
+    lastOutcome = {
+      postCount,
+      outgoingCountIncreased,
+      outgoingSignatureChanged,
+      outgoingCandidateRawCount,
+      outgoingCandidateSafeCount,
+      outgoingSelectorStrategy: outgoingVerificationUsedSelector,
+      outgoingVerificationUsedNewBubble,
+      outgoingVerificationMatchedExpectedBody,
+      outgoingVerificationMatchedQuoteOnly,
+      outgoingVerificationExpectedPreview,
+      outgoingVerificationActualPreview,
+      outgoingVerificationCandidateCount,
+      outgoingVerificationInspectedNewestCount,
+      outgoingVerificationCandidatePreviews,
     };
+
+    if (outgoingVerificationMatchedExpectedBody && outgoingVerificationUsedNewBubble) {
+      return {
+        ok: true,
+        outgoingPreCount: preCount,
+        outgoingPostCount: postCount,
+        outgoingCountIncreased,
+        outgoingSignatureChanged,
+        outgoingCandidateRawCount,
+        outgoingCandidateSafeCount,
+        outgoingSelectorStrategy: outgoingVerificationUsedSelector,
+        outgoingVerificationUsedSelector,
+        outgoingVerificationCandidateCount,
+        outgoingVerificationInspectedNewestCount,
+        outgoingVerificationExpectedPreview,
+        outgoingVerificationActualPreview,
+        outgoingVerificationMatchedExpectedBody,
+        outgoingVerificationMatchedQuoteOnly,
+        outgoingVerificationUsedNewBubble,
+        outgoingVerificationCandidatePreviews,
+        outgoingVerificationFailureReason: null,
+      };
+    }
+
+    if (attempt < maxAttempts) {
+      await waitForOutgoing(retryDelayMs);
+    }
   }
-  return { ok: false, reason: "OUTGOING_MESSAGE_NOT_VERIFIED" };
+
+  const failureReason =
+    sawAnyExpectedBodyCandidate || sawAnyNewOrChangedCandidate || sawAnyQuoteOnlyCandidate
+      ? "OUTGOING_MESSAGE_NOT_VERIFIED"
+      : "OUTGOING_MESSAGE_TEXT_MISMATCH";
+  return {
+    ok: false,
+    reason: failureReason,
+    outgoingPreCount: preCount,
+    outgoingPostCount: lastOutcome?.postCount ?? Number(pre?.count ?? 0),
+    outgoingCountIncreased: lastOutcome?.outgoingCountIncreased === true,
+    outgoingSignatureChanged: lastOutcome?.outgoingSignatureChanged === true,
+    outgoingCandidateRawCount: lastOutcome?.outgoingCandidateRawCount ?? Number(pre?.rawCount ?? preCount),
+    outgoingCandidateSafeCount: lastOutcome?.outgoingCandidateSafeCount ?? Number(pre?.safeCount ?? preCount),
+    outgoingSelectorStrategy: lastOutcome?.outgoingSelectorStrategy || clean(pre?.selectorStrategy) || "unknown",
+    outgoingVerificationUsedSelector: lastOutcome?.outgoingSelectorStrategy || clean(pre?.selectorStrategy) || "unknown",
+    outgoingVerificationCandidateCount:
+      lastOutcome?.outgoingVerificationCandidateCount ?? 0,
+    outgoingVerificationInspectedNewestCount:
+      lastOutcome?.outgoingVerificationInspectedNewestCount ?? 0,
+    outgoingVerificationExpectedPreview:
+      lastOutcome?.outgoingVerificationExpectedPreview || expectedRaw.slice(0, 160),
+    outgoingVerificationActualPreview:
+      lastOutcome?.outgoingVerificationActualPreview || "",
+    outgoingVerificationMatchedExpectedBody:
+      sawAnyExpectedBodyCandidate || lastOutcome?.outgoingVerificationMatchedExpectedBody === true,
+    outgoingVerificationMatchedQuoteOnly:
+      sawAnyQuoteOnlyCandidate || lastOutcome?.outgoingVerificationMatchedQuoteOnly === true,
+    outgoingVerificationUsedNewBubble:
+      sawAnyNewOrChangedCandidate || lastOutcome?.outgoingVerificationUsedNewBubble === true,
+    outgoingVerificationCandidatePreviews:
+      lastOutcome?.outgoingVerificationCandidatePreviews || [],
+    outgoingVerificationFailureReason: failureReason,
+  };
 }
 
 async function recoverGroupViewForRetry(page, expectedGroupTitle) {
@@ -2222,12 +2693,15 @@ function sourceBubbleSearchTerms(sourceMessage = {}) {
     ) || "";
   const text =
     clean(sourceMessage.sourceText ?? sourceMessage.sourceTextPreview ?? "") || "";
-  const messageId = clean(sourceMessage.sourceMessageId) || "";
-  return { participant, text, messageId };
+  const messageId = normalizeWhatsAppMessageId(sourceMessage.sourceMessageId);
+  const idCandidates = sourceMessageIdCandidates(sourceMessage);
+  const textCandidates = sourceTextCandidates(sourceMessage);
+  return { participant, text, messageId, idCandidates, textCandidates };
 }
 
 async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingId }) {
-  const { participant, text, messageId } = sourceBubbleSearchTerms(sourceMessage);
+  const { participant, text, messageId, idCandidates, textCandidates } =
+    sourceBubbleSearchTerms(sourceMessage);
   const expected = {
     bookingId: clean(bookingId) || null,
     expectedParticipantName: clean(
@@ -2246,6 +2720,7 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       clean(sourceMessage?.sourceText ?? sourceMessage?.sourceTextPreview) || null,
     expectedSourceRowKey: clean(sourceMessage?.sourceRowKey) || null,
     expectedSourceMessageId: clean(sourceMessage?.sourceMessageId) || null,
+    normalizedSourceMessageIds: idCandidates,
     expectedSourceMessageIndex:
       sourceMessage?.sourceMessageIndex != null &&
       Number.isFinite(Number(sourceMessage.sourceMessageIndex))
@@ -2259,6 +2734,7 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
     participantKey: expected.expectedParticipantKey,
     sourceRowKey: expected.expectedSourceRowKey,
     sourceMessageId: expected.expectedSourceMessageId,
+    normalizedSourceMessageIds: expected.normalizedSourceMessageIds,
     sourceMessageIndex: expected.expectedSourceMessageIndex,
     sourceTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
     fallbackAnchorType: messageId ? "sourceMessageId" : expected.expectedSourceRowKey ? "sourceRowKey" : "participant_text",
@@ -2266,11 +2742,1280 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
     expectedTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
   });
 
-  const escapeCssAttrValue = (value) =>
-    String(value ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const escapeRegExp = (value) =>
-    String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const expectedLiveTag = textCandidates
+    .map((candidate) => clean(candidate).match(/\bLIVE-E2E-\d+\b/i)?.[0])
+    .find(Boolean) || "";
+  const strippedSourceText =
+    textCandidates.find((candidate) => !/^\[.+\]/.test(candidate) && !/^LIVE-E2E-\d+$/i.test(candidate)) ||
+    textCandidates.find((candidate) => !/^LIVE-E2E-\d+$/i.test(candidate)) ||
+    text;
   const normalizeComparable = (value) => normalizeText(clean(value).replace(/\u00a0/g, " "));
+  const exactSourceText = normalizeExactSourceText(
+    stripLeadingParticipantPrefix(strippedSourceText || text, participant)
+  );
+  const sourceBubbleTextNeedleInfo = {
+    sourceBubbleTextNeedle: exactSourceText,
+    sourceBubbleTextNeedleType:
+      normalizeExactSourceText(clean(sourceMessage?.sourceText ?? sourceMessage?.sourceTextPreview ?? "")) ===
+      exactSourceText
+        ? "raw_source_text"
+        : "stripped_text",
+  };
+  let directConvMsgLookupAttempted = false;
+  let directConvMsgExactRootCount = 0;
+  let directConvMsgExactGlobalCount = 0;
+  let directConvMsgUsedAsCandidate = false;
+  let directConvMsgIdentityConfirmed = false;
+  let directConvMsgTextMatched = false;
+  let directConvMsgParticipantMatched = false;
+  let directConvMsgPassedToOpenBubbleMenu = false;
+  let broadCandidateScanTimedOut = false;
+  let broadCandidateScanReturnedFallback = false;
+  let sourceRowExistsButCandidateScanEmpty = false;
+  let directConvMsgIdentityFailureReason = "";
+  let directConvMsgAmbiguityReason = "";
+  const conversationRootSelectors = [
+    '[data-testid="conversation-panel-body"]',
+    '[data-testid="conversation-panel"]',
+    "#main [role='application']",
+    "#main",
+  ];
+  const resolveConversationScopeLocator = async () => {
+    for (const selector of conversationRootSelectors) {
+      const locator = page.locator(selector).first();
+      const count = await locator.count().catch(() => 0);
+      if (count > 0) return { selector, locator, count };
+    }
+    return { selector: "", locator: page.locator("#main").first(), count: 0 };
+  };
+  const withShortTimeout = async (fn, ms, fallback, meta = null) => {
+    let settled = false;
+    try {
+      const value = await Promise.race([
+        (async () => {
+          const result = await fn();
+          settled = true;
+          return result;
+        })(),
+        new Promise((resolve) =>
+          setTimeout(() => {
+            if (meta && !settled) meta.timedOut = true;
+            resolve(fallback);
+          }, ms)
+        ),
+      ]);
+      if (meta && settled) meta.timedOut = false;
+      return value;
+    } catch {
+      if (meta) meta.failed = true;
+      return fallback;
+    }
+  };
+
+  const candidateRows = () =>
+    page.locator(
+      'div.message-in, div.message-out, [data-testid="msg-container"], [data-testid^="conv-msg-"]'
+    );
+
+  const collectCandidateSnapshots = async (phase = "initial") => {
+    const rows = candidateRows();
+    const scanState = { timedOut: false, failed: false };
+    const snapshots = await withShortTimeout(
+      async () =>
+        rows.evaluateAll((nodes) => {
+        const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+        const lower = (v) => clean(v).toLowerCase();
+        const normalizeBrowserText = (value) => lower(clean(value).replace(/\u00a0/g, " "));
+        const stripLeadingParticipantPrefixBrowser = (value, participantName = "") => {
+          const text = clean(value);
+          if (!text) return "";
+          const expected = clean(participantName);
+          if (expected) {
+            const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const withoutBracket = text.replace(new RegExp(`^\\[${escaped}\\]\\s*`, "i"), "");
+            if (withoutBracket !== text) return clean(withoutBracket);
+            const withoutName = text.replace(new RegExp(`^${escaped}\\s*[:\\-]?\\s*`, "i"), "");
+            if (withoutName !== text) return clean(withoutName);
+          }
+          return clean(text.replace(/^\[[^\]]+\]\s*/, ""));
+        };
+        const hasClass = (el, cls) => {
+            if (!el) return false;
+            if (el.classList?.contains?.(cls)) return true;
+            return new RegExp(`(^|\\s)${cls}(\\s|$)`).test(String(el.className || ""));
+          };
+          const normalizeId = (value) => {
+            const raw = clean(value);
+            if (!raw) return "";
+            const withoutPrefix = raw.replace(/^wa::/i, "");
+            const rowMatch = withoutPrefix.match(/^real:([^#\s]+)(?:#\d+)?$/i);
+            const id = rowMatch ? rowMatch[1] : withoutPrefix;
+            return clean(id.replace(/^message::/i, ""));
+          };
+          const addId = (bucket, source, value) => {
+            const raw = clean(value);
+            if (!raw) return;
+            const normalized = normalizeId(raw);
+            if (!normalized) return;
+            bucket.push({ source, raw, normalized });
+          };
+          const textFor = (root) => {
+            const textNode =
+              root.querySelector?.("span.selectable-text span") ||
+              root.querySelector?.("span.selectable-text");
+            const copyable = root.querySelector?.("div.copyable-text");
+            return clean(textNode?.textContent ?? copyable?.innerText ?? root.innerText ?? root.textContent ?? "");
+          };
+          const prePlainFor = (root) => {
+            const copyable = root.querySelector?.("div.copyable-text");
+            if (copyable?.getAttribute?.("data-pre-plain-text")) {
+              return clean(copyable.getAttribute("data-pre-plain-text"));
+            }
+            if (root.getAttribute?.("data-pre-plain-text")) {
+              return clean(root.getAttribute("data-pre-plain-text"));
+            }
+            const child = root.querySelector?.("[data-pre-plain-text]");
+            return clean(child?.getAttribute?.("data-pre-plain-text"));
+          };
+          const participantFromPrePlain = (plain) => {
+            const match = clean(plain).match(/^\[[^\]]+\]\s*([^:]+):\s*/);
+            return clean(match?.[1] || "");
+          };
+          const sameNormalizedText = (a, b) => {
+            const left = lower(a);
+            const right = lower(b);
+            return Boolean(left && right && left === right);
+          };
+          const participantForElement = (root) =>
+            participantFromPrePlain(prePlainFor(root)) ||
+            clean(
+              root?.getAttribute?.("data-sender") ||
+                root?.getAttribute?.("data-author") ||
+                root?.getAttribute?.("data-participant-id") ||
+                ""
+            );
+          const participantText = (value) => clean(value || "");
+          const exactTextForElement = (root, participantName) =>
+            normalizeBrowserText(
+              stripLeadingParticipantPrefixBrowser(textFor(root), participantName)
+            );
+          const elementHasMessageClass = (el, cls) => {
+            if (!el) return false;
+            if (hasClass(el, cls)) return true;
+            try {
+              return el.matches?.(`.${cls}, [class*='${cls}']`) === true;
+            } catch {
+              return false;
+            }
+          };
+          const uniqueElements = (items) => {
+            const seen = new Set();
+            const out = [];
+            for (const item of items) {
+              if (!item || seen.has(item)) continue;
+              seen.add(item);
+              out.push(item);
+            }
+            return out;
+          };
+          const queryMessageClass = (root, cls) => {
+            const out = [];
+            if (elementHasMessageClass(root, cls)) out.push(root);
+            try {
+              out.push(...Array.from(root.querySelectorAll?.(`.${cls}, [class*='${cls}']`) ?? []));
+            } catch {
+              // Ignore selector failures and keep the candidate fail-closed.
+            }
+            return uniqueElements(out);
+          };
+          const messageEvidenceMatches = (bubble, evidenceText, evidenceParticipant) => {
+            const bubbleText = textFor(bubble);
+            const bubbleParticipant = participantForElement(bubble);
+            return {
+              textMatched: sameNormalizedText(bubbleText, evidenceText),
+              participantMatched: Boolean(
+                evidenceParticipant &&
+                  bubbleParticipant &&
+                  lower(bubbleParticipant).includes(lower(evidenceParticipant))
+              ),
+              participantAvailable: Boolean(bubbleParticipant),
+            };
+          };
+          const closestMessageBubble = (root) => {
+            let el = root;
+            for (let depth = 0; depth < 8 && el; depth += 1) {
+              if (elementHasMessageClass(el, "message-out")) {
+                return { el, direction: "out", relation: depth === 0 ? "self" : "ancestor" };
+              }
+              if (elementHasMessageClass(el, "message-in")) {
+                return { el, direction: "in", relation: depth === 0 ? "self" : "ancestor" };
+              }
+              el = el.parentElement;
+            }
+            return null;
+          };
+          const indexInDocument = (el, selector) => {
+            if (!el?.ownerDocument?.querySelectorAll) return -1;
+            try {
+              return Array.from(el.ownerDocument.querySelectorAll(selector)).indexOf(el);
+            } catch {
+              return -1;
+            }
+          };
+          const makeBubbleResolution = ({
+            found,
+            direction,
+            el,
+            relation,
+            split = false,
+            messageInCount = 0,
+            messageOutCount = 0,
+          }) => ({
+            found: found === true,
+            direction: direction || "unknown",
+            hasMessageIn: direction === "in",
+            hasMessageOut: direction === "out",
+            selectorType: direction === "in" ? "message-in" : direction === "out" ? "message-out" : "",
+            index:
+              direction === "in"
+                ? indexInDocument(el, "div.message-in")
+                : direction === "out"
+                  ? indexInDocument(el, "div.message-out")
+                  : -1,
+            relation: relation || "",
+            evidenceSplitAcrossContainers: split === true,
+            ancestorContainedMessageInCount: Number(messageInCount || 0),
+            ancestorContainedMessageOutCount: Number(messageOutCount || 0),
+            clickableResolvedToMessageIn: found === true && direction === "in",
+          });
+          const resolveNearbyMessageBubble = (root) => {
+            const evidenceText = textFor(root);
+            const evidenceParticipant = participantForElement(root);
+            if (!evidenceText || !evidenceParticipant) return null;
+            const scopes = [];
+            const addScope = (scope, relation) => {
+              if (!scope || scopes.some((entry) => entry.scope === scope)) return;
+              scopes.push({ scope, relation });
+            };
+            addScope(root.parentElement, "parent_scope_same_text_participant");
+            let el = root.parentElement;
+            for (let depth = 0; depth < 6 && el; depth += 1) {
+              addScope(
+                el,
+                depth === 0
+                  ? "parent_scope_same_text_participant"
+                  : "ancestor_scope_same_text_participant"
+              );
+              el = el.parentElement;
+            }
+            for (const { scope, relation } of scopes) {
+              const ins = queryMessageClass(scope, "message-in");
+              const outs = queryMessageClass(scope, "message-out");
+              const matchingIns = ins.filter((bubble) => {
+                const match = messageEvidenceMatches(
+                  bubble,
+                  evidenceText,
+                  evidenceParticipant
+                );
+                return match.textMatched && match.participantMatched;
+              });
+              const matchingOuts = outs.filter((bubble) => {
+                const match = messageEvidenceMatches(
+                  bubble,
+                  evidenceText,
+                  evidenceParticipant
+                );
+                return match.textMatched && match.participantMatched;
+              });
+              if (matchingOuts.length > 0 && matchingIns.length === 0) {
+                return makeBubbleResolution({
+                  found: true,
+                  direction: "out",
+                  el: matchingOuts[0],
+                  relation,
+                  messageInCount: ins.length,
+                  messageOutCount: outs.length,
+                });
+              }
+              if (matchingIns.length === 1 && matchingOuts.length === 0) {
+                return makeBubbleResolution({
+                  found: true,
+                  direction: "in",
+                  el: matchingIns[0],
+                  relation,
+                  messageInCount: ins.length,
+                  messageOutCount: outs.length,
+                });
+              }
+              if (matchingIns.length + matchingOuts.length > 1) {
+                return makeBubbleResolution({
+                  found: false,
+                  direction: "unknown",
+                  relation: "multiple_nearby_matching_message_bubbles",
+                  split: true,
+                  messageInCount: ins.length,
+                  messageOutCount: outs.length,
+                });
+              }
+            }
+            return null;
+          };
+          const resolveMessageBubble = (root) => {
+            const dataTestid = clean(root.getAttribute?.("data-testid") || "");
+            const convMsgDataTestid = /^conv-msg-[^\s]+$/i.test(dataTestid) ? dataTestid : "";
+            const convMsgId = convMsgDataTestid.replace(/^conv-msg-/i, "");
+            const convMsgSelfAnchored = Boolean(
+              convMsgId && idCandidates.some((id) => clean(id) === clean(convMsgId))
+            );
+            const currentParticipant = participantForElement(root);
+            const currentExactText = exactTextForElement(root, currentParticipant || participant);
+            const currentParticipantMatched = Boolean(
+              participant &&
+                currentParticipant &&
+                normalizeComparable(currentParticipant).includes(normalizeComparable(participant))
+            );
+            const currentParticipantMetadataMatched = Boolean(
+              participant && participantText(currentParticipant) && currentParticipantMatched
+            );
+            const currentExactIdentityMatched = Boolean(
+              convMsgSelfAnchored &&
+                currentExactText &&
+                exactSourceText &&
+                currentExactText === exactSourceText &&
+                currentParticipantMetadataMatched
+            );
+            const hasOutgoingSignal =
+              hasClass(root, "message-out") ||
+              Boolean(root.querySelector?.(".message-out, [class*='message-out']"));
+            if (convMsgSelfAnchored && currentExactIdentityMatched && !hasOutgoingSignal) {
+              return makeBubbleResolution({
+                found: true,
+                direction: "in",
+                el: root,
+                relation: "self_conv_msg_source_anchor",
+                messageInCount: 1,
+                messageOutCount: 0,
+              });
+            }
+            if (convMsgSelfAnchored && hasOutgoingSignal) {
+              return makeBubbleResolution({
+                found: true,
+                direction: "out",
+                el: root,
+                relation: "self_conv_msg_source_anchor_outgoing",
+                messageInCount: 0,
+                messageOutCount: 1,
+              });
+            }
+            if (convMsgSelfAnchored) {
+              return {
+                found: false,
+                direction: "unknown",
+                hasMessageIn: false,
+                hasMessageOut: false,
+                selectorType: "conv-msg",
+                index: indexInDocument(root, '[data-testid^="conv-msg-"]'),
+                relation: "self_conv_msg_anchor_identity_unconfirmed",
+                evidenceSplitAcrossContainers: false,
+                ancestorContainedMessageInCount: 0,
+                ancestorContainedMessageOutCount: 0,
+                clickableResolvedToMessageIn: false,
+              };
+            }
+            const closest = closestMessageBubble(root);
+            if (closest?.el) {
+              const messageInCount = queryMessageClass(closest.el, "message-in").length;
+              const messageOutCount = queryMessageClass(closest.el, "message-out").length;
+              return {
+                found: true,
+                direction: closest.direction,
+                hasMessageIn: closest.direction === "in",
+                hasMessageOut: closest.direction === "out",
+                selectorType: closest.direction === "in" ? "message-in" : "message-out",
+                index:
+                  closest.direction === "in"
+                    ? indexInDocument(closest.el, "div.message-in")
+                    : indexInDocument(closest.el, "div.message-out"),
+                relation: closest.relation,
+                evidenceSplitAcrossContainers: false,
+                ancestorContainedMessageInCount: messageInCount,
+                ancestorContainedMessageOutCount: messageOutCount,
+                clickableResolvedToMessageIn: closest.direction === "in",
+              };
+            }
+
+            let el = root;
+            let sawAmbiguousContainer = false;
+            let maxMessageInCount = 0;
+            let maxMessageOutCount = 0;
+            for (let depth = 0; depth < 8 && el; depth += 1) {
+              const ins = queryMessageClass(el, "message-in");
+              const outs = queryMessageClass(el, "message-out");
+              maxMessageInCount = Math.max(maxMessageInCount, ins.length);
+              maxMessageOutCount = Math.max(maxMessageOutCount, outs.length);
+              if (ins.length + outs.length > 1) sawAmbiguousContainer = true;
+              if (depth === 0 && ins.length === 1 && outs.length === 0) {
+                return {
+                  found: true,
+                  direction: "in",
+                  hasMessageIn: true,
+                  hasMessageOut: false,
+                  selectorType: "message-in",
+                  index: indexInDocument(ins[0], "div.message-in"),
+                  relation: depth === 0 ? "descendant" : "ancestor_contains_single_message_in",
+                  evidenceSplitAcrossContainers: false,
+                  ancestorContainedMessageInCount: ins.length,
+                  ancestorContainedMessageOutCount: outs.length,
+                  clickableResolvedToMessageIn: true,
+                };
+              }
+              if (depth === 0 && outs.length === 1 && ins.length === 0) {
+                return {
+                  found: true,
+                  direction: "out",
+                  hasMessageIn: false,
+                  hasMessageOut: true,
+                  selectorType: "message-out",
+                  index: indexInDocument(outs[0], "div.message-out"),
+                  relation: depth === 0 ? "descendant" : "ancestor_contains_single_message_out",
+                  evidenceSplitAcrossContainers: false,
+                  ancestorContainedMessageInCount: ins.length,
+                  ancestorContainedMessageOutCount: outs.length,
+                  clickableResolvedToMessageIn: false,
+                };
+              }
+              el = el.parentElement;
+            }
+            const nearby = resolveNearbyMessageBubble(root);
+            if (nearby) return nearby;
+            return {
+              found: false,
+              direction: "unknown",
+              hasMessageIn: false,
+              hasMessageOut: false,
+              selectorType: "",
+              index: -1,
+              relation: sawAmbiguousContainer ? "ancestor_contains_multiple_message_bubbles" : "none",
+              evidenceSplitAcrossContainers: sawAmbiguousContainer,
+              ancestorContainedMessageInCount: maxMessageInCount,
+              ancestorContainedMessageOutCount: maxMessageOutCount,
+              clickableResolvedToMessageIn: false,
+            };
+          };
+          const messageDirection = (root, ids) => {
+            let el = root;
+            for (let depth = 0; depth < 6 && el; depth += 1) {
+              if (hasClass(el, "message-out")) return "out";
+              if (hasClass(el, "message-in")) return "in";
+              el = el.parentElement;
+            }
+            for (const entry of ids) {
+              if (String(entry.raw || "").startsWith("true_")) return "out";
+              if (String(entry.raw || "").startsWith("false_")) return "in";
+            }
+            if (root.querySelector?.(".message-out, [class*='message-out']")) return "out";
+            if (root.querySelector?.(".message-in, [class*='message-in']")) return "in";
+            return "unknown";
+          };
+          const out = [];
+          for (let index = 0; index < nodes.length; index += 1) {
+            const root = nodes[index];
+            if (!root || typeof root.querySelector !== "function") continue;
+            const ids = [];
+            addId(ids, "self", root.getAttribute?.("data-id"));
+            for (const child of Array.from(root.querySelectorAll?.("[data-id]") ?? [])) {
+              addId(ids, "child", child.getAttribute?.("data-id"));
+            }
+            let parent = root.parentElement;
+            for (let depth = 0; depth < 6 && parent; depth += 1) {
+              addId(ids, "ancestor", parent.getAttribute?.("data-id"));
+              parent = parent.parentElement;
+            }
+            const prePlainText = prePlainFor(root);
+            const visibleText = textFor(root);
+            const fullVisibleText = clean(root.innerText || root.textContent || visibleText);
+            const participant =
+              participantFromPrePlain(prePlainText) ||
+              clean(
+                root.getAttribute?.("data-sender") ||
+                  root.getAttribute?.("data-author") ||
+                  root.getAttribute?.("data-participant-id") ||
+                  ""
+              );
+            const allText = clean(`${visibleText} ${fullVisibleText} ${prePlainText}`);
+            const resolvedBubble = resolveMessageBubble(root);
+            const hasMessageIn =
+              resolvedBubble.hasMessageIn === true ||
+              hasClass(root, "message-in") ||
+              Boolean(root.querySelector?.(".message-in, [class*='message-in']"));
+            const hasMessageOut =
+              resolvedBubble.hasMessageOut === true ||
+              hasClass(root, "message-out") ||
+              Boolean(root.querySelector?.(".message-out, [class*='message-out']"));
+            const direction =
+              resolvedBubble.direction && resolvedBubble.direction !== "unknown"
+                ? resolvedBubble.direction
+                : messageDirection(root, ids);
+            out.push({
+              index,
+              direction,
+              dataIds: ids,
+              dataIdSources: ids.map((entry) => entry.source),
+              normalizedIds: [...new Set(ids.map((entry) => entry.normalized).filter(Boolean))],
+              dataTestid: clean(root.getAttribute?.("data-testid") || ""),
+              convMsgDataTestid:
+                /^conv-msg-[^\s]+$/i.test(clean(root.getAttribute?.("data-testid") || ""))
+                  ? clean(root.getAttribute?.("data-testid") || "")
+                  : "",
+              visibleText,
+              fullVisibleText,
+              prePlainText,
+              participant,
+              liveTag: clean(allText.match(/\bLIVE-E2E-\d+\b/i)?.[0] || ""),
+              hasMessageIn,
+              hasMessageOut,
+              convMsgAnchorFound: Boolean(
+                /^conv-msg-[^\s]+$/i.test(clean(root.getAttribute?.("data-testid") || ""))
+              ),
+              convMsgAnchorIdentityConfirmed:
+                Boolean(
+                  /^conv-msg-[^\s]+$/i.test(clean(root.getAttribute?.("data-testid") || ""))
+                ) &&
+                Boolean(exactSourceText) &&
+                Boolean(
+                  normalizeBrowserText(
+                    stripLeadingParticipantPrefixBrowser(visibleText, participant)
+                  ) === exactSourceText
+                ) &&
+                Boolean(
+                  participant &&
+                    participantFromPrePlain(prePlainText) &&
+                    normalizeComparable(participantFromPrePlain(prePlainText)).includes(
+                      normalizeComparable(participant)
+                    )
+                ),
+              convMsgAnchorTextMatched: Boolean(
+                /^conv-msg-[^\s]+$/i.test(clean(root.getAttribute?.("data-testid") || ""))
+              ) && Boolean(exactSourceText) &&
+                normalizeBrowserText(
+                  stripLeadingParticipantPrefixBrowser(visibleText, participant)
+                ) === exactSourceText,
+              convMsgAnchorParticipantMatched: Boolean(
+                /^conv-msg-[^\s]+$/i.test(clean(root.getAttribute?.("data-testid") || "")) &&
+                  participant &&
+                  participantFromPrePlain(prePlainText) &&
+                  normalizeComparable(participantFromPrePlain(prePlainText)).includes(
+                    normalizeComparable(participant)
+                  )
+              ),
+              convMsgNearestRoleRowFound: Boolean(
+                /^conv-msg-[^\s]+$/i.test(clean(root.getAttribute?.("data-testid") || "")) &&
+                  (() => {
+                    let el = root.parentElement;
+                    for (let depth = 0; depth < 8 && el; depth += 1) {
+                      if (clean(el.getAttribute?.("role") || "") === "row") return true;
+                      el = el.parentElement;
+                    }
+                    return false;
+                  })()
+              ),
+              resolvedBubbleFound: resolvedBubble.found === true,
+              resolvedBubbleDirection: resolvedBubble.direction || "unknown",
+              resolvedBubbleHasMessageIn: resolvedBubble.hasMessageIn === true,
+              resolvedBubbleHasMessageOut: resolvedBubble.hasMessageOut === true,
+              resolvedBubbleSelectorType: resolvedBubble.selectorType || "",
+              resolvedBubbleDataTestid:
+                /^conv-msg-[^\s]+$/i.test(clean(root.getAttribute?.("data-testid") || ""))
+                  ? clean(root.getAttribute?.("data-testid") || "")
+                  : "",
+              resolvedBubbleIndex: Number.isFinite(Number(resolvedBubble.index))
+                ? Number(resolvedBubble.index)
+                : -1,
+              evidenceContainerRelation: resolvedBubble.relation || "",
+              evidenceSplitAcrossContainers: resolvedBubble.evidenceSplitAcrossContainers === true,
+              ancestorContainedMessageInCount: Number(resolvedBubble.ancestorContainedMessageInCount || 0),
+              ancestorContainedMessageOutCount: Number(resolvedBubble.ancestorContainedMessageOutCount || 0),
+              finalClickableResolvedToMessageIn:
+                resolvedBubble.clickableResolvedToMessageIn === true,
+            });
+          }
+          return out;
+        }),
+      1500,
+      []
+    );
+    console.log("[reply_privately_source_candidates_enumerated]", {
+      bookingId: expected.bookingId,
+      phase,
+      candidateCount: Array.isArray(snapshots) ? snapshots.length : 0,
+    });
+    return Array.isArray(snapshots) ? snapshots : [];
+  };
+
+  const evaluateCandidateSnapshot = (candidate) => {
+    const normalizedIds = Array.isArray(candidate?.normalizedIds) ? candidate.normalizedIds : [];
+    const idMatched = idCandidates.find((id) => normalizedIds.some((domId) => domId === id)) || "";
+    const visible = clean(candidate?.visibleText || candidate?.fullVisibleText || "");
+    const combinedText = clean(`${candidate?.visibleText || ""} ${candidate?.fullVisibleText || ""} ${candidate?.prePlainText || ""}`);
+    const candidateExactText = normalizeExactSourceText(stripLeadingParticipantPrefix(visible, participant));
+    const candidateLiveTag = clean(candidate?.liveTag);
+    const hasDifferentLiveTag = Boolean(expectedLiveTag && candidateLiveTag && normalizeComparable(candidateLiveTag) !== normalizeComparable(expectedLiveTag));
+    const liveTagMatched = Boolean(expectedLiveTag && normalizeComparable(candidateLiveTag) === normalizeComparable(expectedLiveTag));
+    const strippedTextMatched = Boolean(
+      strippedSourceText &&
+        (normalizeComparable(visible).includes(normalizeComparable(strippedSourceText)) ||
+          normalizeComparable(combinedText).includes(normalizeComparable(strippedSourceText)))
+    );
+    const participantText = clean(candidate?.participant || "");
+    const participantMetadataAvailable = Boolean(participantText);
+    const participantAvailable = Boolean(participantText || visible);
+    const participantMatched =
+      !participant ||
+      normalizeComparable(participantText).includes(normalizeComparable(participant)) ||
+      normalizeComparable(visible).includes(normalizeComparable(participant)) ||
+      normalizeComparable(combinedText).includes(normalizeComparable(participant));
+    const participantMetadataMatched =
+      Boolean(participant && participantMetadataAvailable) &&
+      normalizeComparable(participantText).includes(normalizeComparable(participant));
+    const participantMismatched = Boolean(participant && participantAvailable && !participantMatched);
+    const exactTextMatched = Boolean(exactSourceText && candidateExactText && candidateExactText === exactSourceText);
+    const incoming =
+      candidate?.resolvedBubbleDirection === "in" &&
+      candidate?.resolvedBubbleHasMessageIn === true &&
+      candidate?.resolvedBubbleHasMessageOut !== true &&
+      candidate?.finalClickableResolvedToMessageIn === true &&
+      candidate?.evidenceSplitAcrossContainers !== true;
+    const outgoing =
+      candidate?.resolvedBubbleDirection === "out" ||
+      candidate?.resolvedBubbleHasMessageOut === true ||
+      candidate?.direction === "out" ||
+      candidate?.hasMessageOut === true;
+    const sourceMessageConfirmed = Boolean(
+      idMatched ||
+        (liveTagMatched && strippedTextMatched && participantMatched && participantAvailable) ||
+        (exactTextMatched && participantMetadataMatched)
+    );
+    const clickableBubbleFound = Boolean(incoming);
+    const matchReasons = [];
+    if (idMatched) matchReasons.push("id");
+    if (liveTagMatched) matchReasons.push("live_tag");
+    if (strippedTextMatched) matchReasons.push("stripped_text");
+    if (exactTextMatched) matchReasons.push("exact_text");
+    if (participantMatched && participant) matchReasons.push("participant");
+    if (participantMetadataMatched) matchReasons.push("participant_metadata");
+    let confidence = "none";
+    let ok = false;
+    let rejectReason = "";
+    if (candidate?.evidenceSplitAcrossContainers === true) {
+      rejectReason = "AMBIGUOUS_MESSAGE_CONTAINER";
+    } else if (outgoing || !incoming) rejectReason = outgoing ? "OUTGOING_ROW" : "NOT_INCOMING_ROW";
+    else if (hasDifferentLiveTag) rejectReason = "DIFFERENT_LIVE_E2E_TAG";
+    else if (participantMismatched) rejectReason = "PARTICIPANT_MISMATCH";
+    else if (idMatched) {
+      confidence = "id";
+      ok = true;
+    } else if (liveTagMatched && strippedTextMatched && participantMatched && participantAvailable) {
+      confidence = "text_live_participant";
+      ok = true;
+    } else if (exactTextMatched && participantMetadataMatched) {
+      confidence = "sourceText_participant_unique";
+      ok = true;
+    } else {
+      rejectReason = "INSUFFICIENT_SOURCE_PROOF";
+    }
+    return {
+      ...candidate,
+      ok,
+      confidence,
+      rejectReason,
+      idMatched,
+      liveTagMatched,
+      strippedTextMatched,
+      exactTextMatched,
+      participantMatched,
+      participantMetadataMatched,
+      participantMetadataAvailable,
+      participantAvailable,
+      participantMismatched,
+      sourceMessageConfirmed,
+      clickableBubbleFound,
+      clickableBubbleDirection: candidate?.resolvedBubbleDirection || "unknown",
+      clickableBubbleSelectorType: candidate?.resolvedBubbleSelectorType || "",
+      sourceBubbleTextNeedle: exactSourceText,
+      sourceBubbleTextNeedleType: sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType,
+      matchReasons,
+      textPreview: visible.slice(0, 140),
+    };
+  };
+
+  const candidateStableKey = (candidate) => {
+    const ids = Array.isArray(candidate?.normalizedIds)
+      ? candidate.normalizedIds.filter(Boolean)
+      : [];
+    if (ids.length > 0) return `id:${ids.join("|")}`;
+    return [
+      "text",
+      normalizeExactSourceText(candidate?.visibleText || candidate?.fullVisibleText || ""),
+      normalizeExactSourceText(candidate?.participant || ""),
+      normalizeExactSourceText(candidate?.prePlainText || ""),
+      candidate?.direction || "unknown",
+      Number.isFinite(Number(candidate?.index)) ? Number(candidate.index) : "na",
+    ].join(":");
+  };
+
+  const dedupeEvaluatedCandidates = (evaluated) => {
+    const seen = new Set();
+    const out = [];
+    for (const candidate of evaluated) {
+      const key = candidateStableKey(candidate);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(candidate);
+    }
+    return out;
+  };
+
+  const summarizeEvaluated = (evaluated) => ({
+    candidateCount: evaluated.length,
+    idMatchSeen: evaluated.some((candidate) => Boolean(candidate.idMatched)),
+    textMatchSeen: evaluated.some((candidate) => candidate.exactTextMatched === true || candidate.strippedTextMatched === true),
+    participantMatchSeen: evaluated.some((candidate) => candidate.participantMatched === true),
+  });
+
+  const compactCandidateSummary = (candidate) => {
+    if (!candidate) return null;
+    const normalizedIds = Array.isArray(candidate.normalizedIds)
+      ? candidate.normalizedIds.filter(Boolean)
+      : [];
+    const dataIdSources = Array.isArray(candidate.dataIdSources)
+      ? [...new Set(candidate.dataIdSources.filter(Boolean))]
+      : [];
+    return {
+      index: Number.isFinite(Number(candidate.index)) ? Number(candidate.index) : null,
+      confidence: clean(candidate.confidence) || null,
+      rejectReason: clean(candidate.rejectReason) || null,
+      direction: clean(candidate.direction) || null,
+      hasMessageIn: candidate.hasMessageIn === true,
+      hasMessageOut: candidate.hasMessageOut === true,
+      idMatched: Boolean(candidate.idMatched),
+      textMatched: candidate.strippedTextMatched === true || candidate.exactTextMatched === true,
+      exactTextMatched: candidate.exactTextMatched === true,
+      strippedTextMatched: candidate.strippedTextMatched === true,
+      participantMatched: candidate.participantMatched === true,
+      participantAvailable: candidate.participantAvailable === true,
+      participantMetadataAvailable: candidate.participantMetadataAvailable === true,
+      participantMetadataMatched: candidate.participantMetadataMatched === true,
+      participantMismatched: candidate.participantMismatched === true,
+      sourceMessageConfirmed: candidate.sourceMessageConfirmed === true,
+      clickableBubbleFound: candidate.clickableBubbleFound === true,
+      clickableBubbleDirection: clean(candidate.clickableBubbleDirection) || null,
+      clickableBubbleSelectorType: clean(candidate.clickableBubbleSelectorType) || null,
+      convMsgAnchorFound: candidate.convMsgAnchorFound === true,
+      convMsgAnchorIdentityConfirmed: candidate.convMsgAnchorIdentityConfirmed === true,
+      convMsgAnchorTextMatched: candidate.convMsgAnchorTextMatched === true,
+      convMsgAnchorParticipantMatched: candidate.convMsgAnchorParticipantMatched === true,
+      convMsgNearestRoleRowFound: candidate.convMsgNearestRoleRowFound === true,
+      liveTagMatched: candidate.liveTagMatched === true,
+      domIdSource: dataIdSources[0] || null,
+      domIdSources: dataIdSources.slice(0, 3),
+      domIdsSeen: normalizedIds.slice(0, 3),
+      textPreview: clean(candidate.textPreview).slice(0, 80) || null,
+      participantPreview: clean(candidate.participant).slice(0, 60) || null,
+      resolvedBubbleFound: candidate.resolvedBubbleFound === true,
+      resolvedBubbleDirection: clean(candidate.resolvedBubbleDirection) || null,
+      resolvedBubbleHasMessageIn: candidate.resolvedBubbleHasMessageIn === true,
+      resolvedBubbleHasMessageOut: candidate.resolvedBubbleHasMessageOut === true,
+      resolvedBubbleSelectorType: clean(candidate.resolvedBubbleSelectorType) || null,
+      resolvedBubbleDataTestid: clean(candidate.resolvedBubbleDataTestid) || null,
+      evidenceContainerRelation: clean(candidate.evidenceContainerRelation) || null,
+      evidenceSplitAcrossContainers: candidate.evidenceSplitAcrossContainers === true,
+      ancestorContainedMessageInCount:
+        Number.isFinite(Number(candidate.ancestorContainedMessageInCount))
+          ? Number(candidate.ancestorContainedMessageInCount)
+          : 0,
+      ancestorContainedMessageOutCount:
+        Number.isFinite(Number(candidate.ancestorContainedMessageOutCount))
+          ? Number(candidate.ancestorContainedMessageOutCount)
+          : 0,
+      finalClickableResolvedToMessageIn:
+        candidate.finalClickableResolvedToMessageIn === true,
+      matchReasons: Array.isArray(candidate.matchReasons)
+        ? candidate.matchReasons.slice(0, 6)
+        : [],
+    };
+  };
+
+  const buildCandidateDiagnostics = (evaluated) => {
+    const candidates = Array.isArray(evaluated) ? evaluated : [];
+    const idMatchedCandidates = candidates.filter((candidate) => Boolean(candidate.idMatched));
+    const textParticipantCandidates = candidates.filter(
+      (candidate) =>
+        (candidate.exactTextMatched === true || candidate.strippedTextMatched === true) &&
+        candidate.participantMatched === true
+    );
+    const sourceTextParticipantUniqueCandidates = candidates.filter(
+      (candidate) => candidate.ok === true && candidate.confidence === "sourceText_participant_unique"
+    );
+    const scored = [...candidates].sort((a, b) => {
+      const score = (candidate) =>
+        (candidate.idMatched ? 100 : 0) +
+        (candidate.exactTextMatched ? 40 : 0) +
+        (candidate.strippedTextMatched ? 20 : 0) +
+        (candidate.participantMetadataMatched ? 20 : 0) +
+        (candidate.participantMatched ? 10 : 0) +
+        (candidate.hasMessageIn ? 5 : 0) -
+        (candidate.hasMessageOut ? 50 : 0);
+      return score(b) - score(a);
+    });
+    const strongestCandidate = scored[0] || null;
+    const firstIdMatched = idMatchedCandidates[0] || null;
+    const firstTextParticipant = textParticipantCandidates[0] || null;
+    const ambiguousCandidateSummaries = scored
+      .filter(
+        (candidate) =>
+          Boolean(candidate.idMatched) ||
+          candidate.exactTextMatched === true ||
+          candidate.strippedTextMatched === true ||
+          candidate.participantMatched === true
+      )
+      .slice(0, 5)
+      .map(compactCandidateSummary)
+      .filter(Boolean);
+    return {
+      sourceTextParticipantUniqueCandidateCount:
+        sourceTextParticipantUniqueCandidates.length,
+      idMatchedCandidateCount: idMatchedCandidates.length,
+      textParticipantCandidateCount: textParticipantCandidates.length,
+      strongestCandidateRejectReason:
+        clean(strongestCandidate?.rejectReason) || null,
+      idMatchedCandidateRejectReason: clean(firstIdMatched?.rejectReason) || null,
+      textParticipantCandidateRejectReason:
+        clean(firstTextParticipant?.rejectReason) || null,
+      idMatchedCandidateDirection: clean(firstIdMatched?.direction) || null,
+      idMatchedCandidateHasMessageIn: firstIdMatched?.hasMessageIn === true,
+      idMatchedCandidateHasMessageOut: firstIdMatched?.hasMessageOut === true,
+      idMatchedCandidateTextMatched:
+        firstIdMatched?.strippedTextMatched === true ||
+        firstIdMatched?.exactTextMatched === true,
+      idMatchedCandidateParticipantMatched:
+        firstIdMatched?.participantMatched === true,
+      idMatchedCandidateParticipantAvailable:
+        firstIdMatched?.participantAvailable === true,
+      idMatchedCandidateExactTextMatched:
+        firstIdMatched?.exactTextMatched === true,
+      idMatchedCandidateLiveTagMatched:
+        firstIdMatched?.liveTagMatched === true,
+      idMatchedCandidateDomIdSource:
+        compactCandidateSummary(firstIdMatched)?.domIdSource || null,
+      idMatchedCandidateTextPreview:
+        compactCandidateSummary(firstIdMatched)?.textPreview || null,
+      idMatchedCandidateParticipantPreview:
+        compactCandidateSummary(firstIdMatched)?.participantPreview || null,
+      idMatchedCandidateResolvedBubbleFound:
+        firstIdMatched?.resolvedBubbleFound === true,
+      idMatchedCandidateResolvedBubbleDirection:
+        clean(firstIdMatched?.resolvedBubbleDirection) || null,
+      idMatchedCandidateResolvedBubbleHasMessageIn:
+        firstIdMatched?.resolvedBubbleHasMessageIn === true,
+      idMatchedCandidateResolvedBubbleHasMessageOut:
+        firstIdMatched?.resolvedBubbleHasMessageOut === true,
+      idMatchedCandidateResolvedBubbleSelectorType:
+        clean(firstIdMatched?.resolvedBubbleSelectorType) || null,
+      idMatchedCandidateEvidenceContainerRelation:
+        clean(firstIdMatched?.evidenceContainerRelation) || null,
+      idMatchedCandidateEvidenceSplitAcrossContainers:
+        firstIdMatched?.evidenceSplitAcrossContainers === true,
+      idMatchedCandidateAncestorContainedMessageInCount:
+        Number.isFinite(Number(firstIdMatched?.ancestorContainedMessageInCount))
+          ? Number(firstIdMatched.ancestorContainedMessageInCount)
+          : 0,
+      idMatchedCandidateAncestorContainedMessageOutCount:
+        Number.isFinite(Number(firstIdMatched?.ancestorContainedMessageOutCount))
+          ? Number(firstIdMatched.ancestorContainedMessageOutCount)
+          : 0,
+      idMatchedCandidateFinalClickableResolvedToMessageIn:
+        firstIdMatched?.finalClickableResolvedToMessageIn === true,
+      sourceMessageConfirmed: strongestCandidate?.sourceMessageConfirmed === true,
+      clickableBubbleFound: strongestCandidate?.clickableBubbleFound === true,
+      clickableBubbleDirection:
+        clean(strongestCandidate?.clickableBubbleDirection) || null,
+      clickableBubbleSelectorType:
+        clean(strongestCandidate?.clickableBubbleSelectorType) || null,
+      textParticipantCandidateDirection:
+        clean(firstTextParticipant?.direction) || null,
+      textParticipantCandidateHasMessageIn:
+        firstTextParticipant?.hasMessageIn === true,
+      textParticipantCandidateHasMessageOut:
+        firstTextParticipant?.hasMessageOut === true,
+      textParticipantCandidateDomIdsSeen:
+        compactCandidateSummary(firstTextParticipant)?.domIdsSeen || [],
+      textParticipantCandidateRejectReason:
+        clean(firstTextParticipant?.rejectReason) || null,
+      textParticipantCandidateResolvedBubbleFound:
+        firstTextParticipant?.resolvedBubbleFound === true,
+      textParticipantCandidateResolvedBubbleDirection:
+        clean(firstTextParticipant?.resolvedBubbleDirection) || null,
+      textParticipantCandidateEvidenceContainerRelation:
+        clean(firstTextParticipant?.evidenceContainerRelation) || null,
+      ambiguousCandidateSummaries,
+    };
+  };
+
+  const selectVerifiedCandidate = (snapshots, phase, { allowTextFallback = true } = {}) => {
+    const evaluated = snapshots.map(evaluateCandidateSnapshot);
+    for (const candidate of evaluated.slice(-12)) {
+      console.log("[reply_privately_source_candidate_checked]", {
+        bookingId: expected.bookingId,
+        phase,
+        index: candidate.index,
+        ok: candidate.ok === true,
+        confidence: candidate.confidence,
+        idMatched: Boolean(candidate.idMatched),
+        liveTagMatched: candidate.liveTagMatched === true,
+        textMatched: candidate.strippedTextMatched === true || candidate.exactTextMatched === true,
+        participantMatched: candidate.participantMatched === true,
+        participantMetadataMatched: candidate.participantMetadataMatched === true,
+        candidateDataIdSources: Array.isArray(candidate.dataIdSources) ? [...new Set(candidate.dataIdSources)] : [],
+        candidateIds: Array.isArray(candidate.normalizedIds) ? candidate.normalizedIds.slice(0, 3) : [],
+        convMsgAnchorFound: candidate.convMsgAnchorFound === true,
+        convMsgAnchorIdentityConfirmed: candidate.convMsgAnchorIdentityConfirmed === true,
+        convMsgAnchorTextMatched: candidate.convMsgAnchorTextMatched === true,
+        convMsgAnchorParticipantMatched: candidate.convMsgAnchorParticipantMatched === true,
+        convMsgNearestRoleRowFound: candidate.convMsgNearestRoleRowFound === true,
+        resolvedBubbleFound: candidate.resolvedBubbleFound === true,
+        resolvedBubbleDirection: candidate.resolvedBubbleDirection || null,
+        resolvedBubbleDataTestid: candidate.resolvedBubbleDataTestid || null,
+        evidenceContainerRelation: candidate.evidenceContainerRelation || null,
+        evidenceSplitAcrossContainers: candidate.evidenceSplitAcrossContainers === true,
+        finalClickableResolvedToMessageIn:
+          candidate.finalClickableResolvedToMessageIn === true,
+        textPreview: clean(candidate.textPreview).slice(0, 120) || null,
+        participantPreview: clean(candidate.participant).slice(0, 80) || null,
+        liveTag: candidate.liveTag || null,
+        matchReasons: candidate.matchReasons,
+        reason: candidate.rejectReason || null,
+      });
+    }
+    const idMatches = evaluated.filter((candidate) => candidate.ok && candidate.confidence === "id");
+    if (idMatches.length === 1) return { ok: true, selected: idMatches[0], reason: "sourceMessageId" };
+    if (idMatches.length > 1) {
+      return { ok: false, reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED", rejectReason: "AMBIGUOUS_ID_MATCH" };
+    }
+    if (!allowTextFallback) {
+      const sawLive = evaluated.some((candidate) => candidate.liveTagMatched);
+      const sawText = evaluated.some((candidate) => candidate.exactTextMatched || candidate.strippedTextMatched);
+      const sawId = evaluated.some((candidate) => candidate.idMatched);
+      return {
+        ok: false,
+        reason: sawId
+          ? "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED"
+          : sawLive || sawText
+            ? "SOURCE_ID_NOT_FOUND"
+            : snapshots.length > 0
+              ? "SOURCE_TEXT_NOT_FOUND"
+              : "SOURCE_ROW_NOT_VISIBLE",
+        rejectReason: "NO_CONFIRMED_SOURCE_BUBBLE",
+        evaluated,
+      };
+    }
+    const fallbackMatches = evaluated.filter((candidate) => candidate.ok && candidate.confidence === "text_live_participant");
+    if (fallbackMatches.length === 1) return { ok: true, selected: fallbackMatches[0], reason: "participant_text" };
+    if (fallbackMatches.length > 1) {
+      return { ok: false, reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED", rejectReason: "AMBIGUOUS_PARTIAL_SOURCE_MATCH" };
+    }
+    const exactTextMatches = evaluated.filter((candidate) => candidate.exactTextMatched && candidate?.direction === "in");
+    const textFromOtherParticipant = exactTextMatches.some((candidate) => {
+      if (candidate.participantMetadataMatched) return false;
+      return clean(candidate.participant || "");
+    });
+    if (textFromOtherParticipant) {
+      return {
+        ok: false,
+        reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED",
+        rejectReason: "SAME_TEXT_DIFFERENT_PARTICIPANT",
+      };
+    }
+    const uniqueTextMatches = evaluated.filter((candidate) => candidate.ok && candidate.confidence === "sourceText_participant_unique");
+    if (uniqueTextMatches.length === 1) {
+      return { ok: true, selected: uniqueTextMatches[0], reason: "sourceText_participant_unique" };
+    }
+    if (uniqueTextMatches.length > 1) {
+      return {
+        ok: false,
+        reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED",
+        rejectReason: "AMBIGUOUS_SOURCE_TEXT_PARTICIPANT",
+      };
+    }
+    const sawLive = evaluated.some((candidate) => candidate.liveTagMatched);
+    const sawText = evaluated.some((candidate) => candidate.exactTextMatched || candidate.strippedTextMatched);
+    const sawId = evaluated.some((candidate) => candidate.idMatched);
+    return {
+      ok: false,
+      reason: sawId
+        ? "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED"
+        : sawLive || sawText
+          ? "SOURCE_ID_NOT_FOUND"
+          : snapshots.length > 0
+            ? "SOURCE_TEXT_NOT_FOUND"
+            : "SOURCE_ROW_NOT_VISIBLE",
+      rejectReason: "NO_CONFIRMED_SOURCE_BUBBLE",
+      evaluated,
+    };
+  };
+
+  const buildDirectConvMsgSnapshot = async (locator, exactSelector, phase) => {
+    return locator.evaluate(
+      (root, params) => {
+        const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+        const lower = (v) => clean(v).toLowerCase();
+        const normalizeBrowserText = (value) => lower(clean(value).replace(/\u00a0/g, " "));
+        const stripLeadingParticipantPrefixBrowser = (value, participantName = "") => {
+          const text = clean(value);
+          if (!text) return "";
+          const expected = clean(participantName);
+          if (expected) {
+            const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const withoutBracket = text.replace(new RegExp(`^\\[${escaped}\\]\\s*`, "i"), "");
+            if (withoutBracket !== text) return clean(withoutBracket);
+            const withoutName = text.replace(new RegExp(`^${escaped}\\s*[:\\-]?\\s*`, "i"), "");
+            if (withoutName !== text) return clean(withoutName);
+          }
+          return clean(text.replace(/^\[[^\]]+\]\s*/, ""));
+        };
+        const normalizeId = (value) => {
+          const raw = clean(value);
+          if (!raw) return "";
+          const withoutPrefix = raw.replace(/^wa::/i, "");
+          const rowMatch = withoutPrefix.match(/^real:([^#\s]+)(?:#\d+)?$/i);
+          const id = rowMatch ? rowMatch[1] : withoutPrefix;
+          return clean(id.replace(/^message::/i, ""));
+        };
+        const addId = (bucket, source, value) => {
+          const raw = clean(value);
+          if (!raw) return;
+          const normalized = normalizeId(raw);
+          if (!normalized) return;
+          bucket.push({ source, raw, normalized });
+        };
+        const textFor = (node) => {
+          const textNode =
+            node.querySelector?.("span.selectable-text span") ||
+            node.querySelector?.("span.selectable-text");
+          const copyable = node.querySelector?.("div.copyable-text");
+          return clean(
+            textNode?.textContent ??
+              copyable?.innerText ??
+              node.innerText ??
+              node.textContent ??
+              ""
+          );
+        };
+        const prePlainFor = (node) => {
+          const copyable = node.querySelector?.("div.copyable-text");
+          if (copyable?.getAttribute?.("data-pre-plain-text")) {
+            return clean(copyable.getAttribute("data-pre-plain-text"));
+          }
+          if (node.getAttribute?.("data-pre-plain-text")) {
+            return clean(node.getAttribute("data-pre-plain-text"));
+          }
+          const child = node.querySelector?.("[data-pre-plain-text]");
+          return clean(child?.getAttribute?.("data-pre-plain-text"));
+        };
+        const participantFromPrePlain = (plain) => {
+          const match = clean(plain).match(/^\[[^\]]+\]\s*([^:]+):\s*/);
+          return clean(match?.[1] || "");
+        };
+        const participantForElement = (node) =>
+          participantFromPrePlain(prePlainFor(node)) ||
+          clean(
+            node?.getAttribute?.("data-sender") ||
+              node?.getAttribute?.("data-author") ||
+              node?.getAttribute?.("data-participant-id") ||
+              ""
+          );
+        const normalizeComparable = (value) => lower(clean(value).replace(/\u00a0/g, " "));
+        const exactSourceText = clean(params?.exactSourceText || "");
+        const exactParticipantName = clean(params?.expectedParticipantName || "");
+        const exactParticipantKey = clean(params?.expectedParticipantKey || "");
+        const dataTestid = clean(root.getAttribute?.("data-testid") || "");
+        const convMsgMatch = /^conv-msg-[^\s]+$/i.test(dataTestid);
+        const convMsgId = convMsgMatch ? dataTestid.replace(/^conv-msg-/i, "") : "";
+        const visibleText = textFor(root);
+        const fullVisibleText = clean(root.innerText || root.textContent || visibleText);
+        const prePlainText = prePlainFor(root);
+        const participant = participantForElement(root);
+        const allText = clean(`${visibleText} ${fullVisibleText} ${prePlainText}`);
+        const ids = [];
+        addId(ids, "self", root.getAttribute?.("data-id"));
+        for (const child of Array.from(root.querySelectorAll?.("[data-id]") ?? [])) {
+          addId(ids, "child", child.getAttribute?.("data-id"));
+        }
+        let parent = root.parentElement;
+        for (let depth = 0; depth < 6 && parent; depth += 1) {
+          addId(ids, "ancestor", parent.getAttribute?.("data-id"));
+          parent = parent.parentElement;
+        }
+        let roleRowFound = false;
+        let ancestor = root.parentElement;
+        for (let depth = 0; depth < 8 && ancestor; depth += 1) {
+          if (clean(ancestor.getAttribute?.("role") || "") === "row") {
+            roleRowFound = true;
+            break;
+          }
+          ancestor = ancestor.parentElement;
+        }
+        const hasOutgoingSignal =
+          root.classList?.contains?.("message-out") ||
+          Boolean(root.querySelector?.(".message-out, [class*='message-out']"));
+        const hasIncomingSignal =
+          root.classList?.contains?.("message-in") ||
+          Boolean(root.querySelector?.(".message-in, [class*='message-in']"));
+        const messageDirection = hasOutgoingSignal ? "out" : "in";
+        const exactTextMatched = Boolean(
+          exactSourceText &&
+            normalizeBrowserText(stripLeadingParticipantPrefixBrowser(visibleText, participant)) ===
+              exactSourceText
+        );
+        const participantMatched = Boolean(
+          (exactParticipantName &&
+            participant &&
+            normalizeComparable(participant).includes(normalizeComparable(exactParticipantName))) ||
+            (exactParticipantKey &&
+              participant &&
+              normalizeComparable(participant).includes(normalizeComparable(exactParticipantKey)))
+        );
+        const participantMetadataAvailable = Boolean(participant);
+        const participantAvailable = Boolean(participant || visibleText);
+        return {
+          index: 0,
+          direction: messageDirection,
+          dataIds: ids,
+          dataIdSources: ids.map((entry) => entry.source),
+          normalizedIds: [...new Set(ids.map((entry) => entry.normalized).filter(Boolean))],
+          dataTestid,
+          convMsgDataTestid: convMsgMatch ? dataTestid : "",
+          visibleText,
+          fullVisibleText,
+          prePlainText,
+          participant,
+          liveTag: clean(allText.match(/\bLIVE-E2E-\d+\b/i)?.[0] || ""),
+          hasMessageIn: !hasOutgoingSignal,
+          hasMessageOut: hasOutgoingSignal,
+          convMsgAnchorFound: convMsgMatch,
+          convMsgAnchorIdentityConfirmed:
+            convMsgMatch &&
+            Boolean(exactSourceText) &&
+            exactTextMatched &&
+            participantMatched &&
+            participantMetadataAvailable &&
+            !hasOutgoingSignal,
+          convMsgAnchorTextMatched: convMsgMatch && exactTextMatched,
+          convMsgAnchorParticipantMatched: convMsgMatch && participantMatched,
+          convMsgNearestRoleRowFound: convMsgMatch && roleRowFound,
+          resolvedBubbleFound: convMsgMatch,
+          resolvedBubbleDirection: messageDirection,
+          resolvedBubbleHasMessageIn: !hasOutgoingSignal,
+          resolvedBubbleHasMessageOut: hasOutgoingSignal,
+          resolvedBubbleSelectorType: "conv-msg",
+          resolvedBubbleDataTestid: convMsgMatch ? dataTestid : "",
+          resolvedBubbleIndex: 0,
+          evidenceContainerRelation: "self_conv_msg_source_anchor",
+          evidenceSplitAcrossContainers: false,
+          ancestorContainedMessageInCount: hasIncomingSignal ? 1 : 0,
+          ancestorContainedMessageOutCount: hasOutgoingSignal ? 1 : 0,
+          finalClickableResolvedToMessageIn: !hasOutgoingSignal,
+        };
+      },
+      {
+        exactSourceText,
+        expectedParticipantName: expected.expectedParticipantName,
+        expectedParticipantKey: expected.expectedParticipantKey,
+        exactSelector,
+        phase,
+      }
+    );
+  };
+
+  const tryDirectExactConvMsgLookup = async (phase = "initial") => {
+    directConvMsgLookupAttempted = true;
+    const { selector: scopeSelector, locator: scopeLocator } = await resolveConversationScopeLocator();
+    const ids = [...new Set(idCandidates.filter(Boolean))];
+    let lastMissing = null;
+    for (const sourceMessageId of ids) {
+      const exactSelector = `[data-testid="conv-msg-${sourceMessageId}"]`;
+      const scopedCount = await scopeLocator.locator(exactSelector).count().catch(() => 0);
+      const globalCount = await page.locator(exactSelector).count().catch(() => 0);
+      directConvMsgExactRootCount = Math.max(directConvMsgExactRootCount, Number(scopedCount || 0));
+      directConvMsgExactGlobalCount = Math.max(directConvMsgExactGlobalCount, Number(globalCount || 0));
+      const candidateCount = scopedCount === 1 ? scopedCount : globalCount === 1 ? globalCount : Math.max(scopedCount, globalCount);
+      console.log("[reply_privately_direct_conv_msg_lookup_attempt]", {
+        bookingId: expected.bookingId,
+        phase,
+        scopeSelector: scopeSelector || null,
+        exactSelector,
+        exactRootCount: scopedCount,
+        exactGlobalCount: globalCount,
+      });
+      if (scopedCount > 1 || globalCount > 1) {
+        directConvMsgAmbiguityReason = "DIRECT_CONV_MSG_AMBIGUOUS";
+        return {
+          ok: false,
+          reason: "DIRECT_CONV_MSG_AMBIGUOUS",
+          rejectReason: "DIRECT_CONV_MSG_AMBIGUOUS",
+          direct: true,
+        };
+      }
+      if (scopedCount !== 1 && globalCount !== 1) {
+        lastMissing = "DIRECT_CONV_MSG_IDENTITY_NOT_FOUND";
+        continue;
+      }
+      const candidateLocator = scopedCount === 1 ? scopeLocator.locator(exactSelector).first() : page.locator(exactSelector).first();
+      const snapshot = await buildDirectConvMsgSnapshot(candidateLocator, exactSelector, phase);
+      const evaluated = evaluateCandidateSnapshot(snapshot);
+      directConvMsgUsedAsCandidate = true;
+      directConvMsgTextMatched = evaluated.exactTextMatched === true || evaluated.strippedTextMatched === true;
+      directConvMsgParticipantMatched = evaluated.participantMatched === true;
+      directConvMsgIdentityConfirmed =
+        evaluated.convMsgAnchorFound === true &&
+        evaluated.convMsgAnchorIdentityConfirmed === true &&
+        evaluated.sourceMessageConfirmed === true &&
+        evaluated.finalClickableResolvedToMessageIn === true;
+      if (directConvMsgIdentityConfirmed) {
+        directConvMsgPassedToOpenBubbleMenu = true;
+        return {
+          ok: true,
+          selected: evaluated,
+          reason: "sourceMessageId",
+          locator: candidateLocator,
+          direct: true,
+          sourceBubbleTextNeedle:
+            evaluated.sourceBubbleTextNeedle || sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle,
+          sourceBubbleTextNeedleType:
+            evaluated.sourceBubbleTextNeedleType ||
+            sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType,
+        };
+      }
+      directConvMsgIdentityFailureReason =
+        evaluated.rejectReason ||
+        (evaluated.convMsgAnchorFound === true
+          ? "DIRECT_CONV_MSG_IDENTITY_FAILED"
+          : "DIRECT_CONV_MSG_SOURCE_ANCHOR_NOT_FOUND");
+      return {
+        ok: false,
+        reason: "DIRECT_CONV_MSG_IDENTITY_FAILED",
+        rejectReason: evaluated.rejectReason || "DIRECT_CONV_MSG_IDENTITY_FAILED",
+        evaluated: [evaluated],
+        snapshots: [snapshot],
+        direct: true,
+      };
+    }
+    return {
+      ok: false,
+      reason: lastMissing || "DIRECT_CONV_MSG_IDENTITY_NOT_FOUND",
+      rejectReason: lastMissing || "DIRECT_CONV_MSG_IDENTITY_NOT_FOUND",
+      direct: true,
+    };
+  };
 
   const snapshotLocator = async (locator) => {
     const count = await locator.count().catch(() => 0);
@@ -2364,6 +4109,7 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       expectedText: expected.expectedText,
       expectedSourceRowKey: expected.expectedSourceRowKey,
       expectedSourceMessageId: expected.expectedSourceMessageId,
+      normalizedSourceMessageIds: expected.normalizedSourceMessageIds,
       expectedSourceMessageIndex: expected.expectedSourceMessageIndex,
       triedStrategies,
     });
@@ -2373,6 +4119,7 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       participantKey: expected.expectedParticipantKey,
       sourceRowKey: expected.expectedSourceRowKey,
       sourceMessageId: expected.expectedSourceMessageId,
+      normalizedSourceMessageIds: expected.normalizedSourceMessageIds,
       sourceMessageIndex: expected.expectedSourceMessageIndex,
       sourceTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
       fallbackAnchorType: triedStrategies.at(-1)?.strategy ?? null,
@@ -2381,6 +4128,245 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       groupChatKey: clean(sourceMessage?.groupChatKey ?? sourceMessage?.sourceGroupName ?? "") || null,
       expectedTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
     });
+  };
+
+  const logDurableLocatorDiagnostics = ({ status = "fail", finalReason = "", evaluated = [], scrollSteps = 0, ambiguityReason = "" } = {}) => {
+    const evaluatedCandidates = Array.isArray(evaluated) ? evaluated : [];
+    const summary = summarizeEvaluated(evaluatedCandidates);
+    const candidateDiagnostics =
+      status === "fail" ? buildCandidateDiagnostics(evaluatedCandidates) : {};
+    logBookingEvent({
+      traceId: expected.bookingId || "reply-private-locator",
+      step: "reply_privately_source_locator_diagnostics",
+      status,
+      data: {
+        bookingId: expected.bookingId,
+        normalizedSourceMessageIds: expected.normalizedSourceMessageIds,
+        normalizedSourceRowKeyIds: sourceMessageIdCandidates({
+          sourceRowKey: expected.expectedSourceRowKey,
+        }),
+        strippedSourceTextPreview: strippedSourceText ? strippedSourceText.slice(0, 120) : null,
+        participantPreview: expected.expectedParticipantName
+          ? expected.expectedParticipantName.slice(0, 80)
+          : null,
+        candidateCount: summary.candidateCount,
+        scrollSteps,
+        idMatchSeen: summary.idMatchSeen,
+        textMatchSeen: summary.textMatchSeen,
+        participantMatchSeen: summary.participantMatchSeen,
+        directConvMsgLookupAttempted,
+        directConvMsgExactRootCount,
+        directConvMsgExactGlobalCount,
+        directConvMsgUsedAsCandidate,
+        directConvMsgIdentityConfirmed,
+        directConvMsgTextMatched,
+        directConvMsgParticipantMatched,
+        directConvMsgPassedToOpenBubbleMenu,
+        broadCandidateScanTimedOut,
+        broadCandidateScanReturnedFallback,
+        sourceRowExistsButCandidateScanEmpty,
+        directConvMsgIdentityFailureReason: directConvMsgIdentityFailureReason || null,
+        directConvMsgAmbiguityReason: directConvMsgAmbiguityReason || null,
+        ambiguityReason: ambiguityReason || null,
+        finalFailureReason: status === "fail" ? finalReason || null : null,
+        ...candidateDiagnostics,
+      },
+    });
+  };
+
+  const logSourceRowNotVisibleAggregateDiagnostics = async ({
+    scrollSteps = 0,
+    finalReason = "",
+    ambiguityReason = "",
+    selectedRootSelector = "",
+  } = {}) => {
+    const sourceMessageId = expected.normalizedSourceMessageIds[0] || expected.expectedSourceMessageId || null;
+    const exactConvMsgSelector = sourceMessageId
+      ? `[data-testid="conv-msg-${sourceMessageId}"]`
+      : "";
+    const convMsgPrefixSelector = '[data-testid^="conv-msg-"]';
+    const messageNeedle = normalizeExactSourceText(
+      stripLeadingParticipantPrefix(strippedSourceText || text, participant)
+    );
+    const selectedScrollContainerSelector =
+      selectedRootSelector ||
+      (await (async () => {
+        const selectors = [
+          '[data-testid="conversation-panel-body"]',
+          '[data-testid="conversation-panel"]',
+          "#main [role='application']",
+          "#main",
+        ];
+        for (const selector of selectors) {
+          const count = await page.locator(selector).count().catch(() => 0);
+          if (count > 0) return selector;
+        }
+        return "";
+      })());
+    const rootSelector = selectedScrollContainerSelector || "#main";
+    const rootLocator = page.locator(rootSelector).first();
+    const globalConvMsgLocator = page.locator(convMsgPrefixSelector);
+    const rootConvMsgLocator = rootLocator.locator(convMsgPrefixSelector);
+    const exactConvMsgGlobalCount = exactConvMsgSelector
+      ? await page.locator(exactConvMsgSelector).count().catch(() => 0)
+      : 0;
+    const exactConvMsgRootCount = exactConvMsgSelector
+      ? await rootLocator.locator(exactConvMsgSelector).count().catch(() => 0)
+      : 0;
+    const convMsgPrefixGlobalCount = await globalConvMsgLocator.count().catch(() => 0);
+    const convMsgPrefixRootCount = await rootConvMsgLocator.count().catch(() => 0);
+    const msgContainerCount = await page.locator('[data-testid="msg-container"]').count().catch(() => 0);
+    const messageInCount = await page.locator("div.message-in").count().catch(() => 0);
+    const messageOutCount = await page.locator("div.message-out").count().catch(() => 0);
+    const rowCount = await rootLocator.locator('[role="row"]').count().catch(() => 0);
+    const panelBodyFound = await page.locator('[data-testid="conversation-panel-body"]').count().catch(() => 0);
+    const panelFound = await page.locator('[data-testid="conversation-panel"]').count().catch(() => 0);
+    const mainFound = await page.locator("#main").count().catch(() => 0);
+    const textMatchGlobalCount = messageNeedle
+      ? await globalConvMsgLocator.evaluateAll((nodes, needle) => {
+          const cleanText = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+          const target = cleanText(needle);
+          if (!target) return 0;
+          let total = 0;
+          for (const node of nodes) {
+            const text = cleanText(node?.innerText || node?.textContent || "");
+            if (text.includes(target)) total += 1;
+          }
+          return total;
+        }, messageNeedle).catch(() => 0)
+      : 0;
+    const textMatchRootCount = messageNeedle
+      ? await rootConvMsgLocator.evaluateAll((nodes, needle) => {
+          const cleanText = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+          const target = cleanText(needle);
+          if (!target) return 0;
+          let total = 0;
+          for (const node of nodes) {
+            const text = cleanText(node?.innerText || node?.textContent || "");
+            if (text.includes(target)) total += 1;
+          }
+          return total;
+        }, messageNeedle).catch(() => 0)
+      : 0;
+    const sourceIdAttributeCount = sourceMessageId
+      ? await page
+          .locator(
+            [
+              `[data-id*="${sourceMessageId}"]`,
+              `[data-testid*="${sourceMessageId}"]`,
+              `[aria-label*="${sourceMessageId}"]`,
+              `[title*="${sourceMessageId}"]`,
+            ].join(", ")
+          )
+          .count()
+          .catch(() => 0)
+      : 0;
+    const sourceIdTextMatchCount = sourceMessageId
+      ? await globalConvMsgLocator.evaluateAll((nodes, needle) => {
+          const cleanText = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+          const target = cleanText(needle);
+          if (!target) return 0;
+          let total = 0;
+          for (const node of nodes) {
+            const text = cleanText(`${node?.innerText || ""} ${node?.textContent || ""} ${node?.getAttribute?.("data-testid") || ""} ${node?.getAttribute?.("data-id") || ""} ${node?.getAttribute?.("aria-label") || ""} ${node?.getAttribute?.("title") || ""}`);
+            if (text.includes(target)) total += 1;
+          }
+          return total;
+        }, sourceMessageId).catch(() => 0)
+      : 0;
+    const collectPreviews = async (locator) =>
+      locator
+        .evaluateAll((nodes) =>
+          nodes.map((node) => {
+            const cleanText = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+            const textNode =
+              node.querySelector?.("span.selectable-text span") ||
+              node.querySelector?.("span.selectable-text");
+            const copyable = node.querySelector?.("div.copyable-text");
+            return cleanText(
+              textNode?.textContent ??
+                copyable?.innerText ??
+                node.innerText ??
+                node.textContent ??
+                ""
+            ).slice(0, 80);
+          })
+        )
+        .catch(() => []);
+    const rootConvMsgPreviews = await collectPreviews(rootConvMsgLocator);
+    const pageUrl = typeof page?.url === "function" ? clean(page.url()) : null;
+    logBookingEvent({
+      traceId: expected.bookingId || "reply-private-locator",
+      step: "reply_privately_source_row_not_visible_aggregate",
+      status: "fail",
+      data: {
+        bookingId: expected.bookingId,
+        normalizedSourceMessageId: sourceMessageId,
+        normalizedSourceRowKeyIds: sourceMessageIdCandidates({
+          sourceRowKey: expected.expectedSourceRowKey,
+        }),
+        expectedSourceTextPreview: expected.expectedText ? expected.expectedText.slice(0, 120) : null,
+        expectedParticipantPreview: expected.expectedParticipantName
+          ? expected.expectedParticipantName.slice(0, 80)
+          : null,
+        activeChatTitle: "",
+        currentUrl: pageUrl || null,
+        conversationPanelFound: panelFound > 0,
+        conversationPanelBodyFound: panelBodyFound > 0,
+        mainFound: mainFound > 0,
+        selectedScrollContainerSelector: selectedScrollContainerSelector || null,
+        selectedScrollContainerCount: selectedScrollContainerSelector ? 1 : 0,
+        scrollTop: null,
+        scrollHeight: null,
+        clientHeight: null,
+        convMsgExactGlobalCount: exactConvMsgGlobalCount,
+        convMsgPrefixGlobalCount,
+        convMsgExactRootCount: exactConvMsgRootCount,
+        convMsgPrefixRootCount,
+        roleRowRootCount: rowCount,
+        msgContainerCount,
+        messageInCount,
+        messageOutCount,
+        visibleTextMatchCountGlobal: textMatchGlobalCount,
+        visibleTextMatchCountRoot: textMatchRootCount,
+        sourceMessageIdAppearsAnywhere:
+          Number(sourceIdAttributeCount || 0) > 0 || Number(sourceIdTextMatchCount || 0) > 0,
+        sourceMessageIdAttributeMatchCount: sourceIdAttributeCount,
+        sourceMessageIdTextMatchCount: sourceIdTextMatchCount,
+        directConvMsgLookupAttempted,
+        directConvMsgExactRootCount,
+        directConvMsgExactGlobalCount,
+        directConvMsgUsedAsCandidate,
+        directConvMsgIdentityConfirmed,
+        directConvMsgTextMatched,
+        directConvMsgParticipantMatched,
+        directConvMsgPassedToOpenBubbleMenu,
+        broadCandidateScanTimedOut,
+        broadCandidateScanReturnedFallback,
+        sourceRowExistsButCandidateScanEmpty,
+        directConvMsgIdentityFailureReason: directConvMsgIdentityFailureReason || null,
+        directConvMsgAmbiguityReason: directConvMsgAmbiguityReason || null,
+        firstConvMsgTextPreviews: rootConvMsgPreviews.slice(0, 5),
+        lastConvMsgTextPreviews: rootConvMsgPreviews.slice(-5),
+        scrollSteps,
+        finalFailureReason: finalReason || null,
+        ambiguityReason: ambiguityReason || null,
+      },
+    });
+  };
+
+  const locatorForSelectedCandidate = (candidate) => {
+    if (clean(candidate?.resolvedBubbleDataTestid)) {
+      return page.locator(`[data-testid="${candidate.resolvedBubbleDataTestid}"]`).first();
+    }
+    if (
+      candidate?.resolvedBubbleSelectorType === "message-in" &&
+      Number.isFinite(Number(candidate.resolvedBubbleIndex)) &&
+      Number(candidate.resolvedBubbleIndex) >= 0
+    ) {
+      return page.locator("div.message-in").nth(Number(candidate.resolvedBubbleIndex));
+    }
+    return candidateRows().nth(Math.max(0, Number(candidate?.index) || 0));
   };
 
   if (!participant || !text) {
@@ -2393,144 +4379,251 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
     await logResolutionFailedDetail();
     return { ok: false, reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED", locator: null };
   }
-  const idBase = messageId ? messageId.split("::")[0] : "";
-
-  // Strategy 1 (strongest): messageId anchor inside the bubble.
-  if (idBase) {
-    const bubbleByMessageId = page
-      .locator("div.message-in")
-      .filter({
-        has: page.locator(`[data-id="${idBase}"], div.copyable-text[data-id="${idBase}"]`),
-      })
-      .first();
-    const count = await bubbleByMessageId.count().catch(() => 0);
-    await recordStrategy({
-      strategy: "sourceMessageId locator",
-      locator: bubbleByMessageId,
-      locatorDescription: `div.message-in has [data-id="${idBase}"]`,
-      reason: count > 0 ? "FOUND" : "NO_MATCH",
-    });
-    if (count > 0) {
-      return { ok: true, reason: "sourceMessageId", locator: bubbleByMessageId };
+  const trySelectFromRenderedRows = async (phase = "initial", { allowTextFallback = false } = {}) => {
+    const directSelection = await tryDirectExactConvMsgLookup(phase);
+    if (directSelection?.ok && directSelection.selected) {
+      console.log("[reply_privately_locator_verified]", {
+        bookingId: expected.bookingId,
+        strategy: "direct_conv_msg",
+        normalizedSourceMessageId: directSelection.selected.idMatched || null,
+        selectedRowIndex: directSelection.selected.index,
+        selectedTextPreview: clean(directSelection.selected.textPreview).slice(0, 120) || null,
+        selectedParticipantPreview: clean(directSelection.selected.participant).slice(0, 80) || null,
+        selectedLiveTag: directSelection.selected.liveTag || null,
+        matchReasons: directSelection.selected.matchReasons,
+      });
+      logDurableLocatorDiagnostics({
+        status: "success",
+        finalReason: directSelection.reason,
+        evaluated: [directSelection.selected],
+        scrollSteps: 0,
+      });
+      return {
+        ok: true,
+        reason: directSelection.reason,
+        locator: locatorForSelectedCandidate(directSelection.selected),
+      };
     }
-  } else {
+    if (
+      directSelection?.direct === true &&
+      directSelection?.reason &&
+      directSelection.reason !== "DIRECT_CONV_MSG_IDENTITY_NOT_FOUND"
+    ) {
+      directConvMsgUsedAsCandidate = true;
+      sourceRowExistsButCandidateScanEmpty = false;
+      logDurableLocatorDiagnostics({
+        status: "fail",
+        finalReason: directSelection.reason,
+        ambiguityReason: directSelection.rejectReason || "",
+        evaluated: directSelection.evaluated || [],
+        scrollSteps: 0,
+      });
+      return {
+        ok: false,
+        reason: directSelection.reason,
+        locator: null,
+      };
+    }
+    const snapshots = await collectCandidateSnapshots(phase);
+    if (directConvMsgLookupAttempted) {
+      sourceRowExistsButCandidateScanEmpty =
+        directConvMsgExactRootCount > 0 || directConvMsgExactGlobalCount > 0
+          ? snapshots.length === 0
+          : false;
+    }
     await recordStrategy({
-      strategy: "sourceMessageId locator",
-      locator: page.locator("div.message-in").filter({ has: page.locator(`[data-id=""]`) }),
-      locatorDescription: "skipped (missing expectedSourceMessageId)",
-      reason: "MISSING_MESSAGE_ID",
+      strategy: `enumerated source rows (${phase})`,
+      locator: candidateRows(),
+      locatorDescription:
+        'div.message-in, div.message-out, [data-testid="msg-container"], [data-testid^="conv-msg-"]',
+      reason: snapshots.length > 0 ? "CANDIDATES_ENUMERATED" : "NO_RENDERED_CANDIDATES",
     });
-  }
+    const selected = selectVerifiedCandidate(snapshots, phase, { allowTextFallback });
+    if (selected.ok && selected.selected) {
+      console.log("[reply_privately_locator_verified]", {
+        bookingId: expected.bookingId,
+        strategy:
+          selected.selected.confidence === "id"
+            ? "sourceMessageId/data-id"
+            : selected.selected.confidence,
+        normalizedSourceMessageId: selected.selected.idMatched || null,
+        selectedRowIndex: selected.selected.index,
+        selectedTextPreview: clean(selected.selected.textPreview).slice(0, 120) || null,
+        selectedParticipantPreview: clean(selected.selected.participant).slice(0, 80) || null,
+        selectedLiveTag: selected.selected.liveTag || null,
+        matchReasons: selected.selected.matchReasons,
+      });
+      logDurableLocatorDiagnostics({
+        status: "success",
+        finalReason: selected.reason,
+        evaluated: selected.evaluated || snapshots.map(evaluateCandidateSnapshot),
+        scrollSteps: 0,
+      });
+      return {
+        ok: true,
+        reason: selected.reason,
+        locator: locatorForSelectedCandidate(selected.selected),
+        sourceBubbleTextNeedle:
+          selected.selected?.sourceBubbleTextNeedle || sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle,
+        sourceBubbleTextNeedleType:
+          selected.selected?.sourceBubbleTextNeedleType ||
+          sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType,
+      };
+    }
+    return { ...selected, snapshots, evaluated: selected.evaluated || snapshots.map(evaluateCandidateSnapshot) };
+  };
 
-  // Visible-text-only strategy: rely on text + participant name as rendered in the bubble.
-  // IMPORTANT: Do not use any [data-pre-plain-text] selectors.
-  console.log("[reply_privately_locator_visible_text_strategy_used]", {
+  const scrollConversationPanelUp = async (step) =>
+    withShortTimeout(
+      async () =>
+        page.evaluate((params) => {
+          const panel =
+            document.querySelector('[data-testid="conversation-panel-body"]') ||
+            document.querySelector('[data-testid="conversation-panel"]') ||
+            document.querySelector("#main [role='application']") ||
+            document.querySelector("#main");
+          if (!panel) return { ok: false, reason: "PANEL_NOT_FOUND" };
+          const before = Number(panel.scrollTop || 0);
+          const amount = Math.max(450, Math.floor(Number(panel.clientHeight || 900) * 0.85));
+          panel.scrollTop = Math.max(0, before - amount);
+          return {
+            ok: true,
+            step: Number(params?.step ?? 0),
+            before,
+            after: Number(panel.scrollTop || 0),
+            amount,
+            scrollHeight: Number(panel.scrollHeight || 0),
+          };
+        }, { step }),
+      1000,
+      { ok: false, reason: "PANEL_SCROLL_TIMEOUT" }
+    );
+
+  const aggregatedEvaluated = [];
+  const appendEvaluated = (evaluated) => {
+    if (Array.isArray(evaluated)) aggregatedEvaluated.push(...evaluated);
+  };
+
+  const initialSelection = await trySelectFromRenderedRows("initial", { allowTextFallback: false });
+  appendEvaluated(initialSelection.evaluated);
+  if (initialSelection.ok) return initialSelection;
+
+  console.log("[reply_privately_source_scroll_search_started]", {
     bookingId: expected.bookingId,
-    expectedText: text,
-    participantName: participant,
+    normalizedSourceMessageIds: idCandidates,
+    expectedLiveTag: expectedLiveTag || null,
+    strippedSourceTextPreview: strippedSourceText ? strippedSourceText.slice(0, 120) : null,
   });
-  console.log("[reply_privately_source_anchor_fallback_attempt]", {
-    bookingId: expected.bookingId,
-    fallbackAnchorType: "participant_text",
-    participantName: participant,
-    participantKey: expected.expectedParticipantKey,
-    sourceRowKey: expected.expectedSourceRowKey,
-    sourceMessageId: expected.expectedSourceMessageId,
-    sourceMessageIndex: expected.expectedSourceMessageIndex,
-    sourceTextPreview: text.slice(0, 120),
-  });
-  const bubble = page
-    .locator("div.message-in")
-    .filter({ hasText: text })
-    .filter({ hasText: participant })
-    ;
-  const bubbleCount = await bubble.count().catch(() => 0);
-  await recordStrategy({
-    strategy: "visible text (participant + message text) locator",
-    locator: bubble.first(),
-    locatorDescription: `div.message-in hasText("${text}") AND hasText("${participant}")`,
-    reason: bubbleCount > 0 ? "CANDIDATE_FOUND" : "NO_MATCH",
-  });
-  if (bubbleCount === 0) {
-    await logResolutionFailedDetail();
-    return { ok: false, reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED", locator: null };
-  }
-  let selectedBubble = bubbleCount === 1 ? bubble.first() : null;
-  if (bubbleCount > 1) {
-    // Do NOT rely on absolute sourceMessageIndex; WhatsApp DOM is virtualized/dynamic.
-    // Select the latest (bottom-most) bubble among the matching candidates only.
-    selectedBubble = bubble.nth(Math.max(0, bubbleCount - 1));
-    console.log("[reply_privately_disambiguated_by_latest_candidate]", {
+  let lastSelection = initialSelection;
+  let scrollSteps = 0;
+  for (let step = 1; step <= 6; step += 1) {
+    const scrollResult = await scrollConversationPanelUp(step);
+    scrollSteps = step;
+    console.log("[reply_privately_source_scroll_step]", {
       bookingId: expected.bookingId,
-      candidateCount: bubbleCount,
-      strategy: "latest_matching_candidate",
+      step,
+      ok: scrollResult?.ok === true,
+      before: Number.isFinite(Number(scrollResult?.before)) ? Math.round(Number(scrollResult.before)) : null,
+      after: Number.isFinite(Number(scrollResult?.after)) ? Math.round(Number(scrollResult.after)) : null,
+      reason: scrollResult?.reason || null,
     });
+    await humanDelay(page);
+    const selected = await trySelectFromRenderedRows(`scroll_${step}`, { allowTextFallback: false });
+    appendEvaluated(selected.evaluated);
+    if (selected.ok) {
+      console.log("[reply_privately_source_scroll_search_found]", {
+        bookingId: expected.bookingId,
+        step,
+      });
+      return selected;
+    }
+    lastSelection = selected;
+    if (scrollResult?.ok === true && Number(scrollResult.before) === Number(scrollResult.after)) {
+      break;
+    }
   }
 
-  const bubbleFirst = selectedBubble;
-
-  // Verify exact participant + exact text on the located bubble (fail closed).
-  const verified = await bubbleFirst
-    .evaluate((row, expected) => {
-      const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
-      const expectedParticipant = clean(expected.participant);
-      const expectedText = clean(expected.text);
-      const copyable = row.querySelector("div.copyable-text");
-      const textNode =
-        row.querySelector("span.selectable-text span") ||
-        row.querySelector("span.selectable-text");
-      const domText = clean(textNode?.textContent ?? (copyable?.innerText ?? row.innerText ?? ""));
-      const domVisible = clean(row.innerText || "");
-      const participantOk = !expectedParticipant || domVisible.toLowerCase().includes(expectedParticipant.toLowerCase());
-      return participantOk && domText === expectedText;
-    }, { participant, text })
-    .catch(() => false);
-  if (!verified) {
-    console.warn("[reply_privately_candidate_rejected_participant_mismatch]", {
-      bookingId: clean(bookingId) || null,
-    });
-    await recordStrategy({
-      strategy: "participant + exact text locator",
-      locator: bubbleFirst,
-      locatorDescription: `verify participant="${participant}" text="${text}"`,
-      reason: "VERIFY_FALSE",
-    });
-
-    // Provide diagnostics for the other strategies too, without changing outcome.
-    const normalizedNeedle = normalizeComparable(text);
-    const normalizedRegex = normalizedNeedle
-      ? new RegExp(escapeRegExp(normalizedNeedle).replace(/\\\s+/g, "\\s+"), "i")
-      : null;
-    const bubbleNormalized = normalizedRegex
-      ? page
-          .locator("div.message-in")
-          .filter({ hasText: normalizedRegex })
-          .filter({ hasText: participant })
-          .first()
-      : page.locator("div.message-in").filter({ hasText: text }).first();
-    await recordStrategy({
-      strategy: "participant + normalized text locator",
-      locator: bubbleNormalized,
-      locatorDescription: normalizedRegex
-        ? `div.message-in hasText(/${normalizedRegex.source}/i) AND hasText("${participant}")`
-        : "skipped (empty normalized needle)",
-      reason: "DIAGNOSTIC_ONLY",
-    });
-    const textOnly = page.locator("div.message-in").filter({ hasText: text });
-    await recordStrategy({
-      strategy: "exact text only locator (diagnostic)",
-      locator: textOnly,
-      locatorDescription: `div.message-in hasText("${text}")`,
-      reason: "DIAGNOSTIC_ONLY",
-    });
-    await logResolutionFailedDetail();
-    return { ok: false, reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED", locator: null };
-  }
-  console.log("[reply_privately_locator_verified]", {
-    bookingId: expected.bookingId,
-    strategy: expected.expectedPrePlainTextFragment ? "prePlainTextFragment" : "participantName",
+  const uniqueEvaluated = dedupeEvaluatedCandidates(aggregatedEvaluated);
+  const aggregateSelection = selectVerifiedCandidate(uniqueEvaluated, "aggregate", {
+    allowTextFallback: true,
   });
-  return { ok: true, reason: "participant_text", locator: bubbleFirst };
+  if (aggregateSelection.ok && aggregateSelection.selected) {
+    const selectedKey = candidateStableKey(aggregateSelection.selected);
+    const finalSnapshots = await collectCandidateSnapshots("final_select");
+    const finalEvaluated = finalSnapshots.map(evaluateCandidateSnapshot);
+    const finalSelected =
+      finalEvaluated.find((candidate) => candidateStableKey(candidate) === selectedKey) || null;
+    if (!finalSelected) {
+      await logSourceRowNotVisibleAggregateDiagnostics({
+        scrollSteps,
+        finalReason: "SOURCE_ROW_NOT_VISIBLE",
+        ambiguityReason: "SELECTED_CANDIDATE_NOT_CURRENTLY_RENDERED",
+      });
+      logDurableLocatorDiagnostics({
+        status: "fail",
+        finalReason: "SOURCE_ROW_NOT_VISIBLE",
+        ambiguityReason: "SELECTED_CANDIDATE_NOT_CURRENTLY_RENDERED",
+        evaluated: uniqueEvaluated,
+        scrollSteps,
+      });
+      return { ok: false, reason: "SOURCE_ROW_NOT_VISIBLE", locator: null };
+    }
+    console.log("[reply_privately_source_scroll_search_found]", {
+      bookingId: expected.bookingId,
+      step: scrollSteps,
+      strategy: finalSelected.confidence,
+    });
+    console.log("[reply_privately_locator_verified]", {
+      bookingId: expected.bookingId,
+      strategy: finalSelected.confidence,
+      normalizedSourceMessageId: finalSelected.idMatched || null,
+      selectedRowIndex: finalSelected.index,
+      selectedTextPreview: clean(finalSelected.textPreview).slice(0, 120) || null,
+      selectedParticipantPreview: clean(finalSelected.participant).slice(0, 80) || null,
+      selectedLiveTag: finalSelected.liveTag || null,
+      matchReasons: finalSelected.matchReasons,
+    });
+    logDurableLocatorDiagnostics({
+      status: "success",
+      finalReason: aggregateSelection.reason,
+      evaluated: uniqueEvaluated,
+      scrollSteps,
+    });
+    return {
+      ok: true,
+      reason: aggregateSelection.reason,
+      locator: locatorForSelectedCandidate(finalSelected),
+      sourceBubbleTextNeedle:
+        finalSelected?.sourceBubbleTextNeedle || sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle,
+      sourceBubbleTextNeedleType:
+        finalSelected?.sourceBubbleTextNeedleType ||
+        sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType,
+    };
+  }
+
+  console.log("[reply_privately_source_scroll_search_exhausted]", {
+    bookingId: expected.bookingId,
+    normalizedSourceMessageIds: idCandidates,
+    reason: aggregateSelection?.rejectReason || lastSelection?.rejectReason || lastSelection?.reason || null,
+  });
+  await logResolutionFailedDetail();
+  await logSourceRowNotVisibleAggregateDiagnostics({
+    scrollSteps,
+    finalReason: aggregateSelection?.reason || lastSelection?.reason || "SOURCE_ROW_NOT_VISIBLE",
+    ambiguityReason: aggregateSelection?.rejectReason || lastSelection?.rejectReason || "",
+  });
+  logDurableLocatorDiagnostics({
+    status: "fail",
+    finalReason: aggregateSelection?.reason || lastSelection?.reason || "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED",
+    ambiguityReason: aggregateSelection?.rejectReason || lastSelection?.rejectReason || "",
+    evaluated: uniqueEvaluated,
+    scrollSteps,
+  });
+  return {
+    ok: false,
+    reason: aggregateSelection?.reason || lastSelection?.reason || "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED",
+    locator: null,
+  };
 }
 
 // Test-only export: allows unit testing locator resolution without running full Playwright flow.
@@ -2682,10 +4775,24 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         }
         const bubble = located.locator;
         await debugHighlightBubble(page, bubble, bookingId);
+        const sourceBubbleTextNeedle =
+          clean(located.sourceBubbleTextNeedle || sourceMessage.sourceBubbleTextNeedle || "") || null;
+        const sourceBubbleTextNeedleType =
+          clean(located.sourceBubbleTextNeedleType || sourceMessage.sourceBubbleTextNeedleType || "") || null;
+        const sourceMessageForMenu = {
+          ...sourceMessage,
+          ...(sourceBubbleTextNeedle
+            ? {
+                sourceBubbleTextNeedle,
+                sourceBubbleTextNeedleType:
+                  sourceBubbleTextNeedleType || "stripped_text",
+              }
+            : {}),
+        };
         const menuOpened = await openBubbleMenu(page, bubble, {
           expectedGroupTitle,
           bookingId,
-          sourceMessage,
+          sourceMessage: sourceMessageForMenu,
         });
         if (!menuOpened.ok) {
           lastReason = menuOpened.reason || "MENU_OPEN_FAILED";
@@ -2918,6 +5025,22 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         sendActionAttempted,
         dmChatTitle,
         dmPlaywrightChatKey,
+        outgoingPreCount: sendVerified.outgoingPreCount ?? null,
+        outgoingPostCount: sendVerified.outgoingPostCount ?? null,
+        outgoingCountIncreased: sendVerified.outgoingCountIncreased === true,
+        outgoingSignatureChanged: sendVerified.outgoingSignatureChanged === true,
+        outgoingVerificationExpectedPreview:
+          sendVerified.outgoingVerificationExpectedPreview || null,
+        outgoingVerificationActualPreview:
+          sendVerified.outgoingVerificationActualPreview || null,
+        outgoingVerificationMatchedExpectedBody:
+          sendVerified.outgoingVerificationMatchedExpectedBody === true,
+        outgoingVerificationMatchedQuoteOnly:
+          sendVerified.outgoingVerificationMatchedQuoteOnly === true,
+        outgoingVerificationUsedNewBubble:
+          sendVerified.outgoingVerificationUsedNewBubble === true,
+        outgoingVerificationFailureReason:
+          sendVerified.outgoingVerificationFailureReason || null,
       });
       if (!sendVerified.ok) {
         console.warn("[reply_privately_failed]", {
