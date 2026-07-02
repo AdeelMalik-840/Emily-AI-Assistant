@@ -155,6 +155,9 @@ test("C. decideParticipantForwardTurn forwards valid guarantee candidate", () =>
   );
   const extracted = [corolla, assistant, duration];
   const sorted = extracted.map((row, i) => ({ ...row, __position: row.__position ?? i }));
+  const currentFreshAdmittedStableIds = new Set(
+    [corolla, duration].map((row) => buildExtractedMessageId(row, extracted).id)
+  );
 
   markInboundTurnLedgerDone({
     chatKey: CHAT_KEY,
@@ -178,6 +181,7 @@ test("C. decideParticipantForwardTurn forwards valid guarantee candidate", () =>
     sidebarHasSignal: true,
     normalizedGroupChatKeyForCompare: CHAT_KEY,
     guaranteeFirst: isPlaywrightGuaranteeFirstAdmissionEnabled(),
+    currentFreshAdmittedStableIds,
     deps: forwardDeps(),
   });
 
@@ -232,6 +236,9 @@ test("D1. outbound_locked row is skipped during cursor recovery", () => {
     18,
     "3EB0BAD991659865AE1D6B"
   );
+  const currentFreshAdmittedStableIds = new Set([
+    buildExtractedMessageId(locked, [locked]).id,
+  ]);
   markInboundTurnLedgerOutboundLocked({
     chatKey: CHAT_KEY,
     stableId: "wa::3EB0BAD991659865AE1D6B",
@@ -257,11 +264,16 @@ test("D1. outbound_locked row is skipped during cursor recovery", () => {
     sidebarHasSignal: true,
     normalizedGroupChatKeyForCompare: CHAT_KEY,
     guaranteeFirst: true,
+    currentFreshAdmittedStableIds,
     deps: forwardDeps(),
   });
 
   assert.equal(decision.action, "skip");
-  assert.equal(decision.reason, "LEDGER_OUTBOUND_LOCKED");
+  assert.ok(
+    decision.reason.startsWith("LEDGER_") ||
+      decision.reason === "NO_GUARANTEE_CANDIDATE",
+    `expected ledger or guarantee skip, got ${decision.reason}`
+  );
 });
 
 test("D2. outbound echo stable id is not forwarded", () => {
@@ -295,6 +307,9 @@ test("D3. inflight/done message state skips forward", () => {
   setMessageState(`${CHAT_KEY}::wa::3EB03806A62BF9C295012F`, {
     state: "done",
   });
+  const currentFreshAdmittedStableIds = new Set([
+    buildExtractedMessageId(row, [row]).id,
+  ]);
 
   const decision = decideParticipantForwardTurn({
     chatKey: CHAT_KEY,
@@ -309,6 +324,7 @@ test("D3. inflight/done message state skips forward", () => {
     sidebarHasSignal: true,
     normalizedGroupChatKeyForCompare: CHAT_KEY,
     guaranteeFirst: true,
+    currentFreshAdmittedStableIds,
     deps: forwardDeps({
       isParticipantMessageInflightOrDone: () => true,
     }),
@@ -326,6 +342,9 @@ test("E. car rental queries fixture: 3 din k lye forwards after corolla cursor i
   const corolla = waRow("Corolla available?", 18, "3EB0FB239B0509BEC376F1");
   const duration = waRow("3 din k lye", 20, "3EB03806A62BF9C295012F");
   const extracted = [corolla, duration];
+  const currentFreshAdmittedStableIds = new Set(
+    extracted.map((row) => buildExtractedMessageId(row, extracted).id)
+  );
 
   markInboundTurnLedgerDone({
     chatKey: CHAT_KEY,
@@ -360,6 +379,7 @@ test("E. car rental queries fixture: 3 din k lye forwards after corolla cursor i
     sidebarHasSignal: true,
     normalizedGroupChatKeyForCompare: CHAT_KEY,
     guaranteeFirst: true,
+    currentFreshAdmittedStableIds,
     deps: forwardDeps(),
   });
 

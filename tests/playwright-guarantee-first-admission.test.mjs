@@ -96,7 +96,7 @@ test("noise includes lone ? (aligned with inbound gate garbage_message)", () => 
   assert.equal(isBurstMergeContinuationText("???"), true);
 });
 
-test("guarantee-first: civic at ack index survives while guarantee idle", () => {
+test("guarantee-first: civic at ack index is blocked under no-replay", () => {
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
   const civic = mkRow({
@@ -122,8 +122,7 @@ test("guarantee-first: civic at ack index survives while guarantee idle", () => 
     extractedList: sorted,
   });
 
-  assert.equal(survivors.length, 1);
-  assert.equal(survivors[0].text, "Civic available?");
+  assert.equal(survivors.length, 0);
   assert.ok(droppedNoise.includes("???"));
 });
 
@@ -148,7 +147,7 @@ test("guarantee-first: drops rows with guarantee done", () => {
   assert.equal(survivors.length, 0);
 });
 
-test("guarantee-first: selects oldest meaningful per participant not tail ?", () => {
+test("guarantee-first: post-anchor noise does not become a survivor", () => {
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
   const civic = mkRow({
@@ -171,8 +170,7 @@ test("guarantee-first: selects oldest meaningful per participant not tail ?", ()
     chatKey: CHAT,
     extractedList: sorted,
   }).survivors;
-  assert.equal(survivors.length, 1);
-  assert.equal(survivors[0].text, "civic available?");
+  assert.equal(survivors.length, 0);
 
   const candidate = buildParticipantForwardCandidate({
     participantMessages: survivors,
@@ -185,9 +183,7 @@ test("guarantee-first: selects oldest meaningful per participant not tail ?", ()
     anchorIndex: -1,
     tickFirstSeenByStableId: st.tickFirstSeenByStableId,
   });
-  assert.ok(candidate);
-  assert.equal(candidate.text, "civic available? ?");
-  assert.equal(candidate.__burstMergedCount, 2);
+  assert.equal(candidate, null);
 });
 
 test("guarantee-first: lone ? is never selected when no meaningful predecessor", () => {
@@ -222,15 +218,29 @@ test("guarantee-first: lone ? is never selected when no meaningful predecessor",
   assert.equal(candidate, null);
 });
 
-test("attachBurstMergeContinuations merges civic + ? only", () => {
+test("attachBurstMergeContinuations blocks civic + ? noise under no-replay", () => {
   const civic = mkRow({
     text: "Civic available?",
     dataId: "false_civic@c.us_M",
     position: 2,
+    participantKey: "p1",
   });
-  const q = mkRow({ text: "?", dataId: "false_q@c.us_M", position: 3 });
-  const noise = mkRow({ text: "???", dataId: "false_n@c.us_M", position: 4 });
+  const q = mkRow({
+    text: "?",
+    dataId: "false_q@c.us_M",
+    position: 3,
+    participantKey: "p1",
+  });
+  const noise = mkRow({
+    text: "???",
+    dataId: "false_n@c.us_M",
+    position: 4,
+    participantKey: "p1",
+  });
   const sorted = [civic, q, noise];
+  const currentFreshAdmittedStableIds = new Set(
+    sorted.map((row) => buildStableMessageKey(row, sorted).id)
+  );
   const merged = attachBurstMergeContinuations(
     civic,
     sorted,
@@ -238,13 +248,16 @@ test("attachBurstMergeContinuations merges civic + ? only", () => {
     120_000,
     new Map(),
     sorted,
-    CHAT
+    CHAT,
+    [],
+    { currentFreshAdmittedStableIds }
   );
-  assert.equal(merged.text, "Civic available? ? ???");
-  assert.equal(merged.__burstMergedCount, 3);
+  assert.equal(merged.text, "Civic available?");
+  assert.equal(merged.__burstMergedCount, undefined);
+  assert.equal(merged.__burstMerged, undefined);
 });
 
-test("guarantee cursor skips done rows and picks next oldest", () => {
+test("guarantee cursor stays closed without fresh admitted ids", () => {
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
   const doneRow = mkRow({
@@ -261,14 +274,15 @@ test("guarantee cursor skips done rows and picks next oldest", () => {
   const doneId = buildStableMessageKey(doneRow, sorted).id;
   setMessageState(`${CHAT}::${doneId}`, "done");
   const st = mkFreshState();
-  const survivors = filterGuaranteeFirstEligibleUserRows({
+  const admitted = filterGuaranteeFirstEligibleUserRows({
     userMessages: sorted,
+    acknowledgedAnchorIndex: 8,
+    resolvedAnchorIndex: 8,
     freshState: st,
     chatKey: CHAT,
     extractedList: sorted,
-  }).survivors;
-  assert.equal(survivors.length, 1);
-  assert.equal(survivors[0].text, "civic available?");
+  });
+  const survivors = admitted.survivors;
   const candidate = buildParticipantForwardCandidate({
     participantMessages: survivors,
     allParticipantUserRows: sorted,
@@ -280,7 +294,9 @@ test("guarantee cursor skips done rows and picks next oldest", () => {
     anchorIndex: -1,
     tickFirstSeenByStableId: st.tickFirstSeenByStableId,
   });
-  assert.equal(candidate.text, "civic available?");
+  assert.equal(survivors.length, 1);
+  assert.equal(survivors[0].text, "civic available?");
+  assert.equal(candidate, null);
 });
 
 test("guarantee-first: old visible row is not a burst source for fresh row", () => {
@@ -603,7 +619,7 @@ test("guarantee-first: logGuaranteeFirstSelection emits selection proof", () => 
   assert.equal(logs[0].participantKey, "p1");
 });
 
-test("guarantee-first: walk-forward selects newest pending when older is superseded", () => {
+test("guarantee-first: walk-forward requires fresh admitted stable ids", () => {
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
   const civic = mkRow({
@@ -618,13 +634,23 @@ test("guarantee-first: walk-forward selects newest pending when older is superse
   });
   const sorted = [civic, civicFollowUp];
   const st = mkFreshState();
-  const survivors = filterGuaranteeFirstEligibleUserRows({
+  const admitted = filterGuaranteeFirstEligibleUserRows({
     userMessages: sorted,
+    acknowledgedAnchorIndex: 0,
+    resolvedAnchorIndex: 0,
     freshState: st,
     chatKey: CHAT,
     extractedList: sorted,
-  }).survivors;
-  assert.equal(survivors.length, 2);
+  });
+  const survivors = admitted.survivors;
+  const currentFreshAdmittedStableIds =
+    admitted.currentFreshAdmittedStableIds instanceof Set
+      ? admitted.currentFreshAdmittedStableIds
+      : new Set(
+          survivors.map((row) => buildStableMessageKey(row, sorted).id)
+        );
+  assert.equal(survivors.length, 1);
+  assert.equal(survivors[0].text, "civic available?????");
   const candidate = buildParticipantForwardCandidate({
     participantMessages: survivors,
     allParticipantUserRows: sorted,
@@ -635,6 +661,7 @@ test("guarantee-first: walk-forward selects newest pending when older is superse
     normalizedGroupChatKeyForCompare: CHAT,
     anchorIndex: -1,
     tickFirstSeenByStableId: st.tickFirstSeenByStableId,
+    currentFreshAdmittedStableIds,
   });
   assert.ok(candidate);
   assert.equal(candidate.text, "civic available?????");

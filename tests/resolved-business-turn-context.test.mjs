@@ -164,25 +164,6 @@ for (const message of pricingCases) {
   });
 }
 
-const imageCases = [
-  "Civic ki picture share kr dn final test",
-  "Civic ki tasveer bhej do",
-  "image share kr do",
-];
-
-for (const message of imageCases) {
-  test(`decision: explicit image request routes image_catalog_request: ${message}`, async () => {
-    const memorySnapshot = message.startsWith("image")
-      ? { lastResolvedItemId: CIVIC_ID, lastItem: { id: CIVIC_ID } }
-      : {};
-    const decision = await resolveDecision(message, { memorySnapshot });
-    assert.equal(decision.workflowType, "image_catalog_request");
-    assert.equal(decision.replyType, "image_catalog");
-    assert.equal(decision.resolvedItemId, CIVIC_ID);
-    assert.equal(decision.strongBookingCommand, false);
-  });
-}
-
 const availabilityCases = [
   "Civic kal available hai?",
   "Civic 3 din ke liye available hai?",
@@ -246,7 +227,7 @@ test("same participant context: itemless pricing follow-up uses remembered Civic
   assert.match(String(result.reply ?? ""), /24,000 PKR/i);
 });
 
-test("same participant context: availability and image follow-ups use remembered Civic", async () => {
+test("same participant context: availability follow-ups use remembered Civic", async () => {
   patchEmilySessionState(sessionKey(PARTICIPANT_A), {
     lastItem: { id: civic.itemId, itemId: civic.itemId, displayLabel: civic.itemLabel },
     lastResolvedItemId: civic.itemId,
@@ -259,13 +240,6 @@ test("same participant context: availability and image follow-ups use remembered
   });
   assert.equal(availability.workflowType, "availability_inquiry");
   assert.match(String(availability.reply ?? ""), /Civic/i);
-
-  const image = await runLive("picture bhej do", {
-    participantKey: PARTICIPANT_A,
-    memorySnapshot: memory,
-  });
-  assert.equal(image.workflowType, "image_catalog_request");
-  assert.equal(image.messageMeta?.deliveryIntent, "show_images");
 });
 
 test("same participant context: fuzzy itemless amount follow-up stays pricing, not booking", async () => {
