@@ -1232,6 +1232,10 @@ export async function openBubbleMenu(page, bubble, opts = {}) {
   );
   // Locator-only: `bubble` is expected to be a Playwright Locator for `div.message-in`.
   const bubbleLocator = bubble;
+  const directSourceProof =
+    opts?.directSourceProof && typeof opts.directSourceProof === "object"
+      ? opts.directSourceProof
+      : null;
   const readDomBubbleVisibleText = async (outerRow) => {
     if (!outerRow) return "";
     if (typeof outerRow.innerText === "function") {
@@ -1242,9 +1246,113 @@ export async function openBubbleMenu(page, bubble, opts = {}) {
     }
     return "";
   };
+  const verifyDirectSourceProof = async ({ outerRow }) => {
+    if (!directSourceProof) return { ok: false, reason: "DIRECT_SOURCE_PROOF_MISSING" };
+    const current = await outerRow
+      .evaluate((el) => {
+        const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+        return {
+          dataTestid: clean(el?.getAttribute?.("data-testid") || ""),
+          connected: Boolean(el && el.isConnected),
+        };
+      })
+      .catch(() => ({ dataTestid: "", connected: false }));
+    const expectedDataTestid = clean(directSourceProof.resolvedBubbleDataTestid);
+    const currentDataTestid = clean(current?.dataTestid);
+    const valid = Boolean(
+      directSourceProof.strategy === "direct_conv_msg" &&
+        clean(directSourceProof.sourceMessageIdMatched) &&
+        directSourceProof.sourceTextMatched === true &&
+        directSourceProof.participantMetadataMatched === true &&
+        directSourceProof.incomingDirectionConfirmed === true &&
+        directSourceProof.unambiguous === true &&
+        directSourceProof.fallbackUsed === false &&
+        expectedDataTestid &&
+        currentDataTestid &&
+        currentDataTestid === expectedDataTestid &&
+        current?.connected === true
+    );
+    console.log("[reply_privately_direct_source_proof_verification]", {
+      bookingId: bookingId || null,
+      valid,
+      strategy: clean(directSourceProof.strategy) || null,
+      sourceMessageIdMatched: clean(directSourceProof.sourceMessageIdMatched) || null,
+      sourceTextMatched: directSourceProof.sourceTextMatched === true,
+      exactTextMatched: directSourceProof.exactTextMatched === true,
+      strippedTextMatched: directSourceProof.strippedTextMatched === true,
+      participantMetadataMatched: directSourceProof.participantMetadataMatched === true,
+      incomingDirectionConfirmed: directSourceProof.incomingDirectionConfirmed === true,
+      unambiguous: directSourceProof.unambiguous === true,
+      fallbackUsed: directSourceProof.fallbackUsed === true,
+      expectedDataTestid: expectedDataTestid || null,
+      currentDataTestid: currentDataTestid || null,
+    });
+    return valid
+      ? { ok: true, reason: "DIRECT_CONV_MSG_SOURCE_PROOF" }
+      : { ok: false, reason: "DIRECT_SOURCE_PROOF_INVALID" };
+  };
   const verifyDomBubbleMatchesExpected = async ({ outerRow }) => {
     if (!expectedSourceMessage || typeof expectedSourceMessage !== "object") {
       return { ok: true, reason: "NO_EXPECTED_SOURCE" };
+    }
+    if (directSourceProof) {
+      const direct = await verifyDirectSourceProof({ outerRow });
+      if (direct.ok) {
+        console.log("[reply_privately_source_bubble_verification]", {
+          bookingId: bookingId || null,
+          sourceBubbleVerificationNeedle:
+            normalizeText(sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle).slice(0, 120) || null,
+          sourceBubbleVerificationNeedleType:
+            sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType || null,
+          sourceBubbleVerificationUsedMessageId: clean(
+            expectedSourceMessage.sourceMessageId ??
+              expectedSourceMessage.messageId ??
+              expectedSourceMessage.sourceRowKey ??
+              ""
+          ) || null,
+          sourceBubbleVerificationUsedParticipant:
+            clean(
+              expectedSourceMessage.sourceParticipantName ??
+                expectedSourceMessage.participantName ??
+                expectedSourceMessage.sourceParticipantDisplayName ??
+                expectedSourceMessage.participantDisplayName ??
+                ""
+            ) || null,
+          sourceBubbleVerificationPassed: true,
+          sourceBubbleVerificationFailureReason: null,
+          sourceBubbleVerificationBy: "direct_conv_msg_proof",
+        });
+        console.log("[reply_privately_bubble_text_verification_passed]", {
+          bookingId: bookingId || null,
+          verificationBy: "direct_conv_msg_proof",
+        });
+        return direct;
+      }
+      console.log("[reply_privately_source_bubble_verification]", {
+        bookingId: bookingId || null,
+        sourceBubbleVerificationNeedle:
+          normalizeText(sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle).slice(0, 120) || null,
+        sourceBubbleVerificationNeedleType:
+          sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType || null,
+        sourceBubbleVerificationUsedMessageId: clean(
+          expectedSourceMessage.sourceMessageId ??
+            expectedSourceMessage.messageId ??
+            expectedSourceMessage.sourceRowKey ??
+            ""
+        ) || null,
+        sourceBubbleVerificationUsedParticipant:
+          clean(
+            expectedSourceMessage.sourceParticipantName ??
+              expectedSourceMessage.participantName ??
+              expectedSourceMessage.sourceParticipantDisplayName ??
+              expectedSourceMessage.participantDisplayName ??
+              ""
+          ) || null,
+        sourceBubbleVerificationPassed: false,
+        sourceBubbleVerificationFailureReason: direct.reason,
+        sourceBubbleVerificationBy: "direct_conv_msg_proof",
+      });
+      return direct;
     }
     const visibleText = normalizeText(await readDomBubbleVisibleText(outerRow));
     if (!visibleText) return { ok: false, reason: "DOM_TEXT_UNAVAILABLE" };
@@ -3982,12 +4090,34 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
         evaluated.finalClickableResolvedToMessageIn === true;
       if (directConvMsgIdentityConfirmed) {
         directConvMsgPassedToOpenBubbleMenu = true;
+        const directSourceProof = {
+          strategy: "direct_conv_msg",
+          sourceMessageIdMatched: evaluated.idMatched || sourceMessageId,
+          sourceTextMatched:
+            evaluated.exactTextMatched === true || evaluated.strippedTextMatched === true,
+          exactTextMatched: evaluated.exactTextMatched === true,
+          strippedTextMatched: evaluated.strippedTextMatched === true,
+          participantMetadataMatched: evaluated.participantMetadataMatched === true,
+          incomingDirectionConfirmed:
+            evaluated.resolvedBubbleDirection === "in" &&
+            evaluated.resolvedBubbleHasMessageIn === true &&
+            evaluated.resolvedBubbleHasMessageOut !== true &&
+            evaluated.finalClickableResolvedToMessageIn === true,
+          unambiguous:
+            scopedCount <= 1 &&
+            globalCount <= 1 &&
+            (scopedCount === 1 || globalCount === 1) &&
+            !directConvMsgAmbiguityReason,
+          fallbackUsed: false,
+          resolvedBubbleDataTestid: evaluated.resolvedBubbleDataTestid || evaluated.dataTestid || "",
+        };
         return {
           ok: true,
           selected: evaluated,
           reason: "sourceMessageId",
           locator: candidateLocator,
           direct: true,
+          directSourceProof,
           sourceBubbleTextNeedle:
             evaluated.sourceBubbleTextNeedle || sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle,
           sourceBubbleTextNeedleType:
@@ -4402,6 +4532,12 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
         ok: true,
         reason: directSelection.reason,
         locator: locatorForSelectedCandidate(directSelection.selected),
+        directSourceProof: directSelection.directSourceProof || null,
+        sourceBubbleTextNeedle:
+          directSelection.sourceBubbleTextNeedle || sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle,
+        sourceBubbleTextNeedleType:
+          directSelection.sourceBubbleTextNeedleType ||
+          sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType,
       };
     }
     if (
@@ -4793,6 +4929,9 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           expectedGroupTitle,
           bookingId,
           sourceMessage: sourceMessageForMenu,
+          ...(located.directSourceProof
+            ? { directSourceProof: located.directSourceProof }
+            : {}),
         });
         if (!menuOpened.ok) {
           lastReason = menuOpened.reason || "MENU_OPEN_FAILED";
@@ -4891,77 +5030,6 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
           retryable,
           dmChatTitle,
           dmPlaywrightChatKey,
-        });
-      }
-
-      const contactPhoneDryRun = dmContactPhoneExtractionDryRunEnabled();
-      // Dry-run only: inspect contact info reliability without storing or affecting send.
-      if (contactPhoneDryRun) {
-        await runDmContactPhoneExtractionDryRun(page, {
-          businessId: resolveOwnerUid(),
-          bookingId,
-          expectedDmChatKey: dmPlaywrightChatKey,
-          expectedDmTitle: dmChatTitle,
-        }).catch((err) => {
-          console.log("[dm_contact_phone_dry_run_failed_safe]", safeDmContactLogContext({
-            businessId: resolveOwnerUid(),
-            bookingId,
-            expectedDmChatKey: dmPlaywrightChatKey,
-            expectedDmTitle: dmChatTitle,
-          }, {
-            skippedReason: String(err?.message ?? err ?? "DRY_RUN_FAILED"),
-            selectedConfidence: "none",
-            wouldStore: false,
-          }));
-        });
-      } else if (shouldRunLegacyContactPhonePersistence({ dryRun: contactPhoneDryRun })) {
-        // Preserve existing production behavior: best-effort contact extraction + booking patch.
-        // This is intentionally skipped only in explicit dry-run mode.
-        try {
-          const ownerUid = resolveOwnerUid();
-          if (ownerUid && bookingId) {
-            console.log("[reply_privately_contact_extraction_started]", {
-              bookingId: bookingId || null,
-            });
-            const phone = await extractActiveDmContactPhone(page).catch(() => null);
-            if (!phone) {
-              console.log("[reply_privately_contact_extraction_failed]", {
-                bookingId: bookingId || null,
-                reason: "NO_PHONE_EXTRACTED",
-              });
-            } else {
-              console.log("[reply_privately_contact_extracted]", {
-                bookingId: bookingId || null,
-                phone,
-              });
-              const ref = db
-                .collection("businesses")
-                .doc(ownerUid)
-                .collection("bookings")
-                .doc(bookingId);
-              const snap = await ref.get().catch(() => null);
-              const data = snap?.exists ? snap.data() || {} : {};
-              const patch = buildLegacyBookingContactPhonePatch(data, phone);
-              const keys = Object.keys(patch).filter((k) => k !== "updatedAt");
-              if (keys.length > 0) {
-                await ref.update(patch).catch(() => null);
-                console.log("[reply_privately_contact_persisted]", {
-                  bookingId: bookingId || null,
-                  phone,
-                });
-              }
-            }
-          }
-        } catch (err) {
-          console.log("[reply_privately_contact_extraction_failed]", {
-            bookingId: bookingId || null,
-            reason: String(err?.message ?? err ?? "CONTACT_EXTRACTION_FAILED"),
-          });
-        }
-      } else if (dmContactPhoneExtractionEnabled()) {
-        console.log("[reply_privately_contact_extraction_failed]", {
-          bookingId: bookingId || null,
-          reason: "CONTACT_EXTRACTION_DISABLED",
         });
       }
 
@@ -5075,6 +5143,76 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         });
       }
       verificationPassed = true;
+      const contactPhoneDryRun = dmContactPhoneExtractionDryRunEnabled();
+      // Contact inspection mutates the WhatsApp UI, so it must never run before send verification.
+      if (contactPhoneDryRun) {
+        await runDmContactPhoneExtractionDryRun(page, {
+          businessId: resolveOwnerUid(),
+          bookingId,
+          expectedDmChatKey: dmPlaywrightChatKey,
+          expectedDmTitle: dmChatTitle,
+        }).catch((err) => {
+          console.log("[dm_contact_phone_dry_run_failed_safe]", safeDmContactLogContext({
+            businessId: resolveOwnerUid(),
+            bookingId,
+            expectedDmChatKey: dmPlaywrightChatKey,
+            expectedDmTitle: dmChatTitle,
+          }, {
+            skippedReason: String(err?.message ?? err ?? "DRY_RUN_FAILED"),
+            selectedConfidence: "none",
+            wouldStore: false,
+          }));
+        });
+      } else if (shouldRunLegacyContactPhonePersistence({ dryRun: contactPhoneDryRun })) {
+        // Preserve existing production behavior: best-effort contact extraction + booking patch.
+        // This is intentionally skipped only in explicit dry-run mode.
+        try {
+          const ownerUid = resolveOwnerUid();
+          if (ownerUid && bookingId) {
+            console.log("[reply_privately_contact_extraction_started]", {
+              bookingId: bookingId || null,
+            });
+            const phone = await extractActiveDmContactPhone(page).catch(() => null);
+            if (!phone) {
+              console.log("[reply_privately_contact_extraction_failed]", {
+                bookingId: bookingId || null,
+                reason: "NO_PHONE_EXTRACTED",
+              });
+            } else {
+              console.log("[reply_privately_contact_extracted]", {
+                bookingId: bookingId || null,
+                phone,
+              });
+              const ref = db
+                .collection("businesses")
+                .doc(ownerUid)
+                .collection("bookings")
+                .doc(bookingId);
+              const snap = await ref.get().catch(() => null);
+              const data = snap?.exists ? snap.data() || {} : {};
+              const patch = buildLegacyBookingContactPhonePatch(data, phone);
+              const keys = Object.keys(patch).filter((k) => k !== "updatedAt");
+              if (keys.length > 0) {
+                await ref.update(patch).catch(() => null);
+                console.log("[reply_privately_contact_persisted]", {
+                  bookingId: bookingId || null,
+                  phone,
+                });
+              }
+            }
+          }
+        } catch (err) {
+          console.log("[reply_privately_contact_extraction_failed]", {
+            bookingId: bookingId || null,
+            reason: String(err?.message ?? err ?? "CONTACT_EXTRACTION_FAILED"),
+          });
+        }
+      } else if (dmContactPhoneExtractionEnabled()) {
+        console.log("[reply_privately_contact_extraction_failed]", {
+          bookingId: bookingId || null,
+          reason: "CONTACT_EXTRACTION_DISABLED",
+        });
+      }
       console.log("[reply_privately_dm_message_sent]", {
         dmChatTitle,
         dmPlaywrightChatKey,
