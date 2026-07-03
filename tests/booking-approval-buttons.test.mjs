@@ -2003,6 +2003,15 @@ test("approval leaves Playwright group continuation pending for local poller", a
           senderScope: "sender-1",
           playwrightChatKey: "Rental Leads",
           sourceText: "4 din",
+          sourceIdentity: {
+            participantName: "Adeel malik",
+            participantDisplayName: "Adeel malik",
+            participantKey: "scope::abc",
+            sourceMessageId: "wa::msg-approval",
+            sourceRowKey: "row::approval#4",
+            sourceMessageIndex: 4,
+            sourceTextPreview: "Toyota Corolla kal ke liye 1 din book karni hai",
+          },
         },
       },
     });
@@ -2066,6 +2075,18 @@ test("approval leaves Playwright group continuation pending for local poller", a
       "pending"
     );
     assert.equal(store.businesses.owner1.bookings["book-rp-1"].data.canDmCustomer, true);
+    assert.equal(
+      store.businesses.owner1.bookings["book-rp-1"].data.sourceIdentity.participantName,
+      "Adeel malik"
+    );
+    assert.equal(
+      store.businesses.owner1.bookings["book-rp-1"].data.sourceIdentity.participantKey,
+      "scope::abc"
+    );
+    assert.equal(
+      store.businesses.owner1.bookings["book-rp-1"].data.sourceIdentity.sourceMessageIndex,
+      4
+    );
     assert.equal(
       store.businesses.owner1.bookings["book-rp-1"].data.approvalCustomerNotificationMethod,
       undefined

@@ -1065,7 +1065,9 @@ export async function executeWhatsAppAiPipeline(p) {
     userPhone,
     participantPhoneForDm: participantPhoneForDmRaw,
     participantName: participantNameRaw,
+    participantDisplayName: participantDisplayNameRaw,
     participantKey: participantKeyRaw,
+    sourceParticipantKey: sourceParticipantKeyRaw,
     senderScope: senderScopeRaw,
     sessionKey: sessionKeyRaw,
     source: sourceRaw,
@@ -1565,6 +1567,30 @@ export async function executeWhatsAppAiPipeline(p) {
     String(groupNameResolved ?? "").trim() ||
     String(sessionKey ?? "").trim() ||
     null;
+  const normalizedParticipantName =
+    participantNameRaw != null && String(participantNameRaw).trim() !== ""
+      ? String(participantNameRaw).trim()
+      : null;
+  const normalizedParticipantDisplayName =
+    participantDisplayNameRaw != null && String(participantDisplayNameRaw).trim() !== ""
+      ? String(participantDisplayNameRaw).trim()
+      : normalizedParticipantName;
+  const normalizedParticipantKey =
+    participantKeyRaw != null && String(participantKeyRaw).trim() !== ""
+      ? String(participantKeyRaw).trim()
+      : null;
+  const normalizedSourceParticipantKey =
+    sourceParticipantKeyRaw != null && String(sourceParticipantKeyRaw).trim() !== ""
+      ? String(sourceParticipantKeyRaw).trim()
+      : normalizedParticipantKey;
+  const normalizedSenderScope =
+    senderScopeRaw != null && String(senderScopeRaw).trim() !== ""
+      ? String(senderScopeRaw).trim()
+      : null;
+  const normalizedSourceMessageIndex =
+    sourceMessageIndexRaw != null && Number.isFinite(Number(sourceMessageIndexRaw))
+      ? Number(sourceMessageIndexRaw)
+      : null;
 
   const routeGate = evaluateBrainRouteGate({
     businessId: ownerUserId,
@@ -1599,7 +1625,14 @@ export async function executeWhatsAppAiPipeline(p) {
       String(groupNameResolved ?? "").trim() ||
       sessionKey,
     sessionKey: normalizedInbound.sessionKey,
-    participantKey: participantKeyRaw,
+    participantKey: normalizedParticipantKey,
+    sourceParticipantKey: normalizedSourceParticipantKey,
+    participantName: normalizedParticipantName,
+    participantDisplayName: normalizedParticipantDisplayName,
+    sourceParticipantName: normalizedParticipantName,
+    sourceParticipantDisplayName: normalizedParticipantDisplayName,
+    senderScope: normalizedSenderScope,
+    sourceSenderScope: normalizedSenderScope,
     participantPhoneForDm:
       String(participantPhoneForDmRaw ?? "").trim() || null,
     playwrightChatKey: playwrightChatKeyRaw,
@@ -1611,6 +1644,7 @@ export async function executeWhatsAppAiPipeline(p) {
     memorySnapshot: shadowPreTurnMemorySnapshot,
     conversationHistory,
     sourceRowKey: sourceRowKeyRaw,
+    sourceMessageIndex: normalizedSourceMessageIndex,
     guaranteeKey: buildPlaywrightGuaranteeKey(groupNameResolved, messageIdRaw),
     groupName: groupNameResolved || null,
     whatsappRecipientType,
@@ -1620,9 +1654,19 @@ export async function executeWhatsAppAiPipeline(p) {
       userId: ownerUserId,
       db,
       sessionKey: normalizedInbound.sessionKey,
-      participantKey: participantKeyRaw,
+      participantKey: normalizedParticipantKey,
+      sourceParticipantKey: normalizedSourceParticipantKey,
+      participantName: normalizedParticipantName,
+      participantDisplayName: normalizedParticipantDisplayName,
+      sourceParticipantName: normalizedParticipantName,
+      sourceParticipantDisplayName: normalizedParticipantDisplayName,
+      senderScope: normalizedSenderScope,
+      sourceSenderScope: normalizedSenderScope,
       participantPhoneForDm:
         String(participantPhoneForDmRaw ?? "").trim() || null,
+      sourceMessageIndex: normalizedSourceMessageIndex,
+      sourceRowKey: sourceRowKeyRaw,
+      messageId: normalizedInbound.messageId,
       sendCredentials,
     },
   };

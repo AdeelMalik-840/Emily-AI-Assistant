@@ -149,6 +149,78 @@ test("failed booking below retry limit and backoff passed is retried", async () 
   assert.equal(calls, 1);
 });
 
+test("invalid Playwright group candidate remains fail-closed before Reply Privately", async () => {
+  const { db } = createFakeDb({
+    bookings: [
+      {
+        id: "invalid_missing_participant",
+        data: baseApprovedBooking({
+          playwrightReplyPrivateEligible: false,
+          approvalCustomerNotificationStatus: "pending",
+          sourceIdentity: {
+            sourceRowKey: "row::abc#1",
+            sourceMessageId: "user::1::1",
+            sourceMessageIndex: 1,
+            sourceTextPreview: "Honda Civic 1 din k lye book karni hai",
+            participantName: null,
+            participantDisplayName: null,
+            participantKey: null,
+          },
+        }),
+      },
+    ],
+  });
+
+  let calls = 0;
+  await pollLocalApprovalContinuations({
+    dbInstance: db,
+    ownerUserId: "owner1",
+    replyPrivately: async () => {
+      calls += 1;
+      return { ok: true, verificationPassed: true };
+    },
+  });
+
+  assert.equal(calls, 0);
+});
+
+test("eligible Playwright group candidate missing participant metadata is excluded by deep validation", async () => {
+  const { db } = createFakeDb({
+    bookings: [
+      {
+        id: "invalid_deep_missing_participant",
+        data: baseApprovedBooking({
+          playwrightReplyPrivateEligible: true,
+          approvalCustomerNotificationStatus: "pending",
+          sourceRowKey: "row::abc#1",
+          sourceMessageId: "user::1::1",
+          sourceIdentity: {
+            sourceRowKey: "row::abc#1",
+            sourceMessageId: "user::1::1",
+            sourceMessageIndex: 1,
+            sourceTextPreview: "Honda Civic 1 din k lye book karni hai",
+            participantName: null,
+            participantDisplayName: null,
+            participantKey: null,
+          },
+        }),
+      },
+    ],
+  });
+
+  let calls = 0;
+  await pollLocalApprovalContinuations({
+    dbInstance: db,
+    ownerUserId: "owner1",
+    replyPrivately: async () => {
+      calls += 1;
+      return { ok: true, verificationPassed: true };
+    },
+  });
+
+  assert.equal(calls, 0);
+});
+
 test("failed booking too recent is skipped due to backoff", async () => {
   const now = Date.now();
   const { db } = createFakeDb({

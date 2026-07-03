@@ -189,16 +189,17 @@ async function buildPlaywrightSchedulePayload(adapted) {
     senderScope: senderScope ? String(senderScope).trim() : "",
   });
   const participantPhoneForDm = participantIdentity.participantPhone || "";
+  const identityParticipantKey = String(participantIdentity.participantKey ?? "").trim();
   // Group follow-ups rely on participant-scoped memory. An unresolved identity
   // must not inherit name-based or group-wide memory.
-  const participantKey = senderScope ? `scope::${senderScope}` : "";
+  const participantKey = senderScope ? `scope::${senderScope}` : identityParticipantKey;
   if (participantKey) {
     console.log("[participant_identity_stable_key_selected]", {
       groupChatKey: String(normalizedGroupChatKey ?? "").trim() || null,
       participantName: participantIdentity.participantName || senderName || null,
       participantKey: String(participantKey).slice(0, 64),
       participantPhonePresent: Boolean(participantPhoneForDm),
-      keySource: senderScope ? "senderScope" : "fallback",
+      keySource: senderScope ? "senderScope" : "participantIdentity",
     });
   }
 
@@ -223,7 +224,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
       messageId: adapted?.messageId ?? null,
       reason: "MISSING_STABLE_SENDER_ANCHOR_OR_PHONE",
     });
-  } else if (!participantIdentity.participantKey) {
+  } else if (!identityParticipantKey) {
     console.log("[participant_identity_fallback_key_used]", {
       groupChatKey: playwrightChatKey || null,
       participantName: senderName || null,
@@ -274,7 +275,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
     .slice(0, 24)}`;
   const hadPhoneLookingSenderName = looksLikePhoneLabel(senderName);
   const safeText = String(adapted?.text ?? "").trim();
-  const line = hadPhoneLookingSenderName ? safeText : `[${senderName}] ${safeText}`.trim();
+  const line = safeText;
   if (hadPhoneLookingSenderName) {
     console.log("[group_sender_phone_label_stripped]", {
       groupChatKey: playwrightChatKey || null,
@@ -308,8 +309,11 @@ async function buildPlaywrightSchedulePayload(adapted) {
       ownerUserId,
       userPhone: "unknown",
       participantName: participantIdentity.participantName || senderName,
+      participantDisplayName: participantIdentity.participantName || senderName,
       participantKey,
+      sourceParticipantKey: participantKey || undefined,
       senderScope,
+      sourceSenderScope: senderScope || undefined,
       ...(participantPhoneForDm
         ? { participantPhoneForDm }
         : {}),

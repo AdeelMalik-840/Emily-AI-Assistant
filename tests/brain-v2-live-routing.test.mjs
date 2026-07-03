@@ -389,4 +389,8 @@ test("pipeline source guards processMessage when v2 live handled", () => {
   const source = executeWhatsAppAiPipeline.toString();
   assert.ok(source.includes("handledByBrainV2Live"));
   assert.ok(source.includes("v2LiveEligible"));
+  assert.ok(source.includes("participantName: normalizedParticipantName"));
+  assert.ok(source.includes("sourceParticipantDisplayName: normalizedParticipantDisplayName"));
+  assert.ok(source.includes("sourceParticipantKey: normalizedSourceParticipantKey"));
+  assert.ok(source.includes("sourceMessageIndex: normalizedSourceMessageIndex"));
 });

@@ -59,6 +59,25 @@ test("same stable sender anchor keeps one final session across display-name chan
   assert.match(first.participantKey, /^scope::/);
 });
 
+test("group participant label stays metadata and does not pollute customer text", async () => {
+  const payload = await captureGroupPayload({
+    text: "Honda Civic 1 din k lye book karni hai",
+    senderName: "Adeel malik",
+    messageId: "clean-text-1",
+    sourceRowKey: "row-clean-text-1",
+    sourceMessageIndex: 7,
+  });
+
+  assert.equal(payload.text, "Honda Civic 1 din k lye book karni hai");
+  assert.doesNotMatch(payload.text, /^\[Adeel malik\]/);
+  assert.equal(payload.participantName, "Adeel malik");
+  assert.equal(payload.participantDisplayName, "Adeel malik");
+  assert.equal(payload.sourceParticipantKey, payload.participantKey);
+  assert.equal(payload.sourceMessageIndex, 7);
+  assert.equal(payload.sourceRowKey, "row-clean-text-1");
+  assert.equal(payload.messageId, "clean-text-1");
+});
+
 test("different group participants never share final participant memory", async () => {
   const userA = await captureGroupPayload({
     messageId: "different-a",
@@ -75,7 +94,7 @@ test("different group participants never share final participant memory", async 
   assert.notEqual(userA.conversationCustomerNumber, userB.conversationCustomerNumber);
 });
 
-test("missing stable sender anchor fails closed without group-wide reusable memory", async () => {
+test("missing sender scope preserves extracted participant identity without group-wide fallback", async () => {
   const first = await captureGroupPayload({
     messageId: "unresolved-1",
     sourceRowKey: "unresolved-row-1",
@@ -92,11 +111,12 @@ test("missing stable sender anchor fails closed without group-wide reusable memo
     senderName: "Adeel Malik",
   });
 
-  assert.equal(first.participantKey, "");
-  assert.equal(second.participantKey, "");
-  assert.match(first.sessionKey, /::participant::unresolved::/);
+  assert.equal(first.participantKey, "adeel::first-seen-1");
+  assert.equal(second.participantKey, "adeel-malik::first-seen-2");
+  assert.equal(first.sourceParticipantKey, "adeel::first-seen-1");
+  assert.equal(second.sourceParticipantKey, "adeel-malik::first-seen-2");
   assert.notEqual(first.sessionKey, second.sessionKey);
-  assert.notEqual(first.conversationCustomerNumber, second.conversationCustomerNumber);
+  assert.equal(first.conversationCustomerNumber, second.conversationCustomerNumber);
 });
 
 test("Civic availability then 10-day price retains Civic across display-name variation", async () => {
