@@ -146,6 +146,8 @@ function createFakeBubbleLocator({
   participantName,
   text,
   messageId = "",
+  dataTestid = "",
+  visibleText = null,
   menuVisibleRef,
   menuButtonClicksRef,
   connected = true,
@@ -196,10 +198,16 @@ function createFakeBubbleLocator({
       return;
     },
     async evaluate(fn, arg) {
+      const visible = visibleText == null ? `${participantName} ${text}`.trim() : String(visibleText);
       const row = {
         isConnected: connected,
-        innerText: `${participantName} ${text}`.trim(),
-        getAttribute: (k) => (k === "data-id" ? messageId : ""),
+        innerText: visible,
+        textContent: visible,
+        getAttribute: (k) => {
+          if (k === "data-id") return messageId;
+          if (k === "data-testid") return dataTestid;
+          return "";
+        },
         querySelector: (sel) => {
           if (sel === "div.copyable-text") {
             return {
@@ -2724,6 +2732,262 @@ test("Reply Privately bubble verification fails closed on wrong stripped source 
     })
   );
 
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(menuButtonClicksRef.count, 0);
+});
+
+function strictDirectProof(overrides = {}) {
+  return {
+    strategy: "direct_conv_msg",
+    sourceMessageIdMatched: "3EB0ABCDEF1234567890AA",
+    sourceTextMatched: true,
+    exactTextMatched: true,
+    strippedTextMatched: false,
+    participantMetadataMatched: true,
+    incomingDirectionConfirmed: true,
+    unambiguous: true,
+    fallbackUsed: false,
+    resolvedBubbleDataTestid: "conv-msg-3EB0ABCDEF1234567890AA",
+    ...overrides,
+  };
+}
+
+function replyPrivateMenuPage({ menuVisibleRef }) {
+  return {
+    waitForTimeout: async () => undefined,
+    waitForSelector: async (selector) =>
+      selector === '[role="menu"]' && menuVisibleRef.value ? {} : null,
+    getByText: () => ({
+      isVisible: async () => menuVisibleRef.value,
+      click: async () => {
+        menuVisibleRef.value = false;
+      },
+    }),
+    keyboard: { press: async () => undefined },
+    mouse: {
+      move: async () => undefined,
+      click: async () => assert.fail("mouse.click should not be used"),
+    },
+    locator: () => ({
+      filter: () => ({
+        first: () => ({
+          isVisible: async () => menuVisibleRef.value,
+        }),
+      }),
+    }),
+  };
+}
+
+test("Reply Privately strict direct conv-msg proof passes when wrapper innerText is incomplete", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Adeel malik",
+    text: "Kia Stonic 1 din k lye book karni hai TEST-FINAL-REJECT-1",
+    dataTestid: "conv-msg-3EB0ABCDEF1234567890AA",
+    visibleText: "click here for contact info",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+
+  const { result, logs } = await captureConsole(() =>
+    openBubbleMenu(replyPrivateMenuPage({ menuVisibleRef }), bubbleLocator, {
+      bookingId: "book-direct-proof-reject",
+      sourceMessage: {
+        sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+        sourceText: "Kia Stonic 1 din k lye book karni hai TEST-FINAL-REJECT-1",
+        sourceParticipantName: "Adeel malik",
+        sourceParticipantKey: "adeel-malik",
+      },
+      directSourceProof: strictDirectProof(),
+    })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(menuButtonClicksRef.count, 1);
+  assert.ok(
+    logs.some(
+      (entry) =>
+        String(entry[0]).includes("[reply_privately_source_bubble_verification]") &&
+        entry[1]?.sourceBubbleVerificationBy === "direct_conv_msg_proof" &&
+        entry[1]?.sourceBubbleVerificationPassed === true
+    )
+  );
+});
+
+test("Reply Privately direct conv-msg proof requires exact source message id", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Adeel malik",
+    text: "Kia Stonic 1 din k lye book karni hai TEST-FINAL-REJECT-1",
+    dataTestid: "conv-msg-3EB0ABCDEF1234567890AA",
+    visibleText: "click here for contact info",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+  const { result } = await captureConsole(() =>
+    openBubbleMenu(replyPrivateMenuPage({ menuVisibleRef }), bubbleLocator, {
+      bookingId: "book-direct-no-id",
+      sourceMessage: {
+        sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+        sourceText: "Kia Stonic 1 din k lye book karni hai TEST-FINAL-REJECT-1",
+        sourceParticipantName: "Adeel malik",
+      },
+      directSourceProof: strictDirectProof({ sourceMessageIdMatched: "" }),
+    })
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(menuButtonClicksRef.count, 0);
+});
+
+test("Reply Privately direct conv-msg proof requires exact or stripped source text", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Adeel malik",
+    text: "Correct source text",
+    dataTestid: "conv-msg-3EB0ABCDEF1234567890AA",
+    visibleText: "click here for contact info",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+  const { result } = await captureConsole(() =>
+    openBubbleMenu(replyPrivateMenuPage({ menuVisibleRef }), bubbleLocator, {
+      bookingId: "book-direct-no-text",
+      sourceMessage: {
+        sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+        sourceText: "Correct source text",
+        sourceParticipantName: "Adeel malik",
+      },
+      directSourceProof: strictDirectProof({
+        sourceTextMatched: false,
+        exactTextMatched: false,
+        strippedTextMatched: false,
+      }),
+    })
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(menuButtonClicksRef.count, 0);
+});
+
+test("Reply Privately direct conv-msg proof requires participant metadata", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Adeel malik",
+    text: "Correct source text",
+    dataTestid: "conv-msg-3EB0ABCDEF1234567890AA",
+    visibleText: "click here for contact info",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+  const { result } = await captureConsole(() =>
+    openBubbleMenu(replyPrivateMenuPage({ menuVisibleRef }), bubbleLocator, {
+      bookingId: "book-direct-no-participant",
+      sourceMessage: {
+        sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+        sourceText: "Correct source text",
+        sourceParticipantName: "Adeel malik",
+      },
+      directSourceProof: strictDirectProof({ participantMetadataMatched: false }),
+    })
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(menuButtonClicksRef.count, 0);
+});
+
+test("Reply Privately direct conv-msg proof requires unambiguous incoming customer row", async () => {
+  for (const directSourceProof of [
+    strictDirectProof({ unambiguous: false }),
+    strictDirectProof({ incomingDirectionConfirmed: false }),
+    strictDirectProof({ fallbackUsed: true }),
+  ]) {
+    const menuVisibleRef = { value: false };
+    const menuButtonClicksRef = { count: 0 };
+    const bubbleLocator = createFakeBubbleLocator({
+      participantName: "Adeel malik",
+      text: "Correct source text",
+      dataTestid: "conv-msg-3EB0ABCDEF1234567890AA",
+      visibleText: "click here for contact info",
+      menuVisibleRef,
+      menuButtonClicksRef,
+      connected: true,
+    });
+    const { result } = await captureConsole(() =>
+      openBubbleMenu(replyPrivateMenuPage({ menuVisibleRef }), bubbleLocator, {
+        bookingId: "book-direct-unsafe",
+        sourceMessage: {
+          sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+          sourceText: "Correct source text",
+          sourceParticipantName: "Adeel malik",
+        },
+        directSourceProof,
+      })
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+    assert.equal(menuButtonClicksRef.count, 0);
+  }
+});
+
+test("Reply Privately direct conv-msg proof requires the same verified locator root", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Adeel malik",
+    text: "Correct source text",
+    dataTestid: "conv-msg-different",
+    visibleText: "click here for contact info",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+  const { result } = await captureConsole(() =>
+    openBubbleMenu(replyPrivateMenuPage({ menuVisibleRef }), bubbleLocator, {
+      bookingId: "book-direct-wrong-root",
+      sourceMessage: {
+        sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+        sourceText: "Correct source text",
+        sourceParticipantName: "Adeel malik",
+      },
+      directSourceProof: strictDirectProof(),
+    })
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
+  assert.equal(menuButtonClicksRef.count, 0);
+});
+
+test("Reply Privately non-direct locator still requires visible text verification", async () => {
+  const menuVisibleRef = { value: false };
+  const menuButtonClicksRef = { count: 0 };
+  const bubbleLocator = createFakeBubbleLocator({
+    participantName: "Adeel malik",
+    text: "Correct source text",
+    visibleText: "click here for contact info",
+    menuVisibleRef,
+    menuButtonClicksRef,
+    connected: true,
+  });
+  const { result } = await captureConsole(() =>
+    openBubbleMenu(replyPrivateMenuPage({ menuVisibleRef }), bubbleLocator, {
+      bookingId: "book-nondirect-visible-required",
+      sourceMessage: {
+        sourceMessageId: "wa::3EB0ABCDEF1234567890AA",
+        sourceText: "Correct source text",
+        sourceParticipantName: "Adeel malik",
+      },
+    })
+  );
   assert.equal(result.ok, false);
   assert.equal(result.reason, "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED");
   assert.equal(menuButtonClicksRef.count, 0);
