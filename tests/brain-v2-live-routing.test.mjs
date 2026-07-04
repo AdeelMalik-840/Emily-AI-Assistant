@@ -12,6 +12,7 @@ import {
   routeLiveActionPlan,
   assertLiveActionPlanIsSafe,
   executeLiveSideEffects,
+  routeAndExecuteLiveActionPlan,
   isLiveWorkflowType,
 } from "../src/brain/live/actionRouter.js";
 import { buildTurnContextInput } from "../src/brain/live/buildTurnContextInput.js";
@@ -49,6 +50,158 @@ const envBackup = {
   EMILY_BRAIN_V2_DM_EXECUTE: process.env.EMILY_BRAIN_V2_DM_EXECUTE,
   EMILY_BRAIN_V2_INFO_LIVE: process.env.EMILY_BRAIN_V2_INFO_LIVE,
 };
+
+function createFakeBookingDb() {
+  const store = { businesses: {} };
+  let autoId = 0;
+
+  function ensureBusiness(id) {
+    store.businesses[id] ||= { data: {}, bookings: {}, bookingSourceKeys: {} };
+    return store.businesses[id];
+  }
+
+  class DocRef {
+    constructor(path) {
+      this.path = path;
+      this.id = String(path[path.length - 1] ?? "");
+    }
+    collection(name) {
+      return new CollectionRef([...this.path, name]);
+    }
+    async get() {
+      const node = this._node();
+      return { exists: Boolean(node), data: () => ({ ...(node?.data ?? {}) }) };
+    }
+    _node() {
+      let node = store;
+      for (let i = 0; i < this.path.length; i += 2) {
+        const collection = this.path[i];
+        const id = this.path[i + 1];
+        node = node?.[collection]?.[id];
+      }
+      return node ?? null;
+    }
+  }
+
+  class CollectionRef {
+    constructor(path, conditions = [], resultLimit = null) {
+      this.path = path;
+      this.conditions = conditions;
+      this.resultLimit = resultLimit;
+    }
+    doc(id = null) {
+      const nextId = id == null ? `booking-${++autoId}` : String(id);
+      if (this.path.length === 1 && this.path[0] === "businesses") {
+        ensureBusiness(nextId);
+      }
+      return new DocRef([...this.path, nextId]);
+    }
+    where(field, op, value) {
+      return new CollectionRef(
+        this.path,
+        [...this.conditions, { field, op, value }],
+        this.resultLimit
+      );
+    }
+    limit(n) {
+      return new CollectionRef(this.path, this.conditions, n);
+    }
+    async get() {
+      let entries = Object.entries(this._collectionNode() ?? {});
+      for (const condition of this.conditions) {
+        entries = entries.filter(([, node]) => {
+          if (condition.op !== "==") return false;
+          return node?.data?.[condition.field] === condition.value;
+        });
+      }
+      if (this.resultLimit != null) entries = entries.slice(0, this.resultLimit);
+      return {
+        docs: entries.map(([id, node]) => ({
+          id,
+          ref: new DocRef([...this.path, id]),
+          data: () => ({ ...(node?.data ?? {}) }),
+        })),
+      };
+    }
+    _collectionNode() {
+      let node = store;
+      for (let i = 0; i < this.path.length; i += 2) {
+        const collection = this.path[i];
+        if (i === this.path.length - 1) return node?.[collection] ?? null;
+        const id = this.path[i + 1];
+        if (collection === "businesses") ensureBusiness(id);
+        node = node?.[collection]?.[id];
+      }
+      return null;
+    }
+  }
+
+  function setDoc(ref, data) {
+    const [rootCollection, rootId, subCollection, docId] = ref.path;
+    if (rootCollection !== "businesses" || !rootId || !subCollection || !docId) {
+      throw new Error(`unsupported fake path ${ref.path.join("/")}`);
+    }
+    const business = ensureBusiness(rootId);
+    business[subCollection] ||= {};
+    business[subCollection][docId] ||= { data: {} };
+    business[subCollection][docId].data = {
+      ...business[subCollection][docId].data,
+      ...data,
+    };
+  }
+
+  const db = {
+    collection(name) {
+      return new CollectionRef([name]);
+    },
+    async runTransaction(fn) {
+      return fn({
+        get: (refOrQuery) => refOrQuery.get(),
+        set: setDoc,
+        create: setDoc,
+      });
+    },
+  };
+
+  function seedBooking(id, data) {
+    const business = ensureBusiness(BUSINESS_ID);
+    business.bookings[id] = { data: { ...data } };
+  }
+
+  return { db, store, seedBooking };
+}
+
+function seedActiveCorollaBooking(fake) {
+  fake.seedBooking("existing-corolla-booking", {
+    itemId: "corolla-1",
+    itemName: "Toyota Corolla",
+    status: "approved",
+    startAt: new Date(Date.now() - 86400000),
+    endAt: new Date(Date.now() + 86400000 * 5),
+  });
+}
+
+function bookingRequestPlan({ itemId = "corolla-1", itemName = "Toyota Corolla", durationDays = 3 } = {}) {
+  return {
+    workflowType: "booking_request",
+    planId: `booking-${itemId}`,
+    replyDraft: "Theek hai, mai check kr k btata hun.",
+    actions: [
+      {
+        type: "REPLY",
+        payload: { text: "Theek hai, mai check kr k btata hun." },
+      },
+      {
+        type: "CREATE_BOOKING",
+        payload: { execute: true, itemId, itemName, durationDays },
+      },
+      {
+        type: "NOTIFY_OWNER",
+        payload: { execute: true },
+      },
+    ],
+  };
+}
 
 function enableV2LiveForSyntheticBusiness() {
   process.env.EMILY_BRAIN_V2_LIVE = "true";
@@ -373,6 +526,139 @@ test("booking executor validates payload without brain decisions", async () => {
   });
   assert.equal(blocked.ok, false);
   assert.equal(blocked.reason, "MISSING_ITEM_ID");
+});
+
+test("booking executor preserves ITEM_ALREADY_BOOKED from inventory", async () => {
+  const fake = createFakeBookingDb();
+  seedActiveCorollaBooking(fake);
+
+  const result = await executeCreateBooking({
+    payload: {
+      itemId: "corolla-1",
+      itemName: "Toyota Corolla",
+      durationDays: 3,
+    },
+    executionContext: {
+      businessId: BUSINESS_ID,
+      traceId: "item-already-booked-executor",
+      dbOverride: fake.db,
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "ITEM_ALREADY_BOOKED");
+  assert.equal(result.error, "ITEM_ALREADY_BOOKED");
+  assert.equal(result.booking, null);
+  assert.equal(result.itemName, "Toyota Corolla");
+});
+
+test("ITEM_ALREADY_BOOKED returns unavailable reply and skips owner notification", async () => {
+  const fake = createFakeBookingDb();
+  seedActiveCorollaBooking(fake);
+
+  const result = await routeAndExecuteLiveActionPlan(
+    bookingRequestPlan(),
+    { bookingExecute: true, ownerExecute: true, dmExecute: false },
+    {
+      businessId: BUSINESS_ID,
+      traceId: "item-already-booked-router",
+      dbOverride: fake.db,
+      db: fake.db,
+    }
+  );
+
+  assert.equal(result.sideEffectResults.CREATE_BOOKING.ok, false);
+  assert.equal(result.sideEffectResults.CREATE_BOOKING.code, "ITEM_ALREADY_BOOKED");
+  assert.equal(result.sideEffectResults.NOTIFY_OWNER, undefined);
+  assert.equal(result.bookingCreated, null);
+  assert.equal(result.skipRemainingActions, true);
+  assert.match(result.reply, /Toyota Corolla is waqt available nahi hai/i);
+  assert.doesNotMatch(result.reply, /reply nahi bhej pa rahi/i);
+});
+
+test("unexpected live booking failure still uses safe apology", async () => {
+  enableV2LiveForSyntheticBusiness();
+  process.env.EMILY_BRAIN_V2_BOOKING_EXECUTE = "true";
+  process.env.EMILY_BRAIN_V2_OWNER_EXECUTE = "true";
+  const fixture = loadSyntheticCarRentalCatalogFixture();
+  const throwingDb = {
+    collection(name) {
+      return createFakeBookingDb().db.collection(name);
+    },
+    async runTransaction() {
+      throw new Error("DB_DOWN");
+    },
+  };
+
+  const result = await runBrainV2LivePipeline({
+    traceId: "unexpected-booking-failure",
+    businessId: BUSINESS_ID,
+    message: "Toyota Corolla 3 din k lye book krni hai",
+    catalogItems: fixture.items,
+    isGroupInbound: true,
+    chatType: "group",
+    executionContext: { dbOverride: throwingDb, db: throwingDb },
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
+    __testOrchestratorFn: () => ({
+      workflowDecision: { workflowType: "booking_request" },
+      actionPlan: bookingRequestPlan(),
+      trace: { test: true },
+    }),
+  });
+
+  assert.equal(result.handled, true);
+  assert.equal(result.workflowType, "error_apology");
+  assert.equal(
+    result.reply,
+    "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please."
+  );
+});
+
+test("successful booking still produces real booking for owner notification dependency", async () => {
+  const fake = createFakeBookingDb();
+
+  const result = await routeAndExecuteLiveActionPlan(
+    {
+      ...bookingRequestPlan({
+        itemId: "civic-1",
+        itemName: "Honda Civic",
+        durationDays: 1,
+      }),
+      actions: [
+        {
+          type: "REPLY",
+          payload: { text: "Theek hai, mai check kr k btata hun." },
+        },
+        {
+          type: "CREATE_BOOKING",
+          payload: {
+            execute: true,
+            itemId: "civic-1",
+            itemName: "Honda Civic",
+            durationDays: 1,
+          },
+        },
+        {
+          type: "NOTIFY_OWNER",
+          payload: { execute: false },
+        },
+      ],
+    },
+    { bookingExecute: true, ownerExecute: true, dmExecute: false },
+    {
+      businessId: BUSINESS_ID,
+      traceId: "successful-booking-router",
+      dbOverride: fake.db,
+      db: fake.db,
+    }
+  );
+
+  assert.equal(result.sideEffectResults.CREATE_BOOKING.ok, true);
+  assert.ok(result.bookingCreated?.id);
+  assert.equal(result.bookingCreated.itemName, "Honda Civic");
+  assert.equal(result.sideEffectResults.NOTIFY_OWNER, undefined);
+  assert.equal(result.skipRemainingActions, false);
 });
 
 test("owner executor blocked without booking context", async () => {

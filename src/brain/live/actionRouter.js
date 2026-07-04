@@ -205,6 +205,37 @@ function suppressFailedBookingConfirmation(reply) {
   return text;
 }
 
+/**
+ * @param {Record<string, unknown> | null | undefined} result
+ */
+function bookingResultCode(result) {
+  return String(result?.code ?? result?.error ?? result?.reason ?? "").trim();
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} result
+ */
+function isItemAlreadyBookedResult(result) {
+  return bookingResultCode(result) === "ITEM_ALREADY_BOOKED";
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} payload
+ * @param {Record<string, unknown> | null | undefined} executionContext
+ * @param {Record<string, unknown> | null | undefined} result
+ */
+function buildItemAlreadyBookedReply(payload, executionContext, result) {
+  const itemName =
+    String(
+      result?.itemName ??
+        payload?.itemName ??
+        payload?.itemLabel ??
+        executionContext?.itemName ??
+        ""
+    ).trim() || "Ye car";
+  return `Sorry, ${itemName} is waqt available nahi hai. Aap Civic, Stonic ya koi aur car dekhna chahenge?`;
+}
+
 /** @deprecated use routeLiveActionPlan */
 export function routeInfoLiveActionPlan(actionPlan, flags) {
   return routeLiveActionPlan(actionPlan, flags);
@@ -222,7 +253,7 @@ export function assertInfoLiveActionPlanIsSafe(actionPlan, flags) {
  *   flags: LiveFlags | Record<string, unknown>,
  *   executionContext?: Record<string, unknown>,
  * }} p
- * @returns {Promise<{ sideEffectResults: Record<string, unknown>, bookingCreated?: Record<string, unknown> | null }>}
+ * @returns {Promise<{ sideEffectResults: Record<string, unknown>, bookingCreated?: Record<string, unknown> | null, customerReplyOverride?: string | null, skipRemainingActions?: boolean }>}
  */
 export async function executeLiveSideEffects(p) {
   const plan = p.actionPlan && typeof p.actionPlan === "object" ? p.actionPlan : null;
@@ -230,8 +261,11 @@ export async function executeLiveSideEffects(p) {
   const sideEffectResults = {};
   /** @type {Record<string, unknown> | null} */
   let bookingCreated = null;
+  let customerReplyOverride = null;
+  let skipRemainingActions = false;
 
   for (const item of rawActions) {
+    if (skipRemainingActions) break;
     const type = String(item?.type ?? "").trim();
     const payload =
       item?.payload && typeof item.payload === "object" ? item.payload : {};
@@ -246,7 +280,24 @@ export async function executeLiveSideEffects(p) {
         executionContext: p.executionContext,
       });
       sideEffectResults.CREATE_BOOKING = result;
-      if (result?.booking) bookingCreated = /** @type {Record<string, unknown>} */ (result.booking);
+      if (isItemAlreadyBookedResult(/** @type {Record<string, unknown>} */ (result))) {
+        customerReplyOverride = buildItemAlreadyBookedReply(
+          payload,
+          p.executionContext,
+          /** @type {Record<string, unknown>} */ (result)
+        );
+        sideEffectResults.CREATE_BOOKING = {
+          ...result,
+          customerReplyOverride,
+          skipRemainingActions: true,
+        };
+        skipRemainingActions = true;
+        continue;
+      }
+      if (result?.ok === false) {
+        throw new Error(`live_create_booking_failed:${bookingResultCode(result) || "UNKNOWN"}`);
+      }
+      if (result?.booking?.id) bookingCreated = /** @type {Record<string, unknown>} */ (result.booking);
     } else if (type === "AVAILABILITY_OWNER_CHECK_REQUIRED") {
       const availabilityCheckResult = await executeAvailabilityOwnerCheck({
         payload,
@@ -324,7 +375,7 @@ export async function executeLiveSideEffects(p) {
     }
   }
 
-  return { sideEffectResults, bookingCreated };
+  return { sideEffectResults, bookingCreated, customerReplyOverride, skipRemainingActions };
 }
 
 /**
@@ -360,7 +411,7 @@ export function isLiveWorkflowType(workflowType) {
  */
 export async function routeAndExecuteLiveActionPlan(actionPlan, flags, executionContext = {}) {
   const routed = assertLiveActionPlanIsSafe(actionPlan, flags);
-  const { sideEffectResults, bookingCreated } = await executeLiveSideEffects({
+  const { sideEffectResults, bookingCreated, customerReplyOverride, skipRemainingActions } = await executeLiveSideEffects({
     actionPlan,
     routed,
     flags,
@@ -368,7 +419,10 @@ export async function routeAndExecuteLiveActionPlan(actionPlan, flags, execution
   });
   return {
     ...routed,
+    reply: String(customerReplyOverride ?? "").trim() || routed.reply,
     sideEffectResults,
     bookingCreated,
+    customerReplyOverride,
+    skipRemainingActions,
   };
 }

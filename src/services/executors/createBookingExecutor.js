@@ -9,7 +9,7 @@ import { createBooking } from "../inventoryService.js";
  *   payload: Record<string, unknown>,
  *   executionContext?: Record<string, unknown>,
  * }} params
- * @returns {Promise<{ ok: boolean, blocked?: boolean, reason?: string, booking?: Record<string, unknown> | null }>}
+ * @returns {Promise<{ ok: boolean, blocked?: boolean, reason?: string, error?: string, code?: string, booking?: Record<string, unknown> | null, itemName?: string }>}
  */
 export async function executeCreateBooking({ payload, executionContext = {} }) {
   const itemId = String(payload?.itemId ?? "").trim();
@@ -28,11 +28,12 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
   }
 
   try {
+    const requestedItemName =
+      String(payload?.itemName ?? payload?.itemLabel ?? executionContext?.itemName ?? "").trim() ||
+      undefined;
     const booking = await createBooking(traceId, userId, {
       itemId,
-      itemName:
-        String(payload?.itemName ?? payload?.itemLabel ?? executionContext?.itemName ?? "").trim() ||
-        undefined,
+      itemName: requestedItemName,
       durationDays: Math.max(1, Math.floor(Number(durationDays))),
       approvalStage: String(payload?.approvalStage ?? "pending_owner_approval").trim(),
       sourceText: String(payload?.sourceMessage ?? executionContext?.message ?? "").trim(),
@@ -136,6 +137,19 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
         undefined,
       dbOverride: executionContext?.dbOverride ?? executionContext?.db,
     });
+    if (booking && typeof booking === "object" && booking.ok === false) {
+      const code =
+        String(booking.code ?? booking.error ?? "BOOKING_CREATE_FAILED").trim() ||
+        "BOOKING_CREATE_FAILED";
+      return {
+        ok: false,
+        code,
+        error: String(booking.error ?? code).trim() || code,
+        reason: String(booking.reason ?? booking.error ?? code).trim() || code,
+        booking: null,
+        ...(requestedItemName ? { itemName: requestedItemName } : {}),
+      };
+    }
     return { ok: true, booking: booking && typeof booking === "object" ? booking : null };
   } catch (err) {
     return {
