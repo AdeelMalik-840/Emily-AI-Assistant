@@ -65,7 +65,7 @@ function catalogTokensLikelyTypo(msgToken, catalogToken) {
       if (msgToken[i] !== catalogToken[i]) break;
       prefix += 1;
     }
-    return maxLen >= 5 && prefix >= 2;
+    return maxLen >= 5 && prefix >= 3;
   }
   return false;
 }

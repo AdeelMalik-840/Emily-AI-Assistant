@@ -5,7 +5,10 @@
 
 import { detectAskedField } from "./answerComposer.js";
 import { parseUserDuration } from "../duration/parseDuration.js";
-import { hasExplicitNewItemMention } from "./currentTurnAuthority.js";
+import {
+  findConservativeFuzzyCatalogMention,
+  hasExplicitNewItemMention,
+} from "./currentTurnAuthority.js";
 import { hasStrongBookingCommitPhrase } from "./conversationRouter.js";
 
 export const ITEMLESS_PRICE_CLARIFICATION_REPLY =
@@ -231,15 +234,28 @@ export function resolveTurnContext(opts = {}) {
   const explicitItem = explicitMention.found
     ? normalizeAuthorityItem(catalogRowById(catalogItems, explicitMention.itemId))
     : null;
-  const hasExplicitItem = Boolean(explicitItem);
+  const fuzzyMention = !explicitItem
+    ? findConservativeFuzzyCatalogMention(message, catalogItems)
+    : { found: false, ambiguous: false, itemId: null };
+  const fuzzyItem =
+    !explicitItem && fuzzyMention.found && !fuzzyMention.ambiguous && fuzzyMention.itemId
+      ? normalizeAuthorityItem(catalogRowById(catalogItems, fuzzyMention.itemId))
+      : null;
+  const fuzzyAmbiguous = Boolean(
+    !explicitItem && fuzzyMention.found && fuzzyMention.ambiguous
+  );
+  const hasExplicitItem = Boolean(explicitItem || fuzzyItem);
 
-  const itemlessPriceDurationFollowup = isItemlessPriceDurationFollowup(
+  const itemlessPriceDurationFollowupRaw = isItemlessPriceDurationFollowup(
     message,
     catalogItems
   );
+  const itemlessPriceDurationFollowup =
+    itemlessPriceDurationFollowupRaw && !hasExplicitItem;
   const requestedField = String(detectAskedField(message) ?? "").trim().toLowerCase();
   const itemlessTrustedContextFollowup =
     !hasExplicitItem &&
+    !fuzzyAmbiguous &&
     (itemlessPriceDurationFollowup ||
       messageLooksLikeAvailabilityQuery(message) ||
       requestedField === "media");
@@ -274,7 +290,7 @@ export function resolveTurnContext(opts = {}) {
     }
   }
 
-  const authoritativeItem = explicitItem || trustedSessionItem || null;
+  const authoritativeItem = explicitItem || fuzzyItem || trustedSessionItem || null;
 
   let shouldClarifyItem = false;
   let clarificationReply = null;
@@ -284,6 +300,7 @@ export function resolveTurnContext(opts = {}) {
     shouldClarifyItem = true;
     clarificationReply = ITEMLESS_PRICE_CLARIFICATION_REPLY;
     clarificationReason =
+      (fuzzyAmbiguous ? "AMBIGUOUS_FUZZY_ITEM" : null) ||
       trustedSessionRejectReason ||
       (isGroupInbound && !participantKey
         ? "MISSING_STABLE_PARTICIPANT_SESSION"
@@ -299,7 +316,7 @@ export function resolveTurnContext(opts = {}) {
   }
 
   const suppressFuzzyCatalog =
-    itemlessPriceDurationFollowup && !explicitItem && !trustedSessionItem;
+    itemlessPriceDurationFollowup && !hasExplicitItem && !trustedSessionItem;
 
   const result = {
     participantIdentity,
@@ -325,6 +342,8 @@ export function resolveTurnContext(opts = {}) {
     turnShape,
     hasExplicitItem,
     explicitItemId: normalizeId(explicitItem?.id) || null,
+    fuzzyItemId: normalizeId(fuzzyItem?.id) || null,
+    fuzzyAmbiguous,
     trustedSessionItemId: normalizeId(trustedSessionItem?.id) || null,
     authoritativeItemId: normalizeId(authoritativeItem?.id) || null,
     itemlessPriceDurationFollowup,

@@ -224,6 +224,130 @@ export function evaluateInboundBrainRoute(p) {
   return "legacy";
 }
 
+function cleanBookingValue(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeBookingItemFromHint(hint) {
+  if (!hint || typeof hint !== "object" || Array.isArray(hint)) return null;
+  const itemId = cleanBookingValue(hint?.itemId ?? hint?.inventoryItemId);
+  const itemName = cleanBookingValue(hint?.itemName ?? hint?.itemLabel ?? hint?.name);
+  if (!itemId) return null;
+  return {
+    id: itemId,
+    itemId,
+    name: itemName || null,
+    displayLabel: itemName || null,
+  };
+}
+
+function normalizeBookingItemFromRecord(booking) {
+  if (!booking || typeof booking !== "object" || Array.isArray(booking)) return null;
+  const itemId = cleanBookingValue(
+    booking?.itemId ?? booking?.inventoryItemId ?? booking?.item?.id
+  );
+  if (!itemId) return null;
+  const itemName = cleanBookingValue(
+    booking?.itemName ??
+      booking?.itemLabel ??
+      booking?.itemDisplayLabel ??
+      booking?.name ??
+      booking?.item?.name
+  );
+  const displayLabel = cleanBookingValue(
+    booking?.itemDisplayLabel ??
+      booking?.itemLabel ??
+      booking?.displayLabel ??
+      itemName
+  );
+  return {
+    id: itemId,
+    itemId,
+    name: itemName || displayLabel || null,
+    displayLabel: displayLabel || itemName || null,
+  };
+}
+
+async function loadDmHandoffBookingItem({ db, businessId, bookingHint, traceId }) {
+  const hint = bookingHint && typeof bookingHint === "object" ? bookingHint : null;
+  if (!hint) return null;
+  const fromHint = normalizeBookingItemFromHint(hint);
+  if (fromHint) {
+    console.log("[brain_v2_dm_handoff_item_hint]", {
+      traceId: traceId || null,
+      bookingId: cleanBookingValue(hint?.bookingId) || null,
+      itemId: fromHint.itemId,
+    });
+    return fromHint;
+  }
+  const bookingId = cleanBookingValue(hint?.bookingId);
+  if (!bookingId || !db) return null;
+  try {
+    const snap = await db
+      .collection("businesses")
+      .doc(String(businessId ?? "").trim())
+      .collection("bookings")
+      .doc(bookingId)
+      .get();
+    if (!snap?.exists) {
+      console.log("[brain_v2_dm_handoff_booking_missing]", {
+        traceId: traceId || null,
+        bookingId,
+      });
+      return null;
+    }
+    const booking = snap.data() || {};
+    const normalized = normalizeBookingItemFromRecord(booking);
+    if (!normalized) {
+      console.log("[brain_v2_dm_handoff_item_missing]", {
+        traceId: traceId || null,
+        bookingId,
+      });
+      return null;
+    }
+    console.log("[brain_v2_dm_handoff_item_loaded]", {
+      traceId: traceId || null,
+      bookingId,
+      itemId: normalized.itemId,
+    });
+    return normalized;
+  } catch (err) {
+    console.warn("[brain_v2_dm_handoff_booking_failed]", {
+      traceId: traceId || null,
+      bookingId,
+      reason: String(err?.message ?? err ?? "UNKNOWN").slice(0, 160),
+    });
+    return null;
+  }
+}
+
+function applyDmHandoffItemToMemorySnapshot({
+  snapshot,
+  bookingItem,
+  bookingHint,
+  traceId,
+}) {
+  if (!bookingItem || !bookingItem.itemId) return snapshot;
+  const next =
+    snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+      ? snapshot
+      : {};
+  const bookingId = cleanBookingValue(bookingHint?.bookingId) || null;
+  next.lastItem = {
+    id: bookingItem.itemId,
+    itemId: bookingItem.itemId,
+    name: bookingItem.name ?? bookingItem.displayLabel ?? null,
+    displayLabel: bookingItem.displayLabel ?? bookingItem.name ?? null,
+  };
+  next.lastResolvedItemId = bookingItem.itemId;
+  console.log("[brain_v2_dm_handoff_memory_applied]", {
+    traceId: traceId || null,
+    bookingId,
+    itemId: bookingItem.itemId,
+  });
+  return next;
+}
+
 /**
  * Attempt v2 full live routing — never falls back to legacy unless explicit rollback flag.
  * @param {Record<string, unknown>} params
@@ -1169,6 +1293,12 @@ export async function executeWhatsAppAiPipeline(p) {
       dmPlaywrightChatKey: dmPlaywrightChatKey || null,
       sessionKey,
     });
+    console.log("[whatsappInboundBuffer_dm_inbound_accepted]", {
+      dmChatTitle: dmChatTitle || null,
+      dmPlaywrightChatKey: dmPlaywrightChatKey || null,
+      hasBookingHint: Boolean(p?.bookingHint),
+      textPreview: String(latestMessageRaw ?? combinedMessage ?? "").slice(0, 120) || null,
+    });
   }
 
   const tsRaw = p?.messageTimestamp ?? p?.timestamp ?? null;
@@ -1505,10 +1635,27 @@ export async function executeWhatsAppAiPipeline(p) {
     playwrightChatKey: playwrightChatKeyRaw,
     isGroupInbound,
   };
-  const shadowPreTurnMemorySnapshot =
+  let shadowPreTurnMemorySnapshot =
     v2LiveMemoryNeeded || shadowEligible
       ? await loadBrainV2SessionMemorySnapshot(memorySnapshotParams)
       : null;
+  const dmHandoffBookingItem =
+    !isGroupInbound && p?.bookingHint
+      ? await loadDmHandoffBookingItem({
+          db,
+          businessId: ownerUserId,
+          bookingHint: p.bookingHint,
+          traceId,
+        })
+      : null;
+  if (dmHandoffBookingItem) {
+    shadowPreTurnMemorySnapshot = applyDmHandoffItemToMemorySnapshot({
+      snapshot: shadowPreTurnMemorySnapshot,
+      bookingItem: dmHandoffBookingItem,
+      bookingHint: p.bookingHint,
+      traceId,
+    });
+  }
 
   logBookingEvent({
     traceId,

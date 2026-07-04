@@ -5,6 +5,12 @@ import {
   forwardPlaywrightDmToPipeline,
   forwardPlaywrightGroupToPipeline,
 } from "../src/services/playwrightListener/pipelineBridge.js";
+import {
+  __pickDmBookingHintForTests,
+  __planDmContinuationHandlingForTests,
+  __resolveDmContinuationMessageDecisionForTests,
+  __selectWatchedDmPriorityCandidateForTests,
+} from "../src/services/playwrightListener/listener.js";
 import { normalizeTitle } from "../src/services/playwrightTitleNormalize.js";
 
 function shouldProcessChat({ chatTitle, targetGroups, activeDmChatKeys }) {
@@ -44,6 +50,303 @@ test("gating: unrelated chat is skipped", () => {
     }),
     false
   );
+});
+
+test("listener: watched DM can be selected for bounded probe while group is active", () => {
+  const probeState = new Map();
+  const selected = __selectWatchedDmPriorityCandidateForTests({
+    rowSignals: [
+      { title: "Leads", previewSnippet: "Corolla 3 din k lye chyh", hasUnread: false },
+      { title: "Adeel malik", previewSnippet: "3 din ka rent kitna hoga?", hasUnread: false },
+    ],
+    activeDmChatKeys: new Set([normalizeTitle("Adeel malik")]),
+    currentActiveTitle: "Leads",
+    lastMessageSnapshot: { "Adeel malik": "3 din ka rent kitna hoga?" },
+    now: 100_000,
+    probeIntervalMs: 20_000,
+    probeState,
+  });
+
+  assert.equal(selected?.chatTitle, "Adeel malik");
+  assert.equal(selected?.chatKey, normalizeTitle("Adeel malik"));
+  assert.equal(selected?.selectReason, "BOUNDED_WATCH_PROBE");
+});
+
+test("listener: non-watched DM is not selected by bounded probe", () => {
+  const selected = __selectWatchedDmPriorityCandidateForTests({
+    rowSignals: [
+      { title: "Random Person", previewSnippet: "hello", hasUnread: true },
+    ],
+    activeDmChatKeys: new Set([normalizeTitle("Adeel malik")]),
+    currentActiveTitle: "Leads",
+    lastMessageSnapshot: {},
+    now: 100_000,
+    probeIntervalMs: 20_000,
+    probeState: new Map(),
+  });
+
+  assert.equal(selected, null);
+});
+
+test("listener: watched DM can be selected by search probe when not visible in sidebar rows", () => {
+  const key = normalizeTitle("Adeel malik");
+  const probeState = new Map();
+  const selected = __selectWatchedDmPriorityCandidateForTests({
+    rowSignals: [
+      { title: "Leads", previewSnippet: "Civic 1 din ke liye book kar do", hasUnread: false },
+      { title: "Muneeb Electric", previewSnippet: "ok", hasUnread: false },
+    ],
+    activeDmChatKeys: new Set([key]),
+    activeDmTargetsByKey: new Map([
+      [
+        key,
+        [
+          {
+            dmChatTitle: "Adeel malik",
+            participantName: "Adeel malik",
+            bookingId: "booking-1",
+          },
+        ],
+      ],
+    ]),
+    currentActiveTitle: "Leads",
+    lastMessageSnapshot: {},
+    now: 100_000,
+    probeIntervalMs: 20_000,
+    probeState,
+  });
+
+  assert.equal(selected?.chatTitle, "Adeel malik");
+  assert.equal(selected?.chatKey, key);
+  assert.equal(selected?.selectReason, "BOUNDED_WATCH_SEARCH_PROBE");
+  assert.equal(probeState.get(key), 100_000);
+});
+
+test("listener: watched DM bounded probe is throttled", () => {
+  const key = normalizeTitle("Adeel malik");
+  const probeState = new Map([[key, 95_000]]);
+  const selected = __selectWatchedDmPriorityCandidateForTests({
+    rowSignals: [
+      { title: "Adeel malik", previewSnippet: "3 din ka rent kitna hoga?", hasUnread: false },
+    ],
+    activeDmChatKeys: new Set([key]),
+    currentActiveTitle: "Leads",
+    lastMessageSnapshot: { "Adeel malik": "3 din ka rent kitna hoga?" },
+    now: 100_000,
+    probeIntervalMs: 20_000,
+    probeState,
+  });
+
+  assert.equal(selected, null);
+});
+
+test("listener: watched DM duplicate scan does not process twice", () => {
+  const row = {
+    sender: "user",
+    text: "3 din ka rent kitna hoga?",
+    prePlainText: "[15:50, 04/07/2026] Adeel malik: ",
+    sourceMessageIndex: 7,
+  };
+  const first = __resolveDmContinuationMessageDecisionForTests({
+    row,
+    booking: { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") },
+  });
+  assert.equal(first.decision, "process");
+  assert.ok(first.messageId);
+  assert.equal(first.dedupeKeySource, "composite_fallback");
+
+  const second = __resolveDmContinuationMessageDecisionForTests({
+    row,
+    booking: { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") },
+    lastProcessedMessageId: first.messageId,
+  });
+  assert.equal(second.decision, "skip");
+  assert.equal(second.reason, "DUPLICATE_DM_MESSAGE");
+});
+
+test("listener: first-open baseline absorbs visible watched DM row", () => {
+  const booking = { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") };
+  const sorted = [
+    {
+      sender: "user",
+      text: "Civic ka 1 din ka rent kitna hai",
+      prePlainText: "[17:53, 04/07/2026] Adeel malik: ",
+      sourceMessageIndex: 14,
+      dataId: "3EB065DAB5186F1AA9DF54",
+    },
+  ];
+  const plan = __planDmContinuationHandlingForTests({
+    sorted,
+    booking,
+    baselineEstablished: false,
+  });
+
+  assert.equal(plan.action, "baseline");
+  assert.equal(plan.reason, "DM_FIRST_OPEN_BASELINE");
+  assert.equal(plan.decision?.decision, "process");
+  assert.equal(plan.decision?.dedupeKeySource, "data_id");
+  assert.equal(plan.decision?.messageId, "dataId::3EB065DAB5186F1AA9DF54");
+});
+
+test("listener: new row after first-open baseline is forwarded once", () => {
+  const booking = { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") };
+  const oldRow = {
+    sender: "user",
+    text: "Civic ka 1 din ka rent kitna hai",
+    prePlainText: "[17:53, 04/07/2026] Adeel malik: ",
+    sourceMessageIndex: 14,
+    dataId: "3EB065DAB5186F1AA9DF54",
+  };
+  const baseline = __planDmContinuationHandlingForTests({
+    sorted: [oldRow],
+    booking,
+    baselineEstablished: false,
+  });
+  const processedDataIds = new Set(["3EB065DAB5186F1AA9DF54"]);
+  const newRow = {
+    sender: "user",
+    text: "ok",
+    prePlainText: "[18:31, 04/07/2026] Adeel malik: ",
+    sourceMessageIndex: 27,
+    dataId: "3EB0A6E1F653E0532A6D3B",
+  };
+  const forwardPlan = __planDmContinuationHandlingForTests({
+    sorted: [oldRow, newRow],
+    booking,
+    baselineEstablished: true,
+    lastProcessedMessageId: baseline.decision.messageId,
+    processedDataIds,
+  });
+
+  assert.equal(forwardPlan.action, "forward");
+  assert.equal(forwardPlan.decision?.decision, "process");
+  assert.equal(forwardPlan.decision?.messageId, "dataId::3EB0A6E1F653E0532A6D3B");
+});
+
+test("listener: same dataId with different sourceMessageIndex is duplicate", () => {
+  const booking = { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") };
+  const first = __resolveDmContinuationMessageDecisionForTests({
+    row: {
+      sender: "user",
+      text: "ok",
+      prePlainText: "[18:31, 04/07/2026] Adeel malik: ",
+      sourceMessageIndex: 27,
+      dataId: "3EB0A6E1F653E0532A6D3B",
+    },
+    booking,
+  });
+  assert.equal(first.decision, "process");
+  assert.equal(first.messageId, "dataId::3EB0A6E1F653E0532A6D3B");
+
+  const second = __resolveDmContinuationMessageDecisionForTests({
+    row: {
+      sender: "user",
+      text: "ok",
+      prePlainText: "[18:31, 04/07/2026] Adeel malik: ",
+      sourceMessageIndex: 26,
+      dataId: "3EB0A6E1F653E0532A6D3B",
+    },
+    booking,
+    lastProcessedMessageId: first.messageId,
+    processedDataIds: new Set(["3EB0A6E1F653E0532A6D3B"]),
+  });
+  assert.equal(second.decision, "skip");
+  assert.equal(second.reason, "DUPLICATE_DM_DATA_ID");
+});
+
+test("listener: missing dataId falls back to existing composite key", () => {
+  const row = {
+    sender: "user",
+    text: "3 din ka rent kitna hoga?",
+    prePlainText: "[15:50, 04/07/2026] Adeel malik: ",
+    sourceMessageIndex: 7,
+  };
+  const first = __resolveDmContinuationMessageDecisionForTests({
+    row,
+    booking: { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") },
+  });
+  assert.equal(first.dedupeKeySource, "composite_fallback");
+  assert.equal(first.messageId, "[15:50, 04/07/2026] Adeel malik:::7");
+
+  const shifted = __resolveDmContinuationMessageDecisionForTests({
+    row: {
+      ...row,
+      sourceMessageIndex: 8,
+    },
+    booking: { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") },
+    lastProcessedMessageId: first.messageId,
+  });
+  assert.equal(shifted.decision, "process");
+  assert.equal(shifted.reason, "NEW_DM_MESSAGE");
+});
+
+test("listener: watched DM continuation chooses only a unique newest booking hint", () => {
+  const key = normalizeTitle("Adeel malik");
+  const result = __pickDmBookingHintForTests(
+    key,
+    new Map([
+      [
+        key,
+        [
+          { bookingId: "older", dmWatchSortMs: 1000 },
+          { bookingId: "newer", dmWatchSortMs: 2000 },
+        ],
+      ],
+    ])
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.hint?.bookingId, "newer");
+  assert.equal(result.resolvedBy, "LATEST_DM_HANDOFF");
+});
+
+test("listener: watched DM continuation fails closed when newest booking hint is tied", () => {
+  const key = normalizeTitle("Adeel malik");
+  const result = __pickDmBookingHintForTests(
+    key,
+    new Map([
+      [
+        key,
+        [
+          { bookingId: "a", dmWatchSortMs: 2000 },
+          { bookingId: "b", dmWatchSortMs: 2000 },
+        ],
+      ],
+    ])
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "AMBIGUOUS_MATCH");
+});
+
+test("listener: watched DM message older than Reply Privately marker is skipped", () => {
+  const result = __resolveDmContinuationMessageDecisionForTests({
+    row: {
+      sender: "user",
+      text: "old address message",
+      prePlainText: "[15:00, 04/07/2026] Adeel malik: ",
+      sourceMessageIndex: 2,
+    },
+    booking: { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") },
+  });
+
+  assert.equal(result.decision, "skip");
+  assert.equal(result.reason, "OLDER_THAN_REPLY_PRIVATE_MARKER");
+});
+
+test("listener: assistant-looking outbound DM text is not forwarded as customer inbound", () => {
+  const result = __resolveDmContinuationMessageDecisionForTests({
+    row: {
+      sender: "user",
+      text: "Honda Civic 2026 Oriel 3 din ke liye available hai. Booking confirm ho gayi hai.",
+      prePlainText: "[15:50, 04/07/2026] Adeel malik: ",
+      sourceMessageIndex: 9,
+    },
+    booking: { approvalCustomerNotificationSentAt: new Date("2026-07-04T10:40:00Z") },
+  });
+
+  assert.equal(result.decision, "skip");
+  assert.equal(result.reason, "LIKELY_ASSISTANT_OUTBOUND_COPY");
 });
 
 test("pipelineBridge: forwardPlaywrightDmToPipeline schedules individual DM payload with bookingHint", async () => {
@@ -154,4 +457,3 @@ test("pipelineBridge: phone-looking group sender label is not included in natura
     process.env.PLAYWRIGHT_OWNER_USER_ID = previousOwner;
   }
 });
-

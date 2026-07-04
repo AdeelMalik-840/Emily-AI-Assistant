@@ -724,14 +724,16 @@ export async function loadActiveDmWatchTargets({
       if (!dmKey) continue;
       keys.add(dmKey);
       const identity = sourceIdentityForDmWatch(data);
+      const updatedAtMs = timestampToMillis(data?.updatedAtMs ?? data?.updatedAt);
+      const dmWatchSortMs = Math.max(
+        timestampToMillis(data?.approvalCustomerNotificationSentAt),
+        timestampToMillis(data?.dmStartedAt),
+        updatedAtMs
+      );
       const entry = {
         bookingId: doc.id,
-        updatedAtMs:
-          typeof data?.updatedAtMs === "number"
-            ? data.updatedAtMs
-            : data?.updatedAt?.toMillis?.() ??
-              (data?.updatedAt instanceof Date ? data.updatedAt.getTime() : 0) ??
-              0,
+        updatedAtMs,
+        dmWatchSortMs,
         approvalStage: approvalStage || null,
         deliveryMethod: clean(data?.deliveryMethod) || null,
         hasDeliveryAddress: clean(data?.deliveryAddress) !== "",
@@ -859,8 +861,20 @@ function pickDmBookingHint(dmChatKey, bookingsByKey) {
   const list = bookingsByKey?.get(dmChatKey) ?? [];
   if (list.length === 0) return { ok: false, reason: "NO_BOOKING_MATCH", hint: null };
   if (list.length === 1) return { ok: true, hint: list[0], ambiguous: false };
-  const sorted = [...list].sort((a, b) => Number(b.updatedAtMs || 0) - Number(a.updatedAtMs || 0));
-  // If multiple active bookings still match this DM key, treat as ambiguous.
+  const sorted = [...list].sort(
+    (a, b) => Number(b.dmWatchSortMs || b.updatedAtMs || 0) - Number(a.dmWatchSortMs || a.updatedAtMs || 0)
+  );
+  const newestMs = Number(sorted[0]?.dmWatchSortMs || sorted[0]?.updatedAtMs || 0);
+  const secondMs = Number(sorted[1]?.dmWatchSortMs || sorted[1]?.updatedAtMs || 0);
+  if (Number.isFinite(newestMs) && newestMs > 0 && newestMs > secondMs) {
+    console.log("[playwright_dm_continuation_latest_target_selected]", {
+      dmChatKey,
+      bookingId: sorted[0]?.bookingId || null,
+      displacedBookingIds: sorted.slice(1).map((b) => b.bookingId).filter(Boolean),
+    });
+    return { ok: true, hint: sorted[0], ambiguous: false, resolvedBy: "LATEST_DM_HANDOFF" };
+  }
+  // If multiple active bookings still match this DM key without a unique newest handoff, treat as ambiguous.
   return { ok: false, reason: "AMBIGUOUS_MATCH", bookingIds: sorted.map((b) => b.bookingId), hint: null };
 }
 
@@ -872,10 +886,471 @@ export function __shouldProcessChatForTests({ chatTitle, targetGroups, activeDmC
   return Boolean(key && activeDmChatKeys instanceof Set && activeDmChatKeys.has(key));
 }
 
+export function __selectWatchedDmPriorityCandidateForTests(args = {}) {
+  return selectWatchedDmPriorityCandidateFromRows(args);
+}
+
+export function __resolveDmContinuationMessageDecisionForTests(args = {}) {
+  return resolveDmContinuationMessageDecision(args);
+}
+
+export function __buildDmContinuationDedupeKeyForTests(row) {
+  return buildDmContinuationDedupeKey(row);
+}
+
+export function __planDmContinuationHandlingForTests(args = {}) {
+  return planDmContinuationHandling(args);
+}
+
+export function __pickDmBookingHintForTests(dmChatKey, bookingsByKey) {
+  return pickDmBookingHint(dmChatKey, bookingsByKey);
+}
+
+const DM_WATCH_PROBE_INTERVAL_MS = Math.max(
+  5_000,
+  Number(process.env.PLAYWRIGHT_DM_WATCH_PROBE_INTERVAL_MS ?? 20_000) || 20_000
+);
+const DM_WATCH_SIDEBAR_SCAN_LIMIT = Math.max(
+  1,
+  Math.min(
+    30,
+    Number.parseInt(String(process.env.PLAYWRIGHT_DM_WATCH_SIDEBAR_SCAN_LIMIT ?? "30"), 10) ||
+      30
+  )
+);
+
+function dmWatchProbeState() {
+  if (!(globalThis.__dmWatchLastProbeAtByKey instanceof Map)) {
+    globalThis.__dmWatchLastProbeAtByKey = new Map();
+  }
+  return globalThis.__dmWatchLastProbeAtByKey;
+}
+
+function selectWatchedDmPriorityCandidateFromRows({
+  rowSignals,
+  activeDmChatKeys,
+  activeDmTargetsByKey,
+  currentActiveTitle,
+  lastMessageSnapshot = lastMessageMap,
+  allowProbe = true,
+  now = Date.now(),
+  probeIntervalMs = DM_WATCH_PROBE_INTERVAL_MS,
+  probeState = dmWatchProbeState(),
+} = {}) {
+  const keys = activeDmChatKeys instanceof Set ? activeDmChatKeys : new Set();
+  if (!keys.size) {
+    console.log("[dm_probe_no_watch_targets]");
+    return null;
+  }
+  const curKey = normalizeTitle(String(currentActiveTitle ?? "").trim());
+  const rows = Array.isArray(rowSignals) ? rowSignals : [];
+  let watchedRowsSeen = 0;
+
+  for (const r of rows) {
+    const chatTitle = String(r?.title ?? "").trim();
+    if (!chatTitle) continue;
+    const chatKey = normalizeTitle(chatTitle);
+    const isWatched = Boolean(chatKey && keys.has(chatKey));
+    const isAlreadyActive = Boolean(curKey && chatKey && chatKey === curKey);
+    const hasUnread = Boolean(r?.hasUnread);
+    const preview = String(r?.previewSnippet ?? "");
+    const norm = normalizePreview(preview);
+    const lastProcessedPreview = String(lastMessageSnapshot?.[chatTitle] ?? "");
+    const previewLooksOutgoing = sidebarPreviewLooksOutgoing(preview);
+    const previewDelta = Boolean(
+      lastProcessedPreview &&
+        norm &&
+        norm !== lastProcessedPreview &&
+        !previewLooksOutgoing
+    );
+
+    if (!isWatched) {
+      if (TRACE_DEBUG) {
+        console.log("[playwright_dm_watch_priority_skipped_not_watched]", {
+          chatTitle,
+          chatKey: chatKey || null,
+        });
+      }
+      continue;
+    }
+    watchedRowsSeen += 1;
+
+    console.log("[playwright_dm_watch_priority_candidate]", { chatTitle, chatKey });
+
+    let selected = false;
+    let selectReason = "";
+    let skipReason = "";
+    const lastProbeAt = Number(probeState?.get?.(chatKey) ?? 0);
+    const probeDue = Boolean(
+      allowProbe &&
+        chatKey &&
+        !isAlreadyActive &&
+        !hasUnread &&
+        !previewDelta &&
+        (!Number.isFinite(lastProbeAt) || now - lastProbeAt >= probeIntervalMs)
+    );
+
+    if (isAlreadyActive) {
+      skipReason = "ALREADY_ACTIVE";
+    } else if (hasUnread) {
+      selected = true;
+      selectReason = "UNREAD";
+    } else if (previewDelta) {
+      selected = true;
+      selectReason = "PREVIEW_DELTA";
+    } else if (probeDue) {
+      selected = true;
+      selectReason = "BOUNDED_WATCH_PROBE";
+    } else {
+      skipReason = "NO_UNREAD_PREVIEW_DELTA_OR_PROBE_DUE";
+    }
+
+    if (skipReason === "NO_UNREAD_PREVIEW_DELTA_OR_PROBE_DUE") {
+      const waitMs =
+        Number.isFinite(lastProbeAt) && lastProbeAt > 0
+          ? Math.max(0, probeIntervalMs - (now - lastProbeAt))
+          : null;
+      console.log("[dm_probe_throttled]", {
+        chatTitle,
+        chatKey,
+        lastProbeAt: lastProbeAt || null,
+        waitMs,
+      });
+    }
+
+    console.log("[playwright_dm_watch_priority_decision]", {
+      chatTitle,
+      chatKey,
+      isWatched,
+      isAlreadyActive,
+      hasUnread,
+      preview: preview || null,
+      lastProcessedPreview: lastProcessedPreview || null,
+      previewLooksOutgoing,
+      previewDelta,
+      selected,
+      selectReason: selectReason || null,
+      skipReason: skipReason || null,
+    });
+
+    if (!selected) continue;
+    console.log("[dm_probe_candidate_found]", {
+      chatTitle,
+      chatKey,
+      selectReason,
+    });
+    if (selectReason === "BOUNDED_WATCH_PROBE" && probeState?.set) {
+      probeState.set(chatKey, now);
+    }
+
+    return { chatTitle, chatKey, selectReason };
+  }
+  if (rows.length > 0 && watchedRowsSeen === 0) {
+    console.log("[dm_probe_no_sidebar_match]", {
+      watchCount: keys.size,
+      sidebarRowsSeen: rows.length,
+      watchedKeys: Array.from(keys).slice(0, 5),
+    });
+  }
+
+  const byKey = activeDmTargetsByKey instanceof Map ? activeDmTargetsByKey : new Map();
+  for (const chatKey of keys) {
+    if (!chatKey || (curKey && chatKey === curKey)) continue;
+    const lastProbeAt = Number(probeState?.get?.(chatKey) ?? 0);
+    const probeDue = Boolean(
+      allowProbe &&
+        (!Number.isFinite(lastProbeAt) || now - lastProbeAt >= probeIntervalMs)
+    );
+    if (!probeDue) {
+      const waitMs =
+        Number.isFinite(lastProbeAt) && lastProbeAt > 0
+          ? Math.max(0, probeIntervalMs - (now - lastProbeAt))
+          : null;
+      console.log("[dm_probe_throttled]", {
+        chatTitle: null,
+        chatKey,
+        lastProbeAt: lastProbeAt || null,
+        waitMs,
+      });
+      continue;
+    }
+    const list = byKey.get(chatKey) ?? [];
+    const first = Array.isArray(list) ? list[0] : null;
+    const chatTitle = clean(first?.dmChatTitle || first?.participantName || "");
+    if (!chatTitle) {
+      console.log("[dm_probe_no_sidebar_match]", {
+        watchCount: keys.size,
+        sidebarRowsSeen: rows.length,
+        watchedKeys: [chatKey],
+        reason: "WATCH_TARGET_TITLE_MISSING",
+      });
+      continue;
+    }
+    if (probeState?.set) {
+      probeState.set(chatKey, now);
+    }
+    console.log("[dm_probe_candidate_found]", {
+      chatTitle,
+      chatKey,
+      selectReason: "BOUNDED_WATCH_SEARCH_PROBE",
+    });
+    return { chatTitle, chatKey, selectReason: "BOUNDED_WATCH_SEARCH_PROBE" };
+  }
+  return null;
+}
+
+function buildDmContinuationDedupeKey(row) {
+  const dataId = getExtractedWhatsAppDataId(row);
+  if (dataId) {
+    return {
+      dedupeKey: `dataId::${dataId}`,
+      dedupeKeySource: "data_id",
+      dataId,
+    };
+  }
+  const sourceIndex =
+    Number.isFinite(Number(row?.sourceMessageIndex))
+      ? Number(row.sourceMessageIndex)
+      : -1;
+  const idxForId = sourceIndex >= 0 ? String(sourceIndex) : "unknown";
+  const prePlainText = String(row?.prePlainText ?? "").trim();
+  const sender = String(row?.sender ?? "user").trim() || "user";
+  const rawText = String(row?.text ?? "").replace(/\s+/g, " ").trim();
+  const textKey = rawText.toLowerCase();
+  const tsCandidate =
+    row?.timestamp != null && String(row.timestamp).trim() !== ""
+      ? String(row.timestamp).trim()
+      : row?.__ts != null && String(row.__ts).trim() !== ""
+        ? String(row.__ts).trim()
+        : "";
+  const tsNum = Number(tsCandidate);
+  const tsLooksPlausible =
+    (Number.isFinite(tsNum) && tsNum > 1_000_000_000_000) ||
+    String(tsCandidate).length >= 10;
+  const dedupeKey = prePlainText
+    ? `${prePlainText}::${idxForId}`
+    : tsCandidate && tsLooksPlausible
+      ? `${sender}::${tsCandidate}`
+      : `${sender}::${textKey}::${idxForId}`;
+  return {
+    dedupeKey,
+    dedupeKeySource: "composite_fallback",
+    dataId: null,
+  };
+}
+
+function isEligibleDmCustomerRowForContinuation(row, booking) {
+  const rawText = String(row?.text ?? "").replace(/\s+/g, " ").trim();
+  if (!rawText) return false;
+  const likelyAssistantDmOutbound =
+    isLikelyAssistantOutboundCopy(rawText) ||
+    /\bbooking confirm ho gayi hai\b/i.test(rawText) ||
+    /\bbook\s*(?:kr|kar)\s*d[ou]\b/i.test(rawText);
+  if (likelyAssistantDmOutbound) return false;
+  const rowTimestampMs = getRowTimestampMs(row);
+  if (
+    __isDmWatchMessageOlderThanBookingMarkersForTests({
+      messageTimestamp: rowTimestampMs || row?.timestamp,
+      booking,
+    })
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function findLatestEligibleDmCustomerRow(sorted, booking) {
+  const rows = Array.isArray(sorted) ? sorted : [];
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (row?.sender !== "user") continue;
+    if (!isEligibleDmCustomerRowForContinuation(row, booking)) continue;
+    return row;
+  }
+  return null;
+}
+
+function resolveDmContinuationMessageDecision({
+  row,
+  booking,
+  lastProcessedMessageId = "",
+  processedDataIds = null,
+} = {}) {
+  const sourceIndex =
+    Number.isFinite(Number(row?.sourceMessageIndex))
+      ? Number(row.sourceMessageIndex)
+      : -1;
+  const prePlainText = String(row?.prePlainText ?? "").trim();
+  const sender = String(row?.sender ?? "user").trim() || "user";
+  const rawText = String(row?.text ?? "").replace(/\s+/g, " ").trim();
+  if (!rawText) {
+    return {
+      decision: "skip",
+      reason: "EMPTY_TEXT",
+      messageId: null,
+      dedupeKey: null,
+      dedupeKeySource: null,
+      dataId: null,
+      sourceMessageIndex: sourceIndex >= 0 ? sourceIndex : null,
+      rawText,
+    };
+  }
+  const likelyAssistantDmOutbound =
+    isLikelyAssistantOutboundCopy(rawText) ||
+    /\bbooking confirm ho gayi hai\b/i.test(rawText) ||
+    /\bbook\s*(?:kr|kar)\s*d[ou]\b/i.test(rawText);
+  if (likelyAssistantDmOutbound) {
+    return {
+      decision: "skip",
+      reason: "LIKELY_ASSISTANT_OUTBOUND_COPY",
+      messageId: null,
+      dedupeKey: null,
+      dedupeKeySource: null,
+      dataId: null,
+      sourceMessageIndex: sourceIndex >= 0 ? sourceIndex : null,
+      rawText,
+    };
+  }
+  const rowTimestampMs = getRowTimestampMs(row);
+  if (
+    __isDmWatchMessageOlderThanBookingMarkersForTests({
+      messageTimestamp: rowTimestampMs || row?.timestamp,
+      booking,
+    })
+  ) {
+    return {
+      decision: "skip",
+      reason: "OLDER_THAN_REPLY_PRIVATE_MARKER",
+      messageId: null,
+      dedupeKey: null,
+      dedupeKeySource: null,
+      dataId: null,
+      sourceMessageIndex: sourceIndex >= 0 ? sourceIndex : null,
+      rawText,
+      rowTimestampMs: rowTimestampMs || null,
+    };
+  }
+  const { dedupeKey, dedupeKeySource, dataId } = buildDmContinuationDedupeKey(row);
+  const lastId = String(lastProcessedMessageId ?? "").trim();
+  const seenDataIds =
+    processedDataIds instanceof Set ? processedDataIds : null;
+  if (dataId && seenDataIds?.has(dataId)) {
+    return {
+      decision: "skip",
+      reason: "DUPLICATE_DM_DATA_ID",
+      messageId: dedupeKey || null,
+      dedupeKey: dedupeKey || null,
+      dedupeKeySource,
+      dataId,
+      sourceMessageIndex: sourceIndex >= 0 ? sourceIndex : null,
+      rawText,
+      rowTimestampMs: rowTimestampMs || null,
+    };
+  }
+  const isDuplicate = Boolean(dedupeKey && dedupeKey === lastId);
+  return {
+    decision: dedupeKey && !isDuplicate ? "process" : "skip",
+    reason: dedupeKey && !isDuplicate ? "NEW_DM_MESSAGE" : "DUPLICATE_DM_MESSAGE",
+    messageId: dedupeKey || null,
+    dedupeKey: dedupeKey || null,
+    dedupeKeySource,
+    dataId: dataId || null,
+    sourceMessageIndex: sourceIndex >= 0 ? sourceIndex : null,
+    rawText,
+    rowTimestampMs: rowTimestampMs || null,
+  };
+}
+
+function planDmContinuationHandling({
+  sorted,
+  booking,
+  lastProcessedMessageId = "",
+  baselineEstablished = false,
+  processedDataIds = null,
+} = {}) {
+  const row = findLatestEligibleDmCustomerRow(sorted, booking);
+  if (!row) {
+    return {
+      action: baselineEstablished ? "skip" : "baseline",
+      reason: baselineEstablished ? "NO_ELIGIBLE_CUSTOMER_ROW" : "DM_FIRST_OPEN_NO_ELIGIBLE_ROW",
+      row: null,
+      decision: null,
+    };
+  }
+  const dmDecision = resolveDmContinuationMessageDecision({
+    row,
+    booking,
+    lastProcessedMessageId,
+    processedDataIds,
+  });
+  if (!baselineEstablished) {
+    return {
+      action: "baseline",
+      reason: "DM_FIRST_OPEN_BASELINE",
+      row,
+      decision: dmDecision,
+    };
+  }
+  if (dmDecision.decision === "skip") {
+    return {
+      action: "skip",
+      reason: dmDecision.reason || "SKIP",
+      row,
+      decision: dmDecision,
+    };
+  }
+  return {
+    action: "forward",
+    reason: dmDecision.reason || "NEW_DM_MESSAGE",
+    row,
+    decision: dmDecision,
+  };
+}
+
+function dmContinuationCursorState() {
+  globalThis.__lastProcessedDmMsg =
+    globalThis.__lastProcessedDmMsg || Object.create(null);
+  globalThis.__lastProcessedDmMsgId =
+    globalThis.__lastProcessedDmMsgId || Object.create(null);
+  globalThis.__dmFirstOpenBaselineEstablished =
+    globalThis.__dmFirstOpenBaselineEstablished || Object.create(null);
+  globalThis.__processedDmDataIdsByKey =
+    globalThis.__processedDmDataIdsByKey || Object.create(null);
+  return {
+    lastProcessedDmMsg: globalThis.__lastProcessedDmMsg,
+    lastProcessedDmMsgId: globalThis.__lastProcessedDmMsgId,
+    firstOpenBaselineEstablished: globalThis.__dmFirstOpenBaselineEstablished,
+    processedDmDataIdsByKey: globalThis.__processedDmDataIdsByKey,
+  };
+}
+
+function getOrCreateProcessedDmDataIdsSet(dmCursorKey) {
+  const state = dmContinuationCursorState();
+  if (!(state.processedDmDataIdsByKey[dmCursorKey] instanceof Set)) {
+    state.processedDmDataIdsByKey[dmCursorKey] = new Set();
+  }
+  return state.processedDmDataIdsByKey[dmCursorKey];
+}
+
+function persistDmContinuationProcessedMarker(dmCursorKey, decision) {
+  if (!decision) return;
+  const state = dmContinuationCursorState();
+  const dedupeKey = String(decision.dedupeKey ?? decision.messageId ?? "").trim();
+  if (dedupeKey) {
+    state.lastProcessedDmMsgId[dmCursorKey] = dedupeKey;
+  }
+  const dataId = String(decision.dataId ?? "").trim();
+  if (dataId) {
+    getOrCreateProcessedDmDataIdsSet(dmCursorKey).add(dataId);
+  }
+}
+
 async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentActiveTitle) {
   const keys = activeDmChatKeys instanceof Set ? activeDmChatKeys : new Set();
-  if (!keys.size) return null;
-  const curKey = normalizeTitle(String(currentActiveTitle ?? "").trim());
+  if (!keys.size) {
+    console.log("[dm_probe_no_watch_targets]");
+    return null;
+  }
   const rowSignals = await page
     .evaluate((maxR) => {
       const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
@@ -896,68 +1371,25 @@ async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentAct
           return { title, previewSnippet, hasUnread };
         })
         .filter(Boolean);
-    }, MAX_PRIORITY_CHATS_PER_LOOP)
+    }, DM_WATCH_SIDEBAR_SCAN_LIMIT)
     .catch(() => []);
 
-  for (const r of rowSignals) {
-    const chatTitle = String(r?.title ?? "").trim();
-    if (!chatTitle) continue;
-    const chatKey = normalizeTitle(chatTitle);
-    const isWatched = Boolean(chatKey && keys.has(chatKey));
-    const isAlreadyActive = Boolean(curKey && chatKey && chatKey === curKey);
-    const hasUnread = Boolean(r?.hasUnread);
-    const preview = String(r?.previewSnippet ?? "");
-    const norm = normalizePreview(preview);
-    const lastProcessedPreview = String(lastMessageMap[chatTitle] ?? "");
-    const previewLooksOutgoing = sidebarPreviewLooksOutgoing(preview);
-    const previewDelta = Boolean(
-      lastProcessedPreview &&
-        norm &&
-        norm !== lastProcessedPreview &&
-        !previewLooksOutgoing
-    );
+  console.log("[dm_probe_sidebar_scanned]", {
+    watchCount: keys.size,
+    rowCount: rowSignals.length,
+    scanLimit: DM_WATCH_SIDEBAR_SCAN_LIMIT,
+    currentActiveTitle: String(currentActiveTitle ?? "").trim() || null,
+  });
 
-    if (!isWatched) {
-      if (TRACE_DEBUG) {
-        console.log("[playwright_dm_watch_priority_skipped_not_watched]", {
-          chatTitle,
-          chatKey: chatKey || null,
-        });
-      }
-      continue;
-    }
-
-    console.log("[playwright_dm_watch_priority_candidate]", { chatTitle, chatKey });
-
-    let selected = false;
-    let skipReason = "";
-    if (isAlreadyActive) {
-      skipReason = "ALREADY_ACTIVE";
-    } else if (!hasUnread && !previewDelta) {
-      skipReason = "NO_UNREAD_OR_PREVIEW_DELTA";
-    } else {
-      selected = true;
-    }
-
-    console.log("[playwright_dm_watch_priority_decision]", {
-      chatTitle,
-      chatKey,
-      isWatched,
-      isAlreadyActive,
-      hasUnread,
-      preview: preview || null,
-      lastProcessedPreview: lastProcessedPreview || null,
-      previewLooksOutgoing,
-      previewDelta,
-      selected,
-      skipReason: skipReason || null,
-    });
-
-    if (!selected) continue;
-
-    return { chatTitle, chatKey };
-  }
-  return null;
+  return selectWatchedDmPriorityCandidateFromRows({
+    rowSignals,
+    activeDmChatKeys,
+    activeDmTargetsByKey:
+      globalThis.__activeDmWatchTargets?.byKey instanceof Map
+        ? globalThis.__activeDmWatchTargets.byKey
+        : new Map(),
+    currentActiveTitle,
+  });
 }
 
 /**
@@ -6555,12 +6987,22 @@ async function runListenerBody() {
               activeNowForStickiness
             );
             if (dmCandidate?.chatTitle) {
+              console.log("[dm_probe_open_attempt]", {
+                chatTitle: dmCandidate.chatTitle,
+                chatKey: dmCandidate.chatKey,
+                selectReason: dmCandidate.selectReason || null,
+              });
               console.log("[playwright_dm_watch_priority_opening]", {
                 chatTitle: dmCandidate.chatTitle,
                 chatKey: dmCandidate.chatKey,
               });
               const opened = await openChatAndConfirm(page, dmCandidate.chatTitle).catch(
                 (err) => {
+                  console.warn("[dm_probe_open_failed]", {
+                    chatTitle: dmCandidate.chatTitle,
+                    chatKey: dmCandidate.chatKey,
+                    reason: clean(err?.message ?? err) || "OPEN_FAILED",
+                  });
                   console.warn("[playwright_dm_watch_priority_open_failed]", {
                     chatTitle: dmCandidate.chatTitle,
                     chatKey: dmCandidate.chatKey,
@@ -6570,10 +7012,21 @@ async function runListenerBody() {
                 }
               );
               if (opened) {
+                console.log("[dm_probe_open_success]", {
+                  chatTitle: dmCandidate.chatTitle,
+                  chatKey: dmCandidate.chatKey,
+                  selectReason: dmCandidate.selectReason || null,
+                });
                 chatName = dmCandidate.chatTitle;
                 globalThis.__activeChatTitle = chatName;
                 globalThis.__activeChatInFocus = chatName;
                 skipRotation = true;
+              } else {
+                console.warn("[dm_probe_open_failed]", {
+                  chatTitle: dmCandidate.chatTitle,
+                  chatKey: dmCandidate.chatKey,
+                  reason: "OPEN_RETURNED_FALSE",
+                });
               }
             }
           }
@@ -6904,60 +7357,13 @@ async function runListenerBody() {
 
           // DM continuation: no group participant bucketing; forward only user/customer replies.
           if (isDmContinuationChat) {
-            globalThis.__lastProcessedDmMsg =
-              globalThis.__lastProcessedDmMsg || Object.create(null);
-            globalThis.__lastProcessedDmMsgId =
-              globalThis.__lastProcessedDmMsgId || Object.create(null);
-            const dmCursorKey = `dm-continuation::${normalizedOpenChatKey}`;
-            const last = [...sorted].reverse().find((m) => m?.sender === "user" && String(m?.text ?? "").trim());
-            if (!last) {
-              return;
-            }
-            const sourceIndex =
-              Number.isFinite(Number(last?.sourceMessageIndex))
-                ? Number(last.sourceMessageIndex)
-                : -1;
-            const idxForId = sourceIndex >= 0 ? String(sourceIndex) : "unknown";
-            const prePlainText = String(last?.prePlainText ?? "").trim();
-            const sender = String(last?.sender ?? "user").trim() || "user";
-            const rawText = String(last?.text ?? "").replace(/\s+/g, " ").trim();
-            const textKey = rawText.toLowerCase();
-            const tsCandidate =
-              last?.timestamp != null && String(last.timestamp).trim() !== ""
-                ? String(last.timestamp).trim()
-                : last?.__ts != null && String(last.__ts).trim() !== ""
-                  ? String(last.__ts).trim()
-                  : "";
-            const tsNum = Number(tsCandidate);
-            const tsLooksPlausible =
-              (Number.isFinite(tsNum) && tsNum > 1_000_000_000_000) ||
-              String(tsCandidate).length >= 10;
-
-            const messageId = prePlainText
-              ? `${prePlainText}::${idxForId}`
-              : tsCandidate && tsLooksPlausible
-                ? `${sender}::${tsCandidate}`
-                : `${sender}::${textKey}::${idxForId}`;
-
-            const lastProcessedMessageId = String(
-              globalThis.__lastProcessedDmMsgId?.[dmCursorKey] ?? ""
-            ).trim();
-
-            const decision =
-              messageId && messageId !== lastProcessedMessageId ? "process" : "skip";
-            console.log("[dm_message_processing_decision]", {
-              messageId: messageId || null,
-              lastProcessedMessageId: lastProcessedMessageId || null,
-              sourceMessageIndex: sourceIndex >= 0 ? sourceIndex : null,
-              decision,
+            console.log("[dm_extraction_started]", {
+              dmChatTitle: openTitle,
+              dmPlaywrightChatKey: normalizedOpenChatKey,
+              rowCount: sorted.length,
             });
-            if (decision === "skip") {
-              console.log("[playwright_dm_message_skipped_already_processed]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-              });
-              return;
-            }
-
+            const dmState = dmContinuationCursorState();
+            const dmCursorKey = `dm-continuation::${normalizedOpenChatKey}`;
             const match = pickDmBookingHint(normalizedOpenChatKey, bookingsByDmKey);
             if (!match.ok) {
               if (match.reason === "AMBIGUOUS_MATCH") {
@@ -6969,6 +7375,123 @@ async function runListenerBody() {
               return;
             }
             const hint = match.hint || {};
+            const baselineEstablished = Boolean(
+              dmState.firstOpenBaselineEstablished[dmCursorKey]
+            );
+            const lastProcessedMessageId = String(
+              dmState.lastProcessedDmMsgId?.[dmCursorKey] ?? ""
+            ).trim();
+            const processedDataIds = getOrCreateProcessedDmDataIdsSet(dmCursorKey);
+            const plan = planDmContinuationHandling({
+              sorted,
+              booking: hint,
+              lastProcessedMessageId,
+              baselineEstablished,
+              processedDataIds,
+            });
+            if (!plan.row) {
+              console.log("[dm_extraction_no_new_customer_rows]", {
+                dmChatTitle: openTitle,
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                rowCount: sorted.length,
+                baselineEstablished,
+                reason: plan.reason || null,
+              });
+              if (!baselineEstablished) {
+                dmState.firstOpenBaselineEstablished[dmCursorKey] = true;
+                console.log("[dm_first_open_baseline_established]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  bookingId: hint.bookingId || null,
+                  baselineMessageId: null,
+                  dedupeKeySource: null,
+                  dataId: null,
+                  reason: plan.reason || "DM_FIRST_OPEN_NO_ELIGIBLE_ROW",
+                });
+              }
+              return;
+            }
+            const last = plan.row;
+            const dmDecision = plan.decision;
+            const rawText = dmDecision?.rawText || String(last.text ?? "").trim();
+            console.log("[playwright_dm_row_extracted]", {
+              dmChatTitle: openTitle,
+              dmPlaywrightChatKey: normalizedOpenChatKey,
+              bookingId: hint.bookingId || null,
+              sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
+              textPreview: rawText.slice(0, 120) || null,
+            });
+            if (dmDecision?.dedupeKey) {
+              console.log("[dm_dedupe_key_selected]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                dedupeKey: dmDecision.dedupeKey,
+                dedupeKeySource: dmDecision.dedupeKeySource || null,
+                dataId: dmDecision.dataId || null,
+                sourceMessageIndex: dmDecision.sourceMessageIndex ?? null,
+              });
+            }
+            if (plan.action === "baseline") {
+              persistDmContinuationProcessedMarker(dmCursorKey, dmDecision);
+              dmState.firstOpenBaselineEstablished[dmCursorKey] = true;
+              console.log("[dm_first_open_baseline_absorbed]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                bookingId: hint.bookingId || null,
+                messageId: dmDecision?.messageId || null,
+                dedupeKeySource: dmDecision?.dedupeKeySource || null,
+                dataId: dmDecision?.dataId || null,
+                sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
+                textPreview: rawText.slice(0, 120) || null,
+              });
+              console.log("[dm_first_open_baseline_established]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                bookingId: hint.bookingId || null,
+                baselineMessageId: dmDecision?.messageId || null,
+                dedupeKeySource: dmDecision?.dedupeKeySource || null,
+                dataId: dmDecision?.dataId || null,
+              });
+              return;
+            }
+            if (dmDecision?.reason === "LIKELY_ASSISTANT_OUTBOUND_COPY") {
+              console.log("[playwright_dm_message_skipped_outbound_echo]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                bookingId: hint.bookingId || null,
+                reason: dmDecision.reason,
+                textPreview: rawText.slice(0, 120),
+              });
+              return;
+            }
+            if (dmDecision?.reason === "OLDER_THAN_REPLY_PRIVATE_MARKER") {
+              console.log("[playwright_dm_message_skipped_before_booking_marker]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                bookingId: hint.bookingId || null,
+                rowTimestampMs: dmDecision.rowTimestampMs || null,
+                reason: dmDecision.reason,
+              });
+              return;
+            }
+            console.log("[dm_message_processing_decision]", {
+              messageId: dmDecision?.messageId || null,
+              dedupeKeySource: dmDecision?.dedupeKeySource || null,
+              dataId: dmDecision?.dataId || null,
+              lastProcessedMessageId: lastProcessedMessageId || null,
+              sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
+              decision: dmDecision?.decision || "skip",
+              reason: dmDecision?.reason || null,
+            });
+            if (dmDecision?.reason === "DUPLICATE_DM_DATA_ID") {
+              console.log("[dm_duplicate_data_id_blocked]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                dataId: dmDecision.dataId || null,
+                dedupeKey: dmDecision.dedupeKey || null,
+                sourceMessageIndex: dmDecision.sourceMessageIndex ?? null,
+              });
+            }
+            if (plan.action === "skip" || dmDecision?.decision === "skip") {
+              console.log("[playwright_dm_message_skipped_already_processed]", {
+                dmPlaywrightChatKey: normalizedOpenChatKey,
+                reason: dmDecision?.reason || plan.reason || "SKIP",
+              });
+              return;
+            }
             const forwarded = await forwardPlaywrightDmToPipeline({
               message: String(last.text ?? "").trim(),
               dmChatTitle: openTitle,
@@ -6984,11 +7507,10 @@ async function runListenerBody() {
               source: "PLAYWRIGHT_DM",
             }).catch(() => false);
             if (forwarded) {
-              // Persist stable id only after successful forward.
-              globalThis.__lastProcessedDmMsgId[dmCursorKey] = messageId || String(Date.now());
-              // Keep legacy debug id store for additional inspection.
+              persistDmContinuationProcessedMarker(dmCursorKey, dmDecision);
               const dmMsgIdDebug = getMessageIdFromExtracted(last, sorted);
-              globalThis.__lastProcessedDmMsg[dmCursorKey] = dmMsgIdDebug || String(Date.now());
+              dmState.lastProcessedDmMsg[dmCursorKey] =
+                dmMsgIdDebug || String(Date.now());
               console.log("[playwright_dm_message_forwarded]", {
                 dmChatTitle: openTitle,
                 dmPlaywrightChatKey: normalizedOpenChatKey,
