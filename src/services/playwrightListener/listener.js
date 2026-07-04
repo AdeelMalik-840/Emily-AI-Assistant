@@ -906,6 +906,10 @@ export function __pickDmBookingHintForTests(dmChatKey, bookingsByKey) {
   return pickDmBookingHint(dmChatKey, bookingsByKey);
 }
 
+export function __resolveBoundedDmProbeRestoreTargetForTests(args = {}) {
+  return resolveBoundedDmProbeRestoreTarget(args);
+}
+
 const DM_WATCH_PROBE_INTERVAL_MS = Math.max(
   5_000,
   Number(process.env.PLAYWRIGHT_DM_WATCH_PROBE_INTERVAL_MS ?? 20_000) || 20_000
@@ -930,6 +934,7 @@ function selectWatchedDmPriorityCandidateFromRows({
   rowSignals,
   activeDmChatKeys,
   activeDmTargetsByKey,
+  targetGroups,
   currentActiveTitle,
   lastMessageSnapshot = lastMessageMap,
   allowProbe = true,
@@ -945,6 +950,12 @@ function selectWatchedDmPriorityCandidateFromRows({
   const curKey = normalizeTitle(String(currentActiveTitle ?? "").trim());
   const rows = Array.isArray(rowSignals) ? rowSignals : [];
   let watchedRowsSeen = 0;
+  const targetGroupSignal = resolveTargetGroupSidebarSignal({
+    rowSignals: rows,
+    activeDmChatKeys: keys,
+    targetGroups,
+    lastMessageSnapshot,
+  });
 
   for (const r of rows) {
     const chatTitle = String(r?.title ?? "").trim();
@@ -953,6 +964,7 @@ function selectWatchedDmPriorityCandidateFromRows({
     const isWatched = Boolean(chatKey && keys.has(chatKey));
     const isAlreadyActive = Boolean(curKey && chatKey && chatKey === curKey);
     const hasUnread = Boolean(r?.hasUnread);
+    const hasBold = Boolean(r?.hasBold || r?.boldPoints);
     const preview = String(r?.previewSnippet ?? "");
     const norm = normalizePreview(preview);
     const lastProcessedPreview = String(lastMessageSnapshot?.[chatTitle] ?? "");
@@ -999,8 +1011,18 @@ function selectWatchedDmPriorityCandidateFromRows({
       selected = true;
       selectReason = "PREVIEW_DELTA";
     } else if (probeDue) {
-      selected = true;
-      selectReason = "BOUNDED_WATCH_PROBE";
+      if (targetGroupSignal) {
+        skipReason = "TARGET_GROUP_SIGNAL_PRESENT";
+        console.log("[dm_probe_skipped_group_signal]", {
+          chatTitle,
+          chatKey,
+          groupTitle: targetGroupSignal.title,
+          groupReason: targetGroupSignal.reason,
+        });
+      } else {
+        selected = true;
+        selectReason = "BOUNDED_WATCH_PROBE";
+      }
     } else {
       skipReason = "NO_UNREAD_PREVIEW_DELTA_OR_PROBE_DUE";
     }
@@ -1024,6 +1046,7 @@ function selectWatchedDmPriorityCandidateFromRows({
       isWatched,
       isAlreadyActive,
       hasUnread,
+      hasBold,
       preview: preview || null,
       lastProcessedPreview: lastProcessedPreview || null,
       previewLooksOutgoing,
@@ -1054,6 +1077,16 @@ function selectWatchedDmPriorityCandidateFromRows({
   }
 
   const byKey = activeDmTargetsByKey instanceof Map ? activeDmTargetsByKey : new Map();
+  if (targetGroupSignal) {
+    console.log("[dm_probe_skipped_group_signal]", {
+      chatTitle: null,
+      chatKey: null,
+      groupTitle: targetGroupSignal.title,
+      groupReason: targetGroupSignal.reason,
+      selectReason: "BOUNDED_WATCH_SEARCH_PROBE",
+    });
+    return null;
+  }
   for (const chatKey of keys) {
     if (!chatKey || (curKey && chatKey === curKey)) continue;
     const lastProbeAt = Number(probeState?.get?.(chatKey) ?? 0);
@@ -1097,6 +1130,112 @@ function selectWatchedDmPriorityCandidateFromRows({
     return { chatTitle, chatKey, selectReason: "BOUNDED_WATCH_SEARCH_PROBE" };
   }
   return null;
+}
+
+function resolveTargetGroupSidebarSignal({
+  rowSignals,
+  activeDmChatKeys,
+  targetGroups,
+  lastMessageSnapshot = lastMessageMap,
+} = {}) {
+  const groups = Array.isArray(targetGroups) ? targetGroups : null;
+  if (groups === null || groups.length === 0) return null;
+  const dmKeys = activeDmChatKeys instanceof Set ? activeDmChatKeys : new Set();
+  const rows = Array.isArray(rowSignals) ? rowSignals : [];
+  for (const r of rows) {
+    const title = String(r?.title ?? "").trim();
+    if (!title || !chatRowMatchesTargets(title, groups)) continue;
+    const key = normalizeTitle(title);
+    if (key && dmKeys.has(key)) continue;
+    const preview = String(r?.previewSnippet ?? "");
+    const norm = normalizePreview(preview);
+    const prev = String(lastMessageSnapshot?.[title] ?? "");
+    const previewDelta = Boolean(
+      prev &&
+        norm &&
+        norm !== prev &&
+        !sidebarPreviewLooksOutgoing(preview)
+    );
+    if (r?.hasUnread) {
+      return { title, reason: "UNREAD" };
+    }
+    if (r?.hasBold || r?.boldPoints) {
+      return { title, reason: "BOLD" };
+    }
+    if (previewDelta) {
+      return { title, reason: "PREVIEW_DELTA" };
+    }
+  }
+  return null;
+}
+
+function resolveBoundedDmProbeRestoreTarget({
+  selectReason,
+  previousActiveTitle,
+  targetGroups,
+} = {}) {
+  const reason = String(selectReason ?? "").trim();
+  if (reason !== "BOUNDED_WATCH_PROBE" && reason !== "BOUNDED_WATCH_SEARCH_PROBE") {
+    return null;
+  }
+  const target = String(previousActiveTitle ?? "").trim();
+  if (!target) return null;
+  if (!chatRowMatchesTargets(target, targetGroups)) return null;
+  if (!isValidBusinessChat(target) || !isAllowedChat(target)) return null;
+  return target;
+}
+
+async function restorePreviousGroupAfterBoundedDmProbe(page, targetGroupTitle) {
+  const target = String(targetGroupTitle ?? "").trim();
+  if (!target) return false;
+  if (isReplyPrivateLockActive() || globalThis.__UI_SEND_LOCK) {
+    console.log("[dm_probe_restore_skipped]", {
+      targetGroupTitle: target,
+      reason: isReplyPrivateLockActive() ? "REPLY_PRIVATE_LOCK_ACTIVE" : "UI_SEND_LOCK_ACTIVE",
+    });
+    return false;
+  }
+  let current = "";
+  try {
+    current = String((await getActiveChatName(page)) ?? "").trim();
+  } catch {
+    current = "";
+  }
+  if (current && normalizeTitle(current) === normalizeTitle(target)) {
+    console.log("[dm_probe_restore_skipped]", {
+      targetGroupTitle: target,
+      reason: "ALREADY_ON_TARGET_GROUP",
+    });
+    return true;
+  }
+  console.log("[dm_probe_restore_attempt]", { targetGroupTitle: target });
+  const opened = await openChatAndConfirm(page, target).catch((err) => {
+    console.warn("[dm_probe_restore_failed]", {
+      targetGroupTitle: target,
+      reason: clean(err?.message ?? err) || "OPEN_FAILED",
+    });
+    return false;
+  });
+  if (!opened) {
+    console.warn("[dm_probe_restore_failed]", {
+      targetGroupTitle: target,
+      reason: "OPEN_RETURNED_FALSE",
+    });
+    return false;
+  }
+  const headerMatches = await ensureHeaderMatches(page, target).catch(() => false);
+  if (!headerMatches) {
+    console.warn("[dm_probe_restore_failed]", {
+      targetGroupTitle: target,
+      reason: "HEADER_MISMATCH",
+    });
+    return false;
+  }
+  setCurrentOpenChatTitleFromSidebar(target);
+  globalThis.__activeChatTitle = target;
+  globalThis.__activeChatInFocus = target;
+  console.log("[dm_probe_restore_success]", { targetGroupTitle: target });
+  return true;
 }
 
 function buildDmContinuationDedupeKey(row) {
@@ -1345,7 +1484,7 @@ function persistDmContinuationProcessedMarker(dmCursorKey, decision) {
   }
 }
 
-async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentActiveTitle) {
+async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentActiveTitle, targetGroups) {
   const keys = activeDmChatKeys instanceof Set ? activeDmChatKeys : new Set();
   if (!keys.size) {
     console.log("[dm_probe_no_watch_targets]");
@@ -1368,7 +1507,19 @@ async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentAct
               row.querySelector('[data-icon=\"unread\"], [data-icon=\"status-unread\"], span[aria-label*=\"unread\" i]') ||
               /unread/i.test(row.getAttribute("aria-label") || "")
           );
-          return { title, previewSnippet, hasUnread };
+          let hasBold = false;
+          row.querySelectorAll("span[dir='auto']").forEach((el) => {
+            try {
+              const w = window.getComputedStyle(el).fontWeight;
+              const n = parseInt(w, 10);
+              if (n >= 600 || w === "bold" || w === "bolder") {
+                hasBold = true;
+              }
+            } catch {
+              /* ignore */
+            }
+          });
+          return { title, previewSnippet, hasUnread, hasBold };
         })
         .filter(Boolean);
     }, DM_WATCH_SIDEBAR_SCAN_LIMIT)
@@ -1388,6 +1539,7 @@ async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentAct
       globalThis.__activeDmWatchTargets?.byKey instanceof Map
         ? globalThis.__activeDmWatchTargets.byKey
         : new Map(),
+    targetGroups,
     currentActiveTitle,
   });
 }
@@ -6930,6 +7082,8 @@ async function runListenerBody() {
 
         let chatName = null;
         let skipRotation = false;
+        let selectedChatReason = null;
+        let dmProbeRestoreTarget = null;
 
         if (globalThis.__forceNextChat) {
           const forcedChatId = String(globalThis.__forceNextChat).trim();
@@ -6984,7 +7138,8 @@ async function runListenerBody() {
             const dmCandidate = await findWatchedDmPriorityCandidate(
               page,
               activeDmChatKeys,
-              activeNowForStickiness
+              activeNowForStickiness,
+              targetGroups
             );
             if (dmCandidate?.chatTitle) {
               console.log("[dm_probe_open_attempt]", {
@@ -7018,6 +7173,19 @@ async function runListenerBody() {
                   selectReason: dmCandidate.selectReason || null,
                 });
                 chatName = dmCandidate.chatTitle;
+                selectedChatReason = dmCandidate.selectReason || null;
+                dmProbeRestoreTarget = resolveBoundedDmProbeRestoreTarget({
+                  selectReason: selectedChatReason,
+                  previousActiveTitle: activeNowForStickiness,
+                  targetGroups,
+                });
+                if (dmProbeRestoreTarget) {
+                  console.log("[dm_probe_restore_planned]", {
+                    targetGroupTitle: dmProbeRestoreTarget,
+                    fromDmTitle: chatName,
+                    selectReason: selectedChatReason,
+                  });
+                }
                 globalThis.__activeChatTitle = chatName;
                 globalThis.__activeChatInFocus = chatName;
                 skipRotation = true;
@@ -7357,172 +7525,176 @@ async function runListenerBody() {
 
           // DM continuation: no group participant bucketing; forward only user/customer replies.
           if (isDmContinuationChat) {
-            console.log("[dm_extraction_started]", {
-              dmChatTitle: openTitle,
-              dmPlaywrightChatKey: normalizedOpenChatKey,
-              rowCount: sorted.length,
-            });
-            const dmState = dmContinuationCursorState();
-            const dmCursorKey = `dm-continuation::${normalizedOpenChatKey}`;
-            const match = pickDmBookingHint(normalizedOpenChatKey, bookingsByDmKey);
-            if (!match.ok) {
-              if (match.reason === "AMBIGUOUS_MATCH") {
-                console.warn("[playwright_dm_continuation_ambiguous]", {
-                  dmChatKey: normalizedOpenChatKey,
-                  bookingIds: match.bookingIds || [],
-                });
-              }
-              return;
-            }
-            const hint = match.hint || {};
-            const baselineEstablished = Boolean(
-              dmState.firstOpenBaselineEstablished[dmCursorKey]
-            );
-            const lastProcessedMessageId = String(
-              dmState.lastProcessedDmMsgId?.[dmCursorKey] ?? ""
-            ).trim();
-            const processedDataIds = getOrCreateProcessedDmDataIdsSet(dmCursorKey);
-            const plan = planDmContinuationHandling({
-              sorted,
-              booking: hint,
-              lastProcessedMessageId,
-              baselineEstablished,
-              processedDataIds,
-            });
-            if (!plan.row) {
-              console.log("[dm_extraction_no_new_customer_rows]", {
+            try {
+              console.log("[dm_extraction_started]", {
                 dmChatTitle: openTitle,
                 dmPlaywrightChatKey: normalizedOpenChatKey,
                 rowCount: sorted.length,
-                baselineEstablished,
-                reason: plan.reason || null,
               });
-              if (!baselineEstablished) {
-                dmState.firstOpenBaselineEstablished[dmCursorKey] = true;
-                console.log("[dm_first_open_baseline_established]", {
-                  dmPlaywrightChatKey: normalizedOpenChatKey,
-                  bookingId: hint.bookingId || null,
-                  baselineMessageId: null,
-                  dedupeKeySource: null,
-                  dataId: null,
-                  reason: plan.reason || "DM_FIRST_OPEN_NO_ELIGIBLE_ROW",
-                });
+              const dmState = dmContinuationCursorState();
+              const dmCursorKey = `dm-continuation::${normalizedOpenChatKey}`;
+              const match = pickDmBookingHint(normalizedOpenChatKey, bookingsByDmKey);
+              if (!match.ok) {
+                if (match.reason === "AMBIGUOUS_MATCH") {
+                  console.warn("[playwright_dm_continuation_ambiguous]", {
+                    dmChatKey: normalizedOpenChatKey,
+                    bookingIds: match.bookingIds || [],
+                  });
+                }
+                return;
               }
-              return;
-            }
-            const last = plan.row;
-            const dmDecision = plan.decision;
-            const rawText = dmDecision?.rawText || String(last.text ?? "").trim();
-            console.log("[playwright_dm_row_extracted]", {
-              dmChatTitle: openTitle,
-              dmPlaywrightChatKey: normalizedOpenChatKey,
-              bookingId: hint.bookingId || null,
-              sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
-              textPreview: rawText.slice(0, 120) || null,
-            });
-            if (dmDecision?.dedupeKey) {
-              console.log("[dm_dedupe_key_selected]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-                dedupeKey: dmDecision.dedupeKey,
-                dedupeKeySource: dmDecision.dedupeKeySource || null,
-                dataId: dmDecision.dataId || null,
-                sourceMessageIndex: dmDecision.sourceMessageIndex ?? null,
+              const hint = match.hint || {};
+              const baselineEstablished = Boolean(
+                dmState.firstOpenBaselineEstablished[dmCursorKey]
+              );
+              const lastProcessedMessageId = String(
+                dmState.lastProcessedDmMsgId?.[dmCursorKey] ?? ""
+              ).trim();
+              const processedDataIds = getOrCreateProcessedDmDataIdsSet(dmCursorKey);
+              const plan = planDmContinuationHandling({
+                sorted,
+                booking: hint,
+                lastProcessedMessageId,
+                baselineEstablished,
+                processedDataIds,
               });
-            }
-            if (plan.action === "baseline") {
-              persistDmContinuationProcessedMarker(dmCursorKey, dmDecision);
-              dmState.firstOpenBaselineEstablished[dmCursorKey] = true;
-              console.log("[dm_first_open_baseline_absorbed]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-                bookingId: hint.bookingId || null,
-                messageId: dmDecision?.messageId || null,
-                dedupeKeySource: dmDecision?.dedupeKeySource || null,
-                dataId: dmDecision?.dataId || null,
-                sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
-                textPreview: rawText.slice(0, 120) || null,
-              });
-              console.log("[dm_first_open_baseline_established]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-                bookingId: hint.bookingId || null,
-                baselineMessageId: dmDecision?.messageId || null,
-                dedupeKeySource: dmDecision?.dedupeKeySource || null,
-                dataId: dmDecision?.dataId || null,
-              });
-              return;
-            }
-            if (dmDecision?.reason === "LIKELY_ASSISTANT_OUTBOUND_COPY") {
-              console.log("[playwright_dm_message_skipped_outbound_echo]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-                bookingId: hint.bookingId || null,
-                reason: dmDecision.reason,
-                textPreview: rawText.slice(0, 120),
-              });
-              return;
-            }
-            if (dmDecision?.reason === "OLDER_THAN_REPLY_PRIVATE_MARKER") {
-              console.log("[playwright_dm_message_skipped_before_booking_marker]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-                bookingId: hint.bookingId || null,
-                rowTimestampMs: dmDecision.rowTimestampMs || null,
-                reason: dmDecision.reason,
-              });
-              return;
-            }
-            console.log("[dm_message_processing_decision]", {
-              messageId: dmDecision?.messageId || null,
-              dedupeKeySource: dmDecision?.dedupeKeySource || null,
-              dataId: dmDecision?.dataId || null,
-              lastProcessedMessageId: lastProcessedMessageId || null,
-              sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
-              decision: dmDecision?.decision || "skip",
-              reason: dmDecision?.reason || null,
-            });
-            if (dmDecision?.reason === "DUPLICATE_DM_DATA_ID") {
-              console.log("[dm_duplicate_data_id_blocked]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-                dataId: dmDecision.dataId || null,
-                dedupeKey: dmDecision.dedupeKey || null,
-                sourceMessageIndex: dmDecision.sourceMessageIndex ?? null,
-              });
-            }
-            if (plan.action === "skip" || dmDecision?.decision === "skip") {
-              console.log("[playwright_dm_message_skipped_already_processed]", {
-                dmPlaywrightChatKey: normalizedOpenChatKey,
-                reason: dmDecision?.reason || plan.reason || "SKIP",
-              });
-              return;
-            }
-            const forwarded = await forwardPlaywrightDmToPipeline({
-              message: String(last.text ?? "").trim(),
-              dmChatTitle: openTitle,
-              dmPlaywrightChatKey: normalizedOpenChatKey,
-              bookingHint: {
-                bookingId: hint.bookingId || null,
-                participantKey: hint.participantKey || null,
-                participantName: hint.participantName || null,
-                participantPhoneForDm: hint.participantPhoneForDm || null,
-                originalGroupName: hint.originalGroupName || null,
-                originalGroupChatKey: hint.originalGroupChatKey || null,
-              },
-              source: "PLAYWRIGHT_DM",
-            }).catch(() => false);
-            if (forwarded) {
-              persistDmContinuationProcessedMarker(dmCursorKey, dmDecision);
-              const dmMsgIdDebug = getMessageIdFromExtracted(last, sorted);
-              dmState.lastProcessedDmMsg[dmCursorKey] =
-                dmMsgIdDebug || String(Date.now());
-              console.log("[playwright_dm_message_forwarded]", {
+              if (!plan.row) {
+                console.log("[dm_extraction_no_new_customer_rows]", {
+                  dmChatTitle: openTitle,
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  rowCount: sorted.length,
+                  baselineEstablished,
+                  reason: plan.reason || null,
+                });
+                if (!baselineEstablished) {
+                  dmState.firstOpenBaselineEstablished[dmCursorKey] = true;
+                  console.log("[dm_first_open_baseline_established]", {
+                    dmPlaywrightChatKey: normalizedOpenChatKey,
+                    bookingId: hint.bookingId || null,
+                    baselineMessageId: null,
+                    dedupeKeySource: null,
+                    dataId: null,
+                    reason: plan.reason || "DM_FIRST_OPEN_NO_ELIGIBLE_ROW",
+                  });
+                }
+                return;
+              }
+              const last = plan.row;
+              const dmDecision = plan.decision;
+              const rawText = dmDecision?.rawText || String(last.text ?? "").trim();
+              console.log("[playwright_dm_row_extracted]", {
                 dmChatTitle: openTitle,
                 dmPlaywrightChatKey: normalizedOpenChatKey,
                 bookingId: hint.bookingId || null,
+                sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
+                textPreview: rawText.slice(0, 120) || null,
               });
-            } else {
-              console.warn("[playwright_dm_continuation_forward_failed]", {
+              if (dmDecision?.dedupeKey) {
+                console.log("[dm_dedupe_key_selected]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  dedupeKey: dmDecision.dedupeKey,
+                  dedupeKeySource: dmDecision.dedupeKeySource || null,
+                  dataId: dmDecision.dataId || null,
+                  sourceMessageIndex: dmDecision.sourceMessageIndex ?? null,
+                });
+              }
+              if (plan.action === "baseline") {
+                persistDmContinuationProcessedMarker(dmCursorKey, dmDecision);
+                dmState.firstOpenBaselineEstablished[dmCursorKey] = true;
+                console.log("[dm_first_open_baseline_absorbed]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  bookingId: hint.bookingId || null,
+                  messageId: dmDecision?.messageId || null,
+                  dedupeKeySource: dmDecision?.dedupeKeySource || null,
+                  dataId: dmDecision?.dataId || null,
+                  sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
+                  textPreview: rawText.slice(0, 120) || null,
+                });
+                console.log("[dm_first_open_baseline_established]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  bookingId: hint.bookingId || null,
+                  baselineMessageId: dmDecision?.messageId || null,
+                  dedupeKeySource: dmDecision?.dedupeKeySource || null,
+                  dataId: dmDecision?.dataId || null,
+                });
+                return;
+              }
+              if (dmDecision?.reason === "LIKELY_ASSISTANT_OUTBOUND_COPY") {
+                console.log("[playwright_dm_message_skipped_outbound_echo]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  bookingId: hint.bookingId || null,
+                  reason: dmDecision.reason,
+                  textPreview: rawText.slice(0, 120),
+                });
+                return;
+              }
+              if (dmDecision?.reason === "OLDER_THAN_REPLY_PRIVATE_MARKER") {
+                console.log("[playwright_dm_message_skipped_before_booking_marker]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  bookingId: hint.bookingId || null,
+                  rowTimestampMs: dmDecision.rowTimestampMs || null,
+                  reason: dmDecision.reason,
+                });
+                return;
+              }
+              console.log("[dm_message_processing_decision]", {
+                messageId: dmDecision?.messageId || null,
+                dedupeKeySource: dmDecision?.dedupeKeySource || null,
+                dataId: dmDecision?.dataId || null,
+                lastProcessedMessageId: lastProcessedMessageId || null,
+                sourceMessageIndex: dmDecision?.sourceMessageIndex ?? null,
+                decision: dmDecision?.decision || "skip",
+                reason: dmDecision?.reason || null,
+              });
+              if (dmDecision?.reason === "DUPLICATE_DM_DATA_ID") {
+                console.log("[dm_duplicate_data_id_blocked]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  dataId: dmDecision.dataId || null,
+                  dedupeKey: dmDecision.dedupeKey || null,
+                  sourceMessageIndex: dmDecision.sourceMessageIndex ?? null,
+                });
+              }
+              if (plan.action === "skip" || dmDecision?.decision === "skip") {
+                console.log("[playwright_dm_message_skipped_already_processed]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  reason: dmDecision?.reason || plan.reason || "SKIP",
+                });
+                return;
+              }
+              const forwarded = await forwardPlaywrightDmToPipeline({
+                message: String(last.text ?? "").trim(),
+                dmChatTitle: openTitle,
                 dmPlaywrightChatKey: normalizedOpenChatKey,
-                reason: "FORWARD_FAILED",
-              });
+                bookingHint: {
+                  bookingId: hint.bookingId || null,
+                  participantKey: hint.participantKey || null,
+                  participantName: hint.participantName || null,
+                  participantPhoneForDm: hint.participantPhoneForDm || null,
+                  originalGroupName: hint.originalGroupName || null,
+                  originalGroupChatKey: hint.originalGroupChatKey || null,
+                },
+                source: "PLAYWRIGHT_DM",
+              }).catch(() => false);
+              if (forwarded) {
+                persistDmContinuationProcessedMarker(dmCursorKey, dmDecision);
+                const dmMsgIdDebug = getMessageIdFromExtracted(last, sorted);
+                dmState.lastProcessedDmMsg[dmCursorKey] =
+                  dmMsgIdDebug || String(Date.now());
+                console.log("[playwright_dm_message_forwarded]", {
+                  dmChatTitle: openTitle,
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  bookingId: hint.bookingId || null,
+                });
+              } else {
+                console.warn("[playwright_dm_continuation_forward_failed]", {
+                  dmPlaywrightChatKey: normalizedOpenChatKey,
+                  reason: "FORWARD_FAILED",
+                });
+              }
+              return;
+            } finally {
+              await restorePreviousGroupAfterBoundedDmProbe(page, dmProbeRestoreTarget);
             }
-            return;
           }
 
           const duplicateRowKeyCounts = new Map();

@@ -8,6 +8,7 @@ import {
 import {
   __pickDmBookingHintForTests,
   __planDmContinuationHandlingForTests,
+  __resolveBoundedDmProbeRestoreTargetForTests,
   __resolveDmContinuationMessageDecisionForTests,
   __selectWatchedDmPriorityCandidateForTests,
 } from "../src/services/playwrightListener/listener.js";
@@ -52,7 +53,7 @@ test("gating: unrelated chat is skipped", () => {
   );
 });
 
-test("listener: watched DM can be selected for bounded probe while group is active", () => {
+test("listener: group signal wins over idle watched DM bounded probe", () => {
   const probeState = new Map();
   const selected = __selectWatchedDmPriorityCandidateForTests({
     rowSignals: [
@@ -60,6 +61,29 @@ test("listener: watched DM can be selected for bounded probe while group is acti
       { title: "Adeel malik", previewSnippet: "3 din ka rent kitna hoga?", hasUnread: false },
     ],
     activeDmChatKeys: new Set([normalizeTitle("Adeel malik")]),
+    targetGroups: ["Leads"],
+    currentActiveTitle: "Leads",
+    lastMessageSnapshot: {
+      Leads: "old leads preview",
+      "Adeel malik": "3 din ka rent kitna hoga?",
+    },
+    now: 100_000,
+    probeIntervalMs: 20_000,
+    probeState,
+  });
+
+  assert.equal(selected, null);
+});
+
+test("listener: watched DM unread still wins over active group", () => {
+  const probeState = new Map();
+  const selected = __selectWatchedDmPriorityCandidateForTests({
+    rowSignals: [
+      { title: "Leads", previewSnippet: "Corolla 3 din k lye chyh", hasUnread: false },
+      { title: "Adeel malik", previewSnippet: "3 din ka rent kitna hoga?", hasUnread: true },
+    ],
+    activeDmChatKeys: new Set([normalizeTitle("Adeel malik")]),
+    targetGroups: ["Leads"],
     currentActiveTitle: "Leads",
     lastMessageSnapshot: { "Adeel malik": "3 din ka rent kitna hoga?" },
     now: 100_000,
@@ -69,7 +93,31 @@ test("listener: watched DM can be selected for bounded probe while group is acti
 
   assert.equal(selected?.chatTitle, "Adeel malik");
   assert.equal(selected?.chatKey, normalizeTitle("Adeel malik"));
-  assert.equal(selected?.selectReason, "BOUNDED_WATCH_PROBE");
+  assert.equal(selected?.selectReason, "UNREAD");
+});
+
+test("listener: watched DM preview delta still wins over active group", () => {
+  const probeState = new Map();
+  const selected = __selectWatchedDmPriorityCandidateForTests({
+    rowSignals: [
+      { title: "Leads", previewSnippet: "Corolla 3 din k lye chyh", hasUnread: false },
+      { title: "Adeel malik", previewSnippet: "3 din ka rent kitna hoga?", hasUnread: false },
+    ],
+    activeDmChatKeys: new Set([normalizeTitle("Adeel malik")]),
+    targetGroups: ["Leads"],
+    currentActiveTitle: "Leads",
+    lastMessageSnapshot: {
+      Leads: "Corolla 3 din k lye chyh",
+      "Adeel malik": "old dm preview",
+    },
+    now: 100_000,
+    probeIntervalMs: 20_000,
+    probeState,
+  });
+
+  assert.equal(selected?.chatTitle, "Adeel malik");
+  assert.equal(selected?.chatKey, normalizeTitle("Adeel malik"));
+  assert.equal(selected?.selectReason, "PREVIEW_DELTA");
 });
 
 test("listener: non-watched DM is not selected by bounded probe", () => {
@@ -109,8 +157,9 @@ test("listener: watched DM can be selected by search probe when not visible in s
         ],
       ],
     ]),
+    targetGroups: ["Leads"],
     currentActiveTitle: "Leads",
-    lastMessageSnapshot: {},
+    lastMessageSnapshot: { Leads: "civic 1 din ke liye book kar do" },
     now: 100_000,
     probeIntervalMs: 20_000,
     probeState,
@@ -120,6 +169,66 @@ test("listener: watched DM can be selected by search probe when not visible in s
   assert.equal(selected?.chatKey, key);
   assert.equal(selected?.selectReason, "BOUNDED_WATCH_SEARCH_PROBE");
   assert.equal(probeState.get(key), 100_000);
+});
+
+test("listener: watched DM search probe waits when target group has signal", () => {
+  const key = normalizeTitle("Adeel malik");
+  const probeState = new Map();
+  const selected = __selectWatchedDmPriorityCandidateForTests({
+    rowSignals: [
+      { title: "Leads", previewSnippet: "Civic 1 din ke liye book kar do", hasUnread: true },
+      { title: "Muneeb Electric", previewSnippet: "ok", hasUnread: false },
+    ],
+    activeDmChatKeys: new Set([key]),
+    activeDmTargetsByKey: new Map([
+      [
+        key,
+        [
+          {
+            dmChatTitle: "Adeel malik",
+            participantName: "Adeel malik",
+            bookingId: "booking-1",
+          },
+        ],
+      ],
+    ]),
+    targetGroups: ["Leads"],
+    currentActiveTitle: "Leads",
+    lastMessageSnapshot: {},
+    now: 100_000,
+    probeIntervalMs: 20_000,
+    probeState,
+  });
+
+  assert.equal(selected, null);
+  assert.equal(probeState.has(key), false);
+});
+
+test("listener: bounded DM probe plans restore to previous target group", () => {
+  assert.equal(
+    __resolveBoundedDmProbeRestoreTargetForTests({
+      selectReason: "BOUNDED_WATCH_PROBE",
+      previousActiveTitle: "Leads",
+      targetGroups: ["Leads"],
+    }),
+    "Leads"
+  );
+  assert.equal(
+    __resolveBoundedDmProbeRestoreTargetForTests({
+      selectReason: "BOUNDED_WATCH_SEARCH_PROBE",
+      previousActiveTitle: "Leads",
+      targetGroups: ["Leads"],
+    }),
+    "Leads"
+  );
+  assert.equal(
+    __resolveBoundedDmProbeRestoreTargetForTests({
+      selectReason: "UNREAD",
+      previousActiveTitle: "Leads",
+      targetGroups: ["Leads"],
+    }),
+    null
+  );
 });
 
 test("listener: watched DM bounded probe is throttled", () => {
