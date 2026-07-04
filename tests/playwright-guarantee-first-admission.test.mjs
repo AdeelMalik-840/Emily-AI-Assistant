@@ -16,12 +16,14 @@ import {
   attachBurstMergeContinuations,
   buildParticipantForwardCandidate,
   buildStableMessageKey,
+  establishFreshDeltaStartupBaseline,
   filterGuaranteeFirstEligibleUserRows,
   filterPostAnchorFreshUserRows,
   isBurstMergeContinuationText,
   isListenerInboundNoise,
   isPlaywrightGuaranteeFirstAdmissionEnabled,
   logGuaranteeFirstSelection,
+  resolveBaselineTailUserDeferral,
 } from "../src/services/playwrightListener/listener.js";
 import { getMessageState, setMessageState } from "../src/services/messageState.js";
 import {
@@ -537,7 +539,7 @@ test("guarantee-first: baseline_seen blocks old backlog; newest pending survives
   assert.ok(droppedBaseline.length >= 2);
 });
 
-test("guarantee-first: startup visible tail user is baseline-blocked", () => {
+test("guarantee-first: true startup visible backlog rows remain baseline-blocked", () => {
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
   const history = mkRow({
@@ -554,18 +556,171 @@ test("guarantee-first: startup visible tail user is baseline-blocked", () => {
   const historyId = buildStableMessageKey(history, sorted).id;
   const tailId = buildStableMessageKey(tail, sorted).id;
   const st = mkFreshState();
-  st.baselineEstablishedAtMs = Date.now();
-  st.baselineSeenStableIds.add(historyId);
-  st.baselineSeenStableIds.add(tailId);
+  st.baselineEstablishedAtMs = null;
+  establishFreshDeltaStartupBaseline({
+    freshState: st,
+    sortedWithPos: sorted,
+    userMessages: sorted,
+    chatKey: CHAT,
+    liveGroupSignal: false,
+  });
+  assert.ok(st.baselineSeenStableIds.has(historyId));
+  assert.ok(st.baselineSeenStableIds.has(tailId));
+  assert.equal(st.baselineDeferredTailUser, null);
 
-  const { survivors, droppedBaseline } = filterGuaranteeFirstEligibleUserRows({
+  const { survivors, droppedBaseline, droppedDone } = filterGuaranteeFirstEligibleUserRows({
     userMessages: sorted,
     freshState: st,
     chatKey: CHAT,
     extractedList: sorted,
   });
   assert.equal(survivors.length, 0);
-  assert.ok(droppedBaseline.some((d) => d.stableId === tailId));
+  assert.ok(
+    droppedDone.includes(tailId) ||
+      droppedBaseline.some((d) => d.stableId === tailId)
+  );
+});
+
+test("guarantee-first: live newest tail deferral is not baseline-absorbed and admits once", () => {
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+  const history = mkRow({
+    text: "stonic available?",
+    dataId: "false_hist@c.us_H",
+    position: 0,
+  });
+  const tail = mkRow({
+    text: "Corolla do din k liy book krni h",
+    dataId: "3EB0FRESH_LIVE_TAIL",
+    position: 4,
+  });
+  const sorted = [history, tail];
+  const historyId = buildStableMessageKey(history, sorted).id;
+  const tailId = buildStableMessageKey(tail, sorted).id;
+  const st = mkFreshState();
+  st.baselineEstablishedAtMs = null;
+  const baseline = establishFreshDeltaStartupBaseline({
+    freshState: st,
+    sortedWithPos: sorted,
+    userMessages: sorted,
+    chatKey: CHAT,
+    liveGroupSignal: true,
+  });
+  const deferral = baseline.deferredTail;
+  assert.equal(deferral?.stableId, tailId);
+  assert.ok(st.baselineSeenStableIds.has(historyId));
+  assert.ok(!st.baselineSeenStableIds.has(tailId));
+  assert.equal(st.acknowledgedAnchorIndex, 0);
+
+  const directDeferral = resolveBaselineTailUserDeferral({
+    anchorRow: tail,
+    anchorIndex: 1,
+    chatKey: CHAT,
+    sortedWithPos: sorted,
+    liveGroupSignal: true,
+  });
+  assert.equal(directDeferral?.stableId, tailId);
+
+  const { survivors, droppedBaseline, droppedDone } = filterGuaranteeFirstEligibleUserRows({
+    userMessages: sorted,
+    acknowledgedAnchorIndex: st.acknowledgedAnchorIndex,
+    resolvedAnchorIndex: st.acknowledgedAnchorIndex,
+    freshState: st,
+    chatKey: CHAT,
+    extractedList: sorted,
+  });
+
+  assert.equal(survivors.length, 1);
+  assert.equal(survivors[0].text, "Corolla do din k liy book krni h");
+  assert.ok(droppedDone.includes(historyId));
+  assert.ok(!droppedBaseline.some((d) => d.stableId === tailId));
+
+  markInboundTurnLedgerDone({
+    chatKey: CHAT,
+    stableId: tailId,
+    guaranteeKey: `${CHAT}::${tailId}`,
+    replySent: true,
+    textPreview: tail.text,
+  });
+
+  const replay = filterGuaranteeFirstEligibleUserRows({
+    userMessages: [tail],
+    acknowledgedAnchorIndex: 0,
+    resolvedAnchorIndex: 0,
+    freshState: {
+      ...mkFreshState(),
+      baselineDeferredTailUser: deferral,
+    },
+    chatKey: CHAT,
+    extractedList: sorted,
+  });
+  assert.equal(replay.survivors.length, 0);
+  assert.ok(replay.droppedDone.includes(tailId));
+});
+
+test("guarantee-first: live tail deferral requires live signal and prior anchor", () => {
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+  const history = mkRow({
+    text: "stonic available?",
+    dataId: "false_hist@c.us_H2",
+    position: 0,
+  });
+  const tail = mkRow({
+    text: "Corolla do din k liy book krni h",
+    dataId: "3EB0FRESH_LIVE_TAIL_NO_SIGNAL",
+    position: 4,
+  });
+  const sorted = [history, tail];
+  assert.equal(
+    resolveBaselineTailUserDeferral({
+      anchorRow: tail,
+      anchorIndex: 1,
+      chatKey: CHAT,
+      sortedWithPos: sorted,
+      liveGroupSignal: false,
+    }),
+    null
+  );
+  assert.equal(
+    resolveBaselineTailUserDeferral({
+      anchorRow: tail,
+      anchorIndex: 0,
+      chatKey: CHAT,
+      sortedWithPos: [tail],
+      liveGroupSignal: true,
+    }),
+    null
+  );
+});
+
+test("guarantee-first: persisted baseline_absorbed row remains blocked", () => {
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+  const row = mkRow({
+    text: "Corolla do din k liy book krni h",
+    dataId: "3EB0PERSISTED_BASELINE",
+    position: 4,
+  });
+  const sorted = [row];
+  const stableId = buildStableMessageKey(row, sorted).id;
+  markInboundTurnLedgerBaselineAbsorbed({
+    chatKey: CHAT,
+    stableId,
+    textPreview: row.text,
+  });
+
+  const { survivors, droppedDone } = filterGuaranteeFirstEligibleUserRows({
+    userMessages: sorted,
+    acknowledgedAnchorIndex: 0,
+    resolvedAnchorIndex: 0,
+    freshState: mkFreshState(),
+    chatKey: CHAT,
+    extractedList: sorted,
+  });
+
+  assert.equal(survivors.length, 0);
+  assert.ok(droppedDone.includes(stableId));
 });
 
 test("guarantee-first: tail user without deferral stays baseline-blocked", () => {

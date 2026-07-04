@@ -43,7 +43,6 @@ import {
 import {
   hydrateInboundTurnLedgerIntoMessageState,
   isInboundTurnLedgerEnabled,
-  isInboundTurnLedgerDone,
   markInboundTurnLedgerBaselineAbsorbed,
   markInboundTurnLedgerProcessing,
   resolveInboundTurnAdmissionBlock,
@@ -4711,13 +4710,18 @@ function matchesBaselineDeferredTailUser(msg, freshState, extractedList) {
 }
 
 /**
- * At first chat open: defer the tail verified user row (not done in ledger) for post-baseline forward.
- * @param {{ anchorRow: object | null, anchorIndex: number, chatKey: string, sortedWithPos: object[] }} p
+ * At first chat open: defer the live-signaled tail verified user row for post-baseline forward.
+ * @param {{ anchorRow: object | null, anchorIndex: number, chatKey: string, sortedWithPos: object[], liveGroupSignal?: boolean }} p
  * @returns {{ stableId: string, hold: object } | null}
  */
 export function resolveBaselineTailUserDeferral(p) {
-  const { anchorRow, anchorIndex, chatKey, sortedWithPos } = p;
+  const { anchorRow, anchorIndex, chatKey, sortedWithPos, liveGroupSignal = false } = p;
+  if (!liveGroupSignal) return null;
   if (!anchorRow) return null;
+  if (!Array.isArray(sortedWithPos) || anchorIndex !== sortedWithPos.length - 1) {
+    return null;
+  }
+  if (anchorIndex <= 0) return null;
   const anchorAssistant = freshDeltaAssistantLikeDetail(anchorRow, chatKey);
   if (!isVerifiedFreshDeltaUserRow(anchorRow, chatKey)) return null;
   if (anchorAssistant.assistantLike) return null;
@@ -4730,12 +4734,18 @@ export function resolveBaselineTailUserDeferral(p) {
   );
   const stableId = String(holdStableId ?? "").trim();
   if (!stableId) return null;
-  if (isInboundTurnLedgerEnabled() && isInboundTurnLedgerDone(chatKey, stableId)) {
-    return null;
+  if (!stableId.startsWith("wa::")) return null;
+  if (isInboundTurnLedgerEnabled()) {
+    const ledgerBlock = resolveInboundTurnAdmissionBlock({
+      chatKey,
+      stableId,
+      textPreview: String(anchorRow?.text ?? "").slice(0, 120),
+    });
+    if (ledgerBlock.blocked) return null;
   }
   const guaranteeKey = playwrightGuaranteeKeyForStableId(chatKey, stableId);
   const st = guaranteeKey ? getMessageState(guaranteeKey) : null;
-  if (st?.state === "done") return null;
+  if (st?.state === "done" || st?.state === "processing") return null;
   return {
     stableId,
     hold: {
@@ -4745,6 +4755,103 @@ export function resolveBaselineTailUserDeferral(p) {
       anchorIndexAtBaseline: anchorIndex,
       consumed: false,
     },
+  };
+}
+
+/**
+ * Establishes per-chat startup baseline without permanently absorbing one live-signaled tail row.
+ * Older visible rows remain baseline-absorbed.
+ * @param {{ freshState: object, sortedWithPos: object[], userMessages: object[], chatKey: string, liveGroupSignal?: boolean }} p
+ * @returns {{ baselineSeen: Set<string>, tailAnchor: object | null, acknowledgedAnchorIndex: number, deferredTail: object | null }}
+ */
+export function establishFreshDeltaStartupBaseline(p) {
+  const {
+    freshState,
+    sortedWithPos,
+    userMessages,
+    chatKey,
+    liveGroupSignal = false,
+  } = p;
+  const anchorIndex = sortedWithPos.length - 1;
+  const tailAnchor = establishTailAnchor(sortedWithPos, chatKey, sortedWithPos);
+  const deferral = resolveBaselineTailUserDeferral({
+    anchorRow: sortedWithPos[anchorIndex] || null,
+    anchorIndex,
+    chatKey,
+    sortedWithPos,
+    liveGroupSignal,
+  });
+  const deferredStableId = deferral?.stableId || "";
+  const effectiveAnchorIndex =
+    deferral && anchorIndex > 0 ? anchorIndex - 1 : anchorIndex;
+  const effectiveTailAnchor =
+    deferral && anchorIndex > 0
+      ? buildTailAnchorFromRow(
+          sortedWithPos[effectiveAnchorIndex],
+          effectiveAnchorIndex,
+          chatKey,
+          sortedWithPos
+        )
+      : tailAnchor;
+  const baselineSeen = new Set();
+
+  for (const msg of sortedWithPos) {
+    const sender = String(msg?.sender ?? "").trim() || "unknown";
+    const textPreview = String(msg?.text ?? "").slice(0, 80);
+    const assistantDetail = freshDeltaAssistantLikeDetail(msg, chatKey);
+    const { stableId } = resolvePlaywrightForwardIdentity(
+      chatKey,
+      msg,
+      0,
+      sortedWithPos
+    );
+    const isDeferredTail = stableId && stableId === deferredStableId;
+    if (stableId && !isDeferredTail) {
+      baselineSeen.add(stableId);
+      if (isInboundTurnLedgerEnabled()) {
+        markInboundTurnLedgerBaselineAbsorbed({
+          chatKey,
+          stableId,
+          textPreview,
+          sender,
+        });
+      }
+    }
+    console.log("[startup_baseline_row_absorbed]", {
+      chatKey,
+      stableId: stableId ?? null,
+      rowKey: String(msg?.__rowKey ?? "").trim() || null,
+      textPreview,
+      sender,
+      assistantLike: assistantDetail.assistantLike,
+      reason: isDeferredTail
+        ? "live_tail_deferred_from_baseline"
+        : assistantDetail.reason || "startup_visible_row",
+    });
+  }
+
+  freshState.baselineSeenStableIds = baselineSeen;
+  freshState.baselineSnapshotHash = String(computeSnapshotHash(userMessages) ?? "");
+  freshState.baselineEstablishedAtMs = Date.now();
+  freshState.acknowledgedAnchorIndex = effectiveAnchorIndex;
+  freshState.anchorHoldUserForward = null;
+  freshState.baselineDeferredTailUser = deferral?.hold || null;
+  freshState.baselineTailAnchor = effectiveTailAnchor;
+  freshState.currentTailAnchor = effectiveTailAnchor;
+
+  recordSessionVisibilityLedger(
+    freshState,
+    sortedWithPos,
+    effectiveAnchorIndex,
+    chatKey,
+    sortedWithPos
+  );
+
+  return {
+    baselineSeen,
+    tailAnchor: effectiveTailAnchor,
+    acknowledgedAnchorIndex: effectiveAnchorIndex,
+    deferredTail: deferral?.hold || null,
   };
 }
 
@@ -7084,6 +7191,7 @@ async function runListenerBody() {
         let skipRotation = false;
         let selectedChatReason = null;
         let dmProbeRestoreTarget = null;
+        let selectedGroupLiveSignal = false;
 
         if (globalThis.__forceNextChat) {
           const forcedChatId = String(globalThis.__forceNextChat).trim();
@@ -7211,6 +7319,7 @@ async function runListenerBody() {
           if (hot) {
             chatName = hot;
             skipRotation = true;
+            selectedGroupLiveSignal = true;
             rotationIdleCount = 0;
             const cur = String(activeNowForStickiness ?? "").trim();
             if (cur && normalize(hot) !== normalize(cur)) {
@@ -7278,6 +7387,7 @@ async function runListenerBody() {
             globalThis.__activeChatTitle = chatName;
             globalThis.__activeChatInFocus = chatName;
             globalThis.__activeChatFocusUntil = Date.now() + 15_000;
+            selectedGroupLiveSignal = true;
             console.log("🚨 INTERRUPT: switching to new inbound chat", chatName);
           } else if (interruptChat && interruptIsSameActiveChat) {
             chatName =
@@ -7286,6 +7396,7 @@ async function runListenerBody() {
               interruptChat;
             globalThis.__activeChatTitle = chatName;
             globalThis.__activeChatInFocus = chatName;
+            selectedGroupLiveSignal = true;
             console.log("🧷 SAME CHAT: continuing active flow", chatName);
           } else if (isActiveChatValid) {
             chatName = globalThis.__activeChatInFocus;
@@ -7759,80 +7870,32 @@ async function runListenerBody() {
             });
             // Seed baseline on first open and return (no forward).
             if (!freshState.baselineEstablishedAtMs) {
-              const tailAnchor = establishTailAnchor(sortedWithPos, chatKey, sortedWithPos);
-              freshState.baselineTailAnchor = tailAnchor;
-              freshState.currentTailAnchor = tailAnchor;
-              const anchorIndex = sortedWithPos.length - 1;
-              const baselineSeen = new Set();
-              for (const msg of sortedWithPos) {
-                const sender = String(msg?.sender ?? "").trim() || "unknown";
-                const textPreview = String(msg?.text ?? "").slice(0, 80);
-                const assistantDetail = freshDeltaAssistantLikeDetail(msg, chatKey);
-                const { stableId } = resolvePlaywrightForwardIdentity(
-                  chatKey,
-                  msg,
-                  0,
-                  sortedWithPos
-                );
-                if (stableId) {
-                  baselineSeen.add(stableId);
-                  if (isInboundTurnLedgerEnabled()) {
-                    markInboundTurnLedgerBaselineAbsorbed({
-                      chatKey,
-                      stableId,
-                      textPreview,
-                      sender,
-                    });
-                  }
-                  console.log("[startup_baseline_row_absorbed]", {
-                    chatKey,
-                    stableId: stableId ?? null,
-                    rowKey: String(msg?.__rowKey ?? "").trim() || null,
-                    textPreview,
-                    sender,
-                    assistantLike: assistantDetail.assistantLike,
-                    reason: assistantDetail.reason || "startup_visible_row",
-                  });
-                } else {
-                  console.log("[startup_baseline_row_absorbed]", {
-                    chatKey,
-                    stableId: stableId ?? null,
-                    rowKey: String(msg?.__rowKey ?? "").trim() || null,
-                    textPreview,
-                    sender,
-                    assistantLike: assistantDetail.assistantLike,
-                    reason: assistantDetail.reason || "startup_visible_row",
-                  });
-                }
-              }
-              freshState.baselineSeenStableIds = baselineSeen;
-              freshState.baselineSnapshotHash = String(computeSnapshotHash(userMessages) ?? "");
-              freshState.baselineEstablishedAtMs = Date.now();
-              freshState.acknowledgedAnchorIndex = anchorIndex;
-              freshState.anchorHoldUserForward = null;
-              freshState.baselineDeferredTailUser = null;
-              recordSessionVisibilityLedger(
+              const baseline = establishFreshDeltaStartupBaseline({
                 freshState,
                 sortedWithPos,
-                anchorIndex,
+                userMessages,
                 chatKey,
-                sortedWithPos
-              );
+                liveGroupSignal: selectedGroupLiveSignal,
+              });
               console.log("[fresh_delta_tail_anchor_established]", {
                 chatKey,
-                stableId: tailAnchor?.stableId ?? null,
-                __position: tailAnchor?.__position ?? anchorIndex,
-                sender: tailAnchor?.sender ?? null,
+                stableId: baseline.tailAnchor?.stableId ?? null,
+                __position:
+                  baseline.tailAnchor?.__position ?? baseline.acknowledgedAnchorIndex,
+                sender: baseline.tailAnchor?.sender ?? null,
                 textPreview: String(
-                  sortedWithPos[anchorIndex]?.text ?? ""
+                  sortedWithPos[baseline.acknowledgedAnchorIndex]?.text ?? ""
                 ).slice(0, 80),
-                baselineSeenCount: baselineSeen.size,
+                baselineSeenCount: baseline.baselineSeen.size,
+                deferredTailStableId: baseline.deferredTail?.stableId ?? null,
               });
               console.log("[startup_baseline_established]", {
                 chatKey,
-                baselineSeenCount: baselineSeen.size,
+                baselineSeenCount: baseline.baselineSeen.size,
                 snapshotHash: freshState.baselineSnapshotHash || null,
                 catchupMs: PLAYWRIGHT_FRESH_DELTA_CATCHUP_MS,
+                liveGroupSignal: selectedGroupLiveSignal,
+                deferredTail: Boolean(baseline.deferredTail),
               });
               return;
             }
