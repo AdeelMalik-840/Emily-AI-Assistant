@@ -258,18 +258,108 @@ const normalize = (s) =>
     .replace(/\s+/g, " ");
 
 /**
- * Click the sidebar row for the expected chat title (recover focus before send).
- * @param {import("playwright").Page} page
- * @param {string} chatTitle
- * @returns {Promise<boolean>}
+ * Pure group-focus resolver: exact title first, then unique normalized sidebar match.
+ * @param {string} expectedTitle
+ * @param {{ headerTitle?: string | null, sidebarTitles?: string[] }} context
+ * @returns {{ ok: boolean, reason?: string, matchedTitle?: string, alreadyFocused?: boolean }}
  */
-export async function refocusChatRowForTitle(page, chatTitle) {
-  const name = String(chatTitle ?? "").trim();
-  if (!name) return false;
+export function resolveGroupFocusMatch(
+  expectedTitle,
+  { headerTitle = null, sidebarTitles = [] } = {}
+) {
+  const expected = String(expectedTitle ?? "").trim();
+  if (!expected) return { ok: false, reason: "GROUP_FOCUS_FAILED" };
+
+  const expectedNorm = normalize(expected);
+  const header = String(headerTitle ?? "").trim();
+  const headerNorm = normalize(header);
+
+  if (headerNorm && headerNorm === expectedNorm) {
+    return { ok: true, matchedTitle: header, alreadyFocused: true };
+  }
+
+  const sidebar = sidebarTitles.map((t) => String(t ?? "").trim()).filter(Boolean);
+  const normalizedMatches = sidebar.filter((t) => normalize(t) === expectedNorm);
+
+  const exactMatches = sidebar.filter((t) => t === expected);
+  if (exactMatches.length === 1) {
+    if (normalizedMatches.length > 1) {
+      return { ok: false, reason: "AMBIGUOUS_GROUP_TITLE" };
+    }
+    return { ok: true, matchedTitle: exactMatches[0], alreadyFocused: false };
+  }
+  if (exactMatches.length > 1) {
+    return { ok: false, reason: "AMBIGUOUS_GROUP_TITLE" };
+  }
+
+  if (normalizedMatches.length === 1) {
+    return { ok: true, matchedTitle: normalizedMatches[0], alreadyFocused: false };
+  }
+  if (normalizedMatches.length > 1) {
+    return { ok: false, reason: "AMBIGUOUS_GROUP_TITLE" };
+  }
+
+  return { ok: false, reason: "GROUP_FOCUS_FAILED" };
+}
+
+/**
+ * @param {import("playwright").Page} page
+ * @returns {Promise<string[]>}
+ */
+async function collectSidebarChatTitles(page) {
+  return page.evaluate(() => {
+    const titles = [];
+    for (const row of document.querySelectorAll('#pane-side div[role="row"]')) {
+      const span = row.querySelector("span[title]");
+      const title = span?.getAttribute("title")?.trim();
+      if (title) titles.push(title);
+    }
+    return titles;
+  });
+}
+
+/**
+ * Resolve and focus the expected group chat (MVP-safe title matching).
+ * @param {import("playwright").Page} page
+ * @param {string} expectedTitle
+ * @returns {Promise<{ ok: boolean, reason?: string, matchedTitle?: string, alreadyFocused?: boolean }>}
+ */
+export async function resolveGroupFocusForExpectedTitle(page, expectedTitle) {
+  const expected = String(expectedTitle ?? "").trim();
+  if (!expected) return { ok: false, reason: "GROUP_FOCUS_FAILED" };
+
+  let headerTitle = null;
+  try {
+    headerTitle = await readOpenConversationHeaderTitle(page);
+  } catch {
+    headerTitle = null;
+  }
+
+  const headerNorm = normalize(String(headerTitle ?? "").trim());
+  const expectedNorm = normalize(expected);
+  if (headerNorm && headerNorm === expectedNorm) {
+    globalThis.__currentOpenChatTitle = headerTitle;
+    globalThis.__currentOpenChatTitleTS = Date.now();
+    return { ok: true, matchedTitle: headerTitle, alreadyFocused: true };
+  }
+
+  const sidebarTitles = await collectSidebarChatTitles(page).catch(() => []);
+  const match = resolveGroupFocusMatch(expected, { headerTitle, sidebarTitles });
+  if (!match.ok) return match;
+
+  if (match.alreadyFocused) {
+    globalThis.__currentOpenChatTitle = match.matchedTitle || headerTitle;
+    globalThis.__currentOpenChatTitleTS = Date.now();
+    return match;
+  }
+
+  const name = match.matchedTitle;
+  if (!name) return { ok: false, reason: "GROUP_FOCUS_FAILED" };
+
   try {
     await page.evaluate((n) => {
-      const row = [...document.querySelectorAll('#pane-side div[role="row"]')].find(
-        (r) => r.querySelector(`span[title="${n}"]`)
+      const row = [...document.querySelectorAll('#pane-side div[role="row"]')].find((r) =>
+        r.querySelector(`span[title="${n}"]`)
       );
       if (row) row.scrollIntoView({ block: "center" });
     }, name);
@@ -278,20 +368,30 @@ export async function refocusChatRowForTitle(page, chatTitle) {
       .locator('#pane-side div[role="row"]')
       .filter({ has: page.locator(`span[title="${name}"]`) })
       .first();
-    if (await chatRow.isVisible().catch(() => false)) {
-      await chatRow.scrollIntoViewIfNeeded();
-      await chatRow.click({ timeout: 2000 });
-    } else {
-      return false;
+    if (!(await chatRow.isVisible().catch(() => false))) {
+      return { ok: false, reason: "GROUP_FOCUS_FAILED" };
     }
+    await chatRow.scrollIntoViewIfNeeded();
+    await chatRow.click({ timeout: 2000 });
     await page.waitForTimeout(300);
     globalThis.__currentOpenChatTitle = name;
     globalThis.__currentOpenChatTitleTS = Date.now();
-    return true;
+    return { ok: true, matchedTitle: name, alreadyFocused: false };
   } catch (e) {
-    console.warn("[playwrightOutbound] refocusChatRowForTitle:", e?.message || e);
-    return false;
+    console.warn("[playwrightOutbound] resolveGroupFocusForExpectedTitle:", e?.message || e);
+    return { ok: false, reason: "GROUP_FOCUS_FAILED" };
   }
+}
+
+/**
+ * Click the sidebar row for the expected chat title (recover focus before send).
+ * @param {import("playwright").Page} page
+ * @param {string} chatTitle
+ * @returns {Promise<boolean>}
+ */
+export async function refocusChatRowForTitle(page, chatTitle) {
+  const result = await resolveGroupFocusForExpectedTitle(page, chatTitle);
+  return result.ok === true;
 }
 
 /**
