@@ -385,6 +385,20 @@ function createFakePageForLocatorResolution(messageIns = []) {
   function clean(value) {
     return String(value ?? "").replace(/\s+/g, " ").trim();
   }
+  function nodesMatchingPartialDataId(nodes, selectorText) {
+    const partialDataIdMatch = String(selectorText || "").match(/\[data-id\*="([^"]+)"\]/i);
+    if (!partialDataIdMatch) return null;
+    const needle = clean(partialDataIdMatch[1]);
+    return nodes.filter((n) => {
+      const ids = [
+        clean(n.messageId),
+        clean(n.parentMessageId),
+        clean(n.childMessageId),
+        ...(Array.isArray(n.childMessageIds) ? n.childMessageIds.map(clean) : []),
+      ].filter(Boolean);
+      return ids.some((id) => id.includes(needle));
+    });
+  }
   const rendered = new Set(
     messageIns
       .map((_, index) => index)
@@ -399,6 +413,10 @@ function createFakePageForLocatorResolution(messageIns = []) {
     }
     locator(selector) {
       const selectorText = String(selector || "");
+      const partialDataIdNodes = nodesMatchingPartialDataId(this.nodes, selectorText);
+      if (partialDataIdNodes) {
+        return new Locator(partialDataIdNodes, selector);
+      }
       const exactConvMsgMatch = selectorText.match(/\[data-testid="conv-msg-([^"]+)"\]/i);
       if (exactConvMsgMatch) {
         const needle = clean(exactConvMsgMatch[1]);
@@ -725,6 +743,10 @@ function createFakePageForLocatorResolution(messageIns = []) {
     },
     locator(selector) {
       const selectorText = String(selector || "");
+      const partialDataIdNodes = nodesMatchingPartialDataId(renderedNodes(), selectorText);
+      if (partialDataIdNodes) {
+        return new Locator(partialDataIdNodes, selector);
+      }
       const exactConvMsgMatch = selectorText.match(/\[data-testid="conv-msg-([^"]+)"\]/i);
       if (exactConvMsgMatch) {
         const needle = clean(exactConvMsgMatch[1]);

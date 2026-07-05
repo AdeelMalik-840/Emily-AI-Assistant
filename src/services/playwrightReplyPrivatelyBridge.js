@@ -2,6 +2,7 @@ import {
   getPlaywrightOutboundPage,
   readOpenConversationHeaderTitle,
   refocusChatRowForTitle,
+  resolveGroupFocusForExpectedTitle,
   sendPlaywrightActiveChatText,
 } from "./playwrightOutboundBridge.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
@@ -107,6 +108,37 @@ function sourceMessageIdCandidates(sourceMessage = {}) {
   return [...out];
 }
 
+const INTERNAL_PARTICIPANT_DISPLAY_MARKERS = new Set(["stable", "unresolved", "scope"]);
+
+/** Strip internal turn-context markers and key fragments from participant display-name fields. */
+export function sanitizeParticipantDisplayName(value) {
+  const text = clean(value);
+  if (!text) return "";
+  const normalized = text.toLowerCase();
+  if (INTERNAL_PARTICIPANT_DISPLAY_MARKERS.has(normalized)) return "";
+  if (/^scope::/i.test(text)) return "";
+  if (/^first-seen[-\s]?\d+$/i.test(text)) return "";
+  return text;
+}
+
+/** Short hex ids derived from sourceMessageId/sourceRowKey for partial DOM data-id lookup. */
+export function partialDataIdLookupNeedles(sourceMessage = {}) {
+  return sourceMessageIdCandidates(sourceMessage).filter((id) => /^[A-F0-9]{8,}$/i.test(id));
+}
+
+function isLongFormPartialDataIdMatch(dataIds = [], shortId = "") {
+  const normalizedShort = clean(shortId).toUpperCase();
+  if (!normalizedShort) return false;
+  for (const entry of dataIds) {
+    const raw = clean(entry?.raw ?? entry);
+    const normalized = clean(entry?.normalized ?? normalizeWhatsAppMessageId(raw)).toUpperCase();
+    if (normalized !== normalizedShort) continue;
+    if (/^false_.+_/i.test(raw) && raw.toUpperCase().includes(normalizedShort)) return true;
+    if (raw.length > normalizedShort.length && raw.toUpperCase().endsWith(normalizedShort)) return true;
+  }
+  return false;
+}
+
 function sourceTextCandidates(sourceMessage = {}) {
   const rawText = clean(
     sourceMessage.sourceText ??
@@ -200,12 +232,15 @@ function envFlagEnabled(name) {
     String(process.env[name] ?? "").trim() === "1";
 }
 
-function dmContactPhoneExtractionDryRunEnabled() {
-  return envFlagEnabled("PLAYWRIGHT_DM_CONTACT_PHONE_EXTRACTION_DRY_RUN");
+function dmContactPhoneExtractionEnabled() {
+  return (
+    envFlagEnabled("PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED") ||
+    envFlagEnabled("PLAYWRIGHT_DM_CONTACT_PHONE_EXTRACTION_ENABLED")
+  );
 }
 
-function dmContactPhoneExtractionEnabled() {
-  return envFlagEnabled("PLAYWRIGHT_DM_CONTACT_PHONE_EXTRACTION_ENABLED");
+function dmContactPhoneExtractionDryRunEnabled() {
+  return envFlagEnabled("PLAYWRIGHT_DM_CONTACT_PHONE_EXTRACTION_DRY_RUN");
 }
 
 function shouldRunLegacyContactPhonePersistence({ dryRun } = {}) {
@@ -379,6 +414,57 @@ export function __buildLegacyBookingContactPhonePatchForTests(data, phone) {
  * @param {import("playwright").Page} page
  * @returns {Promise<string|null>}
  */
+/**
+ * Extract a customer phone from the currently open DM using Contact info panel.
+ * Does not persist to bookings; availability flow stores on availabilityRequest.
+ * @param {import('playwright').Page | null | undefined} pageInput
+ * @param {{ businessId?: string, requestId?: string, expectedDmChatKey?: string, expectedDmTitle?: string }} ctx
+ */
+export async function extractDmContactPhoneFromOpenChat(pageInput, ctx = {}) {
+  if (!contactInfoPhoneExtractionEnabled() && !dmContactPhoneExtractionDryRunEnabled()) {
+    return { ok: false, reason: "PHONE_EXTRACTION_DISABLED" };
+  }
+  const page = pageInput || getPlaywrightOutboundPage();
+  if (!page || (typeof page.isClosed === "function" && page.isClosed())) {
+    return { ok: false, reason: "NO_ACTIVE_PAGE" };
+  }
+  const dry = await runDmContactPhoneExtractionDryRun(page, ctx);
+  if (!dry?.ok) {
+    return { ok: false, reason: dry?.reason || "CONTACT_PANEL_FAILED" };
+  }
+  const activeTitle = await readOpenConversationHeaderTitle(page).catch(() => "");
+  const activeKey = normalizeTitle(activeTitle);
+  const headerTitle = page.locator("#main header span[title]").first();
+  const headerTitleCount = await headerTitle.count().catch(() => 0);
+  if (headerTitleCount === 0) {
+    return { ok: false, reason: "HEADER_TITLE_NOT_FOUND" };
+  }
+  await headerTitle.click({ timeout: 1000 }).catch(() => null);
+  await page.waitForTimeout(250).catch(() => null);
+  const phone = await extractActiveDmContactPhone(page).catch(() => null);
+  await page.keyboard.press("Escape").catch(() => null);
+  await page.waitForTimeout(250).catch(() => null);
+  const normalized = normalizePhone(phone);
+  if (!normalized) {
+    return {
+      ok: false,
+      reason: "NO_PHONE_EXTRACTED",
+      panelDetected: dry.panelDetected === true,
+      contactInfo: { displayName: clean(activeTitle) || clean(ctx.expectedDmTitle) || null },
+    };
+  }
+  return {
+    ok: true,
+    phone: normalized,
+    panelDetected: dry.panelDetected === true,
+    contactInfo: {
+      displayName: clean(activeTitle) || clean(ctx.expectedDmTitle) || null,
+      dmChatTitle: clean(ctx.expectedDmTitle) || clean(activeTitle) || null,
+      dmPlaywrightChatKey: clean(ctx.expectedDmChatKey) || activeKey || null,
+    },
+  };
+}
+
 export async function extractActiveDmContactPhone(page) {
   if (!page) return null;
   const startedAt = Date.now();
@@ -2792,7 +2878,7 @@ async function recoverGroupViewForRetry(page, expectedGroupTitle) {
 
 function sourceBubbleSearchTerms(sourceMessage = {}) {
   const participant =
-    clean(
+    sanitizeParticipantDisplayName(
       sourceMessage.sourceParticipantName ??
         sourceMessage.participantName ??
         sourceMessage.sourceParticipantDisplayName ??
@@ -2812,12 +2898,13 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
     sourceBubbleSearchTerms(sourceMessage);
   const expected = {
     bookingId: clean(bookingId) || null,
-    expectedParticipantName: clean(
-      sourceMessage?.sourceParticipantName ??
-        sourceMessage?.participantName ??
-        sourceMessage?.sourceParticipantDisplayName ??
-        sourceMessage?.participantDisplayName
-    ) || null,
+    expectedParticipantName:
+      sanitizeParticipantDisplayName(
+        sourceMessage?.sourceParticipantName ??
+          sourceMessage?.participantName ??
+          sourceMessage?.sourceParticipantDisplayName ??
+          sourceMessage?.participantDisplayName
+      ) || null,
     expectedParticipantKey: clean(
       sourceMessage?.sourceParticipantKey ??
         sourceMessage?.participantKey ??
@@ -2957,8 +3044,11 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
             if (!raw) return "";
             const withoutPrefix = raw.replace(/^wa::/i, "");
             const rowMatch = withoutPrefix.match(/^real:([^#\s]+)(?:#\d+)?$/i);
-            const id = rowMatch ? rowMatch[1] : withoutPrefix;
-            return clean(id.replace(/^message::/i, ""));
+            let id = rowMatch ? rowMatch[1] : withoutPrefix;
+            id = clean(id.replace(/^message::/i, ""));
+            const falseSuffix = id.match(/_([A-F0-9]{8,})$/i);
+            if (falseSuffix) return clean(falseSuffix[1]);
+            return id;
           };
           const addId = (bucket, source, value) => {
             const raw = clean(value);
@@ -3895,8 +3985,11 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
           if (!raw) return "";
           const withoutPrefix = raw.replace(/^wa::/i, "");
           const rowMatch = withoutPrefix.match(/^real:([^#\s]+)(?:#\d+)?$/i);
-          const id = rowMatch ? rowMatch[1] : withoutPrefix;
-          return clean(id.replace(/^message::/i, ""));
+          let id = rowMatch ? rowMatch[1] : withoutPrefix;
+          id = clean(id.replace(/^message::/i, ""));
+          const falseSuffix = id.match(/_([A-F0-9]{8,})$/i);
+          if (falseSuffix) return clean(falseSuffix[1]);
+          return id;
         };
         const addId = (bucket, source, value) => {
           const raw = clean(value);
@@ -4083,11 +4176,15 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       directConvMsgUsedAsCandidate = true;
       directConvMsgTextMatched = evaluated.exactTextMatched === true || evaluated.strippedTextMatched === true;
       directConvMsgParticipantMatched = evaluated.participantMatched === true;
+      const hasExpectedParticipantDisplay = Boolean(expected.expectedParticipantName);
       directConvMsgIdentityConfirmed =
         evaluated.convMsgAnchorFound === true &&
-        evaluated.convMsgAnchorIdentityConfirmed === true &&
         evaluated.sourceMessageConfirmed === true &&
-        evaluated.finalClickableResolvedToMessageIn === true;
+        evaluated.finalClickableResolvedToMessageIn === true &&
+        Boolean(evaluated.idMatched) &&
+        (hasExpectedParticipantDisplay
+          ? evaluated.convMsgAnchorIdentityConfirmed === true
+          : scopedCount <= 1 && globalCount <= 1);
       if (directConvMsgIdentityConfirmed) {
         directConvMsgPassedToOpenBubbleMenu = true;
         const directSourceProof = {
@@ -4144,6 +4241,96 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       reason: lastMissing || "DIRECT_CONV_MSG_IDENTITY_NOT_FOUND",
       rejectReason: lastMissing || "DIRECT_CONV_MSG_IDENTITY_NOT_FOUND",
       direct: true,
+    };
+  };
+
+  const tryPartialDataIdLookup = async (phase = "initial") => {
+    const { selector: scopeSelector, locator: scopeLocator } = await resolveConversationScopeLocator();
+    const needles = partialDataIdLookupNeedles(sourceMessage);
+    let lastMissing = null;
+
+    const collectIncomingIdMatches = async (rootLocator, shortId) => {
+      const count = await rootLocator.count().catch(() => 0);
+      const matches = [];
+      for (let i = 0; i < count; i += 1) {
+        const nodeLocator = rootLocator.nth(i);
+        const snapshot = await buildDirectConvMsgSnapshot(
+          nodeLocator,
+          `[data-id*="${shortId}"]`,
+          phase
+        );
+        if (!isLongFormPartialDataIdMatch(snapshot?.dataIds, shortId)) continue;
+        const evaluated = evaluateCandidateSnapshot(snapshot);
+        if (
+          evaluated.idMatched &&
+          evaluated.ok === true &&
+          evaluated.confidence === "id" &&
+          evaluated.clickableBubbleFound === true
+        ) {
+          matches.push({ evaluated, locator: nodeLocator });
+        }
+      }
+      return matches;
+    };
+
+    for (const shortId of needles) {
+      const partialSelector = `[data-id*="${shortId}"]`;
+      console.log("[reply_privately_partial_data_id_lookup_attempt]", {
+        bookingId: expected.bookingId,
+        phase,
+        scopeSelector: scopeSelector || null,
+        partialSelector,
+        shortId,
+      });
+
+      const scopedLocator = scopeLocator.locator(partialSelector);
+      const globalLocator = page.locator(partialSelector);
+      let matches = await collectIncomingIdMatches(scopedLocator, shortId);
+      if (matches.length === 0) {
+        matches = await collectIncomingIdMatches(globalLocator, shortId);
+      }
+
+      if (matches.length === 0) {
+        lastMissing = "PARTIAL_DATA_ID_NOT_FOUND";
+        continue;
+      }
+      if (matches.length > 1) {
+        return {
+          ok: false,
+          reason: "PARTIAL_DATA_ID_AMBIGUOUS",
+          rejectReason: "PARTIAL_DATA_ID_AMBIGUOUS",
+          direct: true,
+          evaluated: matches.map((entry) => entry.evaluated),
+        };
+      }
+
+      const { evaluated, locator: candidateLocator } = matches[0];
+      console.log("[reply_privately_partial_data_id_match_confirmed]", {
+        bookingId: expected.bookingId,
+        phase,
+        shortId,
+        normalizedSourceMessageId: evaluated.idMatched || shortId,
+      });
+      return {
+        ok: true,
+        selected: evaluated,
+        reason: "sourceMessageId",
+        strategy: "partial_data_id",
+        locator: candidateLocator,
+        direct: true,
+        sourceBubbleTextNeedle:
+          evaluated.sourceBubbleTextNeedle || sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle,
+        sourceBubbleTextNeedleType:
+          evaluated.sourceBubbleTextNeedleType ||
+          sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType,
+      };
+    }
+
+    return {
+      ok: false,
+      reason: lastMissing || "PARTIAL_DATA_ID_NOT_FOUND",
+      rejectReason: lastMissing || "PARTIAL_DATA_ID_NOT_FOUND",
+      direct: false,
     };
   };
 
@@ -4499,12 +4686,28 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
     return candidateRows().nth(Math.max(0, Number(candidate?.index) || 0));
   };
 
-  if (!participant || !text) {
+  const hasParticipantIdentity = Boolean(participant || expected.expectedParticipantKey);
+  const hasSourceIdAnchor =
+    idCandidates.length > 0 ||
+    Boolean(clean(expected.expectedSourceMessageId)) ||
+    Boolean(clean(expected.expectedSourceRowKey));
+
+  if (!text) {
     await recordStrategy({
       strategy: "precheck",
       locator: null,
       locatorDescription: null,
-      reason: !participant && !text ? "MISSING_PARTICIPANT_AND_TEXT" : !participant ? "MISSING_PARTICIPANT" : "MISSING_TEXT",
+      reason: "MISSING_TEXT",
+    });
+    await logResolutionFailedDetail();
+    return { ok: false, reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED", locator: null };
+  }
+  if (!hasParticipantIdentity && !hasSourceIdAnchor) {
+    await recordStrategy({
+      strategy: "precheck",
+      locator: null,
+      locatorDescription: null,
+      reason: "MISSING_PARTICIPANT",
     });
     await logResolutionFailedDetail();
     return { ok: false, reason: "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED", locator: null };
@@ -4557,6 +4760,53 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
       return {
         ok: false,
         reason: directSelection.reason,
+        locator: null,
+      };
+    }
+    const partialSelection = await tryPartialDataIdLookup(phase);
+    if (partialSelection?.ok && partialSelection.selected) {
+      console.log("[reply_privately_locator_verified]", {
+        bookingId: expected.bookingId,
+        strategy: partialSelection.strategy || "partial_data_id",
+        normalizedSourceMessageId: partialSelection.selected.idMatched || null,
+        selectedRowIndex: partialSelection.selected.index,
+        selectedTextPreview: clean(partialSelection.selected.textPreview).slice(0, 120) || null,
+        selectedParticipantPreview: clean(partialSelection.selected.participant).slice(0, 80) || null,
+        selectedLiveTag: partialSelection.selected.liveTag || null,
+        matchReasons: partialSelection.selected.matchReasons,
+      });
+      logDurableLocatorDiagnostics({
+        status: "success",
+        finalReason: partialSelection.reason,
+        evaluated: [partialSelection.selected],
+        scrollSteps: 0,
+      });
+      return {
+        ok: true,
+        reason: partialSelection.reason,
+        locator: locatorForSelectedCandidate(partialSelection.selected),
+        sourceBubbleTextNeedle:
+          partialSelection.sourceBubbleTextNeedle || sourceBubbleTextNeedleInfo.sourceBubbleTextNeedle,
+        sourceBubbleTextNeedleType:
+          partialSelection.sourceBubbleTextNeedleType ||
+          sourceBubbleTextNeedleInfo.sourceBubbleTextNeedleType,
+      };
+    }
+    if (
+      partialSelection?.direct === true &&
+      partialSelection?.reason &&
+      partialSelection.reason !== "PARTIAL_DATA_ID_NOT_FOUND"
+    ) {
+      logDurableLocatorDiagnostics({
+        status: "fail",
+        finalReason: partialSelection.reason,
+        ambiguityReason: partialSelection.rejectReason || "",
+        evaluated: partialSelection.evaluated || [],
+        scrollSteps: 0,
+      });
+      return {
+        ok: false,
+        reason: partialSelection.reason,
         locator: null,
       };
     }
@@ -4639,10 +4889,37 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
   const appendEvaluated = (evaluated) => {
     if (Array.isArray(evaluated)) aggregatedEvaluated.push(...evaluated);
   };
+  const failClosedSourceLocatorReasons = new Set([
+    "PARTIAL_DATA_ID_AMBIGUOUS",
+    "DIRECT_CONV_MSG_AMBIGUOUS",
+    "DIRECT_CONV_MSG_IDENTITY_FAILED",
+  ]);
+  const shouldAbortSourceLocatorSearch = (selection) =>
+    selection?.ok !== true &&
+    failClosedSourceLocatorReasons.has(clean(selection?.reason));
+  const finalizeFailClosedSelection = async (selection, scrollSteps = 0) => {
+    await logResolutionFailedDetail();
+    await logSourceRowNotVisibleAggregateDiagnostics({
+      scrollSteps,
+      finalReason: selection.reason,
+      ambiguityReason: selection.rejectReason || "",
+    });
+    logDurableLocatorDiagnostics({
+      status: "fail",
+      finalReason: selection.reason,
+      ambiguityReason: selection.rejectReason || "",
+      evaluated: selection.evaluated || [],
+      scrollSteps,
+    });
+    return { ok: false, reason: selection.reason, locator: null };
+  };
 
   const initialSelection = await trySelectFromRenderedRows("initial", { allowTextFallback: false });
   appendEvaluated(initialSelection.evaluated);
   if (initialSelection.ok) return initialSelection;
+  if (shouldAbortSourceLocatorSearch(initialSelection)) {
+    return finalizeFailClosedSelection(initialSelection);
+  }
 
   console.log("[reply_privately_source_scroll_search_started]", {
     bookingId: expected.bookingId,
@@ -4672,6 +4949,9 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
         step,
       });
       return selected;
+    }
+    if (shouldAbortSourceLocatorSearch(selected)) {
+      return finalizeFailClosedSelection(selected, scrollSteps);
     }
     lastSelection = selected;
     if (scrollResult?.ok === true && Number(scrollResult.before) === Number(scrollResult.after)) {
@@ -4876,9 +5156,9 @@ export async function replyPrivatelyToLatestUserMessage(opts = {}) {
         if (attempt > 1) {
           await recoverGroupViewForRetry(page, expectedGroupTitle);
         }
-        const focused = await refocusChatRowForTitle(page, expectedGroupTitle);
-        if (!focused) {
-          lastReason = "GROUP_FOCUS_FAILED";
+        const focusResult = await resolveGroupFocusForExpectedTitle(page, expectedGroupTitle);
+        if (!focusResult.ok) {
+          lastReason = focusResult.reason || "GROUP_FOCUS_FAILED";
           continue;
         }
         const activeGroupTitle = await readOpenConversationHeaderTitle(page);
