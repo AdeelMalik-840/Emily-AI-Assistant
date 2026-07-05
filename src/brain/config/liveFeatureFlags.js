@@ -86,6 +86,16 @@ export function isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled() {
   return envTruthy("EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE");
 }
 
+/** @returns {boolean} */
+export function isEmilyBrainV2AvailabilityConfirmExecuteEnabled() {
+  return envTruthy("EMILY_BRAIN_V2_AVAILABILITY_CONFIRM_EXECUTE");
+}
+
+/** @returns {boolean} */
+export function isPlaywrightContactInfoPhoneExtractionEnabled() {
+  return envTruthy("PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED");
+}
+
 /**
  * @returns {{
  *   live: boolean,
@@ -98,6 +108,8 @@ export function isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled() {
  *   availabilityOwnerCheckExecute: boolean,
  *   availabilityOwnerNotifyExecute: boolean,
  *   availabilityCustomerDmExecute: boolean,
+ *   availabilityConfirmExecute: boolean,
+ *   contactInfoPhoneExtraction: boolean,
  * }}
  */
 export function getEmilyBrainV2LiveFlagSnapshot() {
@@ -112,5 +124,7 @@ export function getEmilyBrainV2LiveFlagSnapshot() {
     availabilityOwnerCheckExecute: isEmilyBrainV2AvailabilityOwnerCheckExecuteEnabled(),
     availabilityOwnerNotifyExecute: isEmilyBrainV2AvailabilityOwnerNotifyExecuteEnabled(),
     availabilityCustomerDmExecute: isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled(),
+    availabilityConfirmExecute: isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
+    contactInfoPhoneExtraction: isPlaywrightContactInfoPhoneExtractionEnabled(),
   };
 }
