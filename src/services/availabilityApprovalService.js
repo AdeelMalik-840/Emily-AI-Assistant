@@ -1,4 +1,5 @@
 import db from "../config/firebase.js";
+import { normalizePhoneDigits } from "./businessWhatsApp.js";
 import {
   getAvailabilityRequest,
   updateAvailabilityRequestDecisionState,
@@ -9,8 +10,24 @@ function clean(value, max = 500) {
   return text ? text.slice(0, max) : "";
 }
 
-function normalizePhone(value) {
-  return clean(value, 32).replace(/[^\d+]/g, "");
+/**
+ * Canonical E.164-style owner phone for auth/logging (matches booking approval).
+ * @param {string | null | undefined} value
+ * @returns {string}
+ */
+function canonicalOwnerPhone(value) {
+  if (!value) return "";
+  const cleaned = String(value).replace(/[^\d+]/g, "").replace(/^\++/, "+");
+  if (!cleaned) return "";
+  if (cleaned.startsWith("+")) return cleaned;
+  if (cleaned.startsWith("92")) return `+${cleaned}`;
+  return `+92${cleaned.replace(/^0+/, "")}`;
+}
+
+function ownerPhonesMatch(ownerPhone, senderPhone) {
+  const ownerDigits = normalizePhoneDigits(ownerPhone);
+  const senderDigits = normalizePhoneDigits(senderPhone);
+  return Boolean(ownerDigits && senderDigits && ownerDigits === senderDigits);
 }
 
 function asPlainObject(value) {
@@ -87,8 +104,8 @@ async function resolveOwnerPhone({ db: connection, businessId }) {
         ? /** @type {Record<string, unknown>} */ (business.businessProfile)
         : {};
     return (
-      normalizePhone(profile.ownerNotificationPhone) ||
-      normalizePhone(business.ownerNotificationPhone) ||
+      canonicalOwnerPhone(profile.ownerNotificationPhone) ||
+      canonicalOwnerPhone(business.ownerNotificationPhone) ||
       ""
     );
   } catch (err) {
@@ -106,11 +123,11 @@ async function authorizeAvailabilityOwner({
   senderPhone,
 }) {
   const ownerPhone = await resolveOwnerPhone({ db: connection, businessId });
-  const sender = normalizePhone(senderPhone);
+  const sender = canonicalOwnerPhone(senderPhone);
   if (!ownerPhone || !sender) {
     return { ok: false, reason: "OWNER_AUTH_MISSING", ownerPhone: ownerPhone || null };
   }
-  if (ownerPhone !== sender) {
+  if (!ownerPhonesMatch(ownerPhone, senderPhone)) {
     return { ok: false, reason: "UNAUTHORIZED_OWNER", ownerPhone, senderPhone: sender };
   }
   return { ok: true, ownerPhone };
@@ -148,7 +165,12 @@ async function updateAvailabilityDecision({
       request: existing,
     };
   }
-  if (currentStatus && currentStatus !== "pending" && currentStatus !== "approved" && currentStatus !== "rejected") {
+  if (
+    currentStatus &&
+    currentStatus !== "pending" &&
+    currentStatus !== "approved" &&
+    currentStatus !== "rejected"
+  ) {
     return {
       ok: false,
       reason: "REQUEST_NOT_PENDING",
@@ -163,7 +185,7 @@ async function updateAvailabilityDecision({
     businessId,
     requestId,
     status: nextStatus,
-    ownerDecisionBy: normalizePhone(senderPhone) || clean(senderPhone),
+    ownerDecisionBy: canonicalOwnerPhone(senderPhone) || clean(senderPhone),
     ownerDecisionAt: new Date(),
     approvalCustomerNotificationStatus: "pending",
   });
@@ -199,12 +221,35 @@ export async function handleAvailabilityRequestApproval({
   buttonId,
 }) {
   const uid = resolveBusinessId({ businessId, userId });
-  if (!uid) return { ok: false, reason: "MISSING_BUSINESS_ID" };
+  if (!uid) {
+    console.warn("[availability_approval_handler_failed]", {
+      reason: "MISSING_BUSINESS_ID",
+      requestId: null,
+      senderPhone: canonicalOwnerPhone(senderPhone) || clean(senderPhone) || null,
+      ownerPhone: null,
+    });
+    return { ok: false, reason: "MISSING_BUSINESS_ID" };
+  }
 
   const parsed =
     parseAvailabilityApprovalMessage(messageText) ||
     parseAvailabilityApprovalButtonId(buttonId);
-  if (!parsed) return { ok: false, reason: "NOT_AVAILABILITY_APPROVAL" };
+  if (!parsed) {
+    console.warn("[availability_approval_handler_failed]", {
+      reason: "NOT_AVAILABILITY_APPROVAL",
+      requestId: null,
+      senderPhone: canonicalOwnerPhone(senderPhone) || clean(senderPhone) || null,
+      ownerPhone: null,
+    });
+    return { ok: false, reason: "NOT_AVAILABILITY_APPROVAL" };
+  }
+
+  console.log("[availability_approval_handler_started]", {
+    businessId: uid,
+    requestId: parsed.requestId,
+    action: parsed.action,
+    senderPhone: canonicalOwnerPhone(senderPhone) || clean(senderPhone) || null,
+  });
 
   const auth = await authorizeAvailabilityOwner({
     db: connection,
@@ -212,6 +257,12 @@ export async function handleAvailabilityRequestApproval({
     senderPhone,
   });
   if (!auth.ok) {
+    console.warn("[availability_approval_handler_failed]", {
+      reason: auth.reason,
+      requestId: parsed.requestId,
+      senderPhone: canonicalOwnerPhone(senderPhone) || clean(senderPhone) || null,
+      ownerPhone: auth.ownerPhone || null,
+    });
     return { ok: false, reason: auth.reason, ownerPhone: auth.ownerPhone || null };
   }
 
@@ -223,6 +274,13 @@ export async function handleAvailabilityRequestApproval({
     senderPhone,
   });
   if (!updated.ok) {
+    console.warn("[availability_approval_handler_failed]", {
+      reason: updated.reason || "UPDATE_FAILED",
+      requestId: parsed.requestId,
+      senderPhone: canonicalOwnerPhone(senderPhone) || clean(senderPhone) || null,
+      ownerPhone: auth.ownerPhone || null,
+      status: updated.status ?? null,
+    });
     return {
       ok: false,
       reason: updated.reason || "UPDATE_FAILED",
@@ -242,6 +300,7 @@ export async function handleAvailabilityRequestApproval({
     ok: true,
     requestId: parsed.requestId,
     status: updated.status,
+    alreadyProcessed: updated.alreadyProcessed === true,
     request: updated.request ?? null,
   };
 }

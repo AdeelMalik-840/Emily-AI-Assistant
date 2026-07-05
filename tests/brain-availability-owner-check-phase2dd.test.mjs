@@ -20,6 +20,9 @@ const BUSINESS_ID = "synthetic-car-rental-business-001";
 const OWNER_PHONE = "+923331234567";
 const CIVIC_ID = "honda_civic_2026_oriel_white_7e961e31";
 const CIVIC_REQUEST_ID = "avr_7a9c8f4c2d1e5b6a7c8d9e0f";
+const LIVE_OWNER_PHONE_E164 = "+923075344347";
+const LIVE_OWNER_WEBHOOK_SENDER = "923075344347";
+const LIVE_REQUEST_ID = "avr_43677a13ee375bde351f75ea";
 
 class FakeDocSnap {
   constructor(store, key) {
@@ -242,6 +245,44 @@ test("unauthorized owner cannot update availability request", async () => {
   assert.equal(stored.status, "pending");
 });
 
+test("webhook sender without plus matches stored owner phone for approve", async () => {
+  const fakeDb = new FakeDb();
+  await seedBusiness(fakeDb, LIVE_OWNER_PHONE_E164);
+  await seedAvailabilityRequest(fakeDb, LIVE_REQUEST_ID);
+
+  const result = await handleAvailabilityRequestApproval({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    senderPhone: LIVE_OWNER_WEBHOOK_SENDER,
+    messageText: `APPROVE ${LIVE_REQUEST_ID}`,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "approved");
+  const stored = getAvailabilityDoc(fakeDb, LIVE_REQUEST_ID);
+  assert.equal(stored.status, "approved");
+  assert.equal(stored.approvalCustomerNotificationStatus, "pending");
+});
+
+test("webhook sender without plus rejects wrong owner phone", async () => {
+  const fakeDb = new FakeDb();
+  await seedBusiness(fakeDb, LIVE_OWNER_PHONE_E164);
+  await seedAvailabilityRequest(fakeDb, LIVE_REQUEST_ID);
+
+  const result = await handleAvailabilityRequestApproval({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    senderPhone: "923001111111",
+    messageText: `APPROVE ${LIVE_REQUEST_ID}`,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "UNAUTHORIZED_OWNER");
+  const stored = getAvailabilityDoc(fakeDb, LIVE_REQUEST_ID);
+  assert.equal(stored.status, "pending");
+  assert.equal(stored.approvalCustomerNotificationStatus, "not_started");
+});
+
 test("approval stays pending when customer DM flag is off", async () => {
   const fakeDb = new FakeDb();
   await seedBusiness(fakeDb);
@@ -307,14 +348,94 @@ test("cloud DM sends approved availability copy and marks request sent", async (
   assert.equal(sendCalls.length, 1);
   assert.equal(sendCalls[0][0], "+923001111111");
   assert.match(sendCalls[0][1], /Honda Civic 2026 Oriel \(White\) 3 din ke liye available hai/);
+  assert.match(sendCalls[0][1], /3 din ka rent 45,000 PKR hoga/);
+  assert.match(sendCalls[0][1], /Book kar du\?/);
   const stored = getAvailabilityDoc(fakeDb, CIVIC_REQUEST_ID);
   assert.equal(stored.approvalCustomerNotificationStatus, "sent");
   assert.equal(stored.approvalCustomerNotificationMethod, "cloud_dm");
+  assert.equal(stored.customerConfirmationStatus, "waiting_confirm");
   assert.equal(stored.approvalCustomerNotificationError, undefined);
   assert.equal(fakeDb.docs.has(`businesses/${BUSINESS_ID}/bookings/${CIVIC_REQUEST_ID}`), false);
 });
 
-test("reply privately is used when cloud DM target is missing but Playwright source anchor exists", async () => {
+test("approved real message sent via reply privately when phone missing; no cloud duplicate", async () => {
+  const prevExtraction = process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED;
+  process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED = "true";
+  const fakeDb = new FakeDb();
+  await seedBusiness(fakeDb);
+  await seedAvailabilityRequest(fakeDb, CIVIC_REQUEST_ID, {
+    approvalCustomerNotificationStatus: "pending",
+    status: "approved",
+    customerDmTarget: "",
+    sourceChatId: "Rental Leads",
+    sourceChatType: "group",
+    sourceIdentity: {
+      participantKey: "cust-1",
+      participantIdentity: "Adeel malik",
+      chatId: "Rental Leads",
+      chatType: "group",
+      sourceMessageId: "msg-001",
+      sourceRowKey: "row-001",
+      sourceTurnKey: "turn-001",
+    },
+  });
+  const replyCalls = [];
+  const sendCalls = [];
+
+  try {
+    const result = await sendAvailabilityCustomerNotification({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: CIVIC_REQUEST_ID,
+      sendWhatsAppMessageFn: async (...args) => {
+        sendCalls.push(args);
+        return { ok: true };
+      },
+      replyPrivatelyFn: async (opts) => {
+        replyCalls.push(opts);
+        return {
+          ok: true,
+          verificationPassed: true,
+          dmOpened: true,
+          dmMessageSent: true,
+          dmChatTitle: "Adeel malik",
+          dmPlaywrightChatKey: "dm-adeel",
+        };
+      },
+      extractDmContactPhoneFn: async () => ({
+        ok: true,
+        phone: "+923001111111",
+        contactInfo: { displayName: "Adeel malik" },
+      }),
+      refocusGroupFn: async () => null,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.method, "reply_privately");
+    assert.equal(replyCalls.length, 1);
+    assert.match(replyCalls[0].message, /Honda Civic 2026 Oriel \(White\) 3 din ke liye available hai/);
+    assert.match(replyCalls[0].message, /Book kar du\?/);
+    assert.doesNotMatch(replyCalls[0].message, /Details DM pe share kar raha hun/i);
+    assert.equal(sendCalls.length, 0);
+    const stored = getAvailabilityDoc(fakeDb, CIVIC_REQUEST_ID);
+    assert.equal(stored.approvalCustomerNotificationStatus, "sent");
+    assert.equal(stored.approvalCustomerNotificationMethod, "reply_privately");
+    assert.equal(stored.customerConfirmationStatus, "waiting_confirm");
+    assert.equal(stored.customerConfirmationChannel, "reply_private_then_cloud_handoff");
+    assert.equal(stored.customerPhone, "+923001111111");
+    assert.equal(stored.phoneExtractionStatus, "extracted");
+  } finally {
+    if (prevExtraction === undefined) {
+      delete process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED;
+    } else {
+      process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED = prevExtraction;
+    }
+  }
+});
+
+test("rejected real message sent via reply privately when phone missing; no cloud duplicate", async () => {
+  const prevExtraction = process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED;
+  process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED = "true";
   const fakeDb = new FakeDb();
   await seedBusiness(fakeDb);
   await seedAvailabilityRequest(fakeDb, CIVIC_REQUEST_ID, {
@@ -334,34 +455,81 @@ test("reply privately is used when cloud DM target is missing but Playwright sou
     },
   });
   const replyCalls = [];
+  const sendCalls = [];
+
+  try {
+    const result = await sendAvailabilityCustomerNotification({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: CIVIC_REQUEST_ID,
+      sendWhatsAppMessageFn: async (...args) => {
+        sendCalls.push(args);
+        return { ok: true };
+      },
+      replyPrivatelyFn: async (opts) => {
+        replyCalls.push(opts);
+        return {
+          ok: true,
+          verificationPassed: true,
+          dmChatTitle: "Adeel malik",
+          dmPlaywrightChatKey: "dm-adeel",
+        };
+      },
+      extractDmContactPhoneFn: async () => ({
+        ok: true,
+        phone: "+923001111111",
+        contactInfo: { displayName: "Adeel malik" },
+      }),
+      refocusGroupFn: async () => null,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.method, "reply_privately");
+    assert.equal(replyCalls.length, 1);
+    assert.equal(replyCalls[0].message, "Sorry abi koi option available ni hai.");
+    assert.equal(sendCalls.length, 0);
+    const stored = getAvailabilityDoc(fakeDb, CIVIC_REQUEST_ID);
+    assert.equal(stored.approvalCustomerNotificationStatus, "sent");
+    assert.equal(stored.customerConfirmationStatus, "unavailable_no_options");
+    assert.notEqual(stored.customerConfirmationStatus, "waiting_confirm");
+  } finally {
+    if (prevExtraction === undefined) {
+      delete process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED;
+    } else {
+      process.env.PLAYWRIGHT_CONTACT_INFO_PHONE_EXTRACTION_ENABLED = prevExtraction;
+    }
+  }
+});
+
+test("missing customer DM target and missing Playwright anchor fail closed", async () => {
+  const fakeDb = new FakeDb();
+  await seedBusiness(fakeDb);
+  await seedAvailabilityRequest(fakeDb, CIVIC_REQUEST_ID, {
+    approvalCustomerNotificationStatus: "pending",
+    status: "rejected",
+    customerDmTarget: "+923001111111",
+  });
+  const sendCalls = [];
 
   const result = await pollLocalAvailabilityContinuations({
     db: fakeDb,
     ownerUserId: BUSINESS_ID,
     availabilityCustomerDmExecute: true,
-    sendWhatsAppMessageFn: async () => {
-      throw new Error("cloud DM should not be used without customerDmTarget");
+    sendWhatsAppMessageFn: async (...args) => {
+      sendCalls.push(args);
+      return { ok: true };
     },
-    replyPrivatelyFn: async (opts) => {
-      replyCalls.push(opts);
-      return {
-        ok: true,
-        verificationPassed: true,
-        dmOpened: true,
-        dmMessageSent: true,
-        dmChatTitle: "Adeel malik",
-        dmPlaywrightChatKey: "Rental Leads",
-      };
+    replyPrivatelyFn: async () => {
+      throw new Error("reply privately should not run when customer phone exists");
     },
   });
 
   assert.equal(result.ok, true);
-  assert.equal(replyCalls.length, 1);
-  assert.equal(replyCalls[0].bookingId, CIVIC_REQUEST_ID);
-  assert.match(replyCalls[0].message, /Sorry, Honda Civic 2026 Oriel \(White\) 3 din ke liye available nahi hai/);
+  assert.equal(sendCalls.length, 1);
+  assert.equal(sendCalls[0][1], "Sorry abi koi option available ni hai.");
   const stored = getAvailabilityDoc(fakeDb, CIVIC_REQUEST_ID);
   assert.equal(stored.approvalCustomerNotificationStatus, "sent");
-  assert.equal(stored.approvalCustomerNotificationMethod, "reply_privately");
+  assert.equal(stored.customerConfirmationStatus, "unavailable_no_options");
 });
 
 test("missing customer DM target and missing Playwright anchor fail closed", async () => {
@@ -402,8 +570,8 @@ test("missing customer DM target and missing Playwright anchor fail closed", asy
   assert.equal(result.ok, true);
   assert.equal(sendCalls.length, 0);
   const stored = getAvailabilityDoc(fakeDb, CIVIC_REQUEST_ID);
-  assert.equal(stored.approvalCustomerNotificationStatus, "skipped");
-  assert.match(String(stored.approvalCustomerNotificationError ?? ""), /MISSING/);
+  assert.equal(stored.approvalCustomerNotificationStatus, "failed");
+  assert.match(String(stored.approvalCustomerNotificationError ?? ""), /MISSING/i);
 });
 
 test("sent customer notification is idempotent", async () => {
@@ -436,22 +604,34 @@ test("sent customer notification is idempotent", async () => {
 });
 
 test("customer DM copy stays natural", () => {
-  const approved = buildAvailabilityCustomerNotificationMessage({
-    status: "approved",
-    itemLabel: "Honda Civic 2026 Oriel (White)",
-    requestedDuration: 3,
-  });
+  const approved = buildAvailabilityCustomerNotificationMessage(
+    {
+      status: "approved",
+      itemLabel: "Honda Civic 2026 Oriel (White)",
+      requestedDuration: 3,
+    },
+    {
+      priceQuote: {
+        status: "quoted",
+        total: 24000,
+        currency: "PKR",
+        durationDays: 3,
+      },
+    }
+  );
   const rejected = buildAvailabilityCustomerNotificationMessage({
     status: "rejected",
     itemLabel: "Honda Civic 2026 Oriel (White)",
     requestedDuration: 3,
   });
 
-  assert.match(approved, /Honda Civic 2026 Oriel \(White\) 3 din ke liye available hai\./);
-  assert.match(approved, /Booking continue kar dun\?/);
-  assert.match(rejected, /Sorry, Honda Civic 2026 Oriel \(White\) 3 din ke liye available nahi hai\./);
-  assert.match(rejected, /Koi aur car dekhni hai\?/);
-  assert.doesNotMatch(approved, /\b(action plan|ledger|system|pipeline|execution flag)\b/i);
-  assert.doesNotMatch(rejected, /\b(action plan|ledger|system|pipeline|execution flag)\b/i);
+  assert.equal(approved.ok, true);
+  assert.match(approved.message, /Honda Civic 2026 Oriel \(White\) 3 din ke liye available hai\./);
+  assert.match(approved.message, /3 din ka rent 24,000 PKR hoga/);
+  assert.match(approved.message, /Book kar du\?/);
+  assert.equal(rejected.ok, true);
+  assert.equal(rejected.message, "Sorry abi koi option available ni hai.");
+  assert.doesNotMatch(approved.message, /\b(action plan|ledger|system|pipeline|execution flag)\b/i);
+  assert.doesNotMatch(rejected.message, /\b(action plan|ledger|system|pipeline|execution flag)\b/i);
 });
 
