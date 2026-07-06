@@ -1,7 +1,27 @@
 import { createHash } from "node:crypto";
 import db from "../config/firebase.js";
+import { sanitizeParticipantDisplayName } from "./playwrightReplyPrivatelyBridge.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
+
+/** @type {ReadonlySet<string>} */
+export const ACTIVE_AVAILABILITY_REQUEST_STATUSES = new Set([
+  "pending",
+  "approved",
+  "processing",
+  "waiting_confirm",
+]);
+
+/** @type {ReadonlySet<string>} */
+export const FINAL_AVAILABILITY_REQUEST_STATUSES = new Set([
+  "rejected",
+  "declined",
+  "expired",
+  "completed",
+  "cancelled",
+  "notification_failed",
+]);
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -65,8 +85,157 @@ function buildAvailabilityRequestId(businessId, sourceTurnKey) {
   return `avr_${createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 24)}`;
 }
 
+function normalizeItemLabelForKey(value) {
+  return clean(value).toLowerCase().replace(/\s+/g, " ");
+}
+
+function buildDurationIdentityPart(requestedDuration, requestedDates = []) {
+  const duration = toFiniteNumber(requestedDuration);
+  if (duration != null && duration > 0) {
+    return `d:${Math.floor(duration)}`;
+  }
+  const dates = normalizeRequestedDates(requestedDates);
+  if (dates.length > 0) {
+    return `dates:${[...dates].sort().join("|")}`;
+  }
+  return "d:unknown";
+}
+
+/**
+ * Stable logical identity for semantic availability idempotency.
+ * @param {Record<string, unknown>} normalized
+ */
+export function buildLogicalAvailabilityRequestKey(normalized = {}) {
+  const businessId = clean(normalized.businessId);
+  const participantKey = clean(normalized.customerParticipantId);
+  const chatKey = clean(normalized.sourceChatId);
+  const itemId = clean(normalized.itemId);
+  const itemLabel = normalizeItemLabelForKey(normalized.itemLabel);
+  const durationPart = buildDurationIdentityPart(
+    normalized.requestedDuration,
+    normalized.requestedDates
+  );
+  if (!businessId || !participantKey || (!itemId && !itemLabel)) {
+    return "";
+  }
+  const itemPart = itemId ? `itemId:${itemId}` : `itemLabel:${itemLabel}`;
+  const raw = [
+    businessId,
+    `participant:${participantKey}`,
+    chatKey ? `chat:${chatKey}` : "chat:unknown",
+    itemPart,
+    durationPart,
+  ].join("::");
+  return createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 32);
+}
+
+function scanAvailabilityRequestsFromTestStore(connection, businessId) {
+  const store = connection && typeof connection === "object" ? connection : null;
+  const docs = store?.docs;
+  if (!docs || typeof docs.entries !== "function") return [];
+  const prefix = `businesses/${clean(businessId)}/availabilityRequests/`;
+  const rows = [];
+  for (const [key, value] of docs.entries()) {
+    if (!String(key).startsWith(prefix)) continue;
+    const requestId = String(key).slice(prefix.length);
+    if (!requestId || requestId.includes("/")) continue;
+    rows.push({ requestId, ...(value && typeof value === "object" ? value : {}) });
+  }
+  return rows;
+}
+
+function pickLatestActiveAvailabilityRequest(rows, logicalRequestKey) {
+  const active = rows.filter((row) => {
+    if (clean(row.logicalRequestKey) !== logicalRequestKey) return false;
+    return ACTIVE_AVAILABILITY_REQUEST_STATUSES.has(clean(row.status) || "pending");
+  });
+  if (active.length === 0) return null;
+  active.sort((a, b) => {
+    const aMs = new Date(a.createdAt ?? a.updatedAt ?? 0).getTime();
+    const bMs = new Date(b.createdAt ?? b.updatedAt ?? 0).getTime();
+    return bMs - aMs;
+  });
+  const winner = active[0];
+  return { requestId: clean(winner.requestId) || null, ...winner };
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   normalized?: Record<string, unknown>,
+ *   logicalRequestKey?: string,
+ * }} params
+ */
+export async function findExistingActiveAvailabilityRequest({
+  db: connection,
+  businessId,
+  normalized = {},
+  logicalRequestKey = "",
+}) {
+  const uid = clean(businessId);
+  const key = clean(logicalRequestKey) || buildLogicalAvailabilityRequestKey(normalized);
+  if (!uid || !key) return null;
+
+  const collection = availabilityRequestCollectionRef(connection, uid);
+  if (collection && typeof collection.where === "function") {
+    const snap = await collection
+      .where("logicalRequestKey", "==", key)
+      .limit(20)
+      .get()
+      .catch(() => null);
+    const queryRows = (snap?.docs ?? []).map((doc) => ({
+      requestId: doc.id,
+      ...(typeof doc.data === "function" ? doc.data() || {} : {}),
+    }));
+    const fromQuery = pickLatestActiveAvailabilityRequest(queryRows, key);
+    if (fromQuery) return fromQuery;
+  }
+
+  const scanned = scanAvailabilityRequestsFromTestStore(connection, uid);
+  return pickLatestActiveAvailabilityRequest(scanned, key);
+}
+
+function firstSanitizedParticipantDisplayName(...candidates) {
+  for (const candidate of candidates) {
+    const sanitized = sanitizeParticipantDisplayName(candidate);
+    if (sanitized) return sanitized;
+  }
+  return null;
+}
+
+/** Booking-style display name resolution for availability Reply Privately / confirm paths. */
+export function resolveAvailabilityParticipantDisplayName(sourceIdentity = {}, request = {}) {
+  const identity = asPlainObject(sourceIdentity) ?? {};
+  const req = asPlainObject(request) ?? {};
+  return firstSanitizedParticipantDisplayName(
+    identity.participantDisplayName,
+    identity.participantName,
+    req.originalCustomerDisplayName,
+    req.sourceParticipantName,
+    req.participantName
+  );
+}
+
 function buildSourceIdentity(payload = {}, executionContext = {}, sourceTurnKey = "") {
   const sourceIdentity = asPlainObject(payload.sourceIdentity) ?? {};
+  const participantDisplayName = firstSanitizedParticipantDisplayName(
+    sourceIdentity.participantDisplayName,
+    payload.participantDisplayName,
+    payload.sourceParticipantDisplayName,
+    executionContext.participantDisplayName,
+    executionContext.sourceParticipantDisplayName
+  );
+  const participantName = firstSanitizedParticipantDisplayName(
+    sourceIdentity.participantName,
+    sourceIdentity.participantDisplayName,
+    payload.participantName,
+    payload.sourceParticipantName,
+    executionContext.participantName,
+    executionContext.sourceParticipantName,
+    executionContext.participantDisplayName,
+    executionContext.sourceParticipantDisplayName
+  );
   return {
     participantKey:
       clean(sourceIdentity.participantKey) ||
@@ -78,6 +247,25 @@ function buildSourceIdentity(payload = {}, executionContext = {}, sourceTurnKey 
     participantIdentity:
       clean(sourceIdentity.participantIdentity) ||
       clean(payload.participant?.identity) ||
+      null,
+    participantDisplayName: participantDisplayName || participantName || null,
+    participantName: participantName || participantDisplayName || null,
+    participantPhone:
+      clean(sourceIdentity.participantPhone) ||
+      clean(payload.participantPhone) ||
+      clean(payload.sourceParticipantPhone) ||
+      clean(executionContext.participantPhoneForDm) ||
+      null,
+    sourceTextPreview:
+      clean(sourceIdentity.sourceTextPreview ?? payload.sourceTextPreview ?? executionContext.message).slice(
+        0,
+        160
+      ) || null,
+    sourceSenderScope:
+      clean(sourceIdentity.sourceSenderScope) ||
+      clean(payload.sourceSenderScope) ||
+      clean(executionContext.senderScope) ||
+      clean(executionContext.sourceSenderScope) ||
       null,
     chatId: clean(sourceIdentity.chatId) || clean(payload.sourceChatId) || clean(executionContext.chatId) || null,
     chatType:
@@ -132,7 +320,7 @@ function normalizeAvailabilityRequestPayload(payload = {}, executionContext = {}
     null;
   const priceQuote = asPlainObject(payload.priceQuote) ?? asPlainObject(payload.canonicalPriceQuote) ?? null;
 
-  return {
+  const base = {
     requestId,
     businessId,
     itemId,
@@ -154,6 +342,10 @@ function normalizeAvailabilityRequestPayload(payload = {}, executionContext = {}
     createdAt: new Date(),
     expiresAt: new Date(Date.now() + DEFAULT_REQUEST_TTL_MS),
     updatedAt: new Date(),
+  };
+  return {
+    ...base,
+    logicalRequestKey: buildLogicalAvailabilityRequestKey(base),
   };
 }
 
@@ -219,6 +411,31 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     return { ok: false, blocked: true, reason: "MISSING_STABLE_TURN_KEY", requestId: null, status: null, request: null, created: false };
   }
 
+  const semanticExisting = await findExistingActiveAvailabilityRequest({
+    db: connection,
+    businessId: normalized.businessId,
+    normalized,
+    logicalRequestKey: normalized.logicalRequestKey,
+  });
+  if (semanticExisting?.requestId) {
+    const request = await getAvailabilityRequest({
+      db: connection,
+      businessId: normalized.businessId,
+      requestId: semanticExisting.requestId,
+    });
+    if (request) {
+      return {
+        ok: true,
+        requestId: semanticExisting.requestId,
+        status: String(request.status ?? "pending"),
+        request,
+        created: false,
+        reused: true,
+        reuseReason: "SEMANTIC_IDEMPOTENT",
+      };
+    }
+  }
+
   const ref = availabilityRequestDocRef(connection, normalized.businessId, normalized.requestId);
   if (!ref) {
     return { ok: false, blocked: true, reason: "MISSING_REQUEST_REF", requestId: normalized.requestId, status: null, request: null, created: false };
@@ -255,6 +472,7 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     approvalCustomerNotificationStatus: normalized.approvalCustomerNotificationStatus,
     sourceIdentity: normalized.sourceIdentity,
     sourceTurnKey: normalized.sourceTurnKey,
+    logicalRequestKey: normalized.logicalRequestKey,
     createdAt: normalized.createdAt,
     expiresAt: normalized.expiresAt,
     updatedAt: normalized.updatedAt,
@@ -393,6 +611,106 @@ export async function markAvailabilityRequestOwnerNotificationFailed({
 }
 
 /**
+ * Atomically claim owner notification send for one avr_ request.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   ownerTarget?: string | null,
+ *   maxFailedRetries?: number,
+ * }} params
+ */
+export async function claimAvailabilityRequestOwnerNotificationSending({
+  db: connection,
+  businessId,
+  requestId,
+  ownerTarget = null,
+  maxFailedRetries = MAX_OWNER_NOTIFICATION_FAILED_RETRIES,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  const rid = clean(requestId);
+  const uid = clean(businessId);
+  if (!ref || !rid || !uid) {
+    return { ok: false, reason: "MISSING_REQUEST_REF", requestId: rid || null };
+  }
+
+  const firestore = resolveAvailabilityRequestDb(connection);
+
+  const evaluate = (data) => {
+    const status = clean(data?.ownerNotificationStatus, 80) || "not_started";
+    if (["queued", "sending", "sent"].includes(status)) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: "IDEMPOTENT_SKIP",
+        ownerNotificationStatus: status,
+      };
+    }
+    const attemptCount = Number(data?.ownerNotificationAttemptCount ?? 0);
+    if (status === "failed" && attemptCount >= maxFailedRetries) {
+      return { ok: false, reason: "MAX_RETRIES_EXCEEDED", ownerNotificationAttemptCount: attemptCount };
+    }
+    if (status !== "not_started" && status !== "failed") {
+      return { ok: false, reason: "NOT_RETRYABLE", ownerNotificationStatus: status };
+    }
+    return { ok: true, claim: true, attemptCount, failedRetry: status === "failed" };
+  };
+
+  const applyClaim = async (getSnap, updateSnap) => {
+    const snap = await getSnap();
+    if (!snap?.exists) {
+      return { ok: false, reason: "REQUEST_NOT_FOUND", requestId: rid };
+    }
+    const data = snap.data() || {};
+    const decision = evaluate(data);
+    if (!decision.ok) {
+      return {
+        ...decision,
+        requestId: rid,
+        request: { requestId: rid, ...data },
+        ownerTarget: normalizePhoneDigits(data.ownerTarget) || normalizePhoneDigits(ownerTarget) || null,
+      };
+    }
+    const target = normalizePhoneDigits(ownerTarget) || normalizePhoneDigits(data.ownerTarget) || null;
+    await updateSnap({
+      ownerNotificationStatus: "sending",
+      ownerTarget: target,
+      ownerNotificationAttemptCount: decision.attemptCount + 1,
+      ownerNotificationAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return {
+      ok: true,
+      claimed: true,
+      requestId: rid,
+      request: {
+        requestId: rid,
+        ...data,
+        ownerNotificationStatus: "sending",
+        ownerTarget: target,
+        ownerNotificationAttemptCount: decision.attemptCount + 1,
+      },
+      ownerTarget: target,
+      failedRetry: decision.failedRetry === true,
+    };
+  };
+
+  if (firestore && typeof firestore.runTransaction === "function") {
+    return firestore.runTransaction(async (tx) =>
+      applyClaim(
+        () => tx.get(ref),
+        (patch) => tx.update(ref, patch)
+      )
+    );
+  }
+
+  return applyClaim(
+    () => ref.get(),
+    (patch) => ref.update(patch)
+  );
+}
+
+/**
  * @param {{
  *   db?: unknown,
  *   businessId: string,
@@ -439,6 +757,103 @@ export async function updateAvailabilityRequestDecisionState({
   } catch {
     return false;
   }
+}
+
+/**
+ * Atomically record owner approve/reject decision for one avr_ request.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   decision: "approve" | "reject",
+ *   ownerDecisionBy?: string | null,
+ * }} params
+ */
+export async function claimAvailabilityRequestOwnerDecision({
+  db: connection,
+  businessId,
+  requestId,
+  decision,
+  ownerDecisionBy = null,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  const rid = clean(requestId);
+  const uid = clean(businessId);
+  const nextStatus = decision === "approve" ? "approved" : "rejected";
+  if (!ref || !rid || !uid || (nextStatus !== "approved" && nextStatus !== "rejected")) {
+    return { ok: false, reason: "MISSING_REQUEST_REF", requestId: rid || null };
+  }
+
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const decisionBy = normalizePhoneDigits(ownerDecisionBy) || clean(ownerDecisionBy, 80) || null;
+  const decisionAt = new Date();
+
+  const evaluate = (data) => {
+    const currentStatus = clean(data?.status) || "pending";
+    if (currentStatus === nextStatus) {
+      return { ok: true, alreadyProcessed: true, status: currentStatus };
+    }
+    if (currentStatus === "approved" || currentStatus === "rejected") {
+      return { ok: false, reason: "REQUEST_ALREADY_DECIDED", status: currentStatus };
+    }
+    if (currentStatus !== "pending") {
+      return { ok: false, reason: "REQUEST_NOT_PENDING", status: currentStatus };
+    }
+    return { ok: true, claim: true };
+  };
+
+  const applyClaim = async (getSnap, updateSnap) => {
+    const snap = await getSnap();
+    if (!snap?.exists) {
+      return { ok: false, reason: "REQUEST_NOT_FOUND", requestId: rid };
+    }
+    const data = snap.data() || {};
+    const verdict = evaluate(data);
+    if (!verdict.ok) {
+      return {
+        ...verdict,
+        requestId: rid,
+        request: { requestId: rid, ...data },
+      };
+    }
+    if (verdict.alreadyProcessed) {
+      return {
+        ok: true,
+        alreadyProcessed: true,
+        status: verdict.status,
+        requestId: rid,
+        request: { requestId: rid, ...data },
+      };
+    }
+    const patch = {
+      status: nextStatus,
+      ownerDecisionBy: decisionBy,
+      ownerDecisionAt: decisionAt,
+      approvalCustomerNotificationStatus: "pending",
+      updatedAt: new Date(),
+    };
+    await updateSnap(patch);
+    return {
+      ok: true,
+      status: nextStatus,
+      requestId: rid,
+      request: { requestId: rid, ...data, ...patch },
+    };
+  };
+
+  if (firestore && typeof firestore.runTransaction === "function") {
+    return firestore.runTransaction(async (tx) =>
+      applyClaim(
+        () => tx.get(ref),
+        (patch) => tx.update(ref, patch)
+      )
+    );
+  }
+
+  return applyClaim(
+    () => ref.get(),
+    (patch) => ref.update(patch)
+  );
 }
 
 /**
@@ -580,4 +995,189 @@ export async function markAvailabilityRequestCustomerNotificationSkipped({
     approvalCustomerNotificationError,
     approvalCustomerNotificationMethod,
   });
+}
+
+const DEFAULT_CONFIRM_TTL_MS = 72 * 60 * 60 * 1000;
+
+function normalizePhoneDigits(value) {
+  return String(value ?? "").replace(/[^\d+]/g, "");
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   patch: Record<string, unknown>,
+ * }} params
+ */
+export async function updateAvailabilityRequestFields({
+  db: connection,
+  businessId,
+  requestId,
+  patch,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  if (!ref || !patch || typeof patch !== "object") return false;
+  try {
+    await ref.update({
+      ...patch,
+      updatedAt: new Date(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function buildConfirmExpiresAt(fromDate = new Date(), ttlMs = DEFAULT_CONFIRM_TTL_MS) {
+  const base = fromDate instanceof Date ? fromDate : new Date(fromDate);
+  return new Date(base.getTime() + Math.max(60_000, Number(ttlMs) || DEFAULT_CONFIRM_TTL_MS));
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   customerConfirmationStatus: string,
+ *   extra?: Record<string, unknown>,
+ * }} params
+ */
+export async function updateAvailabilityRequestCustomerConfirmationState({
+  db: connection,
+  businessId,
+  requestId,
+  customerConfirmationStatus,
+  extra = {},
+}) {
+  const status = clean(customerConfirmationStatus, 80);
+  if (!status) return false;
+  return updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      customerConfirmationStatus: status,
+      ...extra,
+    },
+  });
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ * }} params
+ */
+export async function claimAvailabilityRequestCustomerConfirmProcessing({
+  db: connection,
+  businessId,
+  requestId,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  if (!ref) return { ok: false, reason: "MISSING_REQUEST_REF" };
+  const snap = await ref.get();
+  if (!snap?.exists) return { ok: false, reason: "REQUEST_NOT_FOUND" };
+  const data = snap.data() || {};
+  if (clean(data.linkedBookingId)) {
+    return { ok: false, reason: "BOOKING_ALREADY_LINKED", request: { requestId, ...data } };
+  }
+  const processing = clean(data.customerConfirmProcessingStatus);
+  if (processing === "processing" || processing === "done") {
+    return { ok: false, reason: "ALREADY_PROCESSING", request: { requestId, ...data } };
+  }
+  const expiresAt = data.confirmExpiresAt ? new Date(data.confirmExpiresAt) : null;
+  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= Date.now()) {
+    return { ok: false, reason: "REQUEST_EXPIRED", request: { requestId, ...data } };
+  }
+  const updated = await updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      customerConfirmProcessingStatus: "processing",
+      customerConfirmProcessingStartedAtMs: Date.now(),
+    },
+  });
+  if (!updated) return { ok: false, reason: "CLAIM_FAILED" };
+  const fresh = await getAvailabilityRequest({ db: connection, businessId, requestId });
+  return { ok: true, request: fresh };
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ * }} params
+ */
+export async function findWaitingConfirmAvailabilityRequestsByPhone({
+  db: connection,
+  businessId,
+  customerPhone,
+}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const phone = normalizePhoneDigits(customerPhone);
+  if (!firestore || !uid || !phone) return [];
+
+  const snap = await availabilityRequestCollectionRef(connection, uid)
+    .where("status", "==", "approved")
+    .where("approvalCustomerNotificationStatus", "==", "sent")
+    .where("customerConfirmationStatus", "==", "waiting_confirm")
+    .limit(10)
+    .get()
+    .catch(() => null);
+  const docs = snap?.docs ?? [];
+  const now = Date.now();
+  return docs
+    .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
+    .filter((row) => {
+      if (clean(row.linkedBookingId)) return false;
+      const expiresAt = row.confirmExpiresAt ? new Date(row.confirmExpiresAt) : null;
+      if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= now) {
+        return false;
+      }
+      const targets = [
+        normalizePhoneDigits(row.customerDmTarget),
+        normalizePhoneDigits(row.customerPhone),
+      ].filter(Boolean);
+      return targets.some((target) => target === phone);
+    });
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   itemId?: string | null,
+ *   customerPhone?: string | null,
+ * }} params
+ */
+export async function findLatestWaitingConfirmAvailabilityRequest({
+  db: connection,
+  businessId,
+  itemId = null,
+  customerPhone = null,
+}) {
+  const matches = customerPhone
+    ? await findWaitingConfirmAvailabilityRequestsByPhone({
+        db: connection,
+        businessId,
+        customerPhone,
+      })
+    : [];
+  const filtered = itemId
+    ? matches.filter((row) => clean(row.itemId) === clean(itemId))
+    : matches;
+  const pool = filtered.length > 0 ? filtered : matches;
+  if (pool.length === 0) return null;
+  pool.sort((a, b) => {
+    const aMs = new Date(a.approvalCustomerNotificationAt ?? a.updatedAt ?? 0).getTime();
+    const bMs = new Date(b.approvalCustomerNotificationAt ?? b.updatedAt ?? 0).getTime();
+    return bMs - aMs;
+  });
+  return pool[0];
 }
