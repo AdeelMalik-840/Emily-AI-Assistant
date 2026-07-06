@@ -42,7 +42,9 @@ function hasValue(value) {
  */
 function collectWeakContextSignals(normalizedMessage) {
   const out = [];
-  if (/\b(chahiye|chahye|chaiye|chaahiye|chyh)\b/i.test(normalizedMessage)) {
+  if (
+    /\b(chahiye|chahye|chaiye|chaahiye|chyh|chahie|need|want)\b/i.test(normalizedMessage)
+  ) {
     out.push("need_context");
   }
   if (/\b(final|done|proceed)\b/i.test(normalizedMessage)) {
@@ -58,6 +60,34 @@ function collectWeakContextSignals(normalizedMessage) {
     out.push("for_context");
   }
   return [...new Set(out)];
+}
+
+/**
+ * Bare chahiye/need/want with resolved item + duration/date is an owner availability check,
+ * not a final booking command.
+ *
+ * @param {string} normalizedMessage
+ * @param {Record<string, unknown>} signals
+ * @param {{ durationDays?: number | null, hasResolvedItem?: boolean }} [context]
+ * @returns {boolean}
+ */
+export function isWeakNeedOwnerAvailabilityInquiry(
+  normalizedMessage,
+  signals,
+  context = {}
+) {
+  if (context.hasResolvedItem !== true) return false;
+  if (Boolean(signals?.priceAsk) || Boolean(signals?.availabilityAsk)) return false;
+  if (Boolean(signals?.strongBookingCommitment)) return false;
+
+  const weakContextSignals = collectWeakContextSignals(normalizedMessage);
+  if (!weakContextSignals.includes("need_context")) return false;
+
+  const durationDays = Number(context.durationDays);
+  if (Number.isFinite(durationDays) && durationDays >= 1) return true;
+  if (weakContextSignals.includes("date_context")) return true;
+  if (weakContextSignals.includes("duration_context")) return true;
+  return false;
 }
 
 /**
@@ -154,6 +184,17 @@ function resolveBusinessDecision(p) {
     replyType = "availability_answer";
     confidence = "high";
     reason = "explicit_availability_question";
+  } else if (
+    isWeakNeedOwnerAvailabilityInquiry(p.normalizedMessage, signals, {
+      durationDays,
+      hasResolvedItem,
+    })
+  ) {
+    primaryIntent = "availability_inquiry";
+    workflowType = "availability_inquiry";
+    replyType = "availability_answer";
+    confidence = "high";
+    reason = "item_duration_need_is_owner_availability_check";
   } else if (strongBookingCommand && hasResolvedItem) {
     primaryIntent = "booking_request";
     workflowType = "booking_request";

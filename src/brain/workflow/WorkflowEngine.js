@@ -9,6 +9,7 @@ import {
   isBrowseWorkflowIntent,
   isUnlistedAvailabilityIntent,
 } from "./browseIntent.js";
+import { isWeakNeedOwnerAvailabilityInquiry } from "../facts/resolveBusinessTurnContext.js";
 
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -47,9 +48,24 @@ function isPricingWithDurationInterrupt(understanding) {
 
 /**
  * @param {TurnUnderstanding} understanding
+ * @param {string} [message]
  * @returns {boolean}
  */
-function isBookingRequestContinuation(understanding) {
+function isWeakNeedOwnerAvailabilityContinuation(understanding, message = "") {
+  const normalized = String(message ?? "").trim().toLowerCase();
+  return isWeakNeedOwnerAvailabilityInquiry(normalized, understanding.signals ?? {}, {
+    durationDays: understanding.durationDays ?? null,
+    hasResolvedItem: Boolean(understanding.resolvedItemId),
+  });
+}
+
+/**
+ * @param {TurnUnderstanding} understanding
+ * @param {string} [message]
+ * @returns {boolean}
+ */
+function isBookingRequestContinuation(understanding, message = "") {
+  if (isWeakNeedOwnerAvailabilityContinuation(understanding, message)) return false;
   const signals = understanding.signals ?? {};
   if (signals.bookingCommitment) return true;
   if (understanding.durationDays != null && !signals.priceAsk) return true;
@@ -149,7 +165,7 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
       };
     }
 
-    if (isBookingRequestContinuation(understanding)) {
+    if (isBookingRequestContinuation(understanding, inboundText)) {
       return {
         workflowType: "booking_request",
         reason: understanding.signals?.bookingCommitment
@@ -242,7 +258,7 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
     };
   }
 
-  if (isBookingRequestContinuation(understanding) && understanding.resolvedItemId) {
+  if (isBookingRequestContinuation(understanding, inboundText) && understanding.resolvedItemId) {
     return {
       workflowType: "booking_request",
       reason: "duration_booking_continuation",
