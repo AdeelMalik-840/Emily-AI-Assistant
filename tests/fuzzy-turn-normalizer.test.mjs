@@ -98,7 +98,7 @@ test("5. civic avalable? → availability", () => {
   assert.equal(s.responsePolicy, "check_availability");
 });
 
-test("6. civic 3 din k lye chyh → booking_request", () => {
+test("6. civic 3 din k lye chyh legacy shape still booking_request", () => {
   const f = fuzzy("civic 3 din k lye chyh");
   assert.equal(f.catalogCandidate?.id, "civic-1");
   const s = shapeFromFuzzy(f);
@@ -106,6 +106,64 @@ test("6. civic 3 din k lye chyh → booking_request", () => {
   assert.equal(s.responsePolicy, "start_or_continue_booking");
   const events = detectBookingEvent(f.normalizedText);
   assert.equal(events.bookingIntent, true);
+});
+
+test("6b. civic 3 din k lye chyh brain canonical decision is availability_inquiry", async () => {
+  const { resolveBusinessTurnContext } = await import("../src/brain/facts/resolveBusinessTurnContext.js");
+  const { buildTurnContextInput } = await import("../src/brain/live/buildTurnContextInput.js");
+  const { buildShadowTurnContext } = await import("../src/brain/shadow/brainShadowHook.js");
+  const { evaluateInboundAdmissionContract } = await import("../src/brain/admission/admissionContract.js");
+  const { loadSyntheticCarRentalCatalogFixture } = await import("../src/brain/golden/goldenHarness.js");
+
+  const fixture = loadSyntheticCarRentalCatalogFixture();
+  const message = "Civic 3 din k lye chahiye";
+  const turnContextInput = buildTurnContextInput({
+    channel: "whatsapp_web",
+    chatType: "group",
+    businessId: "synthetic-car-rental-business-001",
+    chatId: "car-rental-queries",
+    messageText: message,
+    participantKey: "cust-1",
+    sessionKey: "synthetic-car-rental-business-001::car-rental-queries::participant::cust-1",
+    playwrightChatKey: "car-rental-queries",
+    isGroupInbound: true,
+    memorySnapshot: {},
+    catalogItems: fixture.items,
+    traceId: "fuzzy-brain-phase-a",
+    resolveTrustedSessionItem: () => ({ ok: false, reason: "NO_TRUSTED_SESSION_ITEM" }),
+  });
+  const brainTurnContext = buildShadowTurnContext({
+    businessId: "synthetic-car-rental-business-001",
+    participantKey: "cust-1",
+    playwrightChatKey: "car-rental-queries",
+    isGroupInbound: true,
+    memorySnapshot: {},
+  });
+  if (turnContextInput.authoritativeItem?.id) {
+    brainTurnContext.lastResolvedItemId = String(turnContextInput.authoritativeItem.id);
+  }
+  const admission = evaluateInboundAdmissionContract({
+    text: message,
+    chatKey: "car-rental-queries",
+    businessId: "synthetic-car-rental-business-001",
+    participantKey: "cust-1",
+    channelId: "whatsapp_web",
+    turnId: "fuzzy-brain-phase-a",
+  });
+  const facts = await resolveBusinessTurnContext({
+    traceId: "fuzzy-brain-phase-a",
+    businessId: "synthetic-car-rental-business-001",
+    rawMessage: message,
+    turnContextInput,
+    turnContext: brainTurnContext,
+    catalogItems: fixture.items,
+    admittedTurn: admission.admittedTurn,
+    log: false,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
+  });
+  assert.equal(facts.decision.workflowType, "availability_inquiry");
+  assert.notEqual(facts.decision.workflowType, "booking_request");
 });
 
 test("7. ambiguous orolla rent with two Corolla variants", () => {

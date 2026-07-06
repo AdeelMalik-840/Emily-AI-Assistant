@@ -145,6 +145,37 @@ function hasRequestedDuration(durationDays) {
 }
 
 /**
+ * @param {Record<string, unknown> | null | undefined} canonical
+ * @param {string} [message]
+ * @returns {{ ready: boolean, durationDays: number | null, datePhrase: string | null }}
+ */
+function resolveOwnerCheckTiming(canonical, message = "") {
+  const durationDays = canonical?.turn?.durationDays ?? null;
+  if (hasRequestedDuration(durationDays)) {
+    return {
+      ready: true,
+      durationDays: Math.max(1, Math.floor(Number(durationDays))),
+      datePhrase: null,
+    };
+  }
+
+  const weakSignals = Array.isArray(canonical?.decision?.weakContextSignals)
+    ? canonical.decision.weakContextSignals
+    : [];
+  const normalized = String(message ?? canonical?.normalizedMessage ?? "")
+    .trim()
+    .toLowerCase();
+  if (weakSignals.includes("date_context") || /\b(?:kal|tomorrow)\b/i.test(normalized)) {
+    return { ready: true, durationDays: 1, datePhrase: "kal" };
+  }
+  if (weakSignals.includes("duration_context")) {
+    return { ready: true, durationDays: 1, datePhrase: null };
+  }
+
+  return { ready: false, durationDays: null, datePhrase: null };
+}
+
+/**
  * @param {string} itemLabel
  * @param {Record<string, unknown>} availability
  * @returns {string}
@@ -231,8 +262,12 @@ export function buildAskDurationAvailabilityReply(conversationalLabel) {
  * @param {number} durationDays
  * @returns {string}
  */
-export function buildOwnerCheckDeferralReply(conversationalLabel, durationDays) {
+export function buildOwnerCheckDeferralReply(conversationalLabel, durationDays, datePhrase = null) {
   const label = String(conversationalLabel ?? "").trim() || "item";
+  const dateOnly = String(datePhrase ?? "").trim().toLowerCase();
+  if (dateOnly === "kal" || dateOnly === "tomorrow") {
+    return `${label} ${dateOnly} ke liye mai confirm kar leta hun.`;
+  }
   const durationPhrase = formatDurationPhrase(durationDays);
   return durationPhrase
     ? `${label} ${durationPhrase} ke liye mai confirm kar leta hun.`
@@ -265,6 +300,7 @@ export function buildAvailabilityInquiryActionPlan({
     const itemLabel = String(resolvedItem.displayLabel ?? resolvedItem.name ?? "").trim() || "item";
     const conversationalLabel = conversationalItemLabelFromResolvedItem(resolvedItem);
     const durationDays = canonical.turn?.durationDays ?? null;
+    const ownerCheckTiming = resolveOwnerCheckTiming(canonical, message);
     const canonicalAvailability = canonical.verified?.availability ?? null;
     const canonicalPriceQuote = canonical.verified?.priceQuote ?? null;
     const participant = canonical.participant ?? null;
@@ -275,7 +311,7 @@ export function buildAvailabilityInquiryActionPlan({
     const sourceTurnKey = String(canonical.turn?.sourceTurnKey ?? "").trim() || null;
     const execute = canonical.actions?.availabilityOwnerCheckExecute === true;
 
-    if (!hasRequestedDuration(durationDays)) {
+    if (!ownerCheckTiming.ready) {
       const replyDraft = buildAskDurationAvailabilityReply(conversationalLabel);
       return Object.freeze({
         planId: randomUUID(),
@@ -302,8 +338,12 @@ export function buildAvailabilityInquiryActionPlan({
       });
     }
 
-    const durationN = Math.max(1, Math.floor(Number(durationDays)));
-    const replyDraft = buildOwnerCheckDeferralReply(conversationalLabel, durationN);
+    const durationN = Math.max(1, Math.floor(Number(ownerCheckTiming.durationDays ?? durationDays ?? 1)));
+    const replyDraft = buildOwnerCheckDeferralReply(
+      conversationalLabel,
+      durationN,
+      ownerCheckTiming.datePhrase
+    );
     logAvailabilityOwnerCheckPlanned({
       itemId,
       itemLabel,

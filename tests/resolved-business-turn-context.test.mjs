@@ -9,6 +9,7 @@ const { buildTurnContextInput } = await import("../src/brain/live/buildTurnConte
 const { runBrainV2LivePipeline } = await import("../src/brain/live/brainV2LivePipeline.js");
 const { buildShadowTurnContext } = await import("../src/brain/shadow/brainShadowHook.js");
 const { evaluateInboundAdmissionContract } = await import("../src/brain/admission/admissionContract.js");
+const { runConversationTurn } = await import("../src/brain/orchestrator/ConversationOrchestrator.js");
 const {
   loadSyntheticCarRentalCatalogFixture,
   resolveCatalogItemFromMessage,
@@ -106,6 +107,79 @@ async function resolveDecision(message, overrides = {}) {
     getBusinessProfileFn: async () => null,
   });
   return facts.decision;
+}
+
+async function resolveLiveTurn(message, overrides = {}) {
+  const participantKey = overrides.participantKey ?? PARTICIPANT_A;
+  const memorySnapshot = overrides.memorySnapshot ?? {};
+  const turnContextInput = buildTurnContextInput({
+    channel: "whatsapp_web",
+    chatType: "group",
+    businessId: BUSINESS_ID,
+    chatId: CHAT,
+    messageText: message,
+    participantKey,
+    sessionKey: sessionKey(participantKey ?? PARTICIPANT_A),
+    playwrightChatKey: CHAT,
+    isGroupInbound: true,
+    memorySnapshot,
+    catalogItems: fixture.items,
+    traceId: "phase-a-live-turn",
+    resolveTrustedSessionItem: overrides.resolveTrustedSessionItem ?? trustedMemoryResolver,
+  });
+
+  const brainTurnContext = buildShadowTurnContext({
+    businessId: BUSINESS_ID,
+    sessionKey: sessionKey(participantKey ?? PARTICIPANT_A),
+    participantKey,
+    playwrightChatKey: CHAT,
+    isGroupInbound: true,
+    memorySnapshot,
+    conversationHistory: "",
+  });
+  if (turnContextInput.authoritativeItem?.id) {
+    brainTurnContext.lastResolvedItemId = String(turnContextInput.authoritativeItem.id);
+  }
+
+  const admission = evaluateInboundAdmissionContract({
+    text: message,
+    chatKey: CHAT,
+    businessId: BUSINESS_ID,
+    participantKey,
+    channelId: "whatsapp_web",
+    turnId: "phase-a-live-turn",
+  });
+
+  const resolvedBusinessTurnContext = await resolveBusinessTurnContext({
+    traceId: "phase-a-live-turn",
+    businessId: BUSINESS_ID,
+    rawMessage: message,
+    turnContextInput,
+    turnContext: brainTurnContext,
+    catalogItems: fixture.items,
+    admittedTurn: admission.admittedTurn,
+    log: false,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
+  });
+
+  const result = runConversationTurn({
+    traceId: "phase-a-live-turn::orchestrator",
+    admittedTurn: admission.admittedTurn,
+    turnContext: brainTurnContext,
+    businessContext: {
+      catalogItems: fixture.items,
+      conversationStyle: "casual_local",
+      resolvedBusinessTurnContext,
+    },
+    mode: "live",
+  });
+
+  return { decision: resolvedBusinessTurnContext.decision, result };
+}
+
+function actionTypes(result) {
+  return (result.actionPlan?.actions ?? []).map((action) => String(action?.type ?? ""));
 }
 
 async function runLive(message, overrides = {}) {
@@ -277,4 +351,63 @@ test("group participant B does not inherit participant A Civic memory", async ()
     resolveTrustedSessionItem: () => ({ ok: false, reason: "NO_TRUSTED_SESSION_ITEM" }),
   });
   assert.match(String(result.reply ?? ""), /Kis car ke liye price pooch rahe hain/i);
+});
+
+const weakNeedAvailabilityCases = [
+  "Civic 3 din k lye chahiye",
+  "Corolla 2 din ke liye chahiye",
+  "Stonic kal ke liye chahiye",
+];
+
+for (const message of weakNeedAvailabilityCases) {
+  test(`phase A decision: weak need + item + duration/date is availability owner check: ${message}`, async () => {
+    const decision = await resolveDecision(message);
+    assert.equal(decision.workflowType, "availability_inquiry");
+    assert.equal(decision.primaryIntent, "availability_inquiry");
+    assert.equal(decision.strongBookingCommand, false);
+    assert.match(decision.reason, /owner_availability_check/i);
+    assert.equal(decision.sideEffectsAllowed.length, 0);
+
+    const { result } = await resolveLiveTurn(message);
+    assert.equal(result.workflowDecision.workflowType, "availability_inquiry");
+    assert.notEqual(result.workflowDecision.workflowType, "booking_request");
+    assert.ok(!actionTypes(result).includes("CREATE_BOOKING"));
+    assert.ok(actionTypes(result).includes("AVAILABILITY_OWNER_CHECK_REQUIRED"));
+  });
+}
+
+test("phase A live: weak need availability defers to owner check, not booking ack", async () => {
+  enableV2LiveEnv();
+  const result = await runLive("Civic 3 din k lye chahiye");
+  assert.equal(result.workflowType, "availability_inquiry");
+  assert.match(String(result.reply ?? ""), /confirm kar leta hun/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /booking confirm/i);
+  const actions = (result.messageMeta?.actionPlan?.actions ?? []).map((a) => a.type);
+  assert.ok(!actions.includes("CREATE_BOOKING"));
+  assert.ok(actions.includes("AVAILABILITY_OWNER_CHECK_REQUIRED"));
+});
+
+test("phase A decision: Stonic kal ke liye chahiye price stays pricing, not availability owner check", async () => {
+  const decision = await resolveDecision("Stonic kal ke liye chahiye price?");
+  assert.equal(decision.workflowType, "pricing_inquiry");
+  assert.notEqual(decision.workflowType, "booking_request");
+  assert.notEqual(decision.workflowType, "availability_inquiry");
+});
+
+test("phase A decision: strong booking phrases stay booking_request", async () => {
+  for (const message of [
+    "Civic 3 din ke liye book kar do",
+    "Civic confirm kar do",
+    "Civic reserve kar do",
+    "Civic final kar do",
+  ]) {
+    const decision = await resolveDecision(message);
+    assert.equal(decision.workflowType, "booking_request", message);
+    assert.equal(decision.strongBookingCommand, true, message);
+  }
+});
+
+test("phase A decision: booking kar do without item is not demoted to availability", async () => {
+  const decision = await resolveDecision("booking kar do");
+  assert.notEqual(decision.workflowType, "availability_inquiry");
 });
