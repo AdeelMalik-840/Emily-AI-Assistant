@@ -566,3 +566,45 @@ test("pipelineBridge: phone-looking group sender label is not included in natura
     process.env.PLAYWRIGHT_OWNER_USER_ID = previousOwner;
   }
 });
+
+test("PLAYWRIGHT_DM_CONTINUATION_ENABLED defaults false when unset", async () => {
+  const prev = process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+  delete process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+  try {
+    const { isPlaywrightDmContinuationEnabled } = await import(
+      "../src/services/playwrightListener/listener.js"
+    );
+    assert.equal(isPlaywrightDmContinuationEnabled(), false);
+  } finally {
+    if (prev === undefined) delete process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+    else process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = prev;
+  }
+});
+
+test("PLAYWRIGHT_DM_CONTINUATION_ENABLED=false skips loadActiveDmWatchTargets", async () => {
+  const prev = process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+  process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = "false";
+  try {
+    const { loadActiveDmWatchTargets, isPlaywrightDmContinuationEnabled } = await import(
+      "../src/services/playwrightListener/listener.js"
+    );
+    assert.equal(isPlaywrightDmContinuationEnabled(), false);
+    let dbCalled = false;
+    const result = await loadActiveDmWatchTargets({
+      dbInstance: {
+        collection() {
+          dbCalled = true;
+          throw new Error("should not query bookings when DM continuation disabled");
+        },
+      },
+      ownerUserId: "test-owner",
+    });
+    assert.equal(dbCalled, false);
+    assert.equal(result.count, 0);
+    assert.equal(result.keys.size, 0);
+    assert.equal(result.byKey.size, 0);
+  } finally {
+    if (prev === undefined) delete process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+    else process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = prev;
+  }
+});

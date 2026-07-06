@@ -209,25 +209,35 @@ test("loadActiveDmWatchTargets skips stale-stage bookings with complete logistic
 });
 
 test("loadActiveDmWatchTargets keeps incomplete waiting bookings watched", async () => {
-  const result = await loadActiveDmWatchTargets({
-    dbInstance: fakeDmWatchDb([
-      {
-        id: "booking-incomplete",
-        status: "approved",
-        approvalCustomerNotificationStatus: "sent",
-        approvalStage: "owner_approved_waiting_customer_details",
-        dmPlaywrightChatKey: "customer-two",
-        sourceGroupName: "general leads",
-        sourcePlaywrightChatKey: "general-leads",
-        deliveryMethod: "delivery",
-        deliveryTime: "evening",
-      },
-    ]),
-    ownerUserId: "owner-test",
-  });
+  const previous = process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+  process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = "true";
+  try {
+    const result = await loadActiveDmWatchTargets({
+      dbInstance: fakeDmWatchDb([
+        {
+          id: "booking-incomplete",
+          status: "approved",
+          approvalCustomerNotificationStatus: "sent",
+          approvalStage: "owner_approved_waiting_customer_details",
+          dmPlaywrightChatKey: "customer-two",
+          sourceGroupName: "general leads",
+          sourcePlaywrightChatKey: "general-leads",
+          deliveryMethod: "delivery",
+          deliveryTime: "evening",
+        },
+      ]),
+      ownerUserId: "owner-test",
+    });
 
-  assert.equal(result.keys.has("customertwo"), true);
-  assert.equal(result.count, 1);
+    assert.equal(result.keys.has("customertwo"), true);
+    assert.equal(result.count, 1);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+    } else {
+      process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = previous;
+    }
+  }
 });
 
 test("loadActiveDmWatchTargets skips terminal manual-review reply-private failures", async () => {
@@ -255,26 +265,36 @@ test("loadActiveDmWatchTargets skips terminal manual-review reply-private failur
 });
 
 test("loadActiveDmWatchTargets includes unverified opened Reply Privately send as watch-only recovery", async () => {
-  const booking = recoverableUnverifiedBooking();
-  const result = await loadActiveDmWatchTargets({
-    dbInstance: fakeDmWatchDb([booking]),
-    ownerUserId: "owner-test",
-  });
+  const previous = process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+  process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = "true";
+  try {
+    const booking = recoverableUnverifiedBooking();
+    const result = await loadActiveDmWatchTargets({
+      dbInstance: fakeDmWatchDb([booking]),
+      ownerUserId: "owner-test",
+    });
 
-  assert.equal(result.keys.has("customerreview"), true);
-  assert.equal(result.count, 1);
-  assert.equal(booking.dmMessageSent, false);
-  assert.equal(booking.approvalCustomerNotificationStatus, "failed");
-  const entry = result.byKey.get("customerreview")?.[0];
-  assert.ok(entry);
-  assert.equal(entry.bookingId, "booking-recovery");
-  assert.equal(entry.watchOnlyRecovery, true);
-  assert.equal(entry.recoveryReason, "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT");
-  assert.equal(entry.dmChatTitle, "Customer Review");
-  assert.equal(entry.dmPlaywrightChatKey, "customer-review");
-  assert.deepEqual(entry.sourceIdentity, booking.sourceIdentity);
-  assert.equal(entry.participantName, "Customer Review");
-  assert.equal(entry.participantKey, "customer-review");
+    assert.equal(result.keys.has("customerreview"), true);
+    assert.equal(result.count, 1);
+    assert.equal(booking.dmMessageSent, false);
+    assert.equal(booking.approvalCustomerNotificationStatus, "failed");
+    const entry = result.byKey.get("customerreview")?.[0];
+    assert.ok(entry);
+    assert.equal(entry.bookingId, "booking-recovery");
+    assert.equal(entry.watchOnlyRecovery, true);
+    assert.equal(entry.recoveryReason, "OUTGOING_SEND_UNVERIFIED_AFTER_ATTEMPT");
+    assert.equal(entry.dmChatTitle, "Customer Review");
+    assert.equal(entry.dmPlaywrightChatKey, "customer-review");
+    assert.deepEqual(entry.sourceIdentity, booking.sourceIdentity);
+    assert.equal(entry.participantName, "Customer Review");
+    assert.equal(entry.participantKey, "customer-review");
+  } finally {
+    if (previous === undefined) {
+      delete process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
+    } else {
+      process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = previous;
+    }
+  }
 });
 
 test("loadActiveDmWatchTargets excludes unverified recovery for unsafe cases", async () => {

@@ -564,6 +564,16 @@ export function __isDmWatchMessageOlderThanBookingMarkersForTests({
   return Boolean(markerMs && messageMs + Number(toleranceMs || 0) < markerMs);
 }
 
+function envTruthy(value) {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+}
+
+/** Default off — set PLAYWRIGHT_DM_CONTINUATION_ENABLED=true to enable DM watch/continuation. */
+export function isPlaywrightDmContinuationEnabled() {
+  return envTruthy(process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED);
+}
+
 /**
  * Load DM watch targets from active approved bookings that already completed Reply Privately DM send.
  * Additive only: does NOT change group scanning; only enables scanning for specific DM chats.
@@ -573,6 +583,9 @@ export async function loadActiveDmWatchTargets({
   ownerUserId = resolveOwnerUid(),
   limit = 25,
 } = {}) {
+  if (!isPlaywrightDmContinuationEnabled()) {
+    return { keys: new Set(), byKey: new Map(), count: 0 };
+  }
   const uid = clean(ownerUserId);
   if (!dbInstance || !uid) return { keys: new Set(), byKey: new Map(), count: 0 };
   try {
@@ -1484,6 +1497,9 @@ function persistDmContinuationProcessedMarker(dmCursorKey, decision) {
 }
 
 async function findWatchedDmPriorityCandidate(page, activeDmChatKeys, currentActiveTitle, targetGroups) {
+  if (!isPlaywrightDmContinuationEnabled()) {
+    return null;
+  }
   const keys = activeDmChatKeys instanceof Set ? activeDmChatKeys : new Set();
   if (!keys.size) {
     console.log("[dm_probe_no_watch_targets]");
@@ -7138,7 +7154,15 @@ async function runListenerBody() {
 
         // DM continuation watch targets (additive only). Refresh periodically.
         const lastLoaded = Number(globalThis.__dmWatchLoadedAtMs ?? 0);
-        if (!Number.isFinite(lastLoaded) || Date.now() - lastLoaded > 7_500) {
+        if (!isPlaywrightDmContinuationEnabled()) {
+          globalThis.__activeDmWatchTargets = { keys: new Set(), byKey: new Map() };
+          globalThis.__watchedDmAllowlist = new Set();
+          globalThis.__dmWatchLoadedAtMs = Date.now();
+          if (!globalThis.__playwrightDmContinuationDisabledLogged) {
+            console.log("[playwright_dm_continuation_disabled]");
+            globalThis.__playwrightDmContinuationDisabledLogged = true;
+          }
+        } else if (!Number.isFinite(lastLoaded) || Date.now() - lastLoaded > 7_500) {
           const loaded = await loadActiveDmWatchTargets().catch(() => null);
           const keys =
             loaded && loaded.keys instanceof Set ? loaded.keys : new Set();
@@ -7238,7 +7262,7 @@ async function runListenerBody() {
 
         // DM watch priority: before group-rotation/stickiness, open watched DM chats
         // when they have unread/preview-delta signals. Additive only; does not scan arbitrary DMs.
-        if (!chatName && !lockedChatName) {
+        if (!chatName && !lockedChatName && isPlaywrightDmContinuationEnabled()) {
           const dmWatch = globalThis.__activeDmWatchTargets || null;
           const activeDmChatKeys =
             dmWatch && dmWatch.keys instanceof Set ? dmWatch.keys : new Set();
@@ -7625,9 +7649,9 @@ async function runListenerBody() {
           const bookingsByDmKey =
             dmWatch && dmWatch.byKey instanceof Map ? dmWatch.byKey : new Map();
           const normalizedOpenChatKey = normalizeTitle(openTitle);
-          const isDmContinuationChat = Boolean(
-            normalizedOpenChatKey && activeDmChatKeys.has(normalizedOpenChatKey)
-          );
+          const isDmContinuationChat =
+            isPlaywrightDmContinuationEnabled() &&
+            Boolean(normalizedOpenChatKey && activeDmChatKeys.has(normalizedOpenChatKey));
           console.log("[playwright_open_chat_classified]", {
             openTitle,
             normalizedOpenChatKey: normalizedOpenChatKey || null,
