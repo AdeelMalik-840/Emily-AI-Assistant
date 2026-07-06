@@ -2,7 +2,64 @@
  * Booking executor — executes v2-approved CREATE_BOOKING actions only.
  * Does not make brain/routing decisions.
  */
+import { getAvailabilityRequest } from "../availabilityRequestService.js";
 import { createBooking } from "../inventoryService.js";
+
+function clean(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizePhone(value) {
+  return clean(value).replace(/[^\d+]/g, "");
+}
+
+async function validateAvailabilityConfirmGate({
+  availabilityRequestId,
+  businessId,
+  itemId,
+  durationDays,
+  customerPhone,
+  db,
+}) {
+  const requestId = clean(availabilityRequestId);
+  const uid = clean(businessId);
+  if (!requestId) return { ok: true };
+  const request = await getAvailabilityRequest({
+    db,
+    businessId: uid,
+    requestId,
+  });
+  if (!request) return { ok: false, reason: "AVAILABILITY_REQUEST_NOT_FOUND" };
+  if (clean(request.status) !== "approved") {
+    return { ok: false, reason: "AVAILABILITY_REQUEST_NOT_APPROVED" };
+  }
+  if (clean(request.approvalCustomerNotificationStatus) !== "sent") {
+    return { ok: false, reason: "AVAILABILITY_CUSTOMER_NOT_NOTIFIED" };
+  }
+  if (clean(request.customerConfirmationStatus) !== "waiting_confirm") {
+    return { ok: false, reason: "AVAILABILITY_NOT_WAITING_CONFIRM" };
+  }
+  if (clean(request.linkedBookingId)) {
+    return { ok: false, reason: "AVAILABILITY_BOOKING_ALREADY_LINKED" };
+  }
+  if (clean(request.itemId) !== clean(itemId)) {
+    return { ok: false, reason: "AVAILABILITY_ITEM_MISMATCH" };
+  }
+  const reqDuration = Number(request.requestedDuration);
+  if (!Number.isFinite(reqDuration) || Math.floor(reqDuration) !== Math.floor(Number(durationDays))) {
+    return { ok: false, reason: "AVAILABILITY_DURATION_MISMATCH" };
+  }
+  const phone = normalizePhone(customerPhone);
+  const requestPhone = normalizePhone(request.customerPhone ?? request.customerDmTarget);
+  if (phone && requestPhone && phone !== requestPhone) {
+    return { ok: false, reason: "AVAILABILITY_CUSTOMER_MISMATCH" };
+  }
+  const expiresAt = request.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
+  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= Date.now()) {
+    return { ok: false, reason: "AVAILABILITY_REQUEST_EXPIRED" };
+  }
+  return { ok: true, request };
+}
 
 /**
  * @param {{
@@ -25,6 +82,24 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
   const traceId = String(executionContext?.traceId ?? "v2-booking").trim();
   if (!userId) {
     return { ok: false, blocked: true, reason: "MISSING_BUSINESS_ID", booking: null };
+  }
+
+  const availabilityRequestId = clean(
+    payload?.availabilityRequestId ?? executionContext?.availabilityRequestId
+  );
+  const gate = await validateAvailabilityConfirmGate({
+    availabilityRequestId,
+    businessId: userId,
+    itemId,
+    durationDays: Math.max(1, Math.floor(Number(durationDays))),
+    customerPhone:
+      executionContext?.participantPhoneForDm ??
+      payload?.customerPhone ??
+      payload?.sourceParticipantPhone,
+    db: executionContext?.dbOverride ?? executionContext?.db,
+  });
+  if (!gate.ok) {
+    return { ok: false, blocked: true, reason: gate.reason || "AVAILABILITY_CONFIRM_GATE_FAILED", booking: null };
   }
 
   try {
