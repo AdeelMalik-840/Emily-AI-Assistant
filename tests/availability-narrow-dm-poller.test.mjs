@@ -268,10 +268,11 @@ test("pollLocalAvailabilityCustomerConfirm bridges eligible candidates when enab
   assert.equal(bridgeCalls[0].activeWaitingCount, 1);
 });
 
-test("N: listener.js was not modified for Phase 1b-A", () => {
+test("N: listener.js was not modified for Phase 1b-A / Phase 2 scheduler", () => {
   const listenerPath = resolve("src/services/playwrightListener/listener.js");
   const src = readFileSync(listenerPath, "utf8");
   assert.equal(src.includes("localAvailabilityCustomerConfirmPoller"), false);
+  assert.equal(src.includes("localAvailabilityCustomerConfirmPollerScheduler"), false);
   assert.equal(src.includes("availabilityCustomerDmBridge"), false);
   assert.equal(src.includes("playwrightNarrowDmMessageReader"), false);
 });

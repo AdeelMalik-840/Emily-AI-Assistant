@@ -137,6 +137,29 @@ test("F: listener.js remains untouched and has no confirm poller reference", () 
   assert.equal(listenerSrc.includes("pollLocalAvailabilityCustomerConfirm"), false);
   assert.equal(listenerSrc.includes("poll-availability-customer-confirm"), false);
   assert.equal(listenerSrc.includes("availabilityCustomerConfirmManualTrigger"), false);
+  assert.equal(listenerSrc.includes("localAvailabilityCustomerConfirmPollerScheduler"), false);
+  assert.equal(listenerSrc.includes("startLocalAvailabilityCustomerConfirmPollerScheduler"), false);
+});
+
+test("I: manual trigger still works when enabled with valid secret", async () => {
+  let calls = 0;
+  const res = mockRes();
+  await handlePollAvailabilityCustomerConfirmManualTrigger(
+    { headers: { "x-clear-secret": "expected-secret" } },
+    res,
+    {
+      manualTriggerEnabled: true,
+      clearSecret: "expected-secret",
+      pollFn: async (params) => {
+        calls += 1;
+        assert.equal(params?.pollerEnabled, true);
+        return { ok: true, processed: 1, bridged: 0, skipped: 1 };
+      },
+    }
+  );
+  assert.equal(calls, 1);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body?.ok, true);
 });
 
 test("manual trigger env flag helper defaults off unless enabled", () => {

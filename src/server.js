@@ -43,6 +43,10 @@ import { getWhatsAppEnv, validateWhatsAppEnv } from "./utils/env.js";
 import { metaCloudFromIsGroupThread } from "./utils/waMetaThreadMarkers.js";
 import { logBrainV2LiveStartupSnapshot } from "./brain/live/brainRouteGate.js";
 import { handlePollAvailabilityCustomerConfirmManualTrigger } from "./internal/pollAvailabilityCustomerConfirmManualTrigger.js";
+import {
+  startLocalAvailabilityCustomerConfirmPollerScheduler,
+  stopLocalAvailabilityCustomerConfirmPollerScheduler,
+} from "./services/localAvailabilityCustomerConfirmPollerScheduler.js";
 
 console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 console.log("[build_marker] whatsapp_cloud_token_fix_v1_loaded");
@@ -995,6 +999,14 @@ let stopPlaywrightListenerFn = null;
 
 async function gracefulPlaywrightShutdown(signal) {
   console.log(`[server] ${signal} — stopping Playwright listener`);
+  try {
+    stopLocalAvailabilityCustomerConfirmPollerScheduler();
+  } catch (err) {
+    console.warn(
+      "[server] availability customer confirm poller scheduler stop error:",
+      err?.message || err
+    );
+  }
   if (stopPlaywrightListenerFn) {
     try {
       await stopPlaywrightListenerFn();
@@ -1019,3 +1031,7 @@ if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true") {
     });
   });
 }
+
+// Narrow availability customer DM confirm poller — independent of listener.js / broad DM.
+// Default off unless PLAYWRIGHT_AVAILABILITY_CUSTOMER_CONFIRM_POLLER_ENABLED=true.
+startLocalAvailabilityCustomerConfirmPollerScheduler();
