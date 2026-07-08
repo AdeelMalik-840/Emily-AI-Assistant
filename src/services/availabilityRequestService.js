@@ -1036,6 +1036,38 @@ export function buildConfirmExpiresAt(fromDate = new Date(), ttlMs = DEFAULT_CON
 }
 
 /**
+ * Persist the latest customer-facing DM prompt context after Emily replies.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   reply: string,
+ *   promptType?: string | null,
+ * }} params
+ */
+export async function recordAvailabilityCustomerDmOutbound({
+  db: connection,
+  businessId,
+  requestId,
+  reply,
+  promptType = null,
+}) {
+  const sentAt = new Date();
+  const type = clean(promptType, 80);
+  return updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      lastCustomerDmPromptType: type || null,
+      lastCustomerDmPromptAt: type ? sentAt : null,
+      lastCustomerDmOutboundAt: sentAt,
+      lastCustomerDmOutboundPreview: clean(reply, 200) || null,
+    },
+  });
+}
+
+/**
  * @param {{
  *   db?: unknown,
  *   businessId: string,
@@ -1180,4 +1212,287 @@ export async function findLatestWaitingConfirmAvailabilityRequest({
     return bMs - aMs;
   });
   return pool[0];
+}
+
+export function resolveLastCustomerNotifyAtMs(request) {
+  const raw = request?.lastCustomerNotifyAt ?? request?.approvalCustomerNotificationAt ?? null;
+  if (!raw) return null;
+  return normalizeTimestampToMs(raw);
+}
+
+/**
+ * Normalize various timestamp shapes into epoch milliseconds.
+ * Returns null for invalid / missing values.
+ *
+ * Supported:
+ * - Date
+ * - number (epoch ms)
+ * - string (ISO/date string)
+ * - Firestore Timestamp (toDate())
+ * - Timestamp-like { seconds, nanoseconds }
+ * - Admin-serialized { _seconds, _nanoseconds }
+ *
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+export function normalizeTimestampToMs(value) {
+  if (value == null) return null;
+
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const ms = new Date(value).getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof value === "object") {
+    // Firestore Timestamp object (preferred)
+    if (typeof value.toDate === "function") {
+      try {
+        const d = value.toDate();
+        const ms = d instanceof Date ? d.getTime() : new Date(d).getTime();
+        return Number.isFinite(ms) ? ms : null;
+      } catch {
+        return null;
+      }
+    }
+
+    // Firestore Timestamp-like / admin-serialized shapes
+    const secondsRaw =
+      value.seconds ??
+      value._seconds ??
+      null;
+    const nanosRaw =
+      value.nanoseconds ??
+      value._nanoseconds ??
+      null;
+
+    const seconds = typeof secondsRaw === "number" ? secondsRaw : Number(secondsRaw);
+    const nanos = typeof nanosRaw === "number" ? nanosRaw : Number(nanosRaw);
+
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    const safeNanos = Number.isFinite(nanos) && nanos > 0 ? nanos : 0;
+    const ms = seconds * 1000 + Math.floor(safeNanos / 1e6);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  return null;
+}
+
+export function hashAvailabilityCustomerInboundDmText(text) {
+  const normalized = clean(text).toLowerCase();
+  if (!normalized) return "";
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 24);
+}
+
+/**
+ * @param {{ dataId?: string | null, text?: string, atMs?: number | null }} message
+ */
+export function buildAvailabilityCustomerInboundDmMessageKey(message = {}) {
+  const dataId = clean(message.dataId);
+  if (dataId) return `data:${dataId}`;
+  const textHash = hashAvailabilityCustomerInboundDmText(message.text);
+  const atMs = Number(message.atMs);
+  if (textHash && Number.isFinite(atMs) && atMs > 0) return `hash:${textHash}:${atMs}`;
+  return textHash ? `hash:${textHash}` : "";
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {number} [nowMs]
+ */
+export function isPlaywrightAvailabilityConfirmRequestEligible(request, nowMs = Date.now()) {
+  if (clean(request?.status) !== "approved") return false;
+  if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
+  if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
+  if (clean(request?.linkedBookingId)) return false;
+  if (!resolveLastCustomerNotifyAtMs(request)) return false;
+  if (!clean(request?.customerDmChatTitle) && !clean(request?.customerDmPlaywrightChatKey)) {
+    return false;
+  }
+  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
+  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ */
+export function resolveAvailabilityCustomerDmTargetKey(request) {
+  return (
+    clean(request?.customerDmPlaywrightChatKey) ||
+    clean(request?.customerDmChatTitle) ||
+    ""
+  );
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {{ dataId?: string | null, text?: string, messageKey?: string, atMs?: number | null }} message
+ */
+export function isDuplicateAvailabilityCustomerInboundDm(request, message = {}) {
+  const dataId = clean(message.dataId);
+  const lastDataId = clean(request?.lastCustomerInboundDmDataId);
+  if (dataId && lastDataId && dataId === lastDataId) return true;
+
+  const messageKey =
+    clean(message.messageKey) ||
+    buildAvailabilityCustomerInboundDmMessageKey({
+      dataId: message.dataId,
+      text: message.text,
+      atMs: message.atMs,
+    });
+  const lastMessageKey = clean(request?.lastCustomerInboundDmMessageKey);
+  if (messageKey && lastMessageKey && messageKey === lastMessageKey) return true;
+
+  const textHash = hashAvailabilityCustomerInboundDmText(message.text);
+  const lastTextHash = clean(request?.lastCustomerInboundDmTextHash);
+  if (textHash && lastTextHash && textHash === lastTextHash) {
+    if (!dataId && !lastDataId) return true;
+    if (dataId && lastDataId && dataId === lastDataId) return true;
+  }
+  return false;
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   limit?: number,
+ *   nowMs?: number,
+ * }} params
+ */
+export async function findEligiblePlaywrightAvailabilityConfirmRequests({
+  db: connection,
+  businessId,
+  limit = 10,
+  nowMs = Date.now(),
+}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  if (!firestore || !uid) return [];
+
+  const snap = await availabilityRequestCollectionRef(connection, uid)
+    .where("status", "==", "approved")
+    .where("approvalCustomerNotificationStatus", "==", "sent")
+    .where("customerConfirmationStatus", "==", "waiting_confirm")
+    .limit(Math.max(1, Math.min(25, Number(limit) || 10)))
+    .get()
+    .catch(() => null);
+
+  const docs = snap?.docs ?? [];
+  return docs
+    .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
+    .filter((row) => isPlaywrightAvailabilityConfirmRequestEligible(row, nowMs));
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ * }} params
+ */
+export async function claimAvailabilityRequestPlaywrightInboundPoll({
+  db: connection,
+  businessId,
+  requestId,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  if (!ref) return { ok: false, reason: "MISSING_REQUEST_REF" };
+  const snap = await ref.get();
+  if (!snap?.exists) return { ok: false, reason: "REQUEST_NOT_FOUND" };
+  const data = snap.data() || {};
+  if (!isPlaywrightAvailabilityConfirmRequestEligible(data)) {
+    return { ok: false, reason: "REQUEST_NOT_ELIGIBLE", request: { requestId, ...data } };
+  }
+  const pollStatus = clean(data.customerPlaywrightInboundPollStatus);
+  if (pollStatus === "processing") {
+    return { ok: false, reason: "POLL_ALREADY_PROCESSING", request: { requestId, ...data } };
+  }
+  const updated = await updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      customerPlaywrightInboundPollStatus: "processing",
+      customerPlaywrightInboundPollStartedAtMs: Date.now(),
+    },
+  });
+  if (!updated) return { ok: false, reason: "CLAIM_FAILED" };
+  const fresh = await getAvailabilityRequest({ db: connection, businessId, requestId });
+  return { ok: true, request: fresh };
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   status?: string,
+ * }} params
+ */
+export async function releaseAvailabilityRequestPlaywrightInboundPoll({
+  db: connection,
+  businessId,
+  requestId,
+  status = "idle",
+}) {
+  const next = clean(status, 40) || "idle";
+  return updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      customerPlaywrightInboundPollStatus: next,
+      ...(next === "idle" ? { customerPlaywrightInboundPollStartedAtMs: null } : {}),
+    },
+  });
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   message: { dataId?: string | null, text?: string, atMs?: number | null, messageKey?: string | null },
+ * }} params
+ */
+export async function recordAvailabilityCustomerInboundDm({
+  db: connection,
+  businessId,
+  requestId,
+  message,
+}) {
+  const dataId = clean(message?.dataId) || null;
+  const textHash = hashAvailabilityCustomerInboundDmText(message?.text);
+  const atMs = Number(message?.atMs);
+  const inboundAt = Number.isFinite(atMs) && atMs > 0 ? new Date(atMs) : new Date();
+  const messageKey =
+    clean(message?.messageKey) ||
+    buildAvailabilityCustomerInboundDmMessageKey({
+      dataId,
+      text: message?.text,
+      atMs: inboundAt.getTime(),
+    });
+  return updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      lastCustomerInboundDmAt: inboundAt,
+      lastCustomerInboundDmDataId: dataId,
+      lastCustomerInboundDmTextHash: textHash || null,
+      lastCustomerInboundDmMessageKey: messageKey || null,
+    },
+  });
 }

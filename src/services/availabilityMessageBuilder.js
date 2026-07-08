@@ -144,6 +144,24 @@ export function buildApprovedAvailabilityCustomerMessage(request, priceQuote) {
 }
 
 /**
+ * Price-only customer message without a booking confirmation prompt.
+ * @param {Record<string, unknown>} request
+ * @param {Record<string, unknown> | null | undefined} priceQuote
+ */
+export function buildApprovedAvailabilityPriceOnlyMessage(request, priceQuote) {
+  const itemLabel = clean(request?.itemLabel) || "Yeh car";
+  const rentDurationPhrase = formatAvailabilityDurationRentPhrase(request);
+  const total = Number(priceQuote?.total);
+  const currency = clean(priceQuote?.currency) || "PKR";
+  if (!Number.isFinite(total) || total <= 0) {
+    return { ok: false, reason: "PRICE_MISSING", message: "" };
+  }
+  const priceText = `${formatMoneyAmount(total)} ${currency}`;
+  const message = `${itemLabel} ${rentDurationPhrase} ka rent ${priceText} hoga.`;
+  return { ok: true, message, priceQuote };
+}
+
+/**
  * @param {Record<string, unknown>} request
  * @param {string[]} alternativeLabels
  */
@@ -173,7 +191,7 @@ export function buildAvailabilityConfirmSuccessReply() {
 }
 
 export function buildAvailabilityConfirmClarificationReply() {
-  return "Availability owner se confirm honi zaroori hai. Kis car ke liye book karna hai?";
+  return "Kaunsi car book karni hai?";
 }
 
 export function buildAvailabilityConfirmDisambiguationReply(options = []) {

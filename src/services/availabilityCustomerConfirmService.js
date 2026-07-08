@@ -1,18 +1,28 @@
 import db from "../config/firebase.js";
 import { isEmilyBrainV2AvailabilityConfirmExecuteEnabled } from "../brain/config/liveFeatureFlags.js";
 import {
-  buildApprovedAvailabilityCustomerMessage,
+  AVAILABILITY_DM_PROMPT_TYPES,
+  buildAvailabilityAskConfirmPrompt,
+  buildAvailabilityGenericAckPromptReply,
+  buildAvailabilityPriceAnswerWithConfirmPrompt,
+  buildAvailabilityScopedQuestionReply,
+  classifyAvailabilityConfirmationIntent,
+  classifyAvailabilityCustomerQuestionTopic,
+  isAvailabilityBookingConfirmationPromptActive,
+  resolveAvailabilityConfirmationTurn,
+  resolveAvailabilityCustomerDmPromptType,
+} from "../brain/availabilityConfirmation/index.js";
+import {
+  buildApprovedAvailabilityPriceOnlyMessage,
   buildAvailabilityConfirmClarificationReply,
   buildAvailabilityConfirmDisambiguationReply,
   buildAvailabilityConfirmSuccessReply,
+  buildRejectedAvailabilityNoOptionsMessage,
+  buildRejectedAvailabilityWithAlternativesMessage,
   formatAvailabilityDurationPhrase,
   resolveAvailabilityApprovedPriceQuote,
 } from "./availabilityMessageBuilder.js";
 import { findVerifiedAvailabilityAlternatives } from "./availabilityRejectionAlternatives.js";
-import {
-  buildRejectedAvailabilityNoOptionsMessage,
-  buildRejectedAvailabilityWithAlternativesMessage,
-} from "./availabilityMessageBuilder.js";
 import { executeCreateBooking } from "./executors/createBookingExecutor.js";
 import { findItemByName } from "./inventoryService.js";
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
@@ -21,10 +31,18 @@ import {
   findLatestWaitingConfirmAvailabilityRequest,
   findWaitingConfirmAvailabilityRequestsByPhone,
   getAvailabilityRequest,
+  recordAvailabilityCustomerDmOutbound,
   resolveAvailabilityParticipantDisplayName,
   updateAvailabilityRequestCustomerConfirmationState,
   updateAvailabilityRequestFields,
 } from "./availabilityRequestService.js";
+
+export {
+  classifyAvailabilityConfirmationIntent,
+  classifyAvailabilityConfirmationIntent as classifyAvailabilityCustomerDmIntent,
+  isAvailabilityBookingConfirmationPromptActive,
+  resolveAvailabilityConfirmationTurn,
+} from "../brain/availabilityConfirmation/index.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -33,37 +51,6 @@ function clean(value, max = 500) {
 
 function normalizePhone(value) {
   return clean(value, 32).replace(/[^\d+]/g, "");
-}
-
-export function classifyAvailabilityCustomerDmIntent(message) {
-  const raw = clean(message);
-  const lower = raw.toLowerCase();
-  if (!raw) return "unclear";
-  if (
-    /\b(nahi|no|cancel|rehne dein|not now|mat|nope)\b/i.test(lower) &&
-    !/\b(book|confirm|haan|yes|ok)\b/i.test(lower)
-  ) {
-    return "decline";
-  }
-  if (
-    /\b(haan\s+book|book kar do|confirm kar do|yes confirm|ok confirm|book kar do|confirm booking|haan confirm|ji confirm|ok book|yes book)\b/i.test(
-      lower
-    ) ||
-    (/^(haan|haan jee|yes|ok|okay|confirm|ji)$/i.test(lower) &&
-      raw.split(/\s+/).filter(Boolean).length <= 2)
-  ) {
-    return "confirm";
-  }
-  if (/\b(rent kitna|price\??|kitna hoga|kitna hai|rate kya|kiraya)\b/i.test(lower)) {
-    return "price";
-  }
-  if (/\b(koi aur option|aur cars?|alternative|dusri car|corolla available|available hai\??)\b/i.test(lower)) {
-    return "alternatives";
-  }
-  if (/\b(instead|ke liye kar do|chahiye instead|badle|change)\b/i.test(lower)) {
-    return "change_request";
-  }
-  return "unclear";
 }
 
 /**
@@ -123,15 +110,23 @@ async function loadCatalogRowForRequest(businessId, request) {
   return itemLabel ? findItemByName(businessId, itemLabel).catch(() => null) : null;
 }
 
-async function buildPriceReplyForRequest(request) {
+async function resolvePriceQuoteForRequest(request) {
   const catalogRow = await loadCatalogRowForRequest(clean(request?.businessId), request);
-  const resolved = resolveAvailabilityApprovedPriceQuote(request, catalogRow);
+  return resolveAvailabilityApprovedPriceQuote(request, catalogRow);
+}
+
+async function buildPriceReplyForRequest(request, { withConfirmPrompt = true } = {}) {
+  const resolved = await resolvePriceQuoteForRequest(request);
   if (!resolved.ok || !resolved.priceQuote) {
-    return "Rate confirm kar ke bata deta hun.";
+    return withConfirmPrompt
+      ? `${buildAvailabilityAskConfirmPrompt()}`
+      : "Rate confirm kar ke bata deta hun.";
   }
-  const built = buildApprovedAvailabilityCustomerMessage(request, resolved.priceQuote);
-  if (!built.ok) return "Rate confirm kar ke bata deta hun.";
-  return built.message;
+  if (withConfirmPrompt) {
+    return buildAvailabilityPriceAnswerWithConfirmPrompt(request, resolved.priceQuote);
+  }
+  const built = buildApprovedAvailabilityPriceOnlyMessage(request, resolved.priceQuote);
+  return built.ok ? built.message : "Rate confirm kar ke bata deta hun.";
 }
 
 async function buildAlternativesReplyForRequest(request) {
@@ -148,6 +143,82 @@ async function buildAlternativesReplyForRequest(request) {
     request,
     alternatives.map((row) => row.itemLabel)
   );
+}
+
+async function buildQuestionReplyForRequest(request, message) {
+  const topic = classifyAvailabilityCustomerQuestionTopic(message) || "unknown";
+  const catalogRow = await loadCatalogRowForRequest(clean(request?.businessId), request);
+  const resolved = await resolvePriceQuoteForRequest(request);
+  return buildAvailabilityScopedQuestionReply({
+    request,
+    topic,
+    catalogRow,
+    priceQuote: resolved.priceQuote,
+  });
+}
+
+async function resolveReplyForBrainDecision(request, decision, messageText) {
+  if (decision.reply) return decision.reply;
+  if (decision.intent === "price") {
+    return buildPriceReplyForRequest(request, { withConfirmPrompt: true });
+  }
+  if (decision.intent === "alternatives") {
+    return buildAlternativesReplyForRequest(request);
+  }
+  if (decision.intent === "question") {
+    return buildQuestionReplyForRequest(request, messageText);
+  }
+  return buildAvailabilityGenericAckPromptReply();
+}
+
+async function sendCustomerDmReply({
+  phone,
+  reply,
+  sendWhatsAppMessageFn,
+  sendCredentials,
+  connection,
+  businessId,
+  requestId,
+  promptType,
+}) {
+  await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
+    recipientType: "individual",
+  }).catch(() => null);
+  if (requestId) {
+    await recordAvailabilityCustomerDmOutbound({
+      db: connection,
+      businessId,
+      requestId,
+      reply,
+      promptType,
+    }).catch(() => null);
+  }
+  return reply;
+}
+
+async function sendPlaywrightCustomerDmReply({
+  reply,
+  sendReplyFn,
+  sendReplyOpts = {},
+  connection,
+  businessId,
+  requestId,
+  promptType,
+}) {
+  if (typeof sendReplyFn !== "function") {
+    return { ok: false, reason: "MISSING_SEND_REPLY_FN" };
+  }
+  await sendReplyFn(reply, sendReplyOpts).catch(() => null);
+  if (requestId) {
+    await recordAvailabilityCustomerDmOutbound({
+      db: connection,
+      businessId,
+      requestId,
+      reply,
+      promptType,
+    }).catch(() => null);
+  }
+  return reply;
 }
 
 /**
@@ -178,14 +249,17 @@ export async function executeAvailabilityCustomerConfirmBooking({
   if (availabilityConfirmExecute !== true) {
     return { ok: false, reason: "CONFIRM_EXECUTE_DISABLED", dryRun: true };
   }
-  if (clean(request?.status) !== "approved") {
-    return { ok: false, reason: "REQUEST_NOT_APPROVED" };
-  }
-  if (clean(request?.approvalCustomerNotificationStatus) !== "sent") {
-    return { ok: false, reason: "CUSTOMER_NOT_NOTIFIED" };
-  }
-  if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") {
-    return { ok: false, reason: "NOT_WAITING_CONFIRM" };
+
+  const decision = resolveAvailabilityConfirmationTurn({
+    request,
+    messageText,
+  });
+  if (!decision.ok || decision.actionType !== "confirm_booking") {
+    return {
+      ok: false,
+      reason: decision.reason || "BRAIN_CONFIRM_ACTION_NOT_ALLOWED",
+      decision,
+    };
   }
 
   const claim = await claimAvailabilityRequestCustomerConfirmProcessing({
@@ -287,6 +361,123 @@ export async function executeAvailabilityCustomerConfirmBooking({
 }
 
 /**
+ * Playwright Reply Privately DM continuation — known request, Playwright outbound only.
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   request: Record<string, unknown>,
+ *   messageText: string,
+ *   messageId?: string | null,
+ *   sendReplyFn?: (text: string, opts?: Record<string, unknown>) => Promise<unknown>,
+ *   sendReplyOpts?: Record<string, unknown>,
+ *   availabilityConfirmExecute?: boolean,
+ * }} params
+ */
+export async function handleAvailabilityCustomerPlaywrightInbound({
+  db: connection,
+  businessId,
+  request,
+  messageText,
+  messageId = null,
+  sendReplyFn,
+  sendReplyOpts = {},
+  availabilityConfirmExecute = isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
+}) {
+  const uid = clean(businessId);
+  const text = clean(messageText);
+  const requestId = clean(request?.requestId ?? request?.id);
+  if (!uid || !requestId || !text) {
+    return { handled: false, reason: "MISSING_CONTEXT" };
+  }
+  if (typeof sendReplyFn !== "function") {
+    return { handled: false, reason: "MISSING_SEND_REPLY_FN" };
+  }
+
+  let fresh =
+    (await getAvailabilityRequest({ db: connection, businessId: uid, requestId })) || request;
+
+  const decision = resolveAvailabilityConfirmationTurn({ request: fresh, messageText: text });
+  if (!decision.ok) {
+    return { handled: false, reason: decision.reason || "BRAIN_DECISION_FAILED" };
+  }
+
+  if (decision.actionType === "decline_request") {
+    await updateAvailabilityRequestCustomerConfirmationState({
+      db: connection,
+      businessId: uid,
+      requestId,
+      customerConfirmationStatus: "declined",
+      extra: {
+        customerConfirmationAt: new Date(),
+        customerConfirmationMessageId: clean(messageId) || null,
+        customerConfirmationTextPreview: text.slice(0, 160),
+      },
+    });
+    const reply = await sendPlaywrightCustomerDmReply({
+      reply: decision.reply,
+      sendReplyFn,
+      sendReplyOpts,
+      connection,
+      businessId: uid,
+      requestId,
+      promptType: decision.outboundPromptType,
+    });
+    return { handled: true, action: "declined", reply, decision };
+  }
+
+  if (decision.actionType === "confirm_booking") {
+    const result = await executeAvailabilityCustomerConfirmBooking({
+      db: connection,
+      businessId: uid,
+      request: fresh,
+      messageText: text,
+      messageId,
+      availabilityConfirmExecute,
+    });
+    const reply =
+      result.ok === true
+        ? result.reply || buildAvailabilityConfirmSuccessReply()
+        : buildAvailabilityConfirmClarificationReply();
+    await sendReplyFn(reply, sendReplyOpts).catch(() => null);
+    if (result.ok === true) {
+      await recordAvailabilityCustomerDmOutbound({
+        db: connection,
+        businessId: uid,
+        requestId,
+        reply,
+        promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
+      }).catch(() => null);
+    }
+    return {
+      handled: true,
+      action: result.ok ? "confirmed_booking" : "confirm_failed",
+      reply,
+      result,
+      decision,
+    };
+  }
+
+  const reply = await resolveReplyForBrainDecision(fresh, decision, text);
+  const replyAction =
+    decision.intent === "acknowledge"
+      ? "acknowledge"
+      : decision.intent === "unclear"
+        ? "unclear"
+        : decision.intent;
+  const sentReply = await sendPlaywrightCustomerDmReply({
+    reply,
+    sendReplyFn,
+    sendReplyOpts,
+    connection,
+    businessId: uid,
+    requestId,
+    promptType: decision.outboundPromptType,
+  });
+  return { handled: true, action: replyAction, reply: sentReply, decision };
+}
+
+/**
  * @param {{
  *   db?: unknown,
  *   businessId: string,
@@ -320,9 +511,8 @@ export async function handleAvailabilityCustomerCloudInbound({
     businessId: uid,
     customerPhone: phone,
   });
-  const intent = classifyAvailabilityCustomerDmIntent(text);
   const selection = selectAvailabilityRequestForCustomerMessage(waiting, text);
-  const request = selection.request;
+  let request = selection.request;
 
   if (!request && waiting.length === 0) {
     return { handled: false, reason: "NO_WAITING_REQUEST" };
@@ -344,11 +534,21 @@ export async function handleAvailabilityCustomerCloudInbound({
     return { handled: true, action: "clarification", reply };
   }
 
-  if (intent === "decline") {
+  const requestId = clean(request.requestId ?? request.id);
+  const fresh =
+    (await getAvailabilityRequest({ db: connection, businessId: uid, requestId })) || request;
+  request = fresh;
+
+  const decision = resolveAvailabilityConfirmationTurn({ request, messageText: text });
+  if (!decision.ok) {
+    return { handled: false, reason: decision.reason || "BRAIN_DECISION_FAILED" };
+  }
+
+  if (decision.actionType === "decline_request") {
     await updateAvailabilityRequestCustomerConfirmationState({
       db: connection,
       businessId: uid,
-      requestId: clean(request.requestId),
+      requestId,
       customerConfirmationStatus: "declined",
       extra: {
         customerConfirmationAt: new Date(),
@@ -356,39 +556,20 @@ export async function handleAvailabilityCustomerCloudInbound({
         customerConfirmationTextPreview: text.slice(0, 160),
       },
     });
-    const reply = "Theek hai, booking hold par hai. Agar baad mein chahiye ho to batayein.";
-    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-      recipientType: "individual",
-    }).catch(() => null);
-    return { handled: true, action: "declined", reply };
+    const reply = await sendCustomerDmReply({
+      phone,
+      reply: decision.reply,
+      sendWhatsAppMessageFn,
+      sendCredentials,
+      connection,
+      businessId: uid,
+      requestId,
+      promptType: decision.outboundPromptType,
+    });
+    return { handled: true, action: "declined", reply, decision };
   }
 
-  if (intent === "price") {
-    const reply = await buildPriceReplyForRequest(request);
-    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-      recipientType: "individual",
-    }).catch(() => null);
-    return { handled: true, action: "price", reply };
-  }
-
-  if (intent === "alternatives") {
-    const reply = await buildAlternativesReplyForRequest(request);
-    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-      recipientType: "individual",
-    }).catch(() => null);
-    return { handled: true, action: "alternatives", reply };
-  }
-
-  if (intent === "change_request") {
-    const reply =
-      "Theek hai, naya item ya duration ke liye main owner se availability check kar leta hun.";
-    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-      recipientType: "individual",
-    }).catch(() => null);
-    return { handled: true, action: "change_request", reply };
-  }
-
-  if (intent === "confirm") {
+  if (decision.actionType === "confirm_booking") {
     const result = await executeAvailabilityCustomerConfirmBooking({
       db: connection,
       businessId: uid,
@@ -405,19 +586,42 @@ export async function handleAvailabilityCustomerCloudInbound({
     await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
       recipientType: "individual",
     }).catch(() => null);
+    if (result.ok === true) {
+      await recordAvailabilityCustomerDmOutbound({
+        db: connection,
+        businessId: uid,
+        requestId,
+        reply,
+        promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
+      }).catch(() => null);
+    }
     return {
       handled: true,
       action: result.ok ? "confirmed_booking" : "confirm_failed",
       reply,
       result,
+      decision,
     };
   }
 
-  const reply = "Samajh gaya. Agar book karna hai to 'haan book kar do' likh dein.";
-  await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-    recipientType: "individual",
-  }).catch(() => null);
-  return { handled: true, action: "unclear", reply };
+  const reply = await resolveReplyForBrainDecision(request, decision, text);
+  const replyAction =
+    decision.intent === "acknowledge"
+      ? "acknowledge"
+      : decision.intent === "unclear"
+        ? "unclear"
+        : decision.intent;
+  const sentReply = await sendCustomerDmReply({
+    phone,
+    reply,
+    sendWhatsAppMessageFn,
+    sendCredentials,
+    connection,
+    businessId: uid,
+    requestId,
+    promptType: decision.outboundPromptType,
+  });
+  return { handled: true, action: replyAction, reply: sentReply, decision };
 }
 
 export async function tryHandleAvailabilityCustomerCloudInbound(params) {
@@ -432,3 +636,13 @@ export async function getTrustedWaitingConfirmRequest(params) {
 export async function loadAvailabilityRequestById(params) {
   return getAvailabilityRequest(params);
 }
+
+/**
+ * @param {{ request: Record<string, unknown> }} params
+ */
+export async function buildAvailabilityRecordedPriceInfoReply({ request }) {
+  const reply = await buildPriceReplyForRequest(request, { withConfirmPrompt: false });
+  return { reply, promptType: AVAILABILITY_DM_PROMPT_TYPES.PRICE_INFO };
+}
+
+export { resolveAvailabilityCustomerDmPromptType };

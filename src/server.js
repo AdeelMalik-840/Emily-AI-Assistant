@@ -42,6 +42,7 @@ import { parseAndValidateManualWhatsAppPhone } from "./lib/validateManualWhatsAp
 import { getWhatsAppEnv, validateWhatsAppEnv } from "./utils/env.js";
 import { metaCloudFromIsGroupThread } from "./utils/waMetaThreadMarkers.js";
 import { logBrainV2LiveStartupSnapshot } from "./brain/live/brainRouteGate.js";
+import { handlePollAvailabilityCustomerConfirmManualTrigger } from "./internal/pollAvailabilityCustomerConfirmManualTrigger.js";
 
 console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 console.log("[build_marker] whatsapp_cloud_token_fix_v1_loaded");
@@ -107,6 +108,16 @@ app.post("/internal/clear-extraction-state", async (req, res) => {
       .json({ ok: false, error: String(e?.message ?? e ?? "unknown") });
   }
 });
+
+/**
+ * Local-only manual trigger for one narrow availability customer confirm poll cycle.
+ * Disabled unless PLAYWRIGHT_AVAILABILITY_CUSTOMER_CONFIRM_MANUAL_TRIGGER_ENABLED=true
+ * and CLEAR_EXTRACTION_STATE_SECRET is set. Requires header x-clear-secret.
+ */
+app.post(
+  "/internal/poll-availability-customer-confirm",
+  handlePollAvailabilityCustomerConfirmManualTrigger
+);
 
 async function getUidFromBearer(req) {
   const raw = req.headers.authorization;
