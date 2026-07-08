@@ -8,13 +8,21 @@ import {
 import {
   buildAvailabilityChangeCarReply,
   buildAvailabilityChangeDurationReply,
+  buildAvailabilityContextClarificationReply,
+  buildAvailabilityPriceAnswerSoftReply,
   buildAvailabilityDeclineAckReply,
   buildAvailabilityGenericAckPromptReply,
 } from "./availabilityConfirmationReplies.js";
+import { resolveAvailabilityApprovedPriceQuote } from "../../services/availabilityMessageBuilder.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
+}
+
+function resolveRequestedDurationDays(request) {
+  const n = Number(request?.requestedDuration ?? request?.durationDays);
+  return Number.isFinite(n) && n > 0 ? Math.max(1, Math.floor(n)) : null;
 }
 
 /**
@@ -75,17 +83,34 @@ export function resolveAvailabilityConfirmationTurn({ request, messageText }) {
   const actionType = mapIntentToActionType(intent);
   const outboundPromptType = mapIntentToOutboundPromptType(intent);
   const changeDuration = detectAvailabilityChangeDurationIntent(text, request);
+  const questionTopic = intent === "question" ? classifyAvailabilityCustomerQuestionTopic(text) : null;
 
   /** @type {string | null} */
   let reply = null;
   if (intent === "decline") {
     reply = buildAvailabilityDeclineAckReply();
   } else if (intent === "change_duration") {
-    reply = buildAvailabilityChangeDurationReply(changeDuration?.requestedDays);
+    const currentDays = resolveRequestedDurationDays(request);
+    const nextDays =
+      changeDuration?.requestedDays != null && Number.isFinite(Number(changeDuration.requestedDays))
+        ? Math.max(1, Math.floor(Number(changeDuration.requestedDays)))
+        : null;
+    const base = nextDays
+      ? `${nextDays} din ke liye availability dobara check karni hogi.`
+      : buildAvailabilityChangeDurationReply(null);
+    reply =
+      currentDays && nextDays
+        ? `${base} Abhi current request ${currentDays} din ke liye hai.`
+        : base;
   } else if (intent === "change_car") {
     reply = buildAvailabilityChangeCarReply();
-  } else if (intent === "acknowledge" || intent === "unclear") {
+  } else if (intent === "price") {
+    const quote = resolveAvailabilityApprovedPriceQuote(request, null).priceQuote;
+    reply = buildAvailabilityPriceAnswerSoftReply(request, quote);
+  } else if (intent === "acknowledge") {
     reply = buildAvailabilityGenericAckPromptReply();
+  } else if (intent === "unclear") {
+    reply = buildAvailabilityContextClarificationReply(request);
   }
 
   return {
@@ -97,7 +122,7 @@ export function resolveAvailabilityConfirmationTurn({ request, messageText }) {
     needsAsyncReply: ["price", "alternatives", "question"].includes(intent),
     questionTopic:
       intent === "question"
-        ? classifyAvailabilityCustomerQuestionTopic(text)
+        ? questionTopic
         : intent === "price"
           ? "price"
           : null,

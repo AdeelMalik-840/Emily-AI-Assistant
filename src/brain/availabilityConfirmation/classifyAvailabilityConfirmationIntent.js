@@ -65,7 +65,10 @@ export function detectAvailabilityChangeDurationIntent(message, request = null) 
     };
   }
   const currentDays = Number(request?.requestedDuration);
-  if (Number.isFinite(currentDays) && /\b(\d+)\s*din\s*(kar do|chahiye|kr do)\b/i.test(lower)) {
+  if (
+    Number.isFinite(currentDays) &&
+    /\b(\d+)\s*din(?:\s*ke\s*liye)?\s*(kar do|chahiye|kr do)\b/i.test(lower)
+  ) {
     const match = lower.match(/\b(\d+)\s*din\b/i);
     const mentioned = match ? Number(match[1]) : null;
     if (Number.isFinite(mentioned) && Math.floor(mentioned) !== Math.floor(currentDays)) {
@@ -124,12 +127,29 @@ export function classifyAvailabilityCustomerQuestionTopic(message) {
   const lower = clean(message).toLowerCase();
   if (!lower) return null;
   if (/\b(pickup|kahan se|kahan se hogi|pick up)\b/i.test(lower)) return "pickup";
+  if (/\b(dropoff|drop off|drop-off)\b/i.test(lower)) return "dropoff";
+  if (/\b(delivery|deliver)\b/i.test(lower)) return "delivery";
+  if (/\b(kal se|kal\s*se\s*chahiye|tomorrow|aaj se)\b/i.test(lower)) return "start_date";
   if (/\b(deposit|security)\b/i.test(lower)) return "deposit";
   if (/\b(driver|driver milega|chauffeur)\b/i.test(lower)) return "driver";
-  if (/\b(model|konsa hai|konsi hai)\b/i.test(lower)) return "model";
   if (/\b(white|colour|color|rang)\b/i.test(lower)) return "color";
+  if (/\b(model)\b/i.test(lower) || /\b(konsa|konsi)\s*model\b/i.test(lower) || /\bmodel\s*(konsa|konsi)\b/i.test(lower)) {
+    return "model";
+  }
+  if (/\b(car ka naam|gaari ka naam|konsi car|kon si car|which car)\b/i.test(lower)) return "car_name";
   if (/\b(\d+\s*din\s*ka\s*hi\s*hai\s*na|duration|kitne din)\b/i.test(lower)) return "duration";
-  if (/\b(rent kitna|price|kitna hoga|kitna hai|rate kya|kiraya)\b/i.test(lower)) return "price";
+  if (/\b(photo|photos|pic|pics|picture|pictures|image|images)\b/i.test(lower)) return "images";
+  if (/\b(available|availability)\b/i.test(lower)) return "availability";
+  if (
+    /\b(rent kitna|price|kitna hoga|kitna hai|rate kya|kiraya|total kitna|daily|per day)\b/i.test(lower) ||
+    /\b(per day)\s*kitna\b/i.test(lower) ||
+    /\b(daily)\s*kitna\b/i.test(lower) ||
+    /\bkitna\s*(?:hoga\s*)?total\b/i.test(lower) ||
+    /\b\d+\s*din\s*ka\s*total\b/i.test(lower) ||
+    /\btotal\s*hai\b/i.test(lower)
+  ) {
+    return "price";
+  }
   return null;
 }
 
@@ -163,16 +183,14 @@ export function classifyAvailabilityConfirmationIntent(message, request = null) 
   }
 
   const questionTopic = classifyAvailabilityCustomerQuestionTopic(raw);
-  if (questionTopic && questionTopic !== "price") {
-    return "question";
-  }
-
-  if (questionTopic === "price" || /\b(rent kitna|price|kitna hoga|kitna hai|rate kya|kiraya)\b/i.test(lower)) {
+  if (questionTopic === "price") {
     return "price";
   }
+  if (questionTopic) return "question";
 
   if (
-    /\b(koi aur option|aur cars?|alternative|dusri car|corolla available|available hai\??)\b/i.test(lower)
+    /\b(koi aur option|aur cars?|alternative|dusri car)\b/i.test(lower) ||
+    /\bcorolla available\b/i.test(lower)
   ) {
     return "alternatives";
   }

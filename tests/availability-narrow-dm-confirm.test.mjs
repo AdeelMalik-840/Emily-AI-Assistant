@@ -194,7 +194,7 @@ test("price then Kar doon prompt then ok creates booking once", async () => {
   const price = await handleInbound(fake, "rent kitna ho ga?", sendCalls);
   assert.equal(price.action, "price");
   assert.match(sendCalls[0][1], /16,000 PKR/);
-  assert.match(sendCalls[0][1], /Kar doon\?/);
+  assert.match(sendCalls[0][1], /Confirm karna ho to bata dein/i);
 
   const confirm = await handleInbound(fake, "ok", sendCalls);
   assert.equal(confirm.action, "confirmed_booking");
@@ -218,7 +218,7 @@ test("price-only context then ok asks Kar doon without booking", async () => {
   const sendCalls = [];
   const result = await handleInbound(fake, "ok", sendCalls);
   assert.equal(result.action, "acknowledge");
-  assert.match(sendCalls[0][1], /Kar doon\?/);
+  assert.match(sendCalls[0][1], /Confirm karna ho to bata dein/i);
   const stored = fake.getRequestDoc(REQUEST_ID);
   assert.equal(stored.customerConfirmationStatus, "waiting_confirm");
   assert.equal(stored.linkedBookingId, undefined);
@@ -259,7 +259,61 @@ test("ok pickup kahan se hogi does not create booking", async () => {
   const sendCalls = [];
   const result = await handleInbound(fake, "ok pickup kahan se hogi?", sendCalls);
   assert.equal(result.action, "question");
-  assert.match(sendCalls[0][1], /confirmation karni hogi|pickup|Kar doon\?/i);
+  assert.match(sendCalls[0][1], /confirmation karni hogi|pickup|Confirm karna ho to bata dein/i);
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("detail question does not create booking", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest({ itemLabel: "Kia Stonic White Color" }));
+  const sendCalls = [];
+  const result = await handleInbound(fake, "color konsa hai?", sendCalls);
+  assert.equal(result.action, "question");
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("image question does not create booking", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest({ itemLabel: "Kia Stonic White Color" }));
+  const sendCalls = [];
+  const result = await handleInbound(fake, "pictures?", sendCalls);
+  assert.equal(result.action, "question");
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("logistics question does not create booking", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const sendCalls = [];
+  const result = await handleInbound(fake, "delivery possible hai?", sendCalls);
+  assert.equal(result.action, "question");
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("duration change does not create booking for 3 din ke liye kar do", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest({ requestedDuration: 5 }));
+  const sendCalls = [];
+  const result = await handleInbound(fake, "3 din ke liye kar do", sendCalls);
+  assert.equal(result.action, "change_duration");
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("item change does not create booking", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const sendCalls = [];
+  const result = await handleInbound(fake, "Civic chahiye instead", sendCalls);
+  assert.equal(result.action, "change_car");
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("unrelated message does not create booking", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest({ itemLabel: "Kia Stonic", requestedDuration: 5 }));
+  const sendCalls = [];
+  const result = await handleInbound(fake, "hello", sendCalls);
+  assert.equal(result.action, "unclear");
   assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
 });
 
@@ -269,7 +323,7 @@ test("change duration does not book and avoids owner mention", async () => {
   const sendCalls = [];
   const result = await handleInbound(fake, "2 din ki jagah 3 din kar do", sendCalls);
   assert.equal(result.action, "change_duration");
-  assert.match(sendCalls[0][1], /3 din ke liye dobara availability confirm karni hogi/);
+  assert.match(sendCalls[0][1], /3 din ke liye availability dobara (check|confirm) karni hogi/i);
   assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
   assertNoOwnerLanguage(sendCalls);
 });

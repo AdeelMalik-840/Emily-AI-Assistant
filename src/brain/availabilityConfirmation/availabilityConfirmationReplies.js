@@ -9,6 +9,11 @@ function clean(value, max = 500) {
   return text ? text.slice(0, max) : "";
 }
 
+function resolveRequestedDurationDays(request) {
+  const n = Number(request?.requestedDuration ?? request?.durationDays);
+  return Number.isFinite(n) && n > 0 ? Math.max(1, Math.floor(n)) : null;
+}
+
 function formatMoneyAmount(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return String(amount ?? "");
@@ -23,7 +28,7 @@ export function containsCustomerFacingOwnerLanguage(text) {
 }
 
 export function buildAvailabilityAskConfirmPrompt() {
-  return "Kar doon?";
+  return "Confirm karna ho to bata dein.";
 }
 
 export function buildAvailabilityConfirmKarDoonPrompt() {
@@ -57,7 +62,14 @@ export function buildAvailabilityUnknownDetailReply() {
 }
 
 export function buildAvailabilityGenericAckPromptReply() {
-  return "Kar doon?";
+  return "Theek hai. Confirm karna ho to bata dein.";
+}
+
+export function buildAvailabilityContextClarificationReply(request) {
+  const itemLabel = clean(request?.itemLabel) || "yeh car";
+  const days = resolveRequestedDurationDays(request);
+  const duration = days ? `${days} din` : "is duration";
+  return `Abhi ${itemLabel} (${duration}) ke hawalay se baat ho rahi hai. Rent ya details poochni hain?`;
 }
 
 /**
@@ -75,12 +87,28 @@ export function buildAvailabilityPriceAnswerMessage(request, priceQuote) {
   return `${itemLabel} ${rentDurationPhrase} ka rent ${formatMoneyAmount(total)} ${currency} hoga.`;
 }
 
+export function buildAvailabilityPriceAnswerSoftReply(request, priceQuote) {
+  const core = buildAvailabilityPriceAnswerMessage(request, priceQuote);
+  return `${core} ${buildAvailabilityAskConfirmPrompt()}`;
+}
+
 /**
  * @param {Record<string, unknown>} request
  * @param {Record<string, unknown> | null | undefined} priceQuote
  */
 export function buildAvailabilityPriceAnswerWithConfirmPrompt(request, priceQuote) {
   return `${buildAvailabilityPriceAnswerMessage(request, priceQuote)} ${buildAvailabilityAskConfirmPrompt()}`;
+}
+
+export function buildAvailabilityImagesSafeReply(request) {
+  const itemLabel = clean(request?.itemLabel) || "yeh car";
+  return `Filhal yahan images attach nahi kar sakta. ${itemLabel} ke details share kar sakta hun.`;
+}
+
+export function buildAvailabilityAvailabilityRecheckReply(request) {
+  const itemLabel = clean(request?.itemLabel) || "Yeh car";
+  const duration = formatAvailabilityDurationPhrase(request);
+  return `Ji, ${itemLabel} ${duration} ke liye available hai.`;
 }
 
 /**
@@ -108,13 +136,30 @@ export function buildAvailabilityScopedQuestionReply({
   switch (topic) {
     case "price": {
       const quote = priceQuote ?? resolveAvailabilityApprovedPriceQuote(request, catalogRow).priceQuote;
-      return buildAvailabilityPriceAnswerWithConfirmPrompt(request, quote);
+      return buildAvailabilityPriceAnswerSoftReply(request, quote);
     }
+    case "availability":
+      return `${buildAvailabilityAvailabilityRecheckReply(request)} ${buildAvailabilityAskConfirmPrompt()}`;
     case "pickup": {
       const pickup = clean(row.pickupLocation ?? profile.pickupLocation ?? profile.location);
       if (pickup) return `${pickup} se pickup ho sakti hai. ${buildAvailabilityAskConfirmPrompt()}`;
       return `${buildAvailabilityUnknownDetailReply()} ${buildAvailabilityAskConfirmPrompt()}`;
     }
+    case "dropoff": {
+      const dropoff = clean(row.dropoffLocation ?? profile.dropoffLocation);
+      if (dropoff) return `${dropoff} par dropoff ho sakta hai. ${buildAvailabilityAskConfirmPrompt()}`;
+      return `${buildAvailabilityUnknownDetailReply()} ${buildAvailabilityAskConfirmPrompt()}`;
+    }
+    case "delivery": {
+      const delivery = clean(row.deliveryAvailable ?? row.delivery ?? profile.deliveryAvailable);
+      if (/^(yes|true|available|haan)/i.test(delivery)) {
+        return `Haan, delivery possible hai. ${buildAvailabilityAskConfirmPrompt()}`;
+      }
+      if (delivery) return `${delivery}. ${buildAvailabilityAskConfirmPrompt()}`;
+      return `${buildAvailabilityUnknownDetailReply()} ${buildAvailabilityAskConfirmPrompt()}`;
+    }
+    case "start_date":
+      return `${buildAvailabilityUnknownDetailReply()} ${buildAvailabilityAskConfirmPrompt()}`;
     case "deposit": {
       const deposit = clean(row.deposit ?? row.securityDeposit ?? profile.deposit);
       if (deposit) return `Deposit ${deposit} hai. ${buildAvailabilityAskConfirmPrompt()}`;
@@ -130,6 +175,8 @@ export function buildAvailabilityScopedQuestionReply({
     }
     case "model":
       return `${itemLabel} hai. ${buildAvailabilityAskConfirmPrompt()}`;
+    case "car_name":
+      return `${itemLabel} hai. ${buildAvailabilityAskConfirmPrompt()}`;
     case "color": {
       const color = clean(row.color ?? row.colour);
       if (color) return `Haan, ${color} colour hai. ${buildAvailabilityAskConfirmPrompt()}`;
@@ -138,6 +185,8 @@ export function buildAvailabilityScopedQuestionReply({
     }
     case "duration":
       return `Haan, ${durationPhrase} ke liye hai. ${buildAvailabilityAskConfirmPrompt()}`;
+    case "images":
+      return `${buildAvailabilityImagesSafeReply(request)} ${buildAvailabilityAskConfirmPrompt()}`;
     default:
       return `${buildAvailabilityUnknownDetailReply()} ${buildAvailabilityAskConfirmPrompt()}`;
   }

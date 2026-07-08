@@ -17,7 +17,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const BUSINESS_ID = "owner-poller-1";
-const NOTIFY_AT_MS = Date.parse("2026-07-05T10:00:00.000Z");
+/** Relative-to-now so confirmExpiresAt stays valid without weakening production gates. */
+const NOTIFY_AT_MS = Date.now() - 5 * 60 * 1000;
 
 function createFakeDb(requests = {}) {
   const store = { businesses: {} };

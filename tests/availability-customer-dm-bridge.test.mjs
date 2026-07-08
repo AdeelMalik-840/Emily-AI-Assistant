@@ -32,7 +32,8 @@ import {
 const BUSINESS_ID = "owner-bridge-1";
 const REQUEST_ID = "avr_bridge_001";
 const CUSTOMER_PHONE = "+923001111111";
-const NOTIFY_AT_MS = Date.parse("2026-07-05T10:00:00.000Z");
+/** Relative-to-now so confirmExpiresAt stays valid without weakening production gates. */
+const NOTIFY_AT_MS = Date.now() - 5 * 60 * 1000;
 
 function createFakeDb(seed = {}) {
   const store = { businesses: {} };
@@ -208,7 +209,10 @@ test("B/C: bridge injects Playwright sendReplyFn and sends through sendPlaywrigh
   assert.equal(result.ok, true);
   assert.equal(result.accepted, 1);
   assert.equal(playwrightSends.length, 1);
-  assert.match(String(playwrightSends[0].text), /rent|Kar doon/i);
+  assert.match(
+    String(playwrightSends[0].text),
+    /rent|Confirm karna ho to bata dein|Rate confirm|Kar doon/i
+  );
   assert.equal(playwrightSends[0].opts.expectedHeaderTitle, "Adeel Malik");
   assert.equal(playwrightSends[0].opts.replyPrivateContext, true);
 });
