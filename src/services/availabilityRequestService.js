@@ -6,7 +6,10 @@ import {
   buildNarrowDmLogicalMessageKey,
   hashNarrowDmMessageText,
 } from "./playwrightNarrowDmMessageReader.js";
-import { buildInitialAvailabilityPhoneExtractionFields } from "./availabilityCustomerPhone.js";
+import {
+  buildInitialAvailabilityPhoneExtractionFields,
+  isRetryablePhoneExtractionError,
+} from "./availabilityCustomerPhone.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
@@ -1773,14 +1776,25 @@ export const MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS = 3;
  */
 export function availabilityRequestNeedsGroupContactPhoneExtraction(request) {
   const status = clean(request?.phoneExtractionStatus);
-  if (status === "resolved" || status === "failed" || status === "ambiguous") {
-    return false;
-  }
-  if (status !== "pending" && status !== "resolving") return false;
+  const errorCode = clean(request?.phoneExtractionError);
   const attempts = Number(request?.phoneExtractionAttemptCount);
-  if (Number.isFinite(attempts) && attempts >= MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS) {
+  const attemptsSafe =
+    !Number.isFinite(attempts) || attempts < MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS;
+
+  if (status === "resolved" || status === "ambiguous") {
     return false;
   }
+  if (status === "failed") {
+    // Temporary lock/page busy must remain reclaimable.
+    if (!isRetryablePhoneExtractionError(errorCode) || !attemptsSafe) {
+      return false;
+    }
+  } else if (status !== "pending" && status !== "resolving") {
+    return false;
+  } else if (!attemptsSafe) {
+    return false;
+  }
+
   const identity = asPlainObject(request?.sourceIdentity) ?? {};
   const hasStrong =
     Boolean(clean(identity.sourceMessageId) || clean(request?.sourceMessageId)) ||
@@ -1812,17 +1826,42 @@ export async function findPendingAvailabilityPhoneExtractionRequests({
   if (!firestore || !uid) return [];
 
   const capped = Math.max(1, Math.min(10, Number(limit) || 1));
-  const snap = await availabilityRequestCollectionRef(connection, uid)
+  const collection = availabilityRequestCollectionRef(connection, uid);
+  if (!collection) return [];
+
+  const pendingSnap = await collection
     .where("phoneExtractionStatus", "==", "pending")
     .limit(capped)
     .get()
     .catch(() => null);
+  const failedSnap = await collection
+    .where("phoneExtractionStatus", "==", "failed")
+    .limit(Math.max(capped, 5))
+    .get()
+    .catch(() => null);
 
-  const docs = snap?.docs ?? [];
-  return docs
-    .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
-    .filter((row) => availabilityRequestNeedsGroupContactPhoneExtraction(row))
-    .slice(0, capped);
+  const rows = [
+    ...(pendingSnap?.docs ?? []).map((doc) => ({
+      requestId: doc.id,
+      ...(doc.data() || {}),
+    })),
+    ...(failedSnap?.docs ?? []).map((doc) => ({
+      requestId: doc.id,
+      ...(doc.data() || {}),
+    })),
+  ];
+
+  const merged = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const id = clean(row.requestId);
+    if (!id || seen.has(id)) continue;
+    if (!availabilityRequestNeedsGroupContactPhoneExtraction(row)) continue;
+    seen.add(id);
+    merged.push(row);
+    if (merged.length >= capped) break;
+  }
+  return merged;
 }
 
 /**
@@ -1850,10 +1889,15 @@ export async function claimAvailabilityPhoneExtractionResolving({
   if (status === "resolving") {
     return { ok: false, reason: "ALREADY_RESOLVING", request: { requestId, ...data } };
   }
-  if (status !== "pending") {
+  const retryableFailed =
+    status === "failed" && isRetryablePhoneExtractionError(data.phoneExtractionError);
+  if (status !== "pending" && !retryableFailed) {
     return { ok: false, reason: "NOT_PENDING", request: { requestId, ...data } };
   }
-  if (!availabilityRequestNeedsGroupContactPhoneExtraction({ ...data, phoneExtractionStatus: "pending" })) {
+  if (!availabilityRequestNeedsGroupContactPhoneExtraction({
+    ...data,
+    phoneExtractionStatus: retryableFailed ? "failed" : "pending",
+  })) {
     return { ok: false, reason: "NOT_ELIGIBLE", request: { requestId, ...data } };
   }
   const attempts = Number(data.phoneExtractionAttemptCount);

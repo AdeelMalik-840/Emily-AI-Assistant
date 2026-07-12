@@ -108,6 +108,53 @@ export function resolveCustomerDmTransport(input = {}) {
   return "none";
 }
 
+/** Temporary UI/page locks — never terminal-fail; do not burn attempt budget. */
+export const RETRYABLE_PHONE_EXTRACTION_ERRORS = Object.freeze([
+  "UI_HARD_LOCK_BUSY",
+  "UI_SEND_LOCK_BUSY",
+  "REPLY_PRIVATE_LOCK_BUSY",
+  "NO_ACTIVE_PAGE",
+]);
+
+/**
+ * Soft/transient locate misses — stay pending until max attempts, then fail.
+ * @type {readonly string[]}
+ */
+export const SOFT_RETRYABLE_PHONE_EXTRACTION_ERRORS = Object.freeze([
+  "SOURCE_ROW_NOT_FOUND",
+  "SOURCE_ROW_NOT_VISIBLE",
+  "REPLY_PRIVATE_SOURCE_BUBBLE_NOT_CONFIRMED",
+]);
+
+/**
+ * @param {unknown} errorCode
+ * @returns {boolean}
+ */
+export function isRetryablePhoneExtractionError(errorCode) {
+  const code = String(errorCode ?? "").trim();
+  return RETRYABLE_PHONE_EXTRACTION_ERRORS.includes(code);
+}
+
+/**
+ * @param {unknown} errorCode
+ * @returns {boolean}
+ */
+export function isSoftRetryablePhoneExtractionError(errorCode) {
+  const code = String(errorCode ?? "").trim();
+  return SOFT_RETRYABLE_PHONE_EXTRACTION_ERRORS.includes(code);
+}
+
+/**
+ * @param {unknown} errorCode
+ * @returns {boolean}
+ */
+export function isDeferredPhoneExtractionError(errorCode) {
+  return (
+    isRetryablePhoneExtractionError(errorCode) ||
+    isSoftRetryablePhoneExtractionError(errorCode)
+  );
+}
+
 /**
  * Initial phone-extraction fields at availabilityRequest creation.
  * participantPhone present → resolved from group_row; else pending for Contact-info resolver.
@@ -282,12 +329,16 @@ export function buildAvailabilityPhoneExtractionFields(input = {}) {
   }
 
   if (status === "pending" || status === "resolving" || status === "not_started") {
+    const error =
+      input.phoneExtractionError != null && String(input.phoneExtractionError).trim()
+        ? String(input.phoneExtractionError).trim().slice(0, 200)
+        : null;
     return {
       ok: true,
       patch: {
         phoneExtractionStatus: status,
         customerDmTransport: "none",
-        phoneExtractionError: null,
+        phoneExtractionError: error,
         phoneExtractionAttemptCount:
           status === "not_started"
             ? asAttemptCount(existing.phoneExtractionAttemptCount)

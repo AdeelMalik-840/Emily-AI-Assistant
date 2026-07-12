@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import {
   buildInitialAvailabilityPhoneExtractionFields,
   buildAvailabilityPhoneExtractionFields,
+  isRetryablePhoneExtractionError,
   maskCustomerPhone,
 } from "../src/services/availabilityCustomerPhone.js";
 import { extractAndPersistAvailabilityCustomerPhone } from "../src/services/availabilityCustomerPhoneExtractionService.js";
@@ -14,6 +15,10 @@ import {
   startLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
   stopLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
 } from "../src/services/localAvailabilityCustomerPhoneExtractionPollerScheduler.js";
+import {
+  availabilityRequestNeedsGroupContactPhoneExtraction,
+  claimAvailabilityPhoneExtractionResolving,
+} from "../src/services/availabilityRequestService.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BUSINESS_ID = "biz1";
@@ -173,7 +178,7 @@ test("3–6. pending calls resolver; success/failure/ambiguous write correctly",
     extractFn: async () => ({
       ok: false,
       status: "failed",
-      errorCode: "SOURCE_ROW_NOT_FOUND",
+      errorCode: "NO_PHONE_EXTRACTED",
       phone: null,
       maskedPhone: null,
       candidates: [],
@@ -183,6 +188,28 @@ test("3–6. pending calls resolver; success/failure/ambiguous write correctly",
   assert.equal(fakeDb.docs.get(avrKey("avr_fail")).phoneExtractionStatus, "failed");
   assert.equal(fakeDb.docs.get(avrKey("avr_fail")).customerDmTransport, "none");
 
+  // Soft-retryable locate miss stays pending (not terminal failed yet).
+  seedPending(fakeDb, "avr_row_miss");
+  const soft = await extractAndPersistAvailabilityCustomerPhone({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_row_miss",
+    enabled: true,
+    getPageFn: () => ({ id: "page" }),
+    extractFn: async () => ({
+      ok: false,
+      status: "failed",
+      errorCode: "SOURCE_ROW_NOT_FOUND",
+      phone: null,
+      candidates: [],
+    }),
+  });
+  assert.equal(soft.deferred, true);
+  assert.equal(fakeDb.docs.get(avrKey("avr_row_miss")).phoneExtractionStatus, "pending");
+  assert.equal(
+    fakeDb.docs.get(avrKey("avr_row_miss")).phoneExtractionError,
+    "SOURCE_ROW_NOT_FOUND"
+  );
   seedPending(fakeDb, "avr_amb");
   const amb = await extractAndPersistAvailabilityCustomerPhone({
     db: fakeDb,
@@ -391,4 +418,158 @@ test("scheduler starts only when enabled and stops cleanly", () => {
     logFn: () => {},
   });
   assert.equal(stopped.stopped, true);
+});
+
+test("UI_HARD_LOCK_BUSY defers to pending, not failed; undoes attempt burn", async () => {
+  const fakeDb = new FakeDb();
+  seedPending(fakeDb, "avr_busy");
+  fakeDb.docs.get(avrKey("avr_busy")).customerPhone = "923009999999";
+
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => {
+    logs.push(args.map((a) => JSON.stringify(a)).join(" "));
+  };
+  let result;
+  try {
+    result = await extractAndPersistAvailabilityCustomerPhone({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: "avr_busy",
+      enabled: true,
+      getPageFn: () => ({ id: "page" }),
+      extractFn: async () => ({
+        ok: false,
+        status: "failed",
+        errorCode: "UI_HARD_LOCK_BUSY",
+        phone: null,
+        candidates: [],
+      }),
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.equal(result.deferred, true);
+  assert.equal(result.status, "pending");
+  const saved = fakeDb.docs.get(avrKey("avr_busy"));
+  assert.equal(saved.phoneExtractionStatus, "pending");
+  assert.equal(saved.phoneExtractionError, "UI_HARD_LOCK_BUSY");
+  assert.equal(saved.customerDmTransport, "none");
+  assert.equal(saved.customerPhone, "923009999999");
+  assert.equal(saved.phoneExtractionAttemptCount, 0);
+  const joined = logs.join("\n");
+  assert.match(joined, /group_contact_phone_extraction_deferred/);
+  assert.doesNotMatch(joined, /group_contact_phone_extraction_failed/);
+});
+
+test("already failed UI_HARD_LOCK_BUSY remains claimable and can resolve", async () => {
+  const fakeDb = new FakeDb();
+  fakeDb.docs.set(avrKey("avr_old_busy"), {
+    requestId: "avr_old_busy",
+    businessId: BUSINESS_ID,
+    phoneExtractionStatus: "failed",
+    phoneExtractionError: "UI_HARD_LOCK_BUSY",
+    phoneExtractionAttemptCount: 1,
+    customerDmTransport: "none",
+    sourceChatId: "Rental Leads",
+    sourceIdentity: {
+      sourceMessageId: "MSG1",
+      participantName: "Adeel",
+      sourceTextPreview: "civic",
+    },
+  });
+
+  assert.equal(
+    availabilityRequestNeedsGroupContactPhoneExtraction(
+      fakeDb.docs.get(avrKey("avr_old_busy"))
+    ),
+    true
+  );
+
+  const claim = await claimAvailabilityPhoneExtractionResolving({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_old_busy",
+  });
+  assert.equal(claim.ok, true);
+
+  // Reset to failed+busy for full extract path (claim already moved to resolving).
+  fakeDb.docs.set(avrKey("avr_old_busy"), {
+    ...fakeDb.docs.get(avrKey("avr_old_busy")),
+    phoneExtractionStatus: "failed",
+    phoneExtractionError: "UI_HARD_LOCK_BUSY",
+    phoneExtractionAttemptCount: 1,
+  });
+
+  const result = await extractAndPersistAvailabilityCustomerPhone({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_old_busy",
+    enabled: true,
+    getPageFn: () => ({ id: "page" }),
+    extractFn: async () => ({
+      ok: true,
+      status: "resolved",
+      phone: "923365149142",
+      rawPhone: "+92 336 5149142",
+      confidence: "high",
+      maskedPhone: "********9142",
+      locatorUsed: "sourceMessageId",
+    }),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "resolved");
+  assert.equal(fakeDb.docs.get(avrKey("avr_old_busy")).customerDmTransport, "cloud_api");
+});
+
+test("deferred UI_HARD_LOCK_BUSY request can be claimed again on next tick", async () => {
+  const fakeDb = new FakeDb();
+  seedPending(fakeDb, "avr_retry");
+  await extractAndPersistAvailabilityCustomerPhone({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_retry",
+    enabled: true,
+    getPageFn: () => ({ id: "page" }),
+    extractFn: async () => ({
+      ok: false,
+      status: "failed",
+      errorCode: "UI_HARD_LOCK_BUSY",
+    }),
+  });
+  const after = fakeDb.docs.get(avrKey("avr_retry"));
+  assert.equal(after.phoneExtractionStatus, "pending");
+  assert.equal(availabilityRequestNeedsGroupContactPhoneExtraction(after), true);
+  const claim = await claimAvailabilityPhoneExtractionResolving({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_retry",
+  });
+  assert.equal(claim.ok, true);
+});
+
+test("terminal NO_PHONE_EXTRACTED still marks failed", async () => {
+  const fakeDb = new FakeDb();
+  seedPending(fakeDb, "avr_term");
+  const result = await extractAndPersistAvailabilityCustomerPhone({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_term",
+    enabled: true,
+    getPageFn: () => ({ id: "page" }),
+    extractFn: async () => ({
+      ok: false,
+      status: "failed",
+      errorCode: "NO_PHONE_EXTRACTED",
+    }),
+  });
+  assert.equal(result.status, "failed");
+  assert.equal(fakeDb.docs.get(avrKey("avr_term")).phoneExtractionStatus, "failed");
+  assert.equal(fakeDb.docs.get(avrKey("avr_term")).customerDmTransport, "none");
+});
+
+test("isRetryablePhoneExtractionError recognizes UI_HARD_LOCK_BUSY", () => {
+  assert.equal(isRetryablePhoneExtractionError("UI_HARD_LOCK_BUSY"), true);
+  assert.equal(isRetryablePhoneExtractionError("NO_PHONE_EXTRACTED"), false);
 });

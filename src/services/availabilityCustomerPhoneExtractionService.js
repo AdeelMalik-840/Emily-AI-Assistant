@@ -5,10 +5,13 @@
 import db from "../config/firebase.js";
 import {
   buildAvailabilityPhoneExtractionFields,
+  isRetryablePhoneExtractionError,
+  isSoftRetryablePhoneExtractionError,
   maskCustomerPhone,
   normalizeCustomerPhoneDigits,
 } from "./availabilityCustomerPhone.js";
 import {
+  MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS,
   claimAvailabilityPhoneExtractionResolving,
   getAvailabilityRequest,
   updateAvailabilityRequestFields,
@@ -107,8 +110,14 @@ export async function extractAndPersistAvailabilityCustomerPhone({
   if (status === "resolved") {
     return { ok: true, skipped: true, reason: "ALREADY_RESOLVED", request: existing };
   }
-  if (status === "failed" || status === "ambiguous") {
-    return { ok: true, skipped: true, reason: `ALREADY_${status.toUpperCase()}`, request: existing };
+  if (status === "ambiguous") {
+    return { ok: true, skipped: true, reason: "ALREADY_AMBIGUOUS", request: existing };
+  }
+  if (
+    status === "failed" &&
+    !isRetryablePhoneExtractionError(existing.phoneExtractionError)
+  ) {
+    return { ok: true, skipped: true, reason: "ALREADY_FAILED", request: existing };
   }
 
   const claim = await claimAvailabilityPhoneExtractionResolving({
@@ -126,6 +135,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
   }
 
   const claimed = claim.request || existing;
+  const claimedAttempts = Number(claimed.phoneExtractionAttemptCount);
   safeExtractionLog("[group_contact_phone_extraction_started]", {
     requestId: id,
     businessId: uid,
@@ -133,28 +143,42 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     source: "group_contact_info",
   });
 
-  const activePage =
-    page ?? (typeof getPageFn === "function" ? getPageFn() : null);
-  if (!activePage) {
-    const failed = buildAvailabilityPhoneExtractionFields({
-      existing: claimed,
-      phoneExtractionStatus: "failed",
-      phoneExtractionError: "NO_ACTIVE_PAGE",
-      incrementAttempt: false,
-    });
+  const persistDeferred = async (errorCode, { undoAttempt = false } = {}) => {
+    const attemptsNow = Number.isFinite(claimedAttempts)
+      ? Math.floor(claimedAttempts)
+      : 0;
+    const nextAttempts = undoAttempt ? Math.max(0, attemptsNow - 1) : attemptsNow;
+    const patch = {
+      phoneExtractionStatus: "pending",
+      phoneExtractionError: clean(errorCode) || "UI_HARD_LOCK_BUSY",
+      customerDmTransport: "none",
+      phoneExtractionAttemptCount: nextAttempts,
+    };
     await updateAvailabilityRequestFields({
       db: firestore,
       businessId: uid,
       requestId: id,
-      patch: failed.patch,
+      patch,
     });
-    safeExtractionLog("[group_contact_phone_extraction_failed]", {
+    safeExtractionLog("[group_contact_phone_extraction_deferred]", {
       requestId: id,
       businessId: uid,
-      status: "failed",
-      errorCode: "NO_ACTIVE_PAGE",
+      status: "pending",
+      errorCode: patch.phoneExtractionError,
     });
-    return { ok: false, reason: "NO_ACTIVE_PAGE", patch: failed.patch };
+    return {
+      ok: false,
+      deferred: true,
+      status: "pending",
+      reason: patch.phoneExtractionError,
+      patch,
+    };
+  };
+
+  const activePage =
+    page ?? (typeof getPageFn === "function" ? getPageFn() : null);
+  if (!activePage) {
+    return persistDeferred("NO_ACTIVE_PAGE", { undoAttempt: true });
   }
 
   let extraction;
@@ -220,14 +244,61 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     };
   }
 
-  const failStatus =
-    extraction?.status === "ambiguous" ? "ambiguous" : "failed";
+  if (extraction?.status === "ambiguous") {
+    const errorCode =
+      clean(extraction?.errorCode) || "MULTIPLE_CONFLICTING_NUMBERS";
+    const built = buildAvailabilityPhoneExtractionFields({
+      existing: claimed,
+      phoneExtractionStatus: "ambiguous",
+      phoneExtractionError: errorCode,
+      incrementAttempt: false,
+    });
+    await updateAvailabilityRequestFields({
+      db: firestore,
+      businessId: uid,
+      requestId: id,
+      patch: built.patch,
+    });
+    safeExtractionLog("[group_contact_phone_extraction_failed]", {
+      requestId: id,
+      businessId: uid,
+      status: "ambiguous",
+      source: "group_contact_info",
+      locatorUsed: extraction?.locatorUsed,
+      errorCode,
+      panelVerified: extraction?.panelVerified,
+      restoredGroup: extraction?.restoredGroup,
+      maskedPhone: extraction?.maskedPhone || null,
+    });
+    return {
+      ok: false,
+      status: "ambiguous",
+      reason: errorCode,
+      patch: built.patch,
+    };
+  }
+
   const errorCode =
     clean(extraction?.errorCode) ||
-    (failStatus === "ambiguous" ? "AMBIGUOUS" : "EXTRACTION_FAILED");
+    clean(extraction?.reason) ||
+    "EXTRACTION_FAILED";
+
+  if (isRetryablePhoneExtractionError(errorCode)) {
+    return persistDeferred(errorCode, { undoAttempt: true });
+  }
+
+  if (isSoftRetryablePhoneExtractionError(errorCode)) {
+    const attemptsNow = Number.isFinite(claimedAttempts)
+      ? Math.floor(claimedAttempts)
+      : 0;
+    if (attemptsNow < MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS) {
+      return persistDeferred(errorCode, { undoAttempt: false });
+    }
+  }
+
   const built = buildAvailabilityPhoneExtractionFields({
     existing: claimed,
-    phoneExtractionStatus: failStatus,
+    phoneExtractionStatus: "failed",
     phoneExtractionError: errorCode,
     incrementAttempt: false,
   });
@@ -240,7 +311,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
   safeExtractionLog("[group_contact_phone_extraction_failed]", {
     requestId: id,
     businessId: uid,
-    status: failStatus,
+    status: "failed",
     source: "group_contact_info",
     locatorUsed: extraction?.locatorUsed,
     errorCode,
@@ -250,7 +321,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
   });
   return {
     ok: false,
-    status: failStatus,
+    status: "failed",
     reason: errorCode,
     patch: built.patch,
   };
