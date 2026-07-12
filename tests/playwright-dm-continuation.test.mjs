@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 
 import {
   forwardPlaywrightDmToPipeline,
@@ -13,6 +14,15 @@ import {
   __selectWatchedDmPriorityCandidateForTests,
 } from "../src/services/playwrightListener/listener.js";
 import { normalizeTitle } from "../src/services/playwrightTitleNormalize.js";
+import {
+  evaluateAvailabilityWaitingConfirmOwnershipGuard,
+  matchWaitingConfirmRequestForInbound,
+} from "../src/services/availabilityRequestService.js";
+import {
+  __clearWhatsAppInboundBufferForTests,
+  executeWhatsAppAiPipeline,
+  isIntentionalSilentInboundResult,
+} from "../src/services/whatsappInboundBuffer.js";
 
 function shouldProcessChat({ chatTitle, targetGroups, activeDmChatKeys }) {
   const title = String(chatTitle ?? "").trim();
@@ -607,4 +617,418 @@ test("PLAYWRIGHT_DM_CONTINUATION_ENABLED=false skips loadActiveDmWatchTargets", 
     if (prev === undefined) delete process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED;
     else process.env.PLAYWRIGHT_DM_CONTINUATION_ENABLED = prev;
   }
+});
+
+const OWNERSHIP_BUSINESS = "owner-ownership-test";
+const OWNERSHIP_REQUEST_ID = "avr_ownership_001";
+const NOTIFY_MS = Date.parse("2026-07-09T10:00:00.000Z");
+
+function waitingConfirmRequest(overrides = {}) {
+  return {
+    requestId: OWNERSHIP_REQUEST_ID,
+    businessId: OWNERSHIP_BUSINESS,
+    status: "approved",
+    approvalCustomerNotificationStatus: "sent",
+    customerConfirmationStatus: "waiting_confirm",
+    customerPhone: "+923001234567",
+    customerDmTarget: "+923001234567",
+    customerDmChatTitle: "Adeel malik",
+    customerDmPlaywrightChatKey: "adeel-malik",
+    customerParticipantId: "participant::adeel",
+    lastCustomerNotifyAt: new Date(NOTIFY_MS),
+    approvalCustomerNotificationAt: new Date(NOTIFY_MS),
+    confirmExpiresAt: new Date(NOTIFY_MS + 72 * 60 * 60 * 1000),
+    itemId: "corolla-1",
+    itemLabel: "Toyota corolla",
+    requestedDuration: 2,
+    sourceChatId: "leads",
+    ...overrides,
+  };
+}
+
+function createOwnershipGuardDb(requestData) {
+  return createPipelineTestDb(
+    requestData
+      ? { [OWNERSHIP_REQUEST_ID]: { data: requestData } }
+      : {}
+  );
+}
+
+function createPipelineTestDb(availabilityRequests = {}) {
+  const store = {
+    businesses: {
+      [OWNERSHIP_BUSINESS]: {
+        availabilityRequests,
+      },
+    },
+    conversations: {},
+  };
+  const messageAdds = [];
+
+  class DocRef {
+    constructor(path) {
+      this.path = path;
+      this.id = String(path[path.length - 1] ?? "");
+    }
+    collection(name) {
+      return new CollectionRef([...this.path, name]);
+    }
+    async get() {
+      if (this.path[0] === "conversations") {
+        const id = this.path[1];
+        const data = store.conversations[id];
+        return { exists: Boolean(data), data: () => ({ ...(data ?? {}) }) };
+      }
+      const node = this._node();
+      return { exists: Boolean(node), data: () => ({ ...(node?.data ?? {}) }) };
+    }
+    async update(patch) {
+      const node = this._node();
+      if (!node) return;
+      node.data = { ...(node.data ?? {}), ...patch };
+    }
+    _node() {
+      if (this.path[0] === "conversations") {
+        return store.conversations[this.path[1]] ?? null;
+      }
+      let node = store;
+      for (let i = 0; i < this.path.length; i += 2) {
+        node = node?.[this.path[i]]?.[this.path[i + 1]];
+      }
+      return node ?? null;
+    }
+  }
+
+  class CollectionRef {
+    constructor(path, conditions = [], resultLimit = null) {
+      this.path = path;
+      this.conditions = conditions;
+      this.resultLimit = resultLimit;
+    }
+    doc(id) {
+      return new DocRef([...this.path, id]);
+    }
+    where(field, op, value) {
+      return new CollectionRef(
+        this.path,
+        [...this.conditions, { field, op, value }],
+        this.resultLimit
+      );
+    }
+    limit(n) {
+      return new CollectionRef(this.path, this.conditions, n);
+    }
+    async add(data) {
+      if (this.path[0] === "messages") {
+        messageAdds.push(data);
+        return { id: `msg-${messageAdds.length}` };
+      }
+      throw new Error(`unsupported add for ${this.path.join("/")}`);
+    }
+    async get() {
+      let entries = Object.entries(this._collectionNode() ?? {});
+      for (const condition of this.conditions) {
+        entries = entries.filter(([, node]) => node?.data?.[condition.field] === condition.value);
+      }
+      if (this.resultLimit != null) entries = entries.slice(0, this.resultLimit);
+      return {
+        docs: entries.map(([id, node]) => ({
+          id,
+          data: () => ({ ...(node?.data ?? {}) }),
+        })),
+      };
+    }
+    _collectionNode() {
+      let node = store;
+      for (let i = 0; i < this.path.length; i += 2) {
+        const collection = this.path[i];
+        if (i === this.path.length - 1) return node?.[collection] ?? null;
+        const id = this.path[i + 1];
+        node = node?.[collection]?.[id];
+      }
+      return null;
+    }
+  }
+
+  function setDoc(ref, data) {
+    if (ref.path[0] === "conversations") {
+      const id = ref.path[1];
+      store.conversations[id] = { ...(store.conversations[id] ?? {}), ...data };
+      return;
+    }
+  }
+
+  const db = {
+    collection(name) {
+      return new CollectionRef([name]);
+    },
+    async runTransaction(fn) {
+      return fn({
+        get: (ref) => ref.get(),
+        set: setDoc,
+        create: setDoc,
+      });
+    },
+  };
+
+  return { db, store, messageAdds };
+}
+
+const v2LiveEnvBackup = {
+  EMILY_BRAIN_V2_LIVE: process.env.EMILY_BRAIN_V2_LIVE,
+  EMILY_BRAIN_V2_LIVE_BUSINESSES: process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES,
+  EMILY_BRAIN_V2_PRODUCTION_ALLOW: process.env.EMILY_BRAIN_V2_PRODUCTION_ALLOW,
+  EMILY_BRAIN_V2_LEGACY_FALLBACK: process.env.EMILY_BRAIN_V2_LEGACY_FALLBACK,
+  EMILY_BRAIN_V2_INFO_LIVE: process.env.EMILY_BRAIN_V2_INFO_LIVE,
+};
+
+function enableV2LiveForOwnershipBusiness() {
+  process.env.EMILY_BRAIN_V2_LIVE = "true";
+  process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES = OWNERSHIP_BUSINESS;
+  process.env.EMILY_BRAIN_V2_PRODUCTION_ALLOW = "true";
+  process.env.EMILY_BRAIN_V2_LEGACY_FALLBACK = "true";
+  delete process.env.EMILY_BRAIN_V2_INFO_LIVE;
+}
+
+function restoreV2LiveEnv() {
+  for (const [key, value] of Object.entries(v2LiveEnvBackup)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function unlistedItemWorkflowStub() {
+  return async () => ({
+    handled: true,
+    legacyBypassed: true,
+    workflowType: "UnlistedItemWorkflow",
+    reply:
+      "total filhal hamare paas nahi hai. Honda Civic 2026 Oriel, Kia Stonic EX Plus 2021 ya Toyota corolla mein se koi check kar dun?",
+    sendVia: "GROUP",
+    messageMeta: { outboundTrace: { finalReplySource: "BRAIN_V2_LIVE" } },
+  });
+}
+
+function resetPipelineTestIsolation() {
+  __clearWhatsAppInboundBufferForTests();
+  delete globalThis.__activeJob;
+  delete globalThis.__activeJobStart;
+  globalThis.__forceProcessing = false;
+  if (Array.isArray(globalThis.__messageQueue)) globalThis.__messageQueue.length = 0;
+}
+
+function dedupeSafePipelineMessage(text) {
+  const base = String(text ?? "").trim();
+  return `${base} [test:${randomUUID()}]`;
+}
+
+async function runOwnershipPipeline({
+  availabilityRequestData = waitingConfirmRequest(),
+  pipelineParams = {},
+  brainV2Spy = unlistedItemWorkflowStub(),
+  processSpy = async () => ({
+    reply: "total filhal hamare paas nahi hai.",
+    sendVia: "GROUP",
+    messageMeta: {},
+  }),
+} = {}) {
+  resetPipelineTestIsolation();
+  const { db, messageAdds } = createPipelineTestDb(
+    availabilityRequestData
+      ? { [OWNERSHIP_REQUEST_ID]: { data: availabilityRequestData } }
+      : {}
+  );
+  let brainV2Calls = 0;
+  let processCalls = 0;
+  /** @type {Record<string, unknown> | null} */
+  let outcome = null;
+  const defaultMessage = "total rent kitna hai?";
+  const pipelineMessage = dedupeSafePipelineMessage(
+    pipelineParams.combinedMessage ??
+      pipelineParams.latestMessage ??
+      defaultMessage
+  );
+  const baseParams = {
+    db,
+    ownerUserId: OWNERSHIP_BUSINESS,
+    userPhone: "+923001234567",
+    participantPhoneForDm: "+923001234567",
+    dmPlaywrightChatKey: "adeel-malik",
+    dmChatTitle: "Adeel malik",
+    participantKey: "participant::adeel",
+    participantName: "Adeel malik",
+    messageTimestamp: NOTIFY_MS + 60_000,
+    sessionKey: `${OWNERSHIP_BUSINESS}::adeel-malik`,
+    sendCredentials: {},
+    playwrightWebInbound: false,
+    ...pipelineParams,
+    combinedMessage: pipelineMessage,
+    latestMessage: pipelineMessage,
+    messageId: `inbound-ownership-${randomUUID()}`,
+    __tryBrainV2LiveBeforeLegacyFn: async (...args) => {
+      brainV2Calls += 1;
+      return brainV2Spy(...args);
+    },
+    __processMessageFn: async (...args) => {
+      processCalls += 1;
+      return processSpy(...args);
+    },
+    __capturePipelineOutcomeForTests: (result) => {
+      outcome = result;
+    },
+  };
+  await executeWhatsAppAiPipeline(baseParams);
+  return { brainV2Calls, processCalls, outcome, messageAdds };
+}
+
+test("3B guard C1: waiting_confirm customer DM text is blocked from general pipeline", async () => {
+  const guard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
+    businessId: OWNERSHIP_BUSINESS,
+    messageText: "total rent kitna hai?",
+    messageTimestampMs: NOTIFY_MS + 60_000,
+    participantPhone: "+923001234567",
+    playwrightChatKey: "adeel-malik",
+    requests: [waitingConfirmRequest()],
+  });
+  assert.equal(guard.block, true);
+  assert.equal(guard.requestId, OWNERSHIP_REQUEST_ID);
+});
+
+test("3B guard C2: blocked path must not call legacy processMessage", async () => {
+  enableV2LiveForOwnershipBusiness();
+  try {
+    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline();
+    assert.equal(brainV2Calls, 0);
+    assert.equal(processCalls, 0);
+    assert.equal(outcome?.intentionalSilent, true);
+    assert.equal(
+      outcome?.messageMeta?.outboundTrace?.finalReplySource,
+      "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+    );
+    assert.equal(isIntentionalSilentInboundResult(outcome), true);
+    assert.equal(outcome?.sendVia, "NONE");
+    assert.equal(outcome?.reply, "");
+  } finally {
+    restoreV2LiveEnv();
+  }
+});
+
+test("3B guard A: Brain V2 live UnlistedItemWorkflow is not invoked when ownership guard blocks", async () => {
+  enableV2LiveForOwnershipBusiness();
+  try {
+    const source = executeWhatsAppAiPipeline.toString();
+    const skipIdx = source.indexOf("skipGeneralBrainForWaitingConfirmOwnership");
+    const v2Idx = source.indexOf("tryBrainV2LiveFn(sharedBrainParams)");
+    const pmIdx = source.indexOf("await processMessageFn({");
+    assert.ok(skipIdx > 0 && v2Idx > skipIdx && pmIdx > skipIdx);
+
+    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline();
+    assert.equal(brainV2Calls, 0);
+    assert.equal(processCalls, 0);
+    assert.notEqual(
+      String(outcome?.reply ?? ""),
+      "total filhal hamare paas nahi hai. Honda Civic 2026 Oriel, Kia Stonic EX Plus 2021 ya Toyota corolla mein se koi check kar dun?"
+    );
+    assert.equal(
+      outcome?.messageMeta?.outboundTrace?.finalReplySource,
+      "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+    );
+  } finally {
+    restoreV2LiveEnv();
+  }
+});
+
+test("3B guard B: normal group inquiry runs when no waiting_confirm request exists", async () => {
+  enableV2LiveForOwnershipBusiness();
+  try {
+    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline({
+      availabilityRequestData: null,
+      pipelineParams: {
+        isGroupMessage: true,
+        userPhone: "unknown",
+        groupName: "rental leads",
+        playwrightChatKey: "rental-leads",
+        playwrightWebTitleIdentity: true,
+        participantKey: "participant::muneeb",
+        participantName: "Muneeb Electric",
+        participantPhoneForDm: "+923009999999",
+        combinedMessage: "Civic available?",
+        latestMessage: "Civic available?",
+        dmPlaywrightChatKey: "",
+        dmChatTitle: "",
+        sessionKey: `${OWNERSHIP_BUSINESS}::rental-leads::participant::muneeb`,
+      },
+      brainV2Spy: async () => ({
+        handled: true,
+        legacyBypassed: true,
+        workflowType: "AvailabilityInquiryWorkflow",
+        reply: "Haan, Civic available hai.",
+        sendVia: "GROUP",
+        messageMeta: {},
+      }),
+    });
+    assert.ok(brainV2Calls + processCalls > 0);
+    assert.notEqual(
+      outcome?.messageMeta?.outboundTrace?.finalReplySource,
+      "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+    );
+    assert.notEqual(outcome?.intentionalSilent, true);
+  } finally {
+    restoreV2LiveEnv();
+  }
+});
+
+test("3B guard C: other customer is not blocked by waiting_confirm ownership guard", async () => {
+  enableV2LiveForOwnershipBusiness();
+  try {
+    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline({
+      availabilityRequestData: waitingConfirmRequest(),
+      pipelineParams: {
+        userPhone: "+923008888888",
+        participantPhoneForDm: "+923008888888",
+        participantKey: "participant::other",
+        participantName: "Other Customer",
+        dmPlaywrightChatKey: "other-customer",
+        dmChatTitle: "Other Customer",
+        combinedMessage: "Civic available?",
+        latestMessage: "Civic available?",
+      },
+      brainV2Spy: async () => ({
+        handled: true,
+        legacyBypassed: true,
+        workflowType: "AvailabilityInquiryWorkflow",
+        reply: "Haan, Civic available hai.",
+        sendVia: "GROUP",
+        messageMeta: {},
+      }),
+    });
+    assert.ok(brainV2Calls + processCalls > 0);
+    assert.notEqual(
+      outcome?.messageMeta?.outboundTrace?.finalReplySource,
+      "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+    );
+  } finally {
+    restoreV2LiveEnv();
+  }
+});
+
+test("3B guard C3: no waiting_confirm request allows general pipeline", async () => {
+  const guard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
+    businessId: OWNERSHIP_BUSINESS,
+    messageText: "Civic chahiye",
+    messageTimestampMs: NOTIFY_MS + 60_000,
+    participantPhone: "+923009999999",
+    requests: [],
+  });
+  assert.equal(guard.block, false);
+});
+
+test("3B guard C4: other customer in group is not blocked", () => {
+  const matched = matchWaitingConfirmRequestForInbound(waitingConfirmRequest(), {
+    participantPhone: "+923008888888",
+    participantName: "Other Customer",
+    playwrightChatKey: "other-customer",
+    messageTimestampMs: NOTIFY_MS + 60_000,
+  });
+  assert.equal(matched, null);
 });

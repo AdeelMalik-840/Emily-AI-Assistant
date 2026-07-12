@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import db from "../config/firebase.js";
 import { sanitizeParticipantDisplayName } from "./playwrightReplyPrivatelyBridge.js";
+import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import {
+  buildNarrowDmLogicalMessageKey,
+  hashNarrowDmMessageText,
+} from "./playwrightNarrowDmMessageReader.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
@@ -1036,6 +1041,38 @@ export function buildConfirmExpiresAt(fromDate = new Date(), ttlMs = DEFAULT_CON
 }
 
 /**
+ * Persist the latest customer-facing DM prompt context after Emily replies.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   reply: string,
+ *   promptType?: string | null,
+ * }} params
+ */
+export async function recordAvailabilityCustomerDmOutbound({
+  db: connection,
+  businessId,
+  requestId,
+  reply,
+  promptType = null,
+}) {
+  const sentAt = new Date();
+  const type = clean(promptType, 80);
+  return updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      lastCustomerDmPromptType: type || null,
+      lastCustomerDmPromptAt: type ? sentAt : null,
+      lastCustomerDmOutboundAt: sentAt,
+      lastCustomerDmOutboundPreview: clean(reply, 200) || null,
+    },
+  });
+}
+
+/**
  * @param {{
  *   db?: unknown,
  *   businessId: string,
@@ -1180,4 +1217,544 @@ export async function findLatestWaitingConfirmAvailabilityRequest({
     return bMs - aMs;
   });
   return pool[0];
+}
+
+export function resolveLastCustomerNotifyAtMs(request) {
+  const raw = request?.lastCustomerNotifyAt ?? request?.approvalCustomerNotificationAt ?? null;
+  if (!raw) return null;
+  return normalizeTimestampToMs(raw);
+}
+
+/**
+ * Normalize various timestamp shapes into epoch milliseconds.
+ * Returns null for invalid / missing values.
+ *
+ * Supported:
+ * - Date
+ * - number (epoch ms)
+ * - string (ISO/date string)
+ * - Firestore Timestamp (toDate())
+ * - Timestamp-like { seconds, nanoseconds }
+ * - Admin-serialized { _seconds, _nanoseconds }
+ *
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+export function normalizeTimestampToMs(value) {
+  if (value == null) return null;
+
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const ms = new Date(value).getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof value === "object") {
+    // Firestore Timestamp object (preferred)
+    if (typeof value.toDate === "function") {
+      try {
+        const d = value.toDate();
+        const ms = d instanceof Date ? d.getTime() : new Date(d).getTime();
+        return Number.isFinite(ms) ? ms : null;
+      } catch {
+        return null;
+      }
+    }
+
+    // Firestore Timestamp-like / admin-serialized shapes
+    const secondsRaw =
+      value.seconds ??
+      value._seconds ??
+      null;
+    const nanosRaw =
+      value.nanoseconds ??
+      value._nanoseconds ??
+      null;
+
+    const seconds = typeof secondsRaw === "number" ? secondsRaw : Number(secondsRaw);
+    const nanos = typeof nanosRaw === "number" ? nanosRaw : Number(nanosRaw);
+
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    const safeNanos = Number.isFinite(nanos) && nanos > 0 ? nanos : 0;
+    const ms = seconds * 1000 + Math.floor(safeNanos / 1e6);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  return null;
+}
+
+export function hashAvailabilityCustomerInboundDmText(text) {
+  return hashNarrowDmMessageText(text);
+}
+
+/**
+ * @param {{ text?: string, atMs?: number | null, requestId?: string, chatKey?: string }} params
+ */
+export function buildAvailabilityCustomerInboundDmLogicalKey(params = {}) {
+  return buildNarrowDmLogicalMessageKey(params);
+}
+
+/**
+ * @param {{ dataId?: string | null, text?: string, atMs?: number | null, requestId?: string, chatKey?: string }} message
+ */
+export function buildAvailabilityCustomerInboundDmMessageKey(message = {}) {
+  const logical = buildAvailabilityCustomerInboundDmLogicalKey({
+    text: message.text,
+    atMs: message.atMs,
+    requestId: message.requestId,
+    chatKey: message.chatKey,
+  });
+  if (logical) return logical;
+  const dataId = clean(message.dataId);
+  if (dataId) return `data:${dataId}`;
+  const textHash = hashAvailabilityCustomerInboundDmText(message.text);
+  const atMs = Number(message.atMs);
+  if (textHash && Number.isFinite(atMs) && atMs > 0) {
+    return `hash:${textHash}:${Math.floor(atMs)}`;
+  }
+  return textHash ? `hash:${textHash}` : "";
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {number} [nowMs]
+ */
+export function isPlaywrightAvailabilityConfirmRequestEligible(request, nowMs = Date.now()) {
+  if (clean(request?.status) !== "approved") return false;
+  if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
+  if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
+  if (clean(request?.linkedBookingId)) return false;
+  if (!resolveLastCustomerNotifyAtMs(request)) return false;
+  if (!clean(request?.customerDmChatTitle) && !clean(request?.customerDmPlaywrightChatKey)) {
+    return false;
+  }
+  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
+  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ */
+export function resolveAvailabilityCustomerDmTargetKey(request) {
+  return (
+    clean(request?.customerDmPlaywrightChatKey) ||
+    clean(request?.customerDmChatTitle) ||
+    ""
+  );
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {{ dataId?: string | null, text?: string, messageKey?: string, atMs?: number | null }} message
+ */
+export function isDuplicateAvailabilityCustomerInboundDm(request, message = {}) {
+  const requestId = clean(request?.requestId ?? request?.id);
+  const chatKey = resolveAvailabilityCustomerDmTargetKey(request);
+  const scope = { requestId, chatKey };
+  const ledger = Array.isArray(request?.processedCustomerInboundDmMessageKeys)
+    ? request.processedCustomerInboundDmMessageKeys.map((v) => clean(v)).filter(Boolean)
+    : [];
+
+  const logicalKey = buildAvailabilityCustomerInboundDmMessageKey({
+    dataId: message.dataId,
+    text: message.text,
+    atMs: message.atMs,
+    requestId,
+    chatKey,
+  });
+  if (logicalKey && ledger.includes(logicalKey)) return true;
+
+  const dataId = clean(message.dataId);
+  if (dataId && ledger.includes(`data:${dataId}`)) return true;
+  const lastDataId = clean(request?.lastCustomerInboundDmDataId);
+  if (dataId && lastDataId && dataId === lastDataId) return true;
+
+  const messageKey =
+    clean(message.messageKey) ||
+    buildAvailabilityCustomerInboundDmMessageKey({
+      dataId: message.dataId,
+      text: message.text,
+      atMs: message.atMs,
+      requestId,
+      chatKey,
+    });
+  const lastMessageKey = clean(request?.lastCustomerInboundDmMessageKey);
+  if (messageKey && lastMessageKey && messageKey === lastMessageKey) return true;
+  if (messageKey && ledger.includes(messageKey)) return true;
+
+  const lastLogicalKey = clean(request?.lastCustomerInboundDmLogicalKey);
+  if (logicalKey && lastLogicalKey && logicalKey === lastLogicalKey) return true;
+
+  return false;
+}
+
+function appendProcessedInboundDmMessageKey(existing = [], messageKey = "", limit = 50) {
+  const key = clean(messageKey, 200);
+  if (!key) return Array.isArray(existing) ? existing : [];
+  const normalized = Array.isArray(existing)
+    ? existing.map((v) => clean(v, 200)).filter(Boolean)
+    : [];
+  if (normalized.includes(key)) return normalized.slice(-limit);
+  const next = [...normalized, key];
+  return next.length > limit ? next.slice(-limit) : next;
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   limit?: number,
+ *   nowMs?: number,
+ * }} params
+ */
+export async function findEligiblePlaywrightAvailabilityConfirmRequests({
+  db: connection,
+  businessId,
+  limit = 10,
+  nowMs = Date.now(),
+}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  if (!firestore || !uid) return [];
+
+  const snap = await availabilityRequestCollectionRef(connection, uid)
+    .where("status", "==", "approved")
+    .where("approvalCustomerNotificationStatus", "==", "sent")
+    .where("customerConfirmationStatus", "==", "waiting_confirm")
+    .limit(Math.max(1, Math.min(25, Number(limit) || 10)))
+    .get()
+    .catch(() => null);
+
+  const docs = snap?.docs ?? [];
+  return docs
+    .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
+    .filter((row) => isPlaywrightAvailabilityConfirmRequestEligible(row, nowMs));
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ * }} params
+ */
+export async function claimAvailabilityRequestPlaywrightInboundPoll({
+  db: connection,
+  businessId,
+  requestId,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  if (!ref) return { ok: false, reason: "MISSING_REQUEST_REF" };
+  const snap = await ref.get();
+  if (!snap?.exists) return { ok: false, reason: "REQUEST_NOT_FOUND" };
+  const data = snap.data() || {};
+  if (!isPlaywrightAvailabilityConfirmRequestEligible(data)) {
+    return { ok: false, reason: "REQUEST_NOT_ELIGIBLE", request: { requestId, ...data } };
+  }
+  const pollStatus = clean(data.customerPlaywrightInboundPollStatus);
+  if (pollStatus === "processing") {
+    return { ok: false, reason: "POLL_ALREADY_PROCESSING", request: { requestId, ...data } };
+  }
+  const updated = await updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      customerPlaywrightInboundPollStatus: "processing",
+      customerPlaywrightInboundPollStartedAtMs: Date.now(),
+    },
+  });
+  if (!updated) return { ok: false, reason: "CLAIM_FAILED" };
+  const fresh = await getAvailabilityRequest({ db: connection, businessId, requestId });
+  return { ok: true, request: fresh };
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   status?: string,
+ * }} params
+ */
+export async function releaseAvailabilityRequestPlaywrightInboundPoll({
+  db: connection,
+  businessId,
+  requestId,
+  status = "idle",
+}) {
+  const next = clean(status, 40) || "idle";
+  return updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      customerPlaywrightInboundPollStatus: next,
+      ...(next === "idle" ? { customerPlaywrightInboundPollStartedAtMs: null } : {}),
+    },
+  });
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   message: { dataId?: string | null, text?: string, atMs?: number | null, messageKey?: string | null },
+ * }} params
+ */
+export async function recordAvailabilityCustomerInboundDm({
+  db: connection,
+  businessId,
+  requestId,
+  message,
+}) {
+  const dataId = clean(message?.dataId) || null;
+  const textHash = hashAvailabilityCustomerInboundDmText(message?.text);
+  const atMs = Number(message?.atMs);
+  const inboundAt = Number.isFinite(atMs) && atMs > 0 ? new Date(atMs) : new Date();
+  const chatKey = clean(message?.chatKey) || "";
+  const logicalKey =
+    clean(message?.logicalKey) ||
+    buildAvailabilityCustomerInboundDmMessageKey({
+      dataId,
+      text: message?.text,
+      atMs: inboundAt.getTime(),
+      requestId,
+      chatKey,
+    });
+  const messageKey = clean(message?.messageKey) || logicalKey;
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  let existingLedger = [];
+  if (ref) {
+    try {
+      const snap = await ref.get();
+      const data = snap?.exists ? snap.data() || {} : {};
+      existingLedger = Array.isArray(data.processedCustomerInboundDmMessageKeys)
+        ? data.processedCustomerInboundDmMessageKeys
+        : [];
+    } catch {
+      existingLedger = [];
+    }
+  }
+  let nextLedger = appendProcessedInboundDmMessageKey(existingLedger, logicalKey, 50);
+  if (messageKey && messageKey !== logicalKey) {
+    nextLedger = appendProcessedInboundDmMessageKey(nextLedger, messageKey, 50);
+  }
+  if (dataId) {
+    nextLedger = appendProcessedInboundDmMessageKey(nextLedger, `data:${dataId}`, 50);
+  }
+  return updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      lastCustomerInboundDmAt: inboundAt,
+      lastCustomerInboundDmDataId: dataId,
+      lastCustomerInboundDmTextHash: textHash || null,
+      lastCustomerInboundDmMessageKey: logicalKey || messageKey || null,
+      lastCustomerInboundDmLogicalKey: logicalKey || null,
+      processedCustomerInboundDmMessageKeys: nextLedger,
+    },
+  });
+}
+
+function bookingDocRef(connection, businessId, bookingId) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const bid = clean(bookingId);
+  if (!firestore || !uid || !bid) return null;
+  return firestore.collection("businesses").doc(uid).collection("bookings").doc(bid);
+}
+
+/**
+ * Persist availability-confirm booking metadata not covered by createBooking defaults.
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   bookingId: string,
+ *   patch: Record<string, unknown>,
+ * }} params
+ */
+export async function patchAvailabilityConfirmBookingMetadata({
+  db: connection,
+  businessId,
+  bookingId,
+  patch = {},
+}) {
+  const ref = bookingDocRef(connection, businessId, bookingId);
+  if (!ref || typeof ref.update !== "function") return false;
+  const safePatch = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    safePatch[key] = value;
+  }
+  if (Object.keys(safePatch).length === 0) return false;
+  await ref.update(safePatch).catch(() => null);
+  return true;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {{
+ *   participantPhone?: string | null,
+ *   participantKey?: string | null,
+ *   participantName?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   dmChatTitle?: string | null,
+ * }} identity
+ */
+export function availabilityRequestMatchesInboundIdentity(request, identity = {}) {
+  const phone = normalizePhoneDigits(identity.participantPhone);
+  const requestPhones = [
+    normalizePhoneDigits(request?.customerPhone),
+    normalizePhoneDigits(request?.customerDmTarget),
+  ].filter(Boolean);
+  if (phone && requestPhones.some((row) => row === phone)) return true;
+
+  const participantKey = clean(identity.participantKey);
+  const requestParticipant = clean(request?.customerParticipantId);
+  const sourceParticipant = clean(request?.sourceIdentity?.participantKey);
+  if (
+    participantKey &&
+    (participantKey === requestParticipant || participantKey === sourceParticipant)
+  ) {
+    return true;
+  }
+
+  const inboundKeys = new Set(
+    [
+      normalizeTitle(identity.playwrightChatKey),
+      normalizeTitle(identity.dmChatTitle),
+      normalizeTitle(identity.participantName),
+    ].filter(Boolean)
+  );
+  if (inboundKeys.size === 0) return false;
+  const requestKeys = new Set(
+    [
+      normalizeTitle(request?.customerDmPlaywrightChatKey),
+      normalizeTitle(request?.customerDmChatTitle),
+      normalizeTitle(request?.customerDisplayName),
+      normalizeTitle(request?.sourceIdentity?.participantDisplayName),
+    ].filter(Boolean)
+  );
+  for (const key of inboundKeys) {
+    if (requestKeys.has(key)) return true;
+  }
+  return false;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {number | null} messageTimestampMs
+ */
+export function availabilityRequestInboundTimestampEligible(request, messageTimestampMs = null) {
+  const notifyAtMs = resolveLastCustomerNotifyAtMs(request);
+  if (!Number.isFinite(notifyAtMs) || notifyAtMs <= 0) return false;
+  const messageMs = Number(messageTimestampMs);
+  if (Number.isFinite(messageMs) && messageMs > 0) {
+    return messageMs > notifyAtMs;
+  }
+  // When transport cannot provide a trusted timestamp, only block DM-target matches.
+  return true;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {{
+ *   participantPhone?: string | null,
+ *   participantKey?: string | null,
+ *   participantName?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   dmChatTitle?: string | null,
+ *   messageTimestampMs?: number | null,
+ * }} identity
+ */
+export function matchWaitingConfirmRequestForInbound(request, identity = {}) {
+  if (!isPlaywrightAvailabilityConfirmRequestEligible(request)) return null;
+  if (!availabilityRequestMatchesInboundIdentity(request, identity)) return null;
+  if (!availabilityRequestInboundTimestampEligible(request, identity.messageTimestampMs)) {
+    return null;
+  }
+  return request;
+}
+
+/**
+ * Narrow single-owner guard: active waiting_confirm DMs belong to the availability poller only.
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   messageText?: string,
+ *   messageTimestampMs?: number | null,
+ *   participantPhone?: string | null,
+ *   participantKey?: string | null,
+ *   participantName?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   dmChatTitle?: string | null,
+ *   isGroupInbound?: boolean,
+ *   requests?: Array<Record<string, unknown>>,
+ * }} params
+ */
+export async function evaluateAvailabilityWaitingConfirmOwnershipGuard({
+  db: connection,
+  businessId,
+  messageText = "",
+  messageTimestampMs = null,
+  participantPhone = null,
+  participantKey = null,
+  participantName = null,
+  playwrightChatKey = null,
+  dmChatTitle = null,
+  isGroupInbound = false,
+  requests = null,
+}) {
+  const uid = clean(businessId);
+  const text = clean(messageText);
+  if (!uid || !text) {
+    return { block: false, reason: "MISSING_CONTEXT" };
+  }
+
+  const identity = {
+    participantPhone,
+    participantKey,
+    participantName,
+    playwrightChatKey,
+    dmChatTitle,
+    messageTimestampMs,
+  };
+
+  const pool =
+    Array.isArray(requests) && requests.length > 0
+      ? requests
+      : await findEligiblePlaywrightAvailabilityConfirmRequests({
+          db: connection,
+          businessId: uid,
+          limit: 25,
+        });
+
+  for (const row of pool) {
+    const matched = matchWaitingConfirmRequestForInbound(row, identity);
+    if (!matched) continue;
+    return {
+      block: true,
+      reason: "WAITING_CONFIRM_NARROW_OWNERSHIP",
+      requestId: clean(matched.requestId ?? matched.id) || null,
+      isGroupInbound: Boolean(isGroupInbound),
+    };
+  }
+
+  return { block: false, reason: "NO_MATCHING_WAITING_CONFIRM" };
 }

@@ -18,6 +18,7 @@ import {
   handleAvailabilityRequestApproval,
   parseAvailabilityApprovalMessage,
 } from "./availabilityApprovalService.js";
+import { evaluateAvailabilityWaitingConfirmOwnershipGuard } from "./availabilityRequestService.js";
 import {
   handleBookingApproval,
   parseApprovalMessage,
@@ -1739,7 +1740,56 @@ export async function executeWhatsAppAiPipeline(p) {
       ? Number(sourceMessageIndexRaw)
       : null;
 
-  const routeGate = evaluateBrainRouteGate({
+  let skipGeneralBrainForWaitingConfirmOwnership = false;
+  const ownershipGuard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
+    db,
+    businessId: ownerUserId,
+    messageText: latestMessage,
+    messageTimestampMs: Number.isFinite(tsNum) && tsNum > 0 ? tsNum : null,
+    participantPhone:
+      String(participantPhoneForDmRaw ?? conversationCustomerNumber ?? "").trim() || null,
+    participantKey: normalizedParticipantKey,
+    participantName: normalizedParticipantDisplayName,
+    playwrightChatKey:
+      String(playwrightChatKeyRaw ?? dmPlaywrightChatKey ?? "").trim() || null,
+    dmChatTitle: dmChatTitle || null,
+    isGroupInbound,
+  });
+  if (ownershipGuard.block) {
+    skipGeneralBrainForWaitingConfirmOwnership = true;
+    console.log("[availability_waiting_confirm_ownership_guard]", {
+      traceId,
+      businessId: ownerUserId,
+      requestId: ownershipGuard.requestId,
+      reason: ownershipGuard.reason,
+      isGroupInbound,
+      messagePreview: String(latestMessage ?? "").slice(0, 120),
+    });
+    reply = "";
+    sendVia = "NONE";
+    messageMeta = {
+      handledWithoutOutbound: true,
+      availabilityWaitingConfirmOwnership: true,
+      availabilityRequestId: ownershipGuard.requestId,
+      outboundTrace: {
+        kind: "silent_noop",
+        finalReplySource: "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP",
+      },
+    };
+    intentionalSilent = true;
+  }
+
+  let routeGate = {
+    selected: "legacy",
+    route: "ownership_skipped",
+    rejectReason: "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP",
+    businessAllowlisted: false,
+    hasV2LivePipeline: false,
+    allowlistConfigError: false,
+    allowlistRaw: null,
+  };
+  if (!skipGeneralBrainForWaitingConfirmOwnership) {
+  routeGate = evaluateBrainRouteGate({
     businessId: ownerUserId,
     chatId: pipelineChatId,
   });
@@ -1850,7 +1900,11 @@ export async function executeWhatsAppAiPipeline(p) {
       messagePreview: String(normalizedInbound.message ?? "").slice(0, 120),
     });
     const v2LiveStartedAt = Date.now();
-    const v2LiveResult = await tryBrainV2LiveBeforeLegacy(sharedBrainParams);
+    const tryBrainV2LiveFn =
+      typeof p.__tryBrainV2LiveBeforeLegacyFn === "function"
+        ? p.__tryBrainV2LiveBeforeLegacyFn
+        : tryBrainV2LiveBeforeLegacy;
+    const v2LiveResult = await tryBrainV2LiveFn(sharedBrainParams);
     logLatency("brainV2Live", v2LiveStartedAt, {
       handled: v2LiveResult?.handled === true,
       reason: v2LiveResult?.reason ?? null,
@@ -2011,6 +2065,7 @@ export async function executeWhatsAppAiPipeline(p) {
     inboundSourceOrigin: effectiveInboundSourceOrigin,
   }));
   }
+  }
   const finalReplySourceFromMeta = String(
     messageMeta?.outboundTrace?.finalReplySource ?? ""
   ).trim();
@@ -2037,6 +2092,15 @@ export async function executeWhatsAppAiPipeline(p) {
     };
   }
   intentionalSilent = isIntentionalSilentInboundResult({ sendVia, messageMeta });
+  if (typeof p.__capturePipelineOutcomeForTests === "function") {
+    p.__capturePipelineOutcomeForTests({
+      reply: String(reply ?? ""),
+      sendVia: sendVia ?? null,
+      messageMeta:
+        messageMeta && typeof messageMeta === "object" ? { ...messageMeta } : {},
+      intentionalSilent,
+    });
+  }
   logLatency("processMessage", processStartedAt, {
     sendVia,
     hasReply: String(reply ?? "").trim() !== "",
