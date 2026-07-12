@@ -47,6 +47,10 @@ import {
   startLocalAvailabilityCustomerConfirmPollerScheduler,
   stopLocalAvailabilityCustomerConfirmPollerScheduler,
 } from "./services/localAvailabilityCustomerConfirmPollerScheduler.js";
+import {
+  startLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
+  stopLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
+} from "./services/localAvailabilityCustomerPhoneExtractionPollerScheduler.js";
 
 console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 console.log("[build_marker] whatsapp_cloud_token_fix_v1_loaded");
@@ -1007,6 +1011,14 @@ async function gracefulPlaywrightShutdown(signal) {
       err?.message || err
     );
   }
+  try {
+    stopLocalAvailabilityCustomerPhoneExtractionPollerScheduler();
+  } catch (err) {
+    console.warn(
+      "[server] availability customer phone extraction poller scheduler stop error:",
+      err?.message || err
+    );
+  }
   if (stopPlaywrightListenerFn) {
     try {
       await stopPlaywrightListenerFn();
@@ -1035,3 +1047,7 @@ if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true") {
 // Narrow availability customer DM confirm poller — independent of listener.js / broad DM.
 // Default off unless PLAYWRIGHT_AVAILABILITY_CUSTOMER_CONFIRM_POLLER_ENABLED=true.
 startLocalAvailabilityCustomerConfirmPollerScheduler();
+
+// Group Contact-info customer phone extraction poller — default off.
+// PLAYWRIGHT_GROUP_CONTACT_PHONE_EXTRACTION_ENABLED=true
+startLocalAvailabilityCustomerPhoneExtractionPollerScheduler();

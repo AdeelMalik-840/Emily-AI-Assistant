@@ -109,6 +109,40 @@ export function resolveCustomerDmTransport(input = {}) {
 }
 
 /**
+ * Initial phone-extraction fields at availabilityRequest creation.
+ * participantPhone present → resolved from group_row; else pending for Contact-info resolver.
+ *
+ * @param {{ participantPhone?: unknown }} [input]
+ * @returns {Record<string, unknown>}
+ */
+export function buildInitialAvailabilityPhoneExtractionFields(input = {}) {
+  const raw =
+    input.participantPhone != null && String(input.participantPhone).trim()
+      ? String(input.participantPhone).trim()
+      : "";
+  const normalized = normalizeCustomerPhoneDigits(raw);
+  if (normalized) {
+    const built = buildAvailabilityPhoneExtractionFields({
+      phoneExtractionStatus: "resolved",
+      customerPhone: normalized,
+      customerPhoneRaw: raw,
+      customerPhoneSource: "group_row",
+      customerPhoneConfidence: "high",
+      incrementAttempt: false,
+    });
+    return built.patch;
+  }
+  const pending = buildAvailabilityPhoneExtractionFields({
+    phoneExtractionStatus: "pending",
+    incrementAttempt: false,
+  });
+  return {
+    ...pending.patch,
+    phoneExtractionAttemptCount: 0,
+  };
+}
+
+/**
  * Pick a single normalized phone from candidates, or fail closed.
  *
  * @param {unknown[]} candidates
