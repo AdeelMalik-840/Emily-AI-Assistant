@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import db from "../config/firebase.js";
 import { sanitizeParticipantDisplayName } from "./playwrightReplyPrivatelyBridge.js";
+import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import {
+  buildNarrowDmLogicalMessageKey,
+  hashNarrowDmMessageText,
+} from "./playwrightNarrowDmMessageReader.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
@@ -1287,20 +1292,34 @@ export function normalizeTimestampToMs(value) {
 }
 
 export function hashAvailabilityCustomerInboundDmText(text) {
-  const normalized = clean(text).toLowerCase();
-  if (!normalized) return "";
-  return createHash("sha256").update(normalized).digest("hex").slice(0, 24);
+  return hashNarrowDmMessageText(text);
 }
 
 /**
- * @param {{ dataId?: string | null, text?: string, atMs?: number | null }} message
+ * @param {{ text?: string, atMs?: number | null, requestId?: string, chatKey?: string }} params
+ */
+export function buildAvailabilityCustomerInboundDmLogicalKey(params = {}) {
+  return buildNarrowDmLogicalMessageKey(params);
+}
+
+/**
+ * @param {{ dataId?: string | null, text?: string, atMs?: number | null, requestId?: string, chatKey?: string }} message
  */
 export function buildAvailabilityCustomerInboundDmMessageKey(message = {}) {
+  const logical = buildAvailabilityCustomerInboundDmLogicalKey({
+    text: message.text,
+    atMs: message.atMs,
+    requestId: message.requestId,
+    chatKey: message.chatKey,
+  });
+  if (logical) return logical;
   const dataId = clean(message.dataId);
   if (dataId) return `data:${dataId}`;
   const textHash = hashAvailabilityCustomerInboundDmText(message.text);
   const atMs = Number(message.atMs);
-  if (textHash && Number.isFinite(atMs) && atMs > 0) return `hash:${textHash}:${atMs}`;
+  if (textHash && Number.isFinite(atMs) && atMs > 0) {
+    return `hash:${textHash}:${Math.floor(atMs)}`;
+  }
   return textHash ? `hash:${textHash}` : "";
 }
 
@@ -1340,7 +1359,24 @@ export function resolveAvailabilityCustomerDmTargetKey(request) {
  * @param {{ dataId?: string | null, text?: string, messageKey?: string, atMs?: number | null }} message
  */
 export function isDuplicateAvailabilityCustomerInboundDm(request, message = {}) {
+  const requestId = clean(request?.requestId ?? request?.id);
+  const chatKey = resolveAvailabilityCustomerDmTargetKey(request);
+  const scope = { requestId, chatKey };
+  const ledger = Array.isArray(request?.processedCustomerInboundDmMessageKeys)
+    ? request.processedCustomerInboundDmMessageKeys.map((v) => clean(v)).filter(Boolean)
+    : [];
+
+  const logicalKey = buildAvailabilityCustomerInboundDmMessageKey({
+    dataId: message.dataId,
+    text: message.text,
+    atMs: message.atMs,
+    requestId,
+    chatKey,
+  });
+  if (logicalKey && ledger.includes(logicalKey)) return true;
+
   const dataId = clean(message.dataId);
+  if (dataId && ledger.includes(`data:${dataId}`)) return true;
   const lastDataId = clean(request?.lastCustomerInboundDmDataId);
   if (dataId && lastDataId && dataId === lastDataId) return true;
 
@@ -1350,17 +1386,28 @@ export function isDuplicateAvailabilityCustomerInboundDm(request, message = {}) 
       dataId: message.dataId,
       text: message.text,
       atMs: message.atMs,
+      requestId,
+      chatKey,
     });
   const lastMessageKey = clean(request?.lastCustomerInboundDmMessageKey);
   if (messageKey && lastMessageKey && messageKey === lastMessageKey) return true;
+  if (messageKey && ledger.includes(messageKey)) return true;
 
-  const textHash = hashAvailabilityCustomerInboundDmText(message.text);
-  const lastTextHash = clean(request?.lastCustomerInboundDmTextHash);
-  if (textHash && lastTextHash && textHash === lastTextHash) {
-    if (!dataId && !lastDataId) return true;
-    if (dataId && lastDataId && dataId === lastDataId) return true;
-  }
+  const lastLogicalKey = clean(request?.lastCustomerInboundDmLogicalKey);
+  if (logicalKey && lastLogicalKey && logicalKey === lastLogicalKey) return true;
+
   return false;
+}
+
+function appendProcessedInboundDmMessageKey(existing = [], messageKey = "", limit = 50) {
+  const key = clean(messageKey, 200);
+  if (!key) return Array.isArray(existing) ? existing : [];
+  const normalized = Array.isArray(existing)
+    ? existing.map((v) => clean(v, 200)).filter(Boolean)
+    : [];
+  if (normalized.includes(key)) return normalized.slice(-limit);
+  const next = [...normalized, key];
+  return next.length > limit ? next.slice(-limit) : next;
 }
 
 /**
@@ -1477,13 +1524,37 @@ export async function recordAvailabilityCustomerInboundDm({
   const textHash = hashAvailabilityCustomerInboundDmText(message?.text);
   const atMs = Number(message?.atMs);
   const inboundAt = Number.isFinite(atMs) && atMs > 0 ? new Date(atMs) : new Date();
-  const messageKey =
-    clean(message?.messageKey) ||
+  const chatKey = clean(message?.chatKey) || "";
+  const logicalKey =
+    clean(message?.logicalKey) ||
     buildAvailabilityCustomerInboundDmMessageKey({
       dataId,
       text: message?.text,
       atMs: inboundAt.getTime(),
+      requestId,
+      chatKey,
     });
+  const messageKey = clean(message?.messageKey) || logicalKey;
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  let existingLedger = [];
+  if (ref) {
+    try {
+      const snap = await ref.get();
+      const data = snap?.exists ? snap.data() || {} : {};
+      existingLedger = Array.isArray(data.processedCustomerInboundDmMessageKeys)
+        ? data.processedCustomerInboundDmMessageKeys
+        : [];
+    } catch {
+      existingLedger = [];
+    }
+  }
+  let nextLedger = appendProcessedInboundDmMessageKey(existingLedger, logicalKey, 50);
+  if (messageKey && messageKey !== logicalKey) {
+    nextLedger = appendProcessedInboundDmMessageKey(nextLedger, messageKey, 50);
+  }
+  if (dataId) {
+    nextLedger = appendProcessedInboundDmMessageKey(nextLedger, `data:${dataId}`, 50);
+  }
   return updateAvailabilityRequestFields({
     db: connection,
     businessId,
@@ -1492,7 +1563,198 @@ export async function recordAvailabilityCustomerInboundDm({
       lastCustomerInboundDmAt: inboundAt,
       lastCustomerInboundDmDataId: dataId,
       lastCustomerInboundDmTextHash: textHash || null,
-      lastCustomerInboundDmMessageKey: messageKey || null,
+      lastCustomerInboundDmMessageKey: logicalKey || messageKey || null,
+      lastCustomerInboundDmLogicalKey: logicalKey || null,
+      processedCustomerInboundDmMessageKeys: nextLedger,
     },
   });
+}
+
+function bookingDocRef(connection, businessId, bookingId) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const bid = clean(bookingId);
+  if (!firestore || !uid || !bid) return null;
+  return firestore.collection("businesses").doc(uid).collection("bookings").doc(bid);
+}
+
+/**
+ * Persist availability-confirm booking metadata not covered by createBooking defaults.
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   bookingId: string,
+ *   patch: Record<string, unknown>,
+ * }} params
+ */
+export async function patchAvailabilityConfirmBookingMetadata({
+  db: connection,
+  businessId,
+  bookingId,
+  patch = {},
+}) {
+  const ref = bookingDocRef(connection, businessId, bookingId);
+  if (!ref || typeof ref.update !== "function") return false;
+  const safePatch = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    safePatch[key] = value;
+  }
+  if (Object.keys(safePatch).length === 0) return false;
+  await ref.update(safePatch).catch(() => null);
+  return true;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {{
+ *   participantPhone?: string | null,
+ *   participantKey?: string | null,
+ *   participantName?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   dmChatTitle?: string | null,
+ * }} identity
+ */
+export function availabilityRequestMatchesInboundIdentity(request, identity = {}) {
+  const phone = normalizePhoneDigits(identity.participantPhone);
+  const requestPhones = [
+    normalizePhoneDigits(request?.customerPhone),
+    normalizePhoneDigits(request?.customerDmTarget),
+  ].filter(Boolean);
+  if (phone && requestPhones.some((row) => row === phone)) return true;
+
+  const participantKey = clean(identity.participantKey);
+  const requestParticipant = clean(request?.customerParticipantId);
+  const sourceParticipant = clean(request?.sourceIdentity?.participantKey);
+  if (
+    participantKey &&
+    (participantKey === requestParticipant || participantKey === sourceParticipant)
+  ) {
+    return true;
+  }
+
+  const inboundKeys = new Set(
+    [
+      normalizeTitle(identity.playwrightChatKey),
+      normalizeTitle(identity.dmChatTitle),
+      normalizeTitle(identity.participantName),
+    ].filter(Boolean)
+  );
+  if (inboundKeys.size === 0) return false;
+  const requestKeys = new Set(
+    [
+      normalizeTitle(request?.customerDmPlaywrightChatKey),
+      normalizeTitle(request?.customerDmChatTitle),
+      normalizeTitle(request?.customerDisplayName),
+      normalizeTitle(request?.sourceIdentity?.participantDisplayName),
+    ].filter(Boolean)
+  );
+  for (const key of inboundKeys) {
+    if (requestKeys.has(key)) return true;
+  }
+  return false;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {number | null} messageTimestampMs
+ */
+export function availabilityRequestInboundTimestampEligible(request, messageTimestampMs = null) {
+  const notifyAtMs = resolveLastCustomerNotifyAtMs(request);
+  if (!Number.isFinite(notifyAtMs) || notifyAtMs <= 0) return false;
+  const messageMs = Number(messageTimestampMs);
+  if (Number.isFinite(messageMs) && messageMs > 0) {
+    return messageMs > notifyAtMs;
+  }
+  // When transport cannot provide a trusted timestamp, only block DM-target matches.
+  return true;
+}
+
+/**
+ * @param {Record<string, unknown>} request
+ * @param {{
+ *   participantPhone?: string | null,
+ *   participantKey?: string | null,
+ *   participantName?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   dmChatTitle?: string | null,
+ *   messageTimestampMs?: number | null,
+ * }} identity
+ */
+export function matchWaitingConfirmRequestForInbound(request, identity = {}) {
+  if (!isPlaywrightAvailabilityConfirmRequestEligible(request)) return null;
+  if (!availabilityRequestMatchesInboundIdentity(request, identity)) return null;
+  if (!availabilityRequestInboundTimestampEligible(request, identity.messageTimestampMs)) {
+    return null;
+  }
+  return request;
+}
+
+/**
+ * Narrow single-owner guard: active waiting_confirm DMs belong to the availability poller only.
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   messageText?: string,
+ *   messageTimestampMs?: number | null,
+ *   participantPhone?: string | null,
+ *   participantKey?: string | null,
+ *   participantName?: string | null,
+ *   playwrightChatKey?: string | null,
+ *   dmChatTitle?: string | null,
+ *   isGroupInbound?: boolean,
+ *   requests?: Array<Record<string, unknown>>,
+ * }} params
+ */
+export async function evaluateAvailabilityWaitingConfirmOwnershipGuard({
+  db: connection,
+  businessId,
+  messageText = "",
+  messageTimestampMs = null,
+  participantPhone = null,
+  participantKey = null,
+  participantName = null,
+  playwrightChatKey = null,
+  dmChatTitle = null,
+  isGroupInbound = false,
+  requests = null,
+}) {
+  const uid = clean(businessId);
+  const text = clean(messageText);
+  if (!uid || !text) {
+    return { block: false, reason: "MISSING_CONTEXT" };
+  }
+
+  const identity = {
+    participantPhone,
+    participantKey,
+    participantName,
+    playwrightChatKey,
+    dmChatTitle,
+    messageTimestampMs,
+  };
+
+  const pool =
+    Array.isArray(requests) && requests.length > 0
+      ? requests
+      : await findEligiblePlaywrightAvailabilityConfirmRequests({
+          db: connection,
+          businessId: uid,
+          limit: 25,
+        });
+
+  for (const row of pool) {
+    const matched = matchWaitingConfirmRequestForInbound(row, identity);
+    if (!matched) continue;
+    return {
+      block: true,
+      reason: "WAITING_CONFIRM_NARROW_OWNERSHIP",
+      requestId: clean(matched.requestId ?? matched.id) || null,
+      isGroupInbound: Boolean(isGroupInbound),
+    };
+  }
+
+  return { block: false, reason: "NO_MATCHING_WAITING_CONFIRM" };
 }

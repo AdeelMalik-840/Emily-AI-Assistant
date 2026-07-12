@@ -10,6 +10,9 @@ import {
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  classifyAvailabilityCustomerQuestionTopic,
+} from "../src/brain/availabilityConfirmation/index.js";
+import {
   bridgeAvailabilityCustomerDmTurn,
   buildPlaywrightCustomerDmSendReplyFn,
   buildTransportSafePlaywrightCustomerDmSendReplyFn,
@@ -473,7 +476,7 @@ test("fresh inbound selection ignores outgoing and old rows", () => {
   assert.equal(fresh.accepted[0].text, "ji");
 });
 
-test("fresh inbound selection accepts msg-container row with hex dataId and copyable prePlainText", () => {
+test("fresh inbound selection accepts msg-container row with customer prePlainText", () => {
   const fresh = selectFreshAvailabilityCustomerInboundMessages(
     baseRequest(),
     [
@@ -488,6 +491,349 @@ test("fresh inbound selection accepts msg-container row with hex dataId and copy
   );
   assert.equal(fresh.accepted.length, 1);
   assert.equal(fresh.accepted[0].text, "Han book kar do");
+});
+
+test("fresh inbound selection fails closed on missing/untrusted row timestamp", () => {
+  const fresh = selectFreshAvailabilityCustomerInboundMessages(baseRequest(), [
+    { className: "message-in", text: "rent kitna hai?", dataId: "false_no_ts" },
+  ]);
+  assert.equal(fresh.accepted.length, 0);
+  assert.equal(fresh.ignored[0]?.reason, "MISSING_TRUSTED_TIMESTAMP");
+});
+
+test("fresh inbound selection ignores assistant-looking texts even if message-in", () => {
+  const fresh = selectFreshAvailabilityCustomerInboundMessages(baseRequest(), [
+    { className: "message-in", text: "Booking confirm ho gayi.", atMs: NOTIFY_AT_MS + 10_000, dataId: "false_bc" },
+  ]);
+  assert.equal(fresh.accepted.length, 0);
+  assert.equal(fresh.ignored[0]?.reason, "ASSISTANT_TEXT_GUARD");
+});
+
+test("processed-row ledger prevents reprocessing same inbound row on next tick", () => {
+  const row = {
+    className: "message-in",
+    text: "rent kitna hai?",
+    atMs: NOTIFY_AT_MS + 10_000,
+    dataId: "false_row1",
+  };
+  const first = selectFreshAvailabilityCustomerInboundMessages(baseRequest(), [row]);
+  assert.equal(first.accepted.length, 1);
+  const key = first.accepted[0].messageKey;
+  const second = selectFreshAvailabilityCustomerInboundMessages(
+    baseRequest({ processedCustomerInboundDmMessageKeys: [key] }),
+    [row]
+  );
+  assert.equal(second.accepted.length, 0);
+  assert.equal(second.ignored[0]?.reason, "PROCESSED_LEDGER");
+});
+
+function corollaRequest(overrides = {}) {
+  return baseRequest({
+    itemLabel: "Toyota corolla (Metallic Grey)",
+    itemId: "corolla-1",
+    canonicalAvailabilityStatus: "available",
+    requestedDuration: 2,
+    priceQuote: {
+      status: "quoted",
+      total: 10000,
+      currency: "PKR",
+      durationDays: 2,
+      dailyRate: 5000,
+    },
+    lastCustomerDmPromptType: "booking_confirmation_prompt",
+    lastCustomerNotifyMessage:
+      "Toyota corolla (Metallic Grey) 2 din ke liye available hai. 2 din ka rent 10,000 PKR hoga. Book kar du?",
+    ...overrides,
+  });
+}
+
+function corollaInboundRow(text, overrides = {}) {
+  return {
+    className: "_amjv",
+    dataId: `3EB0${hashText(text)}`,
+    prePlainText: "[02:15, 09/07/2026] Adeel malik: ",
+    text,
+    atMs: NOTIFY_AT_MS + 10_000,
+    sourceIndex: 5,
+    ...overrides,
+  };
+}
+
+function hashText(text) {
+  return String(text).replace(/\W+/g, "").slice(0, 12).toUpperCase();
+}
+
+function corollaColorRow(overrides = {}) {
+  return {
+    className: "_amjv",
+    dataId: "3EB0COLORBRIDGE",
+    prePlainText: "[02:15, 09/07/2026] Adeel malik: ",
+    text: "Color kon sa hai gari ka?",
+    atMs: NOTIFY_AT_MS + 10_000,
+    sourceIndex: 5,
+    ...overrides,
+  };
+}
+
+test("bridge A: after customer notification, true fresh customer color row is selected and processed", async () => {
+  let seenText = null;
+  const result = await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [corollaColorRow()],
+    handleInboundFn: async (params) => {
+      seenText = params.messageText;
+      return handleAvailabilityCustomerPlaywrightInbound({
+        ...params,
+        availabilityConfirmExecute: false,
+      });
+    },
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(seenText, "Color kon sa hai gari ka?");
+  assert.equal(result.ok, true);
+  assert.equal(result.accepted, 1);
+  assert.equal(result.bridgeReason, "BRIDGED");
+});
+
+test("bridge B: color question reply contains Metallic Grey / color detail", async () => {
+  const playwrightSends = [];
+  assert.equal(
+    classifyAvailabilityCustomerQuestionTopic("Color kon sa hai gari ka?"),
+    "color"
+  );
+  await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [corollaColorRow()],
+    sendPlaywrightActiveChatTextFn: async (text) => {
+      playwrightSends.push(text);
+      return true;
+    },
+  });
+  assert.equal(playwrightSends.length, 1);
+  assert.match(playwrightSends[0], /Metallic Grey/i);
+});
+
+test("bridge scoped B: total rent kitna hai? includes 10,000 PKR", async () => {
+  const playwrightSends = [];
+  await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [corollaInboundRow("total rent kitna hai?")],
+    sendPlaywrightActiveChatTextFn: async (text) => {
+      playwrightSends.push(text);
+      return true;
+    },
+  });
+  assert.equal(playwrightSends.length, 1);
+  assert.match(playwrightSends[0], /10,000 PKR/i);
+});
+
+test("bridge scoped C: per day kitna hai? includes 5,000 PKR", async () => {
+  const playwrightSends = [];
+  await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [corollaInboundRow("per day kitna hai?")],
+    sendPlaywrightActiveChatTextFn: async (text) => {
+      playwrightSends.push(text);
+      return true;
+    },
+  });
+  assert.equal(playwrightSends.length, 1);
+  assert.match(playwrightSends[0], /5,000 PKR/i);
+});
+
+test("bridge scoped D: known-detail questions do not create booking", async () => {
+  const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
+  for (const text of ["Color konsa hai?", "total rent kitna hai?", "per day kitna hai?"]) {
+    const result = await bridgeAvailabilityCustomerDmTurn({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      request: corollaRequest(),
+      page: {},
+      openChatFn: openDmMock,
+      availabilityConfirmExecute: false,
+      readMessagesFn: async () => [corollaInboundRow(text, { atMs: NOTIFY_AT_MS + 11_000 + text.length })],
+      sendPlaywrightActiveChatTextFn: async () => true,
+    });
+    assert.ok(/^(question|price)$/.test(String(result.results[0]?.action ?? "")));
+    assert.notEqual(result.results[0]?.action, "confirmed_booking");
+    const row = fake.readRequest(REQUEST_ID);
+    assert.equal(row.customerConfirmationStatus, "waiting_confirm");
+    assert.equal(row.linkedBookingId ?? null, null);
+  }
+});
+
+test("bridge scoped E: Book kar do still books once", async () => {
+  const fake = createFakeDb({
+    [REQUEST_ID]: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
+  });
+  const result = await bridgeAvailabilityCustomerDmTurn({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
+    page: {},
+    availabilityConfirmExecute: false,
+    openChatFn: openDmMock,
+    readMessagesFn: async () => [
+      corollaInboundRow("Han book kar do", { atMs: NOTIFY_AT_MS + 7_000 }),
+    ],
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.accepted, 1);
+  assert.equal(result.results[0]?.action, "confirm_failed");
+});
+
+test("bridge D: after customer notification, outbound Emily rows only → NO_FRESH_INBOUND", async () => {
+  const result = await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    readMessagesFn: async () => [
+      {
+        className: "message-out",
+        text: "Toyota corolla (Metallic Grey) 2 din ke liye available hai. Book kar du?",
+        atMs: NOTIFY_AT_MS + 2_000,
+        sourceIndex: 0,
+        dataId: "true_notify_out",
+      },
+      {
+        className: "_amjv",
+        hasIncomingDescendant: true,
+        hasOutgoingDescendant: true,
+        prePlainText: "[19:07, 06/07/2026] You: ",
+        text: "Corolla 2 din ke liye chahiye test auto 003",
+        atMs: NOTIFY_AT_MS + 3_000,
+        sourceIndex: 1,
+        dataId: "true_quoted_group",
+      },
+    ],
+    handleInboundFn: async () => {
+      throw new Error("handler should not run");
+    },
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(result.bridgeReason, "NO_FRESH_INBOUND");
+  assert.equal(result.accepted, 0);
+});
+
+test("bridge E: repeated bridge ticks do not process outbound/stale rows", async () => {
+  const outboundOnly = [
+    {
+      className: "message-out",
+      text: "Kar doon?",
+      atMs: NOTIFY_AT_MS + 2_000,
+      sourceIndex: 0,
+      dataId: "true_repeat_out",
+    },
+  ];
+  const first = await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    readMessagesFn: async () => outboundOnly,
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(first.bridgeReason, "NO_FRESH_INBOUND");
+  const second = await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    readMessagesFn: async () => outboundOnly,
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(second.bridgeReason, "NO_FRESH_INBOUND");
+  assert.equal(second.accepted, 0);
+});
+
+test("bridge F: poll lock is released after NO_FRESH_INBOUND", async () => {
+  const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
+  const result = await bridgeAvailabilityCustomerDmTurn({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    readMessagesFn: async () => [
+      {
+        className: "message-out",
+        text: "Kar doon?",
+        atMs: NOTIFY_AT_MS + 2_000,
+        sourceIndex: 0,
+        dataId: "true_poll_release",
+      },
+    ],
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(result.bridgeReason, "NO_FRESH_INBOUND");
+  const row = fake.readRequest(REQUEST_ID);
+  assert.equal(row.customerPlaywrightInboundPollStatus, "idle");
+});
+
+test("bridge G: true fresh Book kar do still confirms booking once", async () => {
+  const fake = createFakeDb({
+    [REQUEST_ID]: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
+  });
+  const result = await bridgeAvailabilityCustomerDmTurn({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
+    page: {},
+    availabilityConfirmExecute: false,
+    openChatFn: openDmMock,
+    readMessagesFn: async () => [
+      {
+        className: "_amjv",
+        dataId: "2AAF853D553496708C1A",
+        prePlainText: "[19:07, 06/07/2026] Adeel malik: ",
+        text: "Han book kar do",
+        atMs: NOTIFY_AT_MS + 7_000,
+        sourceIndex: 2,
+      },
+    ],
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.accepted, 1);
+  assert.equal(result.results[0]?.action, "confirm_failed");
+});
+
+test("bridge H: processed-row ledger prevents same row reprocessing", async () => {
+  const row = corollaColorRow();
+  const first = selectFreshAvailabilityCustomerInboundMessages(corollaRequest(), [row]);
+  assert.equal(first.accepted.length, 1);
+  const key = first.accepted[0].messageKey;
+  const second = selectFreshAvailabilityCustomerInboundMessages(
+    corollaRequest({ processedCustomerInboundDmMessageKeys: [key] }),
+    [row]
+  );
+  assert.equal(second.accepted.length, 0);
+  assert.equal(second.ignored[0]?.reason, "PROCESSED_LEDGER");
 });
 
 test("A: defaultOpenKnownAvailabilityCustomerDm succeeds when focus returns ok:true", async () => {
@@ -1351,6 +1697,125 @@ test("send-reliability J: duplicate latest row still does not fall back", async 
   });
   assert.equal(handlerCalls, 0);
   assert.equal(result.bridgeReason, "DUPLICATE_SELECTED_ROW");
+});
+
+test("3B bridge B1: total rent question sends one reply only", async () => {
+  const playwrightSends = [];
+  const result = await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [corollaInboundRow("total rent kitna hai?")],
+    sendPlaywrightActiveChatTextFn: async (text) => {
+      playwrightSends.push(text);
+      return true;
+    },
+  });
+  assert.equal(result.accepted, 1);
+  assert.equal(playwrightSends.length, 1);
+  assert.match(playwrightSends[0], /10,000 PKR/i);
+});
+
+test("3B bridge B2: next poll tick with same logical row but new data-id is NO_FRESH_INBOUND", async () => {
+  const atMs = NOTIFY_AT_MS + 10_000;
+  const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
+  const first = await bridgeAvailabilityCustomerDmTurn({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [
+      corollaInboundRow("total rent kitna hai?", { atMs, dataId: "3EB0TOTAL_A" }),
+    ],
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(first.accepted, 1);
+  const stored = fake.readRequest(REQUEST_ID);
+  const second = await bridgeAvailabilityCustomerDmTurn({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    request: { ...corollaRequest(), ...stored },
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [
+      corollaInboundRow("total rent kitna hai?", { atMs, dataId: "3EB0TOTAL_B" }),
+    ],
+    sendPlaywrightActiveChatTextFn: async () => {
+      throw new Error("should not send on duplicate logical row");
+    },
+  });
+  assert.equal(second.accepted, 0);
+  assert.ok(
+    second.bridgeReason === "NO_FRESH_INBOUND" ||
+      second.bridgeReason === "DUPLICATE_SELECTED_ROW"
+  );
+});
+
+test("3B bridge B3: color question includes Metallic Grey once", async () => {
+  const playwrightSends = [];
+  await bridgeAvailabilityCustomerDmTurn({
+    db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [corollaColorRow()],
+    sendPlaywrightActiveChatTextFn: async (text) => {
+      playwrightSends.push(text);
+      return true;
+    },
+  });
+  assert.equal(playwrightSends.length, 1);
+  assert.match(playwrightSends[0], /Metallic Grey/i);
+});
+
+test("3B bridge D: logistics question is ledgered and duplicate logical row is skipped", async () => {
+  const atMs = NOTIFY_AT_MS + 12_000;
+  const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
+  const first = await bridgeAvailabilityCustomerDmTurn({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    request: corollaRequest(),
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [corollaInboundRow("delivery possible hai?", { atMs })],
+    sendPlaywrightActiveChatTextFn: async () => true,
+  });
+  assert.equal(first.accepted, 1);
+  assert.equal(first.results[0]?.action, "question");
+  const stored = fake.readRequest(REQUEST_ID);
+  assert.ok(Array.isArray(stored.processedCustomerInboundDmMessageKeys));
+  assert.ok(stored.processedCustomerInboundDmMessageKeys.length > 0);
+  assert.match(String(stored.processedCustomerInboundDmMessageKeys[0]), /^logical:/);
+  assert.equal(stored.linkedBookingId ?? null, null);
+
+  const second = await bridgeAvailabilityCustomerDmTurn({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    request: { ...corollaRequest(), ...stored },
+    page: {},
+    openChatFn: openDmMock,
+    availabilityConfirmExecute: false,
+    readMessagesFn: async () => [
+      corollaInboundRow("delivery possible hai?", { atMs, dataId: "3EB0DELIVERY_B" }),
+    ],
+    sendPlaywrightActiveChatTextFn: async () => {
+      throw new Error("duplicate logistics row should not send");
+    },
+  });
+  assert.equal(second.accepted, 0);
+  assert.ok(
+    second.bridgeReason === "NO_FRESH_INBOUND" ||
+      second.bridgeReason === "DUPLICATE_SELECTED_ROW"
+  );
 });
 
 test("send-reliability K: Cloud API is not used by transport-safe send path", () => {

@@ -31,11 +31,13 @@ import {
   findLatestWaitingConfirmAvailabilityRequest,
   findWaitingConfirmAvailabilityRequestsByPhone,
   getAvailabilityRequest,
+  patchAvailabilityConfirmBookingMetadata,
   recordAvailabilityCustomerDmOutbound,
   resolveAvailabilityParticipantDisplayName,
   updateAvailabilityRequestCustomerConfirmationState,
   updateAvailabilityRequestFields,
 } from "./availabilityRequestService.js";
+import { normalizeTitle } from "./playwrightTitleNormalize.js";
 
 export {
   classifyAvailabilityConfirmationIntent,
@@ -152,6 +154,7 @@ async function buildQuestionReplyForRequest(request, message) {
   return buildAvailabilityScopedQuestionReply({
     request,
     topic,
+    messageText: message,
     catalogRow,
     priceQuote: resolved.priceQuote,
   });
@@ -275,6 +278,15 @@ export async function executeAvailabilityCustomerConfirmBooking({
     request?.sourceIdentity && typeof request.sourceIdentity === "object"
       ? request.sourceIdentity
       : {};
+  const dmChatTitle = clean(request?.customerDmChatTitle);
+  const dmPlaywrightChatKey =
+    clean(request?.customerDmPlaywrightChatKey) || normalizeTitle(dmChatTitle);
+  const originalGroupChatKey = clean(request?.sourceChatId ?? sourceIdentity.chatId);
+  const originalSourceTurnKey = clean(request?.sourceTurnKey ?? sourceIdentity.sourceTurnKey);
+  const dmMessageId = clean(messageId);
+  const customerConfirmTurnKey = dmMessageId
+    ? `${dmPlaywrightChatKey || dmChatTitle || "dm"}::wa::${dmMessageId}`
+    : null;
   const durationDays =
     request?.requestedDuration != null && Number.isFinite(Number(request.requestedDuration))
       ? Math.max(1, Math.floor(Number(request.requestedDuration)))
@@ -295,18 +307,23 @@ export async function executeAvailabilityCustomerConfirmBooking({
       itemLabel: clean(request.itemLabel),
       itemName: clean(request.itemLabel),
       durationDays,
-      approvalStage: "pending_owner_approval",
+      approvalStage: "owner_approved_waiting_customer_details",
       availabilityRequestId: requestId,
       sourceMessage: clean(messageText),
-      sourceTurnKey: clean(request.sourceTurnKey ?? sourceIdentity.sourceTurnKey),
-      sourceMessageId: clean(sourceIdentity.sourceMessageId),
+      sourceTurnKey: customerConfirmTurnKey || originalSourceTurnKey || null,
+      sourceMessageId: dmMessageId || null,
       sourceRowKey: clean(sourceIdentity.sourceRowKey),
       participantKey: clean(sourceIdentity.participantKey ?? request.customerParticipantId),
       sourceParticipantKey: clean(sourceIdentity.participantKey ?? request.customerParticipantId),
       sourceParticipantPhone: normalizePhone(request.customerPhone ?? request.customerDmTarget),
       sourceParticipantName: resolveAvailabilityParticipantDisplayName(sourceIdentity, request),
-      sourceGroupName: clean(request.sourceChatId ?? sourceIdentity.chatId),
-      sourcePlaywrightChatKey: clean(request.sourceChatId ?? sourceIdentity.chatId),
+      sourceGroupName: originalGroupChatKey || null,
+      sourcePlaywrightChatKey: originalGroupChatKey || null,
+      playwrightChatKey: dmPlaywrightChatKey || dmChatTitle || null,
+      groupName: dmChatTitle || dmPlaywrightChatKey || null,
+      canDmCustomer: true,
+      dmTargetPhone: normalizePhone(request.customerPhone ?? request.customerDmTarget),
+      dmTargetSource: "availability_confirm_dm",
       execute: true,
     },
     executionContext: {
@@ -314,10 +331,16 @@ export async function executeAvailabilityCustomerConfirmBooking({
       userId: uid,
       traceId: `availability-confirm-${requestId}`,
       message: clean(messageText),
-      messageId: clean(messageId) || null,
+      messageId: dmMessageId || null,
       participantPhoneForDm: normalizePhone(request.customerPhone ?? request.customerDmTarget),
       availabilityRequestId: requestId,
       availabilityConfirmExecute: true,
+      playwrightChatKey: dmPlaywrightChatKey || dmChatTitle || null,
+      sourcePlaywrightChatKey: originalGroupChatKey || null,
+      sourceGroupName: originalGroupChatKey || null,
+      groupName: dmChatTitle || dmPlaywrightChatKey || null,
+      canDmCustomer: true,
+      dmTargetSource: "availability_confirm_dm",
       db: connection ?? db,
     },
   });
@@ -346,12 +369,28 @@ export async function executeAvailabilityCustomerConfirmBooking({
     customerConfirmationStatus: "confirmed",
     extra: {
       customerConfirmationAt: new Date(),
-      customerConfirmationMessageId: clean(messageId) || null,
+      customerConfirmationMessageId: dmMessageId || null,
       customerConfirmationTextPreview: clean(messageText).slice(0, 160) || null,
       linkedBookingId: clean(bookingResult.booking.id),
       customerConfirmProcessingStatus: "done",
     },
   });
+
+  await patchAvailabilityConfirmBookingMetadata({
+    db: connection,
+    businessId: uid,
+    bookingId: clean(bookingResult.booking.id),
+    patch: {
+      availabilityRequestId: requestId,
+      originalAvailabilityRequestSourceTurnKey: originalSourceTurnKey || null,
+      customerConfirmationMessageId: dmMessageId || null,
+      customerConfirmationTextPreview: clean(messageText).slice(0, 160) || null,
+      customerDmChatTitle: dmChatTitle || null,
+      customerDmPlaywrightChatKey: dmPlaywrightChatKey || null,
+      sourceMessage: clean(messageText),
+      sourceMessageId: dmMessageId || null,
+    },
+  }).catch(() => null);
 
   return {
     ok: true,

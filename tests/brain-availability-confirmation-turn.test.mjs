@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   AVAILABILITY_DM_PROMPT_TYPES,
+  buildAvailabilityScopedQuestionReply,
   resolveAvailabilityConfirmationTurn,
 } from "../src/brain/availabilityConfirmation/index.js";
 
@@ -12,9 +13,49 @@ const waitingRequest = {
   customerConfirmationStatus: "waiting_confirm",
   itemLabel: "Honda Civic 2026",
   requestedDuration: 2,
+  priceQuote: { status: "quoted", total: 16000, currency: "PKR", durationDays: 2, dailyRate: 8000 },
   lastCustomerNotifyMessage:
     "Honda Civic 2026 2 din ke liye available hai. 2 din ka rent 16,000 PKR hoga. Book kar du?",
 };
+
+const corollaWaitingRequest = {
+  status: "approved",
+  approvalCustomerNotificationStatus: "sent",
+  customerConfirmationStatus: "waiting_confirm",
+  canonicalAvailabilityStatus: "available",
+  itemLabel: "Toyota corolla (Metallic Grey)",
+  itemId: "corolla-1",
+  requestedDuration: 2,
+  priceQuote: {
+    status: "quoted",
+    total: 10000,
+    currency: "PKR",
+    durationDays: 2,
+    dailyRate: 5000,
+  },
+  lastCustomerNotifyMessage:
+    "Toyota corolla (Metallic Grey) 2 din ke liye available hai. 2 din ka rent 10,000 PKR hoga. Book kar du?",
+};
+
+function scopedReply(messageText, request = corollaWaitingRequest) {
+  const turn = resolveAvailabilityConfirmationTurn({ request, messageText });
+  if (turn.reply) return turn.reply;
+  if (turn.needsAsyncReply && turn.questionTopic) {
+    return buildAvailabilityScopedQuestionReply({
+      request,
+      topic: turn.questionTopic,
+      messageText,
+      priceQuote: request.priceQuote,
+    });
+  }
+  return "";
+}
+
+function assertNoBookingAction(messageText, request = corollaWaitingRequest) {
+  const turn = resolveAvailabilityConfirmationTurn({ request, messageText });
+  assert.notEqual(turn.actionType, "confirm_booking");
+  assert.notEqual(turn.intent, "confirm");
+}
 
 test("resolveAvailabilityConfirmationTurn rejects non-waiting_confirm lifecycle", () => {
   const result = resolveAvailabilityConfirmationTurn({
@@ -71,7 +112,7 @@ test("resolveAvailabilityConfirmationTurn maps price question to async reply act
   assert.equal(result.actionType, "reply");
   assert.equal(result.needsAsyncReply, true);
   assert.equal(result.questionTopic, "price");
-  assert.match(result.reply ?? "", /Confirm karna ho to bata dein/i);
+  assert.match(result.reply ?? "", /16,000 PKR|total rent/i);
 });
 
 test("resolveAvailabilityConfirmationTurn maps decline to decline_request with reply", () => {
@@ -249,4 +290,133 @@ test("Phase1: unrelated maps to unclear with context-aware reply (not bare Kar d
   assert.equal(result.intent, "unclear");
   assert.match(result.reply ?? "", /rent|details/i);
   assert.equal(/Kar doon\?/i.test(result.reply ?? ""), false);
+});
+
+test("facts A: Konsi car hai? reply includes Toyota Corolla item name", () => {
+  const reply = scopedReply("Konsi car hai?");
+  assert.match(reply, /Toyota corolla/i);
+  assertNoBookingAction("Konsi car hai?");
+});
+
+test("facts B: car ka naam? reply includes Toyota Corolla", () => {
+  const reply = scopedReply("car ka naam?");
+  assert.match(reply, /Toyota corolla/i);
+  assertNoBookingAction("car ka naam?");
+});
+
+test("facts C: model konsa hai? reply includes item/model from itemLabel", () => {
+  const reply = scopedReply("model konsa hai?");
+  assert.match(reply, /Toyota corolla/i);
+  assertNoBookingAction("model konsa hai?");
+});
+
+test("facts D: Color konsa hai? with Metallic Grey itemLabel includes Metallic Grey", () => {
+  const reply = scopedReply("Color konsa hai?");
+  assert.match(reply, /Metallic Grey/i);
+  assertNoBookingAction("Color konsa hai?");
+});
+
+test("facts E: Corolla ka color kon sa hai? includes Metallic Grey", () => {
+  const reply = scopedReply("Corolla ka color kon sa hai?");
+  assert.match(reply, /Metallic Grey/i);
+  assertNoBookingAction("Corolla ka color kon sa hai?");
+});
+
+test("facts F: kitne din ke liye hai? includes 2 din", () => {
+  const reply = scopedReply("kitne din ke liye hai?");
+  assert.match(reply, /2 din/i);
+  assertNoBookingAction("kitne din ke liye hai?");
+});
+
+test("facts G: total rent kitna hai? includes 10,000 PKR", () => {
+  const reply = scopedReply("total rent kitna hai?");
+  assert.match(reply, /10,000 PKR/i);
+  assertNoBookingAction("total rent kitna hai?");
+});
+
+test("facts H: per day kitna hai? includes 5,000 PKR", () => {
+  const reply = scopedReply("per day kitna hai?");
+  assert.match(reply, /5,000 PKR/i);
+  assertNoBookingAction("per day kitna hai?");
+});
+
+test("facts I: ye available hai? includes available + item + duration", () => {
+  const reply = scopedReply("ye available hai?");
+  assert.match(reply, /available hai/i);
+  assert.match(reply, /Toyota corolla/i);
+  assert.match(reply, /2 din/i);
+  assertNoBookingAction("ye available hai?");
+});
+
+test("facts J: details bata dein includes item + duration + total price", () => {
+  const turn = resolveAvailabilityConfirmationTurn({
+    request: corollaWaitingRequest,
+    messageText: "details bata dein",
+  });
+  assert.equal(turn.intent, "question");
+  assert.equal(turn.questionTopic, "request_summary");
+  const reply = buildAvailabilityScopedQuestionReply({
+    request: corollaWaitingRequest,
+    topic: "request_summary",
+    messageText: "details bata dein",
+    priceQuote: corollaWaitingRequest.priceQuote,
+  });
+  assert.match(reply, /Toyota corolla/i);
+  assert.match(reply, /2 din/i);
+  assert.match(reply, /10,000 PKR/i);
+  assertNoBookingAction("details bata dein");
+});
+
+test("facts K: delivery possible hai? with no delivery info uses safe fallback", () => {
+  const reply = scopedReply("delivery possible hai?");
+  assert.match(reply, /confirmation karni hogi/i);
+  assertNoBookingAction("delivery possible hai?");
+});
+
+test("facts L: driver milega? with no driver info uses safe fallback", () => {
+  const reply = scopedReply("driver milega?");
+  assert.match(reply, /confirmation karni hogi/i);
+  assertNoBookingAction("driver milega?");
+});
+
+test("facts M: known-detail questions A-L do not create booking", () => {
+  const prompts = [
+    "Konsi car hai?",
+    "car ka naam?",
+    "model konsa hai?",
+    "Color konsa hai?",
+    "Corolla ka color kon sa hai?",
+    "kitne din ke liye hai?",
+    "total rent kitna hai?",
+    "per day kitna hai?",
+    "ye available hai?",
+    "details bata dein",
+    "delivery possible hai?",
+    "driver milega?",
+  ];
+  for (const messageText of prompts) {
+    assertNoBookingAction(messageText);
+  }
+});
+
+test("facts N: request remains waiting_confirm semantics for known-detail questions", () => {
+  for (const messageText of ["Color konsa hai?", "total rent kitna hai?", "per day kitna hai?"]) {
+    const turn = resolveAvailabilityConfirmationTurn({
+      request: corollaWaitingRequest,
+      messageText,
+    });
+    assert.equal(turn.ok, true);
+    assert.notEqual(turn.actionType, "confirm_booking");
+    assert.notEqual(turn.actionType, "decline_request");
+  }
+});
+
+test("facts O: Book kar do still confirms booking", () => {
+  const result = resolveAvailabilityConfirmationTurn({
+    request: corollaWaitingRequest,
+    messageText: "Book kar do",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.intent, "confirm");
+  assert.equal(result.actionType, "confirm_booking");
 });

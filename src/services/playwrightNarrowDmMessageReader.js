@@ -60,8 +60,11 @@ export function resolveNarrowDmRowDirection(row = {}) {
   if (direction === "outgoing" || direction === "out" || direction === "me") return "outgoing";
 
   const flags = resolveNarrowDmRowDirectionFlags(row);
-  if (flags.hasMessageInClass === true) return "incoming";
+  // Fail closed when both directions appear (observed in Reply Privately DM rows
+  // that contain nested quoted/context elements).
+  if (flags.hasMessageInClass === true && flags.hasMessageOutClass === true) return "unknown";
   if (flags.hasMessageOutClass === true) return "outgoing";
+  if (flags.hasMessageInClass === true) return "incoming";
 
   const dataId = clean(row.dataId);
   if (/^false_/i.test(dataId)) return "incoming";
@@ -73,12 +76,34 @@ export function resolveNarrowDmRowDirection(row = {}) {
     if (plainMatch) {
       const who = clean(plainMatch[1]).toLowerCase();
       if (who === "you") return "outgoing";
+      // Customer name in prePlainText supports inbound only after outbound DOM signals
+      // were ruled out above (message-out, true_ data-id, hasOutgoingDescendant, etc.).
       if (who) return "incoming";
     }
     if (/^\s*you\s*:/i.test(pre)) return "outgoing";
   }
 
   return "unknown";
+}
+
+/**
+ * Parse WhatsApp Web copyable pre-plain-text timestamp header.
+ * Example: "[19:07, 06/07/2026] Adeel malik: "
+ * @param {string | undefined} prePlainText
+ * @returns {number | null}
+ */
+export function parseNarrowDmPrePlainTextAtMs(prePlainText) {
+  const pre = clean(prePlainText);
+  const match = pre.match(/^\[(\d{1,2}):(\d{2}),\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\]/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const day = Number(match[3]);
+  const month = Number(match[4]);
+  const year = Number(match[5]);
+  if (![hour, minute, day, month, year].every(Number.isFinite)) return null;
+  const ms = new Date(year, month - 1, day, hour, minute, 0, 0).getTime();
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
 }
 
 /**
@@ -96,7 +121,7 @@ export function extractNarrowDmRowText(row = {}) {
 /**
  * @param {{ atMs?: number, timestampMs?: number, dataTimestamp?: string | number }} row
  */
-export function resolveNarrowDmRowAtMs(row = {}, fallbackMs = Date.now()) {
+export function resolveNarrowDmRowAtMs(row = {}, fallbackMs = null) {
   const direct = Number(row.atMs ?? row.timestampMs);
   if (Number.isFinite(direct) && direct > 0) return direct;
   const raw = row.dataTimestamp;
@@ -104,19 +129,56 @@ export function resolveNarrowDmRowAtMs(row = {}, fallbackMs = Date.now()) {
     const parsed = new Date(raw).getTime();
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
-  return Number.isFinite(fallbackMs) ? fallbackMs : Date.now();
+  const fromPrePlainText = parseNarrowDmPrePlainTextAtMs(row.prePlainText);
+  if (Number.isFinite(fromPrePlainText) && fromPrePlainText > 0) return fromPrePlainText;
+  // Fail closed: if the row doesn't provide a trustworthy timestamp, return null.
+  return Number.isFinite(Number(fallbackMs)) && Number(fallbackMs) > 0 ? Number(fallbackMs) : null;
 }
 
 /**
- * @param {{ dataId?: string, text?: string, atMs?: number }} row
+ * Stable logical dedupe key: same visible row survives WhatsApp Web data-id churn.
+ * Same text with a different trusted timestamp is intentionally not deduped.
+ *
+ * @param {{ text?: string, atMs?: number | null, requestId?: string, chatKey?: string }} params
  */
-export function buildNarrowDmInboundMessageKey(row = {}) {
+export function buildNarrowDmLogicalMessageKey({
+  text = "",
+  atMs = null,
+  requestId = "",
+  chatKey = "",
+} = {}) {
+  const textHash = hashNarrowDmMessageText(text);
+  const ms = Number(atMs);
+  if (!textHash || !Number.isFinite(ms) || ms <= 0) return "";
+  const parts = ["logical"];
+  const rid = clean(requestId, 80);
+  const key = clean(chatKey, 120);
+  if (rid) parts.push(rid);
+  if (key) parts.push(key);
+  parts.push(textHash, String(Math.floor(ms)));
+  return parts.join(":");
+}
+
+/**
+ * @param {{ dataId?: string, text?: string, atMs?: number, prePlainText?: string }} row
+ * @param {{ requestId?: string, chatKey?: string }} [scope]
+ */
+export function buildNarrowDmInboundMessageKey(row = {}, scope = {}) {
+  const text = extractNarrowDmRowText(row) || clean(row.text);
+  const atMs = resolveNarrowDmRowAtMs(row);
+  const logical = buildNarrowDmLogicalMessageKey({
+    text,
+    atMs,
+    requestId: scope.requestId,
+    chatKey: scope.chatKey,
+  });
+  if (logical) return logical;
   const dataId = clean(row.dataId);
   if (dataId) return `data:${dataId}`;
-  const text = extractNarrowDmRowText(row);
   const hash = hashNarrowDmMessageText(text);
-  const atMs = resolveNarrowDmRowAtMs(row, 0);
-  if (hash && atMs > 0) return `hash:${hash}:${atMs}`;
+  if (hash && Number.isFinite(Number(atMs)) && Number(atMs) > 0) {
+    return `hash:${hash}:${Math.floor(Number(atMs))}`;
+  }
   return hash ? `hash:${hash}` : "";
 }
 
@@ -161,7 +223,7 @@ export function pickLatestFreshInboundRow(accepted = []) {
   })[0];
 }
 
-export function normalizeNarrowDmRow(row = {}) {
+export function normalizeNarrowDmRow(row = {}, scope = {}) {
   const direction = resolveNarrowDmRowDirection(row);
   const text = extractNarrowDmRowText(row);
   const atMs = resolveNarrowDmRowAtMs(row);
@@ -173,10 +235,35 @@ export function normalizeNarrowDmRow(row = {}) {
     atMs,
     dataId: dataId || null,
     sourceIndex,
-    messageKey: buildNarrowDmInboundMessageKey({ dataId, text, atMs }),
+    messageKey: buildNarrowDmInboundMessageKey(
+      { dataId, text, atMs: atMs ?? 0, prePlainText: row.prePlainText },
+      scope
+    ),
     outgoing: direction === "outgoing",
     incoming: direction === "incoming",
   };
+}
+
+function isSystemOrDeletedRowText(text) {
+  const t = clean(text).toLowerCase();
+  if (!t) return false;
+  return (
+    t.includes("this message was deleted") ||
+    t.includes("message was deleted") ||
+    t.includes("you deleted this message") ||
+    t.includes("deleted message")
+  );
+}
+
+function isAssistantLikelyAutoText(text) {
+  const t = clean(text).toLowerCase();
+  if (!t) return false;
+  if (t === "booking confirm ho gayi." || t === "booking confirm ho gayi") return true;
+  if (t.startsWith("abhi honda civic") && t.includes("ke hawalay se baat ho rahi hai")) return true;
+  if (t.includes("confirm karna ho to bata dein")) return true;
+  if (t.includes("haan, white colour hai") && t.includes("confirm karna ho")) return true;
+  if (t.includes("ke liye available hai") && t.includes("book kar du")) return true;
+  return false;
 }
 
 /**
@@ -188,6 +275,9 @@ export function normalizeNarrowDmRow(row = {}) {
  *     lastCustomerInboundDmDataId?: unknown,
  *     lastCustomerInboundDmTextHash?: unknown,
  *     lastCustomerInboundDmMessageKey?: unknown,
+ *     processedCustomerInboundDmMessageKeys?: unknown,
+ *     requestId?: unknown,
+ *     chatKey?: unknown,
  *   },
  *   nowMs?: number,
  * }} params
@@ -202,11 +292,22 @@ export function filterNarrowDmInboundCustomerMessages({
   const ignored = [];
   const notifyMs = Number(notifyAtMs);
   const hasNotifyGate = Number.isFinite(notifyMs) && notifyMs > 0;
+  const processedKeys = Array.isArray(dedupe.processedCustomerInboundDmMessageKeys)
+    ? dedupe.processedCustomerInboundDmMessageKeys.map((v) => clean(v)).filter(Boolean)
+    : [];
+  const dedupeScope = {
+    requestId: clean(dedupe.requestId, 80),
+    chatKey: clean(dedupe.chatKey, 120),
+  };
 
   for (const raw of rows) {
-    const row = normalizeNarrowDmRow(raw);
+    const row = normalizeNarrowDmRow(raw, dedupeScope);
     if (!row.text) {
       ignored.push({ row, reason: "EMPTY_TEXT" });
+      continue;
+    }
+    if (isSystemOrDeletedRowText(row.text)) {
+      ignored.push({ row, reason: "SYSTEM_OR_DELETED" });
       continue;
     }
     if (row.outgoing || row.direction === "outgoing") {
@@ -217,16 +318,30 @@ export function filterNarrowDmInboundCustomerMessages({
       ignored.push({ row, reason: "UNKNOWN_DIRECTION" });
       continue;
     }
+    // If the DOM row cannot provide a trusted timestamp, fail closed so old rows
+    // cannot appear "fresh" just because the DM was reopened.
+    if (!Number.isFinite(Number(row.atMs)) || Number(row.atMs) <= 0) {
+      ignored.push({ row, reason: "MISSING_TRUSTED_TIMESTAMP" });
+      continue;
+    }
     if (hasNotifyGate && row.atMs <= notifyMs) {
       ignored.push({ row, reason: "BEFORE_NOTIFY" });
       continue;
     }
-    if (isPersistedInboundDuplicate(dedupe, row)) {
+    if (isProcessedInboundDmLedgerHit(processedKeys, row, dedupeScope)) {
+      ignored.push({ row, reason: "PROCESSED_LEDGER" });
+      continue;
+    }
+    if (isPersistedInboundDuplicate(dedupe, row, dedupeScope)) {
       ignored.push({ row, reason: "DUPLICATE" });
       continue;
     }
     if (row.atMs > nowMs + 60_000) {
       ignored.push({ row, reason: "FUTURE_TIMESTAMP" });
+      continue;
+    }
+    if (isAssistantLikelyAutoText(row.text)) {
+      ignored.push({ row, reason: "ASSISTANT_TEXT_GUARD" });
       continue;
     }
     accepted.push(row);
@@ -237,24 +352,58 @@ export function filterNarrowDmInboundCustomerMessages({
 }
 
 /**
- * @param {Record<string, unknown>} dedupe
- * @param {{ dataId?: string | null, text?: string, messageKey?: string }} row
+ * @param {string[]} ledger
+ * @param {{ text?: string, atMs?: number | null, messageKey?: string, dataId?: string | null }} row
+ * @param {{ requestId?: string, chatKey?: string }} [scope]
  */
-export function isPersistedInboundDuplicate(dedupe = {}, row = {}) {
+export function isProcessedInboundDmLedgerHit(ledger = [], row = {}, scope = {}) {
+  const keys = Array.isArray(ledger) ? ledger.map((v) => clean(v)).filter(Boolean) : [];
+  if (keys.length === 0) return false;
+  const messageKey =
+    clean(row.messageKey) ||
+    buildNarrowDmInboundMessageKey(row, scope);
+  if (messageKey && keys.includes(messageKey)) return true;
+  const logicalKey = buildNarrowDmLogicalMessageKey({
+    text: row.text,
+    atMs: row.atMs,
+    requestId: scope.requestId,
+    chatKey: scope.chatKey,
+  });
+  if (logicalKey && keys.includes(logicalKey)) return true;
+  const dataId = clean(row.dataId);
+  if (dataId && keys.includes(`data:${dataId}`)) return true;
+  return false;
+}
+
+/**
+ * @param {Record<string, unknown>} dedupe
+ * @param {{ dataId?: string | null, text?: string, messageKey?: string, atMs?: number | null }} row
+ * @param {{ requestId?: string, chatKey?: string }} [scope]
+ */
+export function isPersistedInboundDuplicate(dedupe = {}, row = {}, scope = {}) {
+  const ledger = Array.isArray(dedupe.processedCustomerInboundDmMessageKeys)
+    ? dedupe.processedCustomerInboundDmMessageKeys
+    : [];
+  if (isProcessedInboundDmLedgerHit(ledger, row, scope)) return true;
+
+  const logicalKey = buildNarrowDmLogicalMessageKey({
+    text: row.text,
+    atMs: row.atMs,
+    requestId: scope.requestId || dedupe.requestId,
+    chatKey: scope.chatKey || dedupe.chatKey,
+  });
+  const lastLogicalKey = clean(dedupe.lastCustomerInboundDmLogicalKey);
+  if (logicalKey && lastLogicalKey && logicalKey === lastLogicalKey) return true;
+
   const dataId = clean(row.dataId);
   const lastDataId = clean(dedupe.lastCustomerInboundDmDataId);
   if (dataId && lastDataId && dataId === lastDataId) return true;
 
-  const messageKey = clean(row.messageKey) || buildNarrowDmInboundMessageKey(row);
+  const messageKey =
+    clean(row.messageKey) || buildNarrowDmInboundMessageKey(row, scope);
   const lastMessageKey = clean(dedupe.lastCustomerInboundDmMessageKey);
   if (messageKey && lastMessageKey && messageKey === lastMessageKey) return true;
 
-  const textHash = hashNarrowDmMessageText(row.text);
-  const lastTextHash = clean(dedupe.lastCustomerInboundDmTextHash);
-  if (textHash && lastTextHash && textHash === lastTextHash) {
-    if (!dataId && !lastDataId) return true;
-    if (dataId && lastDataId && dataId === lastDataId) return true;
-  }
   return false;
 }
 

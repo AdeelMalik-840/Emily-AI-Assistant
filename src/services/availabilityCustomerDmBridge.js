@@ -314,14 +314,20 @@ export function selectFreshAvailabilityCustomerInboundMessages(request, rows = [
       ignored: rows.map((raw) => ({ row: raw, reason: "MISSING_NOTIFY_AT" })),
     };
   }
+  const requestId = clean(request?.requestId ?? request?.id);
+  const chatKey = resolveAvailabilityCustomerDmTargetKey(request);
   return filterNarrowDmInboundCustomerMessages({
     rows,
     notifyAtMs,
     dedupe: {
+      requestId,
+      chatKey,
       lastCustomerInboundDmAt: request?.lastCustomerInboundDmAt,
       lastCustomerInboundDmDataId: request?.lastCustomerInboundDmDataId,
       lastCustomerInboundDmTextHash: request?.lastCustomerInboundDmTextHash,
       lastCustomerInboundDmMessageKey: request?.lastCustomerInboundDmMessageKey,
+      lastCustomerInboundDmLogicalKey: request?.lastCustomerInboundDmLogicalKey,
+      processedCustomerInboundDmMessageKeys: request?.processedCustomerInboundDmMessageKeys,
     },
   });
 }
@@ -497,6 +503,8 @@ export async function bridgeAvailabilityCustomerDmTurn({
     audit.ignoredReasons = summarizeIgnoredReasons(fresh.ignored);
 
     const notifyAtMs = resolveLastCustomerNotifyAtMs(request);
+    const requestIdForDedupe = clean(request?.requestId ?? request?.id);
+    const chatKeyForDedupe = resolveAvailabilityCustomerDmTargetKey(request);
     const transportQualified = filterNarrowDmInboundCustomerMessages({
       rows,
       notifyAtMs,
@@ -576,7 +584,10 @@ export async function bridgeAvailabilityCustomerDmTurn({
         db: connection,
         businessId: uid,
         requestId,
-        message: selectedRow,
+        message: {
+          ...selectedRow,
+          chatKey: chatKeyForDedupe,
+        },
       }).catch(() => null);
       request = {
         ...request,

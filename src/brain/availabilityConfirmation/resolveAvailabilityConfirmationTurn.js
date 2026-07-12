@@ -12,6 +12,7 @@ import {
   buildAvailabilityPriceAnswerSoftReply,
   buildAvailabilityDeclineAckReply,
   buildAvailabilityGenericAckPromptReply,
+  detectAvailabilityRequestSummaryQuestion,
 } from "./availabilityConfirmationReplies.js";
 import { resolveAvailabilityApprovedPriceQuote } from "../../services/availabilityMessageBuilder.js";
 
@@ -79,11 +80,17 @@ export function resolveAvailabilityConfirmationTurn({ request, messageText }) {
     return { ok: false, reason: "CUSTOMER_NOT_NOTIFIED" };
   }
 
-  const intent = classifyAvailabilityConfirmationIntent(text, request);
+  let intent = classifyAvailabilityConfirmationIntent(text, request);
   const actionType = mapIntentToActionType(intent);
   const outboundPromptType = mapIntentToOutboundPromptType(intent);
   const changeDuration = detectAvailabilityChangeDurationIntent(text, request);
-  const questionTopic = intent === "question" ? classifyAvailabilityCustomerQuestionTopic(text) : null;
+  let questionTopic =
+    intent === "question" ? classifyAvailabilityCustomerQuestionTopic(text) : null;
+
+  if (intent === "unclear" && detectAvailabilityRequestSummaryQuestion(text)) {
+    intent = "question";
+    questionTopic = "request_summary";
+  }
 
   /** @type {string | null} */
   let reply = null;
@@ -106,7 +113,7 @@ export function resolveAvailabilityConfirmationTurn({ request, messageText }) {
     reply = buildAvailabilityChangeCarReply();
   } else if (intent === "price") {
     const quote = resolveAvailabilityApprovedPriceQuote(request, null).priceQuote;
-    reply = buildAvailabilityPriceAnswerSoftReply(request, quote);
+    reply = buildAvailabilityPriceAnswerSoftReply(request, quote, text);
   } else if (intent === "acknowledge") {
     reply = buildAvailabilityGenericAckPromptReply();
   } else if (intent === "unclear") {
