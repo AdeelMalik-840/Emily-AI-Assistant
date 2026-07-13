@@ -346,7 +346,8 @@ test("cloud DM sends approved availability copy and marks request sent", async (
 
   assert.equal(result.ok, true);
   assert.equal(sendCalls.length, 1);
-  assert.equal(sendCalls[0][0], "+923001111111");
+  // Cloud API target is digits-only (E.164 without '+').
+  assert.equal(sendCalls[0][0], "923001111111");
   assert.match(sendCalls[0][1], /Honda Civic 2026 Oriel \(White\) 3 din ke liye available hai/);
   assert.match(sendCalls[0][1], /3 din ka rent 45,000 PKR hoga/);
   assert.match(sendCalls[0][1], /Book kar du\?/);

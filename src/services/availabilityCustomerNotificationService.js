@@ -19,10 +19,16 @@ import {
   buildConfirmExpiresAt,
   getAvailabilityRequest,
   markAvailabilityRequestCustomerNotificationFailed,
+  markAvailabilityRequestCustomerNotificationPending,
   markAvailabilityRequestCustomerNotificationSent,
+  markAvailabilityRequestCustomerNotificationSkipped,
   resolveAvailabilityParticipantDisplayName,
   updateAvailabilityRequestFields,
 } from "./availabilityRequestService.js";
+import {
+  maskCustomerPhone,
+  normalizeCustomerPhoneDigits,
+} from "./availabilityCustomerPhone.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -37,6 +43,68 @@ function asPlainObject(value) {
 
 function normalizePhone(value) {
   return clean(value, 32).replace(/[^\d+]/g, "");
+}
+
+/**
+ * Phase 4 phone-extraction managed requests (vs legacy docs without these fields).
+ * @param {Record<string, unknown>} request
+ */
+export function isPhase4CustomerPhoneManaged(request) {
+  const transport = clean(request?.customerDmTransport);
+  if (transport === "cloud_api" || transport === "none") return true;
+  const status = clean(request?.phoneExtractionStatus);
+  return (
+    status === "not_started" ||
+    status === "pending" ||
+    status === "resolving" ||
+    status === "resolved" ||
+    status === "failed" ||
+    status === "ambiguous"
+  );
+}
+
+/**
+ * Cloud API send gate for Phase 4.
+ * @param {Record<string, unknown>} request
+ */
+export function canSendAvailabilityCustomerCloudApi(request) {
+  const requestStatus = clean(request?.status).toLowerCase();
+  if (requestStatus !== "approved" && requestStatus !== "rejected") return false;
+  if (clean(request?.phoneExtractionStatus) !== "resolved") return false;
+  if (clean(request?.customerDmTransport) !== "cloud_api") return false;
+  const phone =
+    normalizeCustomerPhoneDigits(request?.customerPhone) ||
+    normalizeCustomerPhoneDigits(request?.customerDmTarget);
+  return Boolean(phone);
+}
+
+function maskPhoneForLog(value) {
+  return maskCustomerPhone(value) || null;
+}
+
+function extractCloudSendMeta(result) {
+  const body =
+    result && typeof result === "object"
+      ? result.data && typeof result.data === "object"
+        ? result.data
+        : result
+      : {};
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const contacts = Array.isArray(body.contacts) ? body.contacts : [];
+  const providerMessageId =
+    clean(result?.providerMessageId) ||
+    (messages[0] && typeof messages[0] === "object"
+      ? clean(messages[0].id)
+      : "") ||
+    null;
+  const customerWaId =
+    clean(result?.customerWaId) ||
+    clean(result?.waId) ||
+    (contacts[0] && typeof contacts[0] === "object"
+      ? clean(contacts[0].wa_id)
+      : "") ||
+    null;
+  return { providerMessageId: providerMessageId || null, customerWaId: customerWaId || null };
 }
 
 function buildReplyPrivateSourceMessage(request) {
@@ -167,15 +235,28 @@ async function sendCloudAvailabilityMessage({
   message,
   sendWhatsAppMessageFn,
   sendCredentials,
+  method = "cloud_api",
 }) {
-  const target = normalizePhone(phone);
+  const target =
+    normalizeCustomerPhoneDigits(phone) || normalizePhone(phone).replace(/\D/g, "");
   if (!target) return { ok: false, reason: "MISSING_CUSTOMER_PHONE" };
   const result = await sendWhatsAppMessageFn(target, message, sendCredentials ?? undefined, {
     recipientType: "individual",
   });
   const sendOk =
     result === undefined || result === true || result?.ok === true || result?.success === true;
-  return sendOk ? { ok: true, method: "cloud_dm", phone: target } : { ok: false, reason: "CLOUD_DM_SEND_FAILED" };
+  if (!sendOk) {
+    return { ok: false, reason: "CLOUD_DM_SEND_FAILED", method };
+  }
+  const meta = extractCloudSendMeta(result);
+  return {
+    ok: true,
+    method,
+    phone: target,
+    maskedPhone: maskPhoneForLog(target),
+    providerMessageId: meta.providerMessageId,
+    customerWaId: meta.customerWaId,
+  };
 }
 
 /**
@@ -385,9 +466,187 @@ export async function sendAvailabilityCustomerNotification({
     return { ok: false, reason: built?.reason || "MESSAGE_BUILD_FAILED", requestId: rid, method: null };
   }
 
-  const customerPhone = normalizePhone(current.customerDmTarget ?? current.customerPhone);
+  const phase4Managed = isPhase4CustomerPhoneManaged(current);
+  const phoneExtractionStatus = clean(current.phoneExtractionStatus);
+  const customerDmTransport = clean(current.customerDmTransport);
+  const phase4Phone =
+    normalizeCustomerPhoneDigits(current.customerPhone) ||
+    normalizeCustomerPhoneDigits(current.customerDmTarget);
+  const legacyPhone = normalizePhone(current.customerDmTarget ?? current.customerPhone);
 
-  if (!customerPhone) {
+  // --- Phase 4 managed path ---
+  if (phase4Managed) {
+    if (phoneExtractionStatus === "pending" || phoneExtractionStatus === "resolving") {
+      await markAvailabilityRequestCustomerNotificationPending({
+        db: firestore,
+        businessId: uid,
+        requestId: rid,
+      });
+      console.log("[availability_customer_cloud_notify_waiting_for_phone]", {
+        requestId: rid,
+        businessId: uid,
+        phoneExtractionStatus,
+        customerDmTransport: customerDmTransport || "none",
+        maskedPhone: null,
+      });
+      return {
+        ok: true,
+        skipped: true,
+        waitingForPhone: true,
+        reason: "WAITING_FOR_PHONE",
+        requestId: rid,
+        method: null,
+        sent: false,
+      };
+    }
+
+    if (phoneExtractionStatus === "failed" || phoneExtractionStatus === "ambiguous") {
+      await markAvailabilityRequestCustomerNotificationSkipped({
+        db: firestore,
+        businessId: uid,
+        requestId: rid,
+        approvalCustomerNotificationError: "manual_required",
+        approvalCustomerNotificationMethod: "skipped_manual_required",
+      });
+      console.log("[availability_customer_cloud_notify_manual_required]", {
+        requestId: rid,
+        businessId: uid,
+        phoneExtractionStatus,
+        phoneExtractionError: clean(current.phoneExtractionError) || null,
+        customerDmTransport: customerDmTransport || "none",
+      });
+      return {
+        ok: true,
+        skipped: true,
+        reason: "MANUAL_REQUIRED",
+        requestId: rid,
+        method: "skipped_manual_required",
+        sent: false,
+      };
+    }
+
+    if (
+      phoneExtractionStatus === "resolved" &&
+      customerDmTransport === "cloud_api" &&
+      phase4Phone
+    ) {
+      const cloudSend = await sendCloudAvailabilityMessage({
+        phone: phase4Phone,
+        message: built.message,
+        sendWhatsAppMessageFn,
+        sendCredentials: executionContext?.sendCredentials ?? null,
+        method: "cloud_api",
+      });
+      if (!cloudSend.ok) {
+        await markAvailabilityRequestCustomerNotificationFailed({
+          db: firestore,
+          businessId: uid,
+          requestId: rid,
+          approvalCustomerNotificationError: cloudSend.reason || "CLOUD_API_SEND_FAILED",
+          approvalCustomerNotificationMethod: "cloud_api",
+        });
+        return {
+          ok: false,
+          reason: cloudSend.reason || "CLOUD_API_SEND_FAILED",
+          requestId: rid,
+          method: "cloud_api",
+          sent: false,
+        };
+      }
+
+      const sentAt = new Date();
+      const confirmPatch = {
+        approvalCustomerNotificationStatus: "sent",
+        approvalCustomerNotificationAt: sentAt,
+        approvalCustomerNotificationMethod: "cloud_api",
+        customerConfirmationChannel: "waiting_confirm_cloud",
+        lastCustomerNotifyMessage: built.message,
+        lastCustomerNotifyAt: sentAt,
+        customerDmTarget: phase4Phone,
+        customerConfirmProcessingStatus: "idle",
+        priceQuote: built.priceQuote ?? current.priceQuote ?? null,
+        // Preserve Phase 4 phone extraction fields — do not overwrite.
+      };
+      if (cloudSend.providerMessageId) {
+        confirmPatch.approvalCustomerNotificationProviderMessageId =
+          cloudSend.providerMessageId;
+      }
+      if (cloudSend.customerWaId) {
+        confirmPatch.customerWaId = cloudSend.customerWaId;
+      }
+      if (requestStatus === "approved") {
+        confirmPatch.customerConfirmationStatus = "waiting_confirm";
+        confirmPatch.confirmExpiresAt = buildConfirmExpiresAt(sentAt);
+      } else {
+        confirmPatch.customerConfirmationStatus =
+          built.customerConfirmationStatus ||
+          (built.message === buildRejectedAvailabilityNoOptionsMessage()
+            ? "unavailable_no_options"
+            : "unavailable_alternatives_offered");
+      }
+
+      await updateAvailabilityRequestFields({
+        db: firestore,
+        businessId: uid,
+        requestId: rid,
+        patch: confirmPatch,
+      });
+      await markAvailabilityRequestCustomerNotificationSent({
+        db: firestore,
+        businessId: uid,
+        requestId: rid,
+        approvalCustomerNotificationMethod: "cloud_api",
+      });
+
+      console.log("[availability_customer_cloud_notify_sent]", {
+        requestId: rid,
+        businessId: uid,
+        method: "cloud_api",
+        channel: "waiting_confirm_cloud",
+        maskedPhone: cloudSend.maskedPhone,
+        providerMessageId: cloudSend.providerMessageId || null,
+      });
+
+      return {
+        ok: true,
+        sent: true,
+        requestId: rid,
+        method: "cloud_api",
+        customerPhone: phase4Phone,
+        maskedPhone: cloudSend.maskedPhone,
+        message: built.message,
+        providerMessageId: cloudSend.providerMessageId || null,
+        customerWaId: cloudSend.customerWaId || null,
+      };
+    }
+
+    // Phase 4 managed but not Cloud-eligible (e.g. resolved without phone / wrong transport).
+    await markAvailabilityRequestCustomerNotificationSkipped({
+      db: firestore,
+      businessId: uid,
+      requestId: rid,
+      approvalCustomerNotificationError: "manual_required",
+      approvalCustomerNotificationMethod: "skipped_manual_required",
+    });
+    console.log("[availability_customer_cloud_notify_manual_required]", {
+      requestId: rid,
+      businessId: uid,
+      phoneExtractionStatus: phoneExtractionStatus || null,
+      customerDmTransport: customerDmTransport || "none",
+      reason: "PHASE4_NOT_CLOUD_ELIGIBLE",
+    });
+    return {
+      ok: true,
+      skipped: true,
+      reason: "MANUAL_REQUIRED",
+      requestId: rid,
+      method: "skipped_manual_required",
+      sent: false,
+    };
+  }
+
+  // --- Legacy path (no Phase 4 phone fields) ---
+  if (!legacyPhone) {
     const replyPrivate = await sendAvailabilityViaReplyPrivately({
       request: current,
       requestId: rid,
@@ -424,6 +683,7 @@ export async function sendAvailabilityCustomerNotification({
         reason: replyPrivate.reason || "REPLY_PRIVATE_SEND_FAILED",
         requestId: rid,
         method: "reply_privately",
+        sent: false,
       };
     }
 
@@ -452,10 +712,11 @@ export async function sendAvailabilityCustomerNotification({
   }
 
   const cloudSend = await sendCloudAvailabilityMessage({
-    phone: customerPhone,
+    phone: legacyPhone,
     message: built.message,
     sendWhatsAppMessageFn,
     sendCredentials: executionContext?.sendCredentials ?? null,
+    method: "cloud_dm",
   });
   if (!cloudSend.ok) {
     await markAvailabilityRequestCustomerNotificationFailed({
@@ -470,6 +731,7 @@ export async function sendAvailabilityCustomerNotification({
       reason: cloudSend.reason || "CLOUD_DM_SEND_FAILED",
       requestId: rid,
       method: "cloud_dm",
+      sent: false,
     };
   }
 
@@ -481,8 +743,8 @@ export async function sendAvailabilityCustomerNotification({
     customerConfirmationChannel: "cloud_dm",
     lastCustomerNotifyMessage: built.message,
     lastCustomerNotifyAt: sentAt,
-    customerDmTarget: customerPhone,
-    customerPhone,
+    customerDmTarget: cloudSend.phone,
+    customerPhone: cloudSend.phone,
     phoneExtractionStatus: "skipped",
     phoneExtractionError: null,
     customerDmChatTitle: clean(current.customerDmChatTitle) || null,
@@ -490,6 +752,13 @@ export async function sendAvailabilityCustomerNotification({
     priceQuote: built.priceQuote ?? current.priceQuote ?? null,
     customerConfirmProcessingStatus: "idle",
   };
+  if (cloudSend.providerMessageId) {
+    confirmPatch.approvalCustomerNotificationProviderMessageId =
+      cloudSend.providerMessageId;
+  }
+  if (cloudSend.customerWaId) {
+    confirmPatch.customerWaId = cloudSend.customerWaId;
+  }
   if (requestStatus === "approved") {
     confirmPatch.customerConfirmationStatus = "waiting_confirm";
     confirmPatch.confirmExpiresAt = buildConfirmExpiresAt(sentAt);
@@ -519,7 +788,7 @@ export async function sendAvailabilityCustomerNotification({
     sent: true,
     requestId: rid,
     method: "cloud_dm",
-    customerPhone,
+    customerPhone: cloudSend.phone,
     message: built.message,
   };
 }

@@ -141,7 +141,7 @@ export async function pollLocalAvailabilityContinuations({
         replyPrivatelyFn,
       });
 
-      if (result?.sent === true || result?.ok === true) {
+      if (result?.sent === true) {
         sent += 1;
       } else {
         skipped += 1;
