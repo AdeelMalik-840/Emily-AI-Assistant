@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   extractCustomerPhoneFromGroupSourceMessage,
   clickSenderControlInGroupMessageRow,
+  clickClusterScopedSenderNearRow,
+  decideClusterSenderClick,
   tryAcquireGroupPhoneExtractionUiLock,
   releaseGroupPhoneExtractionUiLock,
   resolveGroupPhoneExtractionSource,
@@ -309,7 +311,21 @@ test("11. phone resolved returns source=group_contact_info", async () => {
   assert.equal(result.status, "resolved");
 });
 
-test("12. ambiguous phone returns ambiguous", async () => {
+test("12. ambiguous phone returns ambiguous and preserves diagnostic", async () => {
+  const diagnostic = {
+    errorCode: "MULTIPLE_CONFLICTING_NUMBERS",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidateCount: 2,
+    distinctNormalizedCount: 2,
+    disallowedCandidateCount: 0,
+    candidates: [
+      {
+        source: '[data-testid="drawer-right"]',
+        maskedPhone: "********9142",
+        diagnosticOnly: false,
+      },
+    ],
+  };
   const { page, options } = createHarness({
     phoneResult: {
       ok: false,
@@ -317,6 +333,8 @@ test("12. ambiguous phone returns ambiguous", async () => {
       phone: null,
       errorCode: "MULTIPLE_CONFLICTING_NUMBERS",
       candidates: ["+92 336 5149142", "+92 300 1111111"],
+      detectedSource: '[data-testid="drawer-right"]',
+      ambiguousDiagnostic: diagnostic,
     },
   });
   const result = await extractCustomerPhoneFromGroupSourceMessage(
@@ -327,6 +345,8 @@ test("12. ambiguous phone returns ambiguous", async () => {
   assert.equal(result.ok, false);
   assert.equal(result.status, "ambiguous");
   assert.equal(result.errorCode, "MULTIPLE_CONFLICTING_NUMBERS");
+  assert.equal(result.detectedSource, '[data-testid="drawer-right"]');
+  assert.deepEqual(result.ambiguousDiagnostic, diagnostic);
 });
 
 test("13. panel closes and group restore attempted", async () => {
@@ -417,4 +437,271 @@ test("tryAcquire/release UI hard lock helpers", () => {
   } finally {
     globalThis.__UI_HARD_LOCK = prev;
   }
+});
+
+test("4D.1 normal row still prefers in-row sender label", async () => {
+  const clicks = [];
+  const row = {
+    evaluate: async (fn) => {
+      const src = String(fn);
+      if (src.includes("message-out")) return "in";
+      throw new Error("cluster evaluate must not run when in-row succeeds");
+    },
+    locator: (sel) => {
+      const isTitle = String(sel).includes("title=");
+      return {
+        first: () => ({
+          count: async () => (isTitle ? 1 : 0),
+          click: async () => {
+            clicks.push(String(sel));
+          },
+          evaluate: async () => false,
+        }),
+        filter: () => ({
+          first: () => ({
+            count: async () => 0,
+            click: async () => {},
+            evaluate: async () => false,
+          }),
+        }),
+      };
+    },
+  };
+  const result = await clickSenderControlInGroupMessageRow(row, {
+    participantName: "Adeel",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.target, "sender_label_title");
+  assert.equal(result.clusterFallbackUsed, false);
+  assert.equal(clicks.length, 1);
+});
+
+test("4D.2 continuation row uses cluster fallback when previous same-participant label exists", async () => {
+  let evalCalls = 0;
+  const row = {
+    locator: () => ({
+      first: () => ({
+        count: async () => 0,
+        click: async () => {},
+        evaluate: async () => false,
+      }),
+      filter: () => ({
+        first: () => ({
+          count: async () => 0,
+          click: async () => {},
+          evaluate: async () => false,
+        }),
+      }),
+    }),
+    evaluate: async (fn) => {
+      evalCalls += 1;
+      const src = String(fn);
+      if (src.includes("message-out") && !src.includes("__CLUSTER_SENDER_FALLBACK__")) {
+        return "in";
+      }
+      if (src.includes("__IN_ROW_SENDER_CONTROL__")) return null;
+      if (src.includes("__CLUSTER_SENDER_FALLBACK__")) {
+        return {
+          ok: true,
+          clicked: true,
+          candidateCount: 1,
+          rejectedReason: null,
+          target: "cluster_sender_label",
+        };
+      }
+      return null;
+    },
+  };
+  const result = await clickSenderControlInGroupMessageRow(row, {
+    participantName: "Mi",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.target, "cluster_sender_label");
+  assert.equal(result.clusterFallbackUsed, true);
+  assert.equal(result.clusterCandidateCount, 1);
+  assert.ok(evalCalls >= 2);
+});
+
+test("4D.3 decideClusterSenderClick rejects different participant nearby", () => {
+  const decision = decideClusterSenderClick(
+    [
+      {
+        id: "1",
+        kind: "label",
+        participantLabel: "Adeel",
+        inMessageList: true,
+        aboveOrAttached: true,
+        isOutbound: false,
+        inHeaderOrSidebar: false,
+      },
+    ],
+    "Mi"
+  );
+  assert.equal(decision.ok, false);
+  assert.equal(decision.rejectedReason, "CLUSTER_SENDER_NOT_FOUND_OR_MISMATCH");
+});
+
+test("4D.4 decideClusterSenderClick fails closed on multiple nearby senders", () => {
+  const decision = decideClusterSenderClick(
+    [
+      {
+        id: "1",
+        kind: "label",
+        participantLabel: "Mi",
+        inMessageList: true,
+        aboveOrAttached: true,
+        isOutbound: false,
+      },
+      {
+        id: "2",
+        kind: "label",
+        participantLabel: "Mi",
+        inMessageList: true,
+        aboveOrAttached: true,
+        isOutbound: false,
+      },
+    ],
+    "Mi"
+  );
+  assert.equal(decision.ok, false);
+  assert.equal(decision.candidateCount, 2);
+  assert.equal(decision.rejectedReason, "CLUSTER_SENDER_AMBIGUOUS");
+});
+
+test("4D.5 decideClusterSenderClick rejects header/sidebar / non-list global matches", () => {
+  const decision = decideClusterSenderClick(
+    [
+      {
+        id: "global",
+        kind: "label",
+        participantLabel: "Mi",
+        inMessageList: false,
+        aboveOrAttached: true,
+        inHeaderOrSidebar: false,
+      },
+      {
+        id: "header",
+        kind: "label",
+        participantLabel: "Mi",
+        inMessageList: true,
+        aboveOrAttached: true,
+        inHeaderOrSidebar: true,
+      },
+    ],
+    "Mi"
+  );
+  assert.equal(decision.ok, false);
+  assert.equal(decision.candidateCount, 0);
+});
+
+test("4D.6 outbound/message-out row still rejected before cluster", async () => {
+  const result = await clickSenderControlInGroupMessageRow({
+    evaluate: async () => "out",
+    locator: () => ({ first: () => ({ count: async () => 1 }) }),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "OUTBOUND_ROW_REJECTED");
+});
+
+test("4D.7 cluster evaluate outside message list fails closed", async () => {
+  const result = await clickClusterScopedSenderNearRow(
+    {
+      evaluate: async (fn) => {
+        assert.match(String(fn), /__CLUSTER_SENDER_FALLBACK__/);
+        return {
+          ok: false,
+          clicked: false,
+          candidateCount: 0,
+          rejectedReason: "OUTSIDE_MESSAGE_LIST",
+          target: null,
+        };
+      },
+    },
+    { participantName: "Mi" }
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "SENDER_CONTROL_NOT_FOUND");
+  assert.equal(result.clusterRejectedReason, "OUTSIDE_MESSAGE_LIST");
+  assert.equal(result.clusterFallbackUsed, true);
+});
+
+test("4D.8 extract path records cluster_* senderClickTarget when fallback used", async () => {
+  const { page, options, calls } = createHarness();
+  options.clickSenderFn = async (locator, opts) => {
+    calls.click.push({ locator, opts });
+    return {
+      ok: true,
+      target: "cluster_sender_label",
+      clusterFallbackUsed: true,
+      clusterCandidateCount: 1,
+      clusterRejectedReason: null,
+    };
+  };
+  const result = await extractCustomerPhoneFromGroupSourceMessage(
+    page,
+    baseRequest({
+      sourceIdentity: {
+        sourceMessageId: "MSGMI1",
+        sourceRowKey: "row-mi",
+        sourceTextPreview: "Civic 2 din k lye available?",
+        participantName: "Mi",
+      },
+    }),
+    options
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.senderClickTarget, "cluster_sender_label");
+  assert.equal(result.clusterFallbackUsed, true);
+  assert.equal(result.clusterCandidateCount, 1);
+  assert.equal(result.panelVerified, true);
+  assert.equal(calls.extract[0].requirePanelDetected, true);
+});
+
+test("4D.9 panelVerified still required after cluster click", async () => {
+  const { page, options } = createHarness({
+    phoneResult: {
+      ok: false,
+      status: "failed",
+      phone: null,
+      errorCode: "CONTACT_PANEL_NOT_CONFIRMED",
+      candidates: [],
+    },
+  });
+  options.clickSenderFn = async () => ({
+    ok: true,
+    target: "cluster_sender_avatar",
+    clusterFallbackUsed: true,
+    clusterCandidateCount: 1,
+  });
+  const result = await extractCustomerPhoneFromGroupSourceMessage(
+    page,
+    baseRequest(),
+    options
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "CONTACT_PANEL_NOT_CONFIRMED");
+  assert.equal(result.panelVerified, false);
+  assert.equal(result.senderClickTarget, "cluster_sender_avatar");
+  assert.equal(result.clusterFallbackUsed, true);
+});
+
+test("4D.10 ambiguous cluster from click path fails closed", async () => {
+  const { page, options, calls } = createHarness();
+  options.clickSenderFn = async () => ({
+    ok: false,
+    errorCode: "CLUSTER_SENDER_AMBIGUOUS",
+    clusterFallbackUsed: true,
+    clusterCandidateCount: 2,
+    clusterRejectedReason: "CLUSTER_SENDER_AMBIGUOUS",
+  });
+  const result = await extractCustomerPhoneFromGroupSourceMessage(
+    page,
+    baseRequest(),
+    options
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "CLUSTER_SENDER_AMBIGUOUS");
+  assert.equal(result.clusterFallbackUsed, true);
+  assert.equal(result.clusterCandidateCount, 2);
+  assert.equal(calls.extract.length, 0);
 });

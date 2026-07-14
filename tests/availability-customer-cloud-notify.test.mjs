@@ -187,6 +187,7 @@ test("1–5. Phase 4 resolved cloud_api sends Cloud and preserves phone fields",
   assert.equal(stored.customerDmTarget, "923365149142");
   assert.equal(stored.customerWaId, "923365149142");
   assert.equal(stored.approvalCustomerNotificationProviderMessageId, "wamid.TEST123");
+  assert.equal(stored.customerDeliveryStatus, "pending");
   assert.ok(stored.confirmExpiresAt);
   assert.ok(stored.lastCustomerNotifyAt);
   assert.match(String(stored.lastCustomerNotifyMessage || ""), /Book kar du\?/);

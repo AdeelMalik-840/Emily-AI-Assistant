@@ -116,6 +116,11 @@ export function releaseGroupPhoneExtractionUiLock(acquired) {
  *   uiLockAcquired?: boolean,
  *   uiLockReleased?: boolean,
  *   senderClickTarget?: string | null,
+ *   detectedSource?: string | null,
+ *   ambiguousDiagnostic?: Record<string, unknown> | null,
+ *   clusterFallbackUsed?: boolean,
+ *   clusterCandidateCount?: number | null,
+ *   clusterRejectedReason?: string | null,
  * }} partial
  */
 function buildResult(partial = {}) {
@@ -139,12 +144,392 @@ function buildResult(partial = {}) {
     uiLockAcquired: partial.uiLockAcquired === true,
     uiLockReleased: partial.uiLockReleased === true,
     senderClickTarget: partial.senderClickTarget ?? null,
+    detectedSource: partial.detectedSource ?? null,
+    ambiguousDiagnostic: partial.ambiguousDiagnostic ?? null,
+    clusterFallbackUsed: partial.clusterFallbackUsed === true,
+    clusterCandidateCount:
+      partial.clusterCandidateCount == null
+        ? null
+        : Number.isFinite(Number(partial.clusterCandidateCount))
+          ? Math.max(0, Math.floor(Number(partial.clusterCandidateCount)))
+          : null,
+    clusterRejectedReason: clean(partial.clusterRejectedReason) || null,
+  };
+}
+
+/**
+ * Pure decision helper for cluster sender candidates (unit-testable).
+ * Never clicks; never searches globally.
+ *
+ * @param {Array<{
+ *   id?: string,
+ *   kind?: string,
+ *   participantLabel?: string | null,
+ *   isOutbound?: boolean,
+ *   inMessageList?: boolean,
+ *   aboveOrAttached?: boolean,
+ *   inHeaderOrSidebar?: boolean,
+ * }>} candidates
+ * @param {string} [expectedParticipantName]
+ * @returns {{
+ *   ok: boolean,
+ *   selectedId: string | null,
+ *   target: string | null,
+ *   candidateCount: number,
+ *   rejectedReason: string | null,
+ * }}
+ */
+export function decideClusterSenderClick(candidates = [], expectedParticipantName = "") {
+  const expected = clean(expectedParticipantName).toLowerCase();
+  const list = Array.isArray(candidates) ? candidates : [];
+  const eligible = [];
+  for (const raw of list) {
+    if (!raw || typeof raw !== "object") continue;
+    if (raw.inHeaderOrSidebar === true) continue;
+    if (raw.inMessageList !== true) continue;
+    if (raw.aboveOrAttached !== true) continue;
+    if (raw.isOutbound === true) continue;
+    const label = clean(raw.participantLabel).toLowerCase();
+    if (expected) {
+      if (!label || label !== expected) continue;
+    } else if (!label && raw.kind !== "avatar") {
+      continue;
+    }
+    eligible.push(raw);
+  }
+  if (eligible.length === 0) {
+    return {
+      ok: false,
+      selectedId: null,
+      target: null,
+      candidateCount: 0,
+      rejectedReason: expected
+        ? "CLUSTER_SENDER_NOT_FOUND_OR_MISMATCH"
+        : "CLUSTER_SENDER_NOT_FOUND",
+    };
+  }
+  if (eligible.length > 1) {
+    return {
+      ok: false,
+      selectedId: null,
+      target: null,
+      candidateCount: eligible.length,
+      rejectedReason: "CLUSTER_SENDER_AMBIGUOUS",
+    };
+  }
+  const chosen = eligible[0];
+  const kind = clean(chosen.kind) || "label";
+  return {
+    ok: true,
+    selectedId: clean(chosen.id) || "0",
+    target: kind === "avatar" ? "cluster_sender_avatar" : "cluster_sender_label",
+    candidateCount: 1,
+    rejectedReason: null,
+  };
+}
+
+/**
+ * Cluster-scoped fallback: find exactly one sender control near the source row.
+ * Starts from the located row; never page-wide name search.
+ *
+ * @param {import("playwright").Locator | { evaluate?: Function }} rowLocator
+ * @param {{ participantName?: string | null }} [opts]
+ */
+export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
+  const participantName = clean(opts.participantName);
+  if (!rowLocator || typeof rowLocator.evaluate !== "function") {
+    return {
+      ok: false,
+      errorCode: "SENDER_CONTROL_NOT_FOUND",
+      clusterFallbackUsed: true,
+      clusterCandidateCount: 0,
+      clusterRejectedReason: "NO_ROW_EVALUATE",
+    };
+  }
+
+  /** @type {null | {
+   *   ok?: boolean,
+   *   target?: string | null,
+   *   candidateCount?: number,
+   *   rejectedReason?: string | null,
+   *   clicked?: boolean,
+   * }} */
+  let outcome = null;
+  try {
+    outcome = await rowLocator.evaluate((root, expected) => {
+      /* __CLUSTER_SENDER_FALLBACK__ */
+      const cleanLocal = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+      const expectedName = cleanLocal(expected).toLowerCase();
+      if (!(root instanceof Element)) {
+        return {
+          ok: false,
+          clicked: false,
+          candidateCount: 0,
+          rejectedReason: "INVALID_ROW_ROOT",
+          target: null,
+        };
+      }
+
+      const isHeaderOrSidebar = (el) => {
+        if (!(el instanceof Element)) return true;
+        if (el.closest?.("header, [data-testid='chatlist'], #side, [data-testid='drawer-left']")) {
+          return true;
+        }
+        const testId = String(el.getAttribute?.("data-testid") || "");
+        if (/chat-list|chatlist|sidebar|pane-side/i.test(testId)) return true;
+        return false;
+      };
+
+      const messageList =
+        root.closest?.('[data-testid="conversation-panel-body"]') ||
+        root.closest?.('[data-testid="conversation-panel-messages"]') ||
+        root.closest?.("#main") ||
+        null;
+      if (!messageList || isHeaderOrSidebar(root)) {
+        return {
+          ok: false,
+          clicked: false,
+          candidateCount: 0,
+          rejectedReason: "OUTSIDE_MESSAGE_LIST",
+          target: null,
+        };
+      }
+
+      const isOutbound = (el) => {
+        if (!(el instanceof Element)) return false;
+        const cls = String(el.className || "");
+        if (/\bmessage-out\b/.test(cls)) return true;
+        return Boolean(el.closest?.(".message-out, [class*='message-out']"));
+      };
+      const isInbound = (el) => {
+        if (!(el instanceof Element)) return false;
+        const cls = String(el.className || "");
+        if (/\bmessage-in\b/.test(cls)) return true;
+        return Boolean(el.closest?.(".message-in, [class*='message-in']"));
+      };
+      const isBodyText = (el) =>
+        Boolean(
+          el?.closest?.(
+            "span.selectable-text, .selectable-text.copyable-text, div.copyable-text span"
+          )
+        );
+
+      const messageRootOf = (el) =>
+        el?.closest?.(
+          "[data-testid='msg-container'], .message-in, .message-out, [class*='message-in'], [class*='message-out']"
+        ) || el;
+
+      const sourceMsg = messageRootOf(root);
+      if (isOutbound(sourceMsg)) {
+        return {
+          ok: false,
+          clicked: false,
+          candidateCount: 0,
+          rejectedReason: "OUTBOUND_ROW_REJECTED",
+          target: null,
+        };
+      }
+
+      const sourceTop = sourceMsg.getBoundingClientRect?.().top ?? 0;
+
+      /** @type {Element[]} */
+      const scanRoots = [];
+      // Parent message containers (same cluster chrome).
+      let walk = sourceMsg.parentElement;
+      let parentHops = 0;
+      while (walk && walk !== messageList && parentHops < 6) {
+        if (messageList.contains(walk) && !isHeaderOrSidebar(walk)) {
+          scanRoots.push(walk);
+        }
+        walk = walk.parentElement;
+        parentHops += 1;
+      }
+
+      // Immediate previous inbound siblings / prior messages in list (same cluster above).
+      let sibling = sourceMsg.previousElementSibling;
+      let siblingHops = 0;
+      let clusterBroken = false;
+      while (sibling && siblingHops < 8 && !clusterBroken) {
+        siblingHops += 1;
+        if (!messageList.contains(sibling) || isHeaderOrSidebar(sibling)) {
+          sibling = sibling.previousElementSibling;
+          continue;
+        }
+        if (isOutbound(sibling)) {
+          clusterBroken = true;
+          break;
+        }
+        if (!isInbound(sibling) && !sibling.querySelector?.(".message-in, [class*='message-in']")) {
+          // Unknown chrome — stop rather than cross unclear boundary.
+          clusterBroken = true;
+          break;
+        }
+        scanRoots.push(sibling);
+
+        // If this prior row has a different labeled participant, stop after including it
+        // only when label matches; otherwise break without using it.
+        const priorLabels = Array.from(
+          sibling.querySelectorAll?.("span[title], span[dir='auto']") || []
+        );
+        for (const lab of priorLabels) {
+          if (!(lab instanceof Element) || isBodyText(lab)) continue;
+          const title = cleanLocal(lab.getAttribute("title") || "");
+          const text = cleanLocal(lab.textContent || "");
+          const label = (title || text).toLowerCase();
+          if (!label || label.length > 80) continue;
+          if (expectedName && label && label !== expectedName) {
+            clusterBroken = true;
+            break;
+          }
+        }
+        sibling = sibling.previousElementSibling;
+      }
+
+      /** @type {Array<{ el: Element, kind: string, participantLabel: string }>} */
+      const found = [];
+      const seen = new Set();
+
+      const consider = (el, kind) => {
+        if (!(el instanceof Element) || isBodyText(el)) return;
+        if (!messageList.contains(el) || isHeaderOrSidebar(el)) return;
+        if (isOutbound(el)) return;
+        const host = messageRootOf(el);
+        if (isOutbound(host)) return;
+        const rect = el.getBoundingClientRect?.();
+        const top = rect?.top ?? 0;
+        // Must be above or overlapping the source row cluster (not below).
+        if (top > sourceTop + 8) return;
+        const title = cleanLocal(el.getAttribute?.("title") || "");
+        const text = cleanLocal(el.textContent || "").slice(0, 80);
+        const participantLabel = title || text;
+        const labelNorm = participantLabel.toLowerCase();
+        if (expectedName) {
+          if (!labelNorm || labelNorm !== expectedName) {
+            // Avatars may lack text; allow avatar only when inside a host that already
+            // has a matching label nearby.
+            if (kind === "avatar") {
+              const hostHasMatch = Array.from(
+                host.querySelectorAll?.("span[title], span[dir='auto']") || []
+              ).some((lab) => {
+                if (!(lab instanceof Element) || isBodyText(lab)) return false;
+                const t = cleanLocal(lab.getAttribute("title") || lab.textContent || "");
+                return t.toLowerCase() === expectedName;
+              });
+              if (!hostHasMatch) return;
+            } else {
+              return;
+            }
+          }
+        }
+        if (seen.has(el)) return;
+        seen.add(el);
+        found.push({
+          el,
+          kind,
+          participantLabel: expectedName ? expected : participantLabel,
+        });
+      };
+
+      for (const scope of scanRoots) {
+        for (const el of Array.from(
+          scope.querySelectorAll?.(
+            "span[title], span[dir='auto'], img, [data-testid*='avatar'], [data-testid*='default-user']"
+          ) || []
+        )) {
+          const tag = String(el.tagName || "").toLowerCase();
+          const testId = String(el.getAttribute?.("data-testid") || "");
+          if (tag === "img" || /avatar|default-user/i.test(testId)) {
+            consider(el, "avatar");
+          } else {
+            consider(el, "label");
+          }
+        }
+      }
+
+      // Dedupe to unique elements; if multiple distinct elements remain → ambiguous.
+      if (found.length === 0) {
+        return {
+          ok: false,
+          clicked: false,
+          candidateCount: 0,
+          rejectedReason: clusterBroken
+            ? "CLUSTER_BOUNDARY_UNCLEAR_OR_MISMATCH"
+            : "CLUSTER_SENDER_NOT_FOUND",
+          target: null,
+        };
+      }
+      if (found.length > 1) {
+        return {
+          ok: false,
+          clicked: false,
+          candidateCount: found.length,
+          rejectedReason: "CLUSTER_SENDER_AMBIGUOUS",
+          target: null,
+        };
+      }
+
+      const chosen = found[0];
+      if (typeof chosen.el.click !== "function") {
+        return {
+          ok: false,
+          clicked: false,
+          candidateCount: 1,
+          rejectedReason: "CLUSTER_SENDER_NOT_CLICKABLE",
+          target: null,
+        };
+      }
+      chosen.el.click();
+      return {
+        ok: true,
+        clicked: true,
+        candidateCount: 1,
+        rejectedReason: null,
+        target:
+          chosen.kind === "avatar" ? "cluster_sender_avatar" : "cluster_sender_label",
+      };
+    }, participantName);
+  } catch {
+    outcome = {
+      ok: false,
+      clicked: false,
+      candidateCount: 0,
+      rejectedReason: "CLUSTER_EVALUATE_FAILED",
+      target: null,
+    };
+  }
+
+  const candidateCount = Number(outcome?.candidateCount) || 0;
+  const rejectedReason = clean(outcome?.rejectedReason) || null;
+  if (outcome?.ok === true && outcome?.clicked === true) {
+    return {
+      ok: true,
+      target: clean(outcome.target) || "cluster_sender_label",
+      clusterFallbackUsed: true,
+      clusterCandidateCount: candidateCount || 1,
+      clusterRejectedReason: null,
+    };
+  }
+
+  const errorCode =
+    rejectedReason === "OUTBOUND_ROW_REJECTED"
+      ? "OUTBOUND_ROW_REJECTED"
+      : rejectedReason === "CLUSTER_SENDER_AMBIGUOUS"
+        ? "CLUSTER_SENDER_AMBIGUOUS"
+        : "SENDER_CONTROL_NOT_FOUND";
+
+  return {
+    ok: false,
+    errorCode,
+    clusterFallbackUsed: true,
+    clusterCandidateCount: candidateCount,
+    clusterRejectedReason: rejectedReason || "CLUSTER_SENDER_NOT_FOUND",
   };
 }
 
 /**
  * Click sender label / number / avatar inside an already-matched inbound row only.
- * Never opens context menu / Reply Privately.
+ * Falls back to cluster-scoped sender near the row when in-row controls are missing.
+ * Never opens context menu / Reply Privately. Never page-wide name search.
  *
  * @param {import("playwright").Locator | {
  *   locator?: Function,
@@ -152,7 +537,14 @@ function buildResult(partial = {}) {
  *   click?: Function,
  * }} rowLocator
  * @param {{ participantName?: string | null }} [opts]
- * @returns {Promise<{ ok: boolean, target?: string | null, errorCode?: string }>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   target?: string | null,
+ *   errorCode?: string,
+ *   clusterFallbackUsed?: boolean,
+ *   clusterCandidateCount?: number | null,
+ *   clusterRejectedReason?: string | null,
+ * }>}
  */
 export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {}) {
   if (!rowLocator) {
@@ -225,13 +617,20 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
       .catch?.(() => false);
     if (isBody === true && attempt.name !== "sender_phone_label") continue;
     await loc.click?.({ timeout: 1500 }).catch(() => null);
-    return { ok: true, target: attempt.name };
+    return {
+      ok: true,
+      target: attempt.name,
+      clusterFallbackUsed: false,
+      clusterCandidateCount: null,
+      clusterRejectedReason: null,
+    };
   }
 
-  // Last resort: evaluate click on best in-row sender control (still scoped to row).
+  // Last resort in-row: evaluate click on best in-row sender control (still scoped to row).
   if (typeof rowLocator.evaluate === "function") {
     const clicked = await rowLocator
       .evaluate((root, expected) => {
+        /* __IN_ROW_SENDER_CONTROL__ */
         const cleanLocal = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
         const expectedName = cleanLocal(expected).toLowerCase();
         const isBody = (el) =>
@@ -268,10 +667,32 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
         return "evaluate_sender_control";
       }, participantName)
       .catch(() => null);
-    if (clicked) return { ok: true, target: String(clicked) };
+    if (clicked) {
+      return {
+        ok: true,
+        target: String(clicked),
+        clusterFallbackUsed: false,
+        clusterCandidateCount: null,
+        clusterRejectedReason: null,
+      };
+    }
   }
 
-  return { ok: false, errorCode: "SENDER_CONTROL_NOT_FOUND" };
+  const cluster = await clickClusterScopedSenderNearRow(rowLocator, {
+    participantName,
+  });
+  try {
+    console.log("[group_contact_phone_cluster_sender]", {
+      clusterFallbackUsed: true,
+      senderClickTarget: cluster.target || null,
+      clusterCandidateCount: cluster.clusterCandidateCount ?? 0,
+      clusterRejectedReason: cluster.clusterRejectedReason || null,
+      ok: cluster.ok === true,
+    });
+  } catch {
+    // ignore logging failures
+  }
+  return cluster;
 }
 
 function cssEscape(value) {
@@ -364,6 +785,9 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
   let locatorUsed = null;
   let panelVerified = false;
   let senderClickTarget = null;
+  let clusterFallbackUsed = false;
+  let clusterCandidateCount = null;
+  let clusterRejectedReason = null;
   /** @type {ReturnType<typeof buildResult> | null} */
   let result = null;
 
@@ -376,6 +800,9 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
       uiLockAcquired,
       uiLockReleased,
       senderClickTarget,
+      clusterFallbackUsed,
+      clusterCandidateCount,
+      clusterRejectedReason,
     });
 
   const lock = acquireLockFn();
@@ -463,6 +890,12 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
     const clickResult = await clickSenderFn(located.locator, {
       participantName: source.participantName,
     });
+    clusterFallbackUsed = clickResult?.clusterFallbackUsed === true;
+    clusterCandidateCount =
+      clickResult?.clusterCandidateCount == null
+        ? null
+        : Number(clickResult.clusterCandidateCount);
+    clusterRejectedReason = clean(clickResult?.clusterRejectedReason) || null;
     if (!clickResult?.ok) {
       result = finish({
         ok: false,
@@ -506,6 +939,8 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
         errorCode: phoneResult.errorCode || "MULTIPLE_CONFLICTING_NUMBERS",
         candidates: phoneResult.candidates || [],
         panelVerified: true,
+        detectedSource: phoneResult.detectedSource ?? null,
+        ambiguousDiagnostic: phoneResult.ambiguousDiagnostic ?? null,
       });
       return result;
     }
@@ -558,6 +993,9 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
       result.locatorUsed = locatorUsed;
       result.panelVerified = panelVerified;
       result.senderClickTarget = senderClickTarget;
+      result.clusterFallbackUsed = clusterFallbackUsed;
+      result.clusterCandidateCount = clusterCandidateCount;
+      result.clusterRejectedReason = clusterRejectedReason;
     }
   }
 }

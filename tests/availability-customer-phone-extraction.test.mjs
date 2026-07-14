@@ -573,3 +573,132 @@ test("isRetryablePhoneExtractionError recognizes UI_HARD_LOCK_BUSY", () => {
   assert.equal(isRetryablePhoneExtractionError("UI_HARD_LOCK_BUSY"), true);
   assert.equal(isRetryablePhoneExtractionError("NO_PHONE_EXTRACTED"), false);
 });
+
+test("MULTIPLE_CONFLICTING_NUMBERS emits masked ambiguous diagnostic only", async () => {
+  const fakeDb = new FakeDb();
+  seedPending(fakeDb, "avr_amb_diag");
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => {
+    logs.push(args);
+  };
+  try {
+    const amb = await extractAndPersistAvailabilityCustomerPhone({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: "avr_amb_diag",
+      enabled: true,
+      getPageFn: () => ({ id: "page" }),
+      extractFn: async () => ({
+        ok: false,
+        status: "ambiguous",
+        errorCode: "MULTIPLE_CONFLICTING_NUMBERS",
+        phone: null,
+        candidates: ["+92 336 5149142", "+92 300 1111111"],
+        locatorUsed: "sourceMessageId",
+        senderClickTarget: "sender_label_title",
+        panelVerified: true,
+        restoredGroup: true,
+        detectedSource: '[data-testid="drawer-right"]',
+        ambiguousDiagnostic: {
+          errorCode: "MULTIPLE_CONFLICTING_NUMBERS",
+          detectedSource: '[data-testid="drawer-right"]',
+          candidateCount: 2,
+          distinctNormalizedCount: 2,
+          disallowedCandidateCount: 0,
+          candidates: [
+            {
+              source: '[data-testid="drawer-right"]',
+              maskedPhone: maskCustomerPhone("923365149142"),
+              diagnosticOnly: false,
+            },
+            {
+              source: '[data-testid="drawer-right"]',
+              maskedPhone: maskCustomerPhone("923001111111"),
+              diagnosticOnly: false,
+            },
+          ],
+        },
+      }),
+    });
+    assert.equal(amb.status, "ambiguous");
+    assert.equal(
+      fakeDb.docs.get(avrKey("avr_amb_diag")).phoneExtractionStatus,
+      "ambiguous"
+    );
+
+    const ambEvents = logs.filter(
+      (args) => args[0] === "[contact_info_phone_candidates_ambiguous]"
+    );
+    assert.equal(ambEvents.length, 1);
+    const payload = ambEvents[0][1];
+    assert.equal(payload.requestId, "avr_amb_diag");
+    assert.equal(payload.businessId, BUSINESS_ID);
+    assert.equal(payload.errorCode, "MULTIPLE_CONFLICTING_NUMBERS");
+    assert.equal(payload.locatorUsed, "sourceMessageId");
+    assert.equal(payload.senderClickTarget, "sender_label_title");
+    assert.equal(payload.panelVerified, true);
+    assert.equal(payload.restoredGroup, true);
+    assert.equal(payload.detectedSource, '[data-testid="drawer-right"]');
+    assert.equal(payload.candidateCount, 2);
+    assert.equal(payload.distinctNormalizedCount, 2);
+    assert.equal(payload.disallowedCandidateCount, 0);
+    assert.ok(Array.isArray(payload.candidates));
+    assert.equal(payload.candidates.length, 2);
+    for (const c of payload.candidates) {
+      assert.ok(c.source);
+      assert.ok(c.maskedPhone);
+      assert.equal(Object.hasOwn(c, "raw"), false);
+      assert.equal(Object.hasOwn(c, "rawPhone"), false);
+      assert.equal(Object.hasOwn(c, "normalizedPhone"), false);
+    }
+    const serialized = JSON.stringify(payload);
+    assert.equal(serialized.includes("923365149142"), false);
+    assert.equal(serialized.includes("923001111111"), false);
+    assert.equal(serialized.includes("+92 336"), false);
+    assert.equal(Object.hasOwn(payload, "distinctNormalized"), false);
+    assert.equal(Object.hasOwn(payload, "panelText"), false);
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test("resolved extraction does not emit ambiguous diagnostic event", async () => {
+  const fakeDb = new FakeDb();
+  seedPending(fakeDb, "avr_ok_diag");
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => {
+    logs.push(args);
+  };
+  try {
+    await extractAndPersistAvailabilityCustomerPhone({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: "avr_ok_diag",
+      enabled: true,
+      getPageFn: () => ({ id: "page" }),
+      extractFn: async () => ({
+        ok: true,
+        status: "resolved",
+        phone: "923365149142",
+        rawPhone: "+92 336 5149142",
+        confidence: "high",
+        locatorUsed: "sourceMessageId",
+        panelVerified: true,
+        restoredGroup: true,
+        ambiguousDiagnostic: null,
+      }),
+    });
+    const ambEvents = logs.filter(
+      (args) => args[0] === "[contact_info_phone_candidates_ambiguous]"
+    );
+    assert.equal(ambEvents.length, 0);
+    assert.equal(
+      fakeDb.docs.get(avrKey("avr_ok_diag")).phoneExtractionStatus,
+      "resolved"
+    );
+  } finally {
+    console.log = originalLog;
+  }
+});

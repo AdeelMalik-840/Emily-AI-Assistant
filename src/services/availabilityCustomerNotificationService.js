@@ -565,6 +565,8 @@ export async function sendAvailabilityCustomerNotification({
         customerDmTarget: phase4Phone,
         customerConfirmProcessingStatus: "idle",
         priceQuote: built.priceQuote ?? current.priceQuote ?? null,
+        // Cloud API accepted; delivery truth comes from webhook statuses.
+        customerDeliveryStatus: "pending",
         // Preserve Phase 4 phone extraction fields — do not overwrite.
       };
       if (cloudSend.providerMessageId) {

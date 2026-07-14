@@ -32,6 +32,10 @@ import {
 } from "./services/bookingApprovalService.js";
 import { handleWhatsAppNotificationStatuses } from "./services/bookingNotificationState.js";
 import {
+  handleAvailabilityCustomerNotificationStatuses,
+  stringifyWhatsAppStatusesForLog,
+} from "./services/availabilityCustomerNotificationDeliveryStatus.js";
+import {
   normalizeKnowledgePayload,
   saveStructuredKnowledge,
   getBusinessProfile,
@@ -208,7 +212,10 @@ app.post("/webhook", async (req, res) => {
     const waEnv = getWhatsAppEnv();
 
     if (statuses != null) {
-      console.log("📦 Status update:", statuses);
+      console.log(
+        "📦 Status update:",
+        stringifyWhatsAppStatusesForLog(statuses)
+      );
       if (Array.isArray(statuses) && statuses.length > 0) {
         let statusOwnerUserId = phoneNumberId
           ? await findOwnerUidByPhoneNumberId(db, phoneNumberId)
@@ -225,6 +232,11 @@ app.post("/webhook", async (req, res) => {
           await handleWhatsAppNotificationStatuses({
             db,
             userId: statusOwnerUserId,
+            statuses,
+          });
+          await handleAvailabilityCustomerNotificationStatuses({
+            db,
+            businessId: statusOwnerUserId,
             statuses,
           });
         }

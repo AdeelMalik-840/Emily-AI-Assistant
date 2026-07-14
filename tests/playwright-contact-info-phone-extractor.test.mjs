@@ -5,6 +5,9 @@ import {
   extractPhoneFromContactInfoPanelSnapshot,
   extractRawPhonesFromContactInfoText,
   readContactInfoPanelSnapshot,
+  buildAmbiguousCandidatesDiagnostic,
+  buildContactInfoCandidatesFromPanelText,
+  isGroupParticipantStripText,
 } from "../src/services/playwrightContactInfoPhoneExtractor.js";
 import { maskCustomerPhone } from "../src/services/availabilityCustomerPhone.js";
 
@@ -114,7 +117,7 @@ test("extractor does not call any send / click / keyboard APIs", async () => {
         candidates: [
           {
             raw: "+92 336 5149142",
-            source: '[data-testid="drawer-right"]',
+            source: "contact-phone-row",
             diagnosticOnly: false,
           },
         ],
@@ -167,8 +170,13 @@ test("readContactInfoPanelSnapshot is evaluate-only", async () => {
         candidates: [
           {
             raw: "+92 336 5149142",
-            source: '[data-testid="drawer-right"]',
+            source: "tel-link",
             diagnosticOnly: false,
+          },
+          {
+            raw: "+92 336 5149142",
+            source: "drawer-full-text-diagnostic",
+            diagnosticOnly: true,
           },
         ],
         displayNameHint: "Adeel",
@@ -178,7 +186,7 @@ test("readContactInfoPanelSnapshot is evaluate-only", async () => {
   const snapshot = await readContactInfoPanelSnapshot(page);
   assert.equal(evaluateCalls, 1);
   assert.equal(snapshot.panelDetected, true);
-  assert.equal(snapshot.candidates.length, 1);
+  assert.equal(snapshot.candidates.length, 2);
 });
 
 test("expectedDisplayName mismatch fails closed", () => {
@@ -195,4 +203,318 @@ test("extractRawPhonesFromContactInfoText dedupes by digits", () => {
     "+92 336 5149142 and 923365149142"
   );
   assert.equal(raws.length, 1);
+});
+
+test("ambiguous builds masked diagnostic without raw/normalized digits", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText: "Contact info\nAdeel",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 336 5149142",
+        source: "contact-phone-row",
+        diagnosticOnly: false,
+      },
+      {
+        raw: "+92 300 1111111",
+        source: "contact-phone-row",
+        diagnosticOnly: false,
+      },
+      {
+        raw: "+92 318 5163172",
+        source: "app-diagnostic",
+        diagnosticOnly: true,
+      },
+    ],
+  });
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.errorCode, "MULTIPLE_CONFLICTING_NUMBERS");
+  assert.equal(result.phone, null);
+  const diag = result.ambiguousDiagnostic;
+  assert.ok(diag);
+  assert.equal(diag.errorCode, "MULTIPLE_CONFLICTING_NUMBERS");
+  assert.equal(diag.detectedSource, '[data-testid="drawer-right"]');
+  assert.equal(diag.candidateCount, 2);
+  assert.equal(diag.distinctNormalizedCount, 2);
+  assert.ok(Array.isArray(diag.candidates));
+  assert.ok(diag.candidates.length >= 2);
+  for (const c of diag.candidates) {
+    assert.ok(c.source);
+    assert.ok(typeof c.maskedPhone === "string");
+    assert.match(c.maskedPhone, /\*\*\*\d{4}$|\*{4,}\d{4}$/);
+    assert.equal(Object.prototype.hasOwnProperty.call(c, "raw"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(c, "normalized"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(c, "normalizedPhone"), false);
+  }
+  const serialized = JSON.stringify(diag);
+  assert.equal(serialized.includes("923365149142"), false);
+  assert.equal(serialized.includes("923001111111"), false);
+  assert.equal(serialized.includes("336 5149142"), false);
+  assert.equal(serialized.includes("300 1111111"), false);
+  assert.ok(serialized.includes("9142"));
+  assert.ok(serialized.includes("1111"));
+});
+
+test("success does not attach ambiguousDiagnostic", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot(
+    panelFixture("+92 336 5149142")
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.ambiguousDiagnostic, null);
+});
+
+test("buildAmbiguousCandidatesDiagnostic caps at 10 and masks only", () => {
+  const meta = [];
+  for (let i = 0; i < 12; i += 1) {
+    meta.push({
+      raw: `+92 300 ${String(1000000 + i).padStart(7, "0")}`,
+      source: "contact-phone-row",
+      diagnosticOnly: false,
+    });
+  }
+  const diag = buildAmbiguousCandidatesDiagnostic({
+    candidatesWithMeta: meta,
+    detectedSource: '[data-testid="drawer-right"]',
+    distinctNormalizedCount: 12,
+  });
+  assert.equal(diag.candidates.length, 10);
+  assert.equal(diag.candidateCount, 12);
+  assert.equal(diag.distinctNormalizedCount, 12);
+  const serialized = JSON.stringify(diag);
+  assert.equal(serialized.includes("923001000000"), false);
+  assert.equal(serialized.includes("+92 300"), false);
+});
+
+test("4C.1 drawer with one tel: phone resolves", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText:
+      "Profile details\nAdeel malik\nAdeel, Hooria, Mi, +92 318 5163172, You\nAbout",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 336 5149903",
+        source: "tel-link",
+        diagnosticOnly: false,
+      },
+      {
+        raw: "+92 336 5149903",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+      {
+        raw: "+92 318 5163172",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "resolved");
+  assert.equal(result.phone, "923365149903");
+});
+
+test("4C.2 drawer with actual contact phone row resolves", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText: "Contact info\nAdeel\nPhone\n+92 336 5149903\nAbout",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 336 5149903",
+        source: "contact-phone-row",
+        diagnosticOnly: false,
+      },
+      {
+        raw: "+92 336 5149903",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.phone, "923365149903");
+});
+
+test("4C.3 contact phone row plus participant strip resolves only contact row", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText: [
+      "Profile details",
+      "Adeel malik",
+      "Adeel, Hooria, Mi, +92 318 5163172, You",
+      "+92 336 5149903",
+      "About",
+    ].join("\n"),
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 336 5149903",
+        source: "contact-phone-row",
+        diagnosticOnly: false,
+      },
+      {
+        raw: "+92 336 5149903",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+      {
+        raw: "+92 318 5163172",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.phone, "923365149903");
+  assert.equal(result.candidates.length, 1);
+});
+
+test("4C.4 two genuine contact phone rows remain ambiguous", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText: "Contact info\nAdeel\n+92 336 5149903\n+92 300 1111111",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 336 5149903",
+        source: "contact-phone-row",
+        diagnosticOnly: false,
+      },
+      {
+        raw: "+92 300 1111111",
+        source: "tel-link",
+        diagnosticOnly: false,
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.errorCode, "MULTIPLE_CONFLICTING_NUMBERS");
+  assert.equal(result.ambiguousDiagnostic.candidateCount, 2);
+  assert.equal(result.ambiguousDiagnostic.distinctNormalizedCount, 2);
+});
+
+test("4C.5 drawer full innerText with two numbers is not selectable", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText:
+      "Profile details\nAdeel\nAdeel, Hooria, Mi, +92 318 5163172, You\nsome other +92 336 5149903 buried in prose about the rental",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 318 5163172",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+      {
+        raw: "+92 336 5149903",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "failed");
+  assert.equal(result.errorCode, "CONTACT_PHONE_ROW_NOT_FOUND");
+  assert.equal(result.phone, null);
+});
+
+test("4C.6 #app candidates remain diagnosticOnly and never selectable", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText: "Contact info\nAdeel\nAbout",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 336 5149903",
+        source: "app-diagnostic",
+        diagnosticOnly: true,
+      },
+      {
+        raw: "+92 300 1111111",
+        source: "app-diagnostic",
+        diagnosticOnly: true,
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "CONTACT_PHONE_ROW_NOT_FOUND");
+});
+
+test("4C.7 group participant strip row is excluded from panel text builder", () => {
+  const built = buildContactInfoCandidatesFromPanelText(
+    [
+      "Profile details",
+      "Adeel, Hooria, Mi, +92 318 5163172, You",
+      "+92 336 5149903",
+    ].join("\n")
+  );
+  const selectable = built.filter((c) => c.diagnosticOnly !== true);
+  assert.equal(selectable.length, 1);
+  assert.equal(selectable[0].source, "contact-phone-row");
+  assert.match(selectable[0].raw, /9903/);
+  assert.equal(
+    selectable.some((c) => String(c.raw).includes("3172")),
+    false
+  );
+});
+
+test("4C.8 no contact phone row → fail closed", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText: "Profile details\nAdeel, Hooria, Mi, +92 318 5163172, You",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 318 5163172",
+        source: "drawer-full-text-diagnostic",
+        diagnosticOnly: true,
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "CONTACT_PHONE_ROW_NOT_FOUND");
+});
+
+test("4C.9 MULTIPLE_CONFLICTING_NUMBERS remains when two allowed rows exist", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot(
+    panelFixture("+92 336 5149903\n+92 300 1111111")
+  );
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.errorCode, "MULTIPLE_CONFLICTING_NUMBERS");
+});
+
+test("4C.10–11 diagnostic log still masks; no full phone in diagnostic", () => {
+  const result = extractPhoneFromContactInfoPanelSnapshot({
+    panelDetected: true,
+    panelText: "Contact info",
+    detectedSource: '[data-testid="drawer-right"]',
+    candidates: [
+      {
+        raw: "+92 336 5149903",
+        source: "contact-phone-row",
+        diagnosticOnly: false,
+      },
+      {
+        raw: "+92 300 1111111",
+        source: "tel-link",
+        diagnosticOnly: false,
+      },
+    ],
+  });
+  const serialized = JSON.stringify(result.ambiguousDiagnostic);
+  assert.equal(serialized.includes("923365149903"), false);
+  assert.equal(serialized.includes("+92"), false);
+  assert.ok(serialized.includes("9903"));
+  assert.ok(serialized.includes("1111"));
+});
+
+test("isGroupParticipantStripText detects header strip", () => {
+  assert.equal(
+    isGroupParticipantStripText("Adeel, Hooria, Mi, +92 318 5163172, You"),
+    true
+  );
+  assert.equal(isGroupParticipantStripText("+92 336 5149903"), false);
 });

@@ -63,6 +63,66 @@ function safeExtractionLog(event, payload = {}) {
 }
 
 /**
+ * Allowlisted masked diagnostic for MULTIPLE_CONFLICTING_NUMBERS only.
+ * Never logs raw/normalized phones, panel text, or secrets.
+ *
+ * @param {Record<string, unknown>} payload
+ */
+export function logContactInfoPhoneCandidatesAmbiguous(payload = {}) {
+  const diagnostic =
+    payload.ambiguousDiagnostic && typeof payload.ambiguousDiagnostic === "object"
+      ? /** @type {Record<string, unknown>} */ (payload.ambiguousDiagnostic)
+      : {};
+  const rawList = Array.isArray(diagnostic.candidates) ? diagnostic.candidates : [];
+  const candidates = rawList.slice(0, 10).map((entry) => {
+    const row =
+      entry && typeof entry === "object"
+        ? /** @type {Record<string, unknown>} */ (entry)
+        : {};
+    /** @type {{ source: string | null, maskedPhone: string | null, diagnosticOnly?: boolean }} */
+    const safe = {
+      source: clean(row.source) || null,
+      maskedPhone:
+        typeof row.maskedPhone === "string" && row.maskedPhone
+          ? row.maskedPhone
+          : null,
+    };
+    if (typeof row.diagnosticOnly === "boolean") {
+      safe.diagnosticOnly = row.diagnosticOnly;
+    }
+    return safe;
+  });
+
+  console.log("[contact_info_phone_candidates_ambiguous]", {
+    requestId: clean(payload.requestId) || null,
+    businessId: clean(payload.businessId) || null,
+    errorCode: "MULTIPLE_CONFLICTING_NUMBERS",
+    locatorUsed: clean(payload.locatorUsed) || null,
+    senderClickTarget: clean(payload.senderClickTarget) || null,
+    panelVerified:
+      typeof payload.panelVerified === "boolean" ? payload.panelVerified : null,
+    restoredGroup:
+      typeof payload.restoredGroup === "boolean" ? payload.restoredGroup : null,
+    detectedSource:
+      clean(diagnostic.detectedSource ?? payload.detectedSource) || null,
+    candidateCount: Number.isFinite(Number(diagnostic.candidateCount))
+      ? Math.max(0, Math.floor(Number(diagnostic.candidateCount)))
+      : 0,
+    distinctNormalizedCount: Number.isFinite(
+      Number(diagnostic.distinctNormalizedCount)
+    )
+      ? Math.max(0, Math.floor(Number(diagnostic.distinctNormalizedCount)))
+      : 0,
+    disallowedCandidateCount: Number.isFinite(
+      Number(diagnostic.disallowedCandidateCount)
+    )
+      ? Math.max(0, Math.floor(Number(diagnostic.disallowedCandidateCount)))
+      : 0,
+    candidates,
+  });
+}
+
+/**
  * Extract phone for one availabilityRequest and persist fields. Never sends messages.
  *
  * @param {{
@@ -270,6 +330,18 @@ export async function extractAndPersistAvailabilityCustomerPhone({
       restoredGroup: extraction?.restoredGroup,
       maskedPhone: extraction?.maskedPhone || null,
     });
+    if (errorCode === "MULTIPLE_CONFLICTING_NUMBERS") {
+      logContactInfoPhoneCandidatesAmbiguous({
+        requestId: id,
+        businessId: uid,
+        locatorUsed: extraction?.locatorUsed,
+        senderClickTarget: extraction?.senderClickTarget,
+        panelVerified: extraction?.panelVerified,
+        restoredGroup: extraction?.restoredGroup,
+        detectedSource: extraction?.detectedSource,
+        ambiguousDiagnostic: extraction?.ambiguousDiagnostic,
+      });
+    }
     return {
       ok: false,
       status: "ambiguous",
