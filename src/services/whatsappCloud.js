@@ -314,6 +314,127 @@ function extractProviderMessageId(data) {
 }
 
 /**
+ * @param {string} toField
+ * @param {string} templateName
+ * @param {string} languageCode
+ * @param {string[]} bodyParameters
+ */
+function buildTemplatePayload(toField, templateName, languageCode, bodyParameters) {
+  const parameters = (Array.isArray(bodyParameters) ? bodyParameters : [])
+    .map((value) => ({
+      type: "text",
+      text: String(value ?? "").trim(),
+    }))
+    .filter((entry) => entry.text !== "");
+
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: toField,
+    type: "template",
+    template: {
+      name: String(templateName).trim(),
+      language: { code: String(languageCode).trim() },
+      components: [
+        {
+          type: "body",
+          parameters,
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * WhatsApp Cloud API — approved template messages (outside 24h session window).
+ *
+ * @param {{
+ *   to: string,
+ *   templateName: string,
+ *   languageCode: string,
+ *   bodyParameters?: string[],
+ *   credentials?: { phoneNumberId?: string, accessToken?: string } | null,
+ *   caller?: string,
+ * }} params
+ * @returns {Promise<{ ok: boolean, providerMessageId?: string | null, httpStatus?: number, error?: unknown, tokenSource?: string }>}
+ */
+export async function sendWhatsAppTemplateMessage({
+  to,
+  templateName,
+  languageCode,
+  bodyParameters = [],
+  credentials = null,
+  caller = "sendWhatsAppTemplateMessage",
+}) {
+  try {
+    const name = String(templateName ?? "").trim();
+    const lang = String(languageCode ?? "").trim();
+    if (!name || !lang) {
+      console.warn("[whatsappCloud] Empty template name or language, skipping send");
+      return { ok: false };
+    }
+
+    const { toField } = resolveWhatsAppToField(to, "individual");
+    if (!toField) {
+      console.error("[whatsappCloud] Invalid template recipient:", to);
+      return { ok: false };
+    }
+
+    const resolved = resolveWhatsAppCredentials(credentials, { recipient: toField });
+    if (!resolved) {
+      console.error(
+        "[whatsappCloud] Missing phoneNumberId/accessToken — cannot send template"
+      );
+      return { ok: false };
+    }
+
+    const { token, phoneNumberId, tokenSource } = resolved;
+    const payload = buildTemplatePayload(toField, name, lang, bodyParameters);
+    const result = await postWhatsAppMessagesResult(phoneNumberId, token, payload, {
+      tokenSource,
+      phoneNumberId,
+      recipientLast4: toField.replace(/\D/g, "").slice(-4) || null,
+    });
+
+    if (result.ok) {
+      console.log("[cloud_send_result_propagated]", {
+        ok: true,
+        httpStatus: result.status,
+        tokenSource,
+        caller,
+        templateName: name,
+      });
+      return {
+        ok: true,
+        providerMessageId: extractProviderMessageId(result.data),
+        httpStatus: result.status,
+        tokenSource,
+        data: result.data,
+      };
+    }
+
+    console.log("[cloud_send_result_propagated]", {
+      ok: false,
+      httpStatus: result.status,
+      tokenSource,
+      caller,
+      templateName: name,
+    });
+    return {
+      ok: false,
+      providerMessageId: null,
+      httpStatus: result.status,
+      error: result.data,
+      tokenSource,
+      data: result.data,
+    };
+  } catch (err) {
+    console.error("[whatsappCloud] Template send error (non-fatal):", err);
+    return { ok: false };
+  }
+}
+
+/**
  * WhatsApp Cloud API — interactive reply buttons.
  *
  * @param {string} to - E.164 digits for individual recipient

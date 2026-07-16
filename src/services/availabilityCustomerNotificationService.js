@@ -6,7 +6,13 @@ import {
   replyPrivatelyToLatestUserMessage,
 } from "./playwrightReplyPrivatelyBridge.js";
 import { getPlaywrightOutboundPage, refocusChatRowForTitle } from "./playwrightOutboundBridge.js";
-import { sendWhatsAppMessage } from "./whatsappCloud.js";
+import {
+  classifyAvailabilityCustomerLanguage,
+  planAvailabilityCustomerTemplateSend,
+  resolveAvailabilityCustomerSourceTextPreview,
+  shouldUseAvailabilityCustomerTemplateNotify,
+} from "./availabilityCustomerTemplateNotify.js";
+import { sendWhatsAppMessage, sendWhatsAppTemplateMessage } from "./whatsappCloud.js";
 import {
   buildApprovedAvailabilityCustomerMessage,
   buildApprovedAvailabilityCustomerMessageWithoutPrice,
@@ -259,6 +265,67 @@ async function sendCloudAvailabilityMessage({
   };
 }
 
+async function sendCloudAvailabilityTemplateMessage({
+  phone,
+  templateName,
+  languageCode,
+  bodyParameters,
+  sendWhatsAppTemplateMessageFn,
+  sendCredentials,
+}) {
+  const target =
+    normalizeCustomerPhoneDigits(phone) || normalizePhone(phone).replace(/\D/g, "");
+  if (!target) return { ok: false, reason: "MISSING_CUSTOMER_PHONE" };
+  const result = await sendWhatsAppTemplateMessageFn({
+    to: target,
+    templateName,
+    languageCode,
+    bodyParameters,
+    credentials: sendCredentials ?? undefined,
+    caller: "availabilityCustomerTemplateNotify",
+  });
+  const sendOk =
+    result === undefined || result === true || result?.ok === true || result?.success === true;
+  if (!sendOk) {
+    return {
+      ok: false,
+      reason: "CLOUD_TEMPLATE_SEND_FAILED",
+      method: "cloud_api_template",
+    };
+  }
+  const meta = extractCloudSendMeta(result);
+  return {
+    ok: true,
+    method: "cloud_api_template",
+    phone: target,
+    maskedPhone: maskPhoneForLog(target),
+    providerMessageId: meta.providerMessageId,
+    customerWaId: meta.customerWaId,
+  };
+}
+
+async function markAvailabilityTemplateNotifyBlocked({
+  db,
+  businessId,
+  requestId,
+  reason,
+  customerLanguage = null,
+}) {
+  await markAvailabilityRequestCustomerNotificationSkipped({
+    db,
+    businessId,
+    requestId,
+    approvalCustomerNotificationError: "manual_required",
+    approvalCustomerNotificationMethod: "skipped_manual_required",
+  });
+  console.log("[availability_customer_template_notify_blocked]", {
+    requestId,
+    businessId,
+    reason: clean(reason) || "TEMPLATE_BLOCKED",
+    customerLanguage: clean(customerLanguage) || null,
+  });
+}
+
 /**
  * Send the real customer message via Reply Privately, mark sent/waiting_confirm, then extract phone.
  * Does not send the same message through Cloud API.
@@ -385,6 +452,7 @@ async function sendAvailabilityViaReplyPrivately({
  *   request?: Record<string, unknown> | null,
  *   executionContext?: Record<string, unknown>,
  *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
+ *   sendWhatsAppTemplateMessageFn?: typeof sendWhatsAppTemplateMessage,
  *   replyPrivatelyFn?: typeof replyPrivatelyToLatestUserMessage,
  *   extractDmContactPhoneFn?: typeof extractDmContactPhoneFromOpenChat,
  *   refocusGroupFn?: typeof refocusChatRowForTitle,
@@ -397,6 +465,7 @@ export async function sendAvailabilityCustomerNotification({
   request = null,
   executionContext = {},
   sendWhatsAppMessageFn = sendWhatsAppMessage,
+  sendWhatsAppTemplateMessageFn = sendWhatsAppTemplateMessage,
   replyPrivatelyFn = replyPrivatelyToLatestUserMessage,
   extractDmContactPhoneFn = extractDmContactPhoneFromOpenChat,
   refocusGroupFn = refocusChatRowForTitle,
@@ -530,6 +599,125 @@ export async function sendAvailabilityCustomerNotification({
       customerDmTransport === "cloud_api" &&
       phase4Phone
     ) {
+      const useTemplate = shouldUseAvailabilityCustomerTemplateNotify(
+        current,
+        requestStatus
+      );
+
+      if (useTemplate) {
+        const templatePlan = planAvailabilityCustomerTemplateSend(current, catalogRow);
+        if (!templatePlan.ok) {
+          await markAvailabilityTemplateNotifyBlocked({
+            db: firestore,
+            businessId: uid,
+            requestId: rid,
+            reason: templatePlan.reason || "TEMPLATE_BLOCKED",
+            customerLanguage: classifyAvailabilityCustomerLanguage(
+              resolveAvailabilityCustomerSourceTextPreview(current)
+            ),
+          });
+          return {
+            ok: true,
+            skipped: true,
+            reason: "MANUAL_REQUIRED",
+            requestId: rid,
+            method: "skipped_manual_required",
+            sent: false,
+            templateBlockedReason: templatePlan.reason || null,
+          };
+        }
+
+        const cloudSend = await sendCloudAvailabilityTemplateMessage({
+          phone: phase4Phone,
+          templateName: templatePlan.templateName,
+          languageCode: templatePlan.languageCode,
+          bodyParameters: templatePlan.bodyParameters,
+          sendWhatsAppTemplateMessageFn,
+          sendCredentials: executionContext?.sendCredentials ?? null,
+        });
+        if (!cloudSend.ok) {
+          await markAvailabilityRequestCustomerNotificationFailed({
+            db: firestore,
+            businessId: uid,
+            requestId: rid,
+            approvalCustomerNotificationError:
+              cloudSend.reason || "CLOUD_TEMPLATE_SEND_FAILED",
+            approvalCustomerNotificationMethod: "cloud_api_template",
+          });
+          return {
+            ok: false,
+            reason: cloudSend.reason || "CLOUD_TEMPLATE_SEND_FAILED",
+            requestId: rid,
+            method: "cloud_api_template",
+            sent: false,
+          };
+        }
+
+        const sentAt = new Date();
+        const confirmPatch = {
+          approvalCustomerNotificationStatus: "sent",
+          approvalCustomerNotificationAt: sentAt,
+          approvalCustomerNotificationMethod: "cloud_api_template",
+          customerConfirmationChannel: "waiting_confirm_cloud",
+          lastCustomerNotifyMessage: templatePlan.renderedMessage,
+          lastCustomerNotifyAt: sentAt,
+          customerDmTarget: phase4Phone,
+          customerConfirmProcessingStatus: "idle",
+          priceQuote: templatePlan.priceQuote ?? current.priceQuote ?? null,
+          customerDeliveryStatus: "pending",
+          customerLanguage: templatePlan.customerLanguage,
+          approvalCustomerNotificationTemplateName: templatePlan.templateName,
+          approvalCustomerNotificationTemplateLanguage: templatePlan.languageCode,
+        };
+        if (cloudSend.providerMessageId) {
+          confirmPatch.approvalCustomerNotificationProviderMessageId =
+            cloudSend.providerMessageId;
+        }
+        if (cloudSend.customerWaId) {
+          confirmPatch.customerWaId = cloudSend.customerWaId;
+        }
+        confirmPatch.customerConfirmationStatus = "waiting_confirm";
+        confirmPatch.confirmExpiresAt = buildConfirmExpiresAt(sentAt);
+
+        await updateAvailabilityRequestFields({
+          db: firestore,
+          businessId: uid,
+          requestId: rid,
+          patch: confirmPatch,
+        });
+        await markAvailabilityRequestCustomerNotificationSent({
+          db: firestore,
+          businessId: uid,
+          requestId: rid,
+          approvalCustomerNotificationMethod: "cloud_api_template",
+        });
+
+        console.log("[availability_customer_template_notify_sent]", {
+          requestId: rid,
+          businessId: uid,
+          templateName: templatePlan.templateName,
+          languageCode: templatePlan.languageCode,
+          customerLanguage: templatePlan.customerLanguage,
+          maskedPhone: cloudSend.maskedPhone,
+          providerMessageId: cloudSend.providerMessageId || null,
+        });
+
+        return {
+          ok: true,
+          sent: true,
+          requestId: rid,
+          method: "cloud_api_template",
+          customerPhone: phase4Phone,
+          maskedPhone: cloudSend.maskedPhone,
+          message: templatePlan.renderedMessage,
+          providerMessageId: cloudSend.providerMessageId || null,
+          customerWaId: cloudSend.customerWaId || null,
+          templateName: templatePlan.templateName,
+          languageCode: templatePlan.languageCode,
+          customerLanguage: templatePlan.customerLanguage,
+        };
+      }
+
       const cloudSend = await sendCloudAvailabilityMessage({
         phone: phase4Phone,
         message: built.message,

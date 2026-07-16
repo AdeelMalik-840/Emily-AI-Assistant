@@ -11,7 +11,7 @@ function asPlainObject(value) {
     : null;
 }
 
-function formatMoneyAmount(amount) {
+export function formatMoneyAmount(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return String(amount ?? "");
   return n.toLocaleString("en-PK");
