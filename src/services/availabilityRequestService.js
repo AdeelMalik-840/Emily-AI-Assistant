@@ -6,6 +6,10 @@ import {
   buildNarrowDmLogicalMessageKey,
   hashNarrowDmMessageText,
 } from "./playwrightNarrowDmMessageReader.js";
+import {
+  buildInitialAvailabilityPhoneExtractionFields,
+  isRetryablePhoneExtractionError,
+} from "./availabilityCustomerPhone.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
@@ -458,6 +462,10 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     };
   }
 
+  const phoneExtractionFields = buildInitialAvailabilityPhoneExtractionFields({
+    participantPhone: normalized.sourceIdentity?.participantPhone,
+  });
+
   const request = {
     requestId: normalized.requestId,
     businessId: normalized.businessId,
@@ -481,6 +489,7 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     createdAt: normalized.createdAt,
     expiresAt: normalized.expiresAt,
     updatedAt: normalized.updatedAt,
+    ...phoneExtractionFields,
   };
 
   await ref.set(request, { merge: true });
@@ -1757,4 +1766,168 @@ export async function evaluateAvailabilityWaitingConfirmOwnershipGuard({
   }
 
   return { block: false, reason: "NO_MATCHING_WAITING_CONFIRM" };
+}
+
+export const MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS = 3;
+
+/**
+ * @param {Record<string, unknown>} request
+ * @returns {boolean}
+ */
+export function availabilityRequestNeedsGroupContactPhoneExtraction(request) {
+  const status = clean(request?.phoneExtractionStatus);
+  const errorCode = clean(request?.phoneExtractionError);
+  const attempts = Number(request?.phoneExtractionAttemptCount);
+  const attemptsSafe =
+    !Number.isFinite(attempts) || attempts < MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS;
+
+  if (status === "resolved" || status === "ambiguous") {
+    return false;
+  }
+  if (status === "failed") {
+    // Temporary lock/page busy must remain reclaimable.
+    if (!isRetryablePhoneExtractionError(errorCode) || !attemptsSafe) {
+      return false;
+    }
+  } else if (status !== "pending" && status !== "resolving") {
+    return false;
+  } else if (!attemptsSafe) {
+    return false;
+  }
+
+  const identity = asPlainObject(request?.sourceIdentity) ?? {};
+  const hasStrong =
+    Boolean(clean(identity.sourceMessageId) || clean(request?.sourceMessageId)) ||
+    Boolean(clean(identity.sourceRowKey) || clean(request?.sourceRowKey));
+  const hasFallback =
+    Boolean(clean(identity.participantName) || clean(identity.participantDisplayName)) &&
+    Boolean(clean(identity.sourceTextPreview));
+  const group =
+    clean(request?.sourceChatId) ||
+    clean(identity.chatId) ||
+    clean(identity.groupName);
+  return Boolean(group && (hasStrong || hasFallback));
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   limit?: number,
+ * }} params
+ */
+export async function findPendingAvailabilityPhoneExtractionRequests({
+  db: connection,
+  businessId,
+  limit = 1,
+}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  if (!firestore || !uid) return [];
+
+  const capped = Math.max(1, Math.min(10, Number(limit) || 1));
+  const collection = availabilityRequestCollectionRef(connection, uid);
+  if (!collection) return [];
+
+  const pendingSnap = await collection
+    .where("phoneExtractionStatus", "==", "pending")
+    .limit(capped)
+    .get()
+    .catch(() => null);
+  const failedSnap = await collection
+    .where("phoneExtractionStatus", "==", "failed")
+    .limit(Math.max(capped, 5))
+    .get()
+    .catch(() => null);
+
+  const rows = [
+    ...(pendingSnap?.docs ?? []).map((doc) => ({
+      requestId: doc.id,
+      ...(doc.data() || {}),
+    })),
+    ...(failedSnap?.docs ?? []).map((doc) => ({
+      requestId: doc.id,
+      ...(doc.data() || {}),
+    })),
+  ];
+
+  const merged = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const id = clean(row.requestId);
+    if (!id || seen.has(id)) continue;
+    if (!availabilityRequestNeedsGroupContactPhoneExtraction(row)) continue;
+    seen.add(id);
+    merged.push(row);
+    if (merged.length >= capped) break;
+  }
+  return merged;
+}
+
+/**
+ * Claim a pending request for Contact-info phone extraction (pending → resolving).
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ * }} params
+ */
+export async function claimAvailabilityPhoneExtractionResolving({
+  db: connection,
+  businessId,
+  requestId,
+}) {
+  const ref = availabilityRequestDocRef(connection, businessId, requestId);
+  if (!ref) return { ok: false, reason: "MISSING_REQUEST_REF" };
+  const snap = await ref.get();
+  if (!snap?.exists) return { ok: false, reason: "REQUEST_NOT_FOUND" };
+  const data = snap.data() || {};
+  const status = clean(data.phoneExtractionStatus);
+  if (status === "resolved") {
+    return { ok: false, reason: "ALREADY_RESOLVED", request: { requestId, ...data } };
+  }
+  if (status === "resolving") {
+    return { ok: false, reason: "ALREADY_RESOLVING", request: { requestId, ...data } };
+  }
+  const retryableFailed =
+    status === "failed" && isRetryablePhoneExtractionError(data.phoneExtractionError);
+  if (status !== "pending" && !retryableFailed) {
+    return { ok: false, reason: "NOT_PENDING", request: { requestId, ...data } };
+  }
+  if (!availabilityRequestNeedsGroupContactPhoneExtraction({
+    ...data,
+    phoneExtractionStatus: retryableFailed ? "failed" : "pending",
+  })) {
+    return { ok: false, reason: "NOT_ELIGIBLE", request: { requestId, ...data } };
+  }
+  const attempts = Number(data.phoneExtractionAttemptCount);
+  const nextAttempts = (Number.isFinite(attempts) ? Math.floor(attempts) : 0) + 1;
+  if (nextAttempts > MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS) {
+    await updateAvailabilityRequestFields({
+      db: connection,
+      businessId,
+      requestId,
+      patch: {
+        phoneExtractionStatus: "failed",
+        phoneExtractionError: "MAX_ATTEMPTS_EXCEEDED",
+        customerDmTransport: "none",
+        phoneExtractionAttemptCount: nextAttempts - 1,
+      },
+    });
+    return { ok: false, reason: "MAX_ATTEMPTS_EXCEEDED" };
+  }
+  const updated = await updateAvailabilityRequestFields({
+    db: connection,
+    businessId,
+    requestId,
+    patch: {
+      phoneExtractionStatus: "resolving",
+      customerDmTransport: "none",
+      phoneExtractionError: null,
+      phoneExtractionAttemptCount: nextAttempts,
+    },
+  });
+  if (!updated) return { ok: false, reason: "CLAIM_FAILED" };
+  const fresh = await getAvailabilityRequest({ db: connection, businessId, requestId });
+  return { ok: true, request: fresh };
 }

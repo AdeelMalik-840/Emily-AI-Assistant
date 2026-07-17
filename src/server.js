@@ -32,6 +32,10 @@ import {
 } from "./services/bookingApprovalService.js";
 import { handleWhatsAppNotificationStatuses } from "./services/bookingNotificationState.js";
 import {
+  handleAvailabilityCustomerNotificationStatuses,
+  stringifyWhatsAppStatusesForLog,
+} from "./services/availabilityCustomerNotificationDeliveryStatus.js";
+import {
   normalizeKnowledgePayload,
   saveStructuredKnowledge,
   getBusinessProfile,
@@ -47,6 +51,10 @@ import {
   startLocalAvailabilityCustomerConfirmPollerScheduler,
   stopLocalAvailabilityCustomerConfirmPollerScheduler,
 } from "./services/localAvailabilityCustomerConfirmPollerScheduler.js";
+import {
+  startLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
+  stopLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
+} from "./services/localAvailabilityCustomerPhoneExtractionPollerScheduler.js";
 
 console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 console.log("[build_marker] whatsapp_cloud_token_fix_v1_loaded");
@@ -204,7 +212,10 @@ app.post("/webhook", async (req, res) => {
     const waEnv = getWhatsAppEnv();
 
     if (statuses != null) {
-      console.log("📦 Status update:", statuses);
+      console.log(
+        "📦 Status update:",
+        stringifyWhatsAppStatusesForLog(statuses)
+      );
       if (Array.isArray(statuses) && statuses.length > 0) {
         let statusOwnerUserId = phoneNumberId
           ? await findOwnerUidByPhoneNumberId(db, phoneNumberId)
@@ -221,6 +232,11 @@ app.post("/webhook", async (req, res) => {
           await handleWhatsAppNotificationStatuses({
             db,
             userId: statusOwnerUserId,
+            statuses,
+          });
+          await handleAvailabilityCustomerNotificationStatuses({
+            db,
+            businessId: statusOwnerUserId,
             statuses,
           });
         }
@@ -1007,6 +1023,14 @@ async function gracefulPlaywrightShutdown(signal) {
       err?.message || err
     );
   }
+  try {
+    stopLocalAvailabilityCustomerPhoneExtractionPollerScheduler();
+  } catch (err) {
+    console.warn(
+      "[server] availability customer phone extraction poller scheduler stop error:",
+      err?.message || err
+    );
+  }
   if (stopPlaywrightListenerFn) {
     try {
       await stopPlaywrightListenerFn();
@@ -1035,3 +1059,7 @@ if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true") {
 // Narrow availability customer DM confirm poller — independent of listener.js / broad DM.
 // Default off unless PLAYWRIGHT_AVAILABILITY_CUSTOMER_CONFIRM_POLLER_ENABLED=true.
 startLocalAvailabilityCustomerConfirmPollerScheduler();
+
+// Group Contact-info customer phone extraction poller — default off.
+// PLAYWRIGHT_GROUP_CONTACT_PHONE_EXTRACTION_ENABLED=true
+startLocalAvailabilityCustomerPhoneExtractionPollerScheduler();
