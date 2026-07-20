@@ -55,6 +55,10 @@ import {
   startLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
   stopLocalAvailabilityCustomerPhoneExtractionPollerScheduler,
 } from "./services/localAvailabilityCustomerPhoneExtractionPollerScheduler.js";
+import {
+  startAvailabilityCustomerNotificationPollerScheduler,
+  stopAvailabilityCustomerNotificationPollerScheduler,
+} from "./services/availabilityCustomerNotificationPollerScheduler.js";
 
 console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 console.log("[build_marker] whatsapp_cloud_token_fix_v1_loaded");
@@ -1031,6 +1035,14 @@ async function gracefulPlaywrightShutdown(signal) {
       err?.message || err
     );
   }
+  try {
+    stopAvailabilityCustomerNotificationPollerScheduler();
+  } catch (err) {
+    console.warn(
+      "[server] availability customer notification poller scheduler stop error:",
+      err?.message || err
+    );
+  }
   if (stopPlaywrightListenerFn) {
     try {
       await stopPlaywrightListenerFn();
@@ -1063,3 +1075,7 @@ startLocalAvailabilityCustomerConfirmPollerScheduler();
 // Group Contact-info customer phone extraction poller — default off.
 // PLAYWRIGHT_GROUP_CONTACT_PHONE_EXTRACTION_ENABLED=true
 startLocalAvailabilityCustomerPhoneExtractionPollerScheduler();
+
+// Approved AVR customer Cloud notification poller — independent of Playwright.
+// Default off unless EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE=true.
+startAvailabilityCustomerNotificationPollerScheduler();
