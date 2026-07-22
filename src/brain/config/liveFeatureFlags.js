@@ -86,8 +86,18 @@ export function isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled() {
   return envTruthy("EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE");
 }
 
-/** @returns {boolean} */
+/**
+ * Confirm-booking execute gate.
+ * Explicit EMILY_BRAIN_V2_AVAILABILITY_CONFIRM_EXECUTE wins (true or false).
+ * When unset/blank, falls back to EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE
+ * so one Railway flag covers notify + customer confirm booking.
+ * @returns {boolean}
+ */
 export function isEmilyBrainV2AvailabilityConfirmExecuteEnabled() {
+  const raw = process.env.EMILY_BRAIN_V2_AVAILABILITY_CONFIRM_EXECUTE;
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled();
+  }
   return envTruthy("EMILY_BRAIN_V2_AVAILABILITY_CONFIRM_EXECUTE");
 }
 

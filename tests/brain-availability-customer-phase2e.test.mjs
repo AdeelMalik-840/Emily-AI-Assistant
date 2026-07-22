@@ -530,9 +530,20 @@ test("duplicate confirm claim is blocked after processing starts", async () => {
   assert.equal(stored.customerConfirmProcessingStatus, "processing");
 });
 
-test("confirm execute flag defaults false in tests", () => {
+test("confirm execute flag defaults false when confirm and customer DM execute unset", () => {
   delete process.env.EMILY_BRAIN_V2_AVAILABILITY_CONFIRM_EXECUTE;
+  delete process.env.EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE;
   assert.equal(isEmilyBrainV2AvailabilityConfirmExecuteEnabled(), false);
+});
+
+test("confirm execute falls back to customer DM execute when confirm env unset", () => {
+  delete process.env.EMILY_BRAIN_V2_AVAILABILITY_CONFIRM_EXECUTE;
+  process.env.EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE = "true";
+  try {
+    assert.equal(isEmilyBrainV2AvailabilityConfirmExecuteEnabled(), true);
+  } finally {
+    delete process.env.EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE;
+  }
 });
 
 test("executeAvailabilityCustomerConfirmBooking dry-run respects gate without booking side effects", async () => {
