@@ -420,3 +420,86 @@ test("facts O: Book kar do still confirms booking", () => {
   assert.equal(result.intent, "confirm");
   assert.equal(result.actionType, "confirm_booking");
 });
+
+const bookingConfirmPromptRequest = {
+  ...waitingRequest,
+  lastCustomerDmPromptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
+};
+
+const nonBookingConfirmPromptRequest = {
+  ...waitingRequest,
+  lastCustomerDmPromptType: AVAILABILITY_DM_PROMPT_TYPES.PRICE_INFO,
+  lastCustomerNotifyMessage: "Honda Civic 2026 2 din ka rent 16,000 PKR hoga.",
+  lastCustomerDmOutboundPreview: "Honda Civic 2026 2 din ka rent 16,000 PKR hoga.",
+};
+
+test("expanded confirms map to confirm_booking after booking_confirmation_prompt", () => {
+  const phrases = [
+    "booking kar do",
+    "booking kr do",
+    "kar dein",
+    "kr dein",
+    "go ahead",
+    "proceed",
+    "OK.",
+    "Ji!",
+    "Theek hai.",
+    "Haan!",
+  ];
+  for (const messageText of phrases) {
+    const result = resolveAvailabilityConfirmationTurn({
+      request: bookingConfirmPromptRequest,
+      messageText,
+    });
+    assert.equal(
+      result.actionType,
+      "confirm_booking",
+      `expected confirm_booking for ${JSON.stringify(messageText)}, got ${result.intent}/${result.actionType}`
+    );
+    assert.equal(result.intent, "confirm");
+  }
+});
+
+test("short positives do not confirm without booking_confirmation_prompt", () => {
+  const phrases = ["ok", "okay", "haan", "ji", "theek hai", "kar do", "done"];
+  for (const messageText of phrases) {
+    const result = resolveAvailabilityConfirmationTurn({
+      request: nonBookingConfirmPromptRequest,
+      messageText,
+    });
+    assert.notEqual(
+      result.actionType,
+      "confirm_booking",
+      `expected no confirm_booking for ${JSON.stringify(messageText)} without prompt`
+    );
+    assert.notEqual(result.intent, "confirm");
+  }
+});
+
+test("neutral unclear questions and change requests never confirm booking", () => {
+  const phrases = [
+    "acha",
+    "hmm",
+    "hm",
+    "wait",
+    "sochta hun",
+    "rent kitna hai?",
+    "driver milega?",
+    "3 din ke liye chahiye",
+    "Civic chahiye",
+  ];
+  for (const messageText of phrases) {
+    const withPrompt = resolveAvailabilityConfirmationTurn({
+      request: bookingConfirmPromptRequest,
+      messageText,
+    });
+    const withoutPrompt = resolveAvailabilityConfirmationTurn({
+      request: nonBookingConfirmPromptRequest,
+      messageText,
+    });
+    assert.notEqual(withPrompt.actionType, "confirm_booking", messageText);
+    assert.notEqual(withPrompt.intent, "confirm", messageText);
+    assert.notEqual(withoutPrompt.actionType, "confirm_booking", messageText);
+    assert.notEqual(withoutPrompt.intent, "confirm", messageText);
+  }
+});
