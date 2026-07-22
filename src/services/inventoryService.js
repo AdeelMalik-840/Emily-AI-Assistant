@@ -964,7 +964,7 @@ export function __displayNameFromParticipantKeyForTests(value) {
 /**
  * @param {string} traceId - Correlates with pipeline / processMessage logs
  * @param {string} userId
- * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceTurnKey?: string | null, guaranteeKey?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null, dbOverride?: unknown }} opts
+ * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, availabilityRequestId?: string | null, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceTurnKey?: string | null, guaranteeKey?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null, dbOverride?: unknown }} opts
  */
 export async function createBooking(
   traceId,
@@ -991,6 +991,7 @@ export async function createBooking(
     dmTargetSource,
     canDmCustomer,
     approvalStage,
+    availabilityRequestId,
     sourceGroupName,
     sourcePlaywrightChatKey,
     sourceMessageId,
@@ -1181,6 +1182,19 @@ export async function createBooking(
     hasDmTarget: Boolean(dmTargetRaw),
     syntheticTarget: dmTargetLooksSynthetic,
   });
+
+  const approvalStageClean = String(approvalStage ?? "").trim();
+  const dmTargetSourceClean = String(dmTargetSource ?? "").trim();
+  const availabilityRequestIdClean = String(availabilityRequestId ?? "").trim();
+  // Availability-confirm already completed owner AVR approval; do not leave
+  // the created booking as pending_approval (bookingDmFlow expects approved).
+  const isAvailabilityConfirmBooking =
+    approvalStageClean === "owner_approved_waiting_customer_details" &&
+    (dmTargetSourceClean === "availability_confirm_dm" ||
+      Boolean(availabilityRequestIdClean));
+  const initialBookingStatus = isAvailabilityConfirmBooking
+    ? "approved"
+    : "pending_approval";
 
   try {
     const firestoreDb =
@@ -1409,12 +1423,15 @@ export async function createBooking(
           ? { dmTargetSource: String(dmTargetSource).trim() }
           : {}),
         canDmCustomer: safeCanDmCustomer,
-        ...(approvalStage != null && String(approvalStage).trim() !== ""
-          ? { approvalStage: String(approvalStage).trim() }
+        ...(approvalStageClean
+          ? { approvalStage: approvalStageClean }
+          : {}),
+        ...(availabilityRequestIdClean
+          ? { availabilityRequestId: availabilityRequestIdClean }
           : {}),
         startAt,
         endAt,
-        status: "pending_approval",
+        status: initialBookingStatus,
         createdAt: FieldValue.serverTimestamp(),
       });
       if (sourceDedupeKey && sourceLockRef) {

@@ -111,6 +111,10 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
       itemName: requestedItemName,
       durationDays: Math.max(1, Math.floor(Number(durationDays))),
       approvalStage: String(payload?.approvalStage ?? "pending_owner_approval").trim(),
+      availabilityRequestId:
+        String(
+          payload?.availabilityRequestId ?? executionContext?.availabilityRequestId ?? ""
+        ).trim() || undefined,
       sourceText: String(payload?.sourceMessage ?? executionContext?.message ?? "").trim(),
       sourceTurnKey:
         String(payload?.sourceTurnKey ?? executionContext?.sourceTurnKey ?? "").trim() ||

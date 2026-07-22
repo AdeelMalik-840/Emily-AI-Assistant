@@ -460,6 +460,8 @@ test("3B booking D: confirm_booking uses owner_approved_waiting_customer_details
   assert.ok(booking);
   assert.equal(booking.approvalStage, "owner_approved_waiting_customer_details");
   assert.notEqual(booking.approvalStage, "pending_owner_approval");
+  assert.equal(booking.status, "approved");
+  assert.notEqual(booking.status, "pending_approval");
   assert.equal(booking.availabilityRequestId, REQUEST_ID);
   assert.equal(booking.sourceGroupName, "leads");
   assert.equal(booking.sourcePlaywrightChatKey, "leads");
