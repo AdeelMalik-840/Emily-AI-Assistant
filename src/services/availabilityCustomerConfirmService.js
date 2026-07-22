@@ -28,11 +28,14 @@ import { findItemByName } from "./inventoryService.js";
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
 import {
   claimAvailabilityRequestCustomerConfirmProcessing,
+  findAvailabilityRequestByCloudInboundMessageId,
   findLatestWaitingConfirmAvailabilityRequest,
-  findWaitingConfirmAvailabilityRequestsByPhone,
+  findWaitingConfirmCloudAvailabilityRequestsByPhone,
   getAvailabilityRequest,
+  isDuplicateAvailabilityCustomerInboundDm,
   patchAvailabilityConfirmBookingMetadata,
   recordAvailabilityCustomerDmOutbound,
+  recordAvailabilityCustomerInboundDm,
   resolveAvailabilityParticipantDisplayName,
   updateAvailabilityRequestCustomerConfirmationState,
   updateAvailabilityRequestFields,
@@ -528,6 +531,28 @@ export async function handleAvailabilityCustomerPlaywrightInbound({
  *   availabilityConfirmExecute?: boolean,
  * }} params
  */
+async function recordCloudInboundIdempotency({
+  connection,
+  businessId,
+  requestId,
+  messageId,
+  messageText,
+}) {
+  const mid = clean(messageId);
+  if (!requestId || !mid) return;
+  await recordAvailabilityCustomerInboundDm({
+    db: connection,
+    businessId,
+    requestId,
+    message: {
+      dataId: mid,
+      text: messageText,
+      atMs: Date.now(),
+      chatKey: "cloud_dm",
+    },
+  }).catch(() => null);
+}
+
 export async function handleAvailabilityCustomerCloudInbound({
   db: connection,
   businessId,
@@ -541,11 +566,29 @@ export async function handleAvailabilityCustomerCloudInbound({
   const uid = clean(businessId);
   const phone = normalizePhone(customerPhone);
   const text = clean(messageText);
+  const inboundMessageId = clean(messageId);
   if (!uid || !phone || !text) {
     return { handled: false, reason: "MISSING_CONTEXT" };
   }
 
-  const waiting = await findWaitingConfirmAvailabilityRequestsByPhone({
+  if (inboundMessageId) {
+    const prior = await findAvailabilityRequestByCloudInboundMessageId({
+      db: connection,
+      businessId: uid,
+      messageId: inboundMessageId,
+    });
+    if (prior) {
+      return {
+        handled: true,
+        action: "duplicate_inbound",
+        reply: null,
+        requestId: clean(prior.requestId ?? prior.id) || null,
+        duplicate: true,
+      };
+    }
+  }
+
+  const waiting = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
     db: connection,
     businessId: uid,
     customerPhone: phone,
@@ -562,7 +605,7 @@ export async function handleAvailabilityCustomerCloudInbound({
     await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
       recipientType: "individual",
     }).catch(() => null);
-    return { handled: true, action: "disambiguation", reply };
+    return { handled: true, action: "disambiguation", reply, requestId: null };
   }
 
   if (!request) {
@@ -570,7 +613,7 @@ export async function handleAvailabilityCustomerCloudInbound({
     await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
       recipientType: "individual",
     }).catch(() => null);
-    return { handled: true, action: "clarification", reply };
+    return { handled: true, action: "clarification", reply, requestId: null };
   }
 
   const requestId = clean(request.requestId ?? request.id);
@@ -578,9 +621,27 @@ export async function handleAvailabilityCustomerCloudInbound({
     (await getAvailabilityRequest({ db: connection, businessId: uid, requestId })) || request;
   request = fresh;
 
+  if (
+    inboundMessageId &&
+    (clean(request.customerConfirmationMessageId) === inboundMessageId ||
+      isDuplicateAvailabilityCustomerInboundDm(request, {
+        dataId: inboundMessageId,
+        text,
+        atMs: Date.now(),
+      }))
+  ) {
+    return {
+      handled: true,
+      action: "duplicate_inbound",
+      reply: null,
+      requestId,
+      duplicate: true,
+    };
+  }
+
   const decision = resolveAvailabilityConfirmationTurn({ request, messageText: text });
   if (!decision.ok) {
-    return { handled: false, reason: decision.reason || "BRAIN_DECISION_FAILED" };
+    return { handled: false, reason: decision.reason || "BRAIN_DECISION_FAILED", requestId };
   }
 
   if (decision.actionType === "decline_request") {
@@ -591,7 +652,7 @@ export async function handleAvailabilityCustomerCloudInbound({
       customerConfirmationStatus: "declined",
       extra: {
         customerConfirmationAt: new Date(),
-        customerConfirmationMessageId: clean(messageId) || null,
+        customerConfirmationMessageId: inboundMessageId || null,
         customerConfirmationTextPreview: text.slice(0, 160),
       },
     });
@@ -605,7 +666,14 @@ export async function handleAvailabilityCustomerCloudInbound({
       requestId,
       promptType: decision.outboundPromptType,
     });
-    return { handled: true, action: "declined", reply, decision };
+    await recordCloudInboundIdempotency({
+      connection,
+      businessId: uid,
+      requestId,
+      messageId: inboundMessageId,
+      messageText: text,
+    });
+    return { handled: true, action: "declined", reply, decision, requestId };
   }
 
   if (decision.actionType === "confirm_booking") {
@@ -614,7 +682,7 @@ export async function handleAvailabilityCustomerCloudInbound({
       businessId: uid,
       request,
       messageText: text,
-      messageId,
+      messageId: inboundMessageId,
       sendCredentials,
       availabilityConfirmExecute,
     });
@@ -634,12 +702,20 @@ export async function handleAvailabilityCustomerCloudInbound({
         promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
       }).catch(() => null);
     }
+    await recordCloudInboundIdempotency({
+      connection,
+      businessId: uid,
+      requestId,
+      messageId: inboundMessageId,
+      messageText: text,
+    });
     return {
       handled: true,
       action: result.ok ? "confirmed_booking" : "confirm_failed",
       reply,
       result,
       decision,
+      requestId,
     };
   }
 
@@ -660,7 +736,14 @@ export async function handleAvailabilityCustomerCloudInbound({
     requestId,
     promptType: decision.outboundPromptType,
   });
-  return { handled: true, action: replyAction, reply: sentReply, decision };
+  await recordCloudInboundIdempotency({
+    connection,
+    businessId: uid,
+    requestId,
+    messageId: inboundMessageId,
+    messageText: text,
+  });
+  return { handled: true, action: replyAction, reply: sentReply, decision, requestId };
 }
 
 export async function tryHandleAvailabilityCustomerCloudInbound(params) {

@@ -178,6 +178,7 @@ test("1–5. Phase 4 resolved cloud_api sends Cloud and preserves phone fields",
   assert.equal(stored.approvalCustomerNotificationStatus, "sent");
   assert.equal(stored.approvalCustomerNotificationMethod, "cloud_api");
   assert.equal(stored.customerConfirmationChannel, "waiting_confirm_cloud");
+  assert.equal(stored.lastCustomerDmPromptType, "booking_confirmation_prompt");
   assert.equal(stored.customerConfirmationStatus, "waiting_confirm");
   assert.equal(stored.phoneExtractionStatus, "resolved");
   assert.equal(stored.customerDmTransport, "cloud_api");
