@@ -6,10 +6,10 @@ function clean(value, max = 500) {
 }
 
 const SHORT_POSITIVE_CONFIRM_RE =
-  /^(yes|ok|okay|ji|jee|haan|han|ha|confirm|theek hai|thik hai|kar do|kr do|krdo|kardo|done|sure)$/i;
+  /^(yes|ok|okay|ji|jee|haan|han|ha|confirm|theek hai|thik hai|kar do|kr do|krdo|kardo|kar dein|kr dein|go ahead|proceed|done|sure)$/i;
 
 const EXPLICIT_CONFIRM_RE =
-  /\b(book kar do|book kr do|confirm kar do|haan book|yes book|ok book|ji book|yes confirm|ok confirm|ji confirm|haan confirm|confirm booking)\b/i;
+  /\b(book kar do|book kr do|booking kar do|booking kr do|confirm kar do|haan book|yes book|ok book|ji book|yes confirm|ok confirm|ji confirm|haan confirm|confirm booking)\b/i;
 
 const DECLINE_RE =
   /\b(nahi|no|cancel|rehne do|rehne dein|not interested|not now|mat|nope|nahi chahiye)\b/i;
@@ -30,8 +30,18 @@ export function resolveAvailabilityCustomerDmPromptType(request) {
   return null;
 }
 
-export function isShortPositiveConfirmationReply(message) {
+/**
+ * Strip trailing sentence punctuation so "OK." / "Ji!" still match short confirms.
+ * @param {string} message
+ */
+function normalizeShortConfirmText(message) {
   const raw = clean(message, 120);
+  if (!raw) return "";
+  return raw.replace(/[.!?…]+$/u, "").trim();
+}
+
+export function isShortPositiveConfirmationReply(message) {
+  const raw = normalizeShortConfirmText(message);
   if (!raw) return false;
   const tokens = raw.split(/\s+/).filter(Boolean);
   if (tokens.length > 3) return false;
