@@ -59,7 +59,51 @@ function safeExtractionLog(event, payload = {}) {
       typeof payload.panelVerified === "boolean" ? payload.panelVerified : undefined,
     restoredGroup:
       typeof payload.restoredGroup === "boolean" ? payload.restoredGroup : undefined,
+    senderClickTarget: clean(payload.senderClickTarget) || undefined,
+    lastSenderClickTarget: clean(payload.lastSenderClickTarget) || undefined,
+    strategiesTried: Array.isArray(payload.strategiesTried)
+      ? payload.strategiesTried
+      : undefined,
+    lastPanelDetectionReason: clean(payload.lastPanelDetectionReason) || undefined,
+    openAttemptCount:
+      payload.openAttemptCount == null ? undefined : Number(payload.openAttemptCount),
   });
+}
+
+/**
+ * Persistable open-stage diagnostics (no phones / secrets).
+ * @param {Record<string, unknown> | null | undefined} extraction
+ */
+function buildPhoneExtractionOpenDiagnostics(extraction) {
+  if (!extraction || typeof extraction !== "object") return {};
+  /** @type {Record<string, unknown>} */
+  const patch = {};
+  const senderClickTarget = clean(extraction.senderClickTarget);
+  const lastSenderClickTarget =
+    clean(extraction.lastSenderClickTarget) || senderClickTarget;
+  if (senderClickTarget) patch.senderClickTarget = senderClickTarget;
+  if (lastSenderClickTarget) patch.lastSenderClickTarget = lastSenderClickTarget;
+  if (Array.isArray(extraction.strategiesTried)) {
+    const tried = extraction.strategiesTried.map((s) => clean(s)).filter(Boolean);
+    if (tried.length) patch.strategiesTried = tried;
+  }
+  if (extraction.clusterFallbackUsed === true || extraction.clusterFallbackUsed === false) {
+    patch.clusterFallbackUsed = extraction.clusterFallbackUsed === true;
+  }
+  if (extraction.clusterCandidateCount != null && Number.isFinite(Number(extraction.clusterCandidateCount))) {
+    patch.clusterCandidateCount = Math.max(0, Math.floor(Number(extraction.clusterCandidateCount)));
+  }
+  const clusterRejectedReason = clean(extraction.clusterRejectedReason);
+  if (clusterRejectedReason) patch.clusterRejectedReason = clusterRejectedReason;
+  if (typeof extraction.panelVerified === "boolean") {
+    patch.panelVerified = extraction.panelVerified;
+  }
+  const lastPanelDetectionReason = clean(extraction.lastPanelDetectionReason);
+  if (lastPanelDetectionReason) patch.lastPanelDetectionReason = lastPanelDetectionReason;
+  if (extraction.openAttemptCount != null && Number.isFinite(Number(extraction.openAttemptCount))) {
+    patch.openAttemptCount = Math.max(0, Math.floor(Number(extraction.openAttemptCount)));
+  }
+  return patch;
 }
 
 /**
@@ -203,7 +247,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     source: "group_contact_info",
   });
 
-  const persistDeferred = async (errorCode, { undoAttempt = false } = {}) => {
+  const persistDeferred = async (errorCode, { undoAttempt = false, extraction = null } = {}) => {
     const attemptsNow = Number.isFinite(claimedAttempts)
       ? Math.floor(claimedAttempts)
       : 0;
@@ -213,6 +257,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
       phoneExtractionError: clean(errorCode) || "UI_HARD_LOCK_BUSY",
       customerDmTransport: "none",
       phoneExtractionAttemptCount: nextAttempts,
+      ...buildPhoneExtractionOpenDiagnostics(extraction),
     };
     await updateAvailabilityRequestFields({
       db: firestore,
@@ -225,6 +270,12 @@ export async function extractAndPersistAvailabilityCustomerPhone({
       businessId: uid,
       status: "pending",
       errorCode: patch.phoneExtractionError,
+      senderClickTarget: patch.senderClickTarget,
+      lastSenderClickTarget: patch.lastSenderClickTarget,
+      strategiesTried: patch.strategiesTried,
+      lastPanelDetectionReason: patch.lastPanelDetectionReason,
+      openAttemptCount: patch.openAttemptCount,
+      panelVerified: patch.panelVerified,
     });
     return {
       ok: false,
@@ -356,7 +407,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     "EXTRACTION_FAILED";
 
   if (isRetryablePhoneExtractionError(errorCode)) {
-    return persistDeferred(errorCode, { undoAttempt: true });
+    return persistDeferred(errorCode, { undoAttempt: true, extraction });
   }
 
   if (isSoftRetryablePhoneExtractionError(errorCode)) {
@@ -364,7 +415,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
       ? Math.floor(claimedAttempts)
       : 0;
     if (attemptsNow < MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS) {
-      return persistDeferred(errorCode, { undoAttempt: false });
+      return persistDeferred(errorCode, { undoAttempt: false, extraction });
     }
   }
 
@@ -374,11 +425,15 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     phoneExtractionError: errorCode,
     incrementAttempt: false,
   });
+  const failedPatch = {
+    ...built.patch,
+    ...buildPhoneExtractionOpenDiagnostics(extraction),
+  };
   await updateAvailabilityRequestFields({
     db: firestore,
     businessId: uid,
     requestId: id,
-    patch: built.patch,
+    patch: failedPatch,
   });
   safeExtractionLog("[group_contact_phone_extraction_failed]", {
     requestId: id,
@@ -390,11 +445,16 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     panelVerified: extraction?.panelVerified,
     restoredGroup: extraction?.restoredGroup,
     maskedPhone: extraction?.maskedPhone || null,
+    senderClickTarget: extraction?.senderClickTarget,
+    lastSenderClickTarget: extraction?.lastSenderClickTarget,
+    strategiesTried: extraction?.strategiesTried,
+    lastPanelDetectionReason: extraction?.lastPanelDetectionReason,
+    openAttemptCount: extraction?.openAttemptCount,
   });
   return {
     ok: false,
     status: "failed",
     reason: errorCode,
-    patch: built.patch,
+    patch: failedPatch,
   };
 }
