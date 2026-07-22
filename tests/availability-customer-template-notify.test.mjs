@@ -488,6 +488,117 @@ test("15–16. Reply Privately and Playwright DM continuation are not called", a
   }
 });
 
+test("template Graph rejection persists Meta diagnostics on failed AVR", async () => {
+  const saved = saveTemplateEnv();
+  enableTemplateEnv();
+  const fakeDb = new FakeDb();
+  seedGroupApproved(fakeDb);
+  try {
+    const result = await sendAvailabilityCustomerNotification({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: REQUEST_ID,
+      sendWhatsAppMessageFn: async () => {
+        throw new Error("free-form must not run");
+      },
+      sendWhatsAppTemplateMessageFn: async () => ({
+        ok: false,
+        providerMessageId: null,
+        httpStatus: 400,
+        error: {
+          error: {
+            message: "Template name availability_quote_ru_v1 does not exist in en",
+            type: "OAuthException",
+            code: 132001,
+            error_data: {
+              messaging_product: "whatsapp",
+              details: "template name (availability_quote_ru_v1) does not exist in en",
+            },
+            fbtrace_id: "AZaBcDeFgHiJkLmNoPqRsTuV",
+          },
+        },
+        data: {
+          error: {
+            message: "Template name availability_quote_ru_v1 does not exist in en",
+            type: "OAuthException",
+            code: 132001,
+            error_data: {
+              messaging_product: "whatsapp",
+              details: "template name (availability_quote_ru_v1) does not exist in en",
+            },
+            fbtrace_id: "AZaBcDeFgHiJkLmNoPqRsTuV",
+          },
+        },
+      }),
+      replyPrivatelyFn: async () => {
+        throw new Error("Reply Privately must not run");
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.sent, false);
+    assert.equal(result.reason, "CLOUD_TEMPLATE_SEND_FAILED");
+    assert.equal(result.method, "cloud_api_template");
+
+    const stored = fakeDb.docs.get(avrKey());
+    assert.equal(stored.approvalCustomerNotificationStatus, "failed");
+    assert.equal(stored.approvalCustomerNotificationError, "CLOUD_TEMPLATE_SEND_FAILED");
+    assert.equal(stored.approvalCustomerNotificationMethod, "cloud_api_template");
+    assert.equal(stored.approvalCustomerNotificationMetaHttpStatus, 400);
+    assert.equal(stored.approvalCustomerNotificationMetaErrorCode, "132001");
+    assert.equal(
+      stored.approvalCustomerNotificationMetaErrorMessage,
+      "Template name availability_quote_ru_v1 does not exist in en"
+    );
+    assert.equal(
+      stored.approvalCustomerNotificationMetaErrorDetails,
+      "template name (availability_quote_ru_v1) does not exist in en"
+    );
+    assert.equal(
+      stored.approvalCustomerNotificationMetaFbtraceId,
+      "AZaBcDeFgHiJkLmNoPqRsTuV"
+    );
+    assert.equal(stored.approvalCustomerNotificationProviderMessageId, undefined);
+    assert.equal(stored.customerDeliveryStatus, undefined);
+  } finally {
+    restoreTemplateEnv(saved);
+  }
+});
+
+test("template send failure without Meta body still marks failed only", async () => {
+  const saved = saveTemplateEnv();
+  enableTemplateEnv();
+  const fakeDb = new FakeDb();
+  seedGroupApproved(fakeDb);
+  try {
+    const result = await sendAvailabilityCustomerNotification({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: REQUEST_ID,
+      sendWhatsAppMessageFn: async () => {
+        throw new Error("free-form must not run");
+      },
+      sendWhatsAppTemplateMessageFn: async () => ({ ok: false }),
+      replyPrivatelyFn: async () => {
+        throw new Error("Reply Privately must not run");
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "CLOUD_TEMPLATE_SEND_FAILED");
+    const stored = fakeDb.docs.get(avrKey());
+    assert.equal(stored.approvalCustomerNotificationStatus, "failed");
+    assert.equal(stored.approvalCustomerNotificationError, "CLOUD_TEMPLATE_SEND_FAILED");
+    assert.equal(stored.approvalCustomerNotificationMetaHttpStatus, undefined);
+    assert.equal(stored.approvalCustomerNotificationMetaErrorCode, undefined);
+    assert.equal(stored.approvalCustomerNotificationMetaErrorMessage, undefined);
+    assert.equal(stored.approvalCustomerNotificationMetaErrorDetails, undefined);
+    assert.equal(stored.approvalCustomerNotificationMetaFbtraceId, undefined);
+  } finally {
+    restoreTemplateEnv(saved);
+  }
+});
+
 test("template preview render for English bucket", () => {
   const preview = renderAvailabilityCustomerTemplatePreview("english", {
     itemLabel: "Honda Civic 2026",

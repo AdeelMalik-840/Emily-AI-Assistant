@@ -265,6 +265,50 @@ async function sendCloudAvailabilityMessage({
   };
 }
 
+/**
+ * Pull Meta Graph diagnostics from sendWhatsAppTemplateMessage failure shape.
+ * Expected body: { error: { code, message, error_data, fbtrace_id } } plus httpStatus.
+ * @param {unknown} result
+ */
+function extractWhatsAppCloudMetaDiagnostics(result) {
+  const source = asPlainObject(result);
+  if (!source) return {};
+
+  const httpRaw = Number(source.httpStatus ?? source.status);
+  const httpStatus = Number.isFinite(httpRaw) ? Math.trunc(httpRaw) : null;
+
+  const payload = asPlainObject(source.error) || asPlainObject(source.data) || null;
+  const err = asPlainObject(payload?.error) || null;
+
+  const code = err?.code != null ? clean(String(err.code), 40) : "";
+  const message = err?.message != null ? clean(String(err.message), 500) : "";
+  const fbtraceId =
+    err?.fbtrace_id != null ? clean(String(err.fbtrace_id), 120) : "";
+
+  let details = "";
+  const errorData = asPlainObject(err?.error_data);
+  if (errorData) {
+    if (errorData.details != null) {
+      details = clean(String(errorData.details), 500);
+    } else {
+      try {
+        details = clean(JSON.stringify(errorData), 500);
+      } catch {
+        details = "";
+      }
+    }
+  }
+
+  /** @type {Record<string, string | number>} */
+  const out = {};
+  if (httpStatus != null) out.approvalCustomerNotificationMetaHttpStatus = httpStatus;
+  if (code) out.approvalCustomerNotificationMetaErrorCode = code;
+  if (message) out.approvalCustomerNotificationMetaErrorMessage = message;
+  if (details) out.approvalCustomerNotificationMetaErrorDetails = details;
+  if (fbtraceId) out.approvalCustomerNotificationMetaFbtraceId = fbtraceId;
+  return out;
+}
+
 async function sendCloudAvailabilityTemplateMessage({
   phone,
   templateName,
@@ -291,6 +335,7 @@ async function sendCloudAvailabilityTemplateMessage({
       ok: false,
       reason: "CLOUD_TEMPLATE_SEND_FAILED",
       method: "cloud_api_template",
+      ...extractWhatsAppCloudMetaDiagnostics(result),
     };
   }
   const meta = extractCloudSendMeta(result);
@@ -643,6 +688,16 @@ export async function sendAvailabilityCustomerNotification({
             approvalCustomerNotificationError:
               cloudSend.reason || "CLOUD_TEMPLATE_SEND_FAILED",
             approvalCustomerNotificationMethod: "cloud_api_template",
+            approvalCustomerNotificationMetaHttpStatus:
+              cloudSend.approvalCustomerNotificationMetaHttpStatus ?? null,
+            approvalCustomerNotificationMetaErrorCode:
+              cloudSend.approvalCustomerNotificationMetaErrorCode ?? null,
+            approvalCustomerNotificationMetaErrorMessage:
+              cloudSend.approvalCustomerNotificationMetaErrorMessage ?? null,
+            approvalCustomerNotificationMetaErrorDetails:
+              cloudSend.approvalCustomerNotificationMetaErrorDetails ?? null,
+            approvalCustomerNotificationMetaFbtraceId:
+              cloudSend.approvalCustomerNotificationMetaFbtraceId ?? null,
           });
           return {
             ok: false,
