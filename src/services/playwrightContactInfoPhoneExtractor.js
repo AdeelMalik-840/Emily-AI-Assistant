@@ -678,6 +678,69 @@ export async function readContactInfoPanelSnapshot(page) {
 }
 
 /**
+ * Read-only: whether Contact Info / profile drawer appears open.
+ *
+ * @param {import("playwright").Page | { evaluate?: Function } | null | undefined} page
+ * @param {{ readSnapshotFn?: typeof readContactInfoPanelSnapshot }} [opts]
+ * @returns {Promise<{ open: boolean, reason: string, snapshot: ContactInfoPanelSnapshot | null }>}
+ */
+export async function isContactInfoPanelOpen(page, opts = {}) {
+  const readFn = opts.readSnapshotFn || readContactInfoPanelSnapshot;
+  try {
+    const snapshot = await readFn(page);
+    if (snapshot?.panelDetected === true) {
+      return {
+        open: true,
+        reason: clean(snapshot.detectedSource) || "panel_detected",
+        snapshot,
+      };
+    }
+    return {
+      open: false,
+      reason: "CONTACT_PANEL_NOT_CONFIRMED",
+      snapshot: snapshot || null,
+    };
+  } catch {
+    return {
+      open: false,
+      reason: "CONTACT_PANEL_NOT_CONFIRMED",
+      snapshot: null,
+    };
+  }
+}
+
+/**
+ * Poll briefly until Contact Info panel is detected open.
+ * Read-only between polls (no clicks).
+ *
+ * @param {import("playwright").Page | { evaluate?: Function, waitForTimeout?: Function } | null | undefined} page
+ * @param {{
+ *   pollAttempts?: number,
+ *   pollDelayMs?: number,
+ *   readSnapshotFn?: typeof readContactInfoPanelSnapshot,
+ *   isOpenFn?: typeof isContactInfoPanelOpen,
+ * }} [opts]
+ */
+export async function waitForContactInfoPanelOpen(page, opts = {}) {
+  const pollAttempts = Math.max(1, Math.floor(Number(opts.pollAttempts) || 8));
+  const pollDelayMs = Math.max(0, Math.floor(Number(opts.pollDelayMs) || 100));
+  const isOpenFn = opts.isOpenFn || isContactInfoPanelOpen;
+  let last = {
+    open: false,
+    reason: "CONTACT_PANEL_NOT_CONFIRMED",
+    snapshot: /** @type {ContactInfoPanelSnapshot | null} */ (null),
+  };
+  for (let i = 0; i < pollAttempts; i += 1) {
+    last = await isOpenFn(page, { readSnapshotFn: opts.readSnapshotFn });
+    if (last.open === true) return last;
+    if (page && typeof page.waitForTimeout === "function" && pollDelayMs > 0) {
+      await page.waitForTimeout(pollDelayMs).catch(() => null);
+    }
+  }
+  return last;
+}
+
+/**
  * Extract customer phone from an already-open Contact info panel.
  * Read-only: never clicks, types, sends, or presses Escape.
  *

@@ -441,11 +441,14 @@ test("tryAcquire/release UI hard lock helpers", () => {
 
 test("4D.1 normal row still prefers in-row sender label", async () => {
   const clicks = [];
+  let panelOpen = false;
   const row = {
     evaluate: async (fn) => {
       const src = String(fn);
-      if (src.includes("message-out")) return "in";
-      throw new Error("cluster evaluate must not run when in-row succeeds");
+      if (src.includes("message-out") && !src.includes("__IN_ROW_SENDER_CONTROL__")) {
+        return "in";
+      }
+      throw new Error("cluster/in-row evaluate must not run when title click opens panel");
     },
     locator: (sel) => {
       const isTitle = String(sel).includes("title=");
@@ -454,6 +457,7 @@ test("4D.1 normal row still prefers in-row sender label", async () => {
           count: async () => (isTitle ? 1 : 0),
           click: async () => {
             clicks.push(String(sel));
+            panelOpen = true;
           },
           evaluate: async () => false,
         }),
@@ -469,15 +473,27 @@ test("4D.1 normal row still prefers in-row sender label", async () => {
   };
   const result = await clickSenderControlInGroupMessageRow(row, {
     participantName: "Adeel",
+    page: { waitForTimeout: async () => {} },
+    requirePanelVerification: true,
+    verifyPanelOpenFn: async () => ({
+      open: panelOpen === true,
+      reason: panelOpen ? "panel_detected" : "CONTACT_PANEL_NOT_CONFIRMED",
+    }),
+    closePanelFn: async () => {
+      panelOpen = false;
+    },
   });
   assert.equal(result.ok, true);
   assert.equal(result.target, "sender_label_title");
+  assert.equal(result.panelVerified, true);
   assert.equal(result.clusterFallbackUsed, false);
   assert.equal(clicks.length, 1);
+  assert.deepEqual(result.strategiesTried, ["sender_label_title"]);
 });
 
 test("4D.2 continuation row uses cluster fallback when previous same-participant label exists", async () => {
   let evalCalls = 0;
+  let panelOpen = false;
   const row = {
     locator: () => ({
       first: () => ({
@@ -501,6 +517,7 @@ test("4D.2 continuation row uses cluster fallback when previous same-participant
       }
       if (src.includes("__IN_ROW_SENDER_CONTROL__")) return null;
       if (src.includes("__CLUSTER_SENDER_FALLBACK__")) {
+        panelOpen = true;
         return {
           ok: true,
           clicked: true,
@@ -514,9 +531,19 @@ test("4D.2 continuation row uses cluster fallback when previous same-participant
   };
   const result = await clickSenderControlInGroupMessageRow(row, {
     participantName: "Mi",
+    page: { waitForTimeout: async () => {} },
+    requirePanelVerification: true,
+    verifyPanelOpenFn: async () => ({
+      open: panelOpen === true,
+      reason: panelOpen ? "panel_detected" : "CONTACT_PANEL_NOT_CONFIRMED",
+    }),
+    closePanelFn: async () => {
+      panelOpen = false;
+    },
   });
   assert.equal(result.ok, true);
   assert.equal(result.target, "cluster_sender_label");
+  assert.equal(result.panelVerified, true);
   assert.equal(result.clusterFallbackUsed, true);
   assert.equal(result.clusterCandidateCount, 1);
   assert.ok(evalCalls >= 2);
@@ -704,4 +731,160 @@ test("4D.10 ambiguous cluster from click path fails closed", async () => {
   assert.equal(result.clusterFallbackUsed, true);
   assert.equal(result.clusterCandidateCount, 2);
   assert.equal(calls.extract.length, 0);
+});
+
+test("stable open: first scoped click without panel tries next strategy that opens Contact Info", async () => {
+  const clicks = [];
+  let panelOpen = false;
+  const row = {
+    evaluate: async (fn) => {
+      const src = String(fn);
+      if (src.includes("message-out") && !src.includes("__IN_ROW_SENDER_CONTROL__")) {
+        return "in";
+      }
+      if (src.includes("__IN_ROW_SENDER_CONTROL__") || src.includes("__CLUSTER_SENDER_FALLBACK__")) {
+        throw new Error("must not reach evaluate/cluster when avatar opens panel");
+      }
+      return null;
+    },
+    locator: (sel) => {
+      const selText = String(sel);
+      const isTitle = selText.includes("title=");
+      const isAvatar = selText.includes("avatar") || selText.includes("img");
+      return {
+        first: () => ({
+          count: async () => (isTitle || isAvatar ? 1 : 0),
+          click: async () => {
+            clicks.push(isTitle ? "title" : isAvatar ? "avatar" : selText);
+            // Title click does not open panel; avatar does.
+            panelOpen = isAvatar;
+          },
+          evaluate: async () => false,
+        }),
+        filter: () => ({
+          first: () => ({
+            count: async () => 0,
+            click: async () => {},
+            evaluate: async () => false,
+          }),
+        }),
+      };
+    },
+  };
+
+  const result = await clickSenderControlInGroupMessageRow(row, {
+    participantName: "Adeel",
+    page: { waitForTimeout: async () => {} },
+    requirePanelVerification: true,
+    verifyPanelOpenFn: async () => ({
+      open: panelOpen === true,
+      reason: panelOpen ? '[data-testid="drawer-right"]' : "CONTACT_PANEL_NOT_CONFIRMED",
+    }),
+    closePanelFn: async () => {
+      panelOpen = false;
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.panelVerified, true);
+  assert.equal(result.target, "sender_avatar");
+  assert.deepEqual(result.strategiesTried, ["sender_label_title", "sender_avatar"]);
+  assert.equal(result.lastSenderClickTarget, "sender_avatar");
+  assert.equal(clicks[0], "title");
+  assert.equal(clicks[1], "avatar");
+});
+
+test("stable open: all scoped strategies fail panel verification → CONTACT_PANEL_NOT_CONFIRMED", async () => {
+  const row = {
+    evaluate: async (fn) => {
+      const src = String(fn);
+      if (src.includes("message-out") && !src.includes("__CLUSTER_SENDER_FALLBACK__")) {
+        return "in";
+      }
+      if (src.includes("__IN_ROW_SENDER_CONTROL__")) return null;
+      if (src.includes("__CLUSTER_SENDER_FALLBACK__")) {
+        return {
+          ok: true,
+          clicked: true,
+          candidateCount: 1,
+          rejectedReason: null,
+          target: "cluster_sender_label",
+        };
+      }
+      return null;
+    },
+    locator: (sel) => {
+      const isTitle = String(sel).includes("title=");
+      return {
+        first: () => ({
+          count: async () => (isTitle ? 1 : 0),
+          click: async () => {},
+          evaluate: async () => false,
+        }),
+        filter: () => ({
+          first: () => ({
+            count: async () => 0,
+            click: async () => {},
+            evaluate: async () => false,
+          }),
+        }),
+      };
+    },
+  };
+
+  const result = await clickSenderControlInGroupMessageRow(row, {
+    participantName: "Adeel",
+    page: { waitForTimeout: async () => {} },
+    requirePanelVerification: true,
+    verifyPanelOpenFn: async () => ({
+      open: false,
+      reason: "CONTACT_PANEL_NOT_CONFIRMED",
+    }),
+    closePanelFn: async () => {},
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "CONTACT_PANEL_NOT_CONFIRMED");
+  assert.equal(result.panelVerified, false);
+  assert.ok(result.strategiesTried.includes("sender_label_title"));
+  assert.ok(result.strategiesTried.includes("cluster_sender_label"));
+  assert.equal(result.lastPanelDetectionReason, "CONTACT_PANEL_NOT_CONFIRMED");
+});
+
+test("stable open: panel identity mismatch remains terminal at extract layer", async () => {
+  const { page, options } = createHarness({
+    phoneResult: {
+      ok: false,
+      status: "failed",
+      phone: null,
+      errorCode: "PANEL_IDENTITY_MISMATCH",
+      candidates: [],
+    },
+  });
+  options.clickSenderFn = async () => ({
+    ok: true,
+    target: "sender_avatar",
+    panelVerified: true,
+    strategiesTried: ["sender_avatar"],
+    lastSenderClickTarget: "sender_avatar",
+  });
+  const result = await extractCustomerPhoneFromGroupSourceMessage(
+    page,
+    baseRequest(),
+    options
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "PANEL_IDENTITY_MISMATCH");
+});
+
+test("stable open: CONTACT_PANEL_NOT_CONFIRMED is soft-retryable", async () => {
+  const { isSoftRetryablePhoneExtractionError } = await import(
+    "../src/services/availabilityCustomerPhone.js"
+  );
+  assert.equal(isSoftRetryablePhoneExtractionError("CONTACT_PANEL_NOT_CONFIRMED"), true);
+  assert.equal(isSoftRetryablePhoneExtractionError("PANEL_IDENTITY_MISMATCH"), false);
+  assert.equal(isSoftRetryablePhoneExtractionError("CLUSTER_SENDER_AMBIGUOUS"), false);
+  assert.equal(isSoftRetryablePhoneExtractionError("MULTIPLE_CONFLICTING_NUMBERS"), false);
+  assert.equal(isSoftRetryablePhoneExtractionError("DISALLOWED_PHONE"), false);
+  assert.equal(isSoftRetryablePhoneExtractionError("SOURCE_ROW_AMBIGUOUS"), false);
 });
