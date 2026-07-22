@@ -1775,7 +1775,19 @@ export async function executeWhatsAppAiPipeline(p) {
         businessId: ownerUserId,
         requestId: cloudConfirmResult.requestId ?? null,
         action: cloudConfirmResult.action ?? null,
+        actionType:
+          cloudConfirmResult.actionType ??
+          cloudConfirmResult.decision?.actionType ??
+          null,
         duplicate: cloudConfirmResult.duplicate === true,
+        failureReason:
+          cloudConfirmResult.failureReason ??
+          cloudConfirmResult.result?.reason ??
+          null,
+        failureStage:
+          cloudConfirmResult.failureStage ??
+          cloudConfirmResult.result?.failureStage ??
+          null,
         isGroupInbound,
         messagePreview: String(latestMessage ?? "").slice(0, 120),
       });
