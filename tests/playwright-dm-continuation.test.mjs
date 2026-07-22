@@ -621,9 +621,9 @@ test("PLAYWRIGHT_DM_CONTINUATION_ENABLED=false skips loadActiveDmWatchTargets", 
 
 const OWNERSHIP_BUSINESS = "owner-ownership-test";
 const OWNERSHIP_REQUEST_ID = "avr_ownership_001";
-const NOTIFY_MS = Date.parse("2026-07-09T10:00:00.000Z");
 
 function waitingConfirmRequest(overrides = {}) {
+  const notifyMs = Date.now() - 60_000;
   return {
     requestId: OWNERSHIP_REQUEST_ID,
     businessId: OWNERSHIP_BUSINESS,
@@ -635,9 +635,9 @@ function waitingConfirmRequest(overrides = {}) {
     customerDmChatTitle: "Adeel malik",
     customerDmPlaywrightChatKey: "adeel-malik",
     customerParticipantId: "participant::adeel",
-    lastCustomerNotifyAt: new Date(NOTIFY_MS),
-    approvalCustomerNotificationAt: new Date(NOTIFY_MS),
-    confirmExpiresAt: new Date(NOTIFY_MS + 72 * 60 * 60 * 1000),
+    lastCustomerNotifyAt: new Date(notifyMs),
+    approvalCustomerNotificationAt: new Date(notifyMs),
+    confirmExpiresAt: new Date(notifyMs + 72 * 60 * 60 * 1000),
     itemId: "corolla-1",
     itemLabel: "Toyota corolla",
     requestedDuration: 2,
@@ -857,7 +857,7 @@ async function runOwnershipPipeline({
     dmChatTitle: "Adeel malik",
     participantKey: "participant::adeel",
     participantName: "Adeel malik",
-    messageTimestamp: NOTIFY_MS + 60_000,
+    messageTimestamp: Date.now(),
     sessionKey: `${OWNERSHIP_BUSINESS}::adeel-malik`,
     sendCredentials: {},
     playwrightWebInbound: false,
@@ -865,6 +865,7 @@ async function runOwnershipPipeline({
     combinedMessage: pipelineMessage,
     latestMessage: pipelineMessage,
     messageId: `inbound-ownership-${randomUUID()}`,
+    __tryHandleAvailabilityCustomerCloudInboundFn: async () => null,
     __tryBrainV2LiveBeforeLegacyFn: async (...args) => {
       brainV2Calls += 1;
       return brainV2Spy(...args);
@@ -885,7 +886,7 @@ test("3B guard C1: waiting_confirm customer DM text is blocked from general pipe
   const guard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
     businessId: OWNERSHIP_BUSINESS,
     messageText: "total rent kitna hai?",
-    messageTimestampMs: NOTIFY_MS + 60_000,
+    messageTimestampMs: Date.now(),
     participantPhone: "+923001234567",
     playwrightChatKey: "adeel-malik",
     requests: [waitingConfirmRequest()],
@@ -1016,7 +1017,7 @@ test("3B guard C3: no waiting_confirm request allows general pipeline", async ()
   const guard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
     businessId: OWNERSHIP_BUSINESS,
     messageText: "Civic chahiye",
-    messageTimestampMs: NOTIFY_MS + 60_000,
+    messageTimestampMs: Date.now(),
     participantPhone: "+923009999999",
     requests: [],
   });
@@ -1028,7 +1029,7 @@ test("3B guard C4: other customer in group is not blocked", () => {
     participantPhone: "+923008888888",
     participantName: "Other Customer",
     playwrightChatKey: "other-customer",
-    messageTimestampMs: NOTIFY_MS + 60_000,
+    messageTimestampMs: Date.now(),
   });
   assert.equal(matched, null);
 });

@@ -161,8 +161,12 @@ function baseWaitingRequest(overrides = {}) {
     approvalCustomerNotificationStatus: "sent",
     approvalCustomerNotificationAt: sentAt,
     customerConfirmationStatus: "waiting_confirm",
+    customerConfirmationChannel: "waiting_confirm_cloud",
     confirmExpiresAt: buildConfirmExpiresAt(sentAt),
     customerConfirmProcessingStatus: "idle",
+    lastCustomerDmPromptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
+    lastCustomerNotifyMessage:
+      "Honda Civic 2026 2 din ke liye available hai. Total rent 16,000 PKR hoga. Book kar du?",
     priceQuote: { status: "quoted", total: 16000, currency: "PKR", durationDays: 2 },
     sourceIdentity: { participantKey: "cust-1", chatId: "Rental Leads", chatType: "group" },
     ...overrides,

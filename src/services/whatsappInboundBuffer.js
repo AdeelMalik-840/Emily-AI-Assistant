@@ -1741,6 +1741,63 @@ export async function executeWhatsAppAiPipeline(p) {
       : null;
 
   let skipGeneralBrainForWaitingConfirmOwnership = false;
+  const cloudConfirmPhone =
+    String(conversationCustomerNumber ?? "").trim() ||
+    String(userPhone ?? "").trim() ||
+    String(participantPhoneForDmRaw ?? "").trim();
+  const canTryCloudConfirmOwnership =
+    !isGroupInbound &&
+    !playwrightWebInbound &&
+    Boolean(String(ownerUserId ?? "").trim()) &&
+    Boolean(cloudConfirmPhone) &&
+    cloudConfirmPhone !== "unknown" &&
+    Boolean(String(latestMessage ?? "").trim());
+
+  if (canTryCloudConfirmOwnership) {
+    const tryCloudConfirmFn =
+      typeof p.__tryHandleAvailabilityCustomerCloudInboundFn === "function"
+        ? p.__tryHandleAvailabilityCustomerCloudInboundFn
+        : (
+            await import("./availabilityCustomerConfirmService.js")
+          ).tryHandleAvailabilityCustomerCloudInbound;
+    const cloudConfirmResult = await tryCloudConfirmFn({
+      db,
+      businessId: ownerUserId,
+      customerPhone: cloudConfirmPhone,
+      messageText: latestMessage,
+      messageId,
+      sendCredentials,
+    });
+    if (cloudConfirmResult) {
+      skipGeneralBrainForWaitingConfirmOwnership = true;
+      console.log("[availability_cloud_confirm_ownership_handled]", {
+        traceId,
+        businessId: ownerUserId,
+        requestId: cloudConfirmResult.requestId ?? null,
+        action: cloudConfirmResult.action ?? null,
+        duplicate: cloudConfirmResult.duplicate === true,
+        isGroupInbound,
+        messagePreview: String(latestMessage ?? "").slice(0, 120),
+      });
+      reply = "";
+      sendVia = "NONE";
+      messageMeta = {
+        handledWithoutOutbound: true,
+        availabilityCloudConfirmHandled: true,
+        availabilityRequestId: cloudConfirmResult.requestId ?? null,
+        availabilityCloudConfirmAction: cloudConfirmResult.action ?? null,
+        outboundTrace: {
+          kind:
+            cloudConfirmResult.duplicate === true
+              ? "confirm_service_duplicate"
+              : "confirm_service_outbound",
+          finalReplySource: "AVAILABILITY_CUSTOMER_CLOUD_CONFIRM",
+        },
+      };
+    }
+  }
+
+  if (!skipGeneralBrainForWaitingConfirmOwnership) {
   const ownershipGuard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
     db,
     businessId: ownerUserId,
@@ -1777,6 +1834,7 @@ export async function executeWhatsAppAiPipeline(p) {
       },
     };
     intentionalSilent = true;
+  }
   }
 
   let routeGate = {
@@ -2574,14 +2632,26 @@ export async function executeWhatsAppAiPipeline(p) {
   }
 
   if (intentionalSilent) {
-    console.log("[silent_noop_marked_processed]", {
-      source:
-        String(messageMeta?.outboundTrace?.finalReplySource ?? "").trim() ||
-        "PURE_ACK_SILENT",
-      messageId: String(messageId ?? "").trim() || null,
-      bufferKey: String(sessionKey ?? "").trim() || null,
-      guaranteeKey: guaranteeKey || null,
-    });
+    if (messageMeta?.availabilityCloudConfirmHandled === true) {
+      console.log("[availability_cloud_confirm_buffer_skipped_outbound]", {
+        source:
+          String(messageMeta?.outboundTrace?.finalReplySource ?? "").trim() ||
+          "AVAILABILITY_CUSTOMER_CLOUD_CONFIRM",
+        action: messageMeta?.availabilityCloudConfirmAction ?? null,
+        requestId: messageMeta?.availabilityRequestId ?? null,
+        messageId: String(messageId ?? "").trim() || null,
+        bufferKey: String(sessionKey ?? "").trim() || null,
+      });
+    } else {
+      console.log("[silent_noop_marked_processed]", {
+        source:
+          String(messageMeta?.outboundTrace?.finalReplySource ?? "").trim() ||
+          "PURE_ACK_SILENT",
+        messageId: String(messageId ?? "").trim() || null,
+        bufferKey: String(sessionKey ?? "").trim() || null,
+        guaranteeKey: guaranteeKey || null,
+      });
+    }
   }
 
   if (

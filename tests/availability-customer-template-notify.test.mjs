@@ -337,6 +337,7 @@ test("5–11. template send persists Firestore fields and rendered preview", asy
     assert.equal(stored.approvalCustomerNotificationTemplateLanguage, "en_US");
     assert.equal(stored.customerLanguage, "roman_urdu");
     assert.equal(stored.customerConfirmationChannel, "waiting_confirm_cloud");
+    assert.equal(stored.lastCustomerDmPromptType, "booking_confirmation_prompt");
     assert.match(
       String(stored.lastCustomerNotifyMessage || ""),
       /Honda Civic 2026 Oriel \(White\) 2 din ke liye available hai/

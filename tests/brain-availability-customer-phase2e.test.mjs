@@ -153,8 +153,12 @@ function seedWaitingConfirmRequest(fakeDb, requestId, overrides = {}) {
       approvalCustomerNotificationStatus: "sent",
       approvalCustomerNotificationAt: sentAt,
       customerConfirmationStatus: "waiting_confirm",
+      customerConfirmationChannel: "waiting_confirm_cloud",
       confirmExpiresAt: buildConfirmExpiresAt(sentAt),
       customerConfirmProcessingStatus: "idle",
+      lastCustomerDmPromptType: "booking_confirmation_prompt",
+      lastCustomerNotifyMessage:
+        "Honda Civic 2026 3 din ke liye available hai. Book kar du?",
       priceQuote: { status: "quoted", total: 24000, currency: "PKR", durationDays: 3 },
       sourceIdentity: { participantKey: "cust-1", chatId: "Rental Leads", chatType: "group" },
       ...overrides,

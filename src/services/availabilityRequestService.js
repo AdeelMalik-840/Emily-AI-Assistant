@@ -1059,6 +1059,124 @@ function normalizePhoneDigits(value) {
   return String(value ?? "").replace(/[^\d+]/g, "");
 }
 
+function phoneDigitsOnly(value) {
+  return String(value ?? "").replace(/\D/g, "");
+}
+
+/**
+ * Cloud inbound phone match: wa_id / stored phones compared as digit strings.
+ * @param {Record<string, unknown>} request
+ * @param {string} customerPhone
+ */
+export function availabilityRequestMatchesCloudCustomerPhone(request, customerPhone) {
+  const inbound = phoneDigitsOnly(customerPhone);
+  if (!inbound) return false;
+  const targets = [
+    phoneDigitsOnly(request?.customerDmTarget),
+    phoneDigitsOnly(request?.customerPhone),
+    phoneDigitsOnly(request?.customerPhoneNormalized),
+    phoneDigitsOnly(request?.customerWaId),
+  ].filter(Boolean);
+  return targets.some((target) => target === inbound);
+}
+
+/**
+ * Eligible AVR for Cloud waiting_confirm ownership (excludes Playwright channels).
+ * @param {Record<string, unknown>} request
+ * @param {number} [nowMs]
+ */
+export function isCloudWaitingConfirmAvailabilityRequestEligible(request, nowMs = Date.now()) {
+  if (clean(request?.status) !== "approved") return false;
+  if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
+  if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
+  if (clean(request?.customerConfirmationChannel) !== "waiting_confirm_cloud") return false;
+  if (clean(request?.linkedBookingId)) return false;
+  const processing = clean(request?.customerConfirmProcessingStatus);
+  if (processing === "processing" || processing === "done") return false;
+  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
+  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ *   nowMs?: number,
+ * }} params
+ */
+export async function findWaitingConfirmCloudAvailabilityRequestsByPhone({
+  db: connection,
+  businessId,
+  customerPhone,
+  nowMs = Date.now(),
+}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!firestore || !uid || !phone) return [];
+
+  const snap = await availabilityRequestCollectionRef(connection, uid)
+    .where("status", "==", "approved")
+    .where("approvalCustomerNotificationStatus", "==", "sent")
+    .where("customerConfirmationStatus", "==", "waiting_confirm")
+    .limit(10)
+    .get()
+    .catch(() => null);
+  const docs = snap?.docs ?? [];
+  return docs
+    .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
+    .filter((row) => isCloudWaitingConfirmAvailabilityRequestEligible(row, nowMs))
+    .filter((row) => availabilityRequestMatchesCloudCustomerPhone(row, phone));
+}
+
+/**
+ * Idempotency lookup for a Cloud inbound WhatsApp message id already processed on an AVR.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   messageId: string,
+ * }} params
+ */
+export async function findAvailabilityRequestByCloudInboundMessageId({
+  db: connection,
+  businessId,
+  messageId,
+}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const mid = clean(messageId, 200);
+  if (!firestore || !uid || !mid) return null;
+
+  const collection = availabilityRequestCollectionRef(connection, uid);
+  if (!collection) return null;
+
+  const byDataId = await collection
+    .where("lastCustomerInboundDmDataId", "==", mid)
+    .limit(1)
+    .get()
+    .catch(() => null);
+  if (byDataId?.docs?.length) {
+    const doc = byDataId.docs[0];
+    return { requestId: doc.id, ...(doc.data() || {}) };
+  }
+
+  const byConfirmId = await collection
+    .where("customerConfirmationMessageId", "==", mid)
+    .limit(1)
+    .get()
+    .catch(() => null);
+  if (byConfirmId?.docs?.length) {
+    const doc = byConfirmId.docs[0];
+    return { requestId: doc.id, ...(doc.data() || {}) };
+  }
+
+  return null;
+}
+
 /**
  * @param {{
  *   db?: unknown,

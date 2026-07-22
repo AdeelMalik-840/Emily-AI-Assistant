@@ -436,11 +436,17 @@ test("Cloud path still disambiguates multiple waiting requests by phone", async 
       requestId: "avr_one",
       itemLabel: "Honda Civic 2026",
       itemId: "civic-1",
+      customerConfirmationChannel: "waiting_confirm_cloud",
+      customerDmChatTitle: null,
+      customerDmPlaywrightChatKey: null,
     }),
     avr_two: baseRequest({
       requestId: "avr_two",
       itemLabel: "Toyota Corolla 2021",
       itemId: "corolla-1",
+      customerConfirmationChannel: "waiting_confirm_cloud",
+      customerDmChatTitle: null,
+      customerDmPlaywrightChatKey: null,
     }),
   });
 

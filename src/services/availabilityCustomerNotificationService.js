@@ -1,5 +1,6 @@
 import db from "../config/firebase.js";
 import { isPlaywrightContactInfoPhoneExtractionEnabled } from "../brain/config/liveFeatureFlags.js";
+import { AVAILABILITY_DM_PROMPT_TYPES } from "../brain/availabilityConfirmation/index.js";
 import { findItemById, findItemByName } from "./inventoryService.js";
 import {
   extractDmContactPhoneFromOpenChat,
@@ -28,6 +29,7 @@ import {
   markAvailabilityRequestCustomerNotificationPending,
   markAvailabilityRequestCustomerNotificationSent,
   markAvailabilityRequestCustomerNotificationSkipped,
+  recordAvailabilityCustomerDmOutbound,
   resolveAvailabilityParticipantDisplayName,
   updateAvailabilityRequestFields,
 } from "./availabilityRequestService.js";
@@ -746,6 +748,13 @@ export async function sendAvailabilityCustomerNotification({
           requestId: rid,
           approvalCustomerNotificationMethod: "cloud_api_template",
         });
+        await recordAvailabilityCustomerDmOutbound({
+          db: firestore,
+          businessId: uid,
+          requestId: rid,
+          reply: templatePlan.renderedMessage,
+          promptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
+        }).catch(() => null);
 
         console.log("[availability_customer_template_notify_sent]", {
           requestId: rid,
@@ -842,6 +851,15 @@ export async function sendAvailabilityCustomerNotification({
         requestId: rid,
         approvalCustomerNotificationMethod: "cloud_api",
       });
+      if (clean(confirmPatch.customerConfirmationStatus) === "waiting_confirm") {
+        await recordAvailabilityCustomerDmOutbound({
+          db: firestore,
+          businessId: uid,
+          requestId: rid,
+          reply: built.message,
+          promptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
+        }).catch(() => null);
+      }
 
       console.log("[availability_customer_cloud_notify_sent]", {
         requestId: rid,
