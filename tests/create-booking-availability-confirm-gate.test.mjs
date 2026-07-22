@@ -329,4 +329,57 @@ test("does not affect normal booking creation without availabilityRequestId", as
 
   assert.equal(result.ok, true);
   assert.ok(result.booking);
+  assert.equal(result.booking.status, "pending_approval");
+  assert.notEqual(result.booking.approvalStage, "owner_approved_waiting_customer_details");
+});
+
+test("availability-confirm booking is created as approved with waiting customer details stage", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingConfirmRequest());
+
+  const result = await executeCreateBooking({
+    payload: basePayload({
+      approvalStage: "owner_approved_waiting_customer_details",
+      dmTargetSource: "availability_confirm_dm",
+      dmTargetPhone: CUSTOMER_PHONE,
+      canDmCustomer: true,
+    }),
+    executionContext: {
+      ...baseExecutionContext(fake.db),
+      dmTargetSource: "availability_confirm_dm",
+      canDmCustomer: true,
+      availabilityRequestId: REQUEST_ID,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(result.booking);
+  assert.equal(result.booking.status, "approved");
+  assert.equal(result.booking.approvalStage, "owner_approved_waiting_customer_details");
+  assert.equal(result.booking.availabilityRequestId, REQUEST_ID);
+  assert.equal(result.booking.dmTargetSource, "availability_confirm_dm");
+});
+
+test("owner_approved stage alone without confirm markers stays pending_approval", async () => {
+  const fake = createFakeDb();
+
+  const result = await executeCreateBooking({
+    payload: {
+      itemId: ITEM_ID,
+      itemName: "Honda Civic",
+      durationDays: 1,
+      approvalStage: "owner_approved_waiting_customer_details",
+      sourceMessage: "generic booking should stay pending",
+    },
+    executionContext: {
+      businessId: BUSINESS_ID,
+      traceId: "stage-only-no-confirm-markers",
+      dbOverride: fake.db,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(result.booking);
+  assert.equal(result.booking.status, "pending_approval");
+  assert.equal(result.booking.approvalStage, "owner_approved_waiting_customer_details");
 });
