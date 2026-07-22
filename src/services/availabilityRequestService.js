@@ -881,6 +881,11 @@ export async function claimAvailabilityRequestOwnerDecision({
  *   approvalCustomerNotificationMethod?: string | null,
  *   approvalCustomerNotificationProcessingStartedAt?: unknown,
  *   approvalCustomerNotificationProcessingStartedAtMs?: number | null,
+ *   approvalCustomerNotificationMetaHttpStatus?: number | null,
+ *   approvalCustomerNotificationMetaErrorCode?: string | null,
+ *   approvalCustomerNotificationMetaErrorMessage?: string | null,
+ *   approvalCustomerNotificationMetaErrorDetails?: string | null,
+ *   approvalCustomerNotificationMetaFbtraceId?: string | null,
  * }} params
  * @returns {Promise<boolean>}
  */
@@ -894,6 +899,11 @@ export async function updateAvailabilityRequestCustomerNotificationState({
   approvalCustomerNotificationMethod,
   approvalCustomerNotificationProcessingStartedAt,
   approvalCustomerNotificationProcessingStartedAtMs,
+  approvalCustomerNotificationMetaHttpStatus,
+  approvalCustomerNotificationMetaErrorCode,
+  approvalCustomerNotificationMetaErrorMessage,
+  approvalCustomerNotificationMetaErrorDetails,
+  approvalCustomerNotificationMetaFbtraceId,
 }) {
   const ref = availabilityRequestDocRef(connection, businessId, requestId);
   const status = clean(approvalCustomerNotificationStatus, 40);
@@ -923,6 +933,28 @@ export async function updateAvailabilityRequestCustomerNotificationState({
     if (Number.isFinite(startedMs)) {
       update.approvalCustomerNotificationProcessingStartedAtMs = startedMs;
     }
+  }
+  if (approvalCustomerNotificationMetaHttpStatus != null) {
+    const httpStatus = Number(approvalCustomerNotificationMetaHttpStatus);
+    if (Number.isFinite(httpStatus)) {
+      update.approvalCustomerNotificationMetaHttpStatus = Math.trunc(httpStatus);
+    }
+  }
+  if (approvalCustomerNotificationMetaErrorCode != null) {
+    const code = clean(approvalCustomerNotificationMetaErrorCode, 40);
+    if (code) update.approvalCustomerNotificationMetaErrorCode = code;
+  }
+  if (approvalCustomerNotificationMetaErrorMessage != null) {
+    const message = clean(approvalCustomerNotificationMetaErrorMessage, 500);
+    if (message) update.approvalCustomerNotificationMetaErrorMessage = message;
+  }
+  if (approvalCustomerNotificationMetaErrorDetails != null) {
+    const details = clean(approvalCustomerNotificationMetaErrorDetails, 500);
+    if (details) update.approvalCustomerNotificationMetaErrorDetails = details;
+  }
+  if (approvalCustomerNotificationMetaFbtraceId != null) {
+    const fbtraceId = clean(approvalCustomerNotificationMetaFbtraceId, 120);
+    if (fbtraceId) update.approvalCustomerNotificationMetaFbtraceId = fbtraceId;
   }
 
   try {
@@ -983,6 +1015,11 @@ export async function markAvailabilityRequestCustomerNotificationFailed({
   requestId,
   approvalCustomerNotificationError,
   approvalCustomerNotificationMethod,
+  approvalCustomerNotificationMetaHttpStatus,
+  approvalCustomerNotificationMetaErrorCode,
+  approvalCustomerNotificationMetaErrorMessage,
+  approvalCustomerNotificationMetaErrorDetails,
+  approvalCustomerNotificationMetaFbtraceId,
 }) {
   return updateAvailabilityRequestCustomerNotificationState({
     db: connection,
@@ -991,6 +1028,11 @@ export async function markAvailabilityRequestCustomerNotificationFailed({
     approvalCustomerNotificationStatus: "failed",
     approvalCustomerNotificationError,
     approvalCustomerNotificationMethod,
+    approvalCustomerNotificationMetaHttpStatus,
+    approvalCustomerNotificationMetaErrorCode,
+    approvalCustomerNotificationMetaErrorMessage,
+    approvalCustomerNotificationMetaErrorDetails,
+    approvalCustomerNotificationMetaFbtraceId,
   });
 }
 
