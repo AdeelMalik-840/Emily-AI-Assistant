@@ -202,6 +202,115 @@ async function sendCustomerDmReply({
   return reply;
 }
 
+const PRE_CLAIM_CONFIRM_FAILURE_REASONS = new Set([
+  "CONFIRM_EXECUTE_DISABLED",
+  "BRAIN_CONFIRM_ACTION_NOT_ALLOWED",
+  "MISSING_REQUEST",
+  "CUSTOMER_NOT_NOTIFIED",
+  "NOT_WAITING_CONFIRM",
+  "REQUEST_NOT_APPROVED",
+  "EMPTY_MESSAGE",
+]);
+
+const CLAIM_CONFIRM_FAILURE_REASONS = new Set([
+  "MISSING_REQUEST_REF",
+  "REQUEST_NOT_FOUND",
+  "BOOKING_ALREADY_LINKED",
+  "ALREADY_PROCESSING",
+  "REQUEST_EXPIRED",
+  "CLAIM_FAILED",
+]);
+
+const CREATE_BOOKING_CONFIRM_FAILURE_REASONS = new Set([
+  "MISSING_ITEM_OR_DURATION",
+  "CREATE_BOOKING_FAILED",
+  "MISSING_ITEM_ID",
+  "MISSING_DURATION",
+  "MISSING_BUSINESS_ID",
+  "BOOKING_CREATE_FAILED",
+  "BOOKING_EXECUTOR_ERROR",
+  "INVALID_DURATION",
+  "MISSING_USER_OR_ITEM",
+]);
+
+/**
+ * @param {string} reason
+ * @returns {"pre_claim" | "claim" | "create_booking" | "unknown"}
+ */
+export function resolveCustomerConfirmFailureStage(reason) {
+  const code = clean(reason, 120);
+  if (!code) return "unknown";
+  if (PRE_CLAIM_CONFIRM_FAILURE_REASONS.has(code)) return "pre_claim";
+  if (CLAIM_CONFIRM_FAILURE_REASONS.has(code)) return "claim";
+  if (CREATE_BOOKING_CONFIRM_FAILURE_REASONS.has(code)) return "create_booking";
+  if (code.startsWith("AVAILABILITY_")) return "create_booking";
+  return "unknown";
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} extras
+ */
+function buildCustomerConfirmFailureDetails(extras = null) {
+  const src = extras && typeof extras === "object" ? extras : {};
+  /** @type {Record<string, unknown>} */
+  const details = {};
+  if (src.dryRun === true) details.dryRun = true;
+  const bookingReason = clean(src.bookingReason ?? src.reason, 160);
+  const bookingCode = clean(src.bookingCode ?? src.code, 120);
+  if (bookingReason) details.bookingReason = bookingReason;
+  if (bookingCode && bookingCode !== bookingReason) details.bookingCode = bookingCode;
+  if (src.blocked === true) details.blocked = true;
+  return Object.keys(details).length > 0 ? details : null;
+}
+
+/**
+ * Diagnostic-only AVR failure markers. Does not change confirmation/booking status.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   reason?: string | null,
+ *   details?: Record<string, unknown> | null,
+ *   extraPatch?: Record<string, unknown>,
+ * }} params
+ */
+async function persistCustomerConfirmBookingFailure({
+  db: connection,
+  businessId,
+  requestId,
+  reason = null,
+  details = null,
+  extraPatch = null,
+}) {
+  const uid = clean(businessId);
+  const rid = clean(requestId);
+  const failureReason = clean(reason, 160) || "UNKNOWN_CONFIRM_FAILURE";
+  if (!uid || !rid) {
+    return {
+      reason: failureReason,
+      failureStage: resolveCustomerConfirmFailureStage(failureReason),
+      failureDetails: buildCustomerConfirmFailureDetails(details),
+    };
+  }
+  const failureStage = resolveCustomerConfirmFailureStage(failureReason);
+  const failureDetails = buildCustomerConfirmFailureDetails(details);
+  const patch = {
+    ...(extraPatch && typeof extraPatch === "object" ? extraPatch : {}),
+    customerConfirmFailureReason: failureReason,
+    customerConfirmFailureStage: failureStage,
+    customerConfirmFailureDetails: failureDetails,
+    customerConfirmFailureAt: new Date(),
+    customerConfirmFailureAction: "confirm_booking",
+  };
+  await updateAvailabilityRequestFields({
+    db: connection,
+    businessId: uid,
+    requestId: rid,
+    patch,
+  }).catch(() => null);
+  return { reason: failureReason, failureStage, failureDetails };
+}
+
 async function sendPlaywrightCustomerDmReply({
   reply,
   sendReplyFn,
@@ -250,10 +359,34 @@ export async function executeAvailabilityCustomerConfirmBooking({
   const uid = clean(businessId);
   const requestId = clean(request?.requestId ?? request?.id);
   if (!uid || !requestId) {
-    return { ok: false, reason: "MISSING_REQUEST" };
+    const failure = await persistCustomerConfirmBookingFailure({
+      db: connection,
+      businessId: uid,
+      requestId,
+      reason: "MISSING_REQUEST",
+    });
+    return {
+      ok: false,
+      reason: failure.reason,
+      failureStage: failure.failureStage,
+      failureDetails: failure.failureDetails,
+    };
   }
   if (availabilityConfirmExecute !== true) {
-    return { ok: false, reason: "CONFIRM_EXECUTE_DISABLED", dryRun: true };
+    const failure = await persistCustomerConfirmBookingFailure({
+      db: connection,
+      businessId: uid,
+      requestId,
+      reason: "CONFIRM_EXECUTE_DISABLED",
+      details: { dryRun: true },
+    });
+    return {
+      ok: false,
+      reason: failure.reason,
+      dryRun: true,
+      failureStage: failure.failureStage,
+      failureDetails: failure.failureDetails,
+    };
   }
 
   const decision = resolveAvailabilityConfirmationTurn({
@@ -261,10 +394,18 @@ export async function executeAvailabilityCustomerConfirmBooking({
     messageText,
   });
   if (!decision.ok || decision.actionType !== "confirm_booking") {
+    const failure = await persistCustomerConfirmBookingFailure({
+      db: connection,
+      businessId: uid,
+      requestId,
+      reason: decision.reason || "BRAIN_CONFIRM_ACTION_NOT_ALLOWED",
+    });
     return {
       ok: false,
-      reason: decision.reason || "BRAIN_CONFIRM_ACTION_NOT_ALLOWED",
+      reason: failure.reason,
       decision,
+      failureStage: failure.failureStage,
+      failureDetails: failure.failureDetails,
     };
   }
 
@@ -274,7 +415,19 @@ export async function executeAvailabilityCustomerConfirmBooking({
     requestId,
   });
   if (!claim.ok) {
-    return { ok: false, reason: claim.reason || "CLAIM_FAILED", request: claim.request ?? null };
+    const failure = await persistCustomerConfirmBookingFailure({
+      db: connection,
+      businessId: uid,
+      requestId,
+      reason: claim.reason || "CLAIM_FAILED",
+    });
+    return {
+      ok: false,
+      reason: failure.reason,
+      request: claim.request ?? null,
+      failureStage: failure.failureStage,
+      failureDetails: failure.failureDetails,
+    };
   }
 
   const sourceIdentity =
@@ -295,13 +448,19 @@ export async function executeAvailabilityCustomerConfirmBooking({
       ? Math.max(1, Math.floor(Number(request.requestedDuration)))
       : null;
   if (!durationDays || !clean(request?.itemId)) {
-    await updateAvailabilityRequestFields({
+    const failure = await persistCustomerConfirmBookingFailure({
       db: connection,
       businessId: uid,
       requestId,
-      patch: { customerConfirmProcessingStatus: "idle" },
+      reason: "MISSING_ITEM_OR_DURATION",
+      extraPatch: { customerConfirmProcessingStatus: "idle" },
     });
-    return { ok: false, reason: "MISSING_ITEM_OR_DURATION" };
+    return {
+      ok: false,
+      reason: failure.reason,
+      failureStage: failure.failureStage,
+      failureDetails: failure.failureDetails,
+    };
   }
 
   const bookingResult = await executeCreateBooking({
@@ -349,19 +508,29 @@ export async function executeAvailabilityCustomerConfirmBooking({
   });
 
   if (bookingResult?.ok !== true || !bookingResult?.booking?.id) {
-    await updateAvailabilityRequestFields({
+    const bookingReason =
+      bookingResult?.reason || bookingResult?.code || "CREATE_BOOKING_FAILED";
+    const failure = await persistCustomerConfirmBookingFailure({
       db: connection,
       businessId: uid,
       requestId,
-      patch: {
+      reason: bookingReason,
+      details: {
+        bookingReason: bookingResult?.reason ?? null,
+        bookingCode: bookingResult?.code ?? null,
+        blocked: bookingResult?.blocked === true,
+      },
+      extraPatch: {
         customerConfirmProcessingStatus: "idle",
         customerConfirmationStatus: "waiting_confirm",
       },
     });
     return {
       ok: false,
-      reason: bookingResult?.reason || bookingResult?.code || "CREATE_BOOKING_FAILED",
+      reason: failure.reason,
       bookingResult,
+      failureStage: failure.failureStage,
+      failureDetails: failure.failureDetails,
     };
   }
 
@@ -497,6 +666,10 @@ export async function handleAvailabilityCustomerPlaywrightInbound({
       reply,
       result,
       decision,
+      requestId,
+      actionType: decision.actionType,
+      failureReason: result.ok === true ? null : result.reason ?? null,
+      failureStage: result.ok === true ? null : result.failureStage ?? null,
     };
   }
 
@@ -716,6 +889,9 @@ export async function handleAvailabilityCustomerCloudInbound({
       result,
       decision,
       requestId,
+      actionType: decision.actionType,
+      failureReason: result.ok === true ? null : result.reason ?? null,
+      failureStage: result.ok === true ? null : result.failureStage ?? null,
     };
   }
 
