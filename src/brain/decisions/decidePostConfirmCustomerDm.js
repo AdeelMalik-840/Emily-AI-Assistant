@@ -24,6 +24,7 @@ export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
 export const POST_CONFIRM_ACTIONS = Object.freeze([
   "none",
   "reply",
+  "silence",
   "escalate_missing_info",
   "fallthrough_action",
 ]);
@@ -34,13 +35,31 @@ export const POST_CONFIRM_SITUATIONS = Object.freeze([
   "repeat_question_answered",
   "pending_owner_answer",
   "owner_answer_already_sent",
+  "conversation_closing",
+  "social_repair",
+  "decline_more_help",
   "protected_action",
+  "unclear",
+]);
+
+export const POST_CONFIRM_CUSTOMER_INTENTS = Object.freeze([
+  "ack",
+  "farewell",
+  "social_challenge",
+  "decline_more_help",
+  "ask_fact",
+  "ask_action",
+  "complain",
+  "thanks",
   "unclear",
 ]);
 
 /** Honesty-safe fallback — does not promise a follow-up check. */
 export const POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK =
   "Abhi ye detail confirm nahi hai.";
+
+/** Short non-echo close used only when anti-echo must replace a mirrored reply. */
+export const POST_CONFIRM_NON_ECHO_CLOSE = "Theek hai.";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -62,9 +81,137 @@ function cleanSituation(value) {
   return POST_CONFIRM_SITUATIONS.includes(situation) ? situation : "unclear";
 }
 
+function cleanIntent(value) {
+  const intent = clean(value, 40).toLowerCase();
+  return POST_CONFIRM_CUSTOMER_INTENTS.includes(intent) ? intent : "unclear";
+}
+
 function cleanType(value) {
   const t = clean(value, 40).toLowerCase();
   return t || null;
+}
+
+/**
+ * Normalize for echo comparison (not a reply table).
+ * @param {string} value
+ */
+export function normalizeForEchoCompare(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * True when reply is same or near-same as customer message (generic anti-echo).
+ * @param {string} userMessage
+ * @param {string} reply
+ */
+export function isNearEchoReply(userMessage, reply) {
+  const a = normalizeForEchoCompare(userMessage);
+  const b = normalizeForEchoCompare(reply);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  // Short social lines: one embeds the other with tiny length delta.
+  if (a.length <= 40 && b.length <= 40) {
+    if (a.includes(b) || b.includes(a)) {
+      const ratio =
+        Math.min(a.length, b.length) / Math.max(a.length, b.length);
+      if (ratio >= 0.75) return true;
+    }
+  }
+  return false;
+}
+
+function isSocialOrClosingAct(conversationAct, customerIntent, situation) {
+  if (
+    conversationAct === "acknowledgement" ||
+    conversationAct === "thanks" ||
+    conversationAct === "chit_chat"
+  ) {
+    return true;
+  }
+  if (
+    customerIntent === "ack" ||
+    customerIntent === "farewell" ||
+    customerIntent === "thanks" ||
+    customerIntent === "social_challenge" ||
+    customerIntent === "decline_more_help"
+  ) {
+    return true;
+  }
+  if (
+    situation === "conversation_closing" ||
+    situation === "social_repair" ||
+    situation === "decline_more_help" ||
+    situation === "acknowledgement_after_answer"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Apply silence / anti-echo hardening to a decision (generic, not phrase maps).
+ * @param {Record<string, unknown>} decision
+ * @param {string} userMessage
+ */
+export function applyPostConfirmAntiEchoAndSilence(decision, userMessage) {
+  const next = { ...(decision && typeof decision === "object" ? decision : {}) };
+  let action = cleanAction(next.action);
+  let conversationAct = cleanAct(next.conversationAct);
+  let situation = cleanSituation(next.situation);
+  let customerIntent = cleanIntent(next.customerIntent);
+  let customerReply = clean(next.customerReply, 500);
+  let shouldReply =
+    next.shouldReply === false
+      ? false
+      : next.shouldReply === true
+        ? true
+        : action !== "silence" && action !== "none";
+
+  if (action === "silence" || shouldReply === false) {
+    action = "silence";
+    shouldReply = false;
+    customerReply = "";
+  }
+
+  if (
+    customerReply &&
+    isSocialOrClosingAct(conversationAct, customerIntent, situation) &&
+    isNearEchoReply(userMessage, customerReply)
+  ) {
+    // Prefer silence for pure farewell/ack echo; tiny non-echo close for repair contexts.
+    if (
+      situation === "social_repair" ||
+      customerIntent === "social_challenge" ||
+      customerIntent === "complain"
+    ) {
+      customerReply = POST_CONFIRM_NON_ECHO_CLOSE;
+      action = "reply";
+      shouldReply = true;
+    } else {
+      customerReply = "";
+      action = "silence";
+      shouldReply = false;
+    }
+  }
+
+  if (action === "none" && !customerReply) {
+    action = "silence";
+    shouldReply = false;
+  }
+
+  return {
+    ...next,
+    conversationAct,
+    customerIntent,
+    situation,
+    customerReply,
+    action,
+    shouldReply,
+  };
 }
 
 function compactOpenMissingInfo(rows) {
@@ -186,10 +333,12 @@ export function hasOpenPaMissingInfoForType(facts, missingInfoType) {
 function defaultDecision(overrides = {}) {
   return {
     conversationAct: "unknown",
+    customerIntent: "unclear",
     customerIsAskingQuestion: false,
     requestedInfoType: null,
     customerReply: POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
     action: "reply",
+    shouldReply: true,
     situation: "unclear",
     ...overrides,
   };
@@ -198,8 +347,10 @@ function defaultDecision(overrides = {}) {
 /**
  * Normalize / harden model JSON into the Brain decision contract.
  * @param {string} raw
+ * @param {{ userMessage?: string | null }} [opts]
  */
-export function parsePostConfirmCustomerDmDecision(raw) {
+export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
+  const userMessage = String(opts.userMessage ?? "").trim();
   let text = String(raw ?? "").trim();
   if (!text) return null;
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -216,26 +367,43 @@ export function parsePostConfirmCustomerDmDecision(raw) {
   } catch {
     const plain = text.replace(/^\s*["']|["']\s*$/g, "").trim();
     if (!plain || plain.startsWith("{")) return null;
-    return defaultDecision({
-      customerReply: plain.slice(0, 500),
-      situation: "unclear",
-    });
+    return applyPostConfirmAntiEchoAndSilence(
+      defaultDecision({
+        customerReply: plain.slice(0, 500),
+        situation: "unclear",
+        shouldReply: true,
+      }),
+      userMessage
+    );
   }
 
   if (!parsed || typeof parsed !== "object") return null;
 
-  const customerReply = String(parsed.customerReply ?? parsed.reply ?? "")
+  let customerReply = String(parsed.customerReply ?? parsed.reply ?? "")
     .replace(/^\s*["']|["']\s*$/g, "")
     .trim();
-  if (!customerReply) return null;
+  let action = cleanAction(parsed.action);
+  let shouldReply =
+    parsed.shouldReply === false
+      ? false
+      : parsed.shouldReply === true
+        ? true
+        : action !== "silence" && action !== "none";
+
+  // Silence / no-reply may have empty customerReply.
+  if ((action === "silence" || shouldReply === false) && !customerReply) {
+    customerReply = "";
+  } else if (!customerReply) {
+    return null;
+  }
 
   let conversationAct = cleanAct(parsed.conversationAct);
+  let customerIntent = cleanIntent(parsed.customerIntent);
   let customerIsAskingQuestion = parsed.customerIsAskingQuestion === true;
   let requestedInfoType =
     cleanType(parsed.requestedInfoType) ||
     cleanType(parsed.missingInfoType) ||
     null;
-  let action = cleanAction(parsed.action);
   let situation = cleanSituation(parsed.situation);
 
   // Legacy fields must never drive escalate by themselves.
@@ -271,13 +439,21 @@ export function parsePostConfirmCustomerDmDecision(raw) {
       situation === "pending_owner_answer"
     ) {
       situation =
-        conversationAct === "thanks"
-          ? "acknowledgement_after_answer"
-          : situation === "unclear"
-            ? "acknowledgement_after_answer"
-            : "acknowledgement_after_answer";
+        customerIntent === "farewell" || customerIntent === "decline_more_help"
+          ? "conversation_closing"
+          : "acknowledgement_after_answer";
     }
     if (action === "escalate_missing_info") action = "reply";
+  }
+
+  if (customerIntent === "farewell") {
+    situation = "conversation_closing";
+  }
+  if (customerIntent === "decline_more_help") {
+    situation = "decline_more_help";
+  }
+  if (customerIntent === "social_challenge") {
+    situation = "social_repair";
   }
 
   if (conversationAct === "action_request") {
@@ -289,10 +465,7 @@ export function parsePostConfirmCustomerDmDecision(raw) {
     action = "reply";
   }
 
-  if (
-    situation !== "new_question" &&
-    action === "escalate_missing_info"
-  ) {
+  if (situation !== "new_question" && action === "escalate_missing_info") {
     action = "reply";
   }
 
@@ -316,19 +489,20 @@ export function parsePostConfirmCustomerDmDecision(raw) {
     if (situation === "new_question") situation = "protected_action";
   }
 
-  if (action === "none" && !customerReply) {
-    action = "reply";
-  }
-
-  return {
-    conversationAct,
-    customerIsAskingQuestion,
-    requestedInfoType:
-      conversationAct === "information_request" ? requestedInfoType : null,
-    customerReply: customerReply.slice(0, 500),
-    action,
-    situation,
-  };
+  return applyPostConfirmAntiEchoAndSilence(
+    {
+      conversationAct,
+      customerIntent,
+      customerIsAskingQuestion,
+      requestedInfoType:
+        conversationAct === "information_request" ? requestedInfoType : null,
+      customerReply: customerReply.slice(0, 500),
+      action,
+      shouldReply,
+      situation,
+    },
+    userMessage
+  );
 }
 
 /**
@@ -414,78 +588,77 @@ export async function decidePostConfirmCustomerDm({
   AND that fact is missing/null in known
   AND there is NO openMissingInfoRequests row for the same missingInfoType.
 - customerReply may briefly say you will confirm (a real follow-up will run) ONLY for new_question escalate.
-- Never escalate for acknowledgement, thanks, chit_chat, unclear, pending_owner_answer, repeat_question_answered, or owner_answer_already_sent.`
+- Never escalate for acknowledgement, thanks, chit_chat, farewell, decline_more_help, social_repair, unclear, pending_owner_answer, or repeat_question_answered.`
     : `- Never set action="escalate_missing_info" (follow-up loop is not fully enabled).
 - If a requested fact is missing, say it is not confirmed yet. Do NOT promise to check later.
-- Prefer action="reply".`;
+- Prefer action="reply" or silence for social closes.`;
 
-  const system = `You are Emily — Pakistani WhatsApp business staff for this business (not a call-center bot).
+  const system = `You are Emily — a smart Pakistani WhatsApp business staff human (not a bot script, not a call-center dump).
 
 OUTPUT FORMAT (required):
 Return ONLY one JSON object (no markdown fences):
-{"situation":"new_question","conversationAct":"information_request","customerIsAskingQuestion":true,"requestedInfoType":null,"customerReply":"<short reply>","action":"reply"}
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence"}
 
-customerReply language: ${lang}
+customerReply language when shouldReply=true: ${lang}
 
-SITUATION (required — use workflow state in VERIFIED_BUSINESS_PA_FACTS_JSON; do NOT rely only on RECENT_CONVERSATION):
-- acknowledgement_after_answer: customer only acks/thanks AFTER Emily already sent customerFollowupText / answered (latestClosedMissingInfoAnswers).
-- repeat_question_answered: customer asks again a type already answered in known or latestClosedMissingInfoAnswers — answer from those facts.
-- pending_owner_answer: same type already in openMissingInfoRequests — do NOT create another request; say you are still confirming.
-- owner_answer_already_sent: closed row with customerFollowupStatus sent / customerFollowupText present and customer is not asking something new.
-- new_question: genuine new missing detail (or new type) not answered and not already open.
-- protected_action: book/cancel/change/confirm intents (usually handled outside).
-- unclear: ambiguous — reply safely; never escalate; never dangerous actions.
+NEVER MIRROR THE CUSTOMER:
+- customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
+- If you would only repeat them, use action="silence" and shouldReply=false with empty customerReply.
 
-STEP 1 — Classify conversationAct:
-- acknowledgement: short confirm only (OK, okay, theek hai, done, ji, haan) with NO new question
-- thanks: gratitude only
-- information_request: customer wants a fact (may include leading ack, e.g. "ok driver milega?")
-- action_request: book/cancel/change/confirm
-- chit_chat / correction / unknown: as named
+SOCIAL / END-OF-CHAT (critical):
+- Farewells ("have a good day", "allah hafiz", "bye") → situation=conversation_closing, customerIntent=farewell. Prefer action=silence OR a short natural close that is NOT a copy. Never copy their farewell.
+- "you too" after a closing → usually silence (shouldReply=false). Tiny close only if needed — never copy "you too".
+- "why are you copying me" / frustration about echoing → situation=social_repair, customerIntent=social_challenge. Brief apology + stop mirroring. Do NOT ask business clarification. Do NOT ask "kuch aur poochna?".
+- "no" / "nahi" after Emily offered more help OR while closing → situation=decline_more_help, customerIntent=decline_more_help. Reply like a short "Theek hai" OR silence. Do NOT use old clarification ("Main samajh nahi paaya… availability, price, booking…").
+- Do NOT repeatedly ask "kuch aur poochna hai?" / "Kya aap kuch aur poochna chahte hain?".
+- Do NOT use onboarding/clarification style for social endings.
 
-STEP 2 — Set customerIsAskingQuestion=true only when they are asking for information.
+SITUATION values:
+acknowledgement_after_answer | repeat_question_answered | pending_owner_answer | owner_answer_already_sent | new_question | conversation_closing | social_repair | decline_more_help | protected_action | unclear
 
-STEP 3 — requestedInfoType:
-- Set only when conversationAct=information_request AND customerIsAskingQuestion=true
-- Else must be null
-- Allowed: ${PA_MISSING_INFO_TYPES.join(", ")}
+customerIntent values:
+ack | farewell | social_challenge | decline_more_help | ask_fact | ask_action | complain | thanks | unclear
 
-STEP 4 — action (authoritative):
-- reply / none: normal answer/ack
-- escalate_missing_info: only for situation=new_question per escalate rules
+STEP 1 — conversationAct:
+- acknowledgement / thanks / chit_chat / information_request / action_request / correction / unknown
+
+STEP 2 — customerIsAskingQuestion=true only for real information asks (including "ok driver milega?").
+
+STEP 3 — requestedInfoType only for information_request asks; else null. Allowed: ${PA_MISSING_INFO_TYPES.join(", ")}
+
+STEP 4 — action:
+- silence: no WhatsApp send (shouldReply=false, customerReply="")
+- none: rare; prefer silence when empty
+- reply: send customerReply
+- escalate_missing_info: only situation=new_question per escalate rules
 - Do NOT use fallthrough_action here
 
-SITUATION RULES (must follow):
-- If customer acknowledges after Emily already sent the requested answer (see customerFollowupText / latestClosedMissingInfoAnswers), use situation=acknowledgement_after_answer and action=reply or none. Do NOT notify owner. Do NOT open a new missing-info request.
-- If customer asks the same answered question again, use situation=repeat_question_answered and answer from known facts / latestClosedMissingInfoAnswers (ownerAnswer / follow-up text). Do NOT escalate.
-- If there is already an open pending request for the same type, use situation=pending_owner_answer and action=reply. Do NOT create another request. Do NOT notify owner again.
-- If customer asks a NEW missing detail (not in known, not closed, not open), situation=new_question and action may be escalate_missing_info.
-- If unclear, situation=unclear — avoid dangerous actions and do NOT escalate.
-- Do NOT repeat “confirm karta hun / confirm karke batata hun” if the answer was already sent in customerFollowupText.
-- Do NOT notify owner for acknowledgement / thanks / chit_chat.
+SITUATION RULES:
+- Ack after Emily already answered (customerFollowupText / known) → acknowledgement_after_answer; reply brief or silence; never escalate.
+- Same answered question again → repeat_question_answered; answer from known / latestClosedMissingInfoAnswers.
+- Open pending same type → pending_owner_answer; do not create another request.
+- New missing detail → new_question; may escalate if loop enabled.
+- Prefer workflow fields over incomplete RECENT_CONVERSATION.
 
 ${escalateGuidance}
 
 TONE:
-- Local Pakistani Roman Urdu, short (1 sentence, max 2), under ~120 chars when possible.
-- No Hindi formal "swagat", no CRM dump, no welcome speech.
-- Money from facts must include PKR.
+- Short Pakistani Roman Urdu WhatsApp staff, natural. Money from facts includes PKR.
+- No Hindi "swagat", no CRM dump, no welcome speech for active bookings.
 
 CONTEXT:
-- Use ONLY VERIFIED_BUSINESS_PA_FACTS_JSON (especially openMissingInfoRequests + latestClosedMissingInfoAnswers + known).
-- RECENT_CONVERSATION is optional/incomplete — prefer workflow fields for what Emily already told the customer.
+- Use ONLY VERIFIED_BUSINESS_PA_FACTS_JSON + RECENT_CONVERSATION.
 - ${
     hasActiveBooking
-      ? "Active booking is BACKGROUND. Do not onboard or welcome as a new visitor."
+      ? "Active booking is BACKGROUND. Do not onboard as a new visitor."
       : "No active booking object."
   }
-- If advance/driver/etc already present in known facts, answer from facts — do not escalate.
 
 STRICT SAFETY:
 - Do NOT invent amounts or policies.
 - Do NOT create/cancel/change bookings.
 - Do NOT mention Brain, Firestore, OpenAI, or internal tokens.
-- Never escalate acknowledgement/thanks/unclear.`;
+- Never escalate social/closing/acknowledgement turns.`;
 
   let userPayload = `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\nCUSTOMER_MESSAGE:\n${userLine || "(empty)"}`;
   if (historyLine) {
@@ -516,14 +689,14 @@ STRICT SAFETY:
       completionFn({
         model: resolveOpenAiChatModel(),
         temperature: 0.35,
-        max_tokens: 280,
+        max_tokens: 300,
         messages: [
           { role: "system", content: system },
           {
             role: "user",
             content:
               userPayload +
-              "\n\nRemember: JSON only; set situation from workflow state; never escalate acknowledgements or pending/answered types; only verified facts; no inventing.",
+              "\n\nRemember: JSON only; never mirror the customer; silence ok for farewells; social 'no' is decline_more_help not clarification; never escalate acknowledgements; only verified facts.",
           },
         ],
       })
@@ -545,8 +718,13 @@ STRICT SAFETY:
 
     const resp = await timed;
     const raw = resp?.choices?.[0]?.message?.content ?? "";
-    const decision = parsePostConfirmCustomerDmDecision(raw);
-    if (!decision?.customerReply) {
+    const decision = parsePostConfirmCustomerDmDecision(raw, {
+      userMessage: userLine,
+    });
+    const hasSendableReply = Boolean(clean(decision?.customerReply));
+    const isSilence =
+      decision?.action === "silence" || decision?.shouldReply === false;
+    if (!decision || (!hasSendableReply && !isSilence)) {
       return {
         ok: false,
         decision: defaultDecision(),
@@ -569,9 +747,11 @@ STRICT SAFETY:
       decision.situation = "pending_owner_answer";
     }
 
+    const finalized = applyPostConfirmAntiEchoAndSilence(decision, userLine);
+
     return {
       ok: true,
-      decision,
+      decision: finalized,
       source: "openai",
     };
   } catch (err) {

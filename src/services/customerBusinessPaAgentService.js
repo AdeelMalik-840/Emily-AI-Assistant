@@ -5,6 +5,7 @@
  */
 
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
+import { appendConversationMessage } from "./conversationStore.js";
 import {
   isEmilyBusinessPaAgentEnabled,
   isEmilyBusinessPaMissingInfoEnabled,
@@ -12,6 +13,7 @@ import {
 } from "../brain/config/liveFeatureFlags.js";
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
 import {
+  applyPostConfirmAntiEchoAndSilence,
   canEscalatePostConfirmMissingInfo,
   decidePostConfirmCustomerDm,
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
@@ -38,12 +40,28 @@ function phoneDigitsOnly(value) {
 }
 
 /**
+ * Bare social/ending declines — NOT protected booking actions in post-confirm PA.
+ * These must reach the Brain decision helper (not ClarificationWorkflow).
+ */
+function isBareSocialDecline(message) {
+  const t = clean(message).toLowerCase();
+  return /^(no|nah|nahi|nahin|nope|na)\.?$/i.test(t);
+}
+
+/**
+ * Explicit booking/cancel/change protection (post-confirm PA).
+ * Bare "no"/"nahi" alone is NOT an action — social closing goes to Brain.
  * @param {string} message
  * @param {Record<string, unknown> | null} [facts]
  */
 export function classifyCustomerBusinessPaActionIntent(message, facts = null) {
   const text = clean(message);
   if (!text) return { isAction: false, kind: "empty" };
+
+  // Social/ending decline → Brain decide (not AVR-confirm decline fallthrough).
+  if (isBareSocialDecline(text)) {
+    return { isAction: false, kind: "social_decline" };
+  }
 
   const booking =
     facts?.booking && typeof facts.booking === "object" ? facts.booking : {};
@@ -65,7 +83,8 @@ export function classifyCustomerBusinessPaActionIntent(message, facts = null) {
   }
   if (
     /\b(date\s*change|change\s*date|tarikh\s*badal|date\s*badal)\b/i.test(text) ||
-    /\b(reschedule|postpone)\b/i.test(text)
+    /\b(reschedule|postpone)\b/i.test(text) ||
+    /\b(booking\s*change|change\s*booking)\b/i.test(text)
   ) {
     return { isAction: true, kind: "change_date" };
   }
@@ -83,9 +102,10 @@ export function classifyCustomerBusinessPaActionIntent(message, facts = null) {
   }
 
   const intent = classifyAvailabilityConfirmationIntent(text, requestShape);
+  // Post-confirm: do NOT treat bare decline as ACTION_INTENT (causes Clarification leak).
+  // Keep confirm / change_* from the shared classifier when they are real action phrases.
   if (
     intent === "confirm" ||
-    intent === "decline" ||
     intent === "change_duration" ||
     intent === "change_car"
   ) {
@@ -95,12 +115,17 @@ export function classifyCustomerBusinessPaActionIntent(message, facts = null) {
   if (
     /\b(cancel\s*booking|booking\s*cancel|cancel\s*kar\s*do|cancel\s*kr\s*do|update\s*booking)\b/i.test(
       text
-    )
+    ) ||
+    /\b(nahi\s*chahiye|not\s*interested|rehne\s*do|rehne\s*dein)\b/i.test(text)
   ) {
     return { isAction: true, kind: "cancel_or_update" };
   }
 
-  if (/\b(new\s*booking|create\s*booking)\b/i.test(text)) {
+  if (
+    /\b(new\s*booking|create\s*booking|reserve\s*(kar|kr)?\s*(do|dein)?)\b/i.test(
+      text
+    )
+  ) {
     return { isAction: true, kind: "create_booking" };
   }
 
@@ -157,6 +182,7 @@ function isLikelyDeliveryAddressOnly(message) {
  *   __createOrGetOpenPaMissingInfoRequestFn?: typeof createOrGetOpenPaMissingInfoRequest,
  *   __sendPaMissingInfoOwnerNotificationFn?: typeof sendPaMissingInfoOwnerNotification,
  *   __chatCompletionsCreateForTests?: Function,
+ *   __appendConversationMessageFn?: typeof appendConversationMessage,
  * }} params
  */
 export async function handleCustomerBusinessPaInbound({
@@ -176,6 +202,7 @@ export async function handleCustomerBusinessPaInbound({
   __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
   __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
   __chatCompletionsCreateForTests = null,
+  __appendConversationMessageFn = appendConversationMessage,
 }) {
   if (!businessPaEnabled) {
     return { handled: false, reason: "FLAG_OFF" };
@@ -232,21 +259,31 @@ export async function handleCustomerBusinessPaInbound({
     __chatCompletionsCreateForTests,
   });
 
-  const decision = decided?.decision || {
+  let decision = decided?.decision || {
     conversationAct: "unknown",
+    customerIntent: "unclear",
     customerIsAskingQuestion: false,
     requestedInfoType: null,
     customerReply: POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
     action: "reply",
+    shouldReply: true,
     situation: "unclear",
   };
+  decision = applyPostConfirmAntiEchoAndSilence(decision, text);
 
-  const reply = clean(
-    decision.customerReply || POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
-    500
-  );
+  const shouldSend =
+    decision.action !== "silence" &&
+    decision.shouldReply !== false &&
+    Boolean(clean(decision.customerReply));
+  const reply = shouldSend
+    ? clean(decision.customerReply, 500)
+    : "";
   const openaiUsed = decided?.source === "openai" && decided?.ok === true;
-  const reason = openaiUsed ? "HANDLED" : "HANDLED_FALLBACK";
+  const reason = shouldSend
+    ? openaiUsed
+      ? "HANDLED"
+      : "HANDLED_FALLBACK"
+    : "HANDLED_SILENCE";
 
   let missingInfoEscalated = false;
   let missingInfoRequestId = null;
@@ -310,17 +347,32 @@ export async function handleCustomerBusinessPaInbound({
     }
   }
 
-  await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-    recipientType: "individual",
-  }).catch(() => null);
+  if (shouldSend) {
+    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
+      recipientType: "individual",
+    }).catch(() => null);
+
+    // Memory only — do not change WhatsApp send behavior / do not double-send.
+    if (connection && typeof __appendConversationMessageFn === "function") {
+      await __appendConversationMessageFn(connection, {
+        ownerUserId: uid,
+        customerNumber: phone,
+        role: "assistant",
+        text: reply,
+      }).catch(() => null);
+    }
+  }
 
   console.log("[customer_business_pa_result]", {
     businessId: uid,
     bookingId,
     openaiUsed,
     conversationAct: decision.conversationAct,
+    customerIntent: decision.customerIntent ?? null,
     situation: decision.situation,
     decisionAction: decision.action,
+    shouldReply: decision.shouldReply !== false,
+    sentReply: shouldSend,
     missingInfoEscalated,
     missingInfoRequestId,
     missingInfoType,
@@ -329,16 +381,19 @@ export async function handleCustomerBusinessPaInbound({
 
   return {
     handled: true,
-    action: "business_pa_reply",
-    reply,
+    action: shouldSend ? "business_pa_reply" : "business_pa_silence",
+    reply: shouldSend ? reply : "",
+    sentReply: shouldSend,
     bookingId,
     availabilityRequestId,
     reason,
     openaiUsed,
     openaiSource: decided?.source ?? "technical_fallback",
     conversationAct: decision.conversationAct,
+    customerIntent: decision.customerIntent ?? "unclear",
     situation: decision.situation ?? "unclear",
     decisionAction: decision.action,
+    shouldReply: decision.shouldReply !== false,
     missingInfoEscalated,
     missingInfoRequestId,
     missingInfoType,

@@ -285,6 +285,7 @@ test("owner reply with valid pamiss_* token stores answer and sends customer fol
   const fake = createFakeDb();
   seedContext(fake);
   const customerSends = [];
+  const memory = [];
   let openaiCalls = 0;
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
@@ -297,6 +298,9 @@ test("owner reply with valid pamiss_* token stores answer and sends customer fol
       sendWhatsAppMessageFn: async (to, text) => {
         customerSends.push({ to, text });
         return { ok: true, messages: [{ id: "wamid.cust-out-1" }] };
+      },
+      __appendConversationMessageFn: async (_db, p) => {
+        memory.push(p);
       },
       __chatCompletionsCreateForTests: async () => {
         openaiCalls += 1;
@@ -323,6 +327,12 @@ test("owner reply with valid pamiss_* token stores answer and sends customer fol
     assert.equal(customerSends.length, 1);
     assert.equal(phoneDigits(customerSends[0].to), CUSTOMER_PHONE);
     assert.equal(customerSends[0].text, "Advance 5000 PKR dena hoga.");
+    // Memory logging only — one assistant append, no extra WhatsApp send.
+    assert.equal(memory.length, 1);
+    assert.equal(memory[0].role, "assistant");
+    assert.equal(memory[0].text, "Advance 5000 PKR dena hoga.");
+    assert.equal(memory[0].ownerUserId, BUSINESS_ID);
+    assert.equal(phoneDigits(memory[0].customerNumber), CUSTOMER_PHONE);
 
     const row = fake.getMissingInfo(BUSINESS_ID, REQUEST_ID);
     assert.equal(row.status, "closed");
