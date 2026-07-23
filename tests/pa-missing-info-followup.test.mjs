@@ -236,6 +236,8 @@ function jsonAiReply({
   customerIsAskingQuestion = null,
   action = null,
   situation = null,
+  customerIntent = null,
+  shouldReply = null,
 }) {
   const escalate = needsFollowup === true && Boolean(missingInfoType);
   const act =
@@ -254,6 +256,19 @@ function jsonAiReply({
       : act === "acknowledgement" || act === "thanks"
         ? "acknowledgement_after_answer"
         : "unclear");
+  const intentValue =
+    customerIntent ||
+    (escalate
+      ? "ask_fact"
+      : act === "thanks"
+        ? "thanks"
+        : act === "acknowledgement"
+          ? "ack"
+          : "unclear");
+  const shouldReplyValue =
+    shouldReply != null
+      ? shouldReply
+      : decisionAction !== "silence" && decisionAction !== "none";
   return async () => ({
     choices: [
       {
@@ -261,11 +276,12 @@ function jsonAiReply({
           content: JSON.stringify({
             situation: situationValue,
             conversationAct: act,
+            customerIntent: intentValue,
             customerIsAskingQuestion: asking,
             requestedInfoType: escalate ? missingInfoType : null,
-            customerReply,
+            shouldReply: shouldReplyValue,
+            customerReply: shouldReplyValue === false ? "" : customerReply,
             action: decisionAction,
-            // legacy fields ignored for escalate by executor
             needsFollowup,
             missingInfoType,
           }),
@@ -1275,4 +1291,282 @@ test("no PA knowledge store and decision under brain/decisions", async () => {
   const agent = await import("../src/services/customerBusinessPaAgentService.js");
   assert.equal(typeof agent.HOLD_REPLIES, "undefined");
   assert.equal(typeof agent.PA_TOPIC_REPLY_MAP, "undefined");
+});
+
+test("bare no/nahi is not protected ACTION_INTENT (reaches Brain)", () => {
+  for (const msg of ["no", "No", "nahi", "nahin", "nope"]) {
+    const r = classifyCustomerBusinessPaActionIntent(msg);
+    assert.equal(r.isAction, false, msg);
+  }
+  assert.equal(
+    classifyCustomerBusinessPaActionIntent("cancel booking").isAction,
+    true
+  );
+  assert.equal(
+    classifyCustomerBusinessPaActionIntent("book kar do").isAction,
+    true
+  );
+  assert.equal(
+    classifyCustomerBusinessPaActionIntent("confirm kar do").isAction,
+    true
+  );
+});
+
+test("anti-echo: Have a good day is not mirrored exactly", async () => {
+  const {
+    parsePostConfirmCustomerDmDecision,
+    isNearEchoReply,
+  } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+  assert.equal(isNearEchoReply("Have a good day", "Have a good day"), true);
+  const parsed = parsePostConfirmCustomerDmDecision(
+    JSON.stringify({
+      situation: "conversation_closing",
+      conversationAct: "chit_chat",
+      customerIntent: "farewell",
+      customerIsAskingQuestion: false,
+      shouldReply: true,
+      customerReply: "Have a good day",
+      action: "reply",
+    }),
+    { userMessage: "Have a good day" }
+  );
+  assert.notEqual(
+    String(parsed.customerReply || "").toLowerCase().trim(),
+    "have a good day"
+  );
+  assert.ok(
+    parsed.action === "silence" ||
+      (parsed.shouldReply === false && !parsed.customerReply) ||
+      (parsed.customerReply &&
+        !isNearEchoReply("Have a good day", parsed.customerReply))
+  );
+
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let sends = [];
+  const memory = [];
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Have a good day",
+      sendWhatsAppMessageFn: async (to, text) => {
+        sends.push(text);
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __appendConversationMessageFn: async (_db, p) => {
+        memory.push(p);
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Have a good day",
+        conversationAct: "chit_chat",
+        customerIntent: "farewell",
+        situation: "conversation_closing",
+        action: "reply",
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.missingInfoEscalated, false);
+    for (const s of sends) {
+      assert.notEqual(String(s).toLowerCase().trim(), "have a good day");
+    }
+  });
+});
+
+test("anti-echo: you too is not mirrored exactly", async () => {
+  const { parsePostConfirmCustomerDmDecision, isNearEchoReply } = await import(
+    "../src/brain/decisions/decidePostConfirmCustomerDm.js"
+  );
+  const parsed = parsePostConfirmCustomerDmDecision(
+    JSON.stringify({
+      situation: "conversation_closing",
+      conversationAct: "chit_chat",
+      customerIntent: "farewell",
+      customerIsAskingQuestion: false,
+      customerReply: "you too",
+      action: "reply",
+    }),
+    { userMessage: "you too" }
+  );
+  assert.equal(isNearEchoReply("you too", parsed.customerReply || ""), false);
+  assert.ok(parsed.action === "silence" || parsed.shouldReply === false);
+
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let sends = 0;
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "you too",
+      sendWhatsAppMessageFn: async () => {
+        sends += 1;
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __appendConversationMessageFn: async () => {},
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "you too",
+        conversationAct: "chit_chat",
+        customerIntent: "farewell",
+        situation: "conversation_closing",
+        action: "reply",
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.sentReply, false);
+    assert.equal(sends, 0);
+    assert.equal(result.decisionAction, "silence");
+  });
+});
+
+test("why are you copying me → social repair, not clarification", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let sends = [];
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "why are you copying me",
+      sendWhatsAppMessageFn: async (_to, text) => {
+        sends.push(text);
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __appendConversationMessageFn: async () => {},
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        throw new Error("should not escalate");
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Sorry ji, galat ho gaya.",
+        conversationAct: "chit_chat",
+        customerIntent: "social_challenge",
+        situation: "social_repair",
+        action: "reply",
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.situation, "social_repair");
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(sends.length, 1);
+    assert.doesNotMatch(sends[0], /Main samajh nahi paaya/i);
+    assert.doesNotMatch(sends[0], /availability, price, ya booking/i);
+    assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
+  });
+});
+
+test("no after social/help context stays in PA, no ClarificationWorkflow, no pamiss", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let createCalled = false;
+  let sends = [];
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    assert.equal(classifyCustomerBusinessPaActionIntent("no").isAction, false);
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "no",
+      conversationHistory:
+        "Assistant: Kya aap kuch aur poochna chahte hain?\nUser: no",
+      sendWhatsAppMessageFn: async (_to, text) => {
+        sends.push(text);
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __appendConversationMessageFn: async () => {},
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Theek hai.",
+        conversationAct: "acknowledgement",
+        customerIntent: "decline_more_help",
+        situation: "decline_more_help",
+        action: "reply",
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.situation, "decline_more_help");
+    assert.equal(createCalled, false);
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
+    for (const s of sends) {
+      assert.doesNotMatch(s, /Main samajh nahi paaya/i);
+    }
+  });
+});
+
+test("silence action sends nothing but still handled", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let sends = 0;
+  let memory = [];
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "you too",
+      sendWhatsAppMessageFn: async () => {
+        sends += 1;
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __appendConversationMessageFn: async (_db, p) => {
+        memory.push(p);
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "",
+        conversationAct: "chit_chat",
+        customerIntent: "farewell",
+        situation: "conversation_closing",
+        action: "silence",
+        shouldReply: false,
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.sentReply, false);
+    assert.equal(sends, 0);
+    assert.equal(memory.length, 0);
+    assert.equal(result.reason, "HANDLED_SILENCE");
+  });
+});
+
+test("PA reply is appended to conversation memory", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  const memory = [];
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Advance kitna?",
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __appendConversationMessageFn: async (_db, p) => {
+        memory.push(p);
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Advance 5000 PKR dena hoga.",
+        conversationAct: "information_request",
+        customerIntent: "ask_fact",
+        situation: "repeat_question_answered",
+        action: "reply",
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.sentReply, true);
+    assert.equal(memory.length, 1);
+    assert.equal(memory[0].role, "assistant");
+    assert.equal(memory[0].text, "Advance 5000 PKR dena hoga.");
+    assert.equal(memory[0].ownerUserId, BUSINESS_ID);
+  });
 });

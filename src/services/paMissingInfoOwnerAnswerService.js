@@ -4,6 +4,7 @@
  */
 
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
+import { appendConversationMessage } from "./conversationStore.js";
 import {
   isEmilyBusinessPaMissingInfoEnabled,
   isEmilyBusinessPaMissingInfoOwnerAnswerEnabled,
@@ -85,6 +86,7 @@ export function parsePaMissingInfoOwnerAnswerMessage(messageText) {
  *   __resolveActiveCustomerBookingFactsFn?: typeof resolveActiveCustomerBookingFacts,
  *   __generateFollowupFn?: typeof generatePaMissingInfoCustomerFollowupFromOwnerAnswer,
  *   __chatCompletionsCreateForTests?: Function,
+ *   __appendConversationMessageFn?: typeof appendConversationMessage,
  * }} p
  */
 export async function handlePaMissingInfoOwnerAnswerInbound({
@@ -103,6 +105,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
   __generateFollowupFn = generatePaMissingInfoCustomerFollowupFromOwnerAnswer,
   __chatCompletionsCreateForTests = null,
+  __appendConversationMessageFn = appendConversationMessage,
 } = {}) {
   if (!missingInfoEnabled || !ownerAnswerEnabled) {
     return { handled: false, reason: "FLAG_OFF" };
@@ -305,6 +308,16 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       customerFollowupText: followupText,
       providerMessageId,
     });
+
+    // Memory only — same conversation thread the customer uses next turn.
+    if (typeof __appendConversationMessageFn === "function") {
+      await __appendConversationMessageFn(connection, {
+        ownerUserId: uid,
+        customerNumber: customerPhone,
+        role: "assistant",
+        text: followupText,
+      }).catch(() => null);
+    }
 
     console.log("[pa_missing_info_owner_answer_result]", {
       businessId: uid,

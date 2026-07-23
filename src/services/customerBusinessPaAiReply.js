@@ -46,6 +46,8 @@ export function parseCustomerBusinessPaAiJson(raw) {
     requestedInfoType: decision.requestedInfoType,
     action: decision.action,
     situation: decision.situation ?? "unclear",
+    customerIntent: decision.customerIntent ?? "unclear",
+    shouldReply: decision.shouldReply !== false,
   };
 }
 
@@ -87,6 +89,8 @@ export async function generateCustomerBusinessPaReplyFromFacts({
     requestedInfoType: decision?.requestedInfoType ?? null,
     action: decision?.action ?? "reply",
     situation: decision?.situation ?? "unclear",
+    customerIntent: decision?.customerIntent ?? "unclear",
+    shouldReply: decision?.shouldReply !== false,
     source: decided?.source ?? "technical_fallback",
     reason: decided?.reason,
   };
