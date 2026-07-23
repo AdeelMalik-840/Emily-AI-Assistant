@@ -16,8 +16,13 @@ const {
 } = await import("../src/services/customerBusinessPaAgentService.js");
 const {
   findOpenPaMissingInfoRequest,
+  isPaMissingInfoFactMissing,
   PA_MISSING_INFO_TYPES,
 } = await import("../src/services/paMissingInfoRequestService.js");
+const {
+  composeDeliveryPolicyFromLogistics,
+  resolveBusinessProfileFacts,
+} = await import("../src/brain/facts/resolveBusinessProfileFacts.js");
 const { parseCustomerBusinessPaAiJson } = await import(
   "../src/services/customerBusinessPaAiReply.js"
 );
@@ -236,7 +241,14 @@ function jsonAiReply({
   });
 }
 
-function seedActiveContext(fake, { advanceAmount = null } = {}) {
+function seedActiveContext(fake, opts = {}) {
+  const {
+    profile = {
+      businessName: "Emily Cars",
+      category: "car_rental",
+      businessKnowledge: "Friendly staff.",
+    },
+  } = opts;
   fake.setOwnerPhone(BUSINESS_ID, OWNER_PHONE);
   fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
   fake.seedAvailabilityRequest(BUSINESS_ID, AVR_ID, {
@@ -251,14 +263,13 @@ function seedActiveContext(fake, { advanceAmount = null } = {}) {
   return async (p) => {
     const resolved = await resolveActiveCustomerBookingFacts({
       ...p,
-      getBusinessProfileFn: async () => ({
-        businessName: "Emily Cars",
-        category: "car_rental",
-        businessKnowledge: "Friendly staff.",
-      }),
+      getBusinessProfileFn: async () => profile,
     });
-    if (resolved.ok && resolved.facts?.known) {
-      resolved.facts.known.advanceAmount = advanceAmount;
+    if (resolved.ok && resolved.facts?.known && "advanceAmount" in opts) {
+      resolved.facts.known.advanceAmount = opts.advanceAmount;
+      if (resolved.facts.business) {
+        resolved.facts.business.advanceAmount = opts.advanceAmount;
+      }
     }
     return resolved;
   };
@@ -509,4 +520,222 @@ test("no canned HOLD_REPLIES or topic reply maps in PA modules", async () => {
   assert.equal("HOLD_REPLIES" in ai, false);
   assert.equal(typeof agent.buildCustomerBusinessPaPr1Reply, "undefined");
   assert.equal(typeof agent.classifyPaQuestionTopic, "undefined");
+  assert.equal(typeof agent.PA_TOPIC_REPLY_MAP, "undefined");
+  assert.equal(typeof ai.PA_TOPIC_REPLY_MAP, "undefined");
+});
+
+test("no PA-specific knowledge store module added", async () => {
+  await assert.rejects(
+    () => import("../src/services/paKnowledgeStore.js"),
+    /Cannot find module|ERR_MODULE_NOT_FOUND/
+  );
+  await assert.rejects(
+    () => import("../src/brain/facts/paKnowledgeStore.js"),
+    /Cannot find module|ERR_MODULE_NOT_FOUND/
+  );
+});
+
+test("logistics from business setup becomes known.deliveryPolicy", async () => {
+  const composed = composeDeliveryPolicyFromLogistics({
+    defaultPickupLocation: "Gulberg III office",
+    pickupInstructions: "Call on arrival",
+    pickupAvailableHours: "10am-8pm",
+    deliveryCoverageAreas: ["Lahore", "DHA"],
+    deliveryChargesNote: "City delivery 1500 PKR",
+  });
+  assert.match(composed, /Gulberg III office/);
+  assert.match(composed, /Lahore/);
+  assert.match(composed, /1500 PKR/);
+
+  const profileSlice = await resolveBusinessProfileFacts("biz-1", async () => ({
+    businessName: "Emily Cars",
+    profileData: {
+      businessName: "Emily Cars",
+      logistics: {
+        defaultPickupLocation: "Gulberg III office",
+        pickupInstructions: "Call on arrival",
+        pickupAvailableHours: "10am-8pm",
+        deliveryCoverageAreas: ["Lahore", "DHA"],
+        deliveryChargesNote: "City delivery 1500 PKR",
+      },
+    },
+  }));
+  assert.match(profileSlice.business.deliveryPolicy, /Pickup: Gulberg III office/);
+  assert.equal(profileSlice.business.advanceAmount, null);
+  assert.equal(profileSlice.business.advancePolicy, null);
+
+  const fake = createFakeDb();
+  fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
+  const resolved = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    getBusinessProfileFn: async () => ({
+      businessName: "Emily Cars",
+      profileData: {
+        logistics: {
+          defaultPickupLocation: "Gulberg III office",
+          deliveryCoverageAreas: ["Lahore"],
+          deliveryChargesNote: "City delivery 1500 PKR",
+        },
+      },
+    }),
+  });
+  assert.equal(resolved.ok, true);
+  assert.match(resolved.facts.known.deliveryPolicy, /Gulberg III office/);
+  assert.equal(
+    resolved.facts.known.deliveryPolicy,
+    resolved.facts.business.deliveryPolicy
+  );
+  assert.equal(isPaMissingInfoFactMissing(resolved.facts, "delivery"), false);
+  assert.equal(isPaMissingInfoFactMissing(resolved.facts, "advance"), true);
+});
+
+test("delivery question does not escalate when deliveryPolicy exists", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake, {
+    profile: {
+      businessName: "Emily Cars",
+      category: "car_rental",
+      profileData: {
+        logistics: {
+          defaultPickupLocation: "Johar Town",
+          deliveryCoverageAreas: ["Lahore"],
+        },
+      },
+    },
+  });
+  let createCalled = false;
+
+  await withFlags({ pa: true, missingInfo: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Delivery available hai?",
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Pickup Johar Town se hai, Lahore delivery cover hai.",
+        needsFollowup: true,
+        missingInfoType: "delivery",
+      }),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(createCalled, false);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
+  });
+});
+
+test("advance still escalates when no advanceAmount/advancePolicy", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake, {
+    profile: {
+      businessName: "Emily Cars",
+      profileData: {
+        logistics: { defaultPickupLocation: "Office" },
+      },
+    },
+  });
+  const ownerSends = [];
+
+  await withFlags({ pa: true, missingInfo: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Advance kitna?",
+      sendWhatsAppMessageFn: async (to, text) => {
+        if (String(to).replace(/\D/g, "") === OWNER_PHONE) {
+          ownerSends.push({ to, text });
+        }
+        return { ok: true, messages: [{ id: "wamid.out" }] };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Advance confirm karke batata hoon.",
+        needsFollowup: true,
+        missingInfoType: "advance",
+      }),
+    });
+
+    assert.equal(result.missingInfoEscalated, true);
+    assert.equal(result.missingInfoType, "advance");
+    assert.equal(ownerSends.length, 1);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+  });
+});
+
+test("advance does not escalate when advancePolicy exists", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake, {
+    profile: {
+      businessName: "Emily Cars",
+      profileData: {
+        advancePolicy: "50% advance booking confirm par.",
+      },
+    },
+  });
+  let createCalled = false;
+
+  await withFlags({ pa: true, missingInfo: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Advance kitna?",
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Advance 50% booking confirm par hota hai.",
+        needsFollowup: true,
+        missingInfoType: "advance",
+      }),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(createCalled, false);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
+  });
+});
+
+test("compact AI facts JSON includes known policy fields", async () => {
+  const { __compactCustomerBusinessPaFactsForTests } = await import(
+    "../src/services/customerBusinessPaAiReply.js"
+  );
+  const compact = __compactCustomerBusinessPaFactsForTests({
+    businessId: BUSINESS_ID,
+    customerPhoneDigits: CUSTOMER_PHONE,
+    business: {
+      name: "Emily Cars",
+      deliveryPolicy: "Pickup: Office.",
+      advancePolicy: "50% advance",
+    },
+    booking: { id: BOOKING_ID, status: "approved" },
+    known: {
+      deliveryPolicy: "Pickup: Office.",
+      advancePolicy: "50% advance",
+      driverPolicy: "Driver optional",
+      paymentPolicy: "Cash/JazzCash",
+      documentsPolicy: "CNIC required",
+      advanceAmount: null,
+    },
+    policy: { readOnly: true },
+  });
+  assert.match(compact, /"deliveryPolicy":"Pickup: Office\."/);
+  assert.match(compact, /"advancePolicy":"50% advance"/);
+  assert.match(compact, /"driverPolicy":"Driver optional"/);
+  assert.match(compact, /"paymentPolicy":"Cash\/JazzCash"/);
+  assert.match(compact, /"documentsPolicy":"CNIC required"/);
 });

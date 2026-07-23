@@ -42,6 +42,13 @@ function compactFactsForPrompt(facts) {
       category: business.category ?? null,
       tone: business.tone ?? null,
       instructions: business.instructions ?? null,
+      advanceAmount: business.advanceAmount ?? known.advanceAmount ?? null,
+      advancePolicy: business.advancePolicy ?? known.advancePolicy ?? null,
+      driverPolicy: business.driverPolicy ?? known.driverPolicy ?? null,
+      paymentPolicy: business.paymentPolicy ?? known.paymentPolicy ?? null,
+      documentsPolicy:
+        business.documentsPolicy ?? known.documentsPolicy ?? null,
+      deliveryPolicy: business.deliveryPolicy ?? known.deliveryPolicy ?? null,
     },
     booking: {
       id: booking.id ?? null,
@@ -69,6 +76,11 @@ function compactFactsForPrompt(facts) {
       durationDays: known.durationDays ?? null,
       itemLabel: known.itemLabel ?? null,
       advanceAmount: known.advanceAmount ?? null,
+      advancePolicy: known.advancePolicy ?? null,
+      driverPolicy: known.driverPolicy ?? null,
+      paymentPolicy: known.paymentPolicy ?? null,
+      documentsPolicy: known.documentsPolicy ?? null,
+      deliveryPolicy: known.deliveryPolicy ?? null,
       knowledgeExcerpt: known.knowledgeExcerpt ?? null,
     },
     policy: {

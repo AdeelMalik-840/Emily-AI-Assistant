@@ -63,33 +63,35 @@ export function isPaMissingInfoFactMissing(facts, missingInfoType) {
     facts?.business && typeof facts.business === "object" ? facts.business : {};
 
   if (type === "advance") {
-    // Number(null) === 0 — treat null/undefined/"" as missing.
-    if (known.advanceAmount == null || known.advanceAmount === "") return true;
-    return !Number.isFinite(Number(known.advanceAmount));
+    // Present if structured amount OR non-empty advance/deposit policy text.
+    const hasAmount =
+      known.advanceAmount != null &&
+      known.advanceAmount !== "" &&
+      Number.isFinite(Number(known.advanceAmount));
+    const hasPolicy = Boolean(
+      clean(known.advancePolicy, 400) || clean(business.advancePolicy, 400)
+    );
+    return !(hasAmount || hasPolicy);
   }
   if (type === "driver") {
-    return (
-      known.driverAvailable == null &&
-      known.driverPolicy == null &&
-      known.driverFee == null &&
-      business.driverPolicy == null
+    return !(
+      clean(known.driverPolicy, 400) || clean(business.driverPolicy, 400)
     );
   }
   if (type === "delivery") {
-    return (
-      known.deliveryAvailable == null &&
-      known.deliveryPolicy == null &&
-      business.deliveryPolicy == null
+    return !(
+      clean(known.deliveryPolicy, 500) || clean(business.deliveryPolicy, 500)
     );
   }
   if (type === "documents") {
-    return known.documentsRequired == null && business.documentsRequired == null;
+    return !(
+      clean(known.documentsPolicy, 400) ||
+      clean(business.documentsPolicy, 400)
+    );
   }
   if (type === "payment") {
-    return (
-      known.paymentPolicy == null &&
-      known.paymentMethods == null &&
-      business.paymentPolicy == null
+    return !(
+      clean(known.paymentPolicy, 400) || clean(business.paymentPolicy, 400)
     );
   }
   // other: escalate only when model asked; treat as missing (no verified answer field)
