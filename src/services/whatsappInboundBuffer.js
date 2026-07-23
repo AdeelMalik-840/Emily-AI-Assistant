@@ -1883,8 +1883,12 @@ export async function executeWhatsAppAiPipeline(p) {
           availabilityRequestId: businessPaResult.availabilityRequestId ?? null,
           openaiUsed: businessPaResult.openaiUsed === true,
           openaiSource: businessPaResult.openaiSource ?? null,
+          missingInfoEscalated: businessPaResult.missingInfoEscalated === true,
+          missingInfoRequestId: businessPaResult.missingInfoRequestId ?? null,
+          missingInfoType: businessPaResult.missingInfoType ?? null,
+          ownerNotifyStatus: businessPaResult.ownerNotifyStatus ?? null,
           isGroupInbound,
-          messagePreview: String(latestMessage ?? "").slice(0, 120),
+          messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
         });
         reply = "";
         sendVia = "NONE";
@@ -1893,6 +1897,9 @@ export async function executeWhatsAppAiPipeline(p) {
           customerBusinessPaHandled: true,
           bookingId: businessPaResult.bookingId ?? null,
           availabilityRequestId: businessPaResult.availabilityRequestId ?? null,
+          missingInfoEscalated: businessPaResult.missingInfoEscalated === true,
+          missingInfoRequestId: businessPaResult.missingInfoRequestId ?? null,
+          missingInfoType: businessPaResult.missingInfoType ?? null,
           outboundTrace: {
             kind: "business_pa_outbound",
             finalReplySource: "CUSTOMER_BUSINESS_PA",

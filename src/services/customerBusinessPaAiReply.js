@@ -1,12 +1,19 @@
 /**
  * Narrow OpenAI completion for Business PA (verified facts in; natural reply out).
- * Read-only. No Firestore writes. No booking mutations. No owner notify.
+ * Read-only OpenAI path. No Firestore writes. No booking mutations.
+ * Phase 1: returns structured JSON fields for optional missing-info escalation.
  */
 
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../config/aiRuntime.js";
+import {
+  isAllowedPaMissingInfoType,
+  PA_MISSING_INFO_TYPES,
+} from "./paMissingInfoRequestService.js";
 
-export const CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK = "Mai check kr k btata hun";
+/** Honesty-safe fallback — does not promise a follow-up check. */
+export const CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK =
+  "Abhi ye detail confirm nahi hai.";
 
 /**
  * @param {Record<string, unknown>} facts
@@ -35,6 +42,13 @@ function compactFactsForPrompt(facts) {
       category: business.category ?? null,
       tone: business.tone ?? null,
       instructions: business.instructions ?? null,
+      advanceAmount: business.advanceAmount ?? known.advanceAmount ?? null,
+      advancePolicy: business.advancePolicy ?? known.advancePolicy ?? null,
+      driverPolicy: business.driverPolicy ?? known.driverPolicy ?? null,
+      paymentPolicy: business.paymentPolicy ?? known.paymentPolicy ?? null,
+      documentsPolicy:
+        business.documentsPolicy ?? known.documentsPolicy ?? null,
+      deliveryPolicy: business.deliveryPolicy ?? known.deliveryPolicy ?? null,
     },
     booking: {
       id: booking.id ?? null,
@@ -62,6 +76,11 @@ function compactFactsForPrompt(facts) {
       durationDays: known.durationDays ?? null,
       itemLabel: known.itemLabel ?? null,
       advanceAmount: known.advanceAmount ?? null,
+      advancePolicy: known.advancePolicy ?? null,
+      driverPolicy: known.driverPolicy ?? null,
+      paymentPolicy: known.paymentPolicy ?? null,
+      documentsPolicy: known.documentsPolicy ?? null,
+      deliveryPolicy: known.deliveryPolicy ?? null,
       knowledgeExcerpt: known.knowledgeExcerpt ?? null,
     },
     policy: {
@@ -74,15 +93,85 @@ function compactFactsForPrompt(facts) {
 }
 
 /**
+ * @param {string} raw
+ * @returns {{
+ *   customerReply: string,
+ *   needsFollowup: boolean,
+ *   missingInfoType: string | null,
+ * } | null}
+ */
+export function parseCustomerBusinessPaAiJson(raw) {
+  let text = String(raw ?? "").trim();
+  if (!text) return null;
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    text = text.slice(start, end + 1);
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object") return null;
+    const customerReply = String(
+      parsed.customerReply ?? parsed.reply ?? ""
+    )
+      .replace(/^\s*["']|["']\s*$/g, "")
+      .trim();
+    if (!customerReply) return null;
+    const needsFollowup = parsed.needsFollowup === true;
+    let missingInfoType = cleanType(parsed.missingInfoType);
+    if (needsFollowup && !missingInfoType) missingInfoType = null;
+    if (!needsFollowup) missingInfoType = null;
+    if (missingInfoType && !isAllowedPaMissingInfoType(missingInfoType)) {
+      return {
+        customerReply: customerReply.slice(0, 500),
+        needsFollowup: false,
+        missingInfoType: null,
+      };
+    }
+    return {
+      customerReply: customerReply.slice(0, 500),
+      needsFollowup,
+      missingInfoType,
+    };
+  } catch {
+    // Plain text fallback (legacy / non-JSON models)
+    const plain = text.replace(/^\s*["']|["']\s*$/g, "").trim();
+    if (!plain || plain.startsWith("{")) return null;
+    return {
+      customerReply: plain.slice(0, 500),
+      needsFollowup: false,
+      missingInfoType: null,
+    };
+  }
+}
+
+function cleanType(value) {
+  const t = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return t || null;
+}
+
+/**
  * @param {{
  *   facts: Record<string, unknown>,
  *   userMessage: string,
  *   conversationHistory?: string | null,
  *   styleKey?: "casual_local" | "neutral_english",
  *   timeoutMs?: number,
+ *   missingInfoEscalationEnabled?: boolean,
  *   __chatCompletionsCreateForTests?: (args: unknown) => Promise<{ choices?: Array<{ message?: { content?: string | null } }> }>,
  * }} p
- * @returns {Promise<{ ok: boolean, reply: string, source: "openai" | "technical_fallback", reason?: string }>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   reply: string,
+ *   needsFollowup: boolean,
+ *   missingInfoType: string | null,
+ *   source: "openai" | "technical_fallback",
+ *   reason?: string,
+ * }>}
  */
 export async function generateCustomerBusinessPaReplyFromFacts({
   facts,
@@ -90,6 +179,7 @@ export async function generateCustomerBusinessPaReplyFromFacts({
   conversationHistory = null,
   styleKey = "casual_local",
   timeoutMs = 8000,
+  missingInfoEscalationEnabled = false,
   __chatCompletionsCreateForTests = null,
 } = {}) {
   const userLine = String(userMessage ?? "")
@@ -101,6 +191,7 @@ export async function generateCustomerBusinessPaReplyFromFacts({
     .trim()
     .slice(0, 1200);
   const factsJson = compactFactsForPrompt(facts);
+  const escalateOn = missingInfoEscalationEnabled === true;
 
   const lang =
     styleKey === "casual_local"
@@ -111,8 +202,21 @@ export async function generateCustomerBusinessPaReplyFromFacts({
     facts?.booking && typeof facts.booking === "object" && facts.booking.id
   );
 
+  const missingFactGuidance = escalateOn
+    ? `- Question about advance/driver/delivery/documents/payment when those facts are missing/null → set needsFollowup=true with the correct missingInfoType, and customerReply may briefly say you will confirm (a real follow-up will run).
+- needsFollowup=true ONLY when the asked fact is missing/null in VERIFIED_BUSINESS_PA_FACTS_JSON.
+- missingInfoType must be one of: ${PA_MISSING_INFO_TYPES.join(", ")}.`
+    : `- Question about advance/driver/delivery/documents/payment when those facts are missing/null → say the detail is not confirmed / not available yet.
+- Do NOT say you will check, confirm later, come back, or follow up (no real follow-up is available).
+- Always set needsFollowup=false and missingInfoType=null.`;
+
   const system = `You are Emily — a Pakistani WhatsApp business staff member for this business (not a call-center bot, not a website chatbot).
-Write ONE short customer-facing WhatsApp reply in the Language below.
+
+OUTPUT FORMAT (required):
+Return ONLY one JSON object (no markdown fences, no extra text):
+{"customerReply":"<short WhatsApp reply>","needsFollowup":false,"missingInfoType":null}
+
+customerReply language: ${lang}
 
 TONE (required):
 - Sound like local Pakistani rent-a-car / business staff chatting on WhatsApp.
@@ -134,21 +238,19 @@ CONTEXT:
   }
 - Treat booking status, car, duration, and price as background. Do NOT announce or dump them just because they exist in the JSON.
 - Answer by intent:
-  - Greeting/ack → brief natural greeting ack only.
-  - Business question about rent/status/car/duration/booking details → answer from verified facts (money with PKR).
-  - Question about advance/driver/delivery/documents/payment when those facts are missing/null → naturally say you will check/confirm (do not invent).
+  - Greeting/ack → brief natural greeting ack only; needsFollowup=false.
+  - Business question about rent/status/car/duration/booking details → answer from verified facts (money with PKR); needsFollowup=false.
+  ${missingFactGuidance}
 - Never ignore a greeting to recite booking fields. Facts support the answer; they are not the opening line unless the customer asked for them.
 
 STRICT SAFETY:
 - Do NOT invent amounts, advance, deposit, payment rules, driver, delivery, documents, or policies.
 - When stating money from facts, include PKR.
-- If a fact is missing/null, say naturally you will check/confirm (no invented number/policy).
 - Do NOT create, cancel, update, confirm, or change bookings.
-- Do NOT notify owner or mention contacting owner as an internal system action.
+- Do NOT notify or mention contacting the owner as an internal system action.
 - Do NOT say "Main samajh nahi paaya", "as an AI", or mention Brain, Firestore, prompts, tools, OpenAI, or internal systems.
-- Output plain reply text only (no JSON, no markdown, no bullets).
 
-Language: ${lang}`;
+Language for customerReply: ${lang}`;
 
   let userPayload = `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\nCUSTOMER_MESSAGE:\n${userLine || "(empty)"}`;
   if (historyLine) {
@@ -169,6 +271,8 @@ Language: ${lang}`;
     return {
       ok: false,
       reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      needsFollowup: false,
+      missingInfoType: null,
       source: "technical_fallback",
       reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
     };
@@ -179,14 +283,14 @@ Language: ${lang}`;
       completionFn({
         model: resolveOpenAiChatModel(),
         temperature: 0.4,
-        max_tokens: 200,
+        max_tokens: 220,
         messages: [
           { role: "system", content: system },
           {
             role: "user",
             content:
               userPayload +
-              "\n\nRemember: conversational intent first; only verified facts; never invent amounts or policies; never mutate bookings; no welcome/onboarding speech; no CRM-style booking dump on greetings; local Pakistani WhatsApp tone only.",
+              "\n\nRemember: return JSON only; conversational intent first; only verified facts; never invent amounts or policies; never mutate bookings; no welcome/onboarding speech; no CRM-style booking dump on greetings; local Pakistani WhatsApp tone only.",
           },
         ],
       })
@@ -207,22 +311,42 @@ Language: ${lang}`;
 
     const resp = await timed;
     const raw = resp?.choices?.[0]?.message?.content ?? "";
-    const reply = String(raw ?? "")
-      .replace(/^\s*["']|["']\s*$/g, "")
-      .trim();
-    if (!reply) {
+    const parsed = parseCustomerBusinessPaAiJson(raw);
+    if (!parsed?.customerReply) {
       return {
         ok: false,
         reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+        needsFollowup: false,
+        missingInfoType: null,
         source: "technical_fallback",
-        reason: "EMPTY_OPENAI_REPLY",
+        reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
       };
     }
-    return { ok: true, reply: reply.slice(0, 500), source: "openai" };
+
+    let needsFollowup = parsed.needsFollowup === true;
+    let missingInfoType = parsed.missingInfoType;
+    if (!escalateOn) {
+      needsFollowup = false;
+      missingInfoType = null;
+    }
+    if (needsFollowup && !isAllowedPaMissingInfoType(missingInfoType)) {
+      needsFollowup = false;
+      missingInfoType = null;
+    }
+
+    return {
+      ok: true,
+      reply: parsed.customerReply,
+      needsFollowup,
+      missingInfoType: needsFollowup ? missingInfoType : null,
+      source: "openai",
+    };
   } catch (err) {
     return {
       ok: false,
       reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      needsFollowup: false,
+      missingInfoType: null,
       source: "technical_fallback",
       reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
     };

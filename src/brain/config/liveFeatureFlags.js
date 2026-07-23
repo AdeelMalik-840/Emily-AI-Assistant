@@ -116,6 +116,15 @@ export function isEmilyBusinessPaAgentEnabled() {
 }
 
 /**
+ * Business PA missing-info escalation (create request + owner notify).
+ * Default OFF. Requires EMILY_BUSINESS_PA_AGENT_ENABLED as well.
+ * @returns {boolean}
+ */
+export function isEmilyBusinessPaMissingInfoEnabled() {
+  return envTruthy("EMILY_BUSINESS_PA_MISSING_INFO_ENABLED");
+}
+
+/**
  * @returns {{
  *   live: boolean,
  *   liveAllowlist: string[],
@@ -130,6 +139,7 @@ export function isEmilyBusinessPaAgentEnabled() {
  *   availabilityConfirmExecute: boolean,
  *   contactInfoPhoneExtraction: boolean,
  *   businessPaAgent: boolean,
+ *   businessPaMissingInfo: boolean,
  * }}
  */
 export function getEmilyBrainV2LiveFlagSnapshot() {
@@ -147,5 +157,6 @@ export function getEmilyBrainV2LiveFlagSnapshot() {
     availabilityConfirmExecute: isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
     contactInfoPhoneExtraction: isPlaywrightContactInfoPhoneExtractionEnabled(),
     businessPaAgent: isEmilyBusinessPaAgentEnabled(),
+    businessPaMissingInfo: isEmilyBusinessPaMissingInfoEnabled(),
   };
 }

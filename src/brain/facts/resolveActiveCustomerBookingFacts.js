@@ -172,13 +172,33 @@ export async function resolveActiveCustomerBookingFacts({
     clean(availabilityRequest?.itemLabel) ||
     null;
 
+  const biz =
+    profileFacts.business && typeof profileFacts.business === "object"
+      ? profileFacts.business
+      : {};
+  const advanceAmount =
+    toFiniteNumber(biz.advanceAmount) ?? null;
+  const advancePolicy = clean(biz.advancePolicy) || null;
+  const driverPolicy = clean(biz.driverPolicy) || null;
+  const paymentPolicy = clean(biz.paymentPolicy) || null;
+  const documentsPolicy = clean(biz.documentsPolicy) || null;
+  const deliveryPolicy = clean(biz.deliveryPolicy) || null;
+
   return {
     ok: true,
     reason: "MATCHED",
     facts: {
       businessId: uid,
       customerPhoneDigits: phone,
-      business: profileFacts.business,
+      business: {
+        ...biz,
+        advanceAmount,
+        advancePolicy,
+        driverPolicy,
+        paymentPolicy,
+        documentsPolicy,
+        deliveryPolicy,
+      },
       booking: {
         id: clean(booking.id),
         status: clean(booking.status) || null,
@@ -196,14 +216,19 @@ export async function resolveActiveCustomerBookingFacts({
       },
       availabilityRequest,
       known: {
-        // Only pass through verified stored totals — never invent advance/policies.
+        // Verified booking totals + Brain profile policy facts only — never invent.
         totalAmount,
         dailyRate,
         durationDays:
           durationDays != null ? Math.max(1, Math.floor(durationDays)) : null,
         itemLabel,
-        advanceAmount: null,
-        knowledgeExcerpt: profileFacts.business?.instructions ?? null,
+        advanceAmount,
+        advancePolicy,
+        driverPolicy,
+        paymentPolicy,
+        documentsPolicy,
+        deliveryPolicy,
+        knowledgeExcerpt: biz.instructions ?? null,
       },
       policy: {
         readOnly: true,
