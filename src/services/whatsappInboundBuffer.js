@@ -1849,6 +1849,61 @@ export async function executeWhatsAppAiPipeline(p) {
   }
   }
 
+  // Business PA missing-info Phase 2: owner answer → customer follow-up.
+  // After confirm + waiting-confirm ownership; before Business PA / Brain.
+  if (!skipGeneralBrainForWaitingConfirmOwnership) {
+    const canTryOwnerAnswer =
+      !isGroupInbound &&
+      !playwrightWebInbound &&
+      Boolean(String(ownerUserId ?? "").trim()) &&
+      Boolean(cloudConfirmPhone) &&
+      cloudConfirmPhone !== "unknown" &&
+      Boolean(String(latestMessage ?? "").trim());
+    if (canTryOwnerAnswer) {
+      const tryOwnerAnswerFn =
+        typeof p.__tryHandlePaMissingInfoOwnerAnswerFn === "function"
+          ? p.__tryHandlePaMissingInfoOwnerAnswerFn
+          : (
+              await import("./paMissingInfoOwnerAnswerService.js")
+            ).tryHandlePaMissingInfoOwnerAnswer;
+      const ownerAnswerResult = await tryOwnerAnswerFn({
+        db,
+        businessId: ownerUserId,
+        senderPhone: cloudConfirmPhone,
+        messageText: latestMessage,
+        messageId,
+        isGroupInbound,
+        playwrightWebInbound,
+        sendCredentials,
+      });
+      if (ownerAnswerResult) {
+        skipGeneralBrainForWaitingConfirmOwnership = true;
+        console.log("[pa_missing_info_owner_answer_handled]", {
+          traceId,
+          businessId: ownerUserId,
+          requestId: ownerAnswerResult.requestId ?? null,
+          reason: ownerAnswerResult.reason ?? null,
+          action: ownerAnswerResult.action ?? null,
+          customerFollowupSent: ownerAnswerResult.customerFollowupSent === true,
+          matchReason: ownerAnswerResult.matchReason ?? null,
+          isGroupInbound,
+          messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
+        });
+        reply = "";
+        sendVia = "NONE";
+        messageMeta = {
+          handledWithoutOutbound: true,
+          paMissingInfoOwnerAnswerHandled: true,
+          missingInfoRequestId: ownerAnswerResult.requestId ?? null,
+          outboundTrace: {
+            kind: "pa_missing_info_owner_answer",
+            finalReplySource: "PA_MISSING_INFO_OWNER_ANSWER",
+          },
+        };
+      }
+    }
+  }
+
   // Business PA: after Cloud confirm + waiting-confirm ownership guard, before Brain.
   if (!skipGeneralBrainForWaitingConfirmOwnership) {
     const canTryBusinessPa =

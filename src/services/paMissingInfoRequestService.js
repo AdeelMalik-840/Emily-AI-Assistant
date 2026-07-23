@@ -19,7 +19,42 @@ export const PA_MISSING_INFO_OPEN_STATUSES = Object.freeze([
   "owner_notified",
 ]);
 
+/** Statuses that may still accept an owner answer. */
+export const PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES = Object.freeze([
+  "open",
+  "owner_notified",
+]);
+
+/** Terminal / post-answer statuses — never send customer follow-up again. */
+export const PA_MISSING_INFO_POST_ANSWER_STATUSES = Object.freeze([
+  "answered",
+  "customer_notified",
+  "closed",
+  "customer_followup_failed",
+]);
+
+export const PA_MISSING_INFO_STATUSES = Object.freeze([
+  "open",
+  "owner_notified",
+  "failed",
+  "answered",
+  "customer_notified",
+  "closed",
+  "customer_followup_failed",
+]);
+
 const DEFAULT_TTL_MS = 48 * 60 * 60 * 1000;
+
+function isExpiredRequest(data, nowMs = Date.now()) {
+  const expiresAt = data?.expiresAt?.toDate?.() ?? data?.expiresAt ?? null;
+  const expiresMs =
+    expiresAt instanceof Date
+      ? expiresAt.getTime()
+      : expiresAt
+        ? new Date(expiresAt).getTime()
+        : null;
+  return Number.isFinite(expiresMs) && expiresMs < nowMs;
+}
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -129,14 +164,7 @@ export async function findOpenPaMissingInfoRequest({
     const data = doc.data() || {};
     const status = clean(data.status, 40);
     if (!PA_MISSING_INFO_OPEN_STATUSES.includes(status)) continue;
-    const expiresAt = data.expiresAt?.toDate?.() ?? data.expiresAt ?? null;
-    const expiresMs =
-      expiresAt instanceof Date
-        ? expiresAt.getTime()
-        : expiresAt
-          ? new Date(expiresAt).getTime()
-          : null;
-    if (Number.isFinite(expiresMs) && expiresMs < now) continue;
+    if (isExpiredRequest(data, now)) continue;
     return { id: doc.id, ...(data || {}) };
   }
   return null;
@@ -271,4 +299,199 @@ export async function getPaMissingInfoRequest({
   const snap = await col.doc(rid).get().catch(() => null);
   if (!snap?.exists) return null;
   return { id: snap.id, ...(snap.data() || {}) };
+}
+
+/**
+ * List non-expired requests that may still accept an owner answer.
+ * @param {{ db: unknown, businessId: string, limit?: number }} p
+ */
+export async function listOpenForAnswerPaMissingInfoRequests({
+  db: connection,
+  businessId,
+  limit = 40,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  if (!col) return [];
+  const snap = await col.limit(Math.max(1, Math.min(100, Number(limit) || 40))).get().catch(() => null);
+  const now = Date.now();
+  const out = [];
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data() || {};
+    const status = clean(data.status, 40);
+    if (!PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES.includes(status)) continue;
+    if (isExpiredRequest(data, now)) continue;
+    out.push({ id: doc.id, ...(data || {}) });
+  }
+  return out;
+}
+
+/**
+ * Apply owner answer once. Idempotent on messageId / post-answer status.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   ownerAnswer: string,
+ *   ownerAnswerRaw?: string | null,
+ *   ownerAnswerMessageId?: string | null,
+ * }} p
+ */
+export async function applyPaMissingInfoOwnerAnswer(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  const ownerAnswer = clean(p.ownerAnswer, 800);
+  const ownerAnswerRaw = clean(p.ownerAnswerRaw, 1000) || ownerAnswer;
+  const ownerAnswerMessageId = clean(p.ownerAnswerMessageId, 160) || null;
+
+  if (!uid || !requestId || !ownerAnswer) {
+    return { ok: false, reason: "MISSING_CONTEXT", applied: false, request: null };
+  }
+
+  const existing = await getPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+  });
+  if (!existing) {
+    return { ok: false, reason: "NOT_FOUND", applied: false, request: null };
+  }
+
+  const status = clean(existing.status, 40);
+  if (PA_MISSING_INFO_POST_ANSWER_STATUSES.includes(status)) {
+    const sameMessage =
+      ownerAnswerMessageId &&
+      clean(existing.ownerAnswerMessageId, 160) === ownerAnswerMessageId;
+    return {
+      ok: true,
+      reason: sameMessage ? "IDEMPOTENT_SAME_MESSAGE" : "ALREADY_ANSWERED",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (!PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES.includes(status)) {
+    return {
+      ok: false,
+      reason: "NOT_OPEN_FOR_ANSWER",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (isExpiredRequest(existing)) {
+    return {
+      ok: false,
+      reason: "EXPIRED",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (
+    ownerAnswerMessageId &&
+    clean(existing.ownerAnswerMessageId, 160) === ownerAnswerMessageId
+  ) {
+    return {
+      ok: true,
+      reason: "IDEMPOTENT_SAME_MESSAGE",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  const now = new Date();
+  const patch = {
+    ownerAnswer,
+    ownerAnswerRaw,
+    ownerAnswerAt: now,
+    ownerAnswerMessageId,
+    status: "answered",
+  };
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch,
+  });
+
+  return {
+    ok: true,
+    reason: "APPLIED",
+    applied: true,
+    request: { ...existing, ...patch, requestId },
+  };
+}
+
+/**
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   customerFollowupText: string,
+ *   providerMessageId?: string | null,
+ * }} p
+ */
+export async function markPaMissingInfoCustomerFollowupSent(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  const text = clean(p.customerFollowupText, 800);
+  if (!uid || !requestId || !text) {
+    return { ok: false, reason: "MISSING_CONTEXT" };
+  }
+  const now = new Date();
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch: {
+      status: "customer_notified",
+      customerFollowupText: text,
+      customerFollowupStatus: "sent",
+      customerFollowupAt: now,
+      customerFollowupProviderMessageId:
+        clean(p.providerMessageId, 160) || null,
+      customerFollowupError: null,
+    },
+  });
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch: {
+      status: "closed",
+      closedAt: now,
+    },
+  });
+  return { ok: true, status: "closed" };
+}
+
+/**
+ * Mark follow-up as failed (terminal). No blind retry.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   error?: string | null,
+ *   customerFollowupText?: string | null,
+ * }} p
+ */
+export async function markPaMissingInfoCustomerFollowupFailed(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  if (!uid || !requestId) {
+    return { ok: false, reason: "MISSING_CONTEXT" };
+  }
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch: {
+      status: "customer_followup_failed",
+      customerFollowupStatus: "failed",
+      customerFollowupAt: new Date(),
+      customerFollowupText: clean(p.customerFollowupText, 800) || null,
+      customerFollowupError: clean(p.error, 400) || "FOLLOWUP_FAILED",
+    },
+  });
+  return { ok: true, status: "customer_followup_failed" };
 }

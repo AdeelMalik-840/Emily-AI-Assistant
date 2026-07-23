@@ -9,6 +9,7 @@ import { sendWhatsAppMessage } from "./whatsappCloud.js";
 import {
   isEmilyBusinessPaAgentEnabled,
   isEmilyBusinessPaMissingInfoEnabled,
+  isEmilyBusinessPaMissingInfoOwnerAnswerEnabled,
 } from "../brain/config/liveFeatureFlags.js";
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
 import {
@@ -168,6 +169,7 @@ export async function handleCustomerBusinessPaInbound({
   sendWhatsAppMessageFn = sendWhatsAppMessage,
   businessPaEnabled = isEmilyBusinessPaAgentEnabled(),
   missingInfoEscalationEnabled = isEmilyBusinessPaMissingInfoEnabled(),
+  missingInfoOwnerAnswerEnabled = isEmilyBusinessPaMissingInfoOwnerAnswerEnabled(),
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
   __generateCustomerBusinessPaReplyFromFactsFn = generateCustomerBusinessPaReplyFromFacts,
   __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
@@ -217,6 +219,8 @@ export async function handleCustomerBusinessPaInbound({
   }
 
   const escalateEnabled = missingInfoEscalationEnabled === true;
+  const ownerAnswerLoopEnabled =
+    escalateEnabled && missingInfoOwnerAnswerEnabled === true;
 
   const ai = await __generateCustomerBusinessPaReplyFromFactsFn({
     facts,
@@ -224,6 +228,7 @@ export async function handleCustomerBusinessPaInbound({
     conversationHistory,
     styleKey: "casual_local",
     missingInfoEscalationEnabled: escalateEnabled,
+    missingInfoOwnerAnswerEnabled: ownerAnswerLoopEnabled,
     __chatCompletionsCreateForTests,
   });
 
