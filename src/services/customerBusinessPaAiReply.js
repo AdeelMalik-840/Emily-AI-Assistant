@@ -162,6 +162,7 @@ function cleanType(value) {
  *   styleKey?: "casual_local" | "neutral_english",
  *   timeoutMs?: number,
  *   missingInfoEscalationEnabled?: boolean,
+ *   missingInfoOwnerAnswerEnabled?: boolean,
  *   __chatCompletionsCreateForTests?: (args: unknown) => Promise<{ choices?: Array<{ message?: { content?: string | null } }> }>,
  * }} p
  * @returns {Promise<{
@@ -180,6 +181,7 @@ export async function generateCustomerBusinessPaReplyFromFacts({
   styleKey = "casual_local",
   timeoutMs = 8000,
   missingInfoEscalationEnabled = false,
+  missingInfoOwnerAnswerEnabled = false,
   __chatCompletionsCreateForTests = null,
 } = {}) {
   const userLine = String(userMessage ?? "")
@@ -192,6 +194,9 @@ export async function generateCustomerBusinessPaReplyFromFacts({
     .slice(0, 1200);
   const factsJson = compactFactsForPrompt(facts);
   const escalateOn = missingInfoEscalationEnabled === true;
+  // Promise follow-up wording only when the full loop (Phase 1 + Phase 2) is live.
+  const promiseFollowupOn =
+    escalateOn && missingInfoOwnerAnswerEnabled === true;
 
   const lang =
     styleKey === "casual_local"
@@ -202,13 +207,22 @@ export async function generateCustomerBusinessPaReplyFromFacts({
     facts?.booking && typeof facts.booking === "object" && facts.booking.id
   );
 
-  const missingFactGuidance = escalateOn
-    ? `- Question about advance/driver/delivery/documents/payment when those facts are missing/null → set needsFollowup=true with the correct missingInfoType, and customerReply may briefly say you will confirm (a real follow-up will run).
+  let missingFactGuidance;
+  if (promiseFollowupOn) {
+    missingFactGuidance = `- Question about advance/driver/delivery/documents/payment when those facts are missing/null → set needsFollowup=true with the correct missingInfoType, and customerReply may briefly say you will confirm (a real follow-up will run).
 - needsFollowup=true ONLY when the asked fact is missing/null in VERIFIED_BUSINESS_PA_FACTS_JSON.
-- missingInfoType must be one of: ${PA_MISSING_INFO_TYPES.join(", ")}.`
-    : `- Question about advance/driver/delivery/documents/payment when those facts are missing/null → say the detail is not confirmed / not available yet.
+- missingInfoType must be one of: ${PA_MISSING_INFO_TYPES.join(", ")}.`;
+  } else if (escalateOn) {
+    missingFactGuidance = `- Question about advance/driver/delivery/documents/payment when those facts are missing/null → set needsFollowup=true with the correct missingInfoType so the system can escalate internally.
+- customerReply must say the detail is not confirmed / not available yet.
+- Do NOT say you will check, confirm later, come back, or follow up (owner-answer follow-up is not enabled).
+- needsFollowup=true ONLY when the asked fact is missing/null in VERIFIED_BUSINESS_PA_FACTS_JSON.
+- missingInfoType must be one of: ${PA_MISSING_INFO_TYPES.join(", ")}.`;
+  } else {
+    missingFactGuidance = `- Question about advance/driver/delivery/documents/payment when those facts are missing/null → say the detail is not confirmed / not available yet.
 - Do NOT say you will check, confirm later, come back, or follow up (no real follow-up is available).
 - Always set needsFollowup=false and missingInfoType=null.`;
+  }
 
   const system = `You are Emily — a Pakistani WhatsApp business staff member for this business (not a call-center bot, not a website chatbot).
 
@@ -347,6 +361,156 @@ Language for customerReply: ${lang}`;
       reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
       needsFollowup: false,
       missingInfoType: null,
+      source: "technical_fallback",
+      reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
+    };
+  }
+}
+
+/**
+ * Phase 2: compose customer follow-up from verified facts + ownerAnswer only.
+ * Does not persist knowledge. No canned maps.
+ *
+ * @param {{
+ *   facts?: Record<string, unknown> | null,
+ *   customerQuestion?: string | null,
+ *   missingInfoType?: string | null,
+ *   ownerAnswer: string,
+ *   styleKey?: "casual_local" | "neutral_english",
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: (args: unknown) => Promise<{ choices?: Array<{ message?: { content?: string | null } }> }>,
+ * }} p
+ */
+export async function generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
+  facts = null,
+  customerQuestion = null,
+  missingInfoType = null,
+  ownerAnswer,
+  styleKey = "casual_local",
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const answer = String(ownerAnswer ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  if (!answer) {
+    return {
+      ok: false,
+      reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      source: "technical_fallback",
+      reason: "MISSING_OWNER_ANSWER",
+    };
+  }
+
+  const question = String(customerQuestion ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const type = cleanType(missingInfoType);
+  const factsJson = compactFactsForPrompt(facts || {});
+  const lang =
+    styleKey === "casual_local"
+      ? "Local Pakistani Roman Urdu WhatsApp chat (Pakistan), short and direct."
+      : "simple English, short WhatsApp staff style.";
+
+  const system = `You are Emily — Pakistani WhatsApp business staff (not a bot).
+
+OUTPUT: Return ONLY one JSON object:
+{"customerReply":"<short WhatsApp reply>","needsFollowup":false,"missingInfoType":null}
+
+customerReply language: ${lang}
+
+TASK:
+- Customer previously asked a missing-info question. Owner has now provided the answer for THIS request only.
+- Write a short natural follow-up that answers the customer using OWNER_ANSWER_FOR_THIS_REQUEST.
+- Use VERIFIED_BUSINESS_PA_FACTS_JSON only as background (booking/item context). Do not dump CRM fields.
+- Prefer 1 short sentence (max 2). Usually under ~140 characters.
+
+STRICT SAFETY:
+- Treat OWNER_ANSWER_FOR_THIS_REQUEST as verified for this reply only.
+- Do NOT invent amounts, policies, or details beyond owner answer + verified facts.
+- Do NOT persist or imply saving to business knowledge.
+- Do NOT mention owner, admin, internal tokens, Brain, Firestore, or systems.
+- Do NOT create/cancel/change bookings.
+- Money from owner answer: include PKR if an amount is stated.`;
+
+  const userPayload =
+    `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\n` +
+    `MISSING_INFO_TYPE:\n${type || "other"}\n\n` +
+    `ORIGINAL_CUSTOMER_QUESTION:\n${question || "(none)"}\n\n` +
+    `OWNER_ANSWER_FOR_THIS_REQUEST:\n${answer}`;
+
+  const completionFn =
+    typeof __chatCompletionsCreateForTests === "function"
+      ? __chatCompletionsCreateForTests
+      : (() => {
+          const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+          if (!apiKey) return null;
+          const client = new OpenAI({ apiKey });
+          return (args) => client.chat.completions.create(args);
+        })();
+
+  if (!completionFn) {
+    return {
+      ok: false,
+      reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      source: "technical_fallback",
+      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+    };
+  }
+
+  try {
+    const createPromise = Promise.resolve(
+      completionFn({
+        model: resolveOpenAiChatModel(),
+        temperature: 0.35,
+        max_tokens: 180,
+        messages: [
+          { role: "system", content: system },
+          {
+            role: "user",
+            content:
+              userPayload +
+              "\n\nRemember: JSON only; answer from owner answer; no inventing; no knowledge persist.",
+          },
+        ],
+      })
+    );
+    const timed =
+      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Promise.race([
+            createPromise,
+            new Promise((_, reject) => {
+              setTimeout(
+                () =>
+                  reject(new Error("PA_MISSING_INFO_FOLLOWUP_OPENAI_TIMEOUT")),
+                Math.floor(Number(timeoutMs))
+              );
+            }),
+          ])
+        : createPromise;
+
+    const resp = await timed;
+    const raw = resp?.choices?.[0]?.message?.content ?? "";
+    const parsed = parseCustomerBusinessPaAiJson(raw);
+    if (!parsed?.customerReply) {
+      return {
+        ok: false,
+        reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+        source: "technical_fallback",
+        reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+      };
+    }
+    return {
+      ok: true,
+      reply: parsed.customerReply,
+      source: "openai",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
       source: "technical_fallback",
       reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
     };

@@ -125,6 +125,15 @@ export function isEmilyBusinessPaMissingInfoEnabled() {
 }
 
 /**
+ * Business PA missing-info Phase 2: owner answer → customer follow-up.
+ * Default OFF. Requires EMILY_BUSINESS_PA_MISSING_INFO_ENABLED as well.
+ * @returns {boolean}
+ */
+export function isEmilyBusinessPaMissingInfoOwnerAnswerEnabled() {
+  return envTruthy("EMILY_BUSINESS_PA_MISSING_INFO_OWNER_ANSWER_ENABLED");
+}
+
+/**
  * @returns {{
  *   live: boolean,
  *   liveAllowlist: string[],
@@ -140,6 +149,7 @@ export function isEmilyBusinessPaMissingInfoEnabled() {
  *   contactInfoPhoneExtraction: boolean,
  *   businessPaAgent: boolean,
  *   businessPaMissingInfo: boolean,
+ *   businessPaMissingInfoOwnerAnswer: boolean,
  * }}
  */
 export function getEmilyBrainV2LiveFlagSnapshot() {
@@ -158,5 +168,6 @@ export function getEmilyBrainV2LiveFlagSnapshot() {
     contactInfoPhoneExtraction: isPlaywrightContactInfoPhoneExtractionEnabled(),
     businessPaAgent: isEmilyBusinessPaAgentEnabled(),
     businessPaMissingInfo: isEmilyBusinessPaMissingInfoEnabled(),
+    businessPaMissingInfoOwnerAnswer: isEmilyBusinessPaMissingInfoOwnerAnswerEnabled(),
   };
 }
