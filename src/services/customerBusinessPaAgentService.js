@@ -12,10 +12,10 @@ import {
   isEmilyBusinessPaMissingInfoOwnerAnswerEnabled,
 } from "../brain/config/liveFeatureFlags.js";
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
+import { decideCustomerTurn } from "../brain/decisions/decideCustomerTurn.js";
 import {
   applyPostConfirmAntiEchoAndSilence,
   canEscalatePostConfirmMissingInfo,
-  decidePostConfirmCustomerDm,
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
 import {
@@ -178,7 +178,7 @@ function isLikelyDeliveryAddressOnly(message) {
  *   missingInfoEscalationEnabled?: boolean,
  *   missingInfoOwnerAnswerEnabled?: boolean,
  *   __resolveActiveCustomerBookingFactsFn?: typeof resolveActiveCustomerBookingFacts,
- *   __decidePostConfirmCustomerDmFn?: typeof decidePostConfirmCustomerDm,
+ *   __decideCustomerTurnFn?: typeof decideCustomerTurn,
  *   __createOrGetOpenPaMissingInfoRequestFn?: typeof createOrGetOpenPaMissingInfoRequest,
  *   __sendPaMissingInfoOwnerNotificationFn?: typeof sendPaMissingInfoOwnerNotification,
  *   __chatCompletionsCreateForTests?: Function,
@@ -198,7 +198,7 @@ export async function handleCustomerBusinessPaInbound({
   missingInfoEscalationEnabled = isEmilyBusinessPaMissingInfoEnabled(),
   missingInfoOwnerAnswerEnabled = isEmilyBusinessPaMissingInfoOwnerAnswerEnabled(),
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
-  __decidePostConfirmCustomerDmFn = decidePostConfirmCustomerDm,
+  __decideCustomerTurnFn = decideCustomerTurn,
   __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
   __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
   __chatCompletionsCreateForTests = null,
@@ -250,10 +250,26 @@ export async function handleCustomerBusinessPaInbound({
   const ownerAnswerEnabled = missingInfoOwnerAnswerEnabled === true;
   const loopFullyEnabled = missingInfoEnabled && ownerAnswerEnabled;
 
-  const decided = await __decidePostConfirmCustomerDmFn({
+  // Brain shared entrypoint — PA packs context + executes; does not own meaning.
+  const decided = await __decideCustomerTurnFn({
+    lane: "post_confirm_pa",
+    channel: "whatsapp",
+    chatType: "dm",
+    businessId: uid,
+    customerPhone: phone,
+    messageText: text,
+    messageId,
+    recentDialogue: conversationHistory,
+    ownershipLane: "post_confirm_pa",
+    activeBooking: facts.booking ?? null,
+    activeAvailabilityRequest: facts.availabilityRequest ?? null,
+    knownPolicies: facts.known ?? null,
+    openMissingInfoRequests: facts.openMissingInfoRequests ?? null,
+    latestClosedMissingInfoAnswers:
+      facts.latestClosedMissingInfoAnswers ?? null,
+    safetyPolicy: facts.policy ?? null,
+    allowedExecutors: ["whatsapp_cloud_dm", "pa_missing_info_escalate"],
     facts,
-    userMessage: text,
-    conversationHistory,
     styleKey: "casual_local",
     missingInfoLoopFullyEnabled: loopFullyEnabled,
     __chatCompletionsCreateForTests,

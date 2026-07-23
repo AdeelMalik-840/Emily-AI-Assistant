@@ -1,7 +1,7 @@
 /**
  * Compatibility helpers for Business PA.
  * Customer-turn meaning decisions live in Brain:
- *   src/brain/decisions/decidePostConfirmCustomerDm.js
+ *   src/brain/decisions/decideCustomerTurn.js
  * This module keeps:
  * - technical fallback export
  * - compact facts test helper
@@ -10,9 +10,9 @@
 
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../config/aiRuntime.js";
+import { decideCustomerTurn } from "../brain/decisions/decideCustomerTurn.js";
 import {
   compactPostConfirmFactsForPrompt,
-  decidePostConfirmCustomerDm,
   parsePostConfirmCustomerDmDecision,
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
@@ -52,7 +52,7 @@ export function parseCustomerBusinessPaAiJson(raw) {
 }
 
 /**
- * Thin wrapper around Brain decidePostConfirmCustomerDm for older call sites/tests.
+ * Thin wrapper around Brain decideCustomerTurn for older call sites/tests.
  * Not a PA-owned decision engine.
  */
 export async function generateCustomerBusinessPaReplyFromFacts({
@@ -65,10 +65,14 @@ export async function generateCustomerBusinessPaReplyFromFacts({
   missingInfoOwnerAnswerEnabled = false,
   __chatCompletionsCreateForTests = null,
 } = {}) {
-  const decided = await decidePostConfirmCustomerDm({
+  const decided = await decideCustomerTurn({
+    lane: "post_confirm_pa",
+    channel: "whatsapp",
+    chatType: "dm",
+    messageText: userMessage,
+    recentDialogue: conversationHistory,
+    ownershipLane: "post_confirm_pa",
     facts,
-    userMessage,
-    conversationHistory,
     styleKey,
     timeoutMs,
     missingInfoLoopFullyEnabled:
