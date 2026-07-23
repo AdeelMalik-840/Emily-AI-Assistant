@@ -1,8 +1,13 @@
 /**
  * Brain-owned facts: active approved customer booking + linked AVR + business profile.
  * Used by the thin Business PA lane. Does not understand turns or produce replies.
+ * Closed paMissingInfoRequest owner answers overlay as booking-scoped known facts only.
  */
 import { getAvailabilityRequest } from "../../services/availabilityRequestService.js";
+import {
+  listClosedPaMissingInfoAnswersForBooking,
+  listOpenPaMissingInfoRequestsForBooking,
+} from "../../services/paMissingInfoRequestService.js";
 import { resolveBusinessProfileFacts } from "./resolveBusinessProfileFacts.js";
 
 const ACTIVE_APPROVAL_STAGES = [
@@ -54,7 +59,11 @@ function isActiveApprovedBooking(booking) {
 
 function toFiniteNumber(value) {
   if (value == null || value === "") return null;
-  const n = Number(value);
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const raw = String(value).replace(/,/g, "").trim();
+  const match = raw.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const n = Number(match[0]);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -70,12 +79,54 @@ function compactPriceQuote(quote) {
 }
 
 /**
+ * Overlay closed owner answers into known facts (booking-scoped only).
+ * @param {Record<string, unknown>} known
+ * @param {Array<{ missingInfoType: string, ownerAnswer: string, requestId: string }>} answers
+ */
+export function applyClosedPaMissingInfoAnswersToKnown(known, answers) {
+  const next = { ...(known && typeof known === "object" ? known : {}) };
+  const evidence = [];
+  for (const row of answers || []) {
+    const type = clean(row?.missingInfoType, 40);
+    const answer = clean(row?.ownerAnswer, 800);
+    if (!type || !answer) continue;
+    if (type === "advance") {
+      const amount = toFiniteNumber(answer);
+      if (amount != null && next.advanceAmount == null) {
+        next.advanceAmount = amount;
+        evidence.push({ type, requestId: row.requestId, field: "advanceAmount" });
+      } else if (!next.advancePolicy) {
+        next.advancePolicy = answer;
+        evidence.push({ type, requestId: row.requestId, field: "advancePolicy" });
+      }
+      continue;
+    }
+    if (type === "driver" && !next.driverPolicy) {
+      next.driverPolicy = answer;
+      evidence.push({ type, requestId: row.requestId, field: "driverPolicy" });
+    } else if (type === "payment" && !next.paymentPolicy) {
+      next.paymentPolicy = answer;
+      evidence.push({ type, requestId: row.requestId, field: "paymentPolicy" });
+    } else if (type === "documents" && !next.documentsPolicy) {
+      next.documentsPolicy = answer;
+      evidence.push({ type, requestId: row.requestId, field: "documentsPolicy" });
+    } else if (type === "delivery" && !next.deliveryPolicy) {
+      next.deliveryPolicy = answer;
+      evidence.push({ type, requestId: row.requestId, field: "deliveryPolicy" });
+    }
+  }
+  return { known: next, evidence };
+}
+
+/**
  * @param {{
  *   db?: unknown,
  *   businessId: string,
  *   customerPhone: string,
  *   getBusinessProfileFn?: (uid: string) => Promise<unknown>,
  *   getAvailabilityRequestFn?: typeof getAvailabilityRequest,
+ *   listClosedPaMissingInfoAnswersFn?: typeof listClosedPaMissingInfoAnswersForBooking,
+ *   listOpenPaMissingInfoRequestsFn?: typeof listOpenPaMissingInfoRequestsForBooking,
  * }} params
  */
 export async function resolveActiveCustomerBookingFacts({
@@ -84,6 +135,8 @@ export async function resolveActiveCustomerBookingFacts({
   customerPhone,
   getBusinessProfileFn,
   getAvailabilityRequestFn = getAvailabilityRequest,
+  listClosedPaMissingInfoAnswersFn = listClosedPaMissingInfoAnswersForBooking,
+  listOpenPaMissingInfoRequestsFn = listOpenPaMissingInfoRequestsForBooking,
 } = {}) {
   const uid = clean(businessId);
   const phone = phoneDigitsOnly(customerPhone);
@@ -176,13 +229,87 @@ export async function resolveActiveCustomerBookingFacts({
     profileFacts.business && typeof profileFacts.business === "object"
       ? profileFacts.business
       : {};
-  const advanceAmount =
-    toFiniteNumber(biz.advanceAmount) ?? null;
-  const advancePolicy = clean(biz.advancePolicy) || null;
-  const driverPolicy = clean(biz.driverPolicy) || null;
-  const paymentPolicy = clean(biz.paymentPolicy) || null;
-  const documentsPolicy = clean(biz.documentsPolicy) || null;
-  const deliveryPolicy = clean(biz.deliveryPolicy) || null;
+  let advanceAmount = toFiniteNumber(biz.advanceAmount) ?? null;
+  let advancePolicy = clean(biz.advancePolicy) || null;
+  let driverPolicy = clean(biz.driverPolicy) || null;
+  let paymentPolicy = clean(biz.paymentPolicy) || null;
+  let documentsPolicy = clean(biz.documentsPolicy) || null;
+  let deliveryPolicy = clean(biz.deliveryPolicy) || null;
+
+  let known = {
+    totalAmount,
+    dailyRate,
+    durationDays:
+      durationDays != null ? Math.max(1, Math.floor(durationDays)) : null,
+    itemLabel,
+    advanceAmount,
+    advancePolicy,
+    driverPolicy,
+    paymentPolicy,
+    documentsPolicy,
+    deliveryPolicy,
+    knowledgeExcerpt: biz.instructions ?? null,
+  };
+
+  let closedAnswerEvidence = [];
+  /** @type {Array<Record<string, unknown>>} */
+  let openMissingInfoRequests = [];
+  /** @type {Array<Record<string, unknown>>} */
+  let latestClosedMissingInfoAnswers = [];
+  const bookingIdClean = clean(booking.id);
+  try {
+    const [closedAnswers, openRequests] = await Promise.all([
+      listClosedPaMissingInfoAnswersFn({
+        db: connection,
+        businessId: uid,
+        bookingId: bookingIdClean,
+        customerPhone: phone,
+      }),
+      listOpenPaMissingInfoRequestsFn({
+        db: connection,
+        businessId: uid,
+        bookingId: bookingIdClean,
+        customerPhone: phone,
+      }),
+    ]);
+    latestClosedMissingInfoAnswers = Array.isArray(closedAnswers)
+      ? closedAnswers.map((row) => ({
+          requestId: clean(row.requestId, 120) || null,
+          missingInfoType: clean(row.missingInfoType, 40) || null,
+          customerQuestion: clean(row.customerQuestion, 400) || null,
+          ownerAnswer: clean(row.ownerAnswer, 800) || null,
+          customerFollowupText: clean(row.customerFollowupText, 800) || null,
+          customerFollowupStatus: clean(row.customerFollowupStatus, 40) || null,
+          closedAt: clean(row.closedAt, 40) || null,
+        }))
+      : [];
+    openMissingInfoRequests = Array.isArray(openRequests)
+      ? openRequests.map((row) => ({
+          requestId: clean(row.requestId, 120) || null,
+          missingInfoType: clean(row.missingInfoType, 40) || null,
+          customerQuestion: clean(row.customerQuestion, 400) || null,
+          status: clean(row.status, 40) || null,
+          createdAt: clean(row.createdAt, 40) || null,
+          ownerNotifyStatus: clean(row.ownerNotifyStatus, 40) || null,
+        }))
+      : [];
+    const applied = applyClosedPaMissingInfoAnswersToKnown(
+      known,
+      closedAnswers
+    );
+    known = applied.known;
+    closedAnswerEvidence = applied.evidence;
+    advanceAmount = known.advanceAmount ?? null;
+    advancePolicy = known.advancePolicy ?? null;
+    driverPolicy = known.driverPolicy ?? null;
+    paymentPolicy = known.paymentPolicy ?? null;
+    documentsPolicy = known.documentsPolicy ?? null;
+    deliveryPolicy = known.deliveryPolicy ?? null;
+  } catch {
+    closedAnswerEvidence = [];
+    openMissingInfoRequests = [];
+    latestClosedMissingInfoAnswers = [];
+  }
 
   return {
     ok: true,
@@ -200,7 +327,7 @@ export async function resolveActiveCustomerBookingFacts({
         deliveryPolicy,
       },
       booking: {
-        id: clean(booking.id),
+        id: bookingIdClean,
         status: clean(booking.status) || null,
         approvalStage: clean(booking.approvalStage) || null,
         itemId: clean(booking.itemId) || null,
@@ -215,21 +342,9 @@ export async function resolveActiveCustomerBookingFacts({
         dmTargetPhone: phoneDigitsOnly(booking.dmTargetPhone) || null,
       },
       availabilityRequest,
-      known: {
-        // Verified booking totals + Brain profile policy facts only — never invent.
-        totalAmount,
-        dailyRate,
-        durationDays:
-          durationDays != null ? Math.max(1, Math.floor(durationDays)) : null,
-        itemLabel,
-        advanceAmount,
-        advancePolicy,
-        driverPolicy,
-        paymentPolicy,
-        documentsPolicy,
-        deliveryPolicy,
-        knowledgeExcerpt: biz.instructions ?? null,
-      },
+      known,
+      openMissingInfoRequests,
+      latestClosedMissingInfoAnswers,
       policy: {
         readOnly: true,
         doNotInventAmounts: true,
@@ -238,9 +353,12 @@ export async function resolveActiveCustomerBookingFacts({
       },
       sourceEvidence: {
         business: profileFacts.sourceEvidence?.business ?? null,
-        bookingId: clean(booking.id) || null,
+        bookingId: bookingIdClean || null,
         availabilityRequestId: availabilityRequestId || null,
         availabilityRequestLoaded: Boolean(availabilityRequest),
+        paMissingInfoClosedAnswers: closedAnswerEvidence,
+        openMissingInfoCount: openMissingInfoRequests.length,
+        closedMissingInfoCount: latestClosedMissingInfoAnswers.length,
       },
     },
   };

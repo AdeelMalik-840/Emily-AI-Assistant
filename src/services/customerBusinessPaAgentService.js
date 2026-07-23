@@ -1,7 +1,6 @@
 /**
- * Emily Business PA — thin post-confirm customer DM ownership lane.
- * Brain-owned facts → action guard → OpenAI natural reply.
- * Phase 1: optional missing-info escalate (request + owner notify) when flagged.
+ * Emily Business PA — post-confirm context owner + safe executor.
+ * Brain facts → deterministic action block → Brain decision → execute only.
  * Never creates/updates/cancels bookings. No canned topic reply engine.
  */
 
@@ -13,9 +12,10 @@ import {
 } from "../brain/config/liveFeatureFlags.js";
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
 import {
-  CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
-  generateCustomerBusinessPaReplyFromFacts,
-} from "./customerBusinessPaAiReply.js";
+  canEscalatePostConfirmMissingInfo,
+  decidePostConfirmCustomerDm,
+  POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
+} from "../brain/decisions/decidePostConfirmCustomerDm.js";
 import {
   createOrGetOpenPaMissingInfoRequest,
   isPaMissingInfoFactMissing,
@@ -151,8 +151,9 @@ function isLikelyDeliveryAddressOnly(message) {
  *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
  *   businessPaEnabled?: boolean,
  *   missingInfoEscalationEnabled?: boolean,
+ *   missingInfoOwnerAnswerEnabled?: boolean,
  *   __resolveActiveCustomerBookingFactsFn?: typeof resolveActiveCustomerBookingFacts,
- *   __generateCustomerBusinessPaReplyFromFactsFn?: typeof generateCustomerBusinessPaReplyFromFacts,
+ *   __decidePostConfirmCustomerDmFn?: typeof decidePostConfirmCustomerDm,
  *   __createOrGetOpenPaMissingInfoRequestFn?: typeof createOrGetOpenPaMissingInfoRequest,
  *   __sendPaMissingInfoOwnerNotificationFn?: typeof sendPaMissingInfoOwnerNotification,
  *   __chatCompletionsCreateForTests?: Function,
@@ -171,7 +172,7 @@ export async function handleCustomerBusinessPaInbound({
   missingInfoEscalationEnabled = isEmilyBusinessPaMissingInfoEnabled(),
   missingInfoOwnerAnswerEnabled = isEmilyBusinessPaMissingInfoOwnerAnswerEnabled(),
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
-  __generateCustomerBusinessPaReplyFromFactsFn = generateCustomerBusinessPaReplyFromFacts,
+  __decidePostConfirmCustomerDmFn = decidePostConfirmCustomerDm,
   __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
   __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
   __chatCompletionsCreateForTests = null,
@@ -200,12 +201,12 @@ export async function handleCustomerBusinessPaInbound({
   }
 
   const facts = resolved.facts;
-  const action = classifyCustomerBusinessPaActionIntent(text, facts);
-  if (action.isAction) {
+  const actionIntent = classifyCustomerBusinessPaActionIntent(text, facts);
+  if (actionIntent.isAction) {
     return {
       handled: false,
       reason: "ACTION_INTENT",
-      actionKind: action.kind,
+      actionKind: actionIntent.kind,
       bookingId: clean(facts.booking?.id) || null,
     };
   }
@@ -218,22 +219,33 @@ export async function handleCustomerBusinessPaInbound({
     };
   }
 
-  const escalateEnabled = missingInfoEscalationEnabled === true;
-  const ownerAnswerLoopEnabled =
-    escalateEnabled && missingInfoOwnerAnswerEnabled === true;
+  const missingInfoEnabled = missingInfoEscalationEnabled === true;
+  const ownerAnswerEnabled = missingInfoOwnerAnswerEnabled === true;
+  const loopFullyEnabled = missingInfoEnabled && ownerAnswerEnabled;
 
-  const ai = await __generateCustomerBusinessPaReplyFromFactsFn({
+  const decided = await __decidePostConfirmCustomerDmFn({
     facts,
     userMessage: text,
     conversationHistory,
     styleKey: "casual_local",
-    missingInfoEscalationEnabled: escalateEnabled,
-    missingInfoOwnerAnswerEnabled: ownerAnswerLoopEnabled,
+    missingInfoLoopFullyEnabled: loopFullyEnabled,
     __chatCompletionsCreateForTests,
   });
 
-  const reply = clean(ai?.reply || CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK, 500);
-  const openaiUsed = ai?.source === "openai" && ai?.ok === true;
+  const decision = decided?.decision || {
+    conversationAct: "unknown",
+    customerIsAskingQuestion: false,
+    requestedInfoType: null,
+    customerReply: POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
+    action: "reply",
+    situation: "unclear",
+  };
+
+  const reply = clean(
+    decision.customerReply || POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
+    500
+  );
+  const openaiUsed = decided?.source === "openai" && decided?.ok === true;
   const reason = openaiUsed ? "HANDLED" : "HANDLED_FALLBACK";
 
   let missingInfoEscalated = false;
@@ -244,16 +256,17 @@ export async function handleCustomerBusinessPaInbound({
   const bookingId = clean(facts.booking?.id) || null;
   const availabilityRequestId =
     clean(facts.booking?.availabilityRequestId) || null;
-  const modelWantsFollowup = ai?.needsFollowup === true;
-  const modelType = clean(ai?.missingInfoType, 40) || null;
 
-  if (
-    escalateEnabled &&
-    modelWantsFollowup &&
-    modelType &&
-    bookingId &&
-    isPaMissingInfoFactMissing(facts, modelType)
-  ) {
+  const mayEscalate = canEscalatePostConfirmMissingInfo({
+    decision,
+    facts,
+    missingInfoEnabled,
+    ownerAnswerEnabled,
+    isFactMissingFn: isPaMissingInfoFactMissing,
+  });
+
+  if (mayEscalate) {
+    const modelType = clean(decision.requestedInfoType, 40);
     try {
       const created = await __createOrGetOpenPaMissingInfoRequestFn({
         db: connection,
@@ -282,7 +295,6 @@ export async function handleCustomerBusinessPaInbound({
           ownerNotifyStatus = clean(notify?.ownerNotifyStatus, 40) || null;
           missingInfoEscalated = notify?.ok === true || notify?.skipped === true;
         } else {
-          // Deduped open request — no second notify
           ownerNotifyStatus =
             clean(created.request.ownerNotifyStatus, 40) || "sent";
           missingInfoEscalated = false;
@@ -306,6 +318,9 @@ export async function handleCustomerBusinessPaInbound({
     businessId: uid,
     bookingId,
     openaiUsed,
+    conversationAct: decision.conversationAct,
+    situation: decision.situation,
+    decisionAction: decision.action,
     missingInfoEscalated,
     missingInfoRequestId,
     missingInfoType,
@@ -320,7 +335,10 @@ export async function handleCustomerBusinessPaInbound({
     availabilityRequestId,
     reason,
     openaiUsed,
-    openaiSource: ai?.source ?? "technical_fallback",
+    openaiSource: decided?.source ?? "technical_fallback",
+    conversationAct: decision.conversationAct,
+    situation: decision.situation ?? "unclear",
+    decisionAction: decision.action,
     missingInfoEscalated,
     missingInfoRequestId,
     missingInfoType,
