@@ -1,17 +1,25 @@
 /**
  * Emily Business PA — thin post-confirm customer DM ownership lane.
  * Brain-owned facts → action guard → OpenAI natural reply.
- * Never creates/updates/cancels bookings. Never notifies owner.
- * No canned topic reply engine.
+ * Phase 1: optional missing-info escalate (request + owner notify) when flagged.
+ * Never creates/updates/cancels bookings. No canned topic reply engine.
  */
 
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
-import { isEmilyBusinessPaAgentEnabled } from "../brain/config/liveFeatureFlags.js";
+import {
+  isEmilyBusinessPaAgentEnabled,
+  isEmilyBusinessPaMissingInfoEnabled,
+} from "../brain/config/liveFeatureFlags.js";
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
 import {
   CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
   generateCustomerBusinessPaReplyFromFacts,
 } from "./customerBusinessPaAiReply.js";
+import {
+  createOrGetOpenPaMissingInfoRequest,
+  isPaMissingInfoFactMissing,
+} from "./paMissingInfoRequestService.js";
+import { sendPaMissingInfoOwnerNotification } from "./paMissingInfoOwnerNotifyService.js";
 import {
   classifyAvailabilityConfirmationIntent,
   detectAvailabilityChangeCarIntent,
@@ -141,8 +149,11 @@ function isLikelyDeliveryAddressOnly(message) {
  *   sendCredentials?: unknown,
  *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
  *   businessPaEnabled?: boolean,
+ *   missingInfoEscalationEnabled?: boolean,
  *   __resolveActiveCustomerBookingFactsFn?: typeof resolveActiveCustomerBookingFacts,
  *   __generateCustomerBusinessPaReplyFromFactsFn?: typeof generateCustomerBusinessPaReplyFromFacts,
+ *   __createOrGetOpenPaMissingInfoRequestFn?: typeof createOrGetOpenPaMissingInfoRequest,
+ *   __sendPaMissingInfoOwnerNotificationFn?: typeof sendPaMissingInfoOwnerNotification,
  *   __chatCompletionsCreateForTests?: Function,
  * }} params
  */
@@ -156,8 +167,11 @@ export async function handleCustomerBusinessPaInbound({
   sendCredentials = null,
   sendWhatsAppMessageFn = sendWhatsAppMessage,
   businessPaEnabled = isEmilyBusinessPaAgentEnabled(),
+  missingInfoEscalationEnabled = isEmilyBusinessPaMissingInfoEnabled(),
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
   __generateCustomerBusinessPaReplyFromFactsFn = generateCustomerBusinessPaReplyFromFacts,
+  __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
+  __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
   __chatCompletionsCreateForTests = null,
 }) {
   if (!businessPaEnabled) {
@@ -170,7 +184,6 @@ export async function handleCustomerBusinessPaInbound({
   if (!uid || !phone || !text) {
     return { handled: false, reason: "MISSING_CONTEXT" };
   }
-  void messageId;
 
   const resolved = await __resolveActiveCustomerBookingFactsFn({
     db: connection,
@@ -203,11 +216,14 @@ export async function handleCustomerBusinessPaInbound({
     };
   }
 
+  const escalateEnabled = missingInfoEscalationEnabled === true;
+
   const ai = await __generateCustomerBusinessPaReplyFromFactsFn({
     facts,
     userMessage: text,
     conversationHistory,
     styleKey: "casual_local",
+    missingInfoEscalationEnabled: escalateEnabled,
     __chatCompletionsCreateForTests,
   });
 
@@ -215,19 +231,95 @@ export async function handleCustomerBusinessPaInbound({
   const openaiUsed = ai?.source === "openai" && ai?.ok === true;
   const reason = openaiUsed ? "HANDLED" : "HANDLED_FALLBACK";
 
+  let missingInfoEscalated = false;
+  let missingInfoRequestId = null;
+  let missingInfoType = null;
+  let ownerNotifyStatus = null;
+
+  const bookingId = clean(facts.booking?.id) || null;
+  const availabilityRequestId =
+    clean(facts.booking?.availabilityRequestId) || null;
+  const modelWantsFollowup = ai?.needsFollowup === true;
+  const modelType = clean(ai?.missingInfoType, 40) || null;
+
+  if (
+    escalateEnabled &&
+    modelWantsFollowup &&
+    modelType &&
+    bookingId &&
+    isPaMissingInfoFactMissing(facts, modelType)
+  ) {
+    try {
+      const created = await __createOrGetOpenPaMissingInfoRequestFn({
+        db: connection,
+        businessId: uid,
+        customerPhone: phone,
+        bookingId,
+        availabilityRequestId,
+        missingInfoType: modelType,
+        customerQuestion: text,
+        customerMessageId: clean(messageId, 160) || null,
+      });
+
+      if (created?.ok && created.request) {
+        missingInfoRequestId = clean(created.request.requestId, 120) || null;
+        missingInfoType = modelType;
+
+        if (created.created === true) {
+          const notify = await __sendPaMissingInfoOwnerNotificationFn({
+            db: connection,
+            businessId: uid,
+            request: created.request,
+            itemLabel: clean(facts.booking?.itemLabel || facts.known?.itemLabel),
+            sendCredentials,
+            sendWhatsAppMessageFn,
+          });
+          ownerNotifyStatus = clean(notify?.ownerNotifyStatus, 40) || null;
+          missingInfoEscalated = notify?.ok === true || notify?.skipped === true;
+        } else {
+          // Deduped open request — no second notify
+          ownerNotifyStatus =
+            clean(created.request.ownerNotifyStatus, 40) || "sent";
+          missingInfoEscalated = false;
+        }
+      }
+    } catch (err) {
+      console.warn("[pa_missing_info_escalate_failed]", {
+        businessId: uid,
+        bookingId,
+        missingInfoType: modelType,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
   await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
     recipientType: "individual",
   }).catch(() => null);
+
+  console.log("[customer_business_pa_result]", {
+    businessId: uid,
+    bookingId,
+    openaiUsed,
+    missingInfoEscalated,
+    missingInfoRequestId,
+    missingInfoType,
+    ownerNotifyStatus,
+  });
 
   return {
     handled: true,
     action: "business_pa_reply",
     reply,
-    bookingId: clean(facts.booking?.id) || null,
-    availabilityRequestId: clean(facts.booking?.availabilityRequestId) || null,
+    bookingId,
+    availabilityRequestId,
     reason,
     openaiUsed,
     openaiSource: ai?.source ?? "technical_fallback",
+    missingInfoEscalated,
+    missingInfoRequestId,
+    missingInfoType,
+    ownerNotifyStatus,
   };
 }
 
