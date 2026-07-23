@@ -1849,6 +1849,59 @@ export async function executeWhatsAppAiPipeline(p) {
   }
   }
 
+  // Business PA: after Cloud confirm + waiting-confirm ownership guard, before Brain.
+  if (!skipGeneralBrainForWaitingConfirmOwnership) {
+    const canTryBusinessPa =
+      !isGroupInbound &&
+      !playwrightWebInbound &&
+      Boolean(String(ownerUserId ?? "").trim()) &&
+      Boolean(cloudConfirmPhone) &&
+      cloudConfirmPhone !== "unknown" &&
+      Boolean(String(latestMessage ?? "").trim());
+    if (canTryBusinessPa) {
+      const tryBusinessPaFn =
+        typeof p.__tryHandleCustomerBusinessPaInboundFn === "function"
+          ? p.__tryHandleCustomerBusinessPaInboundFn
+          : (
+              await import("./customerBusinessPaAgentService.js")
+            ).tryHandleCustomerBusinessPaInbound;
+      const businessPaResult = await tryBusinessPaFn({
+        db,
+        businessId: ownerUserId,
+        customerPhone: cloudConfirmPhone,
+        messageText: latestMessage,
+        messageId,
+        conversationHistory,
+        sendCredentials,
+      });
+      if (businessPaResult) {
+        skipGeneralBrainForWaitingConfirmOwnership = true;
+        console.log("[customer_business_pa_ownership_handled]", {
+          traceId,
+          businessId: ownerUserId,
+          bookingId: businessPaResult.bookingId ?? null,
+          availabilityRequestId: businessPaResult.availabilityRequestId ?? null,
+          openaiUsed: businessPaResult.openaiUsed === true,
+          openaiSource: businessPaResult.openaiSource ?? null,
+          isGroupInbound,
+          messagePreview: String(latestMessage ?? "").slice(0, 120),
+        });
+        reply = "";
+        sendVia = "NONE";
+        messageMeta = {
+          handledWithoutOutbound: true,
+          customerBusinessPaHandled: true,
+          bookingId: businessPaResult.bookingId ?? null,
+          availabilityRequestId: businessPaResult.availabilityRequestId ?? null,
+          outboundTrace: {
+            kind: "business_pa_outbound",
+            finalReplySource: "CUSTOMER_BUSINESS_PA",
+          },
+        };
+      }
+    }
+  }
+
   let routeGate = {
     selected: "legacy",
     route: "ownership_skipped",

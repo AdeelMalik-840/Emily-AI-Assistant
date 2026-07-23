@@ -107,6 +107,15 @@ export function isPlaywrightContactInfoPhoneExtractionEnabled() {
 }
 
 /**
+ * Customer Business PA Agent (post-confirm business Q&A lane).
+ * Default OFF — must be explicitly enabled.
+ * @returns {boolean}
+ */
+export function isEmilyBusinessPaAgentEnabled() {
+  return envTruthy("EMILY_BUSINESS_PA_AGENT_ENABLED");
+}
+
+/**
  * @returns {{
  *   live: boolean,
  *   liveAllowlist: string[],
@@ -120,6 +129,7 @@ export function isPlaywrightContactInfoPhoneExtractionEnabled() {
  *   availabilityCustomerDmExecute: boolean,
  *   availabilityConfirmExecute: boolean,
  *   contactInfoPhoneExtraction: boolean,
+ *   businessPaAgent: boolean,
  * }}
  */
 export function getEmilyBrainV2LiveFlagSnapshot() {
@@ -136,5 +146,6 @@ export function getEmilyBrainV2LiveFlagSnapshot() {
     availabilityCustomerDmExecute: isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled(),
     availabilityConfirmExecute: isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
     contactInfoPhoneExtraction: isPlaywrightContactInfoPhoneExtractionEnabled(),
+    businessPaAgent: isEmilyBusinessPaAgentEnabled(),
   };
 }
