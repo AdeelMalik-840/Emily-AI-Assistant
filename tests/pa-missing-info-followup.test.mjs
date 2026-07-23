@@ -822,11 +822,106 @@ test("Brain decision helper lives under src/brain/decisions", async () => {
     "../src/brain/decisions/decidePostConfirmCustomerDm.js"
   );
   assert.equal(typeof mod.decidePostConfirmCustomerDm, "function");
+  assert.equal(typeof mod.executePostConfirmPaLaneDecision, "function");
   assert.equal(typeof mod.canEscalatePostConfirmMissingInfo, "function");
   assert.equal(typeof mod.parsePostConfirmCustomerDmDecision, "function");
   assert.ok(mod.POST_CONFIRM_SITUATIONS.includes("new_question"));
   assert.ok(
     mod.POST_CONFIRM_SITUATIONS.includes("acknowledgement_after_answer")
+  );
+});
+
+test("shared decideCustomerTurn exists and post-confirm wrapper stays compatible", async () => {
+  const shared = await import("../src/brain/decisions/decideCustomerTurn.js");
+  const post = await import(
+    "../src/brain/decisions/decidePostConfirmCustomerDm.js"
+  );
+  assert.equal(typeof shared.decideCustomerTurn, "function");
+  assert.equal(typeof shared.normalizeTurnContext, "function");
+  assert.equal(typeof post.decidePostConfirmCustomerDm, "function");
+  assert.ok(shared.CUSTOMER_TURN_LANES.includes("post_confirm_pa"));
+
+  const ctx = shared.normalizeTurnContext({
+    lane: "post_confirm_pa",
+    messageText: "thanks",
+    facts: { businessId: BUSINESS_ID, booking: { id: BOOKING_ID } },
+  });
+  assert.equal(ctx.lane, "post_confirm_pa");
+  assert.equal(ctx.messageText, "thanks");
+  assert.equal(ctx.businessId, BUSINESS_ID);
+  assert.equal(ctx.activeBooking?.id, BOOKING_ID);
+  assert.equal(ctx.pendingPromises, null);
+
+  const decisionJson = {
+    situation: "conversation_closing",
+    conversationAct: "chit_chat",
+    customerIntent: "farewell",
+    customerIsAskingQuestion: false,
+    requestedInfoType: null,
+    shouldReply: false,
+    customerReply: "",
+    action: "silence",
+  };
+  let openaiCalls = 0;
+  const decided = await shared.decideCustomerTurn({
+    lane: "post_confirm_pa",
+    messageText: "Have a good day",
+    facts: { businessId: BUSINESS_ID, booking: { id: BOOKING_ID } },
+    __chatCompletionsCreateForTests: async () => {
+      openaiCalls += 1;
+      return {
+        choices: [{ message: { content: JSON.stringify(decisionJson) } }],
+      };
+    },
+  });
+  assert.equal(openaiCalls, 1);
+  assert.equal(decided.ok, true);
+  assert.equal(decided.lane, "post_confirm_pa");
+  assert.equal(decided.decision.action, "silence");
+  assert.equal(decided.decision.shouldReply, false);
+  assert.equal(decided.decision.conversationStage, "conversation_closing");
+  assert.equal(decided.decision.actionType, "silence");
+  assert.equal(decided.decision.requiredExecutor, "none");
+
+  // Compat wrapper still works and routes through shared entrypoint.
+  const viaCompat = await post.decidePostConfirmCustomerDm({
+    facts: { businessId: BUSINESS_ID, booking: { id: BOOKING_ID } },
+    userMessage: "Have a good day",
+    __chatCompletionsCreateForTests: async () => ({
+      choices: [{ message: { content: JSON.stringify(decisionJson) } }],
+    }),
+  });
+  assert.equal(viaCompat.ok, true);
+  assert.equal(viaCompat.lane, "post_confirm_pa");
+  assert.equal(viaCompat.decision.action, "silence");
+
+  // Unsupported lanes do not invent a second Brain path — soft fallback only.
+  const unsupported = await shared.decideCustomerTurn({
+    lane: "group_availability",
+    messageText: "hello",
+  });
+  assert.equal(unsupported.ok, false);
+  assert.equal(unsupported.reason, "UNSUPPORTED_LANE");
+});
+
+test("PA agent imports shared Brain decideCustomerTurn, not a PA Brain", async () => {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const agentSrc = await fs.readFile(
+    path.join(root, "src/services/customerBusinessPaAgentService.js"),
+    "utf8"
+  );
+  assert.match(agentSrc, /decideCustomerTurn/);
+  assert.match(
+    agentSrc,
+    /from ["']\.\.\/brain\/decisions\/decideCustomerTurn\.js["']/
+  );
+  assert.doesNotMatch(agentSrc, /PA Brain|paBrain|createPaBrain/i);
+  assert.doesNotMatch(
+    agentSrc,
+    /decidePostConfirmCustomerDm\s*\(/
   );
 });
 

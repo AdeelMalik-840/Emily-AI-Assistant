@@ -1,6 +1,7 @@
 /**
- * Brain-owned post-confirm customer DM decision.
- * Single conversational decision for the Business PA ownership lane.
+ * Post-confirm PA lane decision implementation (Brain-owned).
+ * Shared conversational authority entrypoint: decideCustomerTurn.js
+ * This module keeps the post_confirm_pa OpenAI decision + helpers.
  * Executors must not re-interpret meaning — they execute `action` only (plus safety gates).
  */
 
@@ -540,6 +541,9 @@ export function canEscalatePostConfirmMissingInfo({
 }
 
 /**
+ * Post-confirm PA lane runner — single OpenAI decision path for this lane.
+ * Prefer decideCustomerTurn({ lane: "post_confirm_pa", ... }) at call sites.
+ *
  * @param {{
  *   facts: Record<string, unknown>,
  *   userMessage: string,
@@ -550,7 +554,7 @@ export function canEscalatePostConfirmMissingInfo({
  *   __chatCompletionsCreateForTests?: Function,
  * }} p
  */
-export async function decidePostConfirmCustomerDm({
+export async function executePostConfirmPaLaneDecision({
   facts,
   userMessage,
   conversationHistory = null,
@@ -762,4 +766,45 @@ STRICT SAFETY:
       reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
     };
   }
+}
+
+/**
+ * Compatibility wrapper — routes through shared Brain decideCustomerTurn.
+ * Not a second Brain; preserves existing imports/call shape.
+ *
+ * @param {{
+ *   facts: Record<string, unknown>,
+ *   userMessage: string,
+ *   conversationHistory?: string | null,
+ *   styleKey?: "casual_local" | "neutral_english",
+ *   timeoutMs?: number,
+ *   missingInfoLoopFullyEnabled?: boolean,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ */
+export async function decidePostConfirmCustomerDm(p = {}) {
+  const { decideCustomerTurn } = await import("./decideCustomerTurn.js");
+  const facts = p.facts && typeof p.facts === "object" ? p.facts : {};
+  return decideCustomerTurn({
+    lane: "post_confirm_pa",
+    channel: "whatsapp",
+    chatType: "dm",
+    businessId: facts.businessId ?? null,
+    customerPhone: facts.customerPhoneDigits ?? null,
+    messageText: p.userMessage,
+    recentDialogue: p.conversationHistory ?? null,
+    activeBooking: facts.booking ?? null,
+    activeAvailabilityRequest: facts.availabilityRequest ?? null,
+    knownPolicies: facts.known ?? null,
+    openMissingInfoRequests: facts.openMissingInfoRequests ?? null,
+    latestClosedMissingInfoAnswers: facts.latestClosedMissingInfoAnswers ?? null,
+    ownershipLane: "post_confirm_pa",
+    safetyPolicy: facts.policy ?? null,
+    allowedExecutors: ["whatsapp_cloud_dm", "pa_missing_info_escalate"],
+    facts,
+    styleKey: p.styleKey,
+    timeoutMs: p.timeoutMs,
+    missingInfoLoopFullyEnabled: p.missingInfoLoopFullyEnabled,
+    __chatCompletionsCreateForTests: p.__chatCompletionsCreateForTests,
+  });
 }
