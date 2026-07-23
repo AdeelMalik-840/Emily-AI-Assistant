@@ -33,13 +33,17 @@ const OWNER_PHONE = "923009998877";
 const BOOKING_ID = "bk_pa_miss_001";
 const AVR_ID = "avr_pa_miss_001";
 
-function withFlags({ pa = true, missingInfo = false }, fn) {
+function withFlags({ pa = true, missingInfo = false, ownerAnswer = false }, fn) {
   const prevPa = process.env.EMILY_BUSINESS_PA_AGENT_ENABLED;
   const prevMiss = process.env.EMILY_BUSINESS_PA_MISSING_INFO_ENABLED;
+  const prevAns = process.env.EMILY_BUSINESS_PA_MISSING_INFO_OWNER_ANSWER_ENABLED;
   if (pa) process.env.EMILY_BUSINESS_PA_AGENT_ENABLED = "true";
   else delete process.env.EMILY_BUSINESS_PA_AGENT_ENABLED;
   if (missingInfo) process.env.EMILY_BUSINESS_PA_MISSING_INFO_ENABLED = "true";
   else delete process.env.EMILY_BUSINESS_PA_MISSING_INFO_ENABLED;
+  if (ownerAnswer)
+    process.env.EMILY_BUSINESS_PA_MISSING_INFO_OWNER_ANSWER_ENABLED = "true";
+  else delete process.env.EMILY_BUSINESS_PA_MISSING_INFO_OWNER_ANSWER_ENABLED;
   return Promise.resolve()
     .then(fn)
     .finally(() => {
@@ -48,6 +52,9 @@ function withFlags({ pa = true, missingInfo = false }, fn) {
       if (prevMiss === undefined)
         delete process.env.EMILY_BUSINESS_PA_MISSING_INFO_ENABLED;
       else process.env.EMILY_BUSINESS_PA_MISSING_INFO_ENABLED = prevMiss;
+      if (prevAns === undefined)
+        delete process.env.EMILY_BUSINESS_PA_MISSING_INFO_OWNER_ANSWER_ENABLED;
+      else process.env.EMILY_BUSINESS_PA_MISSING_INFO_OWNER_ANSWER_ENABLED = prevAns;
     });
 }
 
@@ -225,13 +232,40 @@ function jsonAiReply({
   customerReply,
   needsFollowup = false,
   missingInfoType = null,
+  conversationAct = null,
+  customerIsAskingQuestion = null,
+  action = null,
+  situation = null,
 }) {
+  const escalate = needsFollowup === true && Boolean(missingInfoType);
+  const act =
+    conversationAct ||
+    (escalate ? "information_request" : "acknowledgement");
+  const asking =
+    customerIsAskingQuestion != null
+      ? customerIsAskingQuestion
+      : escalate;
+  const decisionAction =
+    action || (escalate ? "escalate_missing_info" : "reply");
+  const situationValue =
+    situation ||
+    (escalate
+      ? "new_question"
+      : act === "acknowledgement" || act === "thanks"
+        ? "acknowledgement_after_answer"
+        : "unclear");
   return async () => ({
     choices: [
       {
         message: {
           content: JSON.stringify({
+            situation: situationValue,
+            conversationAct: act,
+            customerIsAskingQuestion: asking,
+            requestedInfoType: escalate ? missingInfoType : null,
             customerReply,
+            action: decisionAction,
+            // legacy fields ignored for escalate by executor
             needsFollowup,
             missingInfoType,
           }),
@@ -290,15 +324,40 @@ test("missing-info flag defaults off", () => {
 test("parse AI JSON shape", () => {
   const parsed = parseCustomerBusinessPaAiJson(
     JSON.stringify({
+      situation: "new_question",
+      conversationAct: "information_request",
+      customerIsAskingQuestion: true,
+      requestedInfoType: "advance",
       customerReply: "Advance abhi confirm nahi hai.",
-      needsFollowup: true,
-      missingInfoType: "advance",
+      action: "escalate_missing_info",
     })
   );
   assert.equal(parsed.customerReply, "Advance abhi confirm nahi hai.");
   assert.equal(parsed.needsFollowup, true);
   assert.equal(parsed.missingInfoType, "advance");
+  assert.equal(parsed.action, "escalate_missing_info");
+  assert.equal(parsed.situation, "new_question");
   assert.deepEqual(PA_MISSING_INFO_TYPES.includes("advance"), true);
+});
+
+test("acknowledgement cannot escalate even if malformed model implies follow-up", () => {
+  const parsed = parseCustomerBusinessPaAiJson(
+    JSON.stringify({
+      situation: "new_question",
+      conversationAct: "acknowledgement",
+      customerIsAskingQuestion: false,
+      requestedInfoType: "advance",
+      customerReply: "Ji theek hai.",
+      action: "escalate_missing_info",
+      needsFollowup: true,
+      missingInfoType: "advance",
+    })
+  );
+  assert.equal(parsed.conversationAct, "acknowledgement");
+  assert.equal(parsed.action, "reply");
+  assert.equal(parsed.needsFollowup, false);
+  assert.equal(parsed.requestedInfoType, null);
+  assert.equal(parsed.situation, "acknowledgement_after_answer");
 });
 
 test("missing advance with missing-info flag ON creates one request and notifies owner", async () => {
@@ -307,7 +366,7 @@ test("missing advance with missing-info flag ON creates one request and notifies
   const ownerSends = [];
   const customerSends = [];
 
-  await withFlags({ pa: true, missingInfo: true }, async () => {
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -365,7 +424,7 @@ test("duplicate missing advance does not create a second request", async () => {
   const resolveFacts = seedActiveContext(fake);
   let ownerNotifyCalls = 0;
 
-  await withFlags({ pa: true, missingInfo: true }, async () => {
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const common = {
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -376,6 +435,7 @@ test("duplicate missing advance does not create a second request", async () => {
         customerReply: "Advance abhi confirm nahi — check karke batata hoon.",
         needsFollowup: true,
         missingInfoType: "advance",
+        situation: "new_question",
       }),
       sendWhatsAppMessageFn: async (to) => {
         if (String(to).replace(/\D/g, "") === OWNER_PHONE) ownerNotifyCalls += 1;
@@ -394,7 +454,8 @@ test("duplicate missing advance does not create a second request", async () => {
 
     assert.equal(first.missingInfoEscalated, true);
     assert.equal(second.missingInfoEscalated, false);
-    assert.equal(second.missingInfoRequestId, first.missingInfoRequestId);
+    // Second turn sees open request in Brain facts → pending; no new ledger row / notify.
+    assert.equal(second.situation, "pending_owner_answer");
     assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
     assert.equal(ownerNotifyCalls, 1);
 
@@ -447,7 +508,7 @@ test("known advance does not escalate", async () => {
   const resolveFacts = seedActiveContext(fake, { advanceAmount: 5000 });
   let createCalled = false;
 
-  await withFlags({ pa: true, missingInfo: true }, async () => {
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -481,7 +542,7 @@ test("action intent kar do does not escalate or call OpenAI", async () => {
 
   assert.equal(classifyCustomerBusinessPaActionIntent("kar do").isAction, true);
 
-  await withFlags({ pa: true, missingInfo: true }, async () => {
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -607,7 +668,7 @@ test("delivery question does not escalate when deliveryPolicy exists", async () 
   });
   let createCalled = false;
 
-  await withFlags({ pa: true, missingInfo: true }, async () => {
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -645,7 +706,7 @@ test("advance still escalates when no advanceAmount/advancePolicy", async () => 
   });
   const ownerSends = [];
 
-  await withFlags({ pa: true, missingInfo: true }, async () => {
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -684,7 +745,7 @@ test("advance does not escalate when advancePolicy exists", async () => {
   });
   let createCalled = false;
 
-  await withFlags({ pa: true, missingInfo: true }, async () => {
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -738,4 +799,480 @@ test("compact AI facts JSON includes known policy fields", async () => {
   assert.match(compact, /"driverPolicy":"Driver optional"/);
   assert.match(compact, /"paymentPolicy":"Cash\/JazzCash"/);
   assert.match(compact, /"documentsPolicy":"CNIC required"/);
+});
+
+test("Brain decision helper lives under src/brain/decisions", async () => {
+  const mod = await import(
+    "../src/brain/decisions/decidePostConfirmCustomerDm.js"
+  );
+  assert.equal(typeof mod.decidePostConfirmCustomerDm, "function");
+  assert.equal(typeof mod.canEscalatePostConfirmMissingInfo, "function");
+  assert.equal(typeof mod.parsePostConfirmCustomerDmDecision, "function");
+  assert.ok(mod.POST_CONFIRM_SITUATIONS.includes("new_question"));
+  assert.ok(
+    mod.POST_CONFIRM_SITUATIONS.includes("acknowledgement_after_answer")
+  );
+});
+
+test("OK after customerFollowupText → acknowledgement_after_answer, no request/notify", async () => {
+  const fake = createFakeDb();
+  const now = new Date();
+  fake.setOwnerPhone(BUSINESS_ID, OWNER_PHONE);
+  fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
+  fake.seedAvailabilityRequest(BUSINESS_ID, AVR_ID, {
+    requestId: AVR_ID,
+    itemLabel: "Honda Civic 2026",
+    requestedDuration: 2,
+    priceQuote: { total: 16000, dailyRate: 8000 },
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    linkedBookingId: BOOKING_ID,
+  });
+  fake.ensureBusiness(BUSINESS_ID).paMissingInfoRequests[
+    "pamiss_closed_adv_001"
+  ] = {
+    data: {
+      requestId: "pamiss_closed_adv_001",
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      bookingId: BOOKING_ID,
+      missingInfoType: "advance",
+      customerQuestion: "Advance kitna?",
+      ownerAnswer: "5000",
+      customerFollowupText: "Advance 5000 PKR dena hoga.",
+      customerFollowupStatus: "sent",
+      status: "closed",
+      closedAt: now,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(now.getTime() + 48 * 60 * 60 * 1000),
+    },
+  };
+  let ownerNotifyCalls = 0;
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const facts = await resolveActiveCustomerBookingFacts({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      getBusinessProfileFn: async () => ({ businessName: "Emily Cars" }),
+    });
+    assert.equal(facts.facts.latestClosedMissingInfoAnswers.length, 1);
+    assert.equal(
+      facts.facts.latestClosedMissingInfoAnswers[0].customerFollowupText,
+      "Advance 5000 PKR dena hoga."
+    );
+
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "OK",
+      sendWhatsAppMessageFn: async (to) => {
+        if (String(to).replace(/\D/g, "") === OWNER_PHONE) ownerNotifyCalls += 1;
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: async () => facts,
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Ji theek hai.",
+        conversationAct: "acknowledgement",
+        customerIsAskingQuestion: false,
+        action: "reply",
+        situation: "acknowledgement_after_answer",
+        needsFollowup: true,
+        missingInfoType: "advance",
+      }),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.situation, "acknowledgement_after_answer");
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(ownerNotifyCalls, 0);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+    assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
+    assert.equal(
+      fake.getBooking(BUSINESS_ID, BOOKING_ID).approvalStage,
+      "owner_approved_waiting_customer_details"
+    );
+    assert.equal(
+      fake.getAvr(BUSINESS_ID, AVR_ID).customerConfirmationStatus,
+      "confirmed"
+    );
+  });
+});
+
+test("thanks after customerFollowupText exists → no escalation", async () => {
+  const fake = createFakeDb();
+  const now = new Date();
+  const resolveFacts = seedActiveContext(fake);
+  fake.ensureBusiness(BUSINESS_ID).paMissingInfoRequests["pamiss_thanks"] = {
+    data: {
+      requestId: "pamiss_thanks",
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      bookingId: BOOKING_ID,
+      missingInfoType: "advance",
+      ownerAnswer: "5000",
+      customerFollowupText: "Advance 5000 PKR dena hoga.",
+      customerFollowupStatus: "sent",
+      status: "closed",
+      closedAt: now,
+      expiresAt: new Date(now.getTime() + 86400000),
+    },
+  };
+  let createCalled = false;
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "thanks",
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Welcome ji.",
+        conversationAct: "thanks",
+        customerIsAskingQuestion: false,
+        action: "escalate_missing_info",
+        situation: "new_question",
+        needsFollowup: true,
+        missingInfoType: "advance",
+      }),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(createCalled, false);
+    assert.equal(result.situation, "acknowledgement_after_answer");
+  });
+});
+
+test("ok driver milega? → new_question information_request can escalate", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  const ownerSends = [];
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "ok driver milega?",
+      sendWhatsAppMessageFn: async (to, text) => {
+        if (String(to).replace(/\D/g, "") === OWNER_PHONE) {
+          ownerSends.push(text);
+        }
+        return { ok: true, messages: [{ id: "wamid.o" }] };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Driver confirm karke batata hoon.",
+        conversationAct: "information_request",
+        customerIsAskingQuestion: true,
+        missingInfoType: "driver",
+        needsFollowup: true,
+        action: "escalate_missing_info",
+        situation: "new_question",
+      }),
+    });
+
+    assert.equal(result.situation, "new_question");
+    assert.equal(result.conversationAct, "information_request");
+    assert.equal(result.missingInfoEscalated, true);
+    assert.equal(result.missingInfoType, "driver");
+    assert.equal(ownerSends.length, 1);
+    assert.match(ownerSends[0], /pamiss_/);
+  });
+});
+
+test("Advance kitna? after ownerAnswer+followup → repeat_question_answered, no escalate", async () => {
+  const fake = createFakeDb();
+  const now = new Date();
+  fake.setOwnerPhone(BUSINESS_ID, OWNER_PHONE);
+  fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
+  fake.seedAvailabilityRequest(BUSINESS_ID, AVR_ID, {
+    requestId: AVR_ID,
+    itemLabel: "Honda Civic 2026",
+    requestedDuration: 2,
+    priceQuote: { total: 16000, dailyRate: 8000 },
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    linkedBookingId: BOOKING_ID,
+  });
+  fake.ensureBusiness(BUSINESS_ID).paMissingInfoRequests["pamiss_closed_5000"] = {
+    data: {
+      requestId: "pamiss_closed_5000",
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      bookingId: BOOKING_ID,
+      missingInfoType: "advance",
+      customerQuestion: "Advance kitna?",
+      ownerAnswer: "5000",
+      customerFollowupText: "Advance 5000 PKR dena hoga.",
+      customerFollowupStatus: "sent",
+      status: "closed",
+      closedAt: now,
+      expiresAt: new Date(now.getTime() + 86400000),
+    },
+  };
+
+  let createCalled = false;
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const facts = await resolveActiveCustomerBookingFacts({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      getBusinessProfileFn: async () => ({ businessName: "Emily Cars" }),
+    });
+    assert.equal(facts.ok, true);
+    assert.equal(facts.facts.known.advanceAmount, 5000);
+    assert.equal(facts.facts.latestClosedMissingInfoAnswers[0].ownerAnswer, "5000");
+
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Advance kitna?",
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
+      __resolveActiveCustomerBookingFactsFn: async () => facts,
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Advance 5000 PKR dena hoga.",
+        conversationAct: "information_request",
+        customerIsAskingQuestion: true,
+        action: "reply",
+        situation: "repeat_question_answered",
+        missingInfoType: null,
+      }),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.situation, "repeat_question_answered");
+    assert.equal(result.reply, "Advance 5000 PKR dena hoga.");
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(createCalled, false);
+  });
+});
+
+test("same missing type while request open → no duplicate request", async () => {
+  const fake = createFakeDb();
+  const now = new Date();
+  fake.setOwnerPhone(BUSINESS_ID, OWNER_PHONE);
+  fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
+  fake.ensureBusiness(BUSINESS_ID).paMissingInfoRequests["pamiss_open_adv"] = {
+    data: {
+      requestId: "pamiss_open_adv",
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      bookingId: BOOKING_ID,
+      missingInfoType: "advance",
+      customerQuestion: "Advance kitna?",
+      status: "owner_notified",
+      ownerNotifyStatus: "sent",
+      createdAt: now,
+      expiresAt: new Date(now.getTime() + 86400000),
+    },
+  };
+  let createCalled = false;
+  let ownerNotifyCalls = 0;
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const facts = await resolveActiveCustomerBookingFacts({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      getBusinessProfileFn: async () => ({ businessName: "Emily Cars" }),
+    });
+    assert.equal(facts.facts.openMissingInfoRequests.length, 1);
+    assert.equal(facts.facts.openMissingInfoRequests[0].missingInfoType, "advance");
+
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Advance kitna dena hoga?",
+      sendWhatsAppMessageFn: async (to) => {
+        if (String(to).replace(/\D/g, "") === OWNER_PHONE) ownerNotifyCalls += 1;
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: async () => facts,
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Abhi confirm kar raha hun.",
+        conversationAct: "information_request",
+        customerIsAskingQuestion: true,
+        needsFollowup: true,
+        missingInfoType: "advance",
+        action: "escalate_missing_info",
+        situation: "new_question",
+      }),
+    });
+
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(createCalled, false);
+    assert.equal(ownerNotifyCalls, 0);
+    assert.equal(result.situation, "pending_owner_answer");
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+  });
+});
+
+test("new missing advance with no open/closed answer → escalate still works", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let ownerNotifyCalls = 0;
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Advance kitna?",
+      sendWhatsAppMessageFn: async (to) => {
+        if (String(to).replace(/\D/g, "") === OWNER_PHONE) ownerNotifyCalls += 1;
+        return { ok: true, messages: [{ id: "wamid.z" }] };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Advance confirm karke batata hoon.",
+        needsFollowup: true,
+        missingInfoType: "advance",
+        situation: "new_question",
+      }),
+    });
+
+    assert.equal(result.situation, "new_question");
+    assert.equal(result.missingInfoEscalated, true);
+    assert.equal(ownerNotifyCalls, 1);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+  });
+});
+
+test("unclear message → no dangerous action / no owner notify", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let createCalled = false;
+  let ownerNotifyCalls = 0;
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "hmm",
+      sendWhatsAppMessageFn: async (to) => {
+        if (String(to).replace(/\D/g, "") === OWNER_PHONE) ownerNotifyCalls += 1;
+        return { ok: true };
+      },
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Ji bataiye?",
+        conversationAct: "unknown",
+        customerIsAskingQuestion: false,
+        action: "escalate_missing_info",
+        situation: "unclear",
+        needsFollowup: true,
+        missingInfoType: "advance",
+      }),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.situation, "unclear");
+    assert.equal(result.decisionAction, "reply");
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(createCalled, false);
+    assert.equal(ownerNotifyCalls, 0);
+    assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
+  });
+});
+
+test("missing-info ON but owner-answer OFF does not escalate", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  let createCalled = false;
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: false }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Advance kitna?",
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __createOrGetOpenPaMissingInfoRequestFn: async () => {
+        createCalled = true;
+        return { ok: false };
+      },
+      __chatCompletionsCreateForTests: jsonAiReply({
+        customerReply: "Advance abhi confirm nahi hai.",
+        needsFollowup: true,
+        missingInfoType: "advance",
+        situation: "new_question",
+      }),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(createCalled, false);
+  });
+});
+
+test("compact facts include open/closed missing-info situation", async () => {
+  const { __compactCustomerBusinessPaFactsForTests } = await import(
+    "../src/services/customerBusinessPaAiReply.js"
+  );
+  const compact = __compactCustomerBusinessPaFactsForTests({
+    businessId: BUSINESS_ID,
+    known: { advanceAmount: 5000 },
+    booking: { id: BOOKING_ID },
+    openMissingInfoRequests: [
+      {
+        requestId: "pamiss_open",
+        missingInfoType: "driver",
+        customerQuestion: "Driver?",
+        status: "open",
+        createdAt: "2026-07-23T00:00:00.000Z",
+        ownerNotifyStatus: "sent",
+      },
+    ],
+    latestClosedMissingInfoAnswers: [
+      {
+        requestId: "pamiss_closed",
+        missingInfoType: "advance",
+        customerQuestion: "Advance kitna?",
+        ownerAnswer: "5000",
+        customerFollowupText: "Advance 5000 PKR dena hoga.",
+        customerFollowupStatus: "sent",
+        closedAt: "2026-07-23T01:00:00.000Z",
+      },
+    ],
+  });
+  assert.match(compact, /"openMissingInfoRequests"/);
+  assert.match(compact, /"latestClosedMissingInfoAnswers"/);
+  assert.match(compact, /"customerFollowupText":"Advance 5000 PKR dena hoga\."/);
+  assert.match(compact, /"missingInfoType":"driver"/);
+});
+
+test("no PA knowledge store and decision under brain/decisions", async () => {
+  await assert.rejects(
+    () => import("../src/services/paKnowledgeStore.js"),
+    /Cannot find module|ERR_MODULE_NOT_FOUND/
+  );
+  const agent = await import("../src/services/customerBusinessPaAgentService.js");
+  assert.equal(typeof agent.HOLD_REPLIES, "undefined");
+  assert.equal(typeof agent.PA_TOPIC_REPLY_MAP, "undefined");
 });

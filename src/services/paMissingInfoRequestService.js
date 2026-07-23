@@ -325,6 +325,158 @@ export async function listOpenForAnswerPaMissingInfoRequests({
   return out;
 }
 
+function phoneMatchesCustomer(rowPhoneRaw, phone) {
+  const rowPhone = phoneDigitsOnly(rowPhoneRaw);
+  if (!rowPhone || !phone) return false;
+  return (
+    rowPhone === phone ||
+    rowPhone.endsWith(phone) ||
+    phone.endsWith(rowPhone)
+  );
+}
+
+function toIsoOrNull(value) {
+  const raw = value?.toDate?.() ?? value ?? null;
+  if (!raw) return null;
+  const d = raw instanceof Date ? raw : new Date(raw);
+  if (!Number.isFinite(d.getTime())) return null;
+  return d.toISOString();
+}
+
+function toMs(value) {
+  const raw = value?.toDate?.() ?? value ?? null;
+  if (!raw) return 0;
+  const d = raw instanceof Date ? raw : new Date(raw);
+  const ms = d.getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * Open missing-info requests for one booking + customer (situation context).
+ * Does not write. Booking-scoped only.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   bookingId: string,
+ *   customerPhone: string,
+ *   limit?: number,
+ * }} p
+ */
+export async function listOpenPaMissingInfoRequestsForBooking({
+  db: connection,
+  businessId,
+  bookingId,
+  customerPhone,
+  limit = 80,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  const bid = clean(bookingId, 120);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!col || !bid || !phone) return [];
+
+  const snap = await col
+    .limit(Math.max(1, Math.min(120, Number(limit) || 80)))
+    .get()
+    .catch(() => null);
+
+  const now = Date.now();
+  const out = [];
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data() || {};
+    if (clean(data.bookingId, 120) !== bid) continue;
+    if (!phoneMatchesCustomer(data.customerPhone, phone)) continue;
+    const status = clean(data.status, 40);
+    if (!PA_MISSING_INFO_OPEN_STATUSES.includes(status)) continue;
+    if (isExpiredRequest(data, now)) continue;
+    const type = clean(data.missingInfoType, 40);
+    if (!isAllowedPaMissingInfoType(type)) continue;
+    out.push({
+      requestId: clean(data.requestId || doc.id, 120) || doc.id,
+      missingInfoType: type,
+      customerQuestion: clean(data.customerQuestion, 400) || null,
+      status,
+      createdAt: toIsoOrNull(data.createdAt) || null,
+      ownerNotifyStatus: clean(data.ownerNotifyStatus, 40) || null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Latest closed/customer_notified owner answers for a booking+customer (booking-scoped facts).
+ * Does not write knowledge. Ignores open/failed/expired.
+ * Includes follow-up wording for situation-aware Brain decisions.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   bookingId: string,
+ *   customerPhone: string,
+ *   limit?: number,
+ * }} p
+ * @returns {Promise<Array<{
+ *   requestId: string,
+ *   missingInfoType: string,
+ *   customerQuestion: string | null,
+ *   ownerAnswer: string,
+ *   customerFollowupText: string | null,
+ *   customerFollowupStatus: string | null,
+ *   closedAt: string | null,
+ *   closedAtMs: number,
+ * }>>}
+ */
+export async function listClosedPaMissingInfoAnswersForBooking({
+  db: connection,
+  businessId,
+  bookingId,
+  customerPhone,
+  limit = 80,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  const bid = clean(bookingId, 120);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!col || !bid || !phone) return [];
+
+  const snap = await col
+    .limit(Math.max(1, Math.min(120, Number(limit) || 80)))
+    .get()
+    .catch(() => null);
+
+  const closedStatuses = new Set(["closed", "customer_notified"]);
+  /** @type {Map<string, Record<string, unknown>>} */
+  const latestByType = new Map();
+
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data() || {};
+    if (clean(data.bookingId, 120) !== bid) continue;
+    if (!phoneMatchesCustomer(data.customerPhone, phone)) continue;
+    const status = clean(data.status, 40);
+    if (!closedStatuses.has(status)) continue;
+    if (isExpiredRequest(data)) continue;
+    const type = clean(data.missingInfoType, 40);
+    if (!isAllowedPaMissingInfoType(type)) continue;
+    const ownerAnswer = clean(data.ownerAnswer, 800);
+    if (!ownerAnswer) continue;
+
+    const closedAtMs = toMs(data.closedAt ?? data.updatedAt);
+    const requestId = clean(data.requestId || doc.id, 120) || doc.id;
+    const prev = latestByType.get(type);
+    if (!prev || closedAtMs >= Number(prev.closedAtMs || 0)) {
+      latestByType.set(type, {
+        requestId,
+        missingInfoType: type,
+        customerQuestion: clean(data.customerQuestion, 400) || null,
+        ownerAnswer,
+        customerFollowupText: clean(data.customerFollowupText, 800) || null,
+        customerFollowupStatus: clean(data.customerFollowupStatus, 40) || null,
+        closedAt: toIsoOrNull(data.closedAt ?? data.updatedAt),
+        closedAtMs: Number.isFinite(closedAtMs) ? closedAtMs : 0,
+      });
+    }
+  }
+
+  return [...latestByType.values()];
+}
+
 /**
  * Apply owner answer once. Idempotent on messageId / post-answer status.
  * @param {{
