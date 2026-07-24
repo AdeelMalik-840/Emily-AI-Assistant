@@ -34,6 +34,8 @@ import {
 import { applySessionMemoryFromActionPlan } from "../src/services/executors/sessionMemoryExecutor.js";
 import { loadBrainV2SessionMemorySnapshot } from "../src/services/whatsappInboundBuffer.js";
 import { resolveShadowEmilySessionKey } from "../src/brain/shadow/brainShadowHook.js";
+import { findVerifiedAvailabilityAlternatives } from "../src/services/availabilityRejectionAlternatives.js";
+import { computeUserFacingAvailability } from "../src/services/inventoryService.js";
 
 const BUSINESS_ID = "biz-unavailable-alts";
 const COROLLA_ID = "toyota_corolla_grey";
@@ -873,4 +875,219 @@ test("16: session-memory round-trip — offer persist → same key load → assi
   });
   assert.notEqual(wfWrong.reason, "availability_assist_follow_up_pending");
   assert.equal(wfWrong.workflowType, "unknown_clarification");
+});
+
+test("17: booking-based alts — Corolla booked, Civic/Stonic free → both listed (no similarity filter)", async () => {
+  const window = resolveBookingDateWindowFromDuration(2, Date.parse("2026-07-24T12:00:00.000Z"));
+  const catalog = [
+    {
+      id: COROLLA_ID,
+      name: "Toyota Corolla",
+      displayLabel: "Toyota Corolla (Metallic Grey)",
+    },
+    { id: CIVIC_ID, name: "Honda Civic 2026 Oriel", displayLabel: "Honda Civic 2026 Oriel (White)" },
+    {
+      id: STONIC_ID,
+      name: "Kia Stonic EX Plus 2021",
+      displayLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    },
+  ];
+  const bookingsByItem = {
+    [COROLLA_ID]: [
+      {
+        id: "bk-corolla",
+        itemId: COROLLA_ID,
+        status: "approved",
+        startAt: new Date("2026-07-22T00:00:00.000Z"),
+        endAt: new Date("2026-07-28T00:00:00.000Z"),
+      },
+    ],
+    [CIVIC_ID]: [],
+    [STONIC_ID]: [],
+  };
+
+  const alts = await findVerifiedAvailabilityAlternatives({
+    businessId: BUSINESS_ID,
+    excludeItemId: COROLLA_ID,
+    referenceItemLabel: "Toyota Corolla (Metallic Grey)",
+    limit: 3,
+    requestedStart: window.startAt,
+    requestedEnd: window.endAt,
+    catalogRows: catalog,
+    getBookingsForItemFn: async (_uid, itemId) => bookingsByItem[itemId] ?? [],
+  });
+
+  const ids = alts.map((a) => a.itemId);
+  assert.ok(ids.includes(CIVIC_ID), "Civic must be eligible despite low name similarity");
+  assert.ok(ids.includes(STONIC_ID), "Stonic must be eligible despite low name similarity");
+  assert.equal(ids.includes(COROLLA_ID), false);
+
+  const acceptPlan = planWithBrain(
+    "yes",
+    {
+      decision: "accept_alternative_offer",
+      confidence: 0.95,
+      ok: true,
+    },
+    {
+      lastAvailabilityAssist: buildOfferedAlternativesAssist({
+        unavailableItemId: COROLLA_ID,
+        unavailableItemLabel: "Toyota Corolla",
+        durationDays: 2,
+        windowStartAt: window.startAt,
+        windowEndAt: window.endAt,
+      }),
+      verified: {
+        availability: {
+          ...unavailableAvailability(),
+          verifiedAlternatives: alts,
+        },
+        priceQuote: null,
+      },
+    },
+    { resolvedItemId: null, signals: {}, durationDays: null }
+  );
+  assert.match(String(acceptPlan.replyDraft ?? ""), /Civic|Stonic/i);
+  assert.doesNotMatch(String(acceptPlan.replyDraft ?? ""), /Sorry abi koi option available nahi hai/i);
+  assert.equal(
+    acceptPlan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    false
+  );
+});
+
+test("18: booking-based alts — all others booked → empty list", async () => {
+  const window = resolveBookingDateWindowFromDuration(2, Date.parse("2026-07-24T12:00:00.000Z"));
+  const conflict = {
+    status: "approved",
+    startAt: new Date("2026-07-22T00:00:00.000Z"),
+    endAt: new Date("2026-07-28T00:00:00.000Z"),
+  };
+  const alts = await findVerifiedAvailabilityAlternatives({
+    businessId: BUSINESS_ID,
+    excludeItemId: COROLLA_ID,
+    referenceItemLabel: "Toyota Corolla",
+    limit: 3,
+    requestedStart: window.startAt,
+    requestedEnd: window.endAt,
+    catalogRows: [
+      { id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" },
+      { id: CIVIC_ID, name: "Honda Civic", displayLabel: "Honda Civic" },
+      { id: STONIC_ID, name: "Kia Stonic", displayLabel: "Kia Stonic" },
+    ],
+    getBookingsForItemFn: async (_uid, itemId) => [
+      { id: `bk-${itemId}`, itemId, ...conflict },
+    ],
+  });
+  assert.equal(alts.length, 0);
+
+  const plan = planWithBrain(
+    "yes",
+    { decision: "accept_alternative_offer", confidence: 0.95, ok: true },
+    {
+      verified: {
+        availability: unavailableAvailability({ verifiedAlternatives: [] }),
+        priceQuote: null,
+      },
+    },
+    { resolvedItemId: null, signals: {}, durationDays: null }
+  );
+  assert.match(String(plan.replyDraft ?? ""), /Sorry abi koi option available nahi hai/i);
+  assert.equal(plan.actions[0]?.payload?.source, "canonical_unavailable_no_alternatives");
+  assert.equal(
+    plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    false
+  );
+});
+
+test("19: booking-based alts — exclude requested + exclude booked candidate", async () => {
+  const window = resolveBookingDateWindowFromDuration(2, Date.parse("2026-07-24T12:00:00.000Z"));
+  const alts = await findVerifiedAvailabilityAlternatives({
+    businessId: BUSINESS_ID,
+    excludeItemId: COROLLA_ID,
+    referenceItemLabel: "Toyota Corolla",
+    limit: 5,
+    requestedStart: window.startAt,
+    requestedEnd: window.endAt,
+    catalogRows: [
+      { id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" },
+      { id: CIVIC_ID, name: "Honda Civic", displayLabel: "Honda Civic" },
+      { id: STONIC_ID, name: "Kia Stonic", displayLabel: "Kia Stonic" },
+    ],
+    getBookingsForItemFn: async (_uid, itemId) => {
+      if (itemId === STONIC_ID) {
+        return [
+          {
+            id: "bk-stonic",
+            itemId: STONIC_ID,
+            status: "approved",
+            startAt: new Date("2026-07-22T00:00:00.000Z"),
+            endAt: new Date("2026-07-28T00:00:00.000Z"),
+          },
+        ];
+      }
+      return [];
+    },
+  });
+  const ids = alts.map((a) => a.itemId);
+  assert.equal(ids.includes(COROLLA_ID), false);
+  assert.equal(ids.includes(STONIC_ID), false);
+  assert.ok(ids.includes(CIVIC_ID));
+});
+
+test("20: AVR is not an availability input — empty bookings ⇒ candidate available", async () => {
+  const window = resolveBookingDateWindowFromDuration(2, Date.parse("2026-07-24T12:00:00.000Z"));
+  let sawAvrArg = false;
+  const alts = await findVerifiedAvailabilityAlternatives({
+    businessId: BUSINESS_ID,
+    excludeItemId: COROLLA_ID,
+    referenceItemLabel: "Toyota Corolla",
+    limit: 3,
+    requestedStart: window.startAt,
+    requestedEnd: window.endAt,
+    catalogRows: [
+      { id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" },
+      { id: CIVIC_ID, name: "Honda Civic", displayLabel: "Honda Civic" },
+    ],
+    getBookingsForItemFn: async () => {
+      // Simulate: AVR may exist in Firestore, but finder only receives bookings.
+      sawAvrArg = false;
+      return [];
+    },
+  });
+  assert.equal(sawAvrArg, false);
+  assert.ok(alts.some((a) => a.itemId === CIVIC_ID));
+  const av = computeUserFacingAvailability([], CIVIC_ID, {
+    requestedStart: window.startAt,
+    requestedEnd: window.endAt,
+  });
+  assert.equal(av.isAvailable, true);
+});
+
+test("21: listing alternatives creates no owner-check / AVR action", () => {
+  const plan = planWithBrain(
+    "yes",
+    { decision: "accept_alternative_offer", confidence: 0.94, ok: true },
+    {
+      verified: {
+        availability: unavailableAvailability({
+          verifiedAlternatives: [
+            { itemId: CIVIC_ID, itemLabel: "Honda Civic" },
+            { itemId: STONIC_ID, itemLabel: "Kia Stonic" },
+          ],
+        }),
+        priceQuote: null,
+      },
+    },
+    { resolvedItemId: null, signals: {}, durationDays: null }
+  );
+  assert.equal(plan.actions[0]?.type, "REPLY");
+  assert.equal(plan.actions[0]?.payload?.source, "canonical_verified_alternatives_list");
+  assert.equal(
+    plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    false
+  );
+  assert.equal(
+    plan.actions.some((a) => a.type === "CREATE_BOOKING" || a.type === "NOTIFY_OWNER"),
+    false
+  );
 });
