@@ -7,6 +7,7 @@ import {
   isBlockingBookingStatus,
 } from "../../services/inventoryService.js";
 import { latestBlockingBookingEnd } from "./bookingDateUtils.js";
+import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
 
 /**
  * @param {Record<string, unknown>} booking
@@ -35,12 +36,45 @@ export function sanitizeBlockingBookingForEvidence(booking) {
 }
 
 /**
+ * Confident unavailable for Brain V2 owner-check skip — requires windowed inventory conflict.
+ * Unknown/error/no-window must not claim unavailable.
+ *
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {boolean}
+ */
+export function isConfidentInventoryUnavailable(availability) {
+  if (!availability || typeof availability !== "object" || Array.isArray(availability)) {
+    return false;
+  }
+  const status = String(availability.status ?? "").trim().toLowerCase();
+  if (status === "error" || status === "unknown") return false;
+  if (availability.isAvailable !== false && status !== "unavailable") return false;
+  if (availability.windowApplied !== true) return false;
+  const reason = String(availability.reason ?? "").trim().toLowerCase();
+  if (
+    reason.includes("query_error") ||
+    reason.includes("booking_query_error") ||
+    reason === "missing_item" ||
+    reason === "not_requested" ||
+    reason === "no_window"
+  ) {
+    return false;
+  }
+  return (
+    status === "unavailable" ||
+    availability.isAvailable === false
+  );
+}
+
+/**
  * @param {{
  *   businessId: string,
  *   catalogRow?: Record<string, unknown> | null,
  *   itemId?: string | null,
  *   itemName?: string | null,
  *   wantsAvailability?: boolean,
+ *   durationDays?: number | null,
+ *   nowMs?: number,
  *   getBookingsForItemFn?: typeof getBookingsForItem,
  * }} p
  */
@@ -48,6 +82,7 @@ export async function resolveItemBookingAwareAvailability(p) {
   const itemId = String(p.itemId ?? p.catalogRow?.id ?? "").trim() || null;
   const itemName = String(p.itemName ?? p.catalogRow?.name ?? "").trim() || null;
   const wantsAvailability = Boolean(p.wantsAvailability);
+  const window = resolveBookingDateWindowFromDuration(p.durationDays, p.nowMs);
 
   const catalogAvailabilityFalse =
     p.catalogRow != null &&
@@ -79,6 +114,11 @@ export async function resolveItemBookingAwareAvailability(p) {
         ownerDisabled: false,
         staleCatalogAvailability: catalogAvailabilityFalse,
         reason: bookingQueryError,
+        windowApplied: false,
+        dateWindowConfidence: "none",
+        requestedStartAt: null,
+        requestedEndAt: null,
+        verifiedAlternatives: [],
       },
       sourceEvidence: {
         availability: { error: bookingQueryError, itemId },
@@ -86,7 +126,10 @@ export async function resolveItemBookingAwareAvailability(p) {
     };
   }
 
-  const av = computeUserFacingAvailability(bookings, itemId);
+  const avOpts = window
+    ? { requestedStart: window.startAt, requestedEnd: window.endAt }
+    : null;
+  const av = computeUserFacingAvailability(bookings, itemId, avOpts);
   const blockingBookings = bookings.filter((b) =>
     isBlockingBookingStatus(String(b?.status ?? "").trim().toLowerCase(), {
       itemId,
@@ -102,8 +145,12 @@ export async function resolveItemBookingAwareAvailability(p) {
 
   /** @type {"available" | "unavailable" | "unknown" | "error"} */
   let status = av.isAvailable ? "available" : "unavailable";
-  let reason = av.isAvailable ? "no_blocking_bookings" : "blocking_bookings";
-  let dateConfidence = "none";
+  let reason = av.isAvailable
+    ? "no_blocking_bookings"
+    : window
+      ? "booking_conflict"
+      : "blocking_bookings";
+  let dateConfidence = window ? window.confidence : "none";
   let unavailableUntil = null;
   let nextAvailableAt = null;
 
@@ -115,10 +162,10 @@ export async function resolveItemBookingAwareAvailability(p) {
         av.nextAvailableAt != null
           ? new Date(av.nextAvailableAt).toISOString()
           : latestEnd.toISOString();
-      reason = "blocking_bookings_with_end_date";
+      reason = window ? "booking_conflict" : "blocking_bookings_with_end_date";
     } else if (blockingBookings.length > 0) {
-      reason = "unavailable_date_unknown";
-      dateConfidence = "none";
+      reason = window ? "booking_conflict" : "unavailable_date_unknown";
+      if (!window) dateConfidence = "none";
     }
   } else if (staleCatalogAvailability) {
     reason = "stale_catalog_availability_ignored";
@@ -143,6 +190,11 @@ export async function resolveItemBookingAwareAvailability(p) {
       ownerDisabled: false,
       staleCatalogAvailability,
       reason,
+      windowApplied: Boolean(window),
+      dateWindowConfidence: window ? window.confidence : "none",
+      requestedStartAt: window ? window.startAt.toISOString() : null,
+      requestedEndAt: window ? window.endAt.toISOString() : null,
+      verifiedAlternatives: [],
     },
     sourceEvidence: {
       availability: {
@@ -152,6 +204,7 @@ export async function resolveItemBookingAwareAvailability(p) {
         catalogAvailabilityFalse,
         staleCatalogAvailability,
         blockingStatusesSeen: av.blockingStatusesSeen ?? [],
+        windowApplied: Boolean(window),
       },
     },
   };

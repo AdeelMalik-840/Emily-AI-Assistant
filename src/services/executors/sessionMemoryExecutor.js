@@ -50,6 +50,16 @@ export function applySessionMemoryFromActionPlan(p) {
     }
   }
 
+  if (persistence?.clearLastAvailabilityAssist === true) {
+    patch.lastAvailabilityAssist = null;
+  } else if (
+    persistence?.rememberLastAvailabilityAssist === true &&
+    persistence?.lastAvailabilityAssist &&
+    typeof persistence.lastAvailabilityAssist === "object"
+  ) {
+    patch.lastAvailabilityAssist = structuredClone(persistence.lastAvailabilityAssist);
+  }
+
   if (Object.keys(patch).length > 0) {
     patchEmilySessionState(sessionKey, patch);
   }

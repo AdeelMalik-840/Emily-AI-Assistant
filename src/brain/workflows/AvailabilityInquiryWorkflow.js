@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { composeInformationalAnswer } from "../../services/answerComposer.js";
+import {
+  buildOfferedAlternativesAssist,
+  readFreshLastAvailabilityAssist,
+} from "../availability/availabilityAssistContext.js";
+import { resolveAvailabilityAssistFollowUpDecision } from "../availability/decideAvailabilityAssistFollowUp.js";
+import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
+import { resolveBookingDateWindowFromDuration } from "../facts/resolveBookingDateWindow.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -176,6 +183,57 @@ function resolveOwnerCheckTiming(canonical, message = "") {
 }
 
 /**
+ * @param {unknown} availability
+ * @returns {Array<{ itemId: string, itemLabel: string }>}
+ */
+function readVerifiedAlternatives(availability) {
+  const rows = Array.isArray(availability?.verifiedAlternatives)
+    ? availability.verifiedAlternatives
+    : [];
+  /** @type {Array<{ itemId: string, itemLabel: string }>} */
+  const out = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const itemId = String(row.itemId ?? "").trim();
+    const itemLabel = String(row.itemLabel ?? "").trim();
+    if (!itemId || !itemLabel) continue;
+    out.push({ itemId, itemLabel });
+  }
+  return out;
+}
+
+/**
+ * Facts-aware drafts from verified labels only — not a failure-code reply table.
+ *
+ * @param {string} conversationalLabel
+ * @param {number} durationDays
+ * @returns {string}
+ */
+export function buildUnavailableWithAlternativeOfferReply(conversationalLabel, durationDays) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  const durationPhrase = formatDurationPhrase(durationDays);
+  const windowBit = durationPhrase ? ` ${durationPhrase} ke liye` : "";
+  return `${label}${windowBit} abhi available nahi hai. Koi aur option dekhun?`;
+}
+
+/**
+ * @param {Array<{ itemId: string, itemLabel: string }>} alternatives
+ * @returns {string}
+ */
+export function buildVerifiedAlternativesReply(alternatives) {
+  const labels = (Array.isArray(alternatives) ? alternatives : [])
+    .map((row) => String(row?.itemLabel ?? "").trim())
+    .filter(Boolean);
+  if (labels.length === 0) {
+    return "Sorry abi koi option available nahi hai.";
+  }
+  if (labels.length === 1) {
+    return `Abhi ${labels[0]} available hai. Ye dekhna hai?`;
+  }
+  return `Abhi ye options available hain: ${labels.join(", ")}. Kaunsa dekhna hai?`;
+}
+
+/**
  * @param {string} itemLabel
  * @param {Record<string, unknown>} availability
  * @returns {string}
@@ -239,10 +297,7 @@ export function logAvailabilityOwnerCheckPlanned(p) {
     workflowType: "availability_inquiry",
     itemId: String(p.itemId ?? "").trim() || null,
     itemLabel: String(p.itemLabel ?? "").trim() || null,
-    durationDays:
-      p.durationDays != null && Number.isFinite(Number(p.durationDays))
-        ? Math.max(1, Math.floor(Number(p.durationDays)))
-        : null,
+    durationDays: p.durationDays ?? null,
     availabilityStatus: p.canonicalAvailability?.status ?? null,
     execute: p.execute === true,
   });
@@ -275,6 +330,206 @@ export function buildOwnerCheckDeferralReply(conversationalLabel, durationDays, 
 }
 
 /**
+ * @param {{
+ *   canonical: Record<string, unknown>,
+ *   itemId: string,
+ *   itemLabel: string,
+ *   durationN: number,
+ *   execute: boolean,
+ *   clearAssist?: boolean,
+ * }} p
+ * @returns {ActionPlan}
+ */
+function buildOwnerCheckActionPlan(p) {
+  const { canonical, itemId, itemLabel, durationN, execute, clearAssist = true } = p;
+  const conversationalLabel = conversationalItemLabelFromResolvedItem({
+    displayLabel: itemLabel,
+    name: itemLabel,
+  });
+  const canonicalAvailability =
+    canonical.verified?.availability && typeof canonical.verified.availability === "object"
+      ? /** @type {Record<string, unknown>} */ (canonical.verified.availability)
+      : null;
+  const canonicalPriceQuote =
+    canonical.verified?.priceQuote && typeof canonical.verified.priceQuote === "object"
+      ? /** @type {Record<string, unknown>} */ (canonical.verified.priceQuote)
+      : null;
+  const participant = canonical.participant ?? null;
+  const sourceIdentity = readSourceIdentity(canonical);
+  const sourceMessageId = String(canonical.turn?.sourceMessageId ?? "").trim() || null;
+  const sourceRowKey = String(canonical.turn?.sourceRowKey ?? "").trim() || null;
+  const guaranteeKey = String(canonical.turn?.guaranteeKey ?? "").trim() || null;
+  const sourceTurnKey = String(canonical.turn?.sourceTurnKey ?? "").trim() || null;
+  const replyDraft = buildOwnerCheckDeferralReply(conversationalLabel, durationN);
+
+  logAvailabilityOwnerCheckPlanned({
+    itemId,
+    itemLabel,
+    durationDays: durationN,
+    canonicalAvailability,
+    execute: false,
+  });
+
+  return Object.freeze({
+    planId: randomUUID(),
+    replyDraft,
+    actions: Object.freeze([
+      Object.freeze({
+        type: "REPLY",
+        payload: Object.freeze({
+          channel: "whatsapp_web",
+          text: replyDraft,
+          field: "availability",
+          itemId,
+          itemLabel,
+          source: "canonical_owner_check_deferral",
+          execute: false,
+        }),
+      }),
+      Object.freeze({
+        type: "AVAILABILITY_OWNER_CHECK_REQUIRED",
+        payload: Object.freeze({
+          businessId: canonical.businessId ?? null,
+          itemId,
+          itemLabel,
+          durationDays: durationN,
+          requestedDuration: durationN,
+          canonicalAvailability:
+            canonicalAvailability != null ? Object.freeze({ ...canonicalAvailability }) : null,
+          canonicalPriceQuote:
+            canonicalPriceQuote != null ? Object.freeze({ ...canonicalPriceQuote }) : null,
+          participant:
+            participant && typeof participant === "object"
+              ? Object.freeze({ ...participant })
+              : null,
+          sourceIdentity:
+            sourceIdentity && typeof sourceIdentity === "object"
+              ? Object.freeze({ ...sourceIdentity })
+              : null,
+          sourceMessageId,
+          sourceRowKey,
+          guaranteeKey,
+          sourceTurnKey,
+          sourceChatId: sourceIdentity?.chatId ?? null,
+          sourceChatType: sourceIdentity?.chatType ?? null,
+          customerParticipantId: sourceIdentity?.participantKey ?? null,
+          customerDmTarget: null,
+          ownerTarget: null,
+          execute,
+        }),
+      }),
+    ]),
+    persistenceIntent: Object.freeze({
+      rememberResolvedItem: true,
+      itemId,
+      rememberDuration: true,
+      durationDays: durationN,
+      ownerCheckPlanned: true,
+      clearLastAvailabilityAssist: clearAssist === true,
+      execute,
+    }),
+  });
+}
+
+/**
+ * @param {{
+ *   conversationalLabel: string,
+ *   itemId: string | null,
+ *   itemLabel: string,
+ *   durationN: number,
+ *   availability: Record<string, unknown>,
+ * }} p
+ * @returns {ActionPlan}
+ */
+function buildUnavailableOfferActionPlan(p) {
+  const replyDraft = buildUnavailableWithAlternativeOfferReply(
+    p.conversationalLabel,
+    p.durationN
+  );
+  const window = resolveBookingDateWindowFromDuration(p.durationN);
+  const assist = buildOfferedAlternativesAssist({
+    unavailableItemId: String(p.itemId ?? ""),
+    unavailableItemLabel: p.itemLabel,
+    durationDays: p.durationN,
+    windowStartAt: window?.startAt ?? null,
+    windowEndAt: window?.endAt ?? null,
+  });
+
+  console.log("[availability_unavailable_offer_planned]", {
+    workflowType: "availability_inquiry",
+    itemId: p.itemId,
+    durationDays: p.durationN,
+    alternativesCount: readVerifiedAlternatives(p.availability).length,
+  });
+
+  return Object.freeze({
+    planId: randomUUID(),
+    replyDraft,
+    actions: Object.freeze([
+      Object.freeze({
+        type: "REPLY",
+        payload: Object.freeze({
+          channel: "whatsapp_web",
+          text: replyDraft,
+          field: "availability",
+          itemId: p.itemId,
+          itemLabel: p.itemLabel,
+          source: "canonical_unavailable_alternative_offer",
+          execute: false,
+        }),
+      }),
+    ]),
+    persistenceIntent: Object.freeze({
+      rememberResolvedItem: true,
+      itemId: p.itemId,
+      rememberDuration: true,
+      durationDays: p.durationN,
+      rememberLastAvailabilityAssist: true,
+      lastAvailabilityAssist: assist,
+      execute: false,
+    }),
+  });
+}
+
+/**
+ * @param {{
+ *   alternatives: Array<{ itemId: string, itemLabel: string }>,
+ *   assist: Record<string, unknown>,
+ * }} p
+ * @returns {ActionPlan}
+ */
+function buildAlternativesListActionPlan(p) {
+  const replyDraft = buildVerifiedAlternativesReply(p.alternatives);
+  return Object.freeze({
+    planId: randomUUID(),
+    replyDraft,
+    actions: Object.freeze([
+      Object.freeze({
+        type: "REPLY",
+        payload: Object.freeze({
+          channel: "whatsapp_web",
+          text: replyDraft,
+          field: "availability",
+          itemId: null,
+          itemLabel: null,
+          source:
+            p.alternatives.length > 0
+              ? "canonical_verified_alternatives_list"
+              : "canonical_unavailable_no_alternatives",
+          execute: false,
+        }),
+      }),
+    ]),
+    persistenceIntent: Object.freeze({
+      rememberLastAvailabilityAssist: p.alternatives.length > 0,
+      lastAvailabilityAssist: p.alternatives.length > 0 ? p.assist : null,
+      clearLastAvailabilityAssist: p.alternatives.length === 0,
+      execute: false,
+    }),
+  });
+}
+
+/**
  * Candidate action plan only — does not send, book, or notify owner.
  *
  * @param {{
@@ -293,6 +548,98 @@ export function buildAvailabilityInquiryActionPlan({
 }) {
   const message = String(admittedTurn?.turn?.text ?? "");
   const canonical = readResolvedBusinessTurnContext(businessContext);
+  const assist = readFreshLastAvailabilityAssist(canonical?.lastAvailabilityAssist);
+  const brainDecision =
+    (businessContext?.__availabilityAssistFollowUpDecision &&
+    typeof businessContext.__availabilityAssistFollowUpDecision === "object"
+      ? /** @type {Record<string, unknown>} */ (
+          businessContext.__availabilityAssistFollowUpDecision
+        )
+      : null) ||
+    (canonical?.availabilityAssistFollowUp &&
+    typeof canonical.availabilityAssistFollowUp === "object"
+      ? /** @type {Record<string, unknown>} */ (canonical.availabilityAssistFollowUp)
+      : null);
+  const followUp = resolveAvailabilityAssistFollowUpDecision({
+    lastAvailabilityAssist: assist,
+    brainDecision,
+    understanding,
+  });
+
+  if (
+    assist &&
+    (followUp.decision === "unrelated_message" || followUp.decision === "unclear")
+  ) {
+    return Object.freeze({
+      planId: randomUUID(),
+      replyDraft: undefined,
+      actions: Object.freeze([]),
+      persistenceIntent: Object.freeze({
+        clearLastAvailabilityAssist: followUp.shouldClearAssist !== false,
+        execute: false,
+      }),
+    });
+  }
+
+  if (assist && followUp.decision === "select_alternative_item") {
+    const selectedId = String(followUp.selectedItemId ?? "").trim();
+    const selectedRow = findCatalogItemById(catalogItems, selectedId);
+    const selectedLabel =
+      String(
+        selectedRow?.displayLabel ??
+          selectedRow?.name ??
+          understanding?.resolvedItemLabel ??
+          ""
+      ).trim() || "item";
+    const durationN = Math.max(1, Math.floor(Number(assist.durationDays)));
+    const availability =
+      canonical?.verified?.availability && typeof canonical.verified.availability === "object"
+        ? /** @type {Record<string, unknown>} */ (canonical.verified.availability)
+        : null;
+    const alts = readVerifiedAlternatives(availability);
+    const selectedAvailable =
+      availability?.isAvailable === true ||
+      alts.some((row) => row.itemId === selectedId);
+
+    if (selectedId && selectedAvailable && canonical) {
+      return buildOwnerCheckActionPlan({
+        canonical: {
+          ...canonical,
+          resolvedItem: {
+            id: selectedId,
+            displayLabel: selectedLabel,
+            name: selectedLabel,
+          },
+        },
+        itemId: selectedId,
+        itemLabel: selectedLabel,
+        durationN,
+        execute: canonical.actions?.availabilityOwnerCheckExecute === true,
+        clearAssist: true,
+      });
+    }
+
+    const remaining = alts.filter((row) => row.itemId !== selectedId);
+    return buildAlternativesListActionPlan({
+      alternatives: remaining,
+      assist,
+    });
+  }
+
+  if (
+    assist &&
+    (followUp.decision === "accept_alternative_offer" ||
+      followUp.decision === "ask_available_alternatives")
+  ) {
+    const availability =
+      canonical?.verified?.availability && typeof canonical.verified.availability === "object"
+        ? /** @type {Record<string, unknown>} */ (canonical.verified.availability)
+        : null;
+    return buildAlternativesListActionPlan({
+      alternatives: readVerifiedAlternatives(availability),
+      assist,
+    });
+  }
 
   if (hasCanonicalOwnerCheckContext(canonical)) {
     const resolvedItem = /** @type {Record<string, unknown>} */ (canonical.resolvedItem);
@@ -302,13 +649,6 @@ export function buildAvailabilityInquiryActionPlan({
     const durationDays = canonical.turn?.durationDays ?? null;
     const ownerCheckTiming = resolveOwnerCheckTiming(canonical, message);
     const canonicalAvailability = canonical.verified?.availability ?? null;
-    const canonicalPriceQuote = canonical.verified?.priceQuote ?? null;
-    const participant = canonical.participant ?? null;
-    const sourceIdentity = readSourceIdentity(canonical);
-    const sourceMessageId = String(canonical.turn?.sourceMessageId ?? "").trim() || null;
-    const sourceRowKey = String(canonical.turn?.sourceRowKey ?? "").trim() || null;
-    const guaranteeKey = String(canonical.turn?.guaranteeKey ?? "").trim() || null;
-    const sourceTurnKey = String(canonical.turn?.sourceTurnKey ?? "").trim() || null;
     const execute = canonical.actions?.availabilityOwnerCheckExecute === true;
 
     if (!ownerCheckTiming.ready) {
@@ -338,82 +678,37 @@ export function buildAvailabilityInquiryActionPlan({
       });
     }
 
-    const durationN = Math.max(1, Math.floor(Number(ownerCheckTiming.durationDays ?? durationDays ?? 1)));
-    const replyDraft = buildOwnerCheckDeferralReply(
-      conversationalLabel,
-      durationN,
-      ownerCheckTiming.datePhrase
+    const durationN = Math.max(
+      1,
+      Math.floor(Number(ownerCheckTiming.durationDays ?? durationDays ?? 1))
     );
-    logAvailabilityOwnerCheckPlanned({
-      itemId,
-      itemLabel,
-      durationDays: durationN,
-      canonicalAvailability:
+
+    if (
+      isConfidentInventoryUnavailable(
         canonicalAvailability && typeof canonicalAvailability === "object"
           ? /** @type {Record<string, unknown>} */ (canonicalAvailability)
-          : null,
-      execute: false,
-    });
-
-    return Object.freeze({
-      planId: randomUUID(),
-      replyDraft,
-      actions: Object.freeze([
-        Object.freeze({
-          type: "REPLY",
-          payload: Object.freeze({
-            channel: "whatsapp_web",
-            text: replyDraft,
-            field: "availability",
-            itemId,
-            itemLabel,
-            source: "canonical_owner_check_deferral",
-            execute: false,
-          }),
-        }),
-        Object.freeze({
-          type: "AVAILABILITY_OWNER_CHECK_REQUIRED",
-          payload: Object.freeze({
-            businessId: canonical.businessId ?? null,
-            itemId,
-            itemLabel,
-            durationDays: durationN,
-            requestedDuration: durationN,
-            canonicalAvailability:
-              canonicalAvailability && typeof canonicalAvailability === "object"
-                ? Object.freeze({ ...canonicalAvailability })
-                : null,
-            canonicalPriceQuote:
-              canonicalPriceQuote && typeof canonicalPriceQuote === "object"
-                ? Object.freeze({ ...canonicalPriceQuote })
-                : null,
-            participant:
-              participant && typeof participant === "object"
-                ? Object.freeze({ ...participant })
-                : null,
-            sourceIdentity:
-              sourceIdentity && typeof sourceIdentity === "object"
-                ? Object.freeze({ ...sourceIdentity })
-                : null,
-            sourceMessageId,
-            sourceRowKey,
-            guaranteeKey,
-            sourceTurnKey,
-            sourceChatId: sourceIdentity?.chatId ?? null,
-            sourceChatType: sourceIdentity?.chatType ?? null,
-            customerParticipantId: sourceIdentity?.participantKey ?? null,
-            customerDmTarget: null,
-            ownerTarget: null,
-            execute,
-          }),
-        }),
-      ]),
-      persistenceIntent: Object.freeze({
-        rememberResolvedItem: true,
+          : null
+      )
+    ) {
+      return buildUnavailableOfferActionPlan({
+        conversationalLabel,
         itemId,
-        ownerCheckPlanned: true,
-        execute,
-      }),
+        itemLabel,
+        durationN,
+        availability:
+          canonicalAvailability && typeof canonicalAvailability === "object"
+            ? /** @type {Record<string, unknown>} */ (canonicalAvailability)
+            : {},
+      });
+    }
+
+    return buildOwnerCheckActionPlan({
+      canonical: /** @type {Record<string, unknown>} */ (canonical),
+      itemId: /** @type {string} */ (itemId),
+      itemLabel,
+      durationN,
+      execute,
+      clearAssist: true,
     });
   }
 

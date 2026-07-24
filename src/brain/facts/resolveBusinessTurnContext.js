@@ -16,6 +16,12 @@ import { logCanonicalFactsResolved } from "./logCanonicalFacts.js";
 import { getBookingsForItem } from "../../services/inventoryService.js";
 import { resolveCatalogBrowseAvailabilityFacts } from "./resolveCatalogBrowseAvailabilityFacts.js";
 import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
+import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
+import { decideAvailabilityAssistFollowUp } from "../availability/decideAvailabilityAssistFollowUp.js";
+import { isConfidentInventoryUnavailable } from "./resolveItemBookingAwareAvailability.js";
+import { findVerifiedAvailabilityAlternatives } from "../../services/availabilityRejectionAlternatives.js";
+import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
+import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCompletionsCreate.js";
 
 /**
  * @param {unknown} message
@@ -372,6 +378,36 @@ export async function resolveBusinessTurnContext(params) {
   };
   const actionFacts = resolveActionPolicyFacts(flags);
 
+  const durationDaysForFacts =
+    understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
+      ? Math.max(1, Math.floor(Number(understanding.durationDays)))
+      : turnContextInput?.duration != null && Number.isFinite(Number(turnContextInput.duration))
+        ? Math.max(1, Math.floor(Number(turnContextInput.duration)))
+        : null;
+
+  const memorySnapshot =
+    (params.turnContext?.memorySnapshot &&
+    typeof params.turnContext.memorySnapshot === "object" &&
+    !Array.isArray(params.turnContext.memorySnapshot)
+      ? /** @type {Record<string, unknown>} */ (params.turnContext.memorySnapshot)
+      : null) ||
+    (turnContextInput?.memorySnapshot &&
+    typeof turnContextInput.memorySnapshot === "object" &&
+    !Array.isArray(turnContextInput.memorySnapshot)
+      ? /** @type {Record<string, unknown>} */ (turnContextInput.memorySnapshot)
+      : null) ||
+    {};
+
+  const lastAvailabilityAssist = readFreshLastAvailabilityAssist(
+    memorySnapshot.lastAvailabilityAssist
+  );
+
+  const durationDaysResolved =
+    durationDaysForFacts ??
+    (lastAvailabilityAssist?.durationDays != null
+      ? Math.max(1, Math.floor(Number(lastAvailabilityAssist.durationDays)))
+      : null);
+
   const availabilityFacts = await resolveAvailabilityFacts({
     businessId,
     catalogRow: itemFacts.catalogRow,
@@ -379,8 +415,111 @@ export async function resolveBusinessTurnContext(params) {
     itemName: itemFacts.name,
     signals,
     requestedField: understanding?.askedField ?? turnContextInput?.requestedField ?? null,
+    durationDays: durationDaysResolved,
     getBookingsForItemFn: params.getBookingsForItemFn,
   });
+
+  /** @type {Array<{ itemId: string, itemLabel: string }>} */
+  let verifiedAlternatives = [];
+  const availabilityForAlts = availabilityFacts.availability;
+  const assistWindow =
+    lastAvailabilityAssist != null
+      ? resolveBookingDateWindowFromDuration(lastAvailabilityAssist.durationDays)
+      : null;
+  const unavailableWindow =
+    availabilityForAlts?.windowApplied === true &&
+    availabilityForAlts?.requestedStartAt &&
+    availabilityForAlts?.requestedEndAt
+      ? {
+          start: availabilityForAlts.requestedStartAt,
+          end: availabilityForAlts.requestedEndAt,
+        }
+      : null;
+  const shouldLoadAlternatives =
+    (isConfidentInventoryUnavailable(availabilityForAlts) &&
+      String(itemFacts.id ?? "").trim() !== "") ||
+    lastAvailabilityAssist != null;
+  if (shouldLoadAlternatives) {
+    const excludeId =
+      String(
+        (isConfidentInventoryUnavailable(availabilityForAlts)
+          ? itemFacts.id
+          : null) ??
+          lastAvailabilityAssist?.unavailableItemId ??
+          ""
+      ).trim() || null;
+    const referenceLabel =
+      String(
+        itemFacts.displayLabel ??
+          itemFacts.name ??
+          lastAvailabilityAssist?.unavailableItemLabel ??
+          ""
+      ).trim() || "item";
+    const windowStart =
+      unavailableWindow?.start ?? assistWindow?.startAt ?? null;
+    const windowEnd = unavailableWindow?.end ?? assistWindow?.endAt ?? null;
+    if (excludeId) {
+      try {
+        verifiedAlternatives = await findVerifiedAvailabilityAlternatives({
+          businessId,
+          excludeItemId: excludeId,
+          referenceItemLabel: referenceLabel,
+          limit: 3,
+          requestedStart: windowStart,
+          requestedEnd: windowEnd,
+          catalogRows: catalogItems,
+          getBookingsForItemFn: params.getBookingsForItemFn,
+        });
+      } catch {
+        verifiedAlternatives = [];
+      }
+    }
+  }
+  availabilityFacts.availability = {
+    ...availabilityFacts.availability,
+    verifiedAlternatives,
+  };
+
+  let availabilityAssistFollowUp = null;
+  if (lastAvailabilityAssist) {
+    try {
+      availabilityAssistFollowUp = await decideAvailabilityAssistFollowUp({
+        customerText: rawMessage,
+        recentConversation:
+          turnContextInput?.conversationHistory ??
+          params.turnContext?.conversationHistory ??
+          null,
+        lastAvailabilityAssist,
+        understanding: {
+          resolvedItemId: itemFacts.id,
+          resolvedItemLabel: itemFacts.displayLabel ?? itemFacts.name,
+          signals,
+          askedField: understanding?.askedField ?? null,
+        },
+        verifiedAlternatives,
+        requestedDurationDays: durationDaysResolved,
+        requestedStartAt: lastAvailabilityAssist.windowStartAt,
+        requestedEndAt: lastAvailabilityAssist.windowEndAt,
+        __decisionForTests: params.__availabilityAssistFollowUpDecision ?? null,
+        __chatCompletionsCreateForTests:
+          params.__availabilityAssistFollowUpChatCreate ?? null,
+        chatCompletionsCreate:
+          typeof params.__availabilityAssistFollowUpChatCreate === "function"
+            ? null
+            : resolveOpenAiChatCompletionsCreate(),
+      });
+    } catch {
+      availabilityAssistFollowUp = {
+        decision: "unclear",
+        confidence: 0,
+        selectedItemId: null,
+        shouldClearAssist: true,
+        reason: "assist_follow_up_exception",
+        ok: false,
+        source: "fallback",
+      };
+    }
+  }
 
   const catalogBrowseFacts = shouldResolveCatalogBrowse(rawMessage, signals, understanding)
     ? await resolveCatalogBrowseAvailabilityFacts({
@@ -413,7 +552,7 @@ export async function resolveBusinessTurnContext(params) {
       turnShape: turnContextInput?.turnShape ?? null,
       requestedField:
         understanding?.askedField ?? turnContextInput?.requestedField ?? null,
-      durationDays: understanding?.durationDays ?? turnContextInput?.duration ?? null,
+      durationDays: durationDaysResolved ?? understanding?.durationDays ?? turnContextInput?.duration ?? null,
       confidence: understanding?.itemConfidence ?? null,
       sourceMessageId,
       sourceRowKey,
@@ -432,6 +571,8 @@ export async function resolveBusinessTurnContext(params) {
 
     participant: participantFacts.participant,
     sourceIdentity,
+    lastAvailabilityAssist,
+    availabilityAssistFollowUp,
 
     resolvedItem: {
       status: itemFacts.status,
