@@ -134,6 +134,15 @@ export function isEmilyBusinessPaMissingInfoOwnerAnswerEnabled() {
 }
 
 /**
+ * Waiting-confirm Cloud DM natural Brain lane (shared decideCustomerTurn).
+ * Default OFF — must be explicitly enabled.
+ * @returns {boolean}
+ */
+export function isEmilyWaitingConfirmDmBrainEnabled() {
+  return envTruthy("EMILY_WAITING_CONFIRM_DM_BRAIN_ENABLED");
+}
+
+/**
  * @returns {{
  *   live: boolean,
  *   liveAllowlist: string[],
@@ -150,6 +159,7 @@ export function isEmilyBusinessPaMissingInfoOwnerAnswerEnabled() {
  *   businessPaAgent: boolean,
  *   businessPaMissingInfo: boolean,
  *   businessPaMissingInfoOwnerAnswer: boolean,
+ *   waitingConfirmDmBrain: boolean,
  * }}
  */
 export function getEmilyBrainV2LiveFlagSnapshot() {
@@ -169,5 +179,6 @@ export function getEmilyBrainV2LiveFlagSnapshot() {
     businessPaAgent: isEmilyBusinessPaAgentEnabled(),
     businessPaMissingInfo: isEmilyBusinessPaMissingInfoEnabled(),
     businessPaMissingInfoOwnerAnswer: isEmilyBusinessPaMissingInfoOwnerAnswerEnabled(),
+    waitingConfirmDmBrain: isEmilyWaitingConfirmDmBrainEnabled(),
   };
 }

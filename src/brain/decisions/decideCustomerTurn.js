@@ -2,20 +2,24 @@
  * Shared Brain conversational decision authority (seed).
  *
  * One Brain, many safe executors — this is the shared customer-turn entrypoint.
- * Phase A post-confirm PA is the first lane (`post_confirm_pa`).
- * Other lanes (group availability, booking, pricing, browse, waiting-confirm)
- * are intentionally NOT migrated yet.
+ * Lanes: `post_confirm_pa`, `waiting_confirm_dm`.
  *
- * Not a second Brain. Not a PA Brain. Reuses the existing post-confirm
- * OpenAI decision path — no parallel decision system.
+ * Not a second Brain. Not a PA Brain. No parallel decision system.
  */
 
 import {
   executePostConfirmPaLaneDecision,
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
 } from "./decidePostConfirmCustomerDm.js";
+import {
+  executeWaitingConfirmDmLaneDecision,
+  WAITING_CONFIRM_DM_LANE,
+} from "./waitingConfirmDmLane.js";
 
-export const CUSTOMER_TURN_LANES = Object.freeze(["post_confirm_pa"]);
+export const CUSTOMER_TURN_LANES = Object.freeze([
+  "post_confirm_pa",
+  WAITING_CONFIRM_DM_LANE,
+]);
 
 /**
  * @typedef {object} TurnContext
@@ -27,6 +31,8 @@ export const CUSTOMER_TURN_LANES = Object.freeze(["post_confirm_pa"]);
  * @property {string | null} [messageText]
  * @property {string | null} [messageId]
  * @property {string | null} [recentDialogue]
+ * @property {string | null} [lastEmilyMessage]
+ * @property {string | null} [lastCustomerDmPromptType]
  * @property {Record<string, unknown> | null} [activeBooking]
  * @property {Record<string, unknown> | null} [activeAvailabilityRequest]
  * @property {Record<string, unknown> | null} [knownPolicies]
@@ -93,6 +99,12 @@ export function normalizeTurnContext(raw = {}) {
         : r.conversationHistory != null
           ? String(r.conversationHistory)
           : null,
+    lastEmilyMessage:
+      r.lastEmilyMessage != null ? String(r.lastEmilyMessage) : null,
+    lastCustomerDmPromptType:
+      r.lastCustomerDmPromptType != null
+        ? String(r.lastCustomerDmPromptType)
+        : null,
     activeBooking:
       r.activeBooking && typeof r.activeBooking === "object"
         ? /** @type {Record<string, unknown>} */ (r.activeBooking)
@@ -193,7 +205,13 @@ export function enrichSharedCustomerTurnDecision(decision) {
   let requiredExecutor = d.requiredExecutor ?? null;
   if (requiredExecutor == null) {
     if (action === "silence" || action === "none") requiredExecutor = "none";
-    else if (action === "escalate_missing_info") {
+    else if (action === "confirm_booking") {
+      requiredExecutor = "confirm_booking_executor";
+    } else if (action === "decline_request") {
+      requiredExecutor = "decline_request_executor";
+    } else if (action === "change_request") {
+      requiredExecutor = "protected_change_reply_executor";
+    } else if (action === "escalate_missing_info") {
       requiredExecutor = "pa_missing_info_escalate";
     } else if (action === "fallthrough_action") {
       requiredExecutor = "brain_fallthrough";
@@ -256,6 +274,22 @@ export async function decideCustomerTurn(turnContextInput = {}) {
       ...result,
       decision: enrichSharedCustomerTurnDecision(result?.decision),
       lane,
+      turnContext,
+    };
+  }
+
+  if (lane === WAITING_CONFIRM_DM_LANE || lane === "waiting_confirm_dm") {
+    const result = await executeWaitingConfirmDmLaneDecision({
+      turnContext,
+      timeoutMs:
+        turnContext.timeoutMs != null ? turnContext.timeoutMs : 8000,
+      __chatCompletionsCreateForTests:
+        turnContext.__chatCompletionsCreateForTests,
+    });
+    return {
+      ...result,
+      decision: enrichSharedCustomerTurnDecision(result?.decision),
+      lane: WAITING_CONFIRM_DM_LANE,
       turnContext,
     };
   }
