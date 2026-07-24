@@ -2,7 +2,6 @@ import db from "../config/firebase.js";
 import {
   computeUserFacingAvailability,
   getBookingsForItem,
-  pickAlternativeAvailableItemsFromCatalogRows,
 } from "./inventoryService.js";
 
 function clean(value, max = 500) {
@@ -26,11 +25,14 @@ async function loadCatalogRows(userId) {
 }
 
 /**
- * Verified alternatives only: catalog match + booking-aware availability for duration window.
+ * Verified alternatives: all catalog cars except excludeItemId, booking-window available.
+ * Name similarity is not used for eligibility (catalog order + availability only).
+ * AVR / availabilityRequest is not consulted — bookings only.
+ *
  * @param {{
  *   businessId: string,
  *   excludeItemId: string,
- *   referenceItemLabel: string,
+ *   referenceItemLabel?: string,
  *   db?: unknown,
  *   limit?: number,
  *   requestedStart?: unknown,
@@ -42,7 +44,7 @@ async function loadCatalogRows(userId) {
 export async function findVerifiedAvailabilityAlternatives({
   businessId,
   excludeItemId,
-  referenceItemLabel,
+  referenceItemLabel: _referenceItemLabel = "",
   limit = 2,
   requestedStart = null,
   requestedEnd = null,
@@ -51,37 +53,31 @@ export async function findVerifiedAvailabilityAlternatives({
 }) {
   const uid = clean(businessId);
   const exclude = clean(excludeItemId);
-  const reference = clean(referenceItemLabel);
-  if (!uid || !exclude || !reference) {
+  if (!uid || !exclude) {
     return [];
   }
 
   const rows = Array.isArray(catalogRows) ? catalogRows : await loadCatalogRows(uid);
-  const ranked = await pickAlternativeAvailableItemsFromCatalogRows(
-    uid,
-    exclude,
-    reference,
-    rows,
-    { limit: Math.max(limit, 2), maxRankedCandidates: 120 }
-  );
-
   const getBookings = getBookingsForItemFn ?? getBookingsForItem;
   const avOpts =
     requestedStart != null || requestedEnd != null
       ? { requestedStart, requestedEnd }
       : null;
+  const max = Math.max(1, Math.min(10, Number(limit) || 2));
 
   const verified = [];
-  for (const row of ranked) {
-    const itemId = clean(row?.id ?? row?.itemId);
-    const itemLabel = clean(row?.displayLabel ?? row?.name);
-    if (!itemId || !itemLabel) continue;
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const itemId = clean(row.id ?? row.itemId);
+    if (!itemId || itemId === exclude) continue;
+    const itemLabel = clean(row.displayLabel ?? row.name);
+    if (!itemLabel) continue;
     try {
       const bookings = await getBookings(uid, itemId, itemLabel);
       const availability = computeUserFacingAvailability(bookings, itemId, avOpts);
       if (availability?.isAvailable !== true) continue;
       verified.push({ itemId, itemLabel });
-      if (verified.length >= limit) break;
+      if (verified.length >= max) break;
     } catch (err) {
       console.warn("[availability_rejection_alternative_row_failed]", {
         businessId: uid,
