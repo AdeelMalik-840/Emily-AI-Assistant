@@ -49,6 +49,49 @@ function isBareSocialDecline(message) {
 }
 
 /**
+ * Narrow social / closing turns that must stay PA-owned (handled:true) under
+ * active booking context. Not a canned reply map — classification only.
+ * @param {string} message
+ */
+export function isPostConfirmSocialOrClosingTurn(message) {
+  const t = clean(message);
+  if (!t) return false;
+  if (isBareSocialDecline(t)) return true;
+  const lower = t.toLowerCase();
+  if (
+    /^(ok|okay|okk|okz|theek|theek\s*hai|thik|thik\s*hai|alright|got\s*it)\.?$/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+  if (
+    /^(thanks|thank\s*you|thx|ty|shukriya|shukria|jazakallah)\.?[!]*$/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+  if (
+    /^(you\s*too|same\s*to\s*you|u\s*too)\.?[!]*$/i.test(lower) ||
+    /have\s+a\s+(good|nice|great)\s+(day|night|evening|one)/i.test(lower) ||
+    /^(allah\s*hafiz|khuda\s*hafiz|bye|goodbye|take\s*care)\.?[!]*$/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+  if (
+    /why\s+(are\s+you\s+)?copy/i.test(lower) ||
+    /copying\s+me/i.test(lower) ||
+    /mera\s+copy/i.test(lower)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Explicit booking/cancel/change protection (post-confirm PA).
  * Bare "no"/"nahi" alone is NOT an action — social closing goes to Brain.
  * @param {string} message
@@ -58,9 +101,12 @@ export function classifyCustomerBusinessPaActionIntent(message, facts = null) {
   const text = clean(message);
   if (!text) return { isAction: false, kind: "empty" };
 
-  // Social/ending decline → Brain decide (not AVR-confirm decline fallthrough).
-  if (isBareSocialDecline(text)) {
-    return { isAction: false, kind: "social_decline" };
+  // Social/closing → Brain decide (not AVR-confirm / Clarification fallthrough).
+  if (isPostConfirmSocialOrClosingTurn(text)) {
+    return {
+      isAction: false,
+      kind: isBareSocialDecline(text) ? "social_decline" : "social_closing",
+    };
   }
 
   const booking =

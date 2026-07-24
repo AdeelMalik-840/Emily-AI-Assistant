@@ -16,11 +16,16 @@ import { buildShadowTurnContext } from "../shadow/brainShadowHook.js";
 import { runConversationTurn } from "../orchestrator/ConversationOrchestrator.js";
 import { executeOutboundReply } from "../../services/executors/outboundReplyExecutor.js";
 import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
+import {
+  ONBOARDING_CLARIFICATION_REPLY,
+  isOnboardingStyleClarificationReply,
+  shouldSuppressPostConfirmOnboardingClarification,
+} from "./shouldSuppressPostConfirmOnboardingClarification.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
-const SAFE_CLARIFICATION =
-  "Main samajh nahi paaya — kya aap availability, price, ya booking ke baare mein pooch rahe hain? Kis item ke liye dekh rahe hain?";
+/** @deprecated Prefer ONBOARDING_CLARIFICATION_REPLY — kept as alias for local call sites. */
+const SAFE_CLARIFICATION = ONBOARDING_CLARIFICATION_REPLY;
 
 /**
  * @typedef {Object} BrainV2LivePipelineResult
@@ -124,6 +129,14 @@ export async function runBrainV2LivePipeline(params) {
         getBusinessProfileFn: params.getBusinessProfileFn,
         getBookingsForItemFn: params.getBookingsForItemFn,
       });
+      const suppressedEarly = await maybeSilentInsteadOfOnboardingClarify({
+        params,
+        channel,
+        chatType,
+        reply: turnContextInput.clarificationReply,
+        reason: "AUTHORITY_CLARIFY_SUPPRESSED",
+      });
+      if (suppressedEarly) return suppressedEarly;
       return finalizeLivePipelineResult({
         params,
         turnContextInput,
@@ -155,6 +168,8 @@ export async function runBrainV2LivePipeline(params) {
       return buildClarificationResult({
         params,
         turnContextInput,
+        channel,
+        chatType,
         reason: admission.skipReason ?? "ADMISSION_SKIPPED",
         reply: SAFE_CLARIFICATION,
       });
@@ -211,6 +226,8 @@ export async function runBrainV2LivePipeline(params) {
       return buildClarificationResult({
         params,
         turnContextInput,
+        channel,
+        chatType,
         reason: "UNSUPPORTED_WORKFLOW",
         reply: SAFE_CLARIFICATION,
         workflowType,
@@ -221,10 +238,34 @@ export async function runBrainV2LivePipeline(params) {
       return buildClarificationResult({
         params,
         turnContextInput,
+        channel,
+        chatType,
         reason: "EMPTY_ACTION_PLAN",
         reply: SAFE_CLARIFICATION,
         workflowType,
       });
+    }
+
+    // ClarificationWorkflow / unknown_clarification action plans with onboarding canned text.
+    const plannedClarifyReply = String(
+      result.actionPlan?.replyDraft ??
+        result.actionPlan?.actions?.[0]?.payload?.text ??
+        ""
+    ).trim();
+    if (
+      (workflowType === "clarification" ||
+        workflowType === "unknown_clarification" ||
+        workflowType === "noop") &&
+      isOnboardingStyleClarificationReply(plannedClarifyReply)
+    ) {
+      const suppressedPlan = await maybeSilentInsteadOfOnboardingClarify({
+        params,
+        channel,
+        chatType,
+        reply: plannedClarifyReply,
+        reason: "ONBOARDING_CLARIFY_PLAN_SUPPRESSED",
+      });
+      if (suppressedPlan) return suppressedPlan;
     }
 
     const { sideEffectResults, bookingCreated, ...routed } = await routeAndExecuteLiveActionPlan(
@@ -380,14 +421,63 @@ function finalizeLivePipelineResult(p) {
 }
 
 /**
+ * Step 3: silence instead of onboarding canned clarify for post-confirm Cloud DM.
+ * @param {{
+ *   params: Record<string, unknown>,
+ *   channel: string,
+ *   chatType: string,
+ *   reply: string,
+ *   reason: string,
+ * }} p
+ */
+async function maybeSilentInsteadOfOnboardingClarify(p) {
+  const params = p.params && typeof p.params === "object" ? p.params : {};
+  const decision = await shouldSuppressPostConfirmOnboardingClarification({
+    channel: p.channel ?? params.channel,
+    chatType: p.chatType ?? params.chatType,
+    isGroupInbound: params.isGroupInbound === true,
+    isGroupMessage: params.isGroupMessage === true,
+    playwrightWebInbound: params.playwrightWebInbound === true,
+    businessId: params.businessId,
+    customerPhone: params.participantPhoneForDm,
+    participantPhoneForDm: params.participantPhoneForDm,
+    db: params.executionContext?.db ?? params.db ?? null,
+    replyText: p.reply,
+    __resolveActiveCustomerBookingFactsFn:
+      params.__resolveActiveCustomerBookingFactsFn ?? null,
+  });
+  if (!decision.suppress) return null;
+  console.log("[brain_v2_post_confirm_onboarding_clarify_suppressed]", {
+    traceId: String(params.traceId ?? "").trim() || null,
+    businessId: String(params.businessId ?? "").trim() || null,
+    reason: decision.reason,
+    suppressReason: p.reason,
+  });
+  return buildSilentPipelineResult({
+    traceId: String(params.traceId ?? "").trim(),
+    reason: p.reason || "POST_CONFIRM_ONBOARDING_CLARIFY_SUPPRESSED",
+  });
+}
+
+/**
  * @param {Record<string, unknown>} p
  */
-function buildClarificationResult(p) {
+async function buildClarificationResult(p) {
+  const reply = p.reply ?? SAFE_CLARIFICATION;
+  const suppressed = await maybeSilentInsteadOfOnboardingClarify({
+    params: p.params,
+    channel: p.channel,
+    chatType: p.chatType,
+    reply,
+    reason: "POST_CONFIRM_ONBOARDING_CLARIFY_SUPPRESSED",
+  });
+  if (suppressed) return suppressed;
+
   return finalizeLivePipelineResult({
     params: p.params,
     turnContextInput: p.turnContextInput,
     workflowType: p.workflowType ?? "unknown_clarification",
-    reply: p.reply ?? SAFE_CLARIFICATION,
+    reply,
     finalReplySource: "BRAIN_V2_LIVE_CLARIFY",
     actionPlan: null,
     flags: getEmilyBrainV2LiveFlagSnapshot(),
