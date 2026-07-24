@@ -10,6 +10,7 @@ import {
   isUnlistedAvailabilityIntent,
 } from "./browseIntent.js";
 import { isWeakNeedOwnerAvailabilityInquiry } from "../facts/resolveBusinessTurnContext.js";
+import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
 
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -153,6 +154,26 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
       reason: "awaiting_booking_contact",
       priority: 88,
     };
+  }
+
+  const memoryForAssist =
+    turnContext?.memorySnapshot && typeof turnContext.memorySnapshot === "object"
+      ? /** @type {Record<string, unknown>} */ (turnContext.memorySnapshot)
+      : null;
+  const freshAssist = readFreshLastAvailabilityAssist(
+    memoryForAssist?.lastAvailabilityAssist
+  );
+  // Context gate only: fresh assist → availability workflow so Brain can decide
+  // meaning. Does not treat short text as accept.
+  if (freshAssist) {
+    const signals = understanding.signals ?? {};
+    if (!signals.priceAsk && !signals.bookingCommitment) {
+      return {
+        workflowType: "availability_inquiry",
+        reason: "availability_assist_follow_up_pending",
+        priority: 78,
+      };
+    }
   }
 
   if (hasOpenCollectDurationPending(turnContext)) {

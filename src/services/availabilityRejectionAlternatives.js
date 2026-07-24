@@ -33,6 +33,10 @@ async function loadCatalogRows(userId) {
  *   referenceItemLabel: string,
  *   db?: unknown,
  *   limit?: number,
+ *   requestedStart?: unknown,
+ *   requestedEnd?: unknown,
+ *   catalogRows?: unknown[],
+ *   getBookingsForItemFn?: typeof getBookingsForItem,
  * }} params
  */
 export async function findVerifiedAvailabilityAlternatives({
@@ -40,6 +44,10 @@ export async function findVerifiedAvailabilityAlternatives({
   excludeItemId,
   referenceItemLabel,
   limit = 2,
+  requestedStart = null,
+  requestedEnd = null,
+  catalogRows = null,
+  getBookingsForItemFn = null,
 }) {
   const uid = clean(businessId);
   const exclude = clean(excludeItemId);
@@ -48,14 +56,20 @@ export async function findVerifiedAvailabilityAlternatives({
     return [];
   }
 
-  const catalogRows = await loadCatalogRows(uid);
+  const rows = Array.isArray(catalogRows) ? catalogRows : await loadCatalogRows(uid);
   const ranked = await pickAlternativeAvailableItemsFromCatalogRows(
     uid,
     exclude,
     reference,
-    catalogRows,
+    rows,
     { limit: Math.max(limit, 2), maxRankedCandidates: 120 }
   );
+
+  const getBookings = getBookingsForItemFn ?? getBookingsForItem;
+  const avOpts =
+    requestedStart != null || requestedEnd != null
+      ? { requestedStart, requestedEnd }
+      : null;
 
   const verified = [];
   for (const row of ranked) {
@@ -63,8 +77,8 @@ export async function findVerifiedAvailabilityAlternatives({
     const itemLabel = clean(row?.displayLabel ?? row?.name);
     if (!itemId || !itemLabel) continue;
     try {
-      const bookings = await getBookingsForItem(uid, itemId, itemLabel);
-      const availability = computeUserFacingAvailability(bookings, itemId);
+      const bookings = await getBookings(uid, itemId, itemLabel);
+      const availability = computeUserFacingAvailability(bookings, itemId, avOpts);
       if (availability?.isAvailable !== true) continue;
       verified.push({ itemId, itemLabel });
       if (verified.length >= limit) break;

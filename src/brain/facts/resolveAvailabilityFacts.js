@@ -12,6 +12,8 @@ import { resolveItemBookingAwareAvailability } from "./resolveItemBookingAwareAv
  *   itemName?: string | null,
  *   signals?: { availabilityAsk?: boolean },
  *   requestedField?: string | null,
+ *   durationDays?: number | null,
+ *   nowMs?: number,
  *   getBookingsForItemFn?: typeof getBookingsForItem,
  * }} p
  */
@@ -37,6 +39,11 @@ export async function resolveAvailabilityFacts(p) {
         ownerDisabled: false,
         staleCatalogAvailability: false,
         reason: wantsAvailability ? "missing_item" : "not_requested",
+        windowApplied: false,
+        dateWindowConfidence: "none",
+        requestedStartAt: null,
+        requestedEndAt: null,
+        verifiedAlternatives: [],
       },
       sourceEvidence: {
         availability: { wantsAvailability, itemId: null },
@@ -50,6 +57,8 @@ export async function resolveAvailabilityFacts(p) {
     itemId,
     itemName: p.itemName,
     wantsAvailability,
+    durationDays: p.durationDays,
+    nowMs: p.nowMs,
     getBookingsForItemFn: p.getBookingsForItemFn,
   });
 }
