@@ -13,6 +13,7 @@ import {
 import {
   buildOfferedAlternativesAssist,
   AVAILABILITY_ASSIST_TTL_MS,
+  readFreshLastAvailabilityAssist,
 } from "../src/brain/availability/availabilityAssistContext.js";
 import {
   decideAvailabilityAssistFollowUp,
@@ -25,6 +26,14 @@ import {
 } from "../src/brain/facts/resolveItemBookingAwareAvailability.js";
 import { resolveBookingDateWindowFromDuration } from "../src/brain/facts/resolveBookingDateWindow.js";
 import { selectWorkflow } from "../src/brain/workflow/WorkflowEngine.js";
+import { runBrainV2LivePipeline } from "../src/brain/live/brainV2LivePipeline.js";
+import {
+  ONBOARDING_CLARIFICATION_REPLY,
+  isOnboardingStyleClarificationReply,
+} from "../src/brain/live/shouldSuppressPostConfirmOnboardingClarification.js";
+import { applySessionMemoryFromActionPlan } from "../src/services/executors/sessionMemoryExecutor.js";
+import { loadBrainV2SessionMemorySnapshot } from "../src/services/whatsappInboundBuffer.js";
+import { resolveShadowEmilySessionKey } from "../src/brain/shadow/brainShadowHook.js";
 
 const BUSINESS_ID = "biz-unavailable-alts";
 const COROLLA_ID = "toyota_corolla_grey";
@@ -272,12 +281,15 @@ test("5: after offer + thanks + injected unrelated → no alts + clear", async (
     signals: {},
     durationDays: null,
   });
-  assert.equal(plan.actions.length, 0);
+  assert.equal(plan.actions.length, 1);
+  assert.equal(plan.actions[0]?.type, "NO_OP");
+  assert.equal(plan.actions[0]?.payload?.intentionallySilent, true);
+  assert.equal(plan.actions[0]?.payload?.source, "availability_assist_context_no_reply");
   assert.equal(plan.persistenceIntent?.clearLastAvailabilityAssist, true);
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Stonic|Civic|options/i);
+  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Stonic|Civic|options|Main samajh nahi paaya/i);
 });
 
-test("6: after offer + done + injected unclear → no alts", async () => {
+test("6: after offer + done + injected unclear → explicit no-reply, no alts", async () => {
   const brain = {
     decision: "unclear",
     confidence: 0.4,
@@ -298,11 +310,14 @@ test("6: after offer + done + injected unclear → no alts", async () => {
     signals: {},
     durationDays: null,
   });
+  assert.equal(plan.actions[0]?.type, "NO_OP");
+  assert.equal(plan.actions[0]?.payload?.intentionallySilent, true);
   assert.equal(
     plan.actions.some((a) => a.type === "REPLY" && /Stonic|options/i.test(String(a.payload?.text))),
     false
   );
   assert.equal(plan.persistenceIntent?.clearLastAvailabilityAssist, true);
+  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Main samajh nahi paaya/i);
 });
 
 test("7: ji without offer context → no alternatives", () => {
@@ -439,8 +454,10 @@ test("11: Brain helper failure + short text → no unsafe alternatives", async (
     signals: {},
     durationDays: null,
   });
-  assert.equal(plan.actions.length, 0);
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Stonic|Civic/i);
+  assert.equal(plan.actions[0]?.type, "NO_OP");
+  assert.equal(plan.actions[0]?.payload?.intentionallySilent, true);
+  assert.equal(plan.persistenceIntent?.clearLastAvailabilityAssist, true);
+  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Stonic|Civic|Main samajh nahi paaya/i);
 });
 
 test("12: heuristic short-accept no longer decides meaning", () => {
@@ -505,4 +522,355 @@ test("14: WorkflowEngine routes fresh assist without short-accept heuristic", ()
   });
   assert.equal(wf.workflowType, "availability_inquiry");
   assert.equal(wf.reason, "availability_assist_follow_up_pending");
+});
+
+function enableV2Live() {
+  process.env.EMILY_BRAIN_V2_LIVE = "true";
+  process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES = BUSINESS_ID;
+  process.env.EMILY_BRAIN_V2_PRODUCTION_ALLOW = "true";
+  process.env.EMILY_BRAIN_V2_LEGACY_FALLBACK = "false";
+}
+
+test("15A: live pipeline — fresh assist + unclear NO_OP → silence, not onboarding clarify", async () => {
+  enableV2Live();
+  const assist = buildOfferedAlternativesAssist({
+    unavailableItemId: COROLLA_ID,
+    unavailableItemLabel: "Toyota Corolla",
+    durationDays: 2,
+  });
+  const plan = planWithBrain(
+    "jii",
+    {
+      decision: "unclear",
+      confidence: 0.2,
+      shouldClearAssist: true,
+      ok: false,
+    },
+    {},
+    { resolvedItemId: null, signals: {}, durationDays: null }
+  );
+  assert.equal(plan.actions[0]?.type, "NO_OP");
+
+  const result = await runBrainV2LivePipeline({
+    traceId: "assist-unclear-silence",
+    businessId: BUSINESS_ID,
+    message: "jii",
+    catalogItems: [
+      { id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" },
+      { id: STONIC_ID, name: "Kia Stonic", displayLabel: "Kia Stonic" },
+    ],
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    sessionKey: "group-assist-unclear",
+    memorySnapshot: { lastAvailabilityAssist: assist },
+    __testOrchestratorFn: () => ({
+      workflowDecision: {
+        workflowType: "availability_inquiry",
+        reason: "availability_assist_follow_up_pending",
+      },
+      actionPlan: plan,
+      understanding: { signals: {} },
+      trace: {},
+    }),
+  });
+
+  assert.equal(result.handled, true);
+  assert.equal(result.reason, "ASSIST_CONTEXT_NO_REPLY");
+  assert.equal(String(result.reply ?? "").trim(), "");
+  assert.equal(result.sendVia, "NONE");
+  assert.doesNotMatch(String(result.reply ?? ""), /Main samajh nahi paaya/i);
+  assert.notEqual(result.reply, ONBOARDING_CLARIFICATION_REPLY);
+  assert.equal(
+    result.actionPlan?.actions?.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    undefined
+  );
+});
+
+test("15B: live pipeline — helper fail unclear → no onboarding, no AVR", async () => {
+  enableV2Live();
+  const assist = buildOfferedAlternativesAssist({
+    unavailableItemId: COROLLA_ID,
+    unavailableItemLabel: "Toyota Corolla",
+    durationDays: 2,
+  });
+  const brain = await decideAvailabilityAssistFollowUp({
+    customerText: "jii",
+    lastAvailabilityAssist: assist,
+    __chatCompletionsCreateForTests: async () => {
+      throw new Error("OPENAI_DOWN");
+    },
+  });
+  const plan = planWithBrain("jii", brain, {}, {
+    resolvedItemId: null,
+    signals: {},
+    durationDays: null,
+  });
+  assert.equal(plan.actions[0]?.type, "NO_OP");
+
+  const result = await runBrainV2LivePipeline({
+    traceId: "assist-helper-fail",
+    businessId: BUSINESS_ID,
+    message: "jii",
+    catalogItems: [{ id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" }],
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    memorySnapshot: { lastAvailabilityAssist: assist },
+    __testOrchestratorFn: () => ({
+      workflowDecision: {
+        workflowType: "availability_inquiry",
+        reason: "availability_assist_follow_up_pending",
+      },
+      actionPlan: plan,
+      understanding: { signals: {} },
+      trace: {},
+    }),
+  });
+  assert.equal(result.reason, "ASSIST_CONTEXT_NO_REPLY");
+  assert.equal(String(result.reply ?? "").trim(), "");
+  assert.doesNotMatch(String(result.reply ?? ""), /Main samajh nahi paaya|Stonic/i);
+});
+
+test("15C: live pipeline — forced empty plan + fresh assist → silence not SAFE_CLARIFICATION", async () => {
+  enableV2Live();
+  const assist = buildOfferedAlternativesAssist({
+    unavailableItemId: COROLLA_ID,
+    unavailableItemLabel: "Toyota Corolla",
+    durationDays: 2,
+  });
+  const result = await runBrainV2LivePipeline({
+    traceId: "assist-empty-guard",
+    businessId: BUSINESS_ID,
+    message: "jii",
+    catalogItems: [{ id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" }],
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-assist-empty",
+    sessionKey: "group-assist-empty",
+    memorySnapshot: { lastAvailabilityAssist: assist },
+    __testOrchestratorFn: () => ({
+      workflowDecision: {
+        workflowType: "availability_inquiry",
+        reason: "availability_assist_follow_up_pending",
+      },
+      actionPlan: {
+        planId: "forced-empty",
+        replyDraft: undefined,
+        actions: [],
+      },
+      understanding: { signals: {} },
+      trace: {},
+    }),
+  });
+  assert.equal(result.handled, true);
+  assert.equal(result.reason, "ASSIST_CONTEXT_NO_REPLY");
+  assert.equal(String(result.reply ?? "").trim(), "");
+  assert.equal(result.sendVia, "NONE");
+  assert.notEqual(result.reply, ONBOARDING_CLARIFICATION_REPLY);
+});
+
+test("15D: live pipeline — no assist + unknown short message → onboarding clarification unchanged", async () => {
+  enableV2Live();
+  const result = await runBrainV2LivePipeline({
+    traceId: "no-assist-clarify",
+    businessId: BUSINESS_ID,
+    message: "asdfqwer",
+    catalogItems: [{ id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" }],
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-no-assist",
+    memorySnapshot: {},
+  });
+  assert.equal(result.handled, true);
+  assert.match(String(result.reply ?? ""), /Main samajh nahi paaya/i);
+  assert.equal(isOnboardingStyleClarificationReply(result.reply), true);
+});
+
+test("15E: fresh assist + injected accept → verified alternatives listed", () => {
+  const plan = planWithBrain(
+    "jii",
+    {
+      decision: "accept_alternative_offer",
+      confidence: 0.92,
+      ok: true,
+    },
+    {},
+    { resolvedItemId: null, signals: {}, durationDays: null }
+  );
+  assert.match(String(plan.replyDraft ?? ""), /Stonic/i);
+  assert.equal(plan.actions[0]?.payload?.source, "canonical_verified_alternatives_list");
+  assert.equal(
+    plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    false
+  );
+});
+
+test("15F: fresh assist + selected Stonic → owner-check", () => {
+  const plan = planWithBrain(
+    "Stonic",
+    {
+      decision: "select_alternative_item",
+      confidence: 0.93,
+      selectedItemId: STONIC_ID,
+      ok: true,
+    },
+    {
+      resolvedItem: { id: STONIC_ID, name: "Kia Stonic", displayLabel: "Kia Stonic" },
+      turn: { durationDays: 2 },
+      verified: {
+        availability: {
+          status: "available",
+          isAvailable: true,
+          windowApplied: true,
+          verifiedAlternatives: [
+            { itemId: STONIC_ID, itemLabel: "Kia Stonic" },
+            { itemId: CIVIC_ID, itemLabel: "Honda Civic" },
+          ],
+        },
+        priceQuote: null,
+      },
+    },
+    {
+      resolvedItemId: STONIC_ID,
+      resolvedItemLabel: "Kia Stonic",
+      signals: {},
+      durationDays: 2,
+    }
+  );
+  assert.equal(
+    plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    true
+  );
+  assert.equal(
+    plan.actions.find((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED")?.payload?.itemId,
+    STONIC_ID
+  );
+});
+
+test("16: session-memory round-trip — offer persist → same key load → assist route → accept alts", async () => {
+  const groupSessionKey = "group-assist-roundtrip";
+  const participantKey = "cust-assist-rt-1";
+  const playwrightChatKey = "group-assist-roundtrip";
+  const memoryParams = {
+    businessId: BUSINESS_ID,
+    ownerUserId: BUSINESS_ID,
+    sessionKey: groupSessionKey,
+    participantKey,
+    playwrightChatKey,
+    isGroupInbound: true,
+  };
+  const emilySessionKey = resolveShadowEmilySessionKey(memoryParams);
+  assert.ok(emilySessionKey);
+
+  const offerPlan = buildAvailabilityInquiryActionPlan({
+    admittedTurn: admitted("Corolla 2 din k lye available hai? smoke42unavail001"),
+    understanding: understanding(),
+    catalogItems: [
+      { id: COROLLA_ID, name: "Toyota Corolla", displayLabel: "Toyota Corolla" },
+      { id: STONIC_ID, name: "Kia Stonic", displayLabel: "Kia Stonic" },
+      { id: CIVIC_ID, name: "Honda Civic", displayLabel: "Honda Civic" },
+    ],
+    businessContext: { resolvedBusinessTurnContext: canonicalContext() },
+  });
+
+  assert.equal(offerPlan.persistenceIntent?.rememberLastAvailabilityAssist, true);
+  assert.equal(
+    offerPlan.persistenceIntent?.lastAvailabilityAssist?.action,
+    "offered_alternatives"
+  );
+  assert.equal(
+    offerPlan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    false
+  );
+
+  applySessionMemoryFromActionPlan({
+    sessionKey: emilySessionKey,
+    actionPlan: offerPlan,
+  });
+
+  const loaded = await loadBrainV2SessionMemorySnapshot({
+    ...memoryParams,
+    traceId: "assist-rt-load",
+  });
+  const freshAssist = readFreshLastAvailabilityAssist(loaded?.lastAvailabilityAssist);
+  assert.ok(freshAssist, "same-key load must return fresh lastAvailabilityAssist");
+  assert.equal(freshAssist.action, "offered_alternatives");
+  assert.equal(freshAssist.unavailableItemId, COROLLA_ID);
+
+  const wf = selectWorkflow({
+    understanding: {
+      resolvedItemId: null,
+      signals: {},
+      intentsRanked: [],
+    },
+    turnContext: {
+      sessionId: emilySessionKey,
+      businessId: BUSINESS_ID,
+      chatKey: playwrightChatKey,
+      participantKey,
+      schemaVersion: 1,
+      memorySnapshot: loaded,
+    },
+    message: "jii",
+  });
+  assert.equal(wf.workflowType, "availability_inquiry");
+  assert.equal(wf.reason, "availability_assist_follow_up_pending");
+
+  const acceptPlan = planWithBrain(
+    "jii",
+    {
+      decision: "accept_alternative_offer",
+      confidence: 0.95,
+      ok: true,
+    },
+    { lastAvailabilityAssist: freshAssist },
+    { resolvedItemId: null, signals: {}, durationDays: null }
+  );
+  assert.match(String(acceptPlan.replyDraft ?? ""), /Stonic|Civic|options/i);
+  assert.equal(
+    acceptPlan.actions[0]?.payload?.source,
+    "canonical_verified_alternatives_list"
+  );
+  assert.equal(
+    acceptPlan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    false
+  );
+  assert.doesNotMatch(
+    String(acceptPlan.replyDraft ?? ""),
+    /Main samajh nahi paaya/i
+  );
+  assert.notEqual(acceptPlan.replyDraft, ONBOARDING_CLARIFICATION_REPLY);
+
+  // Negative control: wrong participant key → no assist → no assist follow-up route
+  const wrongParams = {
+    ...memoryParams,
+    participantKey: "cust-assist-rt-OTHER",
+  };
+  const wrongLoaded = await loadBrainV2SessionMemorySnapshot({
+    ...wrongParams,
+    traceId: "assist-rt-wrong-key",
+  });
+  assert.equal(
+    readFreshLastAvailabilityAssist(wrongLoaded?.lastAvailabilityAssist),
+    null
+  );
+  const wfWrong = selectWorkflow({
+    understanding: {
+      resolvedItemId: null,
+      signals: {},
+      intentsRanked: [],
+    },
+    turnContext: {
+      sessionId: resolveShadowEmilySessionKey(wrongParams),
+      businessId: BUSINESS_ID,
+      chatKey: playwrightChatKey,
+      participantKey: wrongParams.participantKey,
+      schemaVersion: 1,
+      memorySnapshot: wrongLoaded ?? {},
+    },
+    message: "jii",
+  });
+  assert.notEqual(wfWrong.reason, "availability_assist_follow_up_pending");
+  assert.equal(wfWrong.workflowType, "unknown_clarification");
 });
