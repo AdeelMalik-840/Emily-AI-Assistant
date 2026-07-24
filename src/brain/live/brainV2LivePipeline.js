@@ -21,6 +21,7 @@ import {
   isOnboardingStyleClarificationReply,
   shouldSuppressPostConfirmOnboardingClarification,
 } from "./shouldSuppressPostConfirmOnboardingClarification.js";
+import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -235,6 +236,31 @@ export async function runBrainV2LivePipeline(params) {
     }
 
     if (!result.actionPlan?.replyDraft && !result.actionPlan?.actions?.length) {
+      const freshAssist = readFreshLastAvailabilityAssist(
+        resolvedBusinessTurnContext?.lastAvailabilityAssist ??
+          brainTurnContext?.memorySnapshot?.lastAvailabilityAssist ??
+          params.memorySnapshot?.lastAvailabilityAssist
+      );
+      // Active availability-assist context: never map empty plan → onboarding clarify.
+      if (freshAssist) {
+        const emilySessionKey = String(
+          turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
+        ).trim();
+        applyInfoLiveSessionMemoryPatch({
+          sessionKey: emilySessionKey,
+          actionPlan: {
+            persistenceIntent: {
+              clearLastAvailabilityAssist: true,
+              execute: false,
+            },
+          },
+          authoritativeItem: turnContextInput.authoritativeItem,
+        });
+        return buildSilentPipelineResult({
+          traceId,
+          reason: "ASSIST_CONTEXT_NO_REPLY",
+        });
+      }
       return buildClarificationResult({
         params,
         turnContextInput,
@@ -243,6 +269,22 @@ export async function runBrainV2LivePipeline(params) {
         reason: "EMPTY_ACTION_PLAN",
         reply: SAFE_CLARIFICATION,
         workflowType,
+      });
+    }
+
+    // Explicit assist no-reply (NO_OP) — handled silence, never outbound / clarify.
+    if (isAvailabilityAssistContextNoReplyPlan(result.actionPlan)) {
+      const emilySessionKey = String(
+        turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
+      ).trim();
+      applyInfoLiveSessionMemoryPatch({
+        sessionKey: emilySessionKey,
+        actionPlan: result.actionPlan,
+        authoritativeItem: turnContextInput.authoritativeItem,
+      });
+      return buildSilentPipelineResult({
+        traceId,
+        reason: "ASSIST_CONTEXT_NO_REPLY",
       });
     }
 
@@ -485,6 +527,26 @@ async function buildClarificationResult(p) {
     bookingCreated: null,
     reason: p.reason,
   });
+}
+
+/**
+ * @param {import("../contracts/action.js").ActionPlan | null | undefined} actionPlan
+ */
+function isAvailabilityAssistContextNoReplyPlan(actionPlan) {
+  const plan = actionPlan && typeof actionPlan === "object" ? actionPlan : null;
+  if (!plan) return false;
+  const reply = String(plan.replyDraft ?? "").trim();
+  if (reply) return false;
+  const actions = Array.isArray(plan.actions) ? plan.actions : [];
+  if (actions.some((a) => String(a?.type ?? "") === "REPLY" && String(a?.payload?.text ?? "").trim())) {
+    return false;
+  }
+  return actions.some(
+    (a) =>
+      String(a?.type ?? "") === "NO_OP" &&
+      a?.payload?.intentionallySilent === true &&
+      String(a?.payload?.source ?? "") === "availability_assist_context_no_reply"
+  );
 }
 
 /**

@@ -492,6 +492,42 @@ function buildUnavailableOfferActionPlan(p) {
 }
 
 /**
+ * Explicit assist-context no-reply — never an empty plan (live must not
+ * map empty → onboarding SAFE_CLARIFICATION while assist is active).
+ *
+ * @param {{
+ *   reason?: string,
+ *   clearAssist?: boolean,
+ * }} [p]
+ * @returns {ActionPlan}
+ */
+function buildAssistContextNoReplyActionPlan(p = {}) {
+  const reason =
+    String(p.reason ?? "availability_assist_no_reply").trim() ||
+    "availability_assist_no_reply";
+  const clearAssist = p.clearAssist !== false;
+  return Object.freeze({
+    planId: randomUUID(),
+    replyDraft: "",
+    actions: Object.freeze([
+      Object.freeze({
+        type: "NO_OP",
+        payload: Object.freeze({
+          intentionallySilent: true,
+          reason,
+          source: "availability_assist_context_no_reply",
+          execute: false,
+        }),
+      }),
+    ]),
+    persistenceIntent: Object.freeze({
+      clearLastAvailabilityAssist: clearAssist,
+      execute: false,
+    }),
+  });
+}
+
+/**
  * @param {{
  *   alternatives: Array<{ itemId: string, itemLabel: string }>,
  *   assist: Record<string, unknown>,
@@ -570,14 +606,12 @@ export function buildAvailabilityInquiryActionPlan({
     assist &&
     (followUp.decision === "unrelated_message" || followUp.decision === "unclear")
   ) {
-    return Object.freeze({
-      planId: randomUUID(),
-      replyDraft: undefined,
-      actions: Object.freeze([]),
-      persistenceIntent: Object.freeze({
-        clearLastAvailabilityAssist: followUp.shouldClearAssist !== false,
-        execute: false,
-      }),
+    return buildAssistContextNoReplyActionPlan({
+      reason:
+        followUp.decision === "unrelated_message"
+          ? "availability_assist_unrelated"
+          : "availability_assist_unclear",
+      clearAssist: followUp.shouldClearAssist !== false,
     });
   }
 
