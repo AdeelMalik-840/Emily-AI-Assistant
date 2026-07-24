@@ -305,7 +305,8 @@ export function extractPhoneFromContactInfoPanelSnapshot(
     return buildResult({
       ok: false,
       status: "failed",
-      errorCode: "CONTACT_PANEL_NOT_CONFIRMED",
+      // PANEL_NOT_OPENED is preferred; CONTACT_PANEL_NOT_CONFIRMED kept as legacy alias in soft-retry lists.
+      errorCode: "PANEL_NOT_OPENED",
       source,
       candidates: [],
     });
@@ -359,7 +360,9 @@ export function extractPhoneFromContactInfoPanelSnapshot(
       errorCode:
         diagnosticOnlyPhones.length > 0
           ? "CONTACT_PHONE_ROW_NOT_FOUND"
-          : "NO_PHONE_EXTRACTED",
+          : panelDetected
+            ? "PANEL_OPENED_NO_PHONE_VISIBLE"
+            : "NO_PHONE_EXTRACTED",
       source,
       candidates: [],
       detectedSource,
@@ -404,10 +407,14 @@ export function extractPhoneFromContactInfoPanelSnapshot(
     const anyValid = rawCandidates.some((r) => normalizeCustomerPhoneDigits(r));
     const resolvedError =
       errorCode === "NO_VALID_PHONE" && anyRaw && !anyValid
-        ? "INVALID_PHONE"
+        ? "PHONE_NORMALIZATION_FAILED"
         : errorCode === "NO_VALID_PHONE"
-          ? "NO_PHONE_EXTRACTED"
-          : errorCode;
+          ? panelDetected
+            ? "PANEL_OPENED_NO_PHONE_VISIBLE"
+            : "NO_PHONE_EXTRACTED"
+          : errorCode === "INVALID_PHONE"
+            ? "PHONE_NORMALIZATION_FAILED"
+            : errorCode;
 
     /** @type {ReturnType<typeof buildAmbiguousCandidatesDiagnostic> | null} */
     let ambiguousDiagnostic = null;
@@ -697,13 +704,13 @@ export async function isContactInfoPanelOpen(page, opts = {}) {
     }
     return {
       open: false,
-      reason: "CONTACT_PANEL_NOT_CONFIRMED",
+      reason: "PANEL_NOT_OPENED",
       snapshot: snapshot || null,
     };
   } catch {
     return {
       open: false,
-      reason: "CONTACT_PANEL_NOT_CONFIRMED",
+      reason: "PANEL_NOT_OPENED",
       snapshot: null,
     };
   }
@@ -727,7 +734,7 @@ export async function waitForContactInfoPanelOpen(page, opts = {}) {
   const isOpenFn = opts.isOpenFn || isContactInfoPanelOpen;
   let last = {
     open: false,
-    reason: "CONTACT_PANEL_NOT_CONFIRMED",
+    reason: "PANEL_NOT_OPENED",
     snapshot: /** @type {ContactInfoPanelSnapshot | null} */ (null),
   };
   for (let i = 0; i < pollAttempts; i += 1) {

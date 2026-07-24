@@ -52,13 +52,13 @@ test("panel text 923365149142 → resolved", () => {
   assert.equal(result.phone, "923365149142");
 });
 
-test("panel text has no phone → failed / NO_PHONE_EXTRACTED", () => {
+test("panel text has no phone → failed / PANEL_OPENED_NO_PHONE_VISIBLE", () => {
   const result = extractPhoneFromContactInfoPanelSnapshot(
     "Contact info\nAdeel\nAbout\nHey there!"
   );
   assert.equal(result.ok, false);
   assert.equal(result.status, "failed");
-  assert.equal(result.errorCode, "NO_PHONE_EXTRACTED");
+  assert.equal(result.errorCode, "PANEL_OPENED_NO_PHONE_VISIBLE");
   assert.equal(result.phone, null);
 });
 
@@ -69,7 +69,9 @@ test("panel text has invalid phone → failed", () => {
   assert.equal(result.ok, false);
   assert.equal(result.status, "failed");
   assert.ok(
-    result.errorCode === "NO_PHONE_EXTRACTED" ||
+    result.errorCode === "PANEL_OPENED_NO_PHONE_VISIBLE" ||
+      result.errorCode === "PHONE_NORMALIZATION_FAILED" ||
+      result.errorCode === "NO_PHONE_EXTRACTED" ||
       result.errorCode === "INVALID_PHONE"
   );
   assert.equal(result.phone, null);
