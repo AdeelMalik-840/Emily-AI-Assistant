@@ -550,24 +550,71 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
 }
 
 /**
+ * Map open-verification failure reasons to clearer taxonomy.
+ * Legacy CONTACT_PANEL_NOT_CONFIRMED remains soft-retryable via alias.
+ * @param {unknown} reason
+ * @returns {string}
+ */
+function normalizePanelOpenFailureReason(reason) {
+  const code = clean(reason);
+  if (!code || code === "CONTACT_PANEL_NOT_CONFIRMED") return "PANEL_NOT_OPENED";
+  if (code === "PANEL_NOT_OPENED") return "PANEL_NOT_OPENED";
+  return code;
+}
+
+/**
+ * Scroll exact source row into a stable viewport (row-scoped only).
+ * @param {{ scrollIntoViewIfNeeded?: Function, evaluate?: Function } | null | undefined} rowLocator
+ */
+async function scrollGroupSourceRowIntoView(rowLocator) {
+  if (!rowLocator) return;
+  if (typeof rowLocator.scrollIntoViewIfNeeded === "function") {
+    await rowLocator.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => null);
+    return;
+  }
+  if (typeof rowLocator.evaluate === "function") {
+    await rowLocator
+      .evaluate((el) => {
+        if (el && typeof el.scrollIntoView === "function") {
+          el.scrollIntoView({ block: "center", inline: "nearest" });
+        }
+      })
+      .catch(() => null);
+  }
+}
+
+/**
  * Click scoped sender controls until Contact Info is verified open.
- * In-row strategies first, then existing cluster fallback if eligible.
+ * Strategy order (row-scoped only):
+ *   1) sender avatar
+ *   2) sender label/name (title, then text)
+ *   3) sender label parent clickable container
+ *   4) hover row, then retry visible sender control
+ * then existing in-row evaluate + cluster fallback.
  * Never opens context menu / Reply Privately. Never page-wide name search.
  * A mechanical click alone is not success — Contact Info must verify open.
+ * Failed opens cleanup (Escape/restore/re-scroll) before the next strategy.
  *
  * @param {import("playwright").Locator | {
  *   locator?: Function,
  *   evaluate?: Function,
  *   click?: Function,
+ *   hover?: Function,
+ *   scrollIntoViewIfNeeded?: Function,
  * }} rowLocator
  * @param {{
  *   participantName?: string | null,
  *   page?: import("playwright").Page | { waitForTimeout?: Function, keyboard?: { press?: Function } } | null,
  *   verifyPanelOpenFn?: Function,
  *   closePanelFn?: typeof closeContactInfoPanel,
+ *   restoreGroupFn?: Function | null,
+ *   reanchorRowFn?: Function | null,
+ *   groupTitle?: string | null,
  *   panelPollAttempts?: number,
  *   panelPollDelayMs?: number,
  *   requirePanelVerification?: boolean,
+ *   refocusFn?: Function,
+ *   ensureChatViewFn?: Function,
  * }} [opts]
  * @returns {Promise<{
  *   ok: boolean,
@@ -581,6 +628,7 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
  *   lastSenderClickTarget?: string | null,
  *   lastPanelDetectionReason?: string | null,
  *   openAttemptCount?: number,
+ *   cleanupBetweenStrategiesCount?: number,
  * }>}
  */
 export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {}) {
@@ -591,12 +639,26 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
       panelVerified: false,
       strategiesTried: [],
       openAttemptCount: 0,
+      cleanupBetweenStrategiesCount: 0,
     };
   }
 
   const participantName = clean(opts.participantName);
   const page = opts.page ?? null;
+  const groupTitle = clean(opts.groupTitle);
   const closePanelFn = opts.closePanelFn || closeContactInfoPanel;
+  const restoreGroupFn =
+    typeof opts.restoreGroupFn === "function"
+      ? opts.restoreGroupFn
+      : groupTitle
+        ? async (activePage) =>
+            restoreGroupChatAfterContactInfo(activePage, groupTitle, {
+              refocusFn: opts.refocusFn,
+              ensureChatViewFn: opts.ensureChatViewFn,
+            })
+        : null;
+  const reanchorRowFn =
+    typeof opts.reanchorRowFn === "function" ? opts.reanchorRowFn : null;
   const requirePanelVerification =
     opts.requirePanelVerification === true ||
     opts.requirePanelVerification === false
@@ -630,6 +692,7 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
       panelVerified: false,
       strategiesTried: [],
       openAttemptCount: 0,
+      cleanupBetweenStrategiesCount: 0,
     };
   }
 
@@ -639,6 +702,23 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
   let lastPanelDetectionReason = null;
   let lastClusterCandidateCount = null;
   let lastClusterRejectedReason = null;
+  let cleanupBetweenStrategiesCount = 0;
+
+  const cleanupAfterFailedOpen = async () => {
+    cleanupBetweenStrategiesCount += 1;
+    if (page && typeof closePanelFn === "function") {
+      await closePanelFn(page).catch?.(() => null);
+    }
+    if (typeof restoreGroupFn === "function" && page) {
+      await restoreGroupFn(page).catch?.(() => null);
+    } else if (page && typeof closePanelFn === "function") {
+      await closePanelFn(page).catch?.(() => null);
+    }
+    await scrollGroupSourceRowIntoView(rowLocator);
+    if (typeof reanchorRowFn === "function") {
+      await reanchorRowFn({ page, rowLocator }).catch?.(() => null);
+    }
+  };
 
   /**
    * @param {string} target
@@ -660,11 +740,12 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
         lastSenderClickTarget: name,
         lastPanelDetectionReason: null,
         openAttemptCount: strategiesTried.length,
+        cleanupBetweenStrategiesCount,
       };
     }
     const verified = await verifyPanelOpenFn(page);
-    lastPanelDetectionReason = clean(verified?.reason) || "CONTACT_PANEL_NOT_CONFIRMED";
     if (verified?.open === true) {
+      lastPanelDetectionReason = clean(verified?.reason) || "panel_detected";
       return {
         ok: true,
         target: name,
@@ -676,49 +757,23 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
         lastSenderClickTarget: name,
         lastPanelDetectionReason,
         openAttemptCount: strategiesTried.length,
+        cleanupBetweenStrategiesCount,
       };
     }
-    if (page && typeof closePanelFn === "function") {
-      await closePanelFn(page).catch?.(() => null);
-    }
+    lastPanelDetectionReason = normalizePanelOpenFailureReason(verified?.reason);
+    await cleanupAfterFailedOpen();
     return null;
   };
 
-  /** @type {Array<{ name: string, locator: unknown }>} */
-  const attempts = [];
-
-  if (typeof rowLocator.locator === "function") {
-    if (participantName) {
-      attempts.push({
-        name: "sender_label_title",
-        locator: rowLocator.locator(`span[title="${cssEscape(participantName)}"]`).first(),
-      });
-      attempts.push({
-        name: "sender_label_text",
-        locator: rowLocator.locator(`span[dir="auto"]`).filter({ hasText: participantName }).first(),
-      });
-    }
-    attempts.push({
-      name: "sender_phone_label",
-      locator: rowLocator
-        .locator("span[dir='auto'], span[title], a")
-        .filter({ hasText: /^\+?\d[\d\s().-]{7,}\d$/ })
-        .first(),
-    });
-    attempts.push({
-      name: "sender_role_button",
-      locator: rowLocator.locator('[role="button"]').first(),
-    });
-    attempts.push({
-      name: "sender_avatar",
-      locator: rowLocator.locator('img, [data-testid*="avatar"], [data-testid*="default-user"]').first(),
-    });
-  }
-
-  for (const attempt of attempts) {
-    const loc = /** @type {{ count?: Function, click?: Function }} */ (attempt.locator);
+  /**
+   * @param {string} name
+   * @param {{ count?: Function, click?: Function, evaluate?: Function } | null | undefined} loc
+   * @param {{ allowBody?: boolean }} [locOpts]
+   */
+  const tryLocatorClick = async (name, loc, locOpts = {}) => {
+    if (!loc) return null;
     const count = typeof loc.count === "function" ? await loc.count().catch(() => 0) : 0;
-    if (!count) continue;
+    if (!count) return null;
     const isBody = await loc
       .evaluate?.((el) => {
         const cls = String(el?.className || "");
@@ -728,10 +783,120 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
         );
       })
       .catch?.(() => false);
-    if (isBody === true && attempt.name !== "sender_phone_label") continue;
+    if (isBody === true && locOpts.allowBody !== true) return null;
     await loc.click?.({ timeout: 1500 }).catch(() => null);
-    const accepted = await acceptAfterClick(attempt.name, { clusterFallbackUsed: false });
+    return acceptAfterClick(name, { clusterFallbackUsed: false });
+  };
+
+  // 1) Avatar inside exact row
+  if (typeof rowLocator.locator === "function") {
+    const avatarLoc = rowLocator
+      .locator('img, [data-testid*="avatar"], [data-testid*="default-user"]')
+      .first();
+    const accepted = await tryLocatorClick("sender_avatar", avatarLoc);
     if (accepted) return accepted;
+  }
+
+  // 2) Sender label/name inside exact row
+  if (typeof rowLocator.locator === "function" && participantName) {
+    const titleLoc = rowLocator
+      .locator(`span[title="${cssEscape(participantName)}"]`)
+      .first();
+    const acceptedTitle = await tryLocatorClick("sender_label_title", titleLoc);
+    if (acceptedTitle) return acceptedTitle;
+
+    const textLoc = rowLocator
+      .locator(`span[dir="auto"]`)
+      .filter({ hasText: participantName })
+      .first();
+    const acceptedText = await tryLocatorClick("sender_label_text", textLoc);
+    if (acceptedText) return acceptedText;
+  }
+
+  // 3) Sender label parent clickable container (still row-scoped evaluate)
+  if (typeof rowLocator.evaluate === "function" && participantName) {
+    const parentClicked = await rowLocator
+      .evaluate((root, expected) => {
+        /* __IN_ROW_SENDER_LABEL_PARENT__ */
+        const cleanLocal = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+        const expectedName = cleanLocal(expected).toLowerCase();
+        if (!expectedName) return null;
+        const isBody = (el) =>
+          Boolean(
+            el?.closest?.(
+              "span.selectable-text, .selectable-text.copyable-text, div.copyable-text span"
+            )
+          );
+        const labels = Array.from(
+          root.querySelectorAll('span[title], span[dir="auto"]')
+        );
+        for (const el of labels) {
+          if (!(el instanceof Element) || isBody(el)) continue;
+          const title = cleanLocal(el.getAttribute?.("title") || "").toLowerCase();
+          const text = cleanLocal(el.textContent || "").toLowerCase();
+          if (title !== expectedName && text !== expectedName) continue;
+          const parent =
+            el.closest?.('[role="button"]') ||
+            el.closest?.("button") ||
+            el.parentElement;
+          if (!parent || !(parent instanceof Element) || typeof parent.click !== "function") {
+            continue;
+          }
+          if (isBody(parent)) continue;
+          parent.click();
+          return "sender_label_parent";
+        }
+        return null;
+      }, participantName)
+      .catch(() => null);
+    if (parentClicked) {
+      const accepted = await acceptAfterClick(String(parentClicked), {
+        clusterFallbackUsed: false,
+      });
+      if (accepted) return accepted;
+    }
+  }
+
+  // 4) Hover exact row, then retry visible sender controls (avatar / label)
+  if (typeof rowLocator.hover === "function" || typeof rowLocator.locator === "function") {
+    if (typeof rowLocator.hover === "function") {
+      await rowLocator.hover({ timeout: 1500 }).catch(() => null);
+    } else if (typeof rowLocator.evaluate === "function") {
+      await rowLocator
+        .evaluate((el) => {
+          if (el && typeof el.dispatchEvent === "function") {
+            el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          }
+        })
+        .catch(() => null);
+    }
+
+    if (typeof rowLocator.locator === "function") {
+      const hoverAvatar = await tryLocatorClick(
+        "sender_hover_avatar",
+        rowLocator
+          .locator('img, [data-testid*="avatar"], [data-testid*="default-user"]')
+          .first()
+      );
+      if (hoverAvatar) return hoverAvatar;
+
+      if (participantName) {
+        const hoverTitle = await tryLocatorClick(
+          "sender_hover_label_title",
+          rowLocator.locator(`span[title="${cssEscape(participantName)}"]`).first()
+        );
+        if (hoverTitle) return hoverTitle;
+
+        const hoverText = await tryLocatorClick(
+          "sender_hover_label_text",
+          rowLocator
+            .locator(`span[dir="auto"]`)
+            .filter({ hasText: participantName })
+            .first()
+        );
+        if (hoverText) return hoverText;
+      }
+    }
   }
 
   // Last resort in-row: evaluate click on best in-row sender control (still scoped to row).
@@ -821,23 +986,30 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
       lastSenderClickTarget,
       lastPanelDetectionReason,
       openAttemptCount: strategiesTried.length,
+      cleanupBetweenStrategiesCount,
     };
   }
 
   const noStrategyClicked = strategiesTried.length === 0 && cluster.ok !== true;
+  const openError = noStrategyClicked
+    ? clean(cluster.errorCode) === "SENDER_CONTROL_NOT_FOUND" || !clean(cluster.errorCode)
+      ? "SENDER_TARGET_NOT_FOUND"
+      : clean(cluster.errorCode) || "SENDER_TARGET_NOT_FOUND"
+    : "PANEL_NOT_OPENED";
   return {
     ok: false,
-    errorCode: noStrategyClicked
-      ? clean(cluster.errorCode) || "SENDER_CONTROL_NOT_FOUND"
-      : "CONTACT_PANEL_NOT_CONFIRMED",
+    errorCode: openError,
+    /** Legacy alias for soft-retry / older diagnostics consumers. */
+    legacyErrorCode: noStrategyClicked ? null : "CONTACT_PANEL_NOT_CONFIRMED",
     clusterFallbackUsed: true,
     clusterCandidateCount: lastClusterCandidateCount,
     clusterRejectedReason: lastClusterRejectedReason,
     panelVerified: false,
     strategiesTried: [...strategiesTried],
     lastSenderClickTarget,
-    lastPanelDetectionReason: lastPanelDetectionReason || "CONTACT_PANEL_NOT_CONFIRMED",
+    lastPanelDetectionReason: lastPanelDetectionReason || "PANEL_NOT_OPENED",
     openAttemptCount: strategiesTried.length,
+    cleanupBetweenStrategiesCount,
   };
 }
 
@@ -1046,6 +1218,17 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
       participantName: source.participantName,
       page,
       requirePanelVerification: true,
+      groupTitle: source.sourceChatId,
+      refocusFn,
+      ensureChatViewFn,
+      restoreGroupFn: async (activePage) =>
+        restoreGroupChatAfterContactInfo(activePage, source.sourceChatId, {
+          refocusFn,
+          ensureChatViewFn,
+        }),
+      reanchorRowFn: async () => {
+        await scrollGroupSourceRowIntoView(located.locator);
+      },
     });
     clusterFallbackUsed = clickResult?.clusterFallbackUsed === true;
     clusterCandidateCount =
@@ -1067,10 +1250,17 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
         ? strategiesTried.length || null
         : Number(clickResult.openAttemptCount);
     if (!clickResult?.ok) {
+      const clickError = clean(clickResult?.errorCode) || "SENDER_CLICK_FAILED";
+      const mappedClickError =
+        clickError === "CONTACT_PANEL_NOT_CONFIRMED"
+          ? "PANEL_NOT_OPENED"
+          : clickError === "SENDER_CONTROL_NOT_FOUND"
+            ? "SENDER_TARGET_NOT_FOUND"
+            : clickError;
       result = finish({
         ok: false,
         status: "failed",
-        errorCode: clickResult?.errorCode || "SENDER_CLICK_FAILED",
+        errorCode: mappedClickError,
         panelVerified: false,
       });
       return result;
@@ -1091,10 +1281,13 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
 
     if (phoneResult?.ok === true) {
       panelVerified = true;
-    } else if (phoneResult?.errorCode === "CONTACT_PANEL_NOT_CONFIRMED") {
+    } else if (
+      phoneResult?.errorCode === "CONTACT_PANEL_NOT_CONFIRMED" ||
+      phoneResult?.errorCode === "PANEL_NOT_OPENED"
+    ) {
       panelVerified = false;
       if (!lastPanelDetectionReason) {
-        lastPanelDetectionReason = "CONTACT_PANEL_NOT_CONFIRMED";
+        lastPanelDetectionReason = "PANEL_NOT_OPENED";
       }
     }
 
@@ -1122,10 +1315,19 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
     }
 
     if (!phoneResult?.ok) {
+      const rawPhoneError = clean(phoneResult?.errorCode) || "NO_PHONE_EXTRACTED";
+      const mappedPhoneError =
+        rawPhoneError === "CONTACT_PANEL_NOT_CONFIRMED"
+          ? "PANEL_NOT_OPENED"
+          : rawPhoneError === "NO_PHONE_EXTRACTED" && panelVerified
+            ? "PANEL_OPENED_NO_PHONE_VISIBLE"
+            : rawPhoneError === "INVALID_PHONE"
+              ? "PHONE_NORMALIZATION_FAILED"
+              : rawPhoneError;
       result = finish({
         ok: false,
         status: "failed",
-        errorCode: phoneResult?.errorCode || "NO_PHONE_EXTRACTED",
+        errorCode: mappedPhoneError,
         candidates: phoneResult?.candidates || [],
         panelVerified,
       });
