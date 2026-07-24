@@ -1,8 +1,19 @@
 import db from "../config/firebase.js";
-import { isEmilyBrainV2AvailabilityConfirmExecuteEnabled } from "../brain/config/liveFeatureFlags.js";
+import {
+  isEmilyBrainV2AvailabilityConfirmExecuteEnabled,
+  isEmilyWaitingConfirmDmBrainEnabled,
+} from "../brain/config/liveFeatureFlags.js";
+import { decideCustomerTurn } from "../brain/decisions/decideCustomerTurn.js";
+import {
+  evaluateWaitingConfirmDmBrainConfirmGuard,
+  packWaitingConfirmDmTurnContext,
+  resolveWaitingConfirmDmOutboundPromptType,
+} from "../brain/decisions/waitingConfirmDmLane.js";
 import {
   AVAILABILITY_DM_PROMPT_TYPES,
   buildAvailabilityAskConfirmPrompt,
+  buildAvailabilityChangeCarReply,
+  buildAvailabilityDeclineAckReply,
   buildAvailabilityGenericAckPromptReply,
   buildAvailabilityPriceAnswerWithConfirmPrompt,
   buildAvailabilityScopedQuestionReply,
@@ -345,6 +356,7 @@ async function sendPlaywrightCustomerDmReply({
  *   messageId?: string | null,
  *   sendCredentials?: Record<string, unknown> | null,
  *   availabilityConfirmExecute?: boolean,
+ *   brainAuthorizedConfirm?: boolean,
  * }} params
  */
 export async function executeAvailabilityCustomerConfirmBooking({
@@ -355,6 +367,7 @@ export async function executeAvailabilityCustomerConfirmBooking({
   messageId = null,
   sendCredentials = null,
   availabilityConfirmExecute = isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
+  brainAuthorizedConfirm = false,
 }) {
   const uid = clean(businessId);
   const requestId = clean(request?.requestId ?? request?.id);
@@ -389,24 +402,27 @@ export async function executeAvailabilityCustomerConfirmBooking({
     };
   }
 
-  const decision = resolveAvailabilityConfirmationTurn({
-    request,
-    messageText,
-  });
-  if (!decision.ok || decision.actionType !== "confirm_booking") {
-    const failure = await persistCustomerConfirmBookingFailure({
-      db: connection,
-      businessId: uid,
-      requestId,
-      reason: decision.reason || "BRAIN_CONFIRM_ACTION_NOT_ALLOWED",
+  // Brain may authorize confirm meaning; executor still re-checks only when not Brain-authorized.
+  if (brainAuthorizedConfirm !== true) {
+    const decision = resolveAvailabilityConfirmationTurn({
+      request,
+      messageText,
     });
-    return {
-      ok: false,
-      reason: failure.reason,
-      decision,
-      failureStage: failure.failureStage,
-      failureDetails: failure.failureDetails,
-    };
+    if (!decision.ok || decision.actionType !== "confirm_booking") {
+      const failure = await persistCustomerConfirmBookingFailure({
+        db: connection,
+        businessId: uid,
+        requestId,
+        reason: decision.reason || "BRAIN_CONFIRM_ACTION_NOT_ALLOWED",
+      });
+      return {
+        ok: false,
+        reason: failure.reason,
+        decision,
+        failureStage: failure.failureStage,
+        failureDetails: failure.failureDetails,
+      };
+    }
   }
 
   const claim = await claimAvailabilityRequestCustomerConfirmProcessing({
@@ -692,18 +708,6 @@ export async function handleAvailabilityCustomerPlaywrightInbound({
   return { handled: true, action: replyAction, reply: sentReply, decision };
 }
 
-/**
- * @param {{
- *   db?: unknown,
- *   businessId: string,
- *   customerPhone: string,
- *   messageText: string,
- *   messageId?: string | null,
- *   sendCredentials?: Record<string, unknown> | null,
- *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
- *   availabilityConfirmExecute?: boolean,
- * }} params
- */
 async function recordCloudInboundIdempotency({
   connection,
   businessId,
@@ -726,15 +730,215 @@ async function recordCloudInboundIdempotency({
   }).catch(() => null);
 }
 
+function waitingConfirmBrainMeta(extra = {}) {
+  return { waitingConfirmDmBrain: true, pamissCreated: false, ownerNotified: false, ...extra };
+}
+
+/** Flag-ON: Brain meaning → existing confirm/decline/reply executors. No pamiss/owner notify. */
+async function handleWaitingConfirmDmBrainCloudTurn({
+  connection,
+  businessId,
+  phone,
+  text,
+  inboundMessageId,
+  conversationHistory,
+  request,
+  requestId,
+  sendCredentials,
+  sendWhatsAppMessageFn,
+  availabilityConfirmExecute,
+  decideCustomerTurnFn,
+}) {
+  const catalogRow = await loadCatalogRowForRequest(businessId, request);
+  const turnContext = packWaitingConfirmDmTurnContext({
+    businessId,
+    customerPhone: phone,
+    messageText: text,
+    messageId: inboundMessageId,
+    conversationHistory,
+    request,
+    catalogRow,
+  });
+  const decision = (await decideCustomerTurnFn(turnContext))?.decision || {};
+  const action = clean(decision.action, 40) || "reply";
+
+  const finish = async (payload, replyText = null, promptType = null) => {
+    let reply = replyText;
+    if (reply != null) {
+      const recordedPromptType =
+        promptType ||
+        resolveWaitingConfirmDmOutboundPromptType(
+          decision,
+          AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
+        );
+      reply = await sendCustomerDmReply({
+        phone,
+        reply,
+        sendWhatsAppMessageFn,
+        sendCredentials,
+        connection,
+        businessId,
+        requestId,
+        promptType: recordedPromptType,
+      });
+    }
+    await recordCloudInboundIdempotency({
+      connection,
+      businessId,
+      requestId,
+      messageId: inboundMessageId,
+      messageText: text,
+    });
+    return waitingConfirmBrainMeta({
+      handled: true,
+      decision,
+      requestId,
+      reply,
+      turnContext,
+      ...payload,
+    });
+  };
+
+  if (action === "confirm_booking") {
+    const confirmGuard = evaluateWaitingConfirmDmBrainConfirmGuard({
+      decision,
+      turnContext,
+    });
+    if (!confirmGuard.ok) {
+      // Soft fail: no booking / decline / AVR mutate / pamiss / owner notify.
+      // Do not re-activate booking prompt unless Brain explicitly asked to confirm.
+      return finish(
+        {
+          action: "clarify",
+          confirmGuardFailed: true,
+          confirmGuardReasons: confirmGuard.reasons,
+        },
+        clean(decision.customerReply) ||
+          "Book confirm karna hai? Bata dein.",
+        resolveWaitingConfirmDmOutboundPromptType(
+          decision,
+          AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
+        )
+      );
+    }
+
+    const result = await executeAvailabilityCustomerConfirmBooking({
+      db: connection,
+      businessId,
+      request,
+      messageText: text,
+      messageId: inboundMessageId,
+      sendCredentials,
+      availabilityConfirmExecute,
+      brainAuthorizedConfirm: true,
+    });
+    const reply =
+      result.ok === true
+        ? result.reply || buildAvailabilityConfirmSuccessReply()
+        : clean(decision.customerReply) ||
+          buildAvailabilityConfirmClarificationReply();
+    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
+      recipientType: "individual",
+    }).catch(() => null);
+    if (result.ok === true) {
+      await recordAvailabilityCustomerDmOutbound({
+        db: connection,
+        businessId,
+        requestId,
+        reply,
+        promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
+      }).catch(() => null);
+    }
+    await recordCloudInboundIdempotency({
+      connection,
+      businessId,
+      requestId,
+      messageId: inboundMessageId,
+      messageText: text,
+    });
+    return waitingConfirmBrainMeta({
+      handled: true,
+      action: result.ok ? "confirmed_booking" : "confirm_failed",
+      reply,
+      result,
+      decision,
+      requestId,
+      actionType: "confirm_booking",
+      failureReason: result.ok === true ? null : result.reason ?? null,
+      failureStage: result.ok === true ? null : result.failureStage ?? null,
+    });
+  }
+
+  if (action === "decline_request") {
+    await updateAvailabilityRequestCustomerConfirmationState({
+      db: connection,
+      businessId,
+      requestId,
+      customerConfirmationStatus: "declined",
+      extra: {
+        customerConfirmationAt: new Date(),
+        customerConfirmationMessageId: inboundMessageId || null,
+        customerConfirmationTextPreview: text.slice(0, 160),
+      },
+    });
+    return finish(
+      { action: "declined" },
+      clean(decision.customerReply) || buildAvailabilityDeclineAckReply(),
+      AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
+    );
+  }
+
+  if (action === "silence" || action === "none") {
+    return finish({ action: "silence" });
+  }
+
+  return finish(
+    {
+      action:
+        action === "change_request"
+          ? "change_request"
+          : action === "clarify"
+            ? "clarify"
+            : "reply",
+    },
+    clean(decision.customerReply) ||
+      (action === "change_request"
+        ? buildAvailabilityChangeCarReply()
+        : buildAvailabilityGenericAckPromptReply()),
+    resolveWaitingConfirmDmOutboundPromptType(
+      decision,
+      AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
+    )
+  );
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ *   messageText: string,
+ *   messageId?: string | null,
+ *   conversationHistory?: string | null,
+ *   sendCredentials?: Record<string, unknown> | null,
+ *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
+ *   availabilityConfirmExecute?: boolean,
+ *   __waitingConfirmDmBrainEnabled?: boolean,
+ *   __decideCustomerTurnForTests?: Function | null,
+ * }} params
+ */
 export async function handleAvailabilityCustomerCloudInbound({
   db: connection,
   businessId,
   customerPhone,
   messageText,
   messageId = null,
+  conversationHistory = null,
   sendCredentials = null,
   sendWhatsAppMessageFn = sendWhatsAppMessage,
   availabilityConfirmExecute = isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
+  __waitingConfirmDmBrainEnabled = null,
+  __decideCustomerTurnForTests = null,
 }) {
   const uid = clean(businessId);
   const phone = normalizePhone(customerPhone);
@@ -810,6 +1014,32 @@ export async function handleAvailabilityCustomerCloudInbound({
       requestId,
       duplicate: true,
     };
+  }
+
+  const waitingConfirmDmBrainOn =
+    __waitingConfirmDmBrainEnabled === true ||
+    (__waitingConfirmDmBrainEnabled !== false &&
+      isEmilyWaitingConfirmDmBrainEnabled());
+
+  if (waitingConfirmDmBrainOn) {
+    const decideFn =
+      typeof __decideCustomerTurnForTests === "function"
+        ? __decideCustomerTurnForTests
+        : decideCustomerTurn;
+    return handleWaitingConfirmDmBrainCloudTurn({
+      connection,
+      businessId: uid,
+      phone,
+      text,
+      inboundMessageId,
+      conversationHistory,
+      request,
+      requestId,
+      sendCredentials,
+      sendWhatsAppMessageFn,
+      availabilityConfirmExecute,
+      decideCustomerTurnFn: decideFn,
+    });
   }
 
   const decision = resolveAvailabilityConfirmationTurn({ request, messageText: text });
