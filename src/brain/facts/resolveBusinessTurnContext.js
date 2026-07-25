@@ -22,6 +22,9 @@ import { isConfidentInventoryUnavailable } from "./resolveItemBookingAwareAvaila
 import { findVerifiedAvailabilityAlternatives } from "../../services/availabilityRejectionAlternatives.js";
 import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
 import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCompletionsCreate.js";
+import { isAvailabilityDurationPendingAction } from "../availability/availabilityPendingActions.js";
+import { decideEmilyPendingFollowUp } from "../availability/decideEmilyPendingFollowUp.js";
+import { readEmilyPendingFromMemory } from "../availability/emilyPendingContext.js";
 
 /**
  * @param {unknown} message
@@ -127,6 +130,7 @@ function buildContextToPersist(p) {
  *   signals: Record<string, unknown>,
  *   itemFacts: Record<string, unknown>,
  *   participantFacts: Record<string, unknown>,
+ *   memoryPendingAction?: unknown,
  * }} p
  */
 function resolveBusinessDecision(p) {
@@ -152,6 +156,7 @@ function resolveBusinessDecision(p) {
   if (weakContextSignals.length > 0) secondaryIntents.push("context_capture");
   if (signals.availabilityAsk && signals.priceAsk) secondaryIntents.push("availability_context");
   if (durationDays != null) secondaryIntents.push("duration_context");
+  const availabilityDurationPending = isAvailabilityDurationPendingAction(p.memoryPendingAction);
 
   let primaryIntent = "unknown";
   let workflowType = "unknown_clarification";
@@ -190,6 +195,20 @@ function resolveBusinessDecision(p) {
     replyType = "availability_answer";
     confidence = "high";
     reason = "explicit_availability_question";
+  } else if (
+    availabilityDurationPending &&
+    hasResolvedItem &&
+    !signals.priceAsk
+  ) {
+    // Emily asked for duration on availability — keep context on availability (not booking).
+    primaryIntent = "availability_inquiry";
+    workflowType = "availability_inquiry";
+    replyType = "availability_answer";
+    confidence = "high";
+    reason =
+      durationDays != null || weakContextSignals.includes("duration_context")
+        ? "availability_duration_pending_context"
+        : "availability_duration_pending_follow_up_context";
   } else if (
     isWeakNeedOwnerAvailabilityInquiry(p.normalizedMessage, signals, {
       durationDays,
@@ -245,6 +264,14 @@ function resolveBusinessDecision(p) {
     confidence,
     reason,
   });
+}
+
+/**
+ * Test/helper export — same decision core used by resolveBusinessTurnContext.
+ * @param {Parameters<typeof resolveBusinessDecision>[0]} p
+ */
+export function resolveBusinessDecisionForPendingContext(p) {
+  return resolveBusinessDecision(p);
 }
 
 /**
@@ -643,13 +670,59 @@ export async function resolveBusinessTurnContext(params) {
     },
   };
 
+  const memoryPendingAction =
+    memorySnapshot.pendingAction ??
+    readEmilyPendingFromMemory(memorySnapshot) ??
+    null;
+
   resolved.decision = resolveBusinessDecision({
     normalizedMessage,
     understanding,
     signals,
     itemFacts,
     participantFacts,
+    memoryPendingAction,
   });
+
+  resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);
+  resolved.emilyPendingFollowUp = decideEmilyPendingFollowUp({
+    memorySnapshot,
+    participantKey:
+      String(participantFacts?.participant?.key ?? "").trim() ||
+      String(sourceIdentity?.participantKey ?? "").trim() ||
+      null,
+    understanding: {
+      ...(understanding && typeof understanding === "object" ? understanding : {}),
+      durationDays: durationDaysResolved ?? understanding?.durationDays ?? null,
+      resolvedItemId: itemFacts.id,
+      itemSource: understanding?.itemSource ?? null,
+      signals,
+    },
+    signals,
+    customerText: rawMessage,
+    __decisionForTests: params.__emilyPendingFollowUpDecision ?? null,
+  });
+
+  const pendingHint = String(resolved.emilyPendingFollowUp?.workflowHint ?? "")
+    .trim()
+    .slice(0, 80);
+  if (
+    pendingHint &&
+    pendingHint !== "unknown_clarification" &&
+    (resolved.decision.workflowType === "unknown_clarification" ||
+      (resolved.decision.workflowType === "booking_request" &&
+        pendingHint === "availability_inquiry"))
+  ) {
+    resolved.decision = Object.freeze({
+      ...resolved.decision,
+      workflowType: pendingHint,
+      primaryIntent:
+        pendingHint === "availability_inquiry"
+          ? "availability_inquiry"
+          : resolved.decision.primaryIntent,
+      reason: `emily_pending_meaning_${String(resolved.emilyPendingFollowUp?.meaning ?? "hint")}`,
+    });
+  }
 
   if (params.log !== false) {
     logCanonicalFactsResolved(resolved);

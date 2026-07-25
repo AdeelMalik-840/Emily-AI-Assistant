@@ -60,6 +60,26 @@ export function applySessionMemoryFromActionPlan(p) {
     patch.lastAvailabilityAssist = structuredClone(persistence.lastAvailabilityAssist);
   }
 
+  if (persistence?.clearPendingAction === true) {
+    patch.pendingAction = null;
+  } else if (
+    persistence?.setPendingAction === true &&
+    persistence?.pendingAction &&
+    typeof persistence.pendingAction === "object"
+  ) {
+    patch.pendingAction = structuredClone(persistence.pendingAction);
+  }
+
+  if (persistence?.clearEmilyPending === true) {
+    patch.emilyPending = null;
+  } else if (
+    persistence?.rememberEmilyPending === true &&
+    persistence?.emilyPending &&
+    typeof persistence.emilyPending === "object"
+  ) {
+    patch.emilyPending = structuredClone(persistence.emilyPending);
+  }
+
   if (Object.keys(patch).length > 0) {
     patchEmilySessionState(sessionKey, patch);
   }
