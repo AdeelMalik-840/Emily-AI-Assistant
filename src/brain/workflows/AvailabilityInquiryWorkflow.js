@@ -10,6 +10,7 @@ import {
   withAvailabilityAssistPendingQuestion,
 } from "../availability/availabilityAssistContext.js";
 import { resolveAvailabilityAssistFollowUpDecision } from "../availability/decideAvailabilityAssistFollowUp.js";
+import { PENDING_ACTION_COLLECT_AVAILABILITY_DURATION } from "../availability/availabilityPendingActions.js";
 import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
 import { resolveBookingDateWindowFromDuration } from "../facts/resolveBookingDateWindow.js";
 
@@ -431,6 +432,7 @@ function buildOwnerCheckActionPlan(p) {
       durationDays: durationN,
       ownerCheckPlanned: true,
       clearLastAvailabilityAssist: clearAssist === true,
+      clearPendingAction: true,
       execute,
     }),
   });
@@ -736,6 +738,13 @@ export function buildAvailabilityInquiryActionPlan({
         persistenceIntent: Object.freeze({
           rememberResolvedItem: true,
           itemId,
+          setPendingAction: true,
+          pendingAction: Object.freeze({
+            type: PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+            itemId,
+            status: "awaiting",
+            sourceWorkflow: "availability_inquiry",
+          }),
           execute: false,
         }),
       });

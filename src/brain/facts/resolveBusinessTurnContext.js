@@ -22,6 +22,7 @@ import { isConfidentInventoryUnavailable } from "./resolveItemBookingAwareAvaila
 import { findVerifiedAvailabilityAlternatives } from "../../services/availabilityRejectionAlternatives.js";
 import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
 import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCompletionsCreate.js";
+import { isAvailabilityDurationPendingAction } from "../availability/availabilityPendingActions.js";
 
 /**
  * @param {unknown} message
@@ -127,6 +128,7 @@ function buildContextToPersist(p) {
  *   signals: Record<string, unknown>,
  *   itemFacts: Record<string, unknown>,
  *   participantFacts: Record<string, unknown>,
+ *   memoryPendingAction?: unknown,
  * }} p
  */
 function resolveBusinessDecision(p) {
@@ -152,6 +154,7 @@ function resolveBusinessDecision(p) {
   if (weakContextSignals.length > 0) secondaryIntents.push("context_capture");
   if (signals.availabilityAsk && signals.priceAsk) secondaryIntents.push("availability_context");
   if (durationDays != null) secondaryIntents.push("duration_context");
+  const availabilityDurationPending = isAvailabilityDurationPendingAction(p.memoryPendingAction);
 
   let primaryIntent = "unknown";
   let workflowType = "unknown_clarification";
@@ -190,6 +193,20 @@ function resolveBusinessDecision(p) {
     replyType = "availability_answer";
     confidence = "high";
     reason = "explicit_availability_question";
+  } else if (
+    availabilityDurationPending &&
+    hasResolvedItem &&
+    !signals.priceAsk
+  ) {
+    // Emily asked for duration on availability — keep context on availability (not booking).
+    primaryIntent = "availability_inquiry";
+    workflowType = "availability_inquiry";
+    replyType = "availability_answer";
+    confidence = "high";
+    reason =
+      durationDays != null || weakContextSignals.includes("duration_context")
+        ? "availability_duration_pending_context"
+        : "availability_duration_pending_follow_up_context";
   } else if (
     isWeakNeedOwnerAvailabilityInquiry(p.normalizedMessage, signals, {
       durationDays,
@@ -245,6 +262,14 @@ function resolveBusinessDecision(p) {
     confidence,
     reason,
   });
+}
+
+/**
+ * Test/helper export — same decision core used by resolveBusinessTurnContext.
+ * @param {Parameters<typeof resolveBusinessDecision>[0]} p
+ */
+export function resolveBusinessDecisionForPendingContext(p) {
+  return resolveBusinessDecision(p);
 }
 
 /**
@@ -649,6 +674,7 @@ export async function resolveBusinessTurnContext(params) {
     signals,
     itemFacts,
     participantFacts,
+    memoryPendingAction: memorySnapshot.pendingAction ?? null,
   });
 
   if (params.log !== false) {

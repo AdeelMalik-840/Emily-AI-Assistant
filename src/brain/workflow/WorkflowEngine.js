@@ -11,19 +11,26 @@ import {
 } from "./browseIntent.js";
 import { isWeakNeedOwnerAvailabilityInquiry } from "../facts/resolveBusinessTurnContext.js";
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
+import {
+  isAvailabilityDurationPendingAction,
+  PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+} from "../availability/availabilityPendingActions.js";
 
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
 /** @typedef {import("../contracts/workflow.js").WorkflowDecision} WorkflowDecision */
 
 export const PENDING_ACTION_COLLECT_DURATION = "collect_duration";
+export {
+  PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+  isAvailabilityDurationPendingAction,
+};
 
 /**
  * @param {TurnContext} turnContext
- * @returns {boolean}
+ * @returns {Record<string, unknown> | null}
  */
-export function hasOpenCollectDurationPending(turnContext) {
-  if (turnContext?.activeWorkflowType === PENDING_ACTION_COLLECT_DURATION) return true;
+function readMemoryPendingAction(turnContext) {
   const memory =
     turnContext?.memorySnapshot && typeof turnContext.memorySnapshot === "object"
       ? /** @type {Record<string, unknown>} */ (turnContext.memorySnapshot)
@@ -32,7 +39,28 @@ export function hasOpenCollectDurationPending(turnContext) {
     memory?.pendingAction && typeof memory.pendingAction === "object"
       ? /** @type {Record<string, unknown>} */ (memory.pendingAction)
       : null;
+  return pending;
+}
+
+/**
+ * @param {TurnContext} turnContext
+ * @returns {boolean}
+ */
+export function hasOpenCollectDurationPending(turnContext) {
+  if (turnContext?.activeWorkflowType === PENDING_ACTION_COLLECT_DURATION) return true;
+  const pending = readMemoryPendingAction(turnContext);
   return String(pending?.type ?? "").trim() === PENDING_ACTION_COLLECT_DURATION;
+}
+
+/**
+ * @param {TurnContext} turnContext
+ * @returns {boolean}
+ */
+export function hasOpenAvailabilityDurationPending(turnContext) {
+  if (turnContext?.activeWorkflowType === PENDING_ACTION_COLLECT_AVAILABILITY_DURATION) {
+    return true;
+  }
+  return isAvailabilityDurationPendingAction(readMemoryPendingAction(turnContext));
 }
 
 /**
@@ -125,11 +153,17 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
       : null;
   const decisionWorkflowType = String(decision?.workflowType ?? "").trim();
   if (decisionWorkflowType && decisionWorkflowType !== "unknown_clarification") {
-    return {
-      workflowType: decisionWorkflowType,
-      reason: String(decision?.reason ?? "resolved_business_turn_context_decision"),
-      priority: 100,
-    };
+    // Pending availability duration beats a booking decision from weak/signal shortcuts.
+    const bookingBlockedByAvailabilityDuration =
+      decisionWorkflowType === "booking_request" &&
+      hasOpenAvailabilityDurationPending(turnContext);
+    if (!bookingBlockedByAvailabilityDuration) {
+      return {
+        workflowType: decisionWorkflowType,
+        reason: String(decision?.reason ?? "resolved_business_turn_context_decision"),
+        priority: 100,
+      };
+    }
   }
 
   if (isGreeting(normalized)) {
@@ -174,6 +208,27 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
         priority: 78,
       };
     }
+  }
+
+  // Availability asked "kitne din?" — duration / follow-up stays on availability, never auto-book.
+  if (hasOpenAvailabilityDurationPending(turnContext)) {
+    if (isPricingWithDurationInterrupt(understanding)) {
+      return {
+        workflowType: "pricing_with_duration",
+        reason: "explicit_rent_question_interrupts_availability_duration_pending",
+        interruptsPendingWorkflow: true,
+        priority: 100,
+      };
+    }
+    return {
+      workflowType: "availability_inquiry",
+      reason:
+        understanding.durationDays != null
+          ? "availability_duration_pending_continuation"
+          : "availability_duration_pending_follow_up",
+      interruptsPendingWorkflow: false,
+      priority: 88,
+    };
   }
 
   if (hasOpenCollectDurationPending(turnContext)) {
