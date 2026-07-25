@@ -18,6 +18,7 @@ import {
 } from "../availability/emilyPendingContext.js";
 import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
 import { resolveBookingDateWindowFromDuration } from "../facts/resolveBookingDateWindow.js";
+import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -225,6 +226,134 @@ export function buildUnavailableWithAlternativeOfferReply(conversationalLabel, d
   const durationPhrase = formatDurationPhrase(durationDays);
   const windowBit = durationPhrase ? ` ${durationPhrase} ke liye` : "";
   return `${label}${windowBit} abhi available nahi hai. Koi aur option dekhun?`;
+}
+
+/**
+ * Failsafe when AI is unavailable — must respect verified alternatives count.
+ *
+ * @param {string} conversationalLabel
+ * @param {number} durationDays
+ * @param {Array<{ itemId?: string, itemLabel?: string }>} [alternatives]
+ * @returns {string}
+ */
+export function buildUnavailableAvailabilityFailsafeReply(
+  conversationalLabel,
+  durationDays,
+  alternatives = []
+) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  const durationPhrase = formatDurationPhrase(durationDays);
+  const windowBit = durationPhrase ? ` ${durationPhrase} ke liye` : "";
+  const alts = Array.isArray(alternatives) ? alternatives : [];
+  if (alts.length === 0) {
+    return `${label}${windowBit} abhi available nahi hai. Abhi koi aur option available nahi hai.`;
+  }
+  return buildUnavailableWithAlternativeOfferReply(conversationalLabel, durationDays);
+}
+
+/**
+ * @param {string} reply
+ * @param {unknown[]} alternatives
+ * @param {string} failsafe
+ * @returns {string}
+ */
+function validateUnavailableCustomerReply(reply, alternatives, failsafe) {
+  const text = String(reply ?? "").trim();
+  if (!text || text.length > 400) return failsafe;
+  const alts = Array.isArray(alternatives) ? alternatives : [];
+  if (alts.length === 0 && /koi aur option dekhun|other option|aur option/i.test(text)) {
+    return failsafe;
+  }
+  return text;
+}
+
+/**
+ * AI reply from verified unavailable facts (existing workflow file — no new module).
+ * Never invents cars. If alternatives empty, must not offer other options.
+ *
+ * @param {{
+ *   conversationalLabel: string,
+ *   durationDays: number,
+ *   alternatives?: Array<{ itemId?: string, itemLabel?: string }>,
+ *   chatCompletionsCreate?: Function | null,
+ *   __chatCompletionsCreateForTests?: Function | null,
+ *   __replyForTests?: string | null,
+ *   timeoutMs?: number,
+ * }} p
+ * @returns {Promise<string>}
+ */
+export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
+  const label = String(p.conversationalLabel ?? "").trim() || "item";
+  const durationDays = Number(p.durationDays);
+  const durationN =
+    Number.isFinite(durationDays) && durationDays >= 1 ? Math.floor(durationDays) : 1;
+  const alternatives = Array.isArray(p.alternatives) ? p.alternatives : [];
+  const failsafe = buildUnavailableAvailabilityFailsafeReply(label, durationN, alternatives);
+
+  if (typeof p.__replyForTests === "string" && p.__replyForTests.trim()) {
+    return validateUnavailableCustomerReply(p.__replyForTests.trim(), alternatives, failsafe);
+  }
+
+  const create =
+    typeof p.__chatCompletionsCreateForTests === "function"
+      ? p.__chatCompletionsCreateForTests
+      : typeof p.chatCompletionsCreate === "function"
+        ? p.chatCompletionsCreate
+        : null;
+  if (!create) return failsafe;
+
+  const altLabels = alternatives
+    .map((row) => String(row?.itemLabel ?? "").trim())
+    .filter(Boolean)
+    .slice(0, 5);
+
+  const system = `Emily Brain V2 — WhatsApp availability reply.
+Write ONE short customer reply from VERIFIED FACTS only.
+Do not invent cars, prices, or availability.
+If verifiedAlternatives is empty, you MUST NOT ask to show other options.
+If verifiedAlternatives is non-empty, you may offer to show other options (do not list them unless facts say to list).
+Use casual Roman Urdu / simple Urdu-English mix suitable for WhatsApp.
+Return ONLY JSON: {"reply":"..."}`;
+
+  const user = `FACTS_JSON: ${JSON.stringify({
+    itemLabel: label,
+    durationDays: durationN,
+    itemAvailable: false,
+    verifiedAlternativeLabels: altLabels,
+    verifiedAlternativesCount: altLabels.length,
+  })}`;
+
+  try {
+    const timeoutMs =
+      Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) > 0
+        ? Number(p.timeoutMs)
+        : 8000;
+    const completion = await Promise.race([
+      create({
+        model: resolveOpenAiChatModel(),
+        temperature: 0.3,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+      }),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("unavailable_reply_timeout")), timeoutMs);
+      }),
+    ]);
+    const raw = String(completion?.choices?.[0]?.message?.content ?? "").trim();
+    let reply = "";
+    try {
+      const parsed = JSON.parse(raw);
+      reply = String(parsed?.reply ?? "").trim();
+    } catch {
+      reply = "";
+    }
+    return validateUnavailableCustomerReply(reply, alternatives, failsafe);
+  } catch {
+    return failsafe;
+  }
 }
 
 /**
@@ -455,10 +584,22 @@ function buildOwnerCheckActionPlan(p) {
  * @returns {ActionPlan}
  */
 function buildUnavailableOfferActionPlan(p) {
-  const replyDraft = buildUnavailableWithAlternativeOfferReply(
+  const alternatives = readVerifiedAlternatives(p.availability);
+  const hasAlternatives = alternatives.length > 0;
+  const composed = String(p.canonical?.unavailableCustomerReply ?? "").trim();
+  const failsafe = buildUnavailableAvailabilityFailsafeReply(
     p.conversationalLabel,
-    p.durationN
+    p.durationN,
+    alternatives
   );
+  const replyDraft =
+    composed &&
+    !(
+      !hasAlternatives && /koi aur option dekhun|other option|aur option/i.test(composed)
+    )
+      ? composed
+      : failsafe;
+
   const window = resolveBookingDateWindowFromDuration(p.durationN);
   const sourceTurnKey =
     String(p.sourceTurnKey ?? "").trim() ||
@@ -469,26 +610,30 @@ function buildUnavailableOfferActionPlan(p) {
     String(p.canonical?.participant?.key ?? "").trim() ||
     String(p.canonical?.sourceIdentity?.participantKey ?? "").trim() ||
     null;
-  const assist = buildOfferedAlternativesAssist({
-    unavailableItemId: String(p.itemId ?? ""),
-    unavailableItemLabel: p.itemLabel,
-    durationDays: p.durationN,
-    windowStartAt: window?.startAt ?? null,
-    windowEndAt: window?.endAt ?? null,
-    pendingQuestion: replyDraft,
-    pendingPromptType: AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
-    assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
-    sourceTurnKey,
-    participantKey,
-  });
+
+  const assist = hasAlternatives
+    ? buildOfferedAlternativesAssist({
+        unavailableItemId: String(p.itemId ?? ""),
+        unavailableItemLabel: p.itemLabel,
+        durationDays: p.durationN,
+        windowStartAt: window?.startAt ?? null,
+        windowEndAt: window?.endAt ?? null,
+        pendingQuestion: replyDraft,
+        pendingPromptType: AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
+        assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
+        sourceTurnKey,
+        participantKey,
+      })
+    : null;
 
   console.log("[availability_unavailable_offer_planned]", {
     workflowType: "availability_inquiry",
     itemId: p.itemId,
     durationDays: p.durationN,
-    alternativesCount: readVerifiedAlternatives(p.availability).length,
+    alternativesCount: alternatives.length,
     hasPendingQuestion: Boolean(assist?.pendingQuestion),
     assistStage: assist?.assistStage ?? null,
+    offerAssist: hasAlternatives,
   });
 
   return Object.freeze({
@@ -503,7 +648,9 @@ function buildUnavailableOfferActionPlan(p) {
           field: "availability",
           itemId: p.itemId,
           itemLabel: p.itemLabel,
-          source: "canonical_unavailable_alternative_offer",
+          source: hasAlternatives
+            ? "canonical_unavailable_alternative_offer"
+            : "canonical_unavailable_no_alternatives",
           execute: false,
         }),
       }),
@@ -513,8 +660,9 @@ function buildUnavailableOfferActionPlan(p) {
       itemId: p.itemId,
       rememberDuration: true,
       durationDays: p.durationN,
-      rememberLastAvailabilityAssist: true,
+      rememberLastAvailabilityAssist: Boolean(assist),
       lastAvailabilityAssist: assist,
+      clearLastAvailabilityAssist: !assist,
       execute: false,
     }),
   });

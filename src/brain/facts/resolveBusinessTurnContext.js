@@ -25,6 +25,7 @@ import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCom
 import { isAvailabilityDurationPendingAction } from "../availability/availabilityPendingActions.js";
 import { decideEmilyPendingFollowUp } from "../availability/decideEmilyPendingFollowUp.js";
 import { readEmilyPendingFromMemory } from "../availability/emilyPendingContext.js";
+import { composeUnavailableCustomerReplyFromFacts } from "../workflows/AvailabilityInquiryWorkflow.js";
 
 /**
  * @param {unknown} message
@@ -507,6 +508,52 @@ export async function resolveBusinessTurnContext(params) {
     verifiedAlternatives,
   };
 
+  let unavailableCustomerReply = null;
+  if (
+    isConfidentInventoryUnavailable(availabilityFacts.availability) &&
+    lastAvailabilityAssist == null
+  ) {
+    const conversationalLabel =
+      String(
+        itemFacts.displayLabel ??
+          itemFacts.name ??
+          lastAvailabilityAssist?.unavailableItemLabel ??
+          ""
+      ).trim() || "item";
+    const durationForReply = Math.max(
+      1,
+      Math.floor(
+        Number(
+          durationDaysResolved ??
+            lastAvailabilityAssist?.durationDays ??
+            understanding?.durationDays ??
+            1
+        ) || 1
+      )
+    );
+    try {
+      unavailableCustomerReply = await composeUnavailableCustomerReplyFromFacts({
+        conversationalLabel,
+        durationDays: durationForReply,
+        alternatives: verifiedAlternatives,
+        chatCompletionsCreate:
+          typeof params.__unavailableReplyChatCreate === "function"
+            ? null
+            : resolveOpenAiChatCompletionsCreate(),
+        __chatCompletionsCreateForTests:
+          typeof params.__unavailableReplyChatCreate === "function"
+            ? params.__unavailableReplyChatCreate
+            : null,
+        __replyForTests:
+          typeof params.__unavailableReplyForTests === "string"
+            ? params.__unavailableReplyForTests
+            : null,
+      });
+    } catch {
+      unavailableCustomerReply = null;
+    }
+  }
+
   let availabilityAssistFollowUp = null;
   if (lastAvailabilityAssist) {
     try {
@@ -607,6 +654,7 @@ export async function resolveBusinessTurnContext(params) {
     sourceIdentity,
     lastAvailabilityAssist,
     availabilityAssistFollowUp,
+    unavailableCustomerReply,
 
     resolvedItem: {
       status: itemFacts.status,

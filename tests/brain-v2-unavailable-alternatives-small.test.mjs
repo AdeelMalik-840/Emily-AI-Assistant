@@ -9,6 +9,8 @@ process.env.NODE_ENV = "test";
 
 import {
   buildAvailabilityInquiryActionPlan,
+  buildUnavailableAvailabilityFailsafeReply,
+  composeUnavailableCustomerReplyFromFacts,
 } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import {
   buildOfferedAlternativesAssist,
@@ -159,6 +161,7 @@ test("1: unavailable requested item → reply-only offer, no owner-check", () =>
   });
 
   assert.match(String(plan.replyDraft ?? ""), /available nahi hai/i);
+  assert.match(String(plan.replyDraft ?? ""), /Koi aur option dekhun/i);
   assert.equal(
     plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
     false
@@ -178,6 +181,67 @@ test("1: unavailable requested item → reply-only offer, no owner-check", () =>
     "awaiting_alternative_offer_response"
   );
   assert.ok(AVAILABILITY_ASSIST_TTL_MS <= 15 * 60 * 1000);
+});
+
+test("1b: unavailable + empty verifiedAlternatives → no offer assist", () => {
+  const plan = buildAvailabilityInquiryActionPlan({
+    admittedTurn: admitted("Civic 2 din ke liye available hai?"),
+    understanding: understanding({
+      resolvedItemId: CIVIC_ID,
+      resolvedItemLabel: "Honda Civic",
+    }),
+    catalogItems: [
+      { id: CIVIC_ID, name: "Honda Civic", displayLabel: "Honda Civic" },
+    ],
+    businessContext: {
+      resolvedBusinessTurnContext: canonicalContext({
+        resolvedItem: { id: CIVIC_ID, name: "Honda Civic", displayLabel: "Honda Civic" },
+        verified: {
+          availability: unavailableAvailability({ verifiedAlternatives: [] }),
+          priceQuote: null,
+        },
+      }),
+    },
+  });
+
+  assert.match(String(plan.replyDraft ?? ""), /available nahi hai/i);
+  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Koi aur option dekhun/i);
+  assert.match(String(plan.replyDraft ?? ""), /koi aur option available nahi hai/i);
+  assert.equal(plan.actions[0]?.payload?.source, "canonical_unavailable_no_alternatives");
+  assert.equal(plan.persistenceIntent?.rememberLastAvailabilityAssist, false);
+  assert.equal(plan.persistenceIntent?.lastAvailabilityAssist, null);
+  assert.equal(plan.persistenceIntent?.clearLastAvailabilityAssist, true);
+  assert.equal(
+    plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    false
+  );
+});
+
+test("1c: AI compose failsafe rejects offer phrasing when alts empty", async () => {
+  const reply = await composeUnavailableCustomerReplyFromFacts({
+    conversationalLabel: "Honda Civic",
+    durationDays: 2,
+    alternatives: [],
+    __replyForTests: "Civic 2 din ke liye available nahi hai. Koi aur option dekhun?",
+  });
+  assert.equal(
+    reply,
+    buildUnavailableAvailabilityFailsafeReply("Honda Civic", 2, [])
+  );
+  assert.doesNotMatch(reply, /Koi aur option dekhun/i);
+});
+
+test("1d: AI compose keeps offer when alts non-empty", async () => {
+  const reply = await composeUnavailableCustomerReplyFromFacts({
+    conversationalLabel: "Toyota Corolla",
+    durationDays: 2,
+    alternatives: [
+      { itemId: STONIC_ID, itemLabel: "Kia Stonic" },
+      { itemId: CIVIC_ID, itemLabel: "Honda Civic" },
+    ],
+    __replyForTests: "Corolla 2 din ke liye available nahi hai. Koi aur option dekhun?",
+  });
+  assert.match(reply, /Koi aur option dekhun/i);
 });
 
 test("2: available requested item → existing owner-check unchanged", () => {
