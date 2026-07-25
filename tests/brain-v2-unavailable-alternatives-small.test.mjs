@@ -165,6 +165,18 @@ test("1: unavailable requested item → reply-only offer, no owner-check", () =>
   );
   assert.equal(plan.actions[0]?.payload?.source, "canonical_unavailable_alternative_offer");
   assert.equal(plan.persistenceIntent?.lastAvailabilityAssist?.action, "offered_alternatives");
+  assert.equal(
+    plan.persistenceIntent?.lastAvailabilityAssist?.pendingQuestion,
+    plan.replyDraft
+  );
+  assert.equal(
+    plan.persistenceIntent?.lastAvailabilityAssist?.pendingPromptType,
+    "offer_to_list_alternatives"
+  );
+  assert.equal(
+    plan.persistenceIntent?.lastAvailabilityAssist?.assistStage,
+    "awaiting_alternative_offer_response"
+  );
   assert.ok(AVAILABILITY_ASSIST_TTL_MS <= 15 * 60 * 1000);
 });
 

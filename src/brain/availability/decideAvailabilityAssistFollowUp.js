@@ -214,6 +214,10 @@ export function resolveAvailabilityAssistFollowUpDecision(p) {
  *   requestedDurationDays?: number | null,
  *   requestedStartAt?: string | null,
  *   requestedEndAt?: string | null,
+ *   pendingQuestion?: string | null,
+ *   pendingPromptType?: string | null,
+ *   assistStage?: string | null,
+ *   participantKey?: string | null,
  *   timeoutMs?: number,
  *   chatCompletionsCreate?: Function | null,
  *   __chatCompletionsCreateForTests?: Function | null,
@@ -231,6 +235,24 @@ export async function decideAvailabilityAssistFollowUp(p = {}) {
       reason: "no_fresh_assist",
       ok: true,
       source: "deterministic_no_assist",
+    };
+  }
+
+  const currentParticipantKey = clean(p.participantKey, 160);
+  const assistParticipantKey = clean(assist.participantKey, 160);
+  if (
+    assistParticipantKey &&
+    currentParticipantKey &&
+    assistParticipantKey !== currentParticipantKey
+  ) {
+    return {
+      decision: "unrelated_message",
+      confidence: 1,
+      selectedItemId: null,
+      shouldClearAssist: false,
+      reason: "assist_participant_mismatch",
+      ok: true,
+      source: "deterministic_participant_guard",
     };
   }
 
@@ -253,18 +275,27 @@ export async function decideAvailabilityAssistFollowUp(p = {}) {
     .filter((line) => line.length > 4)
     .join("\n");
 
+  const pendingQuestion =
+    clean(p.pendingQuestion, 500) || clean(assist.pendingQuestion, 500) || "";
+  const pendingPromptType =
+    clean(p.pendingPromptType, 80) || clean(assist.pendingPromptType, 80) || "";
+  const assistStage =
+    clean(p.assistStage, 80) || clean(assist.assistStage, 80) || "";
+
   const system = `Emily Brain V2 — availability assist follow-up (group WhatsApp).
-Emily previously told the customer the requested item was unavailable and offered alternatives.
+Emily previously told the customer the requested item was unavailable and may have asked whether to show other options, or already listed options.
 Decide customer MEANING only. Do not invent cars or prices.
+Judge the latest customer message RELATIVE TO Emily's pending question / assist stage. Do not judge short replies in isolation.
+Do not rely on exact phrase matching. Interpret meaning in any language the customer uses.
 
 Return ONLY one JSON object:
 {"decision":"accept_alternative_offer|ask_available_alternatives|select_alternative_item|unrelated_message|unclear","confidence":0.0,"selectedItemId":null,"shouldClearAssist":false,"reason":"short"}
 
 Rules:
-- accept_alternative_offer: customer accepts the offer to see other options (affirmation of that offer).
-- ask_available_alternatives: customer asks what else is available / wants options listed.
-- select_alternative_item: customer names/picks a specific other item. Set selectedItemId to a verified alternative id when possible.
-- unrelated_message: thanks, closing, done, topic change, social — NOT asking for alternatives. shouldClearAssist=true.
+- accept_alternative_offer: the pending question offers to show alternatives, and the customer semantically agrees / acknowledges that offer (any language).
+- ask_available_alternatives: customer asks what else is available / wants options listed (even without a yes/no pending question).
+- select_alternative_item: customer names/picks a specific other item (especially after options were listed). Set selectedItemId to a verified alternative id when possible.
+- unrelated_message: thanks, closing, done, topic change, social, or clear decline of alternatives — NOT accepting the pending offer. shouldClearAssist=true.
 - unclear: cannot tell. shouldClearAssist=true.
 - Never treat a farewell/thanks as accept_alternative_offer.
 - confidence 0..1. Use high confidence only when sure.
@@ -277,7 +308,15 @@ Rules:
     durationDays: assist.durationDays,
     windowStartAt: assist.windowStartAt,
     windowEndAt: assist.windowEndAt,
+    pendingPromptType: pendingPromptType || null,
+    assistStage: assistStage || null,
+    sourceTurnKey: assist.sourceTurnKey ?? null,
+    participantKey: assist.participantKey ?? null,
   })}
+PENDING_PROMPT_TYPE: ${pendingPromptType || "(none)"}
+ASSIST_STAGE: ${assistStage || "(none)"}
+LAST_EMILY_PENDING_QUESTION:
+${pendingQuestion || "(none)"}
 REQUESTED_WINDOW: durationDays=${p.requestedDurationDays ?? assist.durationDays} start=${p.requestedStartAt ?? assist.windowStartAt} end=${p.requestedEndAt ?? assist.windowEndAt}
 RESOLVED_ITEM_ID: ${clean(understanding.resolvedItemId, 80) || "null"}
 RESOLVED_ITEM_LABEL: ${clean(understanding.resolvedItemLabel, 120) || "null"}
