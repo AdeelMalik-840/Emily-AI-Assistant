@@ -500,6 +500,13 @@ export async function resolveBusinessTurnContext(params) {
         requestedDurationDays: durationDaysResolved,
         requestedStartAt: lastAvailabilityAssist.windowStartAt,
         requestedEndAt: lastAvailabilityAssist.windowEndAt,
+        pendingQuestion: lastAvailabilityAssist.pendingQuestion ?? null,
+        pendingPromptType: lastAvailabilityAssist.pendingPromptType ?? null,
+        assistStage: lastAvailabilityAssist.assistStage ?? null,
+        participantKey:
+          String(participantFacts?.participant?.key ?? "").trim() ||
+          String(sourceIdentity?.participantKey ?? "").trim() ||
+          null,
         __decisionForTests: params.__availabilityAssistFollowUpDecision ?? null,
         __chatCompletionsCreateForTests:
           params.__availabilityAssistFollowUpChatCreate ?? null,

@@ -7,8 +7,20 @@ export const AVAILABILITY_ASSIST_ACTION_OFFERED_ALTERNATIVES = "offered_alternat
 /** Aggressive TTL — stale offers must not capture later affirmations. */
 export const AVAILABILITY_ASSIST_TTL_MS = 15 * 60 * 1000;
 
+/** Pending: Emily asked whether to list alternatives. */
+export const AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST = "offer_to_list_alternatives";
+/** Pending: Emily listed alternatives and awaits an item pick. */
+export const AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM =
+  "list_awaiting_item_selection";
+
+export const AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE =
+  "awaiting_alternative_offer_response";
+export const AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION =
+  "awaiting_alternative_item_selection";
+
 /**
  * @param {unknown} value
+ * @param {number} [max]
  * @returns {string}
  */
 function clean(value, max = 200) {
@@ -43,6 +55,11 @@ export function readFreshLastAvailabilityAssist(raw, nowMs = Date.now()) {
     windowEndAt: clean(assist.windowEndAt) || null,
     createdAt: clean(assist.createdAt) || null,
     expiresAt: new Date(expiresAt).toISOString(),
+    pendingQuestion: clean(assist.pendingQuestion, 500) || null,
+    pendingPromptType: clean(assist.pendingPromptType, 80) || null,
+    assistStage: clean(assist.assistStage, 80) || null,
+    sourceTurnKey: clean(assist.sourceTurnKey, 160) || null,
+    participantKey: clean(assist.participantKey, 160) || null,
   };
 }
 
@@ -55,6 +72,11 @@ export function readFreshLastAvailabilityAssist(raw, nowMs = Date.now()) {
  *   windowEndAt?: Date | string | null,
  *   nowMs?: number,
  *   ttlMs?: number,
+ *   pendingQuestion?: string | null,
+ *   pendingPromptType?: string | null,
+ *   assistStage?: string | null,
+ *   sourceTurnKey?: string | null,
+ *   participantKey?: string | null,
  * }} p
  */
 export function buildOfferedAlternativesAssist(p) {
@@ -80,6 +102,13 @@ export function buildOfferedAlternativesAssist(p) {
       : p.windowEndAt
         ? new Date(String(p.windowEndAt))
         : null;
+  const pendingQuestion = clean(p.pendingQuestion, 500) || null;
+  const pendingPromptType =
+    clean(p.pendingPromptType, 80) ||
+    (pendingQuestion ? AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST : null);
+  const assistStage =
+    clean(p.assistStage, 80) ||
+    (pendingQuestion ? AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE : null);
   return {
     action: AVAILABILITY_ASSIST_ACTION_OFFERED_ALTERNATIVES,
     unavailableItemId,
@@ -90,5 +119,39 @@ export function buildOfferedAlternativesAssist(p) {
     windowEndAt: end && Number.isFinite(end.getTime()) ? end.toISOString() : null,
     createdAt: new Date(nowMs).toISOString(),
     expiresAt: new Date(nowMs + ttlMs).toISOString(),
+    pendingQuestion,
+    pendingPromptType,
+    assistStage,
+    sourceTurnKey: clean(p.sourceTurnKey, 160) || null,
+    participantKey: clean(p.participantKey, 160) || null,
+  };
+}
+
+/**
+ * Refresh pending Emily question / stage on an existing fresh assist (e.g. after listing).
+ * Preserves TTL window from the original assist.
+ *
+ * @param {Record<string, unknown> | null | undefined} assist
+ * @param {{
+ *   pendingQuestion: string,
+ *   pendingPromptType?: string | null,
+ *   assistStage?: string | null,
+ * }} patch
+ * @returns {Record<string, unknown> | null}
+ */
+export function withAvailabilityAssistPendingQuestion(assist, patch) {
+  const fresh = readFreshLastAvailabilityAssist(assist);
+  if (!fresh) return null;
+  const pendingQuestion = clean(patch?.pendingQuestion, 500);
+  if (!pendingQuestion) return fresh;
+  return {
+    ...fresh,
+    pendingQuestion,
+    pendingPromptType:
+      clean(patch?.pendingPromptType, 80) ||
+      AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
+    assistStage:
+      clean(patch?.assistStage, 80) ||
+      AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION,
   };
 }

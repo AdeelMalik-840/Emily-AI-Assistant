@@ -1,8 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { composeInformationalAnswer } from "../../services/answerComposer.js";
 import {
+  AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
+  AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
+  AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION,
+  AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
   buildOfferedAlternativesAssist,
   readFreshLastAvailabilityAssist,
+  withAvailabilityAssistPendingQuestion,
 } from "../availability/availabilityAssistContext.js";
 import { resolveAvailabilityAssistFollowUpDecision } from "../availability/decideAvailabilityAssistFollowUp.js";
 import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
@@ -447,12 +452,26 @@ function buildUnavailableOfferActionPlan(p) {
     p.durationN
   );
   const window = resolveBookingDateWindowFromDuration(p.durationN);
+  const sourceTurnKey =
+    String(p.sourceTurnKey ?? "").trim() ||
+    String(p.canonical?.turn?.sourceTurnKey ?? "").trim() ||
+    null;
+  const participantKey =
+    String(p.participantKey ?? "").trim() ||
+    String(p.canonical?.participant?.key ?? "").trim() ||
+    String(p.canonical?.sourceIdentity?.participantKey ?? "").trim() ||
+    null;
   const assist = buildOfferedAlternativesAssist({
     unavailableItemId: String(p.itemId ?? ""),
     unavailableItemLabel: p.itemLabel,
     durationDays: p.durationN,
     windowStartAt: window?.startAt ?? null,
     windowEndAt: window?.endAt ?? null,
+    pendingQuestion: replyDraft,
+    pendingPromptType: AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
+    assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
+    sourceTurnKey,
+    participantKey,
   });
 
   console.log("[availability_unavailable_offer_planned]", {
@@ -460,6 +479,8 @@ function buildUnavailableOfferActionPlan(p) {
     itemId: p.itemId,
     durationDays: p.durationN,
     alternativesCount: readVerifiedAlternatives(p.availability).length,
+    hasPendingQuestion: Boolean(assist?.pendingQuestion),
+    assistStage: assist?.assistStage ?? null,
   });
 
   return Object.freeze({
@@ -536,6 +557,14 @@ function buildAssistContextNoReplyActionPlan(p = {}) {
  */
 function buildAlternativesListActionPlan(p) {
   const replyDraft = buildVerifiedAlternativesReply(p.alternatives);
+  const assistForPersist =
+    p.alternatives.length > 0
+      ? withAvailabilityAssistPendingQuestion(p.assist, {
+          pendingQuestion: replyDraft,
+          pendingPromptType: AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
+          assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION,
+        }) || p.assist
+      : null;
   return Object.freeze({
     planId: randomUUID(),
     replyDraft,
@@ -557,9 +586,9 @@ function buildAlternativesListActionPlan(p) {
       }),
     ]),
     persistenceIntent: Object.freeze({
-      rememberLastAvailabilityAssist: p.alternatives.length > 0,
-      lastAvailabilityAssist: p.alternatives.length > 0 ? p.assist : null,
-      clearLastAvailabilityAssist: p.alternatives.length === 0,
+      rememberLastAvailabilityAssist: Boolean(assistForPersist),
+      lastAvailabilityAssist: assistForPersist,
+      clearLastAvailabilityAssist: !assistForPersist,
       execute: false,
     }),
   });
@@ -733,6 +762,12 @@ export function buildAvailabilityInquiryActionPlan({
           canonicalAvailability && typeof canonicalAvailability === "object"
             ? /** @type {Record<string, unknown>} */ (canonicalAvailability)
             : {},
+        canonical: /** @type {Record<string, unknown>} */ (canonical),
+        sourceTurnKey: String(canonical?.turn?.sourceTurnKey ?? "").trim() || null,
+        participantKey:
+          String(canonical?.participant?.key ?? "").trim() ||
+          String(canonical?.sourceIdentity?.participantKey ?? "").trim() ||
+          null,
       });
     }
 
