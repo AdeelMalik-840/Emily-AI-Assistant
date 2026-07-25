@@ -11,6 +11,11 @@ import {
 } from "../availability/availabilityAssistContext.js";
 import { resolveAvailabilityAssistFollowUpDecision } from "../availability/decideAvailabilityAssistFollowUp.js";
 import { PENDING_ACTION_COLLECT_AVAILABILITY_DURATION } from "../availability/availabilityPendingActions.js";
+import {
+  EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
+  buildEmilyPending,
+  toSessionPendingPersistence,
+} from "../availability/emilyPendingContext.js";
 import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
 import { resolveBookingDateWindowFromDuration } from "../facts/resolveBookingDateWindow.js";
 
@@ -433,6 +438,7 @@ function buildOwnerCheckActionPlan(p) {
       ownerCheckPlanned: true,
       clearLastAvailabilityAssist: clearAssist === true,
       clearPendingAction: true,
+      clearEmilyPending: true,
       execute,
     }),
   });
@@ -718,6 +724,28 @@ export function buildAvailabilityInquiryActionPlan({
 
     if (!ownerCheckTiming.ready) {
       const replyDraft = buildAskDurationAvailabilityReply(conversationalLabel);
+      const emilyPending = buildEmilyPending({
+        stage: EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
+        pendingQuestion: replyDraft,
+        itemId,
+        itemLabel,
+        participantKey:
+          String(canonical?.participant?.key ?? "").trim() ||
+          String(canonical?.sourceIdentity?.participantKey ?? "").trim() ||
+          null,
+        sourceWorkflow: "availability_inquiry",
+        sourceTurnKey: String(canonical?.turn?.sourceTurnKey ?? "").trim() || null,
+        type: PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+      });
+      const pendingPersist = toSessionPendingPersistence(emilyPending) || {
+        setPendingAction: true,
+        pendingAction: {
+          type: PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+          itemId,
+          status: "awaiting",
+          sourceWorkflow: "availability_inquiry",
+        },
+      };
       return Object.freeze({
         planId: randomUUID(),
         replyDraft,
@@ -738,13 +766,7 @@ export function buildAvailabilityInquiryActionPlan({
         persistenceIntent: Object.freeze({
           rememberResolvedItem: true,
           itemId,
-          setPendingAction: true,
-          pendingAction: Object.freeze({
-            type: PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
-            itemId,
-            status: "awaiting",
-            sourceWorkflow: "availability_inquiry",
-          }),
+          ...pendingPersist,
           execute: false,
         }),
       });

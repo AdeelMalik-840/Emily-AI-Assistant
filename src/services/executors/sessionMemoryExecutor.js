@@ -70,6 +70,16 @@ export function applySessionMemoryFromActionPlan(p) {
     patch.pendingAction = structuredClone(persistence.pendingAction);
   }
 
+  if (persistence?.clearEmilyPending === true) {
+    patch.emilyPending = null;
+  } else if (
+    persistence?.rememberEmilyPending === true &&
+    persistence?.emilyPending &&
+    typeof persistence.emilyPending === "object"
+  ) {
+    patch.emilyPending = structuredClone(persistence.emilyPending);
+  }
+
   if (Object.keys(patch).length > 0) {
     patchEmilySessionState(sessionKey, patch);
   }

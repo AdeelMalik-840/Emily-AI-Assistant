@@ -23,6 +23,8 @@ import { findVerifiedAvailabilityAlternatives } from "../../services/availabilit
 import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
 import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCompletionsCreate.js";
 import { isAvailabilityDurationPendingAction } from "../availability/availabilityPendingActions.js";
+import { decideEmilyPendingFollowUp } from "../availability/decideEmilyPendingFollowUp.js";
+import { readEmilyPendingFromMemory } from "../availability/emilyPendingContext.js";
 
 /**
  * @param {unknown} message
@@ -668,14 +670,59 @@ export async function resolveBusinessTurnContext(params) {
     },
   };
 
+  const memoryPendingAction =
+    memorySnapshot.pendingAction ??
+    readEmilyPendingFromMemory(memorySnapshot) ??
+    null;
+
   resolved.decision = resolveBusinessDecision({
     normalizedMessage,
     understanding,
     signals,
     itemFacts,
     participantFacts,
-    memoryPendingAction: memorySnapshot.pendingAction ?? null,
+    memoryPendingAction,
   });
+
+  resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);
+  resolved.emilyPendingFollowUp = decideEmilyPendingFollowUp({
+    memorySnapshot,
+    participantKey:
+      String(participantFacts?.participant?.key ?? "").trim() ||
+      String(sourceIdentity?.participantKey ?? "").trim() ||
+      null,
+    understanding: {
+      ...(understanding && typeof understanding === "object" ? understanding : {}),
+      durationDays: durationDaysResolved ?? understanding?.durationDays ?? null,
+      resolvedItemId: itemFacts.id,
+      itemSource: understanding?.itemSource ?? null,
+      signals,
+    },
+    signals,
+    customerText: rawMessage,
+    __decisionForTests: params.__emilyPendingFollowUpDecision ?? null,
+  });
+
+  const pendingHint = String(resolved.emilyPendingFollowUp?.workflowHint ?? "")
+    .trim()
+    .slice(0, 80);
+  if (
+    pendingHint &&
+    pendingHint !== "unknown_clarification" &&
+    (resolved.decision.workflowType === "unknown_clarification" ||
+      (resolved.decision.workflowType === "booking_request" &&
+        pendingHint === "availability_inquiry"))
+  ) {
+    resolved.decision = Object.freeze({
+      ...resolved.decision,
+      workflowType: pendingHint,
+      primaryIntent:
+        pendingHint === "availability_inquiry"
+          ? "availability_inquiry"
+          : resolved.decision.primaryIntent,
+      reason: `emily_pending_meaning_${String(resolved.emilyPendingFollowUp?.meaning ?? "hint")}`,
+    });
+  }
 
   if (params.log !== false) {
     logCanonicalFactsResolved(resolved);

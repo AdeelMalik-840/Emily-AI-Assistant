@@ -15,6 +15,10 @@ import {
   isAvailabilityDurationPendingAction,
   PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
 } from "../availability/availabilityPendingActions.js";
+import {
+  EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
+  readEmilyPendingFromMemory,
+} from "../availability/emilyPendingContext.js";
 
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -58,6 +62,14 @@ export function hasOpenCollectDurationPending(turnContext) {
  */
 export function hasOpenAvailabilityDurationPending(turnContext) {
   if (turnContext?.activeWorkflowType === PENDING_ACTION_COLLECT_AVAILABILITY_DURATION) {
+    return true;
+  }
+  const memory =
+    turnContext?.memorySnapshot && typeof turnContext.memorySnapshot === "object"
+      ? /** @type {Record<string, unknown>} */ (turnContext.memorySnapshot)
+      : null;
+  const emilyPending = readEmilyPendingFromMemory(memory);
+  if (emilyPending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION) {
     return true;
   }
   return isAvailabilityDurationPendingAction(readMemoryPendingAction(turnContext));
