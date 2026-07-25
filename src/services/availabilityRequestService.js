@@ -1089,7 +1089,9 @@ export function isCloudWaitingConfirmAvailabilityRequestEligible(request, nowMs 
   if (clean(request?.status) !== "approved") return false;
   if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
   if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
-  if (clean(request?.customerConfirmationChannel) !== "waiting_confirm_cloud") return false;
+  const channel = clean(request?.customerConfirmationChannel);
+  const transport = clean(request?.customerDmTransport);
+  if (channel !== "waiting_confirm_cloud" && transport !== "cloud_api") return false;
   if (clean(request?.linkedBookingId)) return false;
   const processing = clean(request?.customerConfirmProcessingStatus);
   if (processing === "processing" || processing === "done") return false;
@@ -1098,6 +1100,55 @@ export function isCloudWaitingConfirmAvailabilityRequestEligible(request, nowMs 
     return false;
   }
   return true;
+}
+
+/**
+ * Trusted for bare-confirm Cloud binding: eligible waiting_confirm + active booking prompt.
+ * @param {Record<string, unknown>} request
+ * @param {number} [nowMs]
+ */
+export function isTrustedWaitingConfirmBookingPromptCandidate(request, nowMs = Date.now()) {
+  if (!isCloudWaitingConfirmAvailabilityRequestEligible(request, nowMs)) return false;
+  return clean(request?.lastCustomerDmPromptType) === "booking_confirmation_prompt";
+}
+
+/**
+ * Desc sort key for latest-trusted waiting_confirm (notify → outbound → updated → created).
+ * @param {Record<string, unknown>} a
+ * @param {Record<string, unknown>} b
+ * @returns {number}
+ */
+export function compareWaitingConfirmTrustRank(a, b) {
+  const keys = [
+    "approvalCustomerNotificationAt",
+    "lastCustomerDmOutboundAt",
+    "updatedAt",
+    "createdAt",
+  ];
+  for (const key of keys) {
+    const aMs = normalizeTimestampToMs(a?.[key]) ?? -1;
+    const bMs = normalizeTimestampToMs(b?.[key]) ?? -1;
+    if (aMs !== bMs) return bMs - aMs;
+  }
+  return 0;
+}
+
+/**
+ * @param {Record<string, unknown>[]} requests
+ * @param {number} [nowMs]
+ * @returns {Record<string, unknown> | null}
+ */
+export function pickLatestTrustedWaitingConfirmRequest(requests, nowMs = Date.now()) {
+  const trusted = (Array.isArray(requests) ? requests : []).filter((row) =>
+    isTrustedWaitingConfirmBookingPromptCandidate(row, nowMs)
+  );
+  if (trusted.length === 0) return null;
+  if (trusted.length === 1) return trusted[0];
+  const sorted = [...trusted].sort(compareWaitingConfirmTrustRank);
+  const top = sorted[0];
+  const second = sorted[1];
+  if (second && compareWaitingConfirmTrustRank(top, second) === 0) return null;
+  return top;
 }
 
 /**
@@ -1369,7 +1420,7 @@ export async function findLatestWaitingConfirmAvailabilityRequest({
   customerPhone = null,
 }) {
   const matches = customerPhone
-    ? await findWaitingConfirmAvailabilityRequestsByPhone({
+    ? await findWaitingConfirmCloudAvailabilityRequestsByPhone({
         db: connection,
         businessId,
         customerPhone,
@@ -1380,12 +1431,88 @@ export async function findLatestWaitingConfirmAvailabilityRequest({
     : matches;
   const pool = filtered.length > 0 ? filtered : matches;
   if (pool.length === 0) return null;
-  pool.sort((a, b) => {
-    const aMs = new Date(a.approvalCustomerNotificationAt ?? a.updatedAt ?? 0).getTime();
-    const bMs = new Date(b.approvalCustomerNotificationAt ?? b.updatedAt ?? 0).getTime();
-    return bMs - aMs;
+  const trustedLatest = pickLatestTrustedWaitingConfirmRequest(pool);
+  if (trustedLatest) return trustedLatest;
+  pool.sort(compareWaitingConfirmTrustRank);
+  return pool[0] ?? null;
+}
+
+/**
+ * Recently superseded Cloud AVRs for the same customer (audit / named-item safety).
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ * }} params
+ */
+export async function findSupersededCloudAvailabilityRequestsByPhone({
+  db: connection,
+  businessId,
+  customerPhone,
+}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!firestore || !uid || !phone) return [];
+
+  const snap = await availabilityRequestCollectionRef(connection, uid)
+    .where("customerConfirmationStatus", "==", "superseded")
+    .limit(10)
+    .get()
+    .catch(() => null);
+  const docs = snap?.docs ?? [];
+  return docs
+    .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
+    .filter((row) => availabilityRequestMatchesCloudCustomerPhone(row, phone));
+}
+
+/**
+ * After a successful new Cloud booking_confirmation_prompt, mark other waiting_confirm
+ * AVRs for the same customer as superseded (audit preserved; not bookable).
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ *   keepRequestId: string,
+ *   now?: Date,
+ * }} params
+ */
+export async function supersedeOtherWaitingConfirmAvailabilityRequestsForCustomer({
+  db: connection,
+  businessId,
+  customerPhone,
+  keepRequestId,
+  now = new Date(),
+}) {
+  const uid = clean(businessId);
+  const keepId = clean(keepRequestId);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!uid || !keepId || !phone) {
+    return { ok: false, supersededCount: 0, reason: "MISSING_CONTEXT" };
+  }
+  const waiting = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
+    db: connection,
+    businessId: uid,
+    customerPhone: phone,
   });
-  return pool[0];
+  let supersededCount = 0;
+  for (const row of waiting) {
+    const id = clean(row.requestId ?? row.id);
+    if (!id || id === keepId) continue;
+    const updated = await updateAvailabilityRequestCustomerConfirmationState({
+      db: connection,
+      businessId: uid,
+      requestId: id,
+      customerConfirmationStatus: "superseded",
+      extra: {
+        supersededAt: now,
+        supersededByAvailabilityRequestId: keepId,
+      },
+    });
+    if (updated) supersededCount += 1;
+  }
+  return { ok: true, supersededCount };
 }
 
 export function resolveLastCustomerNotifyAtMs(request) {

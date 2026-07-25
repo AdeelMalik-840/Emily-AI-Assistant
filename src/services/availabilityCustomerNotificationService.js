@@ -31,6 +31,7 @@ import {
   markAvailabilityRequestCustomerNotificationSkipped,
   recordAvailabilityCustomerDmOutbound,
   resolveAvailabilityParticipantDisplayName,
+  supersedeOtherWaitingConfirmAvailabilityRequestsForCustomer,
   updateAvailabilityRequestFields,
 } from "./availabilityRequestService.js";
 import {
@@ -41,6 +42,43 @@ import {
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
+}
+
+/**
+ * After a successful Cloud booking_confirmation_prompt, supersede other waiting_confirm AVRs.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   customerPhone: string,
+ * }} p
+ */
+async function supersedeSiblingWaitingConfirmAfterCloudPrompt(p) {
+  const phone = clean(p.customerPhone);
+  const requestId = clean(p.requestId);
+  const businessId = clean(p.businessId);
+  if (!phone || !requestId || !businessId) return;
+  try {
+    const result = await supersedeOtherWaitingConfirmAvailabilityRequestsForCustomer({
+      db: p.db,
+      businessId,
+      customerPhone: phone,
+      keepRequestId: requestId,
+    });
+    if (result?.supersededCount > 0) {
+      console.log("[availability_waiting_confirm_superseded_siblings]", {
+        requestId,
+        businessId,
+        supersededCount: result.supersededCount,
+      });
+    }
+  } catch (error) {
+    console.warn("[availability_waiting_confirm_supersede_failed]", {
+      requestId,
+      businessId,
+      error: error?.message || String(error),
+    });
+  }
 }
 
 function asPlainObject(value) {
@@ -755,6 +793,12 @@ export async function sendAvailabilityCustomerNotification({
           reply: templatePlan.renderedMessage,
           promptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
         }).catch(() => null);
+        await supersedeSiblingWaitingConfirmAfterCloudPrompt({
+          db: firestore,
+          businessId: uid,
+          requestId: rid,
+          customerPhone: phase4Phone,
+        });
 
         console.log("[availability_customer_template_notify_sent]", {
           requestId: rid,
@@ -859,6 +903,12 @@ export async function sendAvailabilityCustomerNotification({
           reply: built.message,
           promptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
         }).catch(() => null);
+        await supersedeSiblingWaitingConfirmAfterCloudPrompt({
+          db: firestore,
+          businessId: uid,
+          requestId: rid,
+          customerPhone: phase4Phone,
+        });
       }
 
       console.log("[availability_customer_cloud_notify_sent]", {
