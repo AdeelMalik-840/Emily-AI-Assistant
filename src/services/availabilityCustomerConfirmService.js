@@ -41,10 +41,13 @@ import {
   claimAvailabilityRequestCustomerConfirmProcessing,
   findAvailabilityRequestByCloudInboundMessageId,
   findLatestWaitingConfirmAvailabilityRequest,
+  findSupersededCloudAvailabilityRequestsByPhone,
   findWaitingConfirmCloudAvailabilityRequestsByPhone,
   getAvailabilityRequest,
   isDuplicateAvailabilityCustomerInboundDm,
+  isTrustedWaitingConfirmBookingPromptCandidate,
   patchAvailabilityConfirmBookingMetadata,
+  pickLatestTrustedWaitingConfirmRequest,
   recordAvailabilityCustomerDmOutbound,
   recordAvailabilityCustomerInboundDm,
   resolveAvailabilityParticipantDisplayName,
@@ -87,13 +90,37 @@ export function scoreAvailabilityRequestMatch(request, message) {
 }
 
 /**
+ * Bind Cloud confirm inbound to one AVR: unique item mention, else latest trusted
+ * booking_confirmation_prompt. Ambiguity only when no clear trusted latest / tied ranks.
+ *
  * @param {Record<string, unknown>[]} requests
  * @param {string} message
+ * @param {{
+ *   nowMs?: number,
+ *   inactiveOrSupersededRequests?: Record<string, unknown>[],
+ * }} [opts]
  */
-export function selectAvailabilityRequestForCustomerMessage(requests, message) {
+export function selectAvailabilityRequestForCustomerMessage(requests, message, opts = {}) {
   const pool = Array.isArray(requests) ? requests : [];
-  if (pool.length === 0) return { request: null, reason: "NO_MATCH" };
-  if (pool.length === 1) return { request: pool[0], reason: "SINGLE_MATCH" };
+  const nowMs = Number.isFinite(Number(opts.nowMs)) ? Number(opts.nowMs) : Date.now();
+  const inactivePool = Array.isArray(opts.inactiveOrSupersededRequests)
+    ? opts.inactiveOrSupersededRequests
+    : [];
+
+  if (pool.length === 0) {
+    const namedInactive = inactivePool.filter(
+      (request) => scoreAvailabilityRequestMatch(request, message) > 0
+    );
+    if (namedInactive.length > 0) {
+      return {
+        request: null,
+        reason: "NAMED_INACTIVE",
+        disambiguationReply: buildAvailabilityConfirmClarificationReply(),
+      };
+    }
+    return { request: null, reason: "NO_MATCH" };
+  }
+
   const scored = pool
     .map((request) => ({
       request,
@@ -104,7 +131,44 @@ export function selectAvailabilityRequestForCustomerMessage(requests, message) {
   if (top.length === 1) {
     return { request: top[0].request, reason: "ITEM_MENTION_DISAMBIGUATED" };
   }
-  const options = pool.slice(0, 3).map((row) => {
+  if (top.length > 1) {
+    const options = top.slice(0, 3).map((entry) => {
+      const label = clean(entry.request.itemLabel) || "car";
+      const duration = formatAvailabilityDurationPhrase(entry.request);
+      return `${label} ${duration}`.trim();
+    });
+    return {
+      request: null,
+      reason: "AMBIGUOUS",
+      disambiguationReply: buildAvailabilityConfirmDisambiguationReply(options),
+    };
+  }
+
+  const namedInactive = inactivePool.filter(
+    (request) => scoreAvailabilityRequestMatch(request, message) > 0
+  );
+  if (namedInactive.length > 0) {
+    return {
+      request: null,
+      reason: "NAMED_INACTIVE",
+      disambiguationReply: buildAvailabilityConfirmClarificationReply(),
+    };
+  }
+
+  if (pool.length === 1) {
+    return { request: pool[0], reason: "SINGLE_MATCH" };
+  }
+
+  const trustedLatest = pickLatestTrustedWaitingConfirmRequest(pool, nowMs);
+  if (trustedLatest) {
+    return { request: trustedLatest, reason: "LATEST_TRUSTED_MATCH" };
+  }
+
+  const trusted = pool.filter((row) =>
+    isTrustedWaitingConfirmBookingPromptCandidate(row, nowMs)
+  );
+  const optionsSource = trusted.length > 1 ? trusted : pool;
+  const options = optionsSource.slice(0, 3).map((row) => {
     const label = clean(row.itemLabel) || "car";
     const duration = formatAvailabilityDurationPhrase(row);
     return `${label} ${duration}`.trim();
@@ -970,19 +1034,32 @@ export async function handleAvailabilityCustomerCloudInbound({
     businessId: uid,
     customerPhone: phone,
   });
-  const selection = selectAvailabilityRequestForCustomerMessage(waiting, text);
+  const inactiveOrSuperseded = await findSupersededCloudAvailabilityRequestsByPhone({
+    db: connection,
+    businessId: uid,
+    customerPhone: phone,
+  }).catch(() => []);
+  const selection = selectAvailabilityRequestForCustomerMessage(waiting, text, {
+    inactiveOrSupersededRequests: inactiveOrSuperseded,
+  });
   let request = selection.request;
 
-  if (!request && waiting.length === 0) {
+  if (!request && waiting.length === 0 && selection.reason !== "NAMED_INACTIVE") {
     return { handled: false, reason: "NO_WAITING_REQUEST" };
   }
 
-  if (!request && selection.reason === "AMBIGUOUS") {
-    const reply = selection.disambiguationReply || buildAvailabilityConfirmClarificationReply();
+  if (!request && (selection.reason === "AMBIGUOUS" || selection.reason === "NAMED_INACTIVE")) {
+    const reply =
+      selection.disambiguationReply || buildAvailabilityConfirmClarificationReply();
     await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
       recipientType: "individual",
     }).catch(() => null);
-    return { handled: true, action: "disambiguation", reply, requestId: null };
+    return {
+      handled: true,
+      action: selection.reason === "NAMED_INACTIVE" ? "clarification" : "disambiguation",
+      reply,
+      requestId: null,
+    };
   }
 
   if (!request) {
