@@ -68,6 +68,19 @@ test("isIntentionalSilentInboundResult requires sendVia NONE plus structured met
     }),
     true
   );
+  assert.equal(
+    __isIntentionalSilentInboundResultForTests({
+      sendVia: "NONE",
+      messageMeta: {
+        routeType: "BRAIN_V2_LIVE_SILENT",
+        outboundTrace: {
+          finalReplySource: "BRAIN_V2_LIVE_SILENT",
+          reason: "ASSIST_CONTEXT_NO_REPLY",
+        },
+      },
+    }),
+    true
+  );
 });
 
 test("empty reply without structured signal is not intentional silent", () => {

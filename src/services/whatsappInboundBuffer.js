@@ -1053,6 +1053,8 @@ export function isIntentionalSilentInboundResult(p) {
     p?.messageMeta && typeof p.messageMeta === "object" ? p.messageMeta : null;
   if (!meta) return false;
   if (meta.handledWithoutOutbound === true) return true;
+  if (String(meta.routeType ?? "").trim() === "BRAIN_V2_LIVE_SILENT") return true;
+  if (String(meta.reason ?? "").trim() === "ASSIST_CONTEXT_NO_REPLY") return true;
   const trace =
     meta.outboundTrace && typeof meta.outboundTrace === "object"
       ? meta.outboundTrace
@@ -1060,6 +1062,10 @@ export function isIntentionalSilentInboundResult(p) {
   if (!trace) return false;
   if (String(trace.kind ?? "").trim() === "silent_noop") return true;
   if (String(trace.finalReplySource ?? "").trim() === "PURE_ACK_SILENT") return true;
+  if (String(trace.finalReplySource ?? "").trim() === "BRAIN_V2_LIVE_SILENT") {
+    return true;
+  }
+  if (String(trace.reason ?? "").trim() === "ASSIST_CONTEXT_NO_REPLY") return true;
   return false;
 }
 
@@ -1071,6 +1077,86 @@ export function isIntentionalSilentInboundResult(p) {
  */
 function playwrightInboundTurnComplete(outboundReplyDelivered, intentionalSilent) {
   return Boolean(outboundReplyDelivered || intentionalSilent);
+}
+
+/**
+ * Admit-turn ledger completion: done (reply or intentional silent) or failed.
+ * Never leave Playwright inbound stuck in processing for empty/no-send.
+ *
+ * @param {{
+ *   guaranteeKey: string,
+ *   isPlaywrightWebTab: boolean,
+ *   processingSuccess: boolean,
+ *   outboundReplyDelivered: boolean,
+ *   intentionalSilent: boolean,
+ *   burstStableIds?: string[],
+ *   textPreview?: string,
+ *   lastError?: string | null,
+ * }} p
+ * @returns {"done" | "failed" | "noop"}
+ */
+function finalizeAdmittedInboundTurnLedger(p) {
+  const guaranteeKey = String(p?.guaranteeKey ?? "").trim();
+  if (!guaranteeKey) return "noop";
+  const outboundReplyDelivered = Boolean(p.outboundReplyDelivered);
+  const intentionalSilent = Boolean(p.intentionalSilent);
+  const processingSuccess = Boolean(p.processingSuccess);
+  const isPlaywrightWebTab = Boolean(p.isPlaywrightWebTab);
+  const turnComplete = playwrightInboundTurnComplete(
+    outboundReplyDelivered,
+    intentionalSilent
+  );
+  const textPreview = String(p.textPreview ?? "").slice(0, 120);
+  const burstStableIds = p.burstStableIds;
+  if (processingSuccess && (!isPlaywrightWebTab || turnComplete)) {
+    setMessageState(guaranteeKey, "done");
+    markInboundTurnLedgerDoneForGuarantee({
+      guaranteeKey,
+      burstStableIds,
+      replySent: outboundReplyDelivered,
+      textPreview,
+    });
+    return "done";
+  }
+  if (isPlaywrightWebTab && !turnComplete) {
+    console.log("⚠️ No reply sent — marking inbound ledger failed", {
+      guaranteeKey,
+      lastError: p.lastError ?? "no_outbound_incomplete",
+    });
+    setMessageState(guaranteeKey, "failed");
+    markInboundTurnLedgerFailedForGuarantee({
+      guaranteeKey,
+      burstStableIds,
+      textPreview,
+      lastError: p.lastError ?? "no_outbound_incomplete",
+    });
+    return "failed";
+  }
+  return "noop";
+}
+
+/**
+ * Pipeline hard-timeout: release UI locks and fail the admitted ledger turn.
+ * @param {{
+ *   guaranteeKey: string,
+ *   burstStableIds?: string[],
+ *   textPreview?: string,
+ * }} p
+ */
+function markAdmittedInboundTurnTimedOut(p) {
+  console.log("⚠️ Pipeline timeout — force release");
+  globalThis.__ACTIVE_PIPELINE__ = false;
+  globalThis.__UI_HARD_LOCK = false;
+  releasePlaywrightListenerProcessingLocks();
+  const guaranteeKey = String(p?.guaranteeKey ?? "").trim();
+  if (!guaranteeKey) return;
+  setMessageState(guaranteeKey, "failed");
+  markInboundTurnLedgerFailedForGuarantee({
+    guaranteeKey,
+    burstStableIds: p.burstStableIds,
+    textPreview: String(p.textPreview ?? "").slice(0, 120),
+    lastError: "pipeline_timeout",
+  });
 }
 
 /**
@@ -1499,15 +1585,6 @@ export async function executeWhatsAppAiPipeline(p) {
   globalThis.__activeJobStart = Date.now();
 
   let pipelineTimeoutId = null;
-  if (isPlaywrightWebTabInbound(p)) {
-    /** Text + model + image download + WA Web attach/preview often exceeds 15s; releasing locks mid-send breaks uploads. */
-    pipelineTimeoutId = setTimeout(() => {
-      console.log("⚠️ Pipeline timeout — force release");
-      globalThis.__ACTIVE_PIPELINE__ = false;
-      globalThis.__UI_HARD_LOCK = false;
-      releasePlaywrightListenerProcessingLocks();
-    }, 120_000);
-  }
 
   const guaranteeKey = isPlaywrightWebTabInbound(p)
     ? String(buildPlaywrightGuaranteeKey(groupNameResolved, messageId) ?? "").trim()
@@ -1541,6 +1618,21 @@ export async function executeWhatsAppAiPipeline(p) {
       }
       return;
     }
+  }
+
+  if (isPlaywrightWebTabInbound(p)) {
+    /** Text + model + image download + WA Web attach/preview often exceeds 15s; releasing locks mid-send breaks uploads. */
+    pipelineTimeoutId = setTimeout(() => {
+      const pendingTimeout =
+        guaranteeKey && globalThis.__playwrightPendingByGuarantee instanceof Map
+          ? globalThis.__playwrightPendingByGuarantee.get(guaranteeKey)
+          : null;
+      markAdmittedInboundTurnTimedOut({
+        guaranteeKey,
+        burstStableIds: pendingTimeout?.burstStableIds,
+        textPreview: String(combinedMessage ?? "").slice(0, 120),
+      });
+    }, 120_000);
   }
 
   console.time("TOTAL_RESPONSE");
@@ -2804,6 +2896,7 @@ export async function executeWhatsAppAiPipeline(p) {
         guaranteeKey,
         burstStableIds: pendingFail?.burstStableIds,
         textPreview: String(combinedMessage ?? "").slice(0, 120),
+        lastError: "processing_error",
       });
     }
   } finally {
@@ -2811,22 +2904,20 @@ export async function executeWhatsAppAiPipeline(p) {
       outboundReplyDelivered,
       intentionalSilent
     );
-    if (
-      guaranteeKey &&
-      processingSuccess &&
-      (!isPlaywrightWebTabInbound(p) || playwrightTurnCompleteFinally)
-    ) {
-      setMessageState(guaranteeKey, "done");
+    if (guaranteeKey) {
       const pendingDone =
         globalThis.__playwrightPendingByGuarantee?.get(guaranteeKey);
-      markInboundTurnLedgerDoneForGuarantee({
+      finalizeAdmittedInboundTurnLedger({
         guaranteeKey,
+        isPlaywrightWebTab: isPlaywrightWebTabInbound(p),
+        processingSuccess,
+        outboundReplyDelivered,
+        intentionalSilent,
         burstStableIds: pendingDone?.burstStableIds,
-        replySent: outboundReplyDelivered,
         textPreview: String(combinedMessage ?? "").slice(0, 120),
+        // Preserve catch lastError when already failed; only set for empty no-send.
+        ...(processingSuccess ? { lastError: "no_outbound_incomplete" } : {}),
       });
-    } else if (guaranteeKey && !playwrightTurnCompleteFinally) {
-      console.log("⚠️ Not marking processed — no reply sent");
     }
     if (isPlaywrightWebTabInbound(p) && messageId) {
       const gk = buildPlaywrightGuaranteeKey(groupNameResolved, messageId);
@@ -3552,6 +3643,16 @@ export function __playwrightInboundTurnCompleteForTests(
   intentionalSilent
 ) {
   return playwrightInboundTurnComplete(outboundReplyDelivered, intentionalSilent);
+}
+
+/** @param {Parameters<typeof finalizeAdmittedInboundTurnLedger>[0]} p */
+export function __finalizeAdmittedInboundTurnLedgerForTests(p) {
+  return finalizeAdmittedInboundTurnLedger(p);
+}
+
+/** @param {Parameters<typeof markAdmittedInboundTurnTimedOut>[0]} p */
+export function __markAdmittedInboundTurnTimedOutForTests(p) {
+  return markAdmittedInboundTurnTimedOut(p);
 }
 
 /**
