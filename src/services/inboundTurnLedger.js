@@ -316,7 +316,13 @@ export function markInboundTurnLedgerDone(p) {
 }
 
 /**
- * @param {{ chatKey: string, stableId: string, guaranteeKey?: string, textPreview?: string }} p
+ * @param {{
+ *   chatKey: string,
+ *   stableId: string,
+ *   guaranteeKey?: string,
+ *   textPreview?: string,
+ *   lastError?: string | null,
+ * }} p
  */
 export function markInboundTurnLedgerFailed(p) {
   if (!isInboundTurnLedgerEnabled()) return;
@@ -329,6 +335,12 @@ export function markInboundTurnLedgerFailed(p) {
   if (existing?.state === "done" || existing?.state === "outbound_locked") return;
   const guaranteeKey =
     String(p.guaranteeKey ?? "").trim() || key;
+  const lastErrorPatch =
+    p.lastError !== undefined
+      ? String(p.lastError ?? "").trim() !== ""
+        ? String(p.lastError).slice(0, 160)
+        : null
+      : existing?.lastError ?? null;
   upsertEntry(key, {
     chatKey,
     stableId,
@@ -339,6 +351,7 @@ export function markInboundTurnLedgerFailed(p) {
       120
     ),
     processingAt: null,
+    lastError: lastErrorPatch,
   });
 }
 
@@ -623,7 +636,12 @@ export function markInboundTurnLedgerDoneForGuarantee(p) {
 }
 
 /**
- * @param {{ guaranteeKey: string, burstStableIds?: string[], textPreview?: string }} p
+ * @param {{
+ *   guaranteeKey: string,
+ *   burstStableIds?: string[],
+ *   textPreview?: string,
+ *   lastError?: string | null,
+ * }} p
  */
 export function markInboundTurnLedgerFailedForGuarantee(p) {
   if (!isInboundTurnLedgerEnabled()) return;
@@ -641,6 +659,7 @@ export function markInboundTurnLedgerFailedForGuarantee(p) {
       stableId: sid,
       guaranteeKey: buildInboundTurnLedgerKey(chatKey, sid),
       textPreview: p.textPreview,
+      lastError: p.lastError,
     });
   }
 }
