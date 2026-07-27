@@ -310,10 +310,8 @@ export async function runBrainV2LivePipeline(params) {
       if (suppressedPlan) return suppressedPlan;
     }
 
-    const { sideEffectResults, bookingCreated, ...routed } = await routeAndExecuteLiveActionPlan(
-      result.actionPlan,
-      flags,
-      {
+    const { sideEffectResults, bookingCreated, customerReplySuppressed, ...routed } =
+      await routeAndExecuteLiveActionPlan(result.actionPlan, flags, {
         ...params.executionContext,
         businessId,
         userId: businessId,
@@ -344,8 +342,27 @@ export async function runBrainV2LivePipeline(params) {
         sourcePlaywrightChatKey: params.playwrightChatKey ?? params.chatId ?? null,
         source: params.playwrightWebInbound === true ? "playwright" : channel,
         isGroupInbound: params.isGroupInbound,
-      }
-    );
+      });
+
+    if (customerReplySuppressed === true) {
+      const emilySessionKeySilent = String(
+        turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
+      ).trim();
+      applyInfoLiveSessionMemoryPatch({
+        sessionKey: emilySessionKeySilent,
+        actionPlan: result.actionPlan,
+        authoritativeItem: turnContextInput.authoritativeItem,
+      });
+      const disposition = String(
+        sideEffectResults?.AVAILABILITY_OWNER_CHECK_REQUIRED?.replyDisposition ??
+          sideEffectResults?.AVAILABILITY_OWNER_CHECK_REQUIRED?.lifecycleKind ??
+          "OWNER_CHECK_REPLY_SUPPRESSED"
+      ).trim();
+      return buildSilentPipelineResult({
+        traceId,
+        reason: disposition || "OWNER_CHECK_REPLY_SUPPRESSED",
+      });
+    }
 
     const emilySessionKey = String(turnContextInput._emilySessionKey ?? params.sessionKey ?? "").trim();
     applyInfoLiveSessionMemoryPatch({
