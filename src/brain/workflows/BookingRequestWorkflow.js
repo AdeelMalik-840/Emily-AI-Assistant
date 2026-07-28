@@ -6,20 +6,14 @@ import { randomUUID } from "node:crypto";
 /** @typedef {import("../contracts/action.js").ActionPlan} ActionPlan */
 
 /**
+ * Draft only when CREATE_BOOKING actually executes. Never used as a false
+ * "checking" promise when execute is false.
+ *
  * @param {string} itemLabel
  * @param {number | undefined} durationDays
  * @returns {string}
  */
 function buildGroupBookingSubmittedDraft(itemLabel, durationDays) {
-  return "Theek hai, mai check kr k btata hun.";
-}
-
-/**
- * @param {string} itemLabel
- * @param {number | undefined} durationDays
- * @returns {string}
- */
-function buildGroupBookingNotSubmittedDraft(itemLabel, durationDays) {
   return "Theek hai, mai check kr k btata hun.";
 }
 
@@ -116,15 +110,15 @@ export function buildBookingRequestActionPlan({
     durationDays,
   });
   const notifyOwnerExecute = createBookingExecute && policy.ownerExecute === true;
+  // Truthfulness: never promise checking/booking when CREATE_BOOKING will not run.
   const replyDraft = createBookingExecute
     ? buildGroupBookingSubmittedDraft(itemLabel, durationDays ?? undefined)
-    : buildGroupBookingNotSubmittedDraft(itemLabel, durationDays ?? undefined);
+    : "";
 
-  return Object.freeze({
-    planId: randomUUID(),
-    workflowType: "booking_request",
-    replyDraft,
-    actions: Object.freeze([
+  /** @type {import("../contracts/action.js").ActionPlanItem[]} */
+  const actions = [];
+  if (createBookingExecute) {
+    actions.push(
       Object.freeze({
         type: "REPLY",
         payload: Object.freeze({
@@ -133,52 +127,70 @@ export function buildBookingRequestActionPlan({
           groupSafeBookingAck: true,
           execute: false,
         }),
-      }),
+      })
+    );
+  } else {
+    actions.push(
       Object.freeze({
-        type: "CREATE_BOOKING",
+        type: "NO_OP",
         payload: Object.freeze({
-          itemId,
-          itemLabel,
-          itemName: itemLabel,
-          durationDays,
-          sourceMessage: message,
-          sourceMessageId:
-            String(canonicalTurn?.sourceMessageId ?? sourceIdentity?.sourceMessageId ?? "").trim() ||
-            null,
-          sourceRowKey:
-            String(canonicalTurn?.sourceRowKey ?? sourceIdentity?.sourceRowKey ?? "").trim() ||
-            null,
-          sourceTurnKey:
-            String(canonicalTurn?.sourceTurnKey ?? sourceIdentity?.sourceTurnKey ?? "").trim() ||
-            null,
-          guaranteeKey:
-            String(canonicalTurn?.guaranteeKey ?? sourceIdentity?.guaranteeKey ?? "").trim() ||
-            null,
-          participantKey:
-            String(sourceIdentity?.participantKey ?? "").trim() ||
-            null,
-          approvalStage: "pending_owner_approval",
-          execute: createBookingExecute,
-        }),
-      }),
-      Object.freeze({
-        type: "NOTIFY_OWNER",
-        payload: Object.freeze({
-          reason: "booking_pending_owner_approval",
-          itemId,
-          execute: notifyOwnerExecute,
-        }),
-      }),
-      Object.freeze({
-        type: "UPDATE_STATE",
-        payload: Object.freeze({
-          clearPendingAction: true,
-          pendingActionType: "collect_duration",
-          stage: "pending_owner_approval",
+          intentionallySilent: true,
+          reason: "booking_request_no_executable_action",
           execute: false,
         }),
+      })
+    );
+  }
+  actions.push(
+    Object.freeze({
+      type: "CREATE_BOOKING",
+      payload: Object.freeze({
+        itemId,
+        itemLabel,
+        itemName: itemLabel,
+        durationDays,
+        sourceMessage: message,
+        sourceMessageId:
+          String(canonicalTurn?.sourceMessageId ?? sourceIdentity?.sourceMessageId ?? "").trim() ||
+          null,
+        sourceRowKey:
+          String(canonicalTurn?.sourceRowKey ?? sourceIdentity?.sourceRowKey ?? "").trim() ||
+          null,
+        sourceTurnKey:
+          String(canonicalTurn?.sourceTurnKey ?? sourceIdentity?.sourceTurnKey ?? "").trim() ||
+          null,
+        guaranteeKey:
+          String(canonicalTurn?.guaranteeKey ?? sourceIdentity?.guaranteeKey ?? "").trim() ||
+          null,
+        participantKey: String(sourceIdentity?.participantKey ?? "").trim() || null,
+        approvalStage: "pending_owner_approval",
+        execute: createBookingExecute,
       }),
-    ]),
+    }),
+    Object.freeze({
+      type: "NOTIFY_OWNER",
+      payload: Object.freeze({
+        reason: "booking_pending_owner_approval",
+        itemId,
+        execute: notifyOwnerExecute,
+      }),
+    }),
+    Object.freeze({
+      type: "UPDATE_STATE",
+      payload: Object.freeze({
+        clearPendingAction: true,
+        pendingActionType: "collect_duration",
+        stage: "pending_owner_approval",
+        execute: false,
+      }),
+    })
+  );
+
+  return Object.freeze({
+    planId: randomUUID(),
+    workflowType: "booking_request",
+    replyDraft,
+    actions: Object.freeze(actions),
     persistenceIntent: Object.freeze({
       bookingIntent: true,
       ownerApprovalRequired: true,

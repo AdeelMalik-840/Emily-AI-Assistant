@@ -209,11 +209,14 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
   const freshAssist = readFreshLastAvailabilityAssist(
     memoryForAssist?.lastAvailabilityAssist
   );
-  // Context gate only: fresh assist → availability workflow so Brain can decide
-  // meaning. Does not treat short text as accept.
+  // Context gate only: fresh assist → availability workflow so the central Brain
+  // can decide meaning (alt select / price / question / book). Generic
+  // bookingCommitment (e.g. "3 din k lye") must NOT bypass this stage — that
+  // misroute sent BookingRequestWorkflow's false "checking" ack with no action.
+  // Price questions still interrupt so pricing workflow can own the turn.
   if (freshAssist) {
     const signals = understanding.signals ?? {};
-    if (!signals.priceAsk && !signals.bookingCommitment) {
+    if (!signals.priceAsk) {
       return {
         workflowType: "availability_inquiry",
         reason: "availability_assist_follow_up_pending",
