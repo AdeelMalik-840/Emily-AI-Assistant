@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import db from "../config/firebase.js";
 import admin from "firebase-admin";
 import { logBookingEvent } from "../utils/bookingLogger.js";
+import { bookingOverlapsRequestedWindow } from "./bookingIntervalOverlap.js";
 
 const Timestamp = admin.firestore.Timestamp;
 const FieldValue = admin.firestore.FieldValue;
@@ -716,16 +717,10 @@ function toValidDate(d) {
   return ms != null ? new Date(ms) : null;
 }
 
-function normalizeDateOnly(date) {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function hasDateOverlap(aStart, aEnd, bStart, bEnd) {
-  return aStart < bEnd && bStart < aEnd;
-}
-
+/**
+ * Exact-time half-open overlap via shared {@link bookingOverlapsRequestedWindow}.
+ * Invalid booking/window endpoints fail closed when a blocking status is present.
+ */
 function bookingBlocksWindow(booking, itemId, windowStart, windowEnd, opts = {}) {
   const normalizedItemId = String(itemId ?? "").trim();
   const bookingItemId = String(booking?.itemId ?? "").trim();
@@ -737,30 +732,23 @@ function bookingBlocksWindow(booking, itemId, windowStart, windowEnd, opts = {})
       itemId: normalizedItemId,
       bookingId: booking?.id ?? booking?.bookingId,
     })
-  ) return false;
+  ) {
+    return false;
+  }
 
-  const bStart = toValidDate(booking?.startDate ?? booking?.startAt ?? null);
-  const bEnd = toValidDate(booking?.endDate ?? booking?.endAt ?? null);
-  if (!bStart || !bEnd) {
+  const overlap = bookingOverlapsRequestedWindow(booking, windowStart, windowEnd);
+  if (!overlap.ok) {
     if (status) {
-      console.log("[INVALID BOOKING DATE — BLOCKING]", booking);
+      console.log("[INVALID BOOKING DATE — BLOCKING]", {
+        bookingId: booking?.id ?? booking?.bookingId ?? null,
+        itemId: normalizedItemId,
+        reason: overlap.reason ?? "invalid_interval",
+      });
       return opts.conservativeInvalidDates !== false;
     }
     return false;
   }
-
-  const wStart = toValidDate(windowStart);
-  const wEnd = toValidDate(windowEnd);
-  if (!wStart || !wEnd) {
-    return NO_DATE_BLOCK_MODE === "conservative";
-  }
-
-  return hasDateOverlap(
-    normalizeDateOnly(wStart),
-    normalizeDateOnly(wEnd),
-    normalizeDateOnly(bStart),
-    normalizeDateOnly(bEnd)
-  );
+  return overlap.overlaps === true;
 }
 
 /**
@@ -880,28 +868,29 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
       console.log("[INVALID BOOKING DATE — BLOCKING]", b);
       return Boolean(status);
     }
-    if (blockingEnd == null || bEnd.getTime() > blockingEnd) {
-      blockingEnd = bEnd.getTime();
-    }
 
+    let blocks = false;
     if (!reqStart || !reqEnd) {
       if (!status) {
-        return hasDateOverlap(
-          normalizeDateOnly(new Date()),
-          normalizeDateOnly(new Date(Date.now() + 86400000)),
-          normalizeDateOnly(bStart),
-          normalizeDateOnly(bEnd)
+        const fallback = bookingOverlapsRequestedWindow(
+          b,
+          new Date(),
+          new Date(Date.now() + 86400000)
         );
+        blocks = fallback.ok ? fallback.overlaps === true : true;
+      } else {
+        blocks = NO_DATE_BLOCK_MODE === "conservative";
       }
-      return NO_DATE_BLOCK_MODE === "conservative";
+    } else {
+      const overlap = bookingOverlapsRequestedWindow(b, reqStart, reqEnd);
+      // Fail closed: invalid intervals never report available.
+      blocks = overlap.ok ? overlap.overlaps === true : true;
     }
 
-    return hasDateOverlap(
-      normalizeDateOnly(reqStart),
-      normalizeDateOnly(reqEnd),
-      normalizeDateOnly(bStart),
-      normalizeDateOnly(bEnd)
-    );
+    if (blocks && (blockingEnd == null || bEnd.getTime() > blockingEnd)) {
+      blockingEnd = bEnd.getTime();
+    }
+    return blocks;
   });
   const hasBlockingBooking = blockingBookings.length > 0;
   const blockingStatusesSeen = Array.from(
