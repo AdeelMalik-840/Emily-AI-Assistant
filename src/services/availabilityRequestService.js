@@ -153,10 +153,114 @@ function scanAvailabilityRequestsFromTestStore(connection, businessId) {
   return rows;
 }
 
-function pickLatestActiveAvailabilityRequest(rows, logicalRequestKey) {
+function isTimestampExpired(value, nowMs = Date.now()) {
+  if (value == null || value === "") return false;
+  const ms =
+    value instanceof Date
+      ? value.getTime()
+      : typeof value?.toDate === "function"
+        ? value.toDate().getTime()
+        : new Date(value).getTime();
+  return Number.isFinite(ms) && ms <= nowMs;
+}
+
+/**
+ * When both sides have explicit requestedDates, they must match for semantic reuse.
+ * Duration-only identity is unchanged; this is a post-match eligibility gate.
+ * @param {Record<string, unknown>} existing
+ * @param {Record<string, unknown>} normalized
+ */
+export function explicitRequestedDatesCompatible(existing = {}, normalized = {}) {
+  const existingDates = normalizeRequestedDates(existing.requestedDates);
+  const incomingDates = normalizeRequestedDates(normalized.requestedDates);
+  // Neither side has an explicit window — date comparison does not block reuse.
+  if (existingDates.length === 0 && incomingDates.length === 0) return true;
+  // One-sided explicit windows are not compatible for cross-source semantic reuse.
+  if (existingDates.length === 0 || incomingDates.length === 0) return false;
+  return [...existingDates].sort().join("|") === [...incomingDates].sort().join("|");
+}
+
+/**
+ * Lifecycle-aware semantic reuse eligibility (different inbound turn).
+ * Exact-source turn idempotency is handled separately by deterministic requestId.
+ *
+ * Cross-source pending/processing reuse is intentionally disabled until a product-approved
+ * short freshness window exists. Document expiresAt (7d TTL metadata) is NOT that window.
+ *
+ * @param {Record<string, unknown>} row
+ * @param {Record<string, unknown>} [normalized]
+ * @param {number} [nowMs]
+ * @returns {{ reusable: boolean, kind: string | null, reason: string | null }}
+ */
+export function evaluateSemanticAvailabilityReuseEligibility(
+  row = {},
+  normalized = {},
+  nowMs = Date.now()
+) {
+  const status = clean(row.status) || "pending";
+  const confirmStatus = clean(row.customerConfirmationStatus);
+
+  if (FINAL_AVAILABILITY_REQUEST_STATUSES.has(status)) {
+    return { reusable: false, kind: null, reason: "TERMINAL_STATUS" };
+  }
+  if (
+    confirmStatus === "superseded" ||
+    confirmStatus === "confirmed" ||
+    confirmStatus === "declined"
+  ) {
+    return { reusable: false, kind: null, reason: `CONFIRM_${confirmStatus.toUpperCase()}` };
+  }
+  if (clean(row.supersededByAvailabilityRequestId)) {
+    return { reusable: false, kind: null, reason: "SUPERSEDED_BY" };
+  }
+  if (clean(row.linkedBookingId)) {
+    return { reusable: false, kind: null, reason: "LINKED_BOOKING" };
+  }
+  if (!explicitRequestedDatesCompatible(row, normalized)) {
+    return { reusable: false, kind: null, reason: "DATE_WINDOW_MISMATCH" };
+  }
+
+  // Pending/processing: never semantically reuse across different source turns.
+  // Exact-source replay still covers restart/idempotency via deterministic requestId.
+  // Seven-day document expiresAt is request lifecycle metadata, not an approved dedupe window.
+  if (status === "pending" || status === "processing") {
+    return {
+      reusable: false,
+      kind: null,
+      reason: "CROSS_SOURCE_PENDING_NO_APPROVED_FRESHNESS",
+    };
+  }
+
+  if (status === "approved" && confirmStatus === "waiting_confirm") {
+    if (isTimestampExpired(row.confirmExpiresAt, nowMs)) {
+      return { reusable: false, kind: null, reason: "CONFIRM_EXPIRED" };
+    }
+    return { reusable: true, kind: "waiting_confirm", reason: null };
+  }
+
+  if (status === "waiting_confirm") {
+    if (isTimestampExpired(row.confirmExpiresAt, nowMs)) {
+      return { reusable: false, kind: null, reason: "CONFIRM_EXPIRED" };
+    }
+    return { reusable: true, kind: "waiting_confirm", reason: null };
+  }
+
+  // approved alone (including approved without open waiting_confirm) is not semantically reusable
+  if (status === "approved") {
+    return { reusable: false, kind: null, reason: "APPROVED_NOT_WAITING_CONFIRM" };
+  }
+
+  if (!ACTIVE_AVAILABILITY_REQUEST_STATUSES.has(status)) {
+    return { reusable: false, kind: null, reason: "NOT_ACTIVE_STATUS" };
+  }
+
+  return { reusable: false, kind: null, reason: "NOT_OPEN_JOURNEY" };
+}
+
+function pickLatestActiveAvailabilityRequest(rows, logicalRequestKey, normalized = {}, nowMs = Date.now()) {
   const active = rows.filter((row) => {
     if (clean(row.logicalRequestKey) !== logicalRequestKey) return false;
-    return ACTIVE_AVAILABILITY_REQUEST_STATUSES.has(clean(row.status) || "pending");
+    return evaluateSemanticAvailabilityReuseEligibility(row, normalized, nowMs).reusable;
   });
   if (active.length === 0) return null;
   active.sort((a, b) => {
@@ -165,7 +269,12 @@ function pickLatestActiveAvailabilityRequest(rows, logicalRequestKey) {
     return bMs - aMs;
   });
   const winner = active[0];
-  return { requestId: clean(winner.requestId) || null, ...winner };
+  const eligibility = evaluateSemanticAvailabilityReuseEligibility(winner, normalized, nowMs);
+  return {
+    requestId: clean(winner.requestId) || null,
+    ...winner,
+    semanticReuseKind: eligibility.kind,
+  };
 }
 
 /**
@@ -174,6 +283,7 @@ function pickLatestActiveAvailabilityRequest(rows, logicalRequestKey) {
  *   businessId: string,
  *   normalized?: Record<string, unknown>,
  *   logicalRequestKey?: string,
+ *   nowMs?: number,
  * }} params
  */
 export async function findExistingActiveAvailabilityRequest({
@@ -181,6 +291,7 @@ export async function findExistingActiveAvailabilityRequest({
   businessId,
   normalized = {},
   logicalRequestKey = "",
+  nowMs = Date.now(),
 }) {
   const uid = clean(businessId);
   const key = clean(logicalRequestKey) || buildLogicalAvailabilityRequestKey(normalized);
@@ -197,12 +308,12 @@ export async function findExistingActiveAvailabilityRequest({
       requestId: doc.id,
       ...(typeof doc.data === "function" ? doc.data() || {} : {}),
     }));
-    const fromQuery = pickLatestActiveAvailabilityRequest(queryRows, key);
+    const fromQuery = pickLatestActiveAvailabilityRequest(queryRows, key, normalized, nowMs);
     if (fromQuery) return fromQuery;
   }
 
   const scanned = scanAvailabilityRequestsFromTestStore(connection, uid);
-  return pickLatestActiveAvailabilityRequest(scanned, key);
+  return pickLatestActiveAvailabilityRequest(scanned, key, normalized, nowMs);
 }
 
 function firstSanitizedParticipantDisplayName(...candidates) {
@@ -420,31 +531,7 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     return { ok: false, blocked: true, reason: "MISSING_STABLE_TURN_KEY", requestId: null, status: null, request: null, created: false };
   }
 
-  const semanticExisting = await findExistingActiveAvailabilityRequest({
-    db: connection,
-    businessId: normalized.businessId,
-    normalized,
-    logicalRequestKey: normalized.logicalRequestKey,
-  });
-  if (semanticExisting?.requestId) {
-    const request = await getAvailabilityRequest({
-      db: connection,
-      businessId: normalized.businessId,
-      requestId: semanticExisting.requestId,
-    });
-    if (request) {
-      return {
-        ok: true,
-        requestId: semanticExisting.requestId,
-        status: String(request.status ?? "pending"),
-        request,
-        created: false,
-        reused: true,
-        reuseReason: "SEMANTIC_IDEMPOTENT",
-      };
-    }
-  }
-
+  // 1) Exact-source hard idempotency (same sourceTurnKey / deterministic requestId)
   const ref = availabilityRequestDocRef(connection, normalized.businessId, normalized.requestId);
   if (!ref) {
     return { ok: false, blocked: true, reason: "MISSING_REQUEST_REF", requestId: normalized.requestId, status: null, request: null, created: false };
@@ -459,7 +546,43 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
       status: String(request.status ?? "pending"),
       request,
       created: false,
+      reused: true,
+      reuseReason: "EXACT_SOURCE_TURN",
+      lifecycleKind: "exact_source_replay",
     };
+  }
+
+  // 2) Semantic reuse for a different inbound turn — lifecycle-aware only
+  const semanticExisting = await findExistingActiveAvailabilityRequest({
+    db: connection,
+    businessId: normalized.businessId,
+    normalized,
+    logicalRequestKey: normalized.logicalRequestKey,
+  });
+  if (semanticExisting?.requestId) {
+    const request = await getAvailabilityRequest({
+      db: connection,
+      businessId: normalized.businessId,
+      requestId: semanticExisting.requestId,
+    });
+    if (request) {
+      const eligibility = evaluateSemanticAvailabilityReuseEligibility(request, normalized);
+      const lifecycleKind =
+        eligibility.kind === "waiting_confirm"
+          ? "waiting_confirm_reused"
+          : "pending_owner_check_reused";
+      return {
+        ok: true,
+        requestId: semanticExisting.requestId,
+        status: String(request.status ?? "pending"),
+        request,
+        created: false,
+        reused: true,
+        reuseReason: "SEMANTIC_IDEMPOTENT",
+        lifecycleKind,
+        semanticReuseKind: eligibility.kind,
+      };
+    }
   }
 
   const phoneExtractionFields = buildInitialAvailabilityPhoneExtractionFields({
@@ -499,6 +622,8 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     status: request.status,
     request,
     created: true,
+    reused: false,
+    lifecycleKind: "fresh_owner_check",
   };
 }
 
