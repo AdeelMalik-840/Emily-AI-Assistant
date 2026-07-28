@@ -34,6 +34,7 @@ import {
   supersedeOtherWaitingConfirmAvailabilityRequestsForCustomer,
   updateAvailabilityRequestFields,
 } from "./availabilityRequestService.js";
+import { detectAvailabilityRequestBookingConflict } from "./availabilityBookingConflictGuard.js";
 import {
   maskCustomerPhone,
   normalizeCustomerPhoneDigits,
@@ -554,6 +555,7 @@ export async function sendAvailabilityCustomerNotification({
   replyPrivatelyFn = replyPrivatelyToLatestUserMessage,
   extractDmContactPhoneFn = extractDmContactPhoneFromOpenChat,
   refocusGroupFn = refocusChatRowForTitle,
+  getBookingsForItemFn = null,
 }) {
   const firestore = connection ?? db;
   const uid = clean(businessId ?? executionContext.businessId ?? executionContext.userId);
@@ -589,6 +591,46 @@ export async function sendAvailabilityCustomerNotification({
       requestId: rid,
       method: clean(current.approvalCustomerNotificationMethod) || null,
     };
+  }
+  if (notificationStatus === "skipped") {
+    return {
+      ok: true,
+      skipped: true,
+      reason:
+        clean(current.approvalCustomerNotificationError) || "ALREADY_SKIPPED",
+      requestId: rid,
+      method: clean(current.approvalCustomerNotificationMethod) || null,
+    };
+  }
+
+  // Safety: owner approval must not tell the customer "available" when a
+  // blocking booking now overlaps the requested window (exact timestamps).
+  if (requestStatus === "approved") {
+    const conflict = await detectAvailabilityRequestBookingConflict({
+      businessId: uid,
+      request: current,
+      getBookingsForItemFn:
+        getBookingsForItemFn ?? executionContext.getBookingsForItemFn,
+    });
+    if (conflict.conflict) {
+      await markAvailabilityRequestCustomerNotificationSkipped({
+        db: firestore,
+        businessId: uid,
+        requestId: rid,
+        approvalCustomerNotificationError:
+          conflict.reason || "booking_conflict_detected",
+        approvalCustomerNotificationMethod: "skipped_booking_conflict",
+      });
+      return {
+        ok: false,
+        skipped: true,
+        reason: conflict.reason || "booking_conflict_detected",
+        requestId: rid,
+        method: "skipped_booking_conflict",
+        bookingConflict: true,
+        conflictingBookingId: conflict.bookingId,
+      };
+    }
   }
 
   const catalogRow = await loadCatalogRow(uid, current);
