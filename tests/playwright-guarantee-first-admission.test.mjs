@@ -789,6 +789,7 @@ test("guarantee-first: walk-forward requires fresh admitted stable ids", () => {
   });
   const sorted = [civic, civicFollowUp];
   const st = mkFreshState();
+  st.baselineSeenStableIds.add(buildStableMessageKey(civic, sorted).id);
   const admitted = filterGuaranteeFirstEligibleUserRows({
     userMessages: sorted,
     acknowledgedAnchorIndex: 0,

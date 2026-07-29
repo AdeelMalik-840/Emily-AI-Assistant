@@ -3830,6 +3830,98 @@ export function filterGuaranteeFirstEligibleUserRows(p) {
   };
 }
 
+function hasStableIdBeenSeenInFreshSession(freshState, stableId) {
+  const sid = String(stableId ?? "").trim();
+  if (!sid) return false;
+  if (
+    freshState?.admittedFreshStableIds instanceof Set &&
+    freshState.admittedFreshStableIds.has(sid)
+  ) {
+    return true;
+  }
+  return (
+    freshState?.tickFirstSeenByStableId instanceof Map &&
+    freshState.tickFirstSeenByStableId.has(sid)
+  );
+}
+
+function hasNewerConflictingVerifiedUserRowForIndexReuse({
+  msg,
+  userMessages,
+  chatKey,
+  extractedList,
+  stableId,
+}) {
+  const sortedIndex = Number(msg?.__position);
+  if (!Number.isFinite(sortedIndex)) return true;
+  for (const newer of userMessages || []) {
+    if (newer === msg) continue;
+    const newerIndex = Number(newer?.__position);
+    if (!Number.isFinite(newerIndex) || newerIndex <= sortedIndex) continue;
+    if (!isVerifiedFreshDeltaUserRow(newer, chatKey)) continue;
+    if (isListenerInboundNoise(newer?.text)) return true;
+    const {
+      stableId: newerStableId,
+      strategy: newerStrategy,
+    } = resolvePlaywrightForwardIdentity(chatKey, newer, 0, extractedList);
+    const newerSid = String(newerStableId ?? "").trim();
+    if (
+      newerStrategy !== "WHATSAPP_DATA_ID" ||
+      !newerSid.startsWith("wa::") ||
+      newerSid.length <= "wa::".length
+    ) {
+      return true;
+    }
+    if (newerSid === stableId) continue;
+    // A distinct durable WhatsApp ID is an independent fresh turn, not
+    // evidence that this earlier unseen durable ID is historical.
+  }
+  return false;
+}
+
+function isUnseenWhatsAppIdIndexReuseAdmission({
+  msg,
+  userMessages,
+  freshState,
+  chatKey,
+  extractedList,
+  stableId,
+  strategy,
+  sortedIndex,
+  acknowledgedIndex,
+  resolvedIndex,
+}) {
+  if (strategy !== "WHATSAPP_DATA_ID") return false;
+  const sid = String(stableId ?? "").trim();
+  if (!sid.startsWith("wa::") || sid.length <= "wa::".length) return false;
+  if (!isVerifiedFreshDeltaUserRow(msg, chatKey)) return false;
+  if (hasStableIdBeenSeenInFreshSession(freshState, sid)) return false;
+  if (!Number.isFinite(sortedIndex) || !Number.isFinite(acknowledgedIndex)) {
+    return false;
+  }
+  if (sortedIndex !== acknowledgedIndex) return false;
+  if (!Number.isFinite(resolvedIndex) || sortedIndex < resolvedIndex) return false;
+  const currentAnchorStableId = String(
+    freshState?.currentTailAnchor?.stableId ?? ""
+  ).trim();
+  const lastAdmittedStableId = String(
+    freshState?.lastAdmittedStableId ?? ""
+  ).trim();
+  if (
+    (currentAnchorStableId && currentAnchorStableId === sid) ||
+    (lastAdmittedStableId && lastAdmittedStableId === sid)
+  ) {
+    return false;
+  }
+  return !hasNewerConflictingVerifiedUserRowForIndexReuse({
+    msg,
+    userMessages,
+    chatKey,
+    extractedList,
+    stableId: sid,
+  });
+}
+
 /**
  * Single listener authority for WhatsApp rows that may enter Brain.
  * DOM rows, ledger state, baseline, anchors, and guarantee state are evidence;
@@ -4053,11 +4145,50 @@ export function resolveFreshAdmittedTurns(p) {
       continue;
     }
 
+    const seenInFreshSession = hasStableIdBeenSeenInFreshSession(
+      freshState,
+      stableId
+    );
+    if (seenInFreshSession) {
+      if (droppedDone.length < 3) droppedDone.push(stableId);
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+        finalDecision: "drop",
+        dropReason: "session_seen_stable_id",
+        guaranteeState: st?.state || "idle",
+      });
+      recordRejected({
+        msg,
+        stableId,
+        sortedIndex,
+        dropReason: "session_seen_stable_id",
+        ledgerState: st?.state || "idle",
+      });
+      continue;
+    }
+
     const isStrictlyPostAnchor =
       Number.isFinite(sortedIndex) &&
       effectiveAnchorIndex != null &&
       sortedIndex > effectiveAnchorIndex;
-    if (!isStrictlyPostAnchor) {
+    const isUnseenIndexReuseAdmission =
+      !isStrictlyPostAnchor &&
+      isUnseenWhatsAppIdIndexReuseAdmission({
+        msg,
+        userMessages,
+        freshState,
+        chatKey,
+        extractedList,
+        stableId,
+        strategy,
+        sortedIndex,
+        acknowledgedIndex,
+        resolvedIndex,
+      });
+    if (!isStrictlyPostAnchor && !isUnseenIndexReuseAdmission) {
       if (droppedPreAnchor.length < 3) {
         droppedPreAnchor.push({
           stableId,
@@ -4095,6 +4226,9 @@ export function resolveFreshAdmittedTurns(p) {
       continue;
     }
 
+    const admissionReason = isUnseenIndexReuseAdmission
+      ? "ADMITTED_UNSEEN_WHATSAPP_ID_INDEX_REUSE"
+      : "ADMITTED_POST_CURRENT_ANCHOR";
     if (!tickFirstSeen.has(stableId)) {
       tickFirstSeen.set(stableId, tickMs);
     }
@@ -4115,8 +4249,11 @@ export function resolveFreshAdmittedTurns(p) {
       sourceMessageId: stableId,
       sourceRowKey: String(msg?.__rowKey ?? "").trim() || null,
       guaranteeKey,
+      admissionReason,
       freshnessProof: {
-        kind: "post_current_anchor",
+        kind: isUnseenIndexReuseAdmission
+          ? "unseen_whatsapp_id_index_reuse"
+          : "post_current_anchor",
         sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
         effectiveAnchorIndex,
       },
@@ -4142,6 +4279,7 @@ export function resolveFreshAdmittedTurns(p) {
       textPreview: String(msg?.text ?? "").slice(0, 120),
       finalDecision: "survivor",
       dropReason: null,
+      admissionReason,
       guaranteeState: st?.state || "idle",
     });
   }
