@@ -14,6 +14,7 @@
  * @property {ActionPlanItem[]} actions
  * @property {string} [replyDraft]
  * @property {Record<string, unknown>} [persistenceIntent]
+ * @property {"owner_check_result" | null} [postExecuteCustomerReply]
  */
 
 /**

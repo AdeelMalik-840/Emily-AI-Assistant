@@ -256,8 +256,8 @@ test("A4b: live pipeline Civic available? then 2 din → owner-check deferral no
     getBookingsForItemFn: async () => [],
   });
   assert.equal(follow.workflowType, "availability_inquiry");
-  assert.match(String(follow.reply ?? ""), /mai confirm kar leta hun/i);
-  assert.doesNotMatch(String(follow.reply ?? ""), /Theek hai, mai check kr k btata hun/i);
+  // PR1B: execute=false → silent, no false checking claim.
+  assert.equal(String(follow.reply ?? "").trim(), "");
   assert.equal(follow.messageMeta?.bookingCreated, undefined);
 });
 

@@ -182,6 +182,34 @@ function actionTypes(result) {
   return (result.actionPlan?.actions ?? []).map((action) => String(action?.type ?? ""));
 }
 
+function liveActionTypes(result) {
+  return (result.messageMeta?.actionPlan?.actions ?? []).map((a) => String(a?.type ?? ""));
+}
+
+function ownerCheckLiveAction(result) {
+  return (result.messageMeta?.actionPlan?.actions ?? []).find(
+    (a) => a?.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"
+  );
+}
+
+function assertExecuteFalseOwnerCheckSilence(result) {
+  const plan = result.messageMeta?.actionPlan;
+  const reply = String(result.reply ?? "");
+  assert.equal(result.workflowType, "availability_inquiry");
+  assert.equal(String(plan?.replyDraft ?? "").trim(), "");
+  assert.equal(reply.trim(), "");
+  assert.ok(!liveActionTypes(result).includes("CREATE_BOOKING"));
+  const ownerCheck = ownerCheckLiveAction(result);
+  assert.ok(ownerCheck, "AVAILABILITY_OWNER_CHECK_REQUIRED planned");
+  assert.equal(ownerCheck.payload?.execute, false);
+  assert.doesNotMatch(reply, /confirm kar leta/i, "no false confirmation claim");
+  assert.doesNotMatch(reply, /mai confirm/i, "no false confirm claim");
+  assert.doesNotMatch(reply, /check kar leta/i, "no false checking claim");
+  assert.doesNotMatch(reply, /booking confirm/i, "no booking ack");
+  assert.doesNotMatch(reply, /note kar liya/i, "no booking note claim");
+  assert.doesNotMatch(reply, /Available hai/i, "no false availability claim");
+}
+
 async function runLive(message, overrides = {}) {
   enableV2LiveEnv();
   return runBrainV2LivePipeline({
@@ -312,8 +340,10 @@ test("same participant context: availability follow-ups use remembered Civic", a
     participantKey: PARTICIPANT_A,
     memorySnapshot: memory,
   });
-  assert.equal(availability.workflowType, "availability_inquiry");
-  assert.match(String(availability.reply ?? ""), /Civic/i);
+  assertExecuteFalseOwnerCheckSilence(availability);
+  const ownerCheck = ownerCheckLiveAction(availability);
+  assert.equal(ownerCheck.payload?.itemId, CIVIC_ID, "remembered Civic from session memory");
+  assert.match(String(ownerCheck.payload?.itemLabel ?? ""), /Civic/i);
 });
 
 test("same participant context: fuzzy itemless amount follow-up stays pricing, not booking", async () => {
@@ -377,14 +407,11 @@ for (const message of weakNeedAvailabilityCases) {
 }
 
 test("phase A live: weak need availability defers to owner check, not booking ack", async () => {
-  enableV2LiveEnv();
   const result = await runLive("Civic 3 din k lye chahiye");
-  assert.equal(result.workflowType, "availability_inquiry");
-  assert.match(String(result.reply ?? ""), /confirm kar leta hun/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /booking confirm/i);
-  const actions = (result.messageMeta?.actionPlan?.actions ?? []).map((a) => a.type);
-  assert.ok(!actions.includes("CREATE_BOOKING"));
-  assert.ok(actions.includes("AVAILABILITY_OWNER_CHECK_REQUIRED"));
+  assertExecuteFalseOwnerCheckSilence(result);
+  const ownerCheck = ownerCheckLiveAction(result);
+  assert.equal(ownerCheck.payload?.itemId, CIVIC_ID);
+  assert.equal(ownerCheck.payload?.durationDays, 3);
 });
 
 test("phase A decision: Stonic kal ke liye chahiye price stays pricing, not availability owner check", async () => {

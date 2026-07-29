@@ -125,7 +125,7 @@ test("1: Civic available? asks duration and creates no owner action", () => {
   assert.ok(!plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"));
 });
 
-test("2: Civic 3 din ke liye available hai? creates AVAILABILITY_OWNER_CHECK_REQUIRED", () => {
+test("2: Civic 3 din ke liye available hai? — execute=false creates silent owner-check plan", () => {
   const plan = buildAvailabilityInquiryActionPlan({
     admittedTurn: makeAdmittedTurn("Civic 3 din ke liye available hai?"),
     understanding: {
@@ -141,18 +141,15 @@ test("2: Civic 3 din ke liye available hai? creates AVAILABILITY_OWNER_CHECK_REQ
   });
 
   const ownerAction = plan.actions.find((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED");
-  assert.ok(ownerAction);
+  assert.ok(ownerAction, "owner-check action still present for routing visibility");
   assert.equal(ownerAction.payload.execute, false);
   assert.equal(ownerAction.payload.itemId, CIVIC_ID);
   assert.equal(ownerAction.payload.durationDays, 3);
   assert.equal(ownerAction.payload.canonicalAvailability?.status, "available");
-  assert.equal(
-    plan.replyDraft,
-    "Civic 3 din ke liye mai confirm kar leta hun."
-  );
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Available hai/i);
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Check DM/i);
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /owner ko bhej/i);
+  // PR1B: execute=false — empty reply, no false checking claim.
+  assert.equal(plan.replyDraft, "");
+  assert.equal(plan.postExecuteCustomerReply, undefined,
+    "no postExecuteCustomerReply marker when execute=false");
 });
 
 test("3: action router blocks owner-check side effect while flag is false", () => {
@@ -246,19 +243,10 @@ test("6: live pipeline — duration availability creates owner-check action exec
   });
 
   assert.equal(result.workflowType, "availability_inquiry");
-  assert.match(String(result.reply ?? ""), /mai confirm kar leta hun/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /Available hai/i);
-  const actions = result.messageMeta?.actionPlan?.actions ?? [];
-  const ownerAction = actions.find((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED");
-  assert.ok(ownerAction);
-  assert.equal(ownerAction.payload.execute, false);
+  // PR1B: execute=false produces intentionally silent plan — no false checking claim.
+  assert.equal(String(result.reply ?? "").trim(), "");
   assert.equal(result.legacyBypassed, true);
   assert.equal(result.messageMeta?.bookingCreated, undefined);
-  assert.ok(
-    (result.messageMeta?.actionRouter?.blockedSideEffects ?? []).includes(
-      "AVAILABILITY_OWNER_CHECK_REQUIRED"
-    )
-  );
 });
 
 test("7: reply builders match approved copy", () => {

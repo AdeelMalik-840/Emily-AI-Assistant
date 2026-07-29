@@ -19,14 +19,17 @@ import path from "node:path";
 
 const OUTBOUND_REGISTRY_TTL_MS = 24 * 60 * 60 * 1000;
 const OUTBOUND_REGISTRY_MAX_PER_CHAT = 120;
-const PERSIST_PATH = path.join(
-  String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH ?? "").trim()
-    ? path.dirname(String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH).trim())
-    : path.join(process.cwd(), ".cursor"),
-  String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH ?? "").trim()
-    ? path.basename(String(process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH).trim())
-    : "playwright-outbound-registry.json"
-);
+
+function resolvePersistPath(customPath) {
+  const fromEnvOrArg = String(
+    customPath ?? process.env.PLAYWRIGHT_OUTBOUND_REGISTRY_PATH ?? ""
+  ).trim();
+  if (fromEnvOrArg) return path.resolve(fromEnvOrArg);
+  return path.join(process.cwd(), ".cursor", "playwright-outbound-registry.json");
+}
+
+/** @type {string} */
+let PERSIST_PATH = resolvePersistPath();
 
 /** @type {Map<string, OutboundChunkEntry[]>} */
 const registryByChat = new Map();
@@ -334,13 +337,20 @@ export function isRegisteredPlaywrightOutboundEcho(chatKey, text) {
 }
 
 /** @internal */
+export function __setPlaywrightOutboundRegistryPathForTests(customPath) {
+  PERSIST_PATH = resolvePersistPath(customPath);
+  registryByChat.clear();
+  persistLoaded = false;
+}
+
+/** @internal */
 export function __clearPlaywrightOutboundRegistryForTests() {
   registryByChat.clear();
   persistLoaded = true;
   try {
-    if (existsSync(PERSIST_PATH)) {
-      writeFileSync(PERSIST_PATH, "{}", "utf8");
-    }
+    const dir = path.dirname(PERSIST_PATH);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(PERSIST_PATH, "{}", "utf8");
   } catch {
     /* ignore */
   }

@@ -734,19 +734,25 @@ function buildOwnerCheckActionPlan(p) {
   const sourceRowKey = String(canonical.turn?.sourceRowKey ?? "").trim() || null;
   const guaranteeKey = String(canonical.turn?.guaranteeKey ?? "").trim() || null;
   const sourceTurnKey = String(canonical.turn?.sourceTurnKey ?? "").trim() || null;
-  const replyDraft = buildOwnerCheckDeferralReply(conversationalLabel, durationN);
+  // When execute=true, reply is generated post-execution by the Brain.
+  // When execute=false (flag off), no action runs — no false checking claim.
+  const usePostExecuteReply = execute === true;
+  const replyDraft = "";
 
   logAvailabilityOwnerCheckPlanned({
     itemId,
     itemLabel,
     durationDays: durationN,
     canonicalAvailability,
-    execute: false,
+    execute,
   });
 
   return Object.freeze({
     planId: randomUUID(),
     replyDraft,
+    ...(usePostExecuteReply
+      ? { postExecuteCustomerReply: /** @type {"owner_check_result"} */ ("owner_check_result") }
+      : {}),
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",
@@ -756,7 +762,10 @@ function buildOwnerCheckActionPlan(p) {
           field: "availability",
           itemId,
           itemLabel,
-          source: "canonical_owner_check_deferral",
+          source: usePostExecuteReply
+            ? "canonical_owner_check_post_execute"
+            : "canonical_owner_check_not_executed",
+          ...(usePostExecuteReply ? { awaitPostExecuteReply: true } : {}),
           execute: false,
         }),
       }),

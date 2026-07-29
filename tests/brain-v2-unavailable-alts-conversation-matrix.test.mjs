@@ -236,7 +236,7 @@ function enableV2Live() {
 
 // ─── A. Initial ask (no assist) ─────────────────────────────────────────────
 
-test("matrix A1: available + duration → owner-check deferral (confirm kar leta hun)", () => {
+test("matrix A1: available + duration → owner-check (no false claim when execute=false)", () => {
   const p = plan({
     message: "Corolla 2 din ke liye available hai?",
     ctxOverrides: {
@@ -252,8 +252,9 @@ test("matrix A1: available + duration → owner-check deferral (confirm kar leta
       },
     },
   });
-  assert.match(String(p.replyDraft), /confirm kar leta hun/i);
-  assert.equal(p.actions[0]?.payload?.source, "canonical_owner_check_deferral");
+  // PR1B: execute=false → empty replyDraft, no false checking claim.
+  assert.equal(p.replyDraft, "");
+  assert.equal(p.actions[0]?.payload?.source, "canonical_owner_check_not_executed");
   assertOwnerCheck(p, COROLLA_ID);
   assert.equal(p.persistenceIntent?.rememberLastAvailabilityAssist, undefined);
 });
@@ -472,7 +473,8 @@ test("matrix C1: user=Stonic (available) → owner-check for Stonic", () => {
     }
   );
   assertOwnerCheck(p, STONIC_ID);
-  assert.match(String(p.replyDraft), /confirm kar leta hun/i);
+  // PR1B: execute=false → empty replyDraft, no false checking claim.
+  assert.equal(p.replyDraft, "");
   assert.equal(p.persistenceIntent?.clearLastAvailabilityAssist, true);
 });
 
@@ -744,8 +746,8 @@ test("matrix G1: full happy path Corolla booked → offer → ji → list → St
     }
   );
   assertOwnerCheck(select, STONIC_ID);
-  // conversational label shortens "Kia Stonic" → "Stonic"
-  assert.equal(String(select.replyDraft), buildOwnerCheckDeferralReply("Stonic", 2));
+  // PR1B: execute=false → empty replyDraft, no false checking claim.
+  assert.equal(select.replyDraft, "");
 });
 
 test("matrix G2: all booked → no offer → thanks must not invent list", () => {
