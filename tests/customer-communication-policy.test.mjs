@@ -214,7 +214,10 @@ test("2: waiting_confirm_dm keeps action schema and includes shared DM policy", 
     systems[0],
     /action: confirm_booking\|decline_request\|change_request\|reply\|silence\|clarify\|none/
   );
-  assert.match(systems[0], /Natural confirm after book prompt → confirm_booking/);
+  assert.match(
+    systems[0],
+    /Natural confirm after Emily's book-confirm prompt[\s\S]*action=confirm_booking/
+  );
 });
 
 test("3: post_confirm_pa keeps escalation schema and includes shared DM policy", async () => {

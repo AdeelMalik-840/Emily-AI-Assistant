@@ -333,6 +333,8 @@ export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
     itemAvailable: false,
     verifiedAlternativeLabels: altLabels,
     verifiedAlternativesCount: altLabels.length,
+    customerMessageText: String(p.customerMessageText ?? "").trim() || null,
+    styleKey: p.styleKey ?? null,
   };
   const replyContract = buildUnavailableResourceReplyContract(verifiedFacts);
   const responseFormat = buildStrictJsonSchemaResponseFormat(

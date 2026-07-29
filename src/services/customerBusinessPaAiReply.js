@@ -168,6 +168,8 @@ export async function generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
     ownerAnswer: answer,
     customerQuestion: question,
     missingInfoType: type,
+    customerMessageText: question,
+    styleKey,
   });
   const shared = buildCustomerCommunicationPolicy({
     channel: "dm",

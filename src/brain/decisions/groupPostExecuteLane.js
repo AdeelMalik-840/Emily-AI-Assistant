@@ -302,6 +302,8 @@ function buildGroupPostExecuteSystemPrompt(styleKey) {
     channel: "group",
     styleKey,
   });
+  const exampleLang =
+    styleKey === "neutral_english" ? "english" : "roman_urdu";
 
   return `${shared}
 
@@ -310,15 +312,16 @@ You are responding in a WhatsApp group AFTER an availability check action comple
 Use ONLY the VERIFIED_FACTS_JSON below. Express customer-safe facts conversationally — do not recite internal status labels.
 Do not use vague wording such as "ab dekhte hain kya hota hai".
 Do not promise availability until it is verified in the facts.
+Match the customer's language in customerReply and replySemantics.languageStyle (english / roman_urdu / mixed).
 If noCustomerReplyAllowed is true, return silence.
 If dmGuidanceAllowed is true, you may give short natural guidance about checking their DM / next step — still without mentioning internal people/process details.
 actionsAllowed: false — do not instruct any action, executor, notification, booking, or session change.
 This is a reply-only pass. Your only output is a short natural customer reply or silence.
 
 OUTPUT FORMAT (JSON only, no markdown):
-{"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"...","replySemantics":{"claims":["resource_availability_unconfirmed"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"...","replySemantics":{"claims":["resource_availability_unconfirmed"],"languageStyle":"${exampleLang}","containsTimingPromise":false,"exposesInternalProcess":false}}
 or for silence:
-{"customerReply":"","action":"silence","shouldReply":false,"confidence":0.95,"safetyNotes":null,"reason":"...","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"customerReply":"","action":"silence","shouldReply":false,"confidence":0.95,"safetyNotes":null,"reason":"...","replySemantics":{"claims":[],"languageStyle":"${exampleLang}","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 action must be "reply" or "silence" only.
 customerReply must be empty when action is "silence".
@@ -454,7 +457,19 @@ export async function executeGroupPostExecuteLaneDecision({
     availabilityCheckingInProgress: customerSafeFacts.availabilityCheckingInProgress,
     customerBusinessStatus: customerSafeFacts.customerBusinessStatus,
     dmGuidanceAllowed: customerSafeFacts.dmGuidanceAllowed,
+    customerMessageText: clean(ctx.messageText, 800),
+    recentDialogue: clean(ctx.recentDialogue, 1200) || null,
+    styleKey,
   });
+
+  const languageDirective =
+    replyContract.customerLanguageStyle === "english"
+      ? "LANGUAGE LOCK: customerLanguageStyle=english. Write customerReply in natural English only. replySemantics.languageStyle must be english. Do not use Roman Urdu."
+      : replyContract.customerLanguageStyle === "roman_urdu"
+        ? "LANGUAGE LOCK: customerLanguageStyle=roman_urdu. Write customerReply in natural Roman Urdu. replySemantics.languageStyle must be roman_urdu (or mixed only if the customer mixed). Do not reply in English-only."
+        : replyContract.customerLanguageStyle === "mixed"
+          ? "LANGUAGE LOCK: customerLanguageStyle=mixed. A natural mixed reply is fine."
+          : "LANGUAGE LOCK: customerLanguageStyle=unclear. Follow recent dialogue, then business style preference.";
 
   const responseFormat = buildStrictJsonSchemaResponseFormat(
     "group_post_execute_decision",
@@ -494,14 +509,16 @@ export async function executeGroupPostExecuteLaneDecision({
     let lastUnsafeReason = null;
 
     for (let attempt = 1; attempt <= MAX_CONTENT_SAFETY_ATTEMPTS; attempt++) {
+      const contractBlock = `CUSTOMER_REPLY_CONTRACT:\n${JSON.stringify({
+        allowedClaims: replyContract.allowedClaims,
+        forbiddenClaims: replyContract.forbiddenClaims,
+        requiredMeaning: replyContract.requiredMeaning,
+        customerLanguageStyle: replyContract.customerLanguageStyle,
+      })}\n\n${languageDirective}`;
       const userContent =
         attempt === 1
-          ? `${baseUserPayload}\n\nCUSTOMER_REPLY_CONTRACT:\n${JSON.stringify({
-              allowedClaims: replyContract.allowedClaims,
-              forbiddenClaims: replyContract.forbiddenClaims,
-              requiredMeaning: replyContract.requiredMeaning,
-            })}\n\nReturn strict JSON matching the schema; do not claim availability is confirmed.`
-          : `${baseUserPayload}\n\n${buildCustomerReplyGuardCorrection(lastUnsafeReason || "validation_failed")}`;
+          ? `${baseUserPayload}\n\n${contractBlock}\nReturn strict JSON matching the schema; do not claim availability is confirmed; match customerLanguageStyle in replySemantics.languageStyle and wording.`
+          : `${baseUserPayload}\n\n${contractBlock}\n\n${buildCustomerReplyGuardCorrection(lastUnsafeReason || "validation_failed")}`;
 
       const raw = await runOneBrainAttempt(userContent);
       const decision = parseGroupPostExecuteDecision(raw);

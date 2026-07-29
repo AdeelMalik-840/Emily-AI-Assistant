@@ -8,6 +8,8 @@ import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { resolveAvailabilityApprovedPriceQuote } from "../../services/availabilityMessageBuilder.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 import {
+  CUSTOMER_CLAIMS,
+  buildWaitingConfirmPreExecutionConfirmContract,
   buildWaitingConfirmVerifiedQuotationContract,
   normalizeReplySemantics,
   stripInternalReplySemantics,
@@ -296,7 +298,17 @@ export function parseWaitingConfirmDmDecision(raw) {
   }
 
   // Flags may promote action; action alone must not invent confirming flag.
-  if (customerIsConfirmingBooking) action = "confirm_booking";
+  // Structured replySemantics confirmation claims also mark a confirm turn.
+  const preliminarySemantics = normalizeReplySemantics(parsed.replySemantics);
+  const preliminaryClaims = Array.isArray(preliminarySemantics?.claims)
+    ? preliminarySemantics.claims.map(String)
+    : [];
+  const confirmingFromClaims =
+    preliminaryClaims.includes(CUSTOMER_CLAIMS.CUSTOMER_CONFIRMATION_ACKNOWLEDGED) ||
+    preliminaryClaims.includes(CUSTOMER_CLAIMS.RESERVATION_REQUESTED);
+  const isConfirmingBooking =
+    customerIsConfirmingBooking === true || confirmingFromClaims;
+  if (isConfirmingBooking) action = "confirm_booking";
   else if (customerIsDeclining) action = "decline_request";
   else if (customerWantsChange && action !== "reply") action = "change_request";
 
@@ -327,9 +339,11 @@ export function parseWaitingConfirmDmDecision(raw) {
       : null;
 
   // Soft demote weak confirms at parse; execution guard is authoritative.
+  // Structured confirmation claims already attest a confirm turn — do not demote those.
   if (
     action === "confirm_booking" &&
-    (customerIsConfirmingBooking !== true ||
+    !confirmingFromClaims &&
+    (isConfirmingBooking !== true ||
       customerIsAskingQuestion === true ||
       confidence == null ||
       confidence < WAITING_CONFIRM_DM_CONFIRM_CONFIDENCE_MIN)
@@ -346,7 +360,7 @@ export function parseWaitingConfirmDmDecision(raw) {
     customerIntent: clean(parsed.customerIntent, 40) || "unclear",
     situation: clean(parsed.situation, 60) || "unclear",
     conversationAct: clean(parsed.conversationAct, 40) || "unknown",
-    customerIsConfirmingBooking,
+    customerIsConfirmingBooking: isConfirmingBooking,
     customerIsAskingQuestion,
     customerIsDeclining,
     customerWantsChange: action === "change_request" || customerWantsChange,
@@ -359,7 +373,7 @@ export function parseWaitingConfirmDmDecision(raw) {
     confidence,
     safetyNotes: clean(parsed.safetyNotes, 200) || null,
     reason: clean(parsed.reason, 120) || null,
-    replySemantics: normalizeReplySemantics(parsed.replySemantics),
+    replySemantics: preliminarySemantics,
   };
 }
 
@@ -476,7 +490,12 @@ export async function executeWaitingConfirmDmLaneDecision({
       // verifiedFactsJson may be non-JSON in some injectors; keep factsObj
     }
   }
-  const replyContract = buildWaitingConfirmVerifiedQuotationContract(factsObj);
+  const replyContract = buildWaitingConfirmVerifiedQuotationContract({
+    ...factsObj,
+    customerMessageText: userLine,
+    recentDialogue: historyLine || null,
+    styleKey,
+  });
   const responseFormat = buildStrictJsonSchemaResponseFormat(
     "waiting_confirm_dm_decision",
     WAITING_CONFIRM_DM_OUTPUT_SCHEMA
@@ -488,20 +507,46 @@ LANE OBJECTIVE (waiting_confirm_dm):
 AVR approved, waiting_confirm Cloud DM.
 Decide meaning from latest message + last Emily + history + VERIFIED_FACTS_JSON (not keyword lists).
 Return STRICT JSON only (schema enforced). Include replySemantics for validation.
+Match customerLanguageStyle in replySemantics.languageStyle and in customerReply wording.
 Example shape: {"conversationStage":"booking_offer","customerMood":null,"customerIntent":"ask_fact","situation":"awaiting_confirm","customerIsConfirmingBooking":false,"customerIsAskingQuestion":true,"customerIsDeclining":false,"customerWantsChange":false,"requestedInfoType":null,"shouldReply":true,"customerReply":"...","action":"reply","confidence":0.9,"safetyNotes":null,"reason":"price_question","asksForBookingConfirmation":false,"replySemantics":{"claims":["quotation_verified"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 action: confirm_booking|decline_request|change_request|reply|silence|clarify|none
-Natural confirm after book prompt → confirm_booking. After Q&A ambiguous ack ≠ confirm. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social no/thanks after Q&A → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up.
+Natural confirm after Emily's book-confirm prompt (e.g. "Haan book kar do", "Yes, please book it.") → action=confirm_booking (not clarify/reply). After Q&A ambiguous ack ≠ confirm. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social no/thanks after Q&A → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up.
 If your reply intentionally asks the customer to confirm booking again, set asksForBookingConfirmation=true (structured). Do not set it for ordinary Q&A answers.
-When stating a verified total from facts.quotedPrice, include the exact total number in customerReply and claim quotation_verified.`;
+When stating a verified total from facts.quotedPrice, include the exact total digits (e.g. 15000) in customerReply and claim quotation_verified.
+When action=confirm_booking: the booking executor has NOT run yet. customerReply may only acknowledge confirmation received / that you will proceed with the request. Do NOT claim booking created, booking confirmed, reservation completed, appointment confirmed, or order created. Prefer claims customer_confirmation_acknowledged or reservation_requested — do not require quotation_verified on confirm turns. If you mention price, include the exact total digits. Still must not claim the booking already exists.
+When action=confirm_booking and customerReply is non-empty: write a short natural acknowledgement in the customer's language (e.g. Roman Urdu: confirm mil gaya, request aage barhati hun / English: got it, I'll proceed with your booking request). Do not paste the customer's message back as the reply.`;
 
   let userPayload =
     `VERIFIED_FACTS_JSON:\n${factsJson}\n\nLAST_EMILY_MESSAGE:\n${lastEmily || "(none)"}\n\nCUSTOMER_MESSAGE:\n${userLine || "(empty)"}`;
   if (historyLine) userPayload += `\n\nRECENT_CONVERSATION:\n${historyLine}`;
+  const languageDirective =
+    replyContract.customerLanguageStyle === "english"
+      ? "LANGUAGE LOCK: customerLanguageStyle=english. customerReply must be natural English; replySemantics.languageStyle=english."
+      : replyContract.customerLanguageStyle === "roman_urdu"
+        ? "LANGUAGE LOCK: customerLanguageStyle=roman_urdu. customerReply must be natural Roman Urdu; replySemantics.languageStyle=roman_urdu."
+        : replyContract.customerLanguageStyle === "mixed"
+          ? "LANGUAGE LOCK: customerLanguageStyle=mixed. Natural mixed reply is fine."
+          : "LANGUAGE LOCK: customerLanguageStyle=unclear. Follow recent dialogue / business style.";
   userPayload += `\n\nCUSTOMER_REPLY_CONTRACT:\n${JSON.stringify({
     allowedClaims: replyContract.allowedClaims,
     forbiddenClaims: replyContract.forbiddenClaims,
     requiredMeaning: replyContract.requiredMeaning,
-  })}`;
+    customerLanguageStyle: replyContract.customerLanguageStyle,
+    ...(factsObj?.quotedPrice?.total != null &&
+    Number.isFinite(Number(factsObj.quotedPrice.total))
+      ? {
+          verifiedQuotedTotal: Math.floor(Number(factsObj.quotedPrice.total)),
+          verifiedQuotedCurrency:
+            String(factsObj.quotedPrice.currency ?? "PKR").slice(0, 8) || "PKR",
+        }
+      : {}),
+  })}\n\n${languageDirective}`;
+  if (
+    factsObj?.quotedPrice?.total != null &&
+    Number.isFinite(Number(factsObj.quotedPrice.total))
+  ) {
+    userPayload += `\nWhen answering a price/total question, customerReply MUST include the exact digits ${Math.floor(Number(factsObj.quotedPrice.total))}.`;
+  }
 
   const completionFn =
     typeof __chatCompletionsCreateForTests === "function"
@@ -578,23 +623,57 @@ When stating a verified total from facts.quotedPrice, include the exact total nu
       // Guard customer wording only when a reply would be sent.
       const replyText = String(decision.customerReply ?? "").trim();
       if (replyText) {
+        const normalizedReply = replyText.replace(/\s+/g, " ").trim().toLowerCase();
+        const normalizedCustomer = String(userLine || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+        if (
+          normalizedCustomer &&
+          normalizedReply === normalizedCustomer &&
+          decision.action === "confirm_booking"
+        ) {
+          if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) {
+            lastReason = "customer_reply_echo";
+            continue;
+          }
+          // Final attempt: keep confirm_booking; drop echoed wording (pre-exec reply optional).
+          decision.customerReply = "";
+          decision.shouldReply = false;
+        } else {
         const claims = Array.isArray(decision.replySemantics?.claims)
           ? decision.replySemantics.claims
           : [];
         const askNeedsQuote =
-          decision.customerIsAskingQuestion === true ||
-          claims.includes("quotation_verified");
+          decision.action !== "confirm_booking" &&
+          (decision.customerIsAskingQuestion === true ||
+            claims.includes("quotation_verified"));
         const hasQuote =
           factsObj?.quotedPrice?.total != null &&
           Number.isFinite(Number(factsObj.quotedPrice.total));
+        const usePreExecConfirm =
+          decision.action === "confirm_booking" ||
+          claims.includes(CUSTOMER_CLAIMS.CUSTOMER_CONFIRMATION_ACKNOWLEDGED) ||
+          claims.includes(CUSTOMER_CLAIMS.RESERVATION_REQUESTED);
+        const activeContract = usePreExecConfirm
+            ? buildWaitingConfirmPreExecutionConfirmContract({
+                ...factsObj,
+                customerMessageText: userLine,
+                recentDialogue: historyLine || null,
+                styleKey,
+                bookingExecutionVerified: false,
+              })
+            : {
+                ...replyContract,
+                requiredMeaning:
+                  askNeedsQuote && hasQuote
+                    ? "state_verified_quotation"
+                    : replyContract.requiredMeaning,
+              };
         const guard = validateCustomerReplyAgainstContract(
           replyText,
           {
-            ...replyContract,
-            requiredMeaning:
-              askNeedsQuote && hasQuote
-                ? "state_verified_quotation"
-                : replyContract.requiredMeaning,
+            ...activeContract,
             replyRequired:
               decision.action === "reply" || decision.shouldReply === true,
           },
@@ -610,6 +689,7 @@ When stating a verified total from facts.quotedPrice, include the exact total nu
             reason: lastReason,
             contentSafetyAttempts: attempt,
           };
+        }
         }
       }
 

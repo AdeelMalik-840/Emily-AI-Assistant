@@ -619,9 +619,12 @@ export async function executePostConfirmPaLaneDecision({
           ? { tone: facts.tone }
           : null,
   });
-  const replyContract = buildPostConfirmPaReplyContract(
-    facts && typeof facts === "object" ? facts : {}
-  );
+  const replyContract = buildPostConfirmPaReplyContract({
+    ...(facts && typeof facts === "object" ? facts : {}),
+    customerMessageText: userLine,
+    recentDialogue: historyLine || null,
+    styleKey,
+  });
   const responseFormat = buildStrictJsonSchemaResponseFormat(
     "post_confirm_pa_decision",
     {
@@ -731,6 +734,7 @@ STRICT SAFETY:
     allowedClaims: replyContract.allowedClaims,
     forbiddenClaims: replyContract.forbiddenClaims,
     requiredMeaning: replyContract.requiredMeaning,
+    customerLanguageStyle: replyContract.customerLanguageStyle,
   })}`;
 
   const completionFn =

@@ -238,6 +238,7 @@ function jsonAiReply({
   situation = null,
   customerIntent = null,
   shouldReply = null,
+  languageStyle = null,
 }) {
   const escalate = needsFollowup === true && Boolean(missingInfoType);
   const act =
@@ -269,6 +270,14 @@ function jsonAiReply({
     shouldReply != null
       ? shouldReply
       : decisionAction !== "silence" && decisionAction !== "none";
+  const replyText = shouldReplyValue === false ? "" : customerReply;
+  const inferredLang =
+    languageStyle ||
+    (/\b(hai|hain|hun|hoon|karke|batata|bata|ji|gaya|tha|thi|the|ke|ki|ka|liye|dena|hoga|hogi|kar|welcome\s+ji)\b/i.test(
+      String(replyText || "")
+    )
+      ? "roman_urdu"
+      : "english");
   return async () => ({
     choices: [
       {
@@ -280,10 +289,16 @@ function jsonAiReply({
             customerIsAskingQuestion: asking,
             requestedInfoType: escalate ? missingInfoType : null,
             shouldReply: shouldReplyValue,
-            customerReply: shouldReplyValue === false ? "" : customerReply,
+            customerReply: replyText,
             action: decisionAction,
             needsFollowup,
             missingInfoType,
+            replySemantics: {
+              claims: [],
+              languageStyle: inferredLang,
+              containsTimingPromise: false,
+              exposesInternalProcess: false,
+            },
           }),
         },
       },
@@ -1046,7 +1061,7 @@ test("thanks after customerFollowupText exists → no escalation", async () => {
         return { ok: false };
       },
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Welcome ji.",
+        customerReply: "You're welcome.",
         conversationAct: "thanks",
         customerIsAskingQuestion: false,
         action: "escalate_missing_info",
@@ -1538,7 +1553,7 @@ test("why are you copying me → social repair, not clarification", async () => 
         throw new Error("should not escalate");
       },
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Sorry ji, galat ho gaya.",
+        customerReply: "Sorry about that — that was a mistake.",
         conversationAct: "chit_chat",
         customerIntent: "social_challenge",
         situation: "social_repair",
