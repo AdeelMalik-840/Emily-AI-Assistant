@@ -2,7 +2,7 @@
  * Shared Brain conversational decision authority (seed).
  *
  * One Brain, many safe executors — this is the shared customer-turn entrypoint.
- * Lanes: `post_confirm_pa`, `waiting_confirm_dm`.
+ * Lanes: `post_confirm_pa`, `waiting_confirm_dm`, `group_post_execute`.
  *
  * Not a second Brain. Not a PA Brain. No parallel decision system.
  */
@@ -15,10 +15,15 @@ import {
   executeWaitingConfirmDmLaneDecision,
   WAITING_CONFIRM_DM_LANE,
 } from "./waitingConfirmDmLane.js";
+import {
+  executeGroupPostExecuteLaneDecision,
+  GROUP_POST_EXECUTE_LANE,
+} from "./groupPostExecuteLane.js";
 
 export const CUSTOMER_TURN_LANES = Object.freeze([
   "post_confirm_pa",
   WAITING_CONFIRM_DM_LANE,
+  GROUP_POST_EXECUTE_LANE,
 ]);
 
 /**
@@ -178,6 +183,14 @@ export function normalizeTurnContext(raw = {}) {
       typeof r.__chatCompletionsCreateForTests === "function"
         ? r.__chatCompletionsCreateForTests
         : null,
+    // group_post_execute lane extras
+    postExecuteResult:
+      r.postExecuteResult && typeof r.postExecuteResult === "object"
+        ? /** @type {Record<string, unknown>} */ (r.postExecuteResult)
+        : null,
+    responseDisposition:
+      r.responseDisposition != null ? String(r.responseDisposition) : null,
+    actionsAllowed: r.actionsAllowed === false ? false : null,
   };
 }
 
@@ -290,6 +303,31 @@ export async function decideCustomerTurn(turnContextInput = {}) {
       ...result,
       decision: enrichSharedCustomerTurnDecision(result?.decision),
       lane: WAITING_CONFIRM_DM_LANE,
+      turnContext,
+    };
+  }
+
+  if (lane === GROUP_POST_EXECUTE_LANE) {
+    const result = await executeGroupPostExecuteLaneDecision({
+      turnContext,
+      timeoutMs:
+        turnContext.timeoutMs != null ? turnContext.timeoutMs : 8000,
+      __chatCompletionsCreateForTests:
+        turnContext.__chatCompletionsCreateForTests,
+    });
+    // Enrich through shared contract but force action to reply/silence only
+    const enriched = enrichSharedCustomerTurnDecision(result?.decision);
+    // Safety: group_post_execute lane must never produce an executor that triggers actions
+    const safeEnriched = {
+      ...enriched,
+      requiredExecutor:
+        enriched.action === "reply" ? "group_reply" : "none",
+      actionsAllowed: false,
+    };
+    return {
+      ...result,
+      decision: safeEnriched,
+      lane: GROUP_POST_EXECUTE_LANE,
       turnContext,
     };
   }

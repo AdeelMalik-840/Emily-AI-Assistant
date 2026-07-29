@@ -15,6 +15,8 @@ import {
 import { buildShadowTurnContext } from "../shadow/brainShadowHook.js";
 import { runConversationTurn } from "../orchestrator/ConversationOrchestrator.js";
 import { executeOutboundReply } from "../../services/executors/outboundReplyExecutor.js";
+import { decideCustomerTurn } from "../decisions/decideCustomerTurn.js";
+import { GROUP_POST_EXECUTE_LANE } from "../decisions/groupPostExecuteLane.js";
 import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
 import {
   ONBOARDING_CLARIFICATION_REPLY,
@@ -344,6 +346,87 @@ export async function runBrainV2LivePipeline(params) {
         isGroupInbound: params.isGroupInbound,
       });
 
+    // ── Post-execute Brain reply (PR1B) ────────────────────────────────────
+    // When actionRouter signals awaitsPostExecuteBrainReply, call the existing
+    // Emily Brain with lane=group_post_execute. Reply only — actionsAllowed: false.
+    let finalReply = routed.reply;
+    let finalReplySource = "BRAIN_V2_LIVE";
+    let postExecuteBrainDecision = null;
+
+    if (routed.awaitsPostExecuteBrainReply === true) {
+      const postExecResult =
+        sideEffectResults?.OWNER_CHECK_POST_EXECUTE_RESULT &&
+        typeof sideEffectResults.OWNER_CHECK_POST_EXECUTE_RESULT === "object"
+          ? /** @type {Record<string, unknown>} */ (sideEffectResults.OWNER_CHECK_POST_EXECUTE_RESULT)
+          : null;
+
+      const brainResult = await decideCustomerTurn({
+        lane: GROUP_POST_EXECUTE_LANE,
+        chatType,
+        channel,
+        businessId,
+        messageText: message,
+        recentDialogue: params.conversationHistory ?? null,
+        facts: {
+          ...resolvedBusinessTurnContext,
+          catalogItems,
+        },
+        activeAvailabilityRequest:
+          postExecResult?.facts?.requestId
+            ? {
+                requestId: postExecResult.facts.requestId,
+                status: postExecResult.facts.lifecycleKind ?? null,
+                ownerNotificationStatus: postExecResult.facts.ownerNotificationStatus ?? null,
+                customerDmNotificationStatus:
+                  postExecResult.facts.customerDmNotificationStatus ?? null,
+              }
+            : null,
+        conversationStageHint: "post_owner_check_group",
+        postExecuteResult: postExecResult,
+        responseDisposition: postExecResult?.responseDisposition ?? null,
+        actionsAllowed: false,
+        allowedExecutors: [],
+        styleKey: "casual_local",
+        timeoutMs: 8000,
+        __chatCompletionsCreateForTests:
+          params.executionContext?.__groupPostExecuteChatCreate ?? null,
+      });
+
+      postExecuteBrainDecision = brainResult;
+
+      const brainReply = String(brainResult?.decision?.customerReply ?? "").trim();
+      const brainOk = brainResult?.ok === true && brainReply.length > 0;
+
+      console.log("[brain_v2_group_post_execute]", {
+        traceId,
+        businessId,
+        ok: brainOk,
+        source: brainResult?.source,
+        responseDisposition: postExecResult?.responseDisposition,
+        replyPreview: brainReply.slice(0, 80),
+      });
+
+      if (brainOk) {
+        finalReply = brainReply;
+        finalReplySource = "BRAIN_V2_GROUP_POST_EXECUTE";
+      } else {
+        // Fail closed — Brain call failed or returned empty. Suppress, no canned fallback.
+        const emilySessionKeyFc = String(
+          turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
+        ).trim();
+        applyInfoLiveSessionMemoryPatch({
+          sessionKey: emilySessionKeyFc,
+          actionPlan: result.actionPlan,
+          authoritativeItem: turnContextInput.authoritativeItem,
+        });
+        return buildSilentPipelineResult({
+          traceId,
+          reason: `GROUP_POST_EXECUTE_BRAIN_EMPTY:${brainResult?.reason ?? "no_reply"}`,
+        });
+      }
+    }
+    // ── End post-execute Brain reply ────────────────────────────────────────
+
     if (customerReplySuppressed === true) {
       const emilySessionKeySilent = String(
         turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
@@ -354,7 +437,8 @@ export async function runBrainV2LivePipeline(params) {
         authoritativeItem: turnContextInput.authoritativeItem,
       });
       const disposition = String(
-        sideEffectResults?.AVAILABILITY_OWNER_CHECK_REQUIRED?.replyDisposition ??
+        sideEffectResults?.OWNER_CHECK_POST_EXECUTE_RESULT?.responseDisposition ??
+          sideEffectResults?.AVAILABILITY_OWNER_CHECK_REQUIRED?.replyDisposition ??
           sideEffectResults?.AVAILABILITY_OWNER_CHECK_REQUIRED?.lifecycleKind ??
           "OWNER_CHECK_REPLY_SUPPRESSED"
       ).trim();
@@ -379,18 +463,22 @@ export async function runBrainV2LivePipeline(params) {
       participantIdentity: turnContextInput.participantIdentity,
       authoritativeItemId: turnContextInput.authoritativeItem?.id ?? null,
       blockedSideEffects: routed.blockedSideEffects,
-      replyPreview: routed.reply.slice(0, 120),
+      replyPreview: finalReply.slice(0, 120),
     });
 
     return finalizeLivePipelineResult({
       params,
       turnContextInput,
       workflowType,
-      reply: routed.reply,
-      finalReplySource: "BRAIN_V2_LIVE",
+      reply: finalReply,
+      finalReplySource,
       actionPlan: result.actionPlan,
       flags,
-      routed: { ...routed, sideEffectResults },
+      routed: {
+        ...routed,
+        sideEffectResults,
+        ...(postExecuteBrainDecision ? { postExecuteBrainDecision } : {}),
+      },
       bookingCreated,
       decisionTrace: result.trace,
     });

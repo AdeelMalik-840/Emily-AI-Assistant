@@ -46,6 +46,7 @@ import {
   markInboundTurnLedgerOutboundLockedForGuarantee,
   resolveInboundTurnAdmissionBlock,
 } from "./inboundTurnLedger.js";
+import { tryRecoverOutboundLockedInboundTurn } from "./outboundLockedRecovery.js";
 import { setMessageState } from "./messageState.js";
 import {
   normalizePlaywrightOutboundTrace,
@@ -1594,9 +1595,42 @@ export async function executeWhatsAppAiPipeline(p) {
     const ledgerBlock = resolveInboundTurnAdmissionBlock({
       chatKey: groupNameResolved,
       stableId: messageId,
-      textPreview: String(combinedMessage ?? "").slice(0, 120),
+      textPreview: String(combinedMessage ?? "").trim().slice(0, 120),
       currentForwardedAtMs: Number(playwrightForwardedAtRaw),
     });
+    if (ledgerBlock.blocked && ledgerBlock.reason === "outbound_locked") {
+      // Resume persisted final reply only — never re-run Brain/actions.
+      const recovery = await tryRecoverOutboundLockedInboundTurn({
+        chatKey: groupNameResolved,
+        stableId: messageId,
+        guaranteeKey,
+        __testSendPlaywrightGroupText:
+          typeof p.__testSendPlaywrightGroupText === "function"
+            ? p.__testSendPlaywrightGroupText
+            : undefined,
+        lastPlaywrightTextSends,
+      });
+      logOutboundLifecycle("outbound_locked_recovery", {
+        traceId,
+        guaranteeKey,
+        stableId: messageId,
+        recovered: recovery.recovered === true,
+        action: recovery.action,
+        reason: recovery.reason,
+        sent: recovery.sent === true,
+        outboundReplyDelivered: recovery.sent === true,
+      });
+      const blockedChatKey = normalizeTitle(String(groupNameResolved ?? "").trim());
+      if (blockedChatKey) {
+        globalThis.__chatResponding =
+          globalThis.__chatResponding || Object.create(null);
+        globalThis.__chatResponding[blockedChatKey] = false;
+        if (globalThis.__processingChats instanceof Map) {
+          globalThis.__processingChats.delete(blockedChatKey);
+        }
+      }
+      return;
+    }
     if (ledgerBlock.blocked && ledgerBlock.reason === "recent_processing_duplicate") {
       logOutboundLifecycle("inbound_turn_ledger_processing_existing_blocked", {
         traceId,
@@ -2696,6 +2730,8 @@ export async function executeWhatsAppAiPipeline(p) {
             burstStableIds: pendingLock?.burstStableIds,
             textPreview: String(combinedMessage ?? "").slice(0, 120),
             replyPreview: replyText.slice(0, 160),
+            finalReplyText: replyText,
+            finalReplySource: finalReplySourceForLifecycle || null,
             outboundLockStage: "buffer_send_start",
             sendVia: "PLAYWRIGHT",
             dryRun: false,

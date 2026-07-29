@@ -11,6 +11,8 @@ import { normalizeTitle } from "./playwrightTitleNormalize.js";
 
 /** @typedef {"processing" | "done" | "failed" | "baseline_absorbed" | "outbound_locked"} InboundTurnLedgerState */
 
+/** @typedef {"pending_send" | "send_attempted" | "sent"} OutboundIntentStatus */
+
 /** @typedef {{
  *   chatKey: string,
  *   stableId: string,
@@ -18,6 +20,11 @@ import { normalizeTitle } from "./playwrightTitleNormalize.js";
  *   state: InboundTurnLedgerState,
  *   textPreview?: string,
  *   replyPreview?: string,
+ *   finalReplyText?: string | null,
+ *   finalReplySource?: string | null,
+ *   outboundIntentStatus?: OutboundIntentStatus | null,
+ *   recoveryClaimedAt?: number | null,
+ *   recoveryClaimOwner?: string | null,
  *   autoRetryAllowed?: boolean,
  *   deliveryStatus?: string,
  *   outboundLockedAt?: number | null,
@@ -35,6 +42,18 @@ import { normalizeTitle } from "./playwrightTitleNormalize.js";
  *   processingAt?: number | null,
  *   updatedAt: number,
  * }} InboundTurnLedgerEntry */
+
+/** Stale recovery claim TTL — another worker may reclaim after this. */
+const RECOVERY_CLAIM_TTL_MS = Math.max(
+  15_000,
+  Math.min(
+    10 * 60 * 1000,
+    Number.parseInt(
+      String(process.env.PLAYWRIGHT_OUTBOUND_RECOVERY_CLAIM_TTL_MS ?? "120000"),
+      10
+    ) || 120_000
+  )
+);
 
 const DEFAULT_LEDGER_PATH = path.join(
   process.cwd(),
@@ -412,12 +431,17 @@ export function isInboundTurnLedgerDone(chatKey, stableId) {
  * Mark that a real Playwright outbound attempt has consumed the one automatic
  * send attempt for this inbound. This state is done-like for admission, but
  * visible as manual-review required until a clean success overwrites it.
+ *
+ * When `finalReplyText` is provided, the exact generated reply is persisted so
+ * a restart can resume the send without re-running the Brain or actions.
  * @param {{
  *   chatKey: string,
  *   stableId: string,
  *   guaranteeKey?: string,
  *   textPreview?: string,
  *   replyPreview?: string,
+ *   finalReplyText?: string,
+ *   finalReplySource?: string,
  *   outboundLockStage?: string,
  *   sendVia?: string,
  *   dryRun?: boolean,
@@ -440,6 +464,26 @@ export function markInboundTurnLedgerOutboundLocked(p) {
   const existing = ledgerByKey.get(key);
   if (existing?.state === "done") return;
   const now = Date.now();
+  const nextFinalReply =
+    p.finalReplyText != null
+      ? String(p.finalReplyText)
+      : existing?.finalReplyText != null
+        ? String(existing.finalReplyText)
+        : null;
+  const nextFinalReplySource =
+    p.finalReplySource != null
+      ? String(p.finalReplySource).trim() || null
+      : existing?.finalReplySource != null
+        ? String(existing.finalReplySource).trim() || null
+        : null;
+  // Preserve send_attempted/sent across re-lock; otherwise start as pending_send.
+  const existingIntent = String(existing?.outboundIntentStatus ?? "").trim();
+  const outboundIntentStatus =
+    existingIntent === "sent" || existingIntent === "send_attempted"
+      ? existingIntent
+      : nextFinalReply
+        ? "pending_send"
+        : existingIntent || "pending_send";
   upsertEntry(key, {
     chatKey,
     stableId,
@@ -458,7 +502,12 @@ export function markInboundTurnLedgerOutboundLocked(p) {
     traceId: String(p.traceId ?? existing?.traceId ?? "").trim() || null,
     groupChatKey: String(p.groupChatKey ?? existing?.groupChatKey ?? "").trim() || null,
     textPreview: String(p.textPreview ?? existing?.textPreview ?? "").slice(0, 120),
-    replyPreview: String(p.replyPreview ?? existing?.replyPreview ?? "").slice(0, 160),
+    replyPreview: String(
+      p.replyPreview ?? nextFinalReply ?? existing?.replyPreview ?? ""
+    ).slice(0, 160),
+    finalReplyText: nextFinalReply,
+    finalReplySource: nextFinalReplySource,
+    outboundIntentStatus,
     messageHash: String(p.messageHash ?? existing?.messageHash ?? "").trim() || null,
     replyHash: String(p.replyHash ?? existing?.replyHash ?? "").trim() || null,
     sourceMessageIndex:
@@ -476,6 +525,9 @@ export function markInboundTurnLedgerOutboundLocked(p) {
       String(p.outboundLockStage ?? "").trim() || "buffer_send_start",
     sendVia: String(p.sendVia ?? "").trim() || "PLAYWRIGHT",
     traceId: String(p.traceId ?? "").trim() || null,
+    outboundIntentStatus,
+    hasFinalReply: Boolean(nextFinalReply),
+    finalReplyChars: nextFinalReply ? nextFinalReply.length : 0,
   });
 }
 
@@ -671,6 +723,8 @@ export function markInboundTurnLedgerFailedForGuarantee(p) {
  *   burstStableIds?: string[],
  *   textPreview?: string,
  *   replyPreview?: string,
+ *   finalReplyText?: string,
+ *   finalReplySource?: string,
  *   outboundLockStage?: string,
  *   sendVia?: string,
  *   dryRun?: boolean,
@@ -697,6 +751,8 @@ export function markInboundTurnLedgerOutboundLockedForGuarantee(p) {
       guaranteeKey: buildInboundTurnLedgerKey(chatKey, sid),
       textPreview: p.textPreview,
       replyPreview: p.replyPreview,
+      finalReplyText: p.finalReplyText,
+      finalReplySource: p.finalReplySource,
       outboundLockStage: p.outboundLockStage,
       sendVia: p.sendVia,
       dryRun: p.dryRun,
@@ -708,6 +764,225 @@ export function markInboundTurnLedgerOutboundLockedForGuarantee(p) {
       lastError: p.lastError,
     });
   }
+}
+
+/**
+ * Classify how an outbound_locked turn should be recovered.
+ * @param {InboundTurnLedgerEntry | null | undefined} entry
+ * @param {{ hasOutboundEcho?: boolean }} [opts]
+ * @returns {{
+ *   action: "resume_send" | "complete_ledger" | "uncertain_fail_closed" | "not_recoverable",
+ *   reason: string,
+ *   finalReplyText: string,
+ *   replyHash: string | null,
+ *   groupChatKey: string | null,
+ *   sendVia: string | null,
+ *   guaranteeKey: string | null,
+ * }}
+ */
+export function classifyOutboundLockedRecovery(entry, opts = {}) {
+  const e = entry && typeof entry === "object" ? entry : null;
+  if (!e || e.state !== "outbound_locked") {
+    return {
+      action: "not_recoverable",
+      reason: "not_outbound_locked",
+      finalReplyText: "",
+      replyHash: null,
+      groupChatKey: null,
+      sendVia: null,
+      guaranteeKey: null,
+    };
+  }
+  const finalReplyText = String(e.finalReplyText ?? "").trim();
+  const replyHash = String(e.replyHash ?? "").trim() || null;
+  const groupChatKey =
+    String(e.groupChatKey ?? e.chatKey ?? "").trim() || null;
+  const sendVia = String(e.sendVia ?? "PLAYWRIGHT").trim() || "PLAYWRIGHT";
+  const guaranteeKey =
+    String(e.guaranteeKey ?? "").trim() ||
+    buildInboundTurnLedgerKey(e.chatKey, e.stableId) ||
+    null;
+  const intent = String(e.outboundIntentStatus ?? "").trim();
+  const hasEcho = opts.hasOutboundEcho === true;
+
+  if (hasEcho || intent === "sent") {
+    return {
+      action: "complete_ledger",
+      reason: hasEcho ? "outbound_echo_registered" : "intent_already_sent",
+      finalReplyText,
+      replyHash,
+      groupChatKey,
+      sendVia,
+      guaranteeKey,
+    };
+  }
+
+  if (intent === "send_attempted") {
+    return {
+      action: "uncertain_fail_closed",
+      reason: "send_attempted_without_echo",
+      finalReplyText,
+      replyHash,
+      groupChatKey,
+      sendVia,
+      guaranteeKey,
+    };
+  }
+
+  if (!finalReplyText) {
+    return {
+      action: "not_recoverable",
+      reason: "missing_final_reply_text",
+      finalReplyText: "",
+      replyHash,
+      groupChatKey,
+      sendVia,
+      guaranteeKey,
+    };
+  }
+
+  return {
+    action: "resume_send",
+    reason: "pending_send_with_persisted_reply",
+    finalReplyText,
+    replyHash,
+    groupChatKey,
+    sendVia,
+    guaranteeKey,
+  };
+}
+
+/**
+ * Claim exclusive ownership of an outbound_locked recovery send.
+ * @param {{
+ *   chatKey: string,
+ *   stableId: string,
+ *   claimOwner: string,
+ *   claimTtlMs?: number,
+ * }} p
+ * @returns {{ claimed: boolean, reason: string, entry?: InboundTurnLedgerEntry }}
+ */
+export function claimOutboundLockedRecovery(p) {
+  if (!isInboundTurnLedgerEnabled()) {
+    return { claimed: false, reason: "ledger_disabled" };
+  }
+  initInboundTurnLedger();
+  const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
+  const stableId = String(p.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return { claimed: false, reason: "invalid_key" };
+  const entry = ledgerByKey.get(key);
+  if (!entry || entry.state !== "outbound_locked") {
+    return { claimed: false, reason: "not_outbound_locked" };
+  }
+  const claimOwner = String(p.claimOwner ?? "").trim();
+  if (!claimOwner) return { claimed: false, reason: "missing_claim_owner" };
+  const ttl =
+    Number.isFinite(Number(p.claimTtlMs)) && Number(p.claimTtlMs) > 0
+      ? Number(p.claimTtlMs)
+      : RECOVERY_CLAIM_TTL_MS;
+  const now = Date.now();
+  const claimedAt = Number(entry.recoveryClaimedAt ?? 0);
+  const existingOwner = String(entry.recoveryClaimOwner ?? "").trim();
+  if (
+    existingOwner &&
+    existingOwner !== claimOwner &&
+    Number.isFinite(claimedAt) &&
+    now - claimedAt <= ttl
+  ) {
+    return { claimed: false, reason: "recovery_claim_held", entry };
+  }
+  const next = upsertEntry(key, {
+    ...entry,
+    recoveryClaimedAt: now,
+    recoveryClaimOwner: claimOwner,
+    outboundIntentStatus: "send_attempted",
+  });
+  console.log("[inbound_turn_ledger_recovery_claimed]", {
+    chatKey,
+    stableId,
+    claimOwner,
+    guaranteeKey: entry.guaranteeKey ?? null,
+  });
+  return { claimed: true, reason: "claimed", entry: next };
+}
+
+/**
+ * Mark outbound intent as successfully sent and complete the ledger.
+ * @param {{
+ *   chatKey: string,
+ *   stableId: string,
+ *   guaranteeKey?: string,
+ *   textPreview?: string,
+ * }} p
+ */
+export function markOutboundLockedRecoverySent(p) {
+  if (!isInboundTurnLedgerEnabled()) return;
+  initInboundTurnLedger();
+  const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
+  const stableId = String(p.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return;
+  const existing = ledgerByKey.get(key);
+  upsertEntry(key, {
+    ...(existing || {}),
+    chatKey,
+    stableId,
+    guaranteeKey:
+      String(p.guaranteeKey ?? existing?.guaranteeKey ?? "").trim() || key,
+    outboundIntentStatus: "sent",
+    recoveryClaimedAt: null,
+    recoveryClaimOwner: null,
+    deliveryStatus: "sent",
+  });
+  markInboundTurnLedgerDone({
+    chatKey,
+    stableId,
+    guaranteeKey: String(p.guaranteeKey ?? existing?.guaranteeKey ?? "").trim() || key,
+    replySent: true,
+    textPreview: p.textPreview ?? existing?.textPreview,
+  });
+}
+
+/**
+ * Clear a stale/failed recovery claim back to pending_send when send clearly failed.
+ * Does not clear send_attempted when uncertainty should fail closed.
+ * @param {{ chatKey: string, stableId: string, claimOwner: string, resetToPending?: boolean }} p
+ */
+export function releaseOutboundLockedRecoveryClaim(p) {
+  if (!isInboundTurnLedgerEnabled()) return;
+  initInboundTurnLedger();
+  const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
+  const stableId = String(p.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return;
+  const existing = ledgerByKey.get(key);
+  if (!existing || existing.state !== "outbound_locked") return;
+  const claimOwner = String(p.claimOwner ?? "").trim();
+  if (
+    claimOwner &&
+    String(existing.recoveryClaimOwner ?? "").trim() &&
+    String(existing.recoveryClaimOwner).trim() !== claimOwner
+  ) {
+    return;
+  }
+  upsertEntry(key, {
+    ...existing,
+    recoveryClaimedAt: null,
+    recoveryClaimOwner: null,
+    outboundIntentStatus:
+      p.resetToPending === true ? "pending_send" : existing.outboundIntentStatus,
+  });
+}
+
+/**
+ * @param {string} guaranteeKey
+ * @returns {InboundTurnLedgerEntry | undefined}
+ */
+export function getInboundTurnLedgerEntryByGuaranteeKey(guaranteeKey) {
+  const { chatKey, stableId } = parseGuaranteeKeyParts(guaranteeKey);
+  if (!chatKey || !stableId) return undefined;
+  return getInboundTurnLedgerEntry(chatKey, stableId);
 }
 
 /** @param {string} [customPath] */

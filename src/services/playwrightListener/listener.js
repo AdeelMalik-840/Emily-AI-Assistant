@@ -47,6 +47,7 @@ import {
   markInboundTurnLedgerProcessing,
   resolveInboundTurnAdmissionBlock,
 } from "../inboundTurnLedger.js";
+import { scheduleOutboundLockedRecovery } from "../outboundLockedRecovery.js";
 import { clearWhatsAppInboundMessageCaches } from "../whatsappInboundBuffer.js";
 import { pollLocalApprovalContinuations } from "../localApprovalContinuationPoller.js";
 import { pollLocalAvailabilityContinuations } from "../localAvailabilityContinuationPoller.js";
@@ -1791,6 +1792,14 @@ function isFreshMergeSourceAllowed({
     stableId: sid,
     textPreview: String(row?.text ?? "").slice(0, 120),
   });
+  if (ledgerBlock.blocked === true && ledgerBlock.reason === "outbound_locked") {
+    scheduleOutboundLockedRecovery({
+      chatKey,
+      stableId: sid,
+      guaranteeKey:
+        ledgerBlock.guaranteeKey || playwrightGuaranteeKeyForStableId(chatKey, sid),
+    });
+  }
   return ledgerBlock.blocked !== true;
 }
 
@@ -3642,6 +3651,15 @@ export function filterGuaranteeFirstEligibleUserRows(p) {
         textPreview: String(msg?.text ?? "").slice(0, 120),
       });
       if (ledgerBlock.blocked) {
+        if (ledgerBlock.reason === "outbound_locked") {
+          scheduleOutboundLockedRecovery({
+            chatKey,
+            stableId,
+            guaranteeKey:
+              ledgerBlock.guaranteeKey ||
+              playwrightGuaranteeKeyForStableId(chatKey, stableId),
+          });
+        }
         if (droppedDone.length < 3) droppedDone.push(stableId);
         console.log("[guarantee_first_row_decision]", {
           chatKey,
@@ -3878,6 +3896,15 @@ export function resolveFreshAdmittedTurns(p) {
         textPreview: String(msg?.text ?? "").slice(0, 120),
       });
       if (ledgerBlock.blocked) {
+        if (ledgerBlock.reason === "outbound_locked") {
+          scheduleOutboundLockedRecovery({
+            chatKey,
+            stableId,
+            guaranteeKey:
+              ledgerBlock.guaranteeKey ||
+              playwrightGuaranteeKeyForStableId(chatKey, stableId),
+          });
+        }
         if (droppedDone.length < 3) droppedDone.push(stableId);
         console.log("[guarantee_first_row_decision]", {
           chatKey,

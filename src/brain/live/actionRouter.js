@@ -10,6 +10,7 @@ import { executeOwnerNotification } from "../../services/executors/ownerNotifica
 import { executeReplyPrivate } from "../../services/executors/replyPrivateExecutor.js";
 import { applySessionMemoryFromActionPlan } from "../../services/executors/sessionMemoryExecutor.js";
 import { FINAL_AVAILABILITY_REQUEST_STATUSES } from "../../services/availabilityRequestService.js";
+import { detectAvailabilityRequestBookingConflict } from "../../services/availabilityBookingConflictGuard.js";
 
 /** @typedef {import("../contracts/action.js").ActionPlan} ActionPlan */
 /** @typedef {import("../config/liveFeatureFlags.js").getEmilyBrainV2LiveFlagSnapshot extends () => infer R ? R : never} LiveFlags */
@@ -234,7 +235,13 @@ export function assertLiveActionPlanIsSafe(actionPlan, flags) {
   if (routed.hasDisallowedExecute) {
     throw new Error("live_action_plan_execute_true");
   }
-  if (!routed.intentionallySilent && !routed.reply) {
+  const awaitsPostExecuteReply =
+    String(actionPlan?.postExecuteCustomerReply ?? "").trim() === "owner_check_result";
+  // When owner-check is present but execute=false, empty reply is intentional (no false claim).
+  const hasOwnerCheckNotExecuted = routed.actions.some(
+    (a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED" && !a.allowed
+  );
+  if (!routed.intentionallySilent && !routed.reply && !awaitsPostExecuteReply && !hasOwnerCheckNotExecuted) {
     const hasReplyAction = routed.actions.some((a) => a.type === "REPLY" && a.text);
     if (!hasReplyAction) {
       throw new Error("live_action_plan_missing_reply");
@@ -380,32 +387,41 @@ export async function executeLiveSideEffects(p) {
       const lifecycleKind = cleanStatus(availabilityCheckResult?.lifecycleKind);
       const notifyExecute = p.flags?.availabilityOwnerNotifyExecute === true;
       const customerDmExecute = p.flags?.availabilityCustomerDmExecute === true;
+      const awaitsPostExecuteReply =
+        String(p.actionPlan?.postExecuteCustomerReply ?? "").trim() === "owner_check_result";
 
       if (availabilityCheckResult?.ok === true && lifecycleKind === "waiting_confirm_reused") {
-        // Preserve open waiting_confirm AVR. Confirmation belongs in DM — never group "Book kar du?".
         sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION = {
           ok: true,
           skipped: true,
           reason: "WAITING_CONFIRM_NO_OWNER_NOTIFY",
           requestId: availabilityCheckResult?.requestId ?? null,
         };
-        if (!customerDmExecute) {
-          sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
-            ...availabilityCheckResult,
-            lifecycleKind: "waiting_confirm_reused_but_dm_unavailable",
-            replyDisposition: "SUPPRESS_NO_CHECK_CLAIM",
-            dmContinuation: "unavailable_flag_off",
-          };
-          suppressCustomerReply = true;
-          customerReplyOverride = null;
+        if (awaitsPostExecuteReply) {
+          // Post-execute path in routeAndExecuteLiveActionPlan handles disposition.
+          if (!customerDmExecute) {
+            sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
+              ...availabilityCheckResult,
+              lifecycleKind: "waiting_confirm_reused_but_dm_unavailable",
+              dmContinuation: "unavailable_flag_off",
+            };
+          }
         } else {
-          // Flag on but group owner-check path does not schedule DM here — fail closed rather than group confirm prompt.
-          sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
-            ...availabilityCheckResult,
-            lifecycleKind: "waiting_confirm_reused_but_dm_unavailable",
-            replyDisposition: "SUPPRESS_NO_CHECK_CLAIM",
-            dmContinuation: "not_scheduled_on_group_owner_check_path",
-          };
+          if (!customerDmExecute) {
+            sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
+              ...availabilityCheckResult,
+              lifecycleKind: "waiting_confirm_reused_but_dm_unavailable",
+              replyDisposition: "SUPPRESS_NO_CHECK_CLAIM",
+              dmContinuation: "unavailable_flag_off",
+            };
+          } else {
+            sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
+              ...availabilityCheckResult,
+              lifecycleKind: "waiting_confirm_reused_but_dm_unavailable",
+              replyDisposition: "SUPPRESS_NO_CHECK_CLAIM",
+              dmContinuation: "not_scheduled_on_group_owner_check_path",
+            };
+          }
           suppressCustomerReply = true;
           customerReplyOverride = null;
         }
@@ -475,23 +491,29 @@ export async function executeLiveSideEffects(p) {
             notifyExecute: true,
           })
         ) {
-          suppressCustomerReply = true;
-          customerReplyOverride = null;
+          if (!awaitsPostExecuteReply) {
+            suppressCustomerReply = true;
+            customerReplyOverride = null;
+          }
           sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
             ...checkForReply,
             replyDisposition: "SUPPRESS_NO_CHECK_CLAIM",
           };
         }
       } else if (availabilityCheckResult?.ok === true && !notifyExecute) {
-        suppressCustomerReply = true;
-        customerReplyOverride = null;
+        if (!awaitsPostExecuteReply) {
+          suppressCustomerReply = true;
+          customerReplyOverride = null;
+        }
         sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
           ...availabilityCheckResult,
           replyDisposition: "SUPPRESS_NOTIFY_DISABLED",
         };
       } else {
-        suppressCustomerReply = true;
-        customerReplyOverride = null;
+        if (!awaitsPostExecuteReply) {
+          suppressCustomerReply = true;
+          customerReplyOverride = null;
+        }
         sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = {
           ...(availabilityCheckResult && typeof availabilityCheckResult === "object"
             ? availabilityCheckResult
@@ -555,6 +577,77 @@ export function isLiveWorkflowType(workflowType) {
 }
 
 /**
+ * @typedef {Object} OwnerCheckPostExecuteFacts
+ * @property {string} actionType
+ * @property {string} status
+ * @property {string | null} itemId
+ * @property {string | null} itemLabel
+ * @property {number | null} durationDays
+ * @property {string | null} requestedStartAt
+ * @property {string | null} requestedEndAt
+ * @property {string | null} requestId
+ * @property {string | null} lifecycleKind
+ * @property {boolean} created
+ * @property {boolean} reused
+ * @property {boolean} ownerNotificationSent
+ * @property {boolean} ownerNotificationSkipped
+ * @property {string | null} ownerNotificationStatus
+ * @property {string | null} customerDmNotificationStatus
+ * @property {boolean} freshConflictDetected
+ * @property {string | null} responseDisposition
+ */
+
+/**
+ * Build verified post-execution facts from an accepted owner-check result.
+ * Pure data — no OpenAI, no wording generation.
+ *
+ * @param {{
+ *   checkResult: Record<string, unknown> | null,
+ *   notifyResult: Record<string, unknown> | null,
+ *   payload: Record<string, unknown>,
+ *   freshConflictDetected?: boolean,
+ *   responseDisposition?: string | null,
+ * }} p
+ * @returns {OwnerCheckPostExecuteFacts}
+ */
+export function buildOwnerCheckPostExecuteFacts(p) {
+  const check = p.checkResult && typeof p.checkResult === "object" ? p.checkResult : {};
+  const notify = p.notifyResult && typeof p.notifyResult === "object" ? p.notifyResult : {};
+  const payload = p.payload && typeof p.payload === "object" ? p.payload : {};
+  const request =
+    check.request && typeof check.request === "object"
+      ? /** @type {Record<string, unknown>} */ (check.request)
+      : null;
+  return {
+    actionType: "AVAILABILITY_OWNER_CHECK_REQUIRED",
+    status: "accepted",
+    itemId: String(payload.itemId ?? "").trim() || null,
+    itemLabel: String(payload.itemLabel ?? "").trim() || null,
+    durationDays:
+      payload.durationDays != null && Number.isFinite(Number(payload.durationDays))
+        ? Math.max(1, Math.floor(Number(payload.durationDays)))
+        : null,
+    requestedStartAt: String(payload.requestedStartAt ?? "").trim() || null,
+    requestedEndAt: String(payload.requestedEndAt ?? "").trim() || null,
+    requestId: check.requestId ?? request?.requestId ?? null,
+    lifecycleKind: cleanStatus(check.lifecycleKind) || null,
+    created: check.created === true,
+    reused: check.reused === true,
+    ownerNotificationSent: notify.sent === true,
+    ownerNotificationSkipped: notify.skipped === true,
+    ownerNotificationStatus:
+      cleanStatus(request?.ownerNotificationStatus) ||
+      (notify.sent === true ? "sent" : notify.skipped === true ? "skipped" : null),
+    customerDmNotificationStatus:
+      cleanStatus(request?.customerDmNotificationStatus) ||
+      cleanStatus(request?.customerNotificationStatus) ||
+      null,
+    freshConflictDetected: p.freshConflictDetected === true,
+    responseDisposition: cleanStatus(p.responseDisposition) || null,
+  };
+}
+
+/**
  * @param {ActionPlan | null | undefined} actionPlan
  * @param {LiveFlags | Record<string, unknown>} flags
  * @param {Record<string, unknown>} [executionContext]
@@ -573,25 +666,180 @@ export async function routeAndExecuteLiveActionPlan(actionPlan, flags, execution
     flags,
     executionContext,
   });
-  if (suppressCustomerReply === true) {
+
+  const awaitsPostExecute =
+    String(actionPlan?.postExecuteCustomerReply ?? "").trim() === "owner_check_result";
+
+  let postExecuteResult = null;
+
+  if (awaitsPostExecute) {
+    const checkResult =
+      sideEffectResults?.AVAILABILITY_OWNER_CHECK_REQUIRED &&
+      typeof sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED === "object"
+        ? /** @type {Record<string, unknown>} */ (sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED)
+        : null;
+    const notifyResult =
+      sideEffectResults?.AVAILABILITY_OWNER_NOTIFICATION &&
+      typeof sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION === "object"
+        ? /** @type {Record<string, unknown>} */ (sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION)
+        : null;
+    const ownerCheckAction = (Array.isArray(actionPlan?.actions) ? actionPlan.actions : []).find(
+      (a) => String(a?.type ?? "").trim() === "AVAILABILITY_OWNER_CHECK_REQUIRED"
+    );
+    const payload =
+      ownerCheckAction?.payload && typeof ownerCheckAction.payload === "object"
+        ? /** @type {Record<string, unknown>} */ (ownerCheckAction.payload)
+        : {};
+
+    if (checkResult?.ok === true) {
+      const lifecycleKind = cleanStatus(checkResult?.lifecycleKind);
+      const notifyExecute = flags?.availabilityOwnerNotifyExecute === true;
+
+      const isDeferralAllowed = shouldAllowOwnerCheckDeferralReply({
+        checkResult: /** @type {Record<string, unknown>} */ (checkResult),
+        notifyResult,
+        notifyExecute,
+      });
+
+      const isWaitingConfirmReused =
+        lifecycleKind === "waiting_confirm_reused" ||
+        lifecycleKind === "waiting_confirm_reused_but_dm_unavailable";
+
+      if (isDeferralAllowed || isWaitingConfirmReused) {
+        let freshConflictDetected = false;
+        if (isWaitingConfirmReused) {
+          const request =
+            checkResult.request && typeof checkResult.request === "object"
+              ? /** @type {Record<string, unknown>} */ (checkResult.request)
+              : null;
+          if (request?.requestId) {
+            try {
+              const conflictResult = await detectAvailabilityRequestBookingConflict({
+                request,
+                businessId: String(executionContext.businessId ?? "").trim(),
+                getBookingsForItemFn: executionContext.getBookingsForItemFn ?? undefined,
+              });
+              freshConflictDetected = conflictResult?.conflict === true;
+            } catch {
+              freshConflictDetected = true;
+            }
+          } else {
+            freshConflictDetected = true;
+          }
+        }
+
+        let responseDisposition = "owner_check_created";
+        if (freshConflictDetected) {
+          responseDisposition = "fresh_conflict_suppress";
+        } else if (isWaitingConfirmReused) {
+          const checkRequest =
+            checkResult.request && typeof checkResult.request === "object"
+              ? /** @type {Record<string, unknown>} */ (checkResult.request)
+              : {};
+          const dmStatus = cleanStatus(
+            checkRequest.customerDmNotificationStatus ??
+            checkRequest.customerNotificationStatus
+          );
+          responseDisposition =
+            dmStatus === "sent" || dmStatus === "accepted"
+              ? "waiting_confirm_reused_guidance_allowed"
+              : "waiting_confirm_reused_guidance_blocked";
+        } else if (notifyResult?.sent === true) {
+          responseDisposition = "owner_notification_sent";
+        } else if (notifyResult?.skipped === true) {
+          responseDisposition = "owner_notification_skipped";
+        }
+
+        const facts = buildOwnerCheckPostExecuteFacts({
+          checkResult,
+          notifyResult,
+          payload,
+          freshConflictDetected,
+          responseDisposition,
+        });
+
+        postExecuteResult = {
+          awaitsReply: !freshConflictDetected,
+          suppress: freshConflictDetected,
+          facts,
+          responseDisposition,
+          lifecycleKind,
+          freshConflictDetected,
+        };
+      } else {
+        postExecuteResult = {
+          awaitsReply: false,
+          suppress: true,
+          facts: null,
+          responseDisposition: cleanStatus(checkResult?.replyDisposition) || "not_eligible_for_reply",
+          lifecycleKind: cleanStatus(checkResult?.lifecycleKind),
+          freshConflictDetected: false,
+        };
+      }
+    } else {
+      postExecuteResult = {
+        awaitsReply: false,
+        suppress: true,
+        facts: null,
+        responseDisposition: "owner_check_failed",
+        lifecycleKind: null,
+        freshConflictDetected: false,
+      };
+    }
+  }
+
+  const finalSideEffectResults = {
+    ...sideEffectResults,
+    ...(postExecuteResult ? { OWNER_CHECK_POST_EXECUTE_RESULT: postExecuteResult } : {}),
+  };
+
+  // When post-execute result says suppress, or when executeLiveSideEffects suppressed
+  // (and no post-execute path overrides it), suppress the reply.
+  const shouldSuppress =
+    (suppressCustomerReply === true && !awaitsPostExecute) ||
+    (awaitsPostExecute && postExecuteResult?.suppress === true);
+
+  // When post-execute awaits a Brain reply, the pipeline handles wording — actionRouter
+  // returns empty reply and awaitsPostExecuteBrainReply: true so the caller knows to invoke
+  // the Brain's response-only mode.
+  const awaitsBrainReply = awaitsPostExecute && postExecuteResult?.awaitsReply === true;
+
+  if (shouldSuppress) {
     return {
       ...routed,
       reply: "",
       intentionallySilent: true,
       customerReplySuppressed: true,
-      sideEffectResults,
+      sideEffectResults: finalSideEffectResults,
       bookingCreated,
       customerReplyOverride: null,
       skipRemainingActions,
+      awaitsPostExecuteBrainReply: false,
     };
   }
+
+  if (awaitsBrainReply) {
+    return {
+      ...routed,
+      reply: "",
+      intentionallySilent: false,
+      customerReplySuppressed: false,
+      sideEffectResults: finalSideEffectResults,
+      bookingCreated,
+      customerReplyOverride: null,
+      skipRemainingActions,
+      awaitsPostExecuteBrainReply: true,
+    };
+  }
+
   return {
     ...routed,
     reply: String(customerReplyOverride ?? "").trim() || routed.reply,
-    sideEffectResults,
+    sideEffectResults: finalSideEffectResults,
     bookingCreated,
     customerReplyOverride,
     customerReplySuppressed: false,
     skipRemainingActions,
+    awaitsPostExecuteBrainReply: false,
   };
 }
