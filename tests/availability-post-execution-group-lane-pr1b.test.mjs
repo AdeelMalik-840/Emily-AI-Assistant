@@ -148,13 +148,14 @@ test("1: fresh owner-check created — Brain generates one reply", async () => {
 // 2. Owner notification sent — reply does not make false claims
 // ═══════════════════════════════════════════
 
-test("2: owner notification sent — reply based on verified facts only", async () => {
+test("2: owner notification sent — customer Brain facts stay owner-free", async () => {
   const postExec = makePostExecResult({
-    responseDisposition: "owner_check_created",
+    responseDisposition: "owner_notification_sent",
     facts: {
       ...makePostExecResult().facts,
       ownerNotificationSent: true,
       ownerNotificationStatus: "sent",
+      responseDisposition: "owner_notification_sent",
     },
   });
 
@@ -162,7 +163,7 @@ test("2: owner notification sent — reply based on verified facts only", async 
   const stubBrain = async (args) => {
     capturedPayload = args;
     return {
-      choices: [{ message: { content: JSON.stringify({ customerReply: "Maalik ko message bhej diya", action: "reply", shouldReply: true, confidence: 0.9, safetyNotes: null, reason: "test" }) } }],
+      choices: [{ message: { content: JSON.stringify({ customerReply: "Corolla 3 din ke liye check kar raha hun", action: "reply", shouldReply: true, confidence: 0.9, safetyNotes: null, reason: "test" }) } }],
     };
   };
 
@@ -172,7 +173,7 @@ test("2: owner notification sent — reply based on verified facts only", async 
       recentDialogue: null,
       facts: BASE_FACTS,
       postExecuteResult: postExec,
-      responseDisposition: "owner_check_created",
+      responseDisposition: "owner_notification_sent",
       actionsAllowed: false,
       allowedExecutors: [],
     },
@@ -180,16 +181,18 @@ test("2: owner notification sent — reply based on verified facts only", async 
   });
 
   assert.strictEqual(result.ok, true);
-  // Verify the facts passed to the Brain include ownerNotificationSent=true
   const userMsg = capturedPayload?.messages?.find((m) => m.role === "user")?.content ?? "";
-  assert.ok(userMsg.includes("ownerNotificationSent"), "facts must include ownerNotificationSent");
+  assert.doesNotMatch(userMsg, /ownerNotificationSent/);
+  assert.doesNotMatch(userMsg, /ownerNotificationStatus/);
+  assert.doesNotMatch(userMsg, /owner_notification_sent/);
+  assert.match(userMsg, /availabilityCheckingInProgress/);
 });
 
 // ═══════════════════════════════════════════
 // 3. Owner notification failed — no false success claim
 // ═══════════════════════════════════════════
 
-test("3: owner notification failed — Brain receives accurate failed status", async () => {
+test("3: owner notification failed — customer facts omit internal notify status", async () => {
   const postExec = makePostExecResult({
     responseDisposition: "owner_notification_failed",
     facts: {
@@ -204,7 +207,7 @@ test("3: owner notification failed — Brain receives accurate failed status", a
   let capturedPayload;
   const stubBrain = async (args) => {
     capturedPayload = args;
-    return { choices: [{ message: { content: JSON.stringify({ customerReply: "Request record ho gayi", action: "reply", shouldReply: true, confidence: 0.85, safetyNotes: null, reason: "test" }) } }] };
+    return { choices: [{ message: { content: JSON.stringify({ customerReply: "Corolla check chal raha hai", action: "reply", shouldReply: true, confidence: 0.85, safetyNotes: null, reason: "test" }) } }] };
   };
 
   const result = await executeGroupPostExecuteLaneDecision({
@@ -220,12 +223,10 @@ test("3: owner notification failed — Brain receives accurate failed status", a
 
   assert.strictEqual(result.ok, true);
   const userMsg = capturedPayload?.messages?.find((m) => m.role === "user")?.content ?? "";
-  // Must not falsely claim notification was sent in facts
+  assert.doesNotMatch(userMsg, /ownerNotificationStatus/);
+  assert.doesNotMatch(userMsg, /owner_notification_failed/);
   const factsInPrompt = JSON.parse(userMsg.match(/VERIFIED_FACTS_JSON:\n(\{[\s\S]+?)(?:\n\n|$)/)?.[1] ?? "{}");
-  const nr = factsInPrompt?.postExecuteResult;
-  if (nr) {
-    assert.notStrictEqual(nr.ownerNotificationStatus, "sent", "must not claim sent when failed");
-  }
+  assert.equal(factsInPrompt?.postExecuteCustomerStatus?.availabilityCheckingInProgress, true);
 });
 
 // ═══════════════════════════════════════════
