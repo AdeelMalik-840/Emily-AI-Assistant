@@ -3200,7 +3200,6 @@ function shouldBypassSessionLedgerForHoldEligibleRow(p) {
 export function resolveFreshDeltaAdmissionGate(sorted, freshState, chatKey) {
   const resolvedAnchorIndex = findTailAnchorIndex(sorted, freshState?.currentTailAnchor);
   const listLength = Array.isArray(sorted) ? sorted.length : 0;
-  const maxIndex = listLength > 0 ? listLength - 1 : -1;
   let acknowledgedAnchorIndex = Number(freshState?.acknowledgedAnchorIndex);
   const staleAck = acknowledgedAnchorIndex;
   const needsRepair =
@@ -3209,20 +3208,44 @@ export function resolveFreshDeltaAdmissionGate(sorted, freshState, chatKey) {
     (listLength > 0 && acknowledgedAnchorIndex >= listLength);
 
   if (needsRepair) {
-    acknowledgedAnchorIndex =
-      resolvedAnchorIndex >= 0 ? resolvedAnchorIndex : maxIndex;
-    if (freshState && Number.isFinite(acknowledgedAnchorIndex)) {
-      freshState.acknowledgedAnchorIndex = acknowledgedAnchorIndex;
+    if (resolvedAnchorIndex >= 0) {
+      // Restore only from trusted last-admitted identity currently in the DOM.
+      // Never repair to max visible index — that row may never have been admitted.
+      acknowledgedAnchorIndex = resolvedAnchorIndex;
+      if (freshState && Number.isFinite(acknowledgedAnchorIndex)) {
+        freshState.acknowledgedAnchorIndex = acknowledgedAnchorIndex;
+      }
+      console.log("[fresh_delta_acknowledged_anchor_repaired]", {
+        chatKey,
+        staleAcknowledgedAnchorIndex: Number.isFinite(staleAck) ? staleAck : null,
+        repairedAcknowledgedAnchorIndex: acknowledgedAnchorIndex,
+        resolvedAnchorIndex,
+        currentListLength: listLength,
+        reason:
+          !Number.isFinite(staleAck) || staleAck < 0 ? "invalid_negative" : "out_of_range",
+        repairSource: "trusted_last_admitted_identity",
+      });
+      return {
+        resolvedAnchorIndex,
+        acknowledgedAnchorIndex,
+        waitForRescan: false,
+      };
     }
-    console.log("[fresh_delta_acknowledged_anchor_repaired]", {
+    // Missing trusted identity: wait/rescan. Do not reanchor to the visible tail.
+    console.log("[fresh_delta_acknowledged_anchor_wait_rescan]", {
       chatKey,
       staleAcknowledgedAnchorIndex: Number.isFinite(staleAck) ? staleAck : null,
-      repairedAcknowledgedAnchorIndex: acknowledgedAnchorIndex,
       resolvedAnchorIndex,
       currentListLength: listLength,
       reason:
         !Number.isFinite(staleAck) || staleAck < 0 ? "invalid_negative" : "out_of_range",
+      note: "no_repair_to_visible_tail",
     });
+    return {
+      resolvedAnchorIndex,
+      acknowledgedAnchorIndex: Number.isFinite(staleAck) ? staleAck : -1,
+      waitForRescan: true,
+    };
   }
   if (
     resolvedAnchorIndex >= 0 &&
@@ -3237,35 +3260,82 @@ export function resolveFreshDeltaAdmissionGate(sorted, freshState, chatKey) {
       currentListLength: listLength,
     });
   }
-  return { resolvedAnchorIndex, acknowledgedAnchorIndex };
+  return { resolvedAnchorIndex, acknowledgedAnchorIndex, waitForRescan: false };
 }
 
 /**
- * Test helper: mirror production missing-anchor path (no forward this tick).
+ * Restore currentTailAnchor + ack from trusted last-admitted stableId when present in DOM.
+ * @param {Array<object>} sorted
+ * @param {object} freshState
+ * @param {string} chatKey
+ * @returns {number} restored index or -1
+ */
+function tryRestoreAnchorFromLastAdmitted(sorted, freshState, chatKey) {
+  if (!freshState || !Array.isArray(sorted) || sorted.length === 0) return -1;
+  const trustedId = String(
+    freshState.lastAdmittedStableId || freshState.currentTailAnchor?.stableId || ""
+  ).trim();
+  if (!trustedId) return -1;
+  const restoredIndex = findTailAnchorIndex(sorted, {
+    stableId: trustedId,
+    rowKey: "",
+    textFingerprint: "",
+    __position: -1,
+  });
+  if (restoredIndex < 0) return -1;
+  const restoredAnchor = buildTailAnchorFromRow(
+    sorted[restoredIndex],
+    restoredIndex,
+    chatKey,
+    sorted
+  );
+  freshState.currentTailAnchor = restoredAnchor;
+  freshState.acknowledgedAnchorIndex = restoredIndex;
+  console.log("[fresh_delta_anchor_restored_from_last_admitted]", {
+    chatKey,
+    restoredIndex,
+    stableId: trustedId,
+    currentListLength: sorted.length,
+  });
+  return restoredIndex;
+}
+
+/**
+ * Test helper: mirror production missing-anchor path (wait/rescan; no reanchor to tail).
  * @param {Array<object>} sorted
  * @param {object} freshState
  * @param {string} chatKey
  */
 export function __freshDeltaAnchorMissingForTests(sorted, freshState, chatKey) {
-  const resolvedAnchorIndex = findTailAnchorIndex(sorted, freshState?.currentTailAnchor);
+  let resolvedAnchorIndex = findTailAnchorIndex(sorted, freshState?.currentTailAnchor);
+  if (resolvedAnchorIndex < 0) {
+    resolvedAnchorIndex = tryRestoreAnchorFromLastAdmitted(sorted, freshState, chatKey);
+  }
   if (resolvedAnchorIndex >= 0) {
     const gate = resolveFreshDeltaAdmissionGate(sorted, freshState, chatKey);
     return {
-      forwardAllowed: true,
+      forwardAllowed: !gate.waitForRescan,
       reanchored: false,
+      waitForRescan: Boolean(gate.waitForRescan),
+      restoredFromLastAdmitted: Boolean(freshState?.lastAdmittedStableId),
       resolvedAnchorIndex: gate.resolvedAnchorIndex,
       acknowledgedAnchorIndex: gate.acknowledgedAnchorIndex,
     };
   }
-  const newAnchor = establishTailAnchor(sorted, chatKey, sorted);
-  freshState.currentTailAnchor = newAnchor;
-  const idx = sorted.length - 1;
-  freshState.acknowledgedAnchorIndex = idx;
+  console.log("[fresh_delta_anchor_missing_wait_rescan]", {
+    chatKey,
+    acknowledgedAnchorIndex: freshState?.acknowledgedAnchorIndex ?? null,
+    lastAdmittedStableId: freshState?.lastAdmittedStableId ?? null,
+    currentListLength: Array.isArray(sorted) ? sorted.length : 0,
+    note: "wait_rescan_no_reanchor_to_tail",
+  });
   return {
     forwardAllowed: false,
-    reanchored: true,
-    resolvedAnchorIndex: idx,
-    acknowledgedAnchorIndex: idx,
+    reanchored: false,
+    waitForRescan: true,
+    restoredFromLastAdmitted: false,
+    resolvedAnchorIndex: -1,
+    acknowledgedAnchorIndex: Number(freshState?.acknowledgedAnchorIndex),
   };
 }
 
@@ -3789,17 +3859,19 @@ export function resolveFreshAdmittedTurns(p) {
   const currentFreshAdmittedStableIdsByParticipant = new Map();
   const resolvedIndex = Number(resolvedAnchorIndex);
   const acknowledgedIndex = Number(acknowledgedAnchorIndex);
-  const effectiveAnchorIndex = Number.isFinite(resolvedIndex)
-    ? resolvedIndex
-    : Number.isFinite(acknowledgedIndex)
-      ? acknowledgedIndex
+  // Prefer acknowledged (last successfully advanced admitted turn) so a relocated
+  // or wrongly-advanced currentTailAnchor cannot raise the gate past unadmitted rows.
+  const effectiveAnchorIndex = Number.isFinite(acknowledgedIndex)
+    ? acknowledgedIndex
+    : Number.isFinite(resolvedIndex)
+      ? resolvedIndex
       : null;
   const anchorProof = {
     effectiveAnchorIndex,
-    source: Number.isFinite(resolvedIndex)
-      ? "resolvedAnchorIndex"
-      : Number.isFinite(acknowledgedIndex)
-        ? "acknowledgedAnchorIndex"
+    source: Number.isFinite(acknowledgedIndex)
+      ? "acknowledgedAnchorIndex"
+      : Number.isFinite(resolvedIndex)
+        ? "resolvedAnchorIndex"
         : "missing",
     resolvedAnchorIndex: Number.isFinite(resolvedIndex) ? resolvedIndex : null,
     acknowledgedAnchorIndex: Number.isFinite(acknowledgedIndex)
@@ -3869,23 +3941,27 @@ export function resolveFreshAdmittedTurns(p) {
       continue;
     }
 
-    const { stableId, guaranteeKey } = resolvePlaywrightForwardIdentity(
+    const { stableId, guaranteeKey, strategy } = resolvePlaywrightForwardIdentity(
       chatKey,
       msg,
       0,
       extractedList
     );
-    if (!stableId) {
+    if (!stableId || strategy !== "WHATSAPP_DATA_ID") {
+      // Defer until a stable WhatsApp data-id appears. Do not ledger-block by text.
+      const dropReason = !stableId ? "missing_stable_id" : "missing_whatsapp_data_id";
       console.log("[guarantee_first_row_decision]", {
         chatKey,
-        stableId: null,
+        stableId: stableId || null,
+        strategy: strategy || null,
         sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
         textPreview: String(msg?.text ?? "").slice(0, 120),
         finalDecision: "drop",
-        dropReason: "missing_stable_id",
+        dropReason,
         guaranteeState: null,
+        note: "defer_rescan_no_ledger_mark",
       });
-      recordRejected({ msg, sortedIndex, dropReason: "missing_stable_id" });
+      recordRejected({ msg, stableId: stableId || null, sortedIndex, dropReason });
       continue;
     }
 
@@ -4653,6 +4729,10 @@ export function advanceTailAnchor(freshState, deliveredMsg, sorted, chatKey, ext
   const newAnchor = buildTailAnchorFromRow(anchorRow, anchorIndex, chatKey, extractedList);
   freshState.currentTailAnchor = newAnchor;
   freshState.acknowledgedAnchorIndex = anchorIndex;
+  // Trusted evidence for missing-anchor restore — only set on successful admit/forward.
+  if (newAnchor?.stableId) {
+    freshState.lastAdmittedStableId = String(newAnchor.stableId);
+  }
   if (freshState.anchorHoldUserForward) {
     freshState.anchorHoldUserForward.consumed = true;
   }
@@ -4680,6 +4760,7 @@ export function advanceTailAnchor(freshState, deliveredMsg, sorted, chatKey, ext
     toStableId: newAnchor.stableId,
     __position: newAnchor.__position,
     acknowledgedAnchorIndex: freshState.acknowledgedAnchorIndex,
+    lastAdmittedStableId: freshState.lastAdmittedStableId ?? null,
     burstCount: deliveredMsg?.__burstMergedCount ?? 1,
     textPreview: String(anchorRow?.text ?? "").slice(0, 80),
   });
@@ -7961,36 +8042,38 @@ async function runListenerBody() {
               freshState.currentTailAnchor
             );
             if (resolvedAnchorIndex < 0) {
-              const newAnchor = establishTailAnchor(sortedWithPos, chatKey, sortedWithPos);
-              freshState.currentTailAnchor = newAnchor;
-              if (!freshState.baselineTailAnchor) {
-                freshState.baselineTailAnchor = newAnchor;
-              }
-              resolvedAnchorIndex = sortedWithPos.length - 1;
-              freshState.acknowledgedAnchorIndex = resolvedAnchorIndex;
-              recordSessionVisibilityLedger(
-                freshState,
+              resolvedAnchorIndex = tryRestoreAnchorFromLastAdmitted(
                 sortedWithPos,
-                resolvedAnchorIndex,
-                chatKey,
-                sortedWithPos
+                freshState,
+                chatKey
               );
-              console.log("[fresh_delta_anchor_missing_reanchored]", {
+            }
+            if (resolvedAnchorIndex < 0) {
+              // Wait/rescan — never reanchor to max visible index (may be unadmitted).
+              console.log("[fresh_delta_anchor_missing_wait_rescan]", {
                 chatKey,
-                resolvedAnchorIndex,
                 acknowledgedAnchorIndex: freshState.acknowledgedAnchorIndex,
-                stableId: newAnchor?.stableId ?? null,
+                lastAdmittedStableId: freshState.lastAdmittedStableId ?? null,
                 currentListLength: sortedWithPos.length,
-                note: "no_forward_this_tick",
+                note: "wait_rescan_no_reanchor_to_tail",
               });
               return;
             }
 
-            const { acknowledgedAnchorIndex } = resolveFreshDeltaAdmissionGate(
-              sortedWithPos,
-              freshState,
-              chatKey
-            );
+            const {
+              acknowledgedAnchorIndex,
+              waitForRescan: admissionGateWaitForRescan,
+            } = resolveFreshDeltaAdmissionGate(sortedWithPos, freshState, chatKey);
+            if (admissionGateWaitForRescan) {
+              console.log("[fresh_delta_admission_gate_wait_rescan]", {
+                chatKey,
+                acknowledgedAnchorIndex,
+                resolvedAnchorIndex,
+                currentListLength: sortedWithPos.length,
+                note: "no_repair_to_visible_tail",
+              });
+              return;
+            }
 
             freshDeltaTailAnchorIndex = resolvedAnchorIndex;
             freshDeltaAcknowledgedAnchorIndex = acknowledgedAnchorIndex;
@@ -8757,7 +8840,8 @@ async function runListenerBody() {
                     freshState.anchorHoldUserForward.consumed = true;
                   }
                 }
-                if (freshState && !isPlaywrightGuaranteeFirstAdmissionEnabled()) {
+                if (freshState) {
+                  // Advance runtime anchor only after a successfully admitted/forwarded turn.
                   advanceTailAnchor(
                     freshState,
                     msg,

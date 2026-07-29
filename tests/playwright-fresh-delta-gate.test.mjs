@@ -99,6 +99,36 @@ function filterFresh({
   });
 }
 
+function forwardCandidateFromSurvivors({
+  survivors,
+  sorted,
+  st,
+  anchorIndex,
+  allParticipantUserRows,
+  currentFreshAdmittedStableIds,
+}) {
+  const admitted =
+    currentFreshAdmittedStableIds instanceof Set
+      ? currentFreshAdmittedStableIds
+      : new Set(
+          (survivors || [])
+            .map((row) => buildStableMessageKey(row, sorted).id)
+            .filter(Boolean)
+        );
+  return buildParticipantForwardCandidate({
+    participantMessages: survivors,
+    allParticipantUserRows,
+    lastProcessedUserMsgId: "",
+    chatKey: CHAT,
+    extractedMessages: sorted,
+    sorted,
+    normalizedGroupChatKeyForCompare: CHAT,
+    anchorIndex,
+    tickFirstSeenByStableId: st?.tickFirstSeenByStableId,
+    currentFreshAdmittedStableIds: admitted,
+  });
+}
+
 function buildTextFingerprint(text) {
   const norm = String(text ?? "")
     .replace(/\s+/g, " ")
@@ -213,16 +243,12 @@ test("1: Civic at index 14 after acknowledged anchor 13 → admitted", () => {
   assert.equal(survivors.length, 1);
   assert.match(survivors[0].text, /Civic available for rent/i);
 
-  const merged = buildParticipantForwardCandidate({
-    participantMessages: survivors,
-    lastProcessedUserMsgId: "",
-    chatKey: CHAT,
-    extractedMessages: sorted,
-    sorted,
-    normalizedGroupChatKeyForCompare: CHAT,
-    anchorIndex: 13,
-    tickFirstSeenByStableId: st.tickFirstSeenByStableId,
-  });
+  const merged = forwardCandidateFromSurvivors({
+  survivors: survivors,
+  sorted: sorted,
+  st: st,
+  anchorIndex: 13,
+});
   assert.match(merged.text, /Civic available for rent/i);
   assert.doesNotMatch(merged.text, /1703/);
 });
@@ -297,16 +323,12 @@ test("3: anchor relocation drift — admission uses acknowledged not resolved", 
   assert.equal(survivors.length, 1);
   assert.match(survivors[0].text, /1802/);
 
-  const merged = buildParticipantForwardCandidate({
-    participantMessages: survivors,
-    lastProcessedUserMsgId: "",
-    chatKey: CHAT,
-    extractedMessages: grown,
-    sorted: grown,
-    normalizedGroupChatKeyForCompare: CHAT,
-    anchorIndex: 10,
-    tickFirstSeenByStableId: st.tickFirstSeenByStableId,
-  });
+  const merged = forwardCandidateFromSurvivors({
+  survivors: survivors,
+  sorted: grown,
+  st: st,
+  anchorIndex: 10,
+});
   assert.match(merged.text, /1802/);
   assert.doesNotMatch(merged.text, /Corolla available/i);
   assert.doesNotMatch(merged.text, /3 din/i);
@@ -350,16 +372,12 @@ test("A regression: old CITY/Corolla + fresh Kia → only Kia forwarded", () => 
   assert.equal(survivors[0].text, "KIA PROOF 1606 Kia Stonic available hai?");
   assert.ok(droppedPreAnchor.length >= 2);
 
-  const merged = buildParticipantForwardCandidate({
-    participantMessages: survivors,
-    lastProcessedUserMsgId: "",
-    chatKey: CHAT,
-    extractedMessages: sorted,
-    sorted,
-    normalizedGroupChatKeyForCompare: CHAT,
-    anchorIndex: 2,
-    tickFirstSeenByStableId: st.tickFirstSeenByStableId,
-  });
+  const merged = forwardCandidateFromSurvivors({
+  survivors: survivors,
+  sorted: sorted,
+  st: st,
+  anchorIndex: 2,
+});
   assert.equal(merged.text, "KIA PROOF 1606 Kia Stonic available hai?");
   assert.doesNotMatch(merged.text, /CITY K ANDAR/i);
   assert.doesNotMatch(merged.text, /Corolla available/i);
@@ -410,33 +428,56 @@ test("D: catch-up admits fresh row after anchor", () => {
   assert.equal(survivors.length, 1);
 });
 
-test("E: burst merge meaningful row + ? continuation (guarantee-first)", () => {
+test("E: burst merge meaningful row + continuation (guarantee-first)", () => {
   clearPlaywrightExtractedMessageState();
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
-  const anchorRow = mkRow({ sender: "assistant", text: "Noted 👍", rowKey: "row::a#1" });
-  const a = mkRow({ text: "Corolla available", rowKey: "row::1#1", timestamp: 1_700_000_000_000 });
-  const b = mkRow({ text: "?", rowKey: "row::2#1", timestamp: 1_700_000_002_000 });
-  const sorted = mkSortedThread([anchorRow, a, b]);
-  const st = baselineSeedState(CHAT, [anchorRow]);
-  const userRows = sorted.filter((r) => r.sender === "user");
-  const { survivors } = filterFresh({ sorted, st, userMessages: userRows });
-  assert.equal(survivors.length, 1);
-  assert.equal(survivors[0].text, "Corolla available");
-  const merged = buildParticipantForwardCandidate({
-    participantMessages: survivors,
-    allParticipantUserRows: userRows,
-    lastProcessedUserMsgId: "",
-    chatKey: CHAT,
-    extractedMessages: sorted,
-    sorted,
-    normalizedGroupChatKeyForCompare: CHAT,
-    anchorIndex: -1,
-    tickFirstSeenByStableId: st.tickFirstSeenByStableId,
-  });
-  assert.equal(Boolean(merged.__burstMerged), true);
-  assert.equal(merged.__burstMergedCount, 2);
-  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "false";
+  try {
+    const anchorRow = mkRow({ sender: "assistant", text: "Noted 👍", rowKey: "row::a#1" });
+    const a = mkRow({
+      text: "Corolla available",
+      rowKey: "row::1#1",
+      timestamp: 1_700_000_000_000,
+      id: { _serialized: "false_burst_a@c.us" },
+    });
+    const b = mkRow({
+      text: "picture bhej do",
+      rowKey: "row::2#1",
+      timestamp: 1_700_000_002_000,
+      id: { _serialized: "false_burst_b@c.us" },
+    });
+    const sorted = mkSortedThread([anchorRow, a, b]);
+    const st = baselineSeedState(CHAT, [anchorRow]);
+    const userRows = sorted.filter((r) => r.sender === "user");
+    const { survivors, currentFreshAdmittedStableIds } = filterFresh({
+      sorted,
+      st,
+      userMessages: userRows,
+    });
+    assert.equal(survivors.length, 2);
+    assert.equal(survivors[0].text, "Corolla available");
+    const admittedIds =
+      currentFreshAdmittedStableIds instanceof Set
+        ? currentFreshAdmittedStableIds
+        : new Set(survivors.map((row) => buildStableMessageKey(row, sorted).id));
+    const merged = buildParticipantForwardCandidate({
+      participantMessages: survivors,
+      allParticipantUserRows: userRows,
+      lastProcessedUserMsgId: "",
+      chatKey: CHAT,
+      extractedMessages: sorted,
+      sorted,
+      normalizedGroupChatKeyForCompare: CHAT,
+      anchorIndex: -1,
+      tickFirstSeenByStableId: st.tickFirstSeenByStableId,
+      currentFreshAdmittedStableIds: admittedIds,
+    });
+    assert.ok(merged);
+    assert.equal(Boolean(merged.__burstMerged), true);
+    assert.equal(merged.__burstMergedCount, 2);
+  } finally {
+    process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "false";
+  }
 });
 
 test("F: burst merge rejects 15:06 + 15:21 gap", () => {
@@ -481,12 +522,13 @@ test("G: restart idle with old rows visible → zero forwards", () => {
   assert.equal(survivors.length, 0);
 });
 
-test("7: anchor missing → no forward, re-anchor to bottom", () => {
+test("7: anchor missing → no forward, wait/rescan (no reanchor to tail)", () => {
   clearPlaywrightExtractedMessageState();
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   const row = mkRow({ text: "hello", rowKey: "row::1#1" });
   const sorted = mkSortedThread([row]);
   const st = baselineSeedState(CHAT, sorted);
+  const ackBefore = st.acknowledgedAnchorIndex;
   st.currentTailAnchor = {
     ...st.currentTailAnchor,
     stableId: "user::missing::anchor",
@@ -501,9 +543,11 @@ test("7: anchor missing → no forward, re-anchor to bottom", () => {
   const grown = mkSortedThread([row, fresh]);
   const result = __freshDeltaAnchorMissingForTests(grown, st, CHAT);
   assert.equal(result.forwardAllowed, false);
-  assert.equal(result.reanchored, true);
-  assert.equal(result.resolvedAnchorIndex, grown.length - 1);
-  assert.equal(st.acknowledgedAnchorIndex, grown.length - 1);
+  assert.equal(result.reanchored, false);
+  assert.equal(result.waitForRescan, true);
+  assert.equal(result.resolvedAnchorIndex, -1);
+  assert.equal(st.acknowledgedAnchorIndex, ackBefore);
+  assert.notEqual(st.acknowledgedAnchorIndex, grown.length - 1);
 });
 
 test("H: after successful forward tail anchor advances acknowledged index", () => {
@@ -715,16 +759,12 @@ test("stale ack repair admits only bottom fresh row, not old baseline rows", () 
   });
   assert.equal(survivors.length, 1);
   assert.match(survivors[0].text, /1902/);
-  const merged = buildParticipantForwardCandidate({
-    participantMessages: survivors,
-    lastProcessedUserMsgId: "",
-    chatKey: CHAT,
-    extractedMessages: sorted,
-    sorted,
-    normalizedGroupChatKeyForCompare: CHAT,
-    anchorIndex: gate.acknowledgedAnchorIndex,
-    tickFirstSeenByStableId: st.tickFirstSeenByStableId,
-  });
+  const merged = forwardCandidateFromSurvivors({
+  survivors: survivors,
+  sorted: sorted,
+  st: st,
+  anchorIndex: gate.acknowledgedAnchorIndex,
+});
   assert.doesNotMatch(merged.text, /CITY K ANDAR/i);
   assert.doesNotMatch(merged.text, /Corolla available/i);
 });
@@ -987,16 +1027,12 @@ test("same-index Civic does not merge old KIA/CITY/Corolla rows", () => {
   assert.equal(survivors.length, 1);
   assert.match(survivors[0].text, /CIVIC PROOF 2001/);
 
-  const merged = buildParticipantForwardCandidate({
-    participantMessages: survivors,
-    lastProcessedUserMsgId: "",
-    chatKey: CHAT,
-    extractedMessages: sorted,
-    sorted,
-    normalizedGroupChatKeyForCompare: CHAT,
-    anchorIndex: gate.acknowledgedAnchorIndex,
-    tickFirstSeenByStableId: st.tickFirstSeenByStableId,
-  });
+  const merged = forwardCandidateFromSurvivors({
+  survivors: survivors,
+  sorted: sorted,
+  st: st,
+  anchorIndex: gate.acknowledgedAnchorIndex,
+});
   assert.match(merged.text, /CIVIC PROOF 2001/);
   assert.doesNotMatch(merged.text, /1703/);
   assert.doesNotMatch(merged.text, /Corolla/);
