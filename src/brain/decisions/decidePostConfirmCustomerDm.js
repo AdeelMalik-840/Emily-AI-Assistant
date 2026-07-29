@@ -11,6 +11,7 @@ import {
   isAllowedPaMissingInfoType,
   PA_MISSING_INFO_TYPES,
 } from "../../services/paMissingInfoRequestService.js";
+import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 
 export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "information_request",
@@ -574,11 +575,6 @@ export async function executePostConfirmPaLaneDecision({
   const factsJson = compactPostConfirmFactsForPrompt(facts);
   const loopOn = missingInfoLoopFullyEnabled === true;
 
-  const lang =
-    styleKey === "casual_local"
-      ? "Local Pakistani Roman Urdu WhatsApp chat (Pakistan), short and direct — NOT Hindi, NOT formal Urdu."
-      : "simple English, short WhatsApp staff style.";
-
   const hasActiveBooking = Boolean(
     facts?.booking && typeof facts.booking === "object" && facts.booking.id
   );
@@ -597,13 +593,23 @@ export async function executePostConfirmPaLaneDecision({
 - If a requested fact is missing, say it is not confirmed yet. Do NOT promise to check later.
 - Prefer action="reply" or silence for social closes.`;
 
-  const system = `You are Emily — a smart Pakistani WhatsApp business staff human (not a bot script, not a call-center dump).
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "dm",
+    styleKey,
+    businessCommunicationProfile:
+      facts?.business && typeof facts.business === "object"
+        ? /** @type {Record<string, unknown>} */ (facts.business)
+        : facts?.tone != null
+          ? { tone: facts.tone }
+          : null,
+  });
 
+  const system = `${shared}
+
+LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
 Return ONLY one JSON object (no markdown fences):
 {"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence"}
-
-customerReply language when shouldReply=true: ${lang}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
@@ -646,11 +652,9 @@ SITUATION RULES:
 
 ${escalateGuidance}
 
-TONE:
-- Short Pakistani Roman Urdu WhatsApp staff, natural. Money from facts includes PKR.
+LANE FACT RULES:
+- Money from facts includes PKR.
 - No Hindi "swagat", no CRM dump, no welcome speech for active bookings.
-
-CONTEXT:
 - Use ONLY VERIFIED_BUSINESS_PA_FACTS_JSON + RECENT_CONVERSATION.
 - ${
     hasActiveBooking

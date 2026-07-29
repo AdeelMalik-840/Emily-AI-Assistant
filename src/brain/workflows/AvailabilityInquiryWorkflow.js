@@ -19,6 +19,7 @@ import {
 import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
 import { resolveBookingDateWindowFromDuration } from "../facts/resolveBookingDateWindow.js";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
+import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -307,12 +308,13 @@ export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
     .filter(Boolean)
     .slice(0, 5);
 
-  const system = `Emily Brain V2 — WhatsApp availability reply.
+  const system = `${buildCustomerCommunicationPolicy({ channel: "group" })}
+
+LANE OBJECTIVE (unavailable availability reply):
 Write ONE short customer reply from VERIFIED FACTS only.
 Do not invent cars, prices, or availability.
 If verifiedAlternatives is empty, you MUST NOT ask to show other options.
 If verifiedAlternatives is non-empty, you may offer to show other options (do not list them unless facts say to list).
-Use casual Roman Urdu / simple Urdu-English mix suitable for WhatsApp.
 Return ONLY JSON: {"reply":"..."}`;
 
   const user = `FACTS_JSON: ${JSON.stringify({

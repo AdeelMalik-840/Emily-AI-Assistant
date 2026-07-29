@@ -16,6 +16,7 @@ import {
   parsePostConfirmCustomerDmDecision,
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
+import { buildCustomerCommunicationPolicy } from "../brain/policies/customerCommunicationPolicy.js";
 import { isAllowedPaMissingInfoType } from "./paMissingInfoRequestService.js";
 
 export const CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK =
@@ -149,29 +150,33 @@ export async function generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
     .slice(0, 800);
   const type = cleanType(missingInfoType);
   const factsJson = compactPostConfirmFactsForPrompt(facts || {});
-  const lang =
-    styleKey === "casual_local"
-      ? "Local Pakistani Roman Urdu WhatsApp chat (Pakistan), short and direct."
-      : "simple English, short WhatsApp staff style.";
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "dm",
+    styleKey,
+    businessCommunicationProfile:
+      facts?.business && typeof facts.business === "object"
+        ? /** @type {Record<string, unknown>} */ (facts.business)
+        : facts?.tone != null
+          ? { tone: facts.tone }
+          : null,
+  });
 
-  const system = `You are Emily — Pakistani WhatsApp business staff (not a bot).
+  const system = `${shared}
 
+LANE OBJECTIVE (PA missing-info owner-answer follow-up):
 OUTPUT: Return ONLY one JSON object:
 {"customerReply":"<short WhatsApp reply>","needsFollowup":false,"missingInfoType":null}
 
-customerReply language: ${lang}
-
 TASK:
-- Customer previously asked a missing-info question. Owner has now provided the answer for THIS request only.
+- Customer previously asked a missing-info question. A verified answer is now available for THIS request only (OWNER_ANSWER_FOR_THIS_REQUEST).
 - Write a short natural follow-up that answers the customer using OWNER_ANSWER_FOR_THIS_REQUEST.
 - Use VERIFIED_BUSINESS_PA_FACTS_JSON only as background (booking/item context). Do not dump CRM fields.
-- Prefer 1 short sentence (max 2). Usually under ~140 characters.
 
 STRICT SAFETY:
 - Treat OWNER_ANSWER_FOR_THIS_REQUEST as verified for this reply only.
 - Do NOT invent amounts, policies, or details beyond owner answer + verified facts.
 - Do NOT persist or imply saving to business knowledge.
-- Do NOT mention owner, admin, internal tokens, Brain, Firestore, or systems.
+- Do NOT mention internal tokens, Brain, Firestore, or systems.
 - Do NOT create/cancel/change bookings.
 - Money from owner answer: include PKR if an amount is stated.`;
 

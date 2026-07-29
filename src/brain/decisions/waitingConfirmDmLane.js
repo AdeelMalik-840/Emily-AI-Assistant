@@ -6,6 +6,7 @@
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { resolveAvailabilityApprovedPriceQuote } from "../../services/availabilityMessageBuilder.js";
+import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 
 export const WAITING_CONFIRM_DM_LANE = "waiting_confirm_dm";
 
@@ -385,11 +386,20 @@ export async function executeWaitingConfirmDmLaneDecision({
     clean(ctx.verifiedFactsJson, 4000) ||
     JSON.stringify(ctx.facts && typeof ctx.facts === "object" ? ctx.facts : {});
 
-  const system = `Emily — Pakistani WhatsApp staff. AVR approved, waiting_confirm Cloud DM.
+  const styleKey =
+    ctx.styleKey === "neutral_english" ? "neutral_english" : "casual_local";
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "dm",
+    styleKey,
+  });
+  const system = `${shared}
+
+LANE OBJECTIVE (waiting_confirm_dm):
+AVR approved, waiting_confirm Cloud DM.
 Decide meaning from latest message + last Emily + history + VERIFIED_FACTS_JSON (not keyword lists).
 JSON only: {"conversationStage":"booking_offer","customerMood":null,"customerIntent":"confirm_booking","situation":"awaiting_confirm","customerIsConfirmingBooking":true,"customerIsAskingQuestion":false,"customerIsDeclining":false,"customerWantsChange":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"confirm_booking","confidence":0.9,"safetyNotes":null,"reason":"natural_confirm"}
 action: confirm_booking|decline_request|change_request|reply|silence|clarify|none
-Natural confirm after book prompt → confirm_booking. After Q&A ambiguous ack ≠ confirm. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social no/thanks after Q&A → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up. Short Roman Urdu.
+Natural confirm after book prompt → confirm_booking. After Q&A ambiguous ack ≠ confirm. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social no/thanks after Q&A → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up.
 If your reply intentionally asks the customer to confirm booking again, set asksForBookingConfirmation=true (structured). Do not set it for ordinary Q&A answers.`;
 
   let userPayload =
