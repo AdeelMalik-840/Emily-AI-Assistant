@@ -333,7 +333,7 @@ Do not include any field that requests an action, executor, or mutation.`;
  * Build the customer-facing VERIFIED_FACTS_JSON payload (exported for tests).
  *
  * @param {Record<string, unknown>} ctx
- * @returns {{ verifiedFactsForPrompt: Record<string, unknown>, customerSafeFacts: Record<string, unknown>, responseDisposition: string | null }}
+ * @returns {{ verifiedFactsForPrompt: Record<string, unknown>, customerSafeFacts: Record<string, unknown>, replyGuardFacts: Record<string, unknown>, responseDisposition: string | null }}
  */
 export function buildGroupPostExecuteCustomerFacingFacts(ctx = {}) {
   const facts = ctx.facts && typeof ctx.facts === "object" ? ctx.facts : {};
@@ -351,20 +351,31 @@ export function buildGroupPostExecuteCustomerFacingFacts(ctx = {}) {
     responseDisposition,
   });
 
+  const internalPostExecuteFacts =
+    postExecuteResult?.facts && typeof postExecuteResult.facts === "object"
+      ? postExecuteResult.facts
+      : {};
+  const replyGuardFacts = {
+    itemId: clean(internalPostExecuteFacts.itemId, 160) || null,
+    itemLabel: customerSafeFacts.itemLabel,
+    durationDays: customerSafeFacts.durationDays,
+    catalogItems: Array.isArray(facts.catalogItems) ? facts.catalogItems : [],
+  };
+
   const verifiedFactsForPrompt = {
     businessName: clean(facts.businessName ?? facts.name ?? "", 100) || null,
-    catalogItems: Array.isArray(facts.catalogItems)
-      ? facts.catalogItems
-          .slice(0, 8)
-          .map((item) => ({ id: item?.id, label: item?.displayLabel ?? item?.name }))
-      : null,
     knownPolicies: facts.known && typeof facts.known === "object" ? facts.known : null,
     postExecuteCustomerStatus: customerSafeFacts,
     // Customer-safe stage label only — never pass internal "post_owner_check_group".
     conversationStageHint: "post_availability_check_group",
   };
 
-  return { verifiedFactsForPrompt, customerSafeFacts, responseDisposition };
+  return {
+    verifiedFactsForPrompt,
+    customerSafeFacts,
+    replyGuardFacts,
+    responseDisposition,
+  };
 }
 
 /**
@@ -393,7 +404,12 @@ export async function executeGroupPostExecuteLaneDecision({
   const recentDialogue = clean(ctx.recentDialogue, 1200);
   const styleKey = ctx.styleKey === "neutral_english" ? "neutral_english" : "casual_local";
 
-  const { verifiedFactsForPrompt, customerSafeFacts, responseDisposition } =
+  const {
+    verifiedFactsForPrompt,
+    customerSafeFacts,
+    replyGuardFacts,
+    responseDisposition,
+  } =
     buildGroupPostExecuteCustomerFacingFacts(ctx);
 
   // ── Fail-closed dispositions — never generate reply ──────────────────────
@@ -452,8 +468,10 @@ export async function executeGroupPostExecuteLaneDecision({
   }
 
   const replyContract = buildGroupPostExecutePendingAvailabilityContract({
-    itemLabel: customerSafeFacts.itemLabel,
-    durationDays: customerSafeFacts.durationDays,
+    itemId: replyGuardFacts.itemId,
+    itemLabel: replyGuardFacts.itemLabel,
+    durationDays: replyGuardFacts.durationDays,
+    catalogItems: replyGuardFacts.catalogItems,
     availabilityCheckingInProgress: customerSafeFacts.availabilityCheckingInProgress,
     customerBusinessStatus: customerSafeFacts.customerBusinessStatus,
     dmGuidanceAllowed: customerSafeFacts.dmGuidanceAllowed,

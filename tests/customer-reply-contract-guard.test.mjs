@@ -25,7 +25,10 @@ import {
   MAX_CUSTOMER_REPLY_ATTEMPTS,
   REPLY_SEMANTICS_SCHEMA,
 } from "../src/brain/openai/strictJsonSchema.js";
-import { executeGroupPostExecuteLaneDecision } from "../src/brain/decisions/groupPostExecuteLane.js";
+import {
+  buildGroupPostExecuteCustomerFacingFacts,
+  executeGroupPostExecuteLaneDecision,
+} from "../src/brain/decisions/groupPostExecuteLane.js";
 import { executeWaitingConfirmDmLaneDecision } from "../src/brain/decisions/waitingConfirmDmLane.js";
 import { buildAvailabilityConfirmSuccessReply } from "../src/services/availabilityMessageBuilder.js";
 
@@ -35,6 +38,19 @@ const SEM = {
   containsTimingPromise: false,
   exposesInternalProcess: false,
 };
+
+const RENTAL_CATALOG = [
+  {
+    id: "st-1",
+    name: "Kia Stonic EX Plus 2021",
+    displayLabel: "Kia Stonic EX Plus 2021 (White Color)",
+  },
+  {
+    id: "co-1",
+    name: "Toyota Corolla",
+    displayLabel: "Toyota Corolla (Metallic Grey)",
+  },
+];
 
 test("inferCustomerLanguageStyle: english / roman_urdu / mixed", () => {
   assert.equal(
@@ -220,6 +236,248 @@ test("guard: allows check-in-progress wording without confirmed claim", () => {
   assert.equal(ok.ok, true);
 });
 
+test("guard: Stonic facts reject an explicit Corolla reply", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Corolla 3 din ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.deepEqual(result, { ok: false, reason: "verified_item_mismatch" });
+});
+
+test("guard: Stonic alias and full display label both match verified Stonic", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  for (const reply of [
+    "Stonic 3 din ke liye check kar leta hun",
+    "Kia Stonic EX Plus 2021 (White Color) 3 din ke liye check kar leta hun",
+  ]) {
+    const result = validateCustomerReplyAgainstContract(reply, c, {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    });
+    assert.equal(result.ok, true, reply);
+  }
+});
+
+test("guard: generic item-free reply remains accepted", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Theek hai, availability check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.equal(result.ok, true);
+});
+
+test("guard: verified 3 days rejects an explicitly stated 2-day reply", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Stonic 2 din ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.deepEqual(result, { ok: false, reason: "verified_duration_mismatch" });
+});
+
+test('guard: verified 3 days rejects the English word claim "two days"', () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Stonic two days ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.deepEqual(result, { ok: false, reason: "verified_duration_mismatch" });
+});
+
+test('guard: verified 3 days accepts the Roman Urdu claim "teen din"', () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Stonic teen din ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.equal(result.ok, true);
+});
+
+test('guard: verified 3 days accepts "3-day" and "3 day" claims', () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  for (const reply of [
+    "Stonic 3-day ke liye check kar leta hun",
+    "Stonic 3 day ke liye check kar leta hun",
+  ]) {
+    const result = validateCustomerReplyAgainstContract(reply, c, {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    });
+    assert.equal(result.ok, true, reply);
+  }
+});
+
+test("guard: verified duration accepts a reply with no duration claim", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Stonic ki availability check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.equal(result.ok, true);
+});
+
+test("guard: any conflicting explicit duration rejects the reply", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Stonic 3 days ya 2 days ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.deepEqual(result, { ok: false, reason: "verified_duration_mismatch" });
+});
+
+test("guard: verified Stonic plus explicit Corolla mention is rejected", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Corolla ya Stonic 3 din ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.deepEqual(result, { ok: false, reason: "verified_item_mismatch" });
+});
+
+test("guard: repeated aliases of the verified Stonic remain accepted", () => {
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "st-1",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 3,
+    catalogItems: RENTAL_CATALOG,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Stonic aur Kia Stonic EX Plus 2021 (White Color) 3 din ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.equal(result.ok, true);
+});
+
+test("guard: ambiguous fuzzy item text does not invent a mismatch", () => {
+  const ambiguousCatalog = [
+    {
+      id: "cv-white",
+      name: "Honda Civic",
+      displayLabel: "Honda Civic (White)",
+    },
+    {
+      id: "cv-black",
+      name: "Honda Civic",
+      displayLabel: "Honda Civic (Black)",
+    },
+  ];
+  const c = buildGroupPostExecutePendingAvailabilityContract({
+    itemId: "cv-white",
+    itemLabel: "Honda Civic (White)",
+    durationDays: 3,
+    catalogItems: ambiguousCatalog,
+    customerMessageText: "3 din k liye chahiye",
+  });
+  const result = validateCustomerReplyAgainstContract(
+    "Civik 3 din ke liye check kar leta hun",
+    c,
+    {
+      ...SEM,
+      claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+    }
+  );
+  assert.equal(result.ok, true);
+});
+
 test("guard: verified quotation must include verified total when required", () => {
   const facts = {
     quotedPrice: { total: 12000, currency: "PKR" },
@@ -239,6 +497,91 @@ test("guard: verified quotation must include verified total when required", () =
     claims: [CUSTOMER_CLAIMS.QUOTATION_VERIFIED],
   });
   assert.equal(hit.ok, true);
+});
+
+test("group lane: opaque itemId stays out of VERIFIED_FACTS_JSON but remains in reply contract", async () => {
+  const turnContext = {
+    messageText: "3 din k liye chahiye",
+    facts: { businessName: "Test", catalogItems: RENTAL_CATALOG },
+    postExecuteResult: {
+      awaitsReply: true,
+      responseDisposition: "owner_check_created",
+      facts: {
+        itemId: "st-1",
+        itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+        durationDays: 3,
+        responseDisposition: "owner_check_created",
+      },
+    },
+    responseDisposition: "owner_check_created",
+    actionsAllowed: false,
+    styleKey: "casual_local",
+  };
+  const facing = buildGroupPostExecuteCustomerFacingFacts(turnContext);
+  const promptFactsJson = JSON.stringify(facing.verifiedFactsForPrompt);
+  assert.equal(Object.hasOwn(facing.customerSafeFacts, "itemId"), false);
+  assert.equal(
+    Object.hasOwn(
+      facing.verifiedFactsForPrompt.postExecuteCustomerStatus,
+      "itemId"
+    ),
+    false
+  );
+  assert.doesNotMatch(promptFactsJson, /st-1|co-1/);
+  assert.equal(facing.replyGuardFacts.itemId, "st-1");
+  assert.equal(
+    facing.replyGuardFacts.itemLabel,
+    "Kia Stonic EX Plus 2021 (White Color)"
+  );
+  assert.equal(facing.replyGuardFacts.durationDays, 3);
+  assert.equal(facing.replyGuardFacts.catalogItems, RENTAL_CATALOG);
+
+  const replyContract = buildGroupPostExecutePendingAvailabilityContract({
+    ...facing.replyGuardFacts,
+    customerMessageText: turnContext.messageText,
+  });
+  assert.equal(replyContract.verifiedCustomerFacts.itemId, "st-1");
+  assert.equal(
+    replyContract.verifiedCustomerFacts.catalogItems,
+    RENTAL_CATALOG
+  );
+
+  let capturedUserPrompt = "";
+  const result = await executeGroupPostExecuteLaneDecision({
+    turnContext,
+    __chatCompletionsCreateForTests: async (args) => {
+      capturedUserPrompt = String(args?.messages?.[1]?.content ?? "");
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply: "Stonic 3 din ke liye check kar leta hun",
+                action: "reply",
+                shouldReply: true,
+                confidence: 0.9,
+                safetyNotes: null,
+                reason: "grounded",
+                replySemantics: {
+                  claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+  assert.equal(result.ok, true);
+  const serializedVerifiedFacts =
+    capturedUserPrompt.match(
+      /VERIFIED_FACTS_JSON:\n(\{[\s\S]+?})(?:\n\n|$)/
+    )?.[1] ?? "";
+  assert.ok(serializedVerifiedFacts);
+  assert.doesNotMatch(serializedVerifiedFacts, /st-1|co-1/);
 });
 
 test("stripInternalReplySemantics removes replySemantics only", () => {
@@ -343,6 +686,120 @@ test("group lane: false availability is rejected then rewritten once", async () 
   assert.match(String(result.decision.customerReply), /check/i);
   assert.doesNotMatch(String(result.decision.customerReply), /available hai/i);
   assert.equal(result.decision.replySemantics, undefined);
+});
+
+test("group lane: item mismatch regenerates in-lane without action execution", async () => {
+  let calls = 0;
+  const create = async (args) => {
+    calls += 1;
+    assert.match(
+      String(args?.messages?.[1]?.content ?? ""),
+      calls === 1 ? /VERIFIED_FACTS_JSON/ : /verified_item_mismatch/
+    );
+    const reply =
+      calls === 1
+        ? "Corolla 3 din ke liye check kar leta hun"
+        : "Stonic 3 din ke liye check kar leta hun";
+    return {
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              customerReply: reply,
+              action: "reply",
+              shouldReply: true,
+              confidence: 0.9,
+              safetyNotes: null,
+              reason: calls === 1 ? "wrong_item" : "grounded_item",
+              replySemantics: {
+                claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+                languageStyle: "roman_urdu",
+                containsTimingPromise: false,
+                exposesInternalProcess: false,
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+  const result = await executeGroupPostExecuteLaneDecision({
+    turnContext: {
+      messageText: "3 din k liye chahiye",
+      facts: { businessName: "Test", catalogItems: RENTAL_CATALOG },
+      postExecuteResult: {
+        awaitsReply: true,
+        responseDisposition: "owner_check_created",
+        facts: {
+          itemId: "st-1",
+          itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+          durationDays: 3,
+          responseDisposition: "owner_check_created",
+        },
+      },
+      responseDisposition: "owner_check_created",
+      actionsAllowed: false,
+      styleKey: "casual_local",
+    },
+    __chatCompletionsCreateForTests: create,
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.match(String(result.decision.customerReply), /Stonic/i);
+  assert.doesNotMatch(String(result.decision.customerReply), /Corolla/i);
+});
+
+test("group lane: two item-mismatched attempts preserve fail-closed silence", async () => {
+  let calls = 0;
+  const result = await executeGroupPostExecuteLaneDecision({
+    turnContext: {
+      messageText: "3 din k liye chahiye",
+      facts: { businessName: "Test", catalogItems: RENTAL_CATALOG },
+      postExecuteResult: {
+        awaitsReply: true,
+        responseDisposition: "owner_check_created",
+        facts: {
+          itemId: "st-1",
+          itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+          durationDays: 3,
+          responseDisposition: "owner_check_created",
+        },
+      },
+      responseDisposition: "owner_check_created",
+      actionsAllowed: false,
+      styleKey: "casual_local",
+    },
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply: "Corolla 3 din ke liye check kar leta hun",
+                action: "reply",
+                shouldReply: true,
+                confidence: 0.9,
+                safetyNotes: null,
+                reason: "wrong_item",
+                replySemantics: {
+                  claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, false);
+  assert.equal(result.source, "content_safety_fail_closed");
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.reason, "verified_item_mismatch");
 });
 
 test("waiting_confirm: verified price JSON succeeds; external shape has no replySemantics", async () => {
