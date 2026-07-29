@@ -10,6 +10,7 @@ import {
   normalizeCustomerLanguageStyle,
   normalizeCustomerReplyChannel,
 } from "../contracts/customerReplyContract.js";
+import { findConservativeFuzzyCatalogMention } from "../../services/currentTurnAuthority.js";
 
 const TIMING_PROMISE_RE =
   /\bthodi\s+der\b|\bshortly\b|\bjaldi\b|\b\d+\s*(min|mins|minute|minutes)\b/i;
@@ -86,6 +87,230 @@ function inferReplyLanguageFromText(replyText, declaredStyle) {
   return "mixed";
 }
 
+function normalizeItemId(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function normalizeItemLabel(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function catalogItemId(row) {
+  return normalizeItemId(row?.id ?? row?.itemId);
+}
+
+function catalogItemLabels(row) {
+  return [
+    row?.displayLabel,
+    row?.normalizedLabel,
+    row?.label,
+    row?.name,
+    ...(Array.isArray(row?.aliases) ? row.aliases : []),
+  ]
+    .map(normalizeItemLabel)
+    .filter(Boolean);
+}
+
+const CATALOG_NON_IDENTITY_TOKENS = new Set([
+  "color",
+  "colour",
+  "model",
+  "vehicle",
+  "rental",
+  "gaari",
+  "gari",
+  "plus",
+]);
+
+const REPLY_DURATION_WORD_VALUES = new Map([
+  ["a", 1],
+  ["one", 1],
+  ["ek", 1],
+  ["aik", 1],
+  ["two", 2],
+  ["do", 2],
+  ["three", 3],
+  ["teen", 3],
+  ["four", 4],
+  ["char", 4],
+  ["chaar", 4],
+  ["five", 5],
+  ["panch", 5],
+  ["paanch", 5],
+  ["six", 6],
+  ["che", 6],
+  ["chay", 6],
+  ["chhe", 6],
+  ["seven", 7],
+  ["saat", 7],
+  ["eight", 8],
+  ["aath", 8],
+  ["nine", 9],
+  ["nau", 9],
+  ["ten", 10],
+  ["das", 10],
+]);
+
+const REPLY_DURATION_CLAIM_RE =
+  /\b(\d+|a|one|ek|aik|two|do|three|teen|four|char|chaar|five|panch|paanch|six|che|chay|chhe|seven|saat|eight|aath|nine|nau|ten|das)\s*(?:-\s*)?(days?|din|dino|duna|deen)\b/giu;
+
+function resolveVerifiedCatalogItemId(facts, catalogItems) {
+  const direct = normalizeItemId(facts?.itemId);
+  if (direct) return direct;
+  const verifiedLabel = normalizeItemLabel(facts?.itemLabel);
+  if (!verifiedLabel) return "";
+  for (const row of catalogItems) {
+    const labels = catalogItemLabels(row);
+    if (
+      labels.some(
+        (label) =>
+          label === verifiedLabel ||
+          label.includes(verifiedLabel) ||
+          verifiedLabel.includes(label)
+      )
+    ) {
+      return catalogItemId(row);
+    }
+  }
+  return "";
+}
+
+function normalizedTextContainsPhrase(normalizedText, normalizedPhrase) {
+  if (!normalizedText || !normalizedPhrase) return false;
+  return ` ${normalizedText} `.includes(` ${normalizedPhrase} `);
+}
+
+function catalogItemIdentityTokens(row) {
+  return [
+    row?.name,
+    row?.normalizedLabel,
+    row?.label,
+    ...(Array.isArray(row?.aliases) ? row.aliases : []),
+  ]
+    .map(normalizeItemLabel)
+    .filter(Boolean)
+    .flatMap((label) => label.split(/\s+/))
+    .filter(
+      (token) =>
+        token.length >= 4 &&
+        !/^\d+$/.test(token) &&
+        !CATALOG_NON_IDENTITY_TOKENS.has(token)
+    );
+}
+
+/**
+ * Resolve every confidently explicit catalog item in a generated reply.
+ * Exact full labels/aliases and catalog-unique identity tokens are authoritative.
+ * Conservative fuzzy matching contributes only when it resolves one unambiguous item.
+ */
+function resolveExplicitReplyItemIds(replyText, catalogItems) {
+  const normalizedReply = normalizeItemLabel(replyText);
+  if (!normalizedReply || !Array.isArray(catalogItems) || catalogItems.length === 0) {
+    return new Set();
+  }
+
+  const rows = catalogItems
+    .map((row) => ({ row, itemId: catalogItemId(row) }))
+    .filter(({ row, itemId }) => row && typeof row === "object" && itemId);
+  const itemIdsByToken = new Map();
+  const itemIdsByLabel = new Map();
+
+  for (const { row, itemId } of rows) {
+    for (const token of new Set(catalogItemIdentityTokens(row))) {
+      if (!itemIdsByToken.has(token)) itemIdsByToken.set(token, new Set());
+      itemIdsByToken.get(token).add(itemId);
+    }
+    for (const label of new Set(catalogItemLabels(row))) {
+      if (!itemIdsByLabel.has(label)) itemIdsByLabel.set(label, new Set());
+      itemIdsByLabel.get(label).add(itemId);
+    }
+  }
+
+  const replyTokens = new Set(normalizedReply.split(/\s+/).filter(Boolean));
+  const resolvedIds = new Set();
+  for (const { row, itemId } of rows) {
+    const hasExactLabel = catalogItemLabels(row).some(
+      (label) =>
+        itemIdsByLabel.get(label)?.size === 1 &&
+        normalizedTextContainsPhrase(normalizedReply, label)
+    );
+    const hasUniqueIdentityToken = catalogItemIdentityTokens(row).some(
+      (token) => replyTokens.has(token) && itemIdsByToken.get(token)?.size === 1
+    );
+    if (hasExactLabel || hasUniqueIdentityToken) {
+      resolvedIds.add(itemId);
+    }
+  }
+
+  const fuzzy = findConservativeFuzzyCatalogMention(replyText, catalogItems);
+  if (fuzzy.found && !fuzzy.ambiguous && fuzzy.itemId) {
+    resolvedIds.add(normalizeItemId(fuzzy.itemId));
+  }
+  return resolvedIds;
+}
+
+/**
+ * Extract every explicit day-duration claim from generated customer wording.
+ * This is deliberately guard-local; it does not change booking-flow parsing.
+ */
+function extractExplicitReplyDurationDays(replyText) {
+  const text = String(replyText ?? "");
+  const durations = [];
+  REPLY_DURATION_CLAIM_RE.lastIndex = 0;
+  for (const match of text.matchAll(REPLY_DURATION_CLAIM_RE)) {
+    const token = String(match[1] ?? "").toLowerCase();
+    const value = /^\d+$/.test(token)
+      ? Number.parseInt(token, 10)
+      : REPLY_DURATION_WORD_VALUES.get(token);
+    if (Number.isFinite(value) && value >= 1) {
+      durations.push(Math.floor(value));
+    }
+  }
+  return durations;
+}
+
+function validateVerifiedReplyEntities(text, contract) {
+  const facts =
+    contract?.verifiedCustomerFacts &&
+    typeof contract.verifiedCustomerFacts === "object"
+      ? contract.verifiedCustomerFacts
+      : {};
+  const catalogItems = Array.isArray(facts.catalogItems) ? facts.catalogItems : [];
+  const verifiedItemId = resolveVerifiedCatalogItemId(facts, catalogItems);
+  const replyItemIds =
+    catalogItems.length > 0
+      ? resolveExplicitReplyItemIds(text, catalogItems)
+      : new Set();
+  if (
+    verifiedItemId &&
+    [...replyItemIds].some((replyItemId) => replyItemId !== verifiedItemId)
+  ) {
+    return { ok: false, reason: "verified_item_mismatch" };
+  }
+
+  const verifiedDuration = Number(facts.durationDays);
+  if (Number.isFinite(verifiedDuration) && verifiedDuration >= 1) {
+    const normalizedVerifiedDuration = Math.max(
+      1,
+      Math.floor(verifiedDuration)
+    );
+    const replyDurations = extractExplicitReplyDurationDays(text);
+    if (
+      replyDurations.some(
+        (replyDuration) => replyDuration !== normalizedVerifiedDuration
+      )
+    ) {
+      return { ok: false, reason: "verified_duration_mismatch" };
+    }
+  }
+
+  return { ok: true };
+}
+
 /**
  * @param {string} replyText
  * @param {Record<string, unknown>} contract
@@ -116,6 +341,9 @@ export function validateCustomerReplyAgainstContract(
     return { ok: false, reason: "customer_reply_required_but_empty" };
   }
   if (!text) return { ok: true };
+
+  const entityGrounding = validateVerifiedReplyEntities(text, contract);
+  if (!entityGrounding.ok) return entityGrounding;
 
   if (channel === "group") {
     const sentences = text.split(/[.!?۔]/).filter((s) => s.trim()).length;
