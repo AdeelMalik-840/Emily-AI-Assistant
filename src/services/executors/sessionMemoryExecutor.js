@@ -18,6 +18,9 @@ export function applySessionMemoryFromActionPlan(p) {
     plan?.persistenceIntent && typeof plan.persistenceIntent === "object"
       ? plan.persistenceIntent
       : null;
+  // Side-effect execute flags on persistenceIntent (e.g. booking create) must not
+  // silently apply unrelated memory. Owner-check plans keep persistence.execute=false
+  // so assist clear / remembers still run after action-side execute.
   if (persistence?.execute === true) return;
 
   const patch = {};

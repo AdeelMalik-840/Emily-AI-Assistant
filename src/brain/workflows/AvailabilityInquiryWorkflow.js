@@ -470,6 +470,232 @@ export function buildOwnerCheckDeferralReply(conversationalLabel, durationDays, 
 }
 
 /**
+ * Newest explicit duration from the current turn, else trusted assist fallback.
+ * @param {{
+ *   canonical?: Record<string, unknown> | null,
+ *   understanding?: Record<string, unknown> | null,
+ *   assist?: Record<string, unknown> | null,
+ * }} p
+ * @returns {number}
+ */
+function resolveLatestOwnerCheckDurationDays(p = {}) {
+  const candidates = [
+    p.canonical?.turn?.durationDays,
+    p.understanding?.durationDays,
+    p.assist?.durationDays,
+  ];
+  for (const raw of candidates) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 1) return Math.max(1, Math.floor(n));
+  }
+  return 1;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {Date | null}
+ */
+function parseAssistWindowDate(value) {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value : null;
+  }
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+/**
+ * @param {Date} startAt
+ * @param {Date} endAt
+ * @returns {string[]}
+ */
+function requestedDatesFromExactWindow(startAt, endAt) {
+  if (!(startAt instanceof Date) || !(endAt instanceof Date)) return [];
+  if (!Number.isFinite(startAt.getTime()) || !Number.isFinite(endAt.getTime())) return [];
+  if (endAt.getTime() <= startAt.getTime()) return [];
+  const dates = [];
+  const cursor = new Date(
+    Date.UTC(startAt.getUTCFullYear(), startAt.getUTCMonth(), startAt.getUTCDate())
+  );
+  const endDay = new Date(
+    Date.UTC(endAt.getUTCFullYear(), endAt.getUTCMonth(), endAt.getUTCDate())
+  );
+  while (cursor.getTime() < endDay.getTime() && dates.length < 366) {
+    dates.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function normalizeRequestedDateList(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+}
+
+/**
+ * Prefer an existing canonical availability / turn window; only then roll from duration.
+ * @param {{
+ *   durationN: number,
+ *   availability?: Record<string, unknown> | null,
+ *   canonical?: Record<string, unknown> | null,
+ * }} p
+ * @returns {{
+ *   startAt: Date,
+ *   endAt: Date,
+ *   requestedDates: string[],
+ *   source: "canonical_window" | "turn_requested_dates" | "duration_default_now",
+ * }}
+ */
+function resolveAssistOfferWindow(p = {}) {
+  const durationN = Math.max(1, Math.floor(Number(p.durationN) || 1));
+  const availability =
+    p.availability && typeof p.availability === "object" ? p.availability : null;
+  const availStart = parseAssistWindowDate(availability?.requestedStartAt);
+  const availEnd = parseAssistWindowDate(availability?.requestedEndAt);
+  if (availability?.windowApplied === true && availStart && availEnd && availEnd > availStart) {
+    const turnDates = normalizeRequestedDateList(p.canonical?.turn?.requestedDates);
+    return {
+      startAt: availStart,
+      endAt: availEnd,
+      requestedDates:
+        turnDates.length > 0 ? turnDates : requestedDatesFromExactWindow(availStart, availEnd),
+      source: "canonical_window",
+    };
+  }
+
+  const turnDates = normalizeRequestedDateList(p.canonical?.turn?.requestedDates);
+  if (turnDates.length > 0) {
+    const startAt = parseAssistWindowDate(`${turnDates[0]}T00:00:00.000Z`);
+    if (startAt) {
+      const rolled = resolveBookingDateWindowFromDuration(durationN, startAt.getTime());
+      if (rolled) {
+        return {
+          startAt: rolled.startAt,
+          endAt: rolled.endAt,
+          requestedDates: turnDates,
+          source: "turn_requested_dates",
+        };
+      }
+    }
+  }
+
+  const rolled = resolveBookingDateWindowFromDuration(durationN);
+  return {
+    startAt: rolled?.startAt ?? new Date(),
+    endAt: rolled?.endAt ?? new Date(Date.now() + durationN * 86400000),
+    requestedDates: [],
+    source: "duration_default_now",
+  };
+}
+
+/**
+ * Latest owner-check window: current explicit facts → assist stored window → duration roll.
+ * @param {{
+ *   canonical?: Record<string, unknown> | null,
+ *   understanding?: Record<string, unknown> | null,
+ *   assist?: Record<string, unknown> | null,
+ *   durationN: number,
+ * }} p
+ * @returns {{
+ *   requestedDates: string[],
+ *   windowStartAt: string | null,
+ *   windowEndAt: string | null,
+ * }}
+ */
+function resolveLatestOwnerCheckWindow(p = {}) {
+  const durationN = Math.max(1, Math.floor(Number(p.durationN) || 1));
+  const currentDates = [
+    ...normalizeRequestedDateList(p.canonical?.turn?.requestedDates),
+    ...normalizeRequestedDateList(p.understanding?.requestedDates),
+  ];
+  // Dedupe while preserving order
+  const explicitDates = [...new Set(currentDates)];
+  if (explicitDates.length > 0) {
+    const startAt = parseAssistWindowDate(`${explicitDates[0]}T00:00:00.000Z`);
+    const rolled = startAt
+      ? resolveBookingDateWindowFromDuration(durationN, startAt.getTime())
+      : null;
+    return {
+      requestedDates: explicitDates,
+      windowStartAt: rolled?.startAt?.toISOString?.() ?? null,
+      windowEndAt: rolled?.endAt?.toISOString?.() ?? null,
+    };
+  }
+
+  const turnStart = parseAssistWindowDate(
+    p.canonical?.turn?.requestedStartAt ?? p.understanding?.requestedStartAt
+  );
+  const turnEnd = parseAssistWindowDate(
+    p.canonical?.turn?.requestedEndAt ?? p.understanding?.requestedEndAt
+  );
+  if (turnStart && turnEnd && turnEnd > turnStart) {
+    return {
+      requestedDates: requestedDatesFromExactWindow(turnStart, turnEnd),
+      windowStartAt: turnStart.toISOString(),
+      windowEndAt: turnEnd.toISOString(),
+    };
+  }
+
+  const assistStart = parseAssistWindowDate(p.assist?.windowStartAt);
+  const assistEnd = parseAssistWindowDate(p.assist?.windowEndAt);
+  const assistDates = normalizeRequestedDateList(p.assist?.requestedDates);
+  // Only an understanding-supplied duration counts as a *new* duration from this turn.
+  // canonical.turn.durationDays may already be the assist fallback from facts packing.
+  const hasExplicitCurrentDuration =
+    p.understanding?.durationDays != null &&
+    Number.isFinite(Number(p.understanding.durationDays));
+
+  if (assistStart && assistEnd && assistEnd > assistStart) {
+    if (hasExplicitCurrentDuration) {
+      const rolled = resolveBookingDateWindowFromDuration(durationN, assistStart.getTime());
+      return {
+        requestedDates:
+          assistDates.length > 0
+            ? assistDates
+            : requestedDatesFromExactWindow(
+                rolled?.startAt ?? assistStart,
+                rolled?.endAt ?? assistEnd
+              ),
+        windowStartAt: (rolled?.startAt ?? assistStart).toISOString(),
+        windowEndAt: (rolled?.endAt ?? assistEnd).toISOString(),
+      };
+    }
+    return {
+      requestedDates:
+        assistDates.length > 0
+          ? assistDates
+          : requestedDatesFromExactWindow(assistStart, assistEnd),
+      windowStartAt: assistStart.toISOString(),
+      windowEndAt: assistEnd.toISOString(),
+    };
+  }
+
+  if (assistDates.length > 0) {
+    const startAt = parseAssistWindowDate(`${assistDates[0]}T00:00:00.000Z`);
+    const rolled = startAt
+      ? resolveBookingDateWindowFromDuration(durationN, startAt.getTime())
+      : resolveBookingDateWindowFromDuration(durationN);
+    return {
+      requestedDates: assistDates,
+      windowStartAt: rolled?.startAt?.toISOString?.() ?? null,
+      windowEndAt: rolled?.endAt?.toISOString?.() ?? null,
+    };
+  }
+
+  const rolled = resolveBookingDateWindowFromDuration(durationN);
+  return {
+    requestedDates: [],
+    windowStartAt: rolled?.startAt?.toISOString?.() ?? null,
+    windowEndAt: rolled?.endAt?.toISOString?.() ?? null,
+  };
+}
+
+/**
  * @param {{
  *   canonical: Record<string, unknown>,
  *   itemId: string,
@@ -477,11 +703,19 @@ export function buildOwnerCheckDeferralReply(conversationalLabel, durationDays, 
  *   durationN: number,
  *   execute: boolean,
  *   clearAssist?: boolean,
+ *   requestedDates?: string[] | null,
+ *   windowStartAt?: string | null,
+ *   windowEndAt?: string | null,
  * }} p
  * @returns {ActionPlan}
  */
 function buildOwnerCheckActionPlan(p) {
   const { canonical, itemId, itemLabel, durationN, execute, clearAssist = true } = p;
+  const requestedDates = Array.isArray(p.requestedDates)
+    ? p.requestedDates.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+    : [];
+  const windowStartAt = String(p.windowStartAt ?? "").trim() || null;
+  const windowEndAt = String(p.windowEndAt ?? "").trim() || null;
   const conversationalLabel = conversationalItemLabelFromResolvedItem({
     displayLabel: itemLabel,
     name: itemLabel,
@@ -534,6 +768,9 @@ function buildOwnerCheckActionPlan(p) {
           itemLabel,
           durationDays: durationN,
           requestedDuration: durationN,
+          requestedDates: Object.freeze([...requestedDates]),
+          requestedStartAt: windowStartAt,
+          requestedEndAt: windowEndAt,
           canonicalAvailability:
             canonicalAvailability != null ? Object.freeze({ ...canonicalAvailability }) : null,
           canonicalPriceQuote:
@@ -568,7 +805,8 @@ function buildOwnerCheckActionPlan(p) {
       clearLastAvailabilityAssist: clearAssist === true,
       clearPendingAction: true,
       clearEmilyPending: true,
-      execute,
+      // Session memory only — never couple to action-side execute flags.
+      execute: false,
     }),
   });
 }
@@ -600,7 +838,11 @@ function buildUnavailableOfferActionPlan(p) {
       ? composed
       : failsafe;
 
-  const window = resolveBookingDateWindowFromDuration(p.durationN);
+  const offerWindow = resolveAssistOfferWindow({
+    durationN: p.durationN,
+    availability: p.availability,
+    canonical: p.canonical,
+  });
   const sourceTurnKey =
     String(p.sourceTurnKey ?? "").trim() ||
     String(p.canonical?.turn?.sourceTurnKey ?? "").trim() ||
@@ -616,8 +858,9 @@ function buildUnavailableOfferActionPlan(p) {
         unavailableItemId: String(p.itemId ?? ""),
         unavailableItemLabel: p.itemLabel,
         durationDays: p.durationN,
-        windowStartAt: window?.startAt ?? null,
-        windowEndAt: window?.endAt ?? null,
+        windowStartAt: offerWindow.startAt,
+        windowEndAt: offerWindow.endAt,
+        requestedDates: offerWindow.requestedDates,
         pendingQuestion: replyDraft,
         pendingPromptType: AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
         assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
@@ -810,7 +1053,18 @@ export function buildAvailabilityInquiryActionPlan({
           understanding?.resolvedItemLabel ??
           ""
       ).trim() || "item";
-    const durationN = Math.max(1, Math.floor(Number(assist.durationDays)));
+    const durationN = resolveLatestOwnerCheckDurationDays({
+      canonical,
+      understanding,
+      assist,
+    });
+    const windowFacts = resolveLatestOwnerCheckWindow({
+      canonical,
+      understanding,
+      assist,
+      durationN,
+    });
+    const requestedDates = windowFacts.requestedDates;
     const availability =
       canonical?.verified?.availability && typeof canonical.verified.availability === "object"
         ? /** @type {Record<string, unknown>} */ (canonical.verified.availability)
@@ -829,10 +1083,22 @@ export function buildAvailabilityInquiryActionPlan({
             displayLabel: selectedLabel,
             name: selectedLabel,
           },
+          turn: {
+            ...(canonical.turn && typeof canonical.turn === "object" ? canonical.turn : {}),
+            durationDays: durationN,
+            ...(requestedDates.length > 0 ? { requestedDates } : {}),
+            ...(windowFacts.windowStartAt
+              ? { requestedStartAt: windowFacts.windowStartAt }
+              : {}),
+            ...(windowFacts.windowEndAt ? { requestedEndAt: windowFacts.windowEndAt } : {}),
+          },
         },
         itemId: selectedId,
         itemLabel: selectedLabel,
         durationN,
+        requestedDates,
+        windowStartAt: windowFacts.windowStartAt,
+        windowEndAt: windowFacts.windowEndAt,
         execute: canonical.actions?.availabilityOwnerCheckExecute === true,
         clearAssist: true,
       });
@@ -955,6 +1221,19 @@ export function buildAvailabilityInquiryActionPlan({
       itemId: /** @type {string} */ (itemId),
       itemLabel,
       durationN,
+      ...(() => {
+        const windowFacts = resolveLatestOwnerCheckWindow({
+          canonical: /** @type {Record<string, unknown>} */ (canonical),
+          understanding,
+          assist: null,
+          durationN,
+        });
+        return {
+          requestedDates: windowFacts.requestedDates,
+          windowStartAt: windowFacts.windowStartAt,
+          windowEndAt: windowFacts.windowEndAt,
+        };
+      })(),
       execute,
       clearAssist: true,
     });
