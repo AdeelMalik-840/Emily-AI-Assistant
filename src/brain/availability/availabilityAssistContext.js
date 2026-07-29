@@ -46,6 +46,9 @@ export function readFreshLastAvailabilityAssist(raw, nowMs = Date.now()) {
   if (!Number.isFinite(expiresAt) || expiresAt <= now) return null;
   const durationDays = Number(assist.durationDays);
   if (!Number.isFinite(durationDays) || durationDays < 1) return null;
+  const requestedDates = Array.isArray(assist.requestedDates)
+    ? assist.requestedDates.map((entry) => clean(entry, 40)).filter(Boolean)
+    : [];
   return {
     action: AVAILABILITY_ASSIST_ACTION_OFFERED_ALTERNATIVES,
     unavailableItemId,
@@ -53,6 +56,7 @@ export function readFreshLastAvailabilityAssist(raw, nowMs = Date.now()) {
     durationDays: Math.max(1, Math.floor(durationDays)),
     windowStartAt: clean(assist.windowStartAt) || null,
     windowEndAt: clean(assist.windowEndAt) || null,
+    requestedDates,
     createdAt: clean(assist.createdAt) || null,
     expiresAt: new Date(expiresAt).toISOString(),
     pendingQuestion: clean(assist.pendingQuestion, 500) || null,
@@ -70,6 +74,7 @@ export function readFreshLastAvailabilityAssist(raw, nowMs = Date.now()) {
  *   durationDays: number,
  *   windowStartAt?: Date | string | null,
  *   windowEndAt?: Date | string | null,
+ *   requestedDates?: string[] | null,
  *   nowMs?: number,
  *   ttlMs?: number,
  *   pendingQuestion?: string | null,
@@ -102,6 +107,9 @@ export function buildOfferedAlternativesAssist(p) {
       : p.windowEndAt
         ? new Date(String(p.windowEndAt))
         : null;
+  const requestedDates = Array.isArray(p.requestedDates)
+    ? p.requestedDates.map((entry) => clean(entry, 40)).filter(Boolean)
+    : [];
   const pendingQuestion = clean(p.pendingQuestion, 500) || null;
   const pendingPromptType =
     clean(p.pendingPromptType, 80) ||
@@ -117,6 +125,7 @@ export function buildOfferedAlternativesAssist(p) {
     windowStartAt:
       start && Number.isFinite(start.getTime()) ? start.toISOString() : null,
     windowEndAt: end && Number.isFinite(end.getTime()) ? end.toISOString() : null,
+    requestedDates,
     createdAt: new Date(nowMs).toISOString(),
     expiresAt: new Date(nowMs + ttlMs).toISOString(),
     pendingQuestion,

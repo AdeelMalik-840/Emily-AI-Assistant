@@ -445,14 +445,36 @@ export async function resolveBusinessTurnContext(params) {
     requestedField: understanding?.askedField ?? turnContextInput?.requestedField ?? null,
     durationDays: durationDaysResolved,
     getBookingsForItemFn: params.getBookingsForItemFn,
+    ...(function resolveAssistNowMs() {
+      const startMs = Date.parse(String(lastAvailabilityAssist?.windowStartAt ?? ""));
+      const hasExplicitCurrentDates =
+        Array.isArray(understanding?.requestedDates) &&
+        understanding.requestedDates.some((d) => String(d ?? "").trim());
+      // Reuse stored assist start whenever follow-up keeps the original calendar window.
+      if (lastAvailabilityAssist && Number.isFinite(startMs) && !hasExplicitCurrentDates) {
+        return { nowMs: startMs };
+      }
+      return {};
+    })(),
   });
 
   /** @type {Array<{ itemId: string, itemLabel: string }>} */
   let verifiedAlternatives = [];
   const availabilityForAlts = availabilityFacts.availability;
+  const assistStartMs = Date.parse(String(lastAvailabilityAssist?.windowStartAt ?? ""));
+  const assistEndMs = Date.parse(String(lastAvailabilityAssist?.windowEndAt ?? ""));
   const assistWindow =
     lastAvailabilityAssist != null
-      ? resolveBookingDateWindowFromDuration(lastAvailabilityAssist.durationDays)
+      ? Number.isFinite(assistStartMs) &&
+        Number.isFinite(assistEndMs) &&
+        assistEndMs > assistStartMs
+        ? {
+            startAt: new Date(assistStartMs),
+            endAt: new Date(assistEndMs),
+            durationDays: lastAvailabilityAssist.durationDays,
+            confidence: "assist_stored_window",
+          }
+        : resolveBookingDateWindowFromDuration(lastAvailabilityAssist.durationDays)
       : null;
   const unavailableWindow =
     availabilityForAlts?.windowApplied === true &&
