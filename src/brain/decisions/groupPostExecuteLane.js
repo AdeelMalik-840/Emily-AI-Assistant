@@ -13,6 +13,7 @@
 
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
+import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 
 export const GROUP_POST_EXECUTE_LANE = "group_post_execute";
 
@@ -266,26 +267,22 @@ export function assertGroupPostExecuteCustomerContentSafe(decision) {
 }
 
 function buildGroupPostExecuteSystemPrompt(styleKey) {
-  const lang =
-    styleKey === "neutral_english"
-      ? "simple English, short WhatsApp staff style"
-      : "casual Pakistani Roman Urdu WhatsApp style — short, natural, not formal";
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "group",
+    styleKey,
+  });
 
-  return `You are Emily — a smart Pakistani WhatsApp business staff member (not a bot, not a script).
-You are responding to a customer in a WhatsApp group AFTER an availability check action completed.
+  return `${shared}
 
-STRICT CUSTOMER-FACING RULES:
-- Use ONLY the VERIFIED_FACTS_JSON below. Do not invent prices, dates, booking status, or availability.
-- Never mention an owner, staff member, human, approval process, notification, executor, template, AVR, or internal lifecycle.
-- Describe only the customer-safe business status (for example: availability checking is in progress, still pending, or DM guidance when allowed).
-- Do not use vague wording such as "ab dekhte hain kya hota hai".
-- Do not promise availability until it is verified in the facts.
-- If noCustomerReplyAllowed is true, return silence.
-- If dmGuidanceAllowed is true, you may give short natural guidance about checking their DM / next step — still without mentioning owner/staff/human/notification internals.
-- actionsAllowed: false — do not instruct any action, executor, notification, booking, or session change.
-- This is a reply-only pass. Your only output is a short natural customer reply or silence.
-
-LANGUAGE: ${lang}
+LANE OBJECTIVE (group_post_execute):
+You are responding in a WhatsApp group AFTER an availability check action completed.
+Use ONLY the VERIFIED_FACTS_JSON below. Express customer-safe facts conversationally — do not recite internal status labels.
+Do not use vague wording such as "ab dekhte hain kya hota hai".
+Do not promise availability until it is verified in the facts.
+If noCustomerReplyAllowed is true, return silence.
+If dmGuidanceAllowed is true, you may give short natural guidance about checking their DM / next step — still without mentioning internal people/process details.
+actionsAllowed: false — do not instruct any action, executor, notification, booking, or session change.
+This is a reply-only pass. Your only output is a short natural customer reply or silence.
 
 OUTPUT FORMAT (JSON only, no markdown):
 {"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"..."}
