@@ -2114,6 +2114,7 @@ export function matchWaitingConfirmRequestForInbound(request, identity = {}) {
 
 /**
  * Narrow single-owner guard: active waiting_confirm DMs belong to the availability poller only.
+ * Group inbound is never owned by this DM poller — fail open so general Brain can reply.
  *
  * @param {{
  *   db?: unknown,
@@ -2142,6 +2143,13 @@ export async function evaluateAvailabilityWaitingConfirmOwnershipGuard({
   isGroupInbound = false,
   requests = null,
 }) {
+  if (isGroupInbound === true) {
+    return {
+      block: false,
+      reason: "GROUP_INBOUND_NOT_OWNED_BY_DM_POLLER",
+    };
+  }
+
   const uid = clean(businessId);
   const text = clean(messageText);
   if (!uid || !text) {

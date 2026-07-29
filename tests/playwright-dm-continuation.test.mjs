@@ -889,10 +889,90 @@ test("3B guard C1: waiting_confirm customer DM text is blocked from general pipe
     messageTimestampMs: Date.now(),
     participantPhone: "+923001234567",
     playwrightChatKey: "adeel-malik",
+    isGroupInbound: false,
     requests: [waitingConfirmRequest()],
   });
   assert.equal(guard.block, true);
   assert.equal(guard.requestId, OWNERSHIP_REQUEST_ID);
+  assert.equal(guard.reason, "WAITING_CONFIRM_NARROW_OWNERSHIP");
+});
+
+test("A: group inbound + matching waiting_confirm → guard fail-open (block:false)", async () => {
+  const guard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
+    businessId: OWNERSHIP_BUSINESS,
+    messageText: "Corolla 2 din k liye available hai?",
+    messageTimestampMs: Date.now(),
+    participantPhone: "+923001234567",
+    participantKey: "participant::adeel",
+    participantName: "Adeel malik",
+    playwrightChatKey: "leads",
+    isGroupInbound: true,
+    requests: [waitingConfirmRequest()],
+  });
+  assert.equal(guard.block, false);
+  assert.equal(guard.reason, "GROUP_INBOUND_NOT_OWNED_BY_DM_POLLER");
+  assert.equal(guard.requestId, undefined);
+});
+
+test("B: DM inbound + matching waiting_confirm → guard still blocks", async () => {
+  const guard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
+    businessId: OWNERSHIP_BUSINESS,
+    messageText: "total rent kitna hai?",
+    messageTimestampMs: Date.now(),
+    participantPhone: "+923001234567",
+    playwrightChatKey: "adeel-malik",
+    dmChatTitle: "Adeel malik",
+    isGroupInbound: false,
+    requests: [waitingConfirmRequest()],
+  });
+  assert.equal(guard.block, true);
+  assert.equal(guard.reason, "WAITING_CONFIRM_NARROW_OWNERSHIP");
+  assert.equal(guard.requestId, OWNERSHIP_REQUEST_ID);
+});
+
+test("C: group availability question is not ownership-silenced when waiting_confirm matches", async () => {
+  enableV2LiveForOwnershipBusiness();
+  try {
+    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline({
+      pipelineParams: {
+        isGroupMessage: true,
+        userPhone: "unknown",
+        groupName: "Leads",
+        playwrightChatKey: "leads",
+        playwrightWebTitleIdentity: true,
+        participantKey: "participant::adeel",
+        participantName: "Adeel malik",
+        participantPhoneForDm: "+923001234567",
+        combinedMessage: "Corolla 2 din k liye available hai?",
+        latestMessage: "Corolla 2 din k liye available hai?",
+        dmPlaywrightChatKey: "",
+        dmChatTitle: "",
+        sessionKey: `${OWNERSHIP_BUSINESS}::leads::participant::adeel`,
+      },
+      brainV2Spy: async () => ({
+        handled: true,
+        legacyBypassed: true,
+        workflowType: "AvailabilityInquiryWorkflow",
+        reply: "Corolla 2 din ke liye check kar leta hun.",
+        sendVia: "GROUP",
+        messageMeta: {
+          routeType: "BRAIN_V2_LIVE",
+          outboundTrace: { finalReplySource: "BRAIN_V2_LIVE" },
+        },
+      }),
+    });
+    assert.ok(brainV2Calls + processCalls > 0);
+    assert.notEqual(
+      outcome?.messageMeta?.outboundTrace?.finalReplySource,
+      "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+    );
+    assert.notEqual(outcome?.messageMeta?.handledWithoutOutbound, true);
+    assert.notEqual(outcome?.intentionalSilent, true);
+    assert.notEqual(outcome?.sendVia, "NONE");
+    assert.match(String(outcome?.reply ?? ""), /Corolla/i);
+  } finally {
+    restoreV2LiveEnv();
+  }
 });
 
 test("3B guard C2: blocked path must not call legacy processMessage", async () => {
