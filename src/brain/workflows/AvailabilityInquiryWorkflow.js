@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import OpenAI from "openai";
 import { composeInformationalAnswer } from "../../services/answerComposer.js";
 import {
   AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
@@ -20,6 +21,19 @@ import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwar
 import { resolveBookingDateWindowFromDuration } from "../facts/resolveBookingDateWindow.js";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
+import {
+  buildUnavailableResourceReplyContract,
+  normalizeReplySemantics,
+} from "../contracts/customerReplyContract.js";
+import {
+  buildCustomerReplyGuardCorrection,
+  validateCustomerReplyAgainstContract,
+} from "../guards/customerReplyGuard.js";
+import {
+  buildStrictJsonSchemaResponseFormat,
+  MAX_CUSTOMER_REPLY_ATTEMPTS,
+  REPLY_SEMANTICS_SCHEMA,
+} from "../openai/strictJsonSchema.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -300,13 +314,41 @@ export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
       ? p.__chatCompletionsCreateForTests
       : typeof p.chatCompletionsCreate === "function"
         ? p.chatCompletionsCreate
-        : null;
+        : (() => {
+            const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+            if (!apiKey) return null;
+            const client = new OpenAI({ apiKey });
+            return (args) => client.chat.completions.create(args);
+          })();
   if (!create) return failsafe;
 
   const altLabels = alternatives
     .map((row) => String(row?.itemLabel ?? "").trim())
     .filter(Boolean)
     .slice(0, 5);
+
+  const verifiedFacts = {
+    itemLabel: label,
+    durationDays: durationN,
+    itemAvailable: false,
+    verifiedAlternativeLabels: altLabels,
+    verifiedAlternativesCount: altLabels.length,
+    customerMessageText: String(p.customerMessageText ?? "").trim() || null,
+    styleKey: p.styleKey ?? null,
+  };
+  const replyContract = buildUnavailableResourceReplyContract(verifiedFacts);
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "unavailable_customer_reply",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        reply: { type: "string" },
+        replySemantics: REPLY_SEMANTICS_SCHEMA,
+      },
+      required: ["reply", "replySemantics"],
+    }
+  );
 
   const system = `${buildCustomerCommunicationPolicy({ channel: "group" })}
 
@@ -315,14 +357,13 @@ Write ONE short customer reply from VERIFIED FACTS only.
 Do not invent cars, prices, or availability.
 If verifiedAlternatives is empty, you MUST NOT ask to show other options.
 If verifiedAlternatives is non-empty, you may offer to show other options (do not list them unless facts say to list).
-Return ONLY JSON: {"reply":"..."}`;
+Return STRICT JSON: {"reply":"...","replySemantics":{"claims":["resource_unavailable"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}`;
 
-  const user = `FACTS_JSON: ${JSON.stringify({
-    itemLabel: label,
-    durationDays: durationN,
-    itemAvailable: false,
-    verifiedAlternativeLabels: altLabels,
-    verifiedAlternativesCount: altLabels.length,
+  const userBase = `FACTS_JSON: ${JSON.stringify(verifiedFacts)}
+CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
+    allowedClaims: replyContract.allowedClaims,
+    forbiddenClaims: replyContract.forbiddenClaims,
+    requiredMeaning: replyContract.requiredMeaning,
   })}`;
 
   try {
@@ -330,29 +371,61 @@ Return ONLY JSON: {"reply":"..."}`;
       Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) > 0
         ? Number(p.timeoutMs)
         : 8000;
-    const completion = await Promise.race([
-      create({
-        model: resolveOpenAiChatModel(),
-        temperature: 0.3,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-      }),
-      new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("unavailable_reply_timeout")), timeoutMs);
-      }),
-    ]);
-    const raw = String(completion?.choices?.[0]?.message?.content ?? "").trim();
-    let reply = "";
-    try {
-      const parsed = JSON.parse(raw);
-      reply = String(parsed?.reply ?? "").trim();
-    } catch {
-      reply = "";
+    let lastReason = null;
+    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
+      const userContent =
+        attempt === 1
+          ? `${userBase}\n\nStrict JSON only.`
+          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason || "validation_failed")}`;
+      const completion = await Promise.race([
+        create({
+          model: resolveOpenAiChatModel(),
+          temperature: 0.3,
+          response_format: responseFormat,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userContent },
+          ],
+        }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("unavailable_reply_timeout")), timeoutMs);
+        }),
+      ]);
+      const raw = String(completion?.choices?.[0]?.message?.content ?? "").trim();
+      let reply = "";
+      let semantics = null;
+      try {
+        const parsed = JSON.parse(raw);
+        reply = String(parsed?.reply ?? "").trim();
+        semantics = normalizeReplySemantics(parsed?.replySemantics);
+      } catch {
+        reply = "";
+      }
+      if (!reply) {
+        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return ""; // fail closed — no canned fallback after guarded attempts
+      }
+      const guard = validateCustomerReplyAgainstContract(
+        reply,
+        replyContract,
+        semantics
+      );
+      if (!guard.ok) {
+        lastReason = guard.reason || "customer_reply_guard_failed";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return "";
+      }
+      // Keep existing length/alts sanity checks; empty alternatives still forbid "other option".
+      const validated = validateUnavailableCustomerReply(reply, alternatives, "");
+      if (!validated) {
+        lastReason = "unavailable_reply_failed_local_validation";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return "";
+      }
+      return validated;
     }
-    return validateUnavailableCustomerReply(reply, alternatives, failsafe);
+    return "";
   } catch {
     return failsafe;
   }

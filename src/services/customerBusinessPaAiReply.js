@@ -17,6 +17,19 @@ import {
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
 import { buildCustomerCommunicationPolicy } from "../brain/policies/customerCommunicationPolicy.js";
+import {
+  buildPaMissingInfoFollowupContract,
+  normalizeReplySemantics,
+} from "../brain/contracts/customerReplyContract.js";
+import {
+  buildCustomerReplyGuardCorrection,
+  validateCustomerReplyAgainstContract,
+} from "../brain/guards/customerReplyGuard.js";
+import {
+  buildStrictJsonSchemaResponseFormat,
+  MAX_CUSTOMER_REPLY_ATTEMPTS,
+  REPLY_SEMANTICS_SCHEMA,
+} from "../brain/openai/strictJsonSchema.js";
 import { isAllowedPaMissingInfoType } from "./paMissingInfoRequestService.js";
 
 export const CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK =
@@ -85,8 +98,7 @@ export async function generateCustomerBusinessPaReplyFromFacts({
   const needsFollowup = decision?.action === "escalate_missing_info";
   return {
     ok: decided?.ok === true,
-    reply:
-      decision?.customerReply || CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+    reply: decision?.customerReply || "",
     needsFollowup,
     missingInfoType: needsFollowup ? decision?.requestedInfoType ?? null : null,
     conversationAct: decision?.conversationAct ?? "unknown",
@@ -138,7 +150,7 @@ export async function generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
   if (!answer) {
     return {
       ok: false,
-      reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      reply: "",
       source: "technical_fallback",
       reason: "MISSING_OWNER_ANSWER",
     };
@@ -149,23 +161,51 @@ export async function generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
     .trim()
     .slice(0, 800);
   const type = cleanType(missingInfoType);
-  const factsJson = compactPostConfirmFactsForPrompt(facts || {});
+  const factsObj = facts && typeof facts === "object" ? facts : {};
+  const factsJson = compactPostConfirmFactsForPrompt(factsObj);
+  const replyContract = buildPaMissingInfoFollowupContract({
+    ...factsObj,
+    ownerAnswer: answer,
+    customerQuestion: question,
+    missingInfoType: type,
+    customerMessageText: question,
+    styleKey,
+  });
   const shared = buildCustomerCommunicationPolicy({
     channel: "dm",
     styleKey,
     businessCommunicationProfile:
-      facts?.business && typeof facts.business === "object"
-        ? /** @type {Record<string, unknown>} */ (facts.business)
-        : facts?.tone != null
-          ? { tone: facts.tone }
+      factsObj?.business && typeof factsObj.business === "object"
+        ? /** @type {Record<string, unknown>} */ (factsObj.business)
+        : factsObj?.tone != null
+          ? { tone: factsObj.tone }
           : null,
   });
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "pa_missing_info_followup",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        customerReply: { type: "string" },
+        needsFollowup: { type: "boolean" },
+        missingInfoType: { type: ["string", "null"] },
+        replySemantics: REPLY_SEMANTICS_SCHEMA,
+      },
+      required: [
+        "customerReply",
+        "needsFollowup",
+        "missingInfoType",
+        "replySemantics",
+      ],
+    }
+  );
 
   const system = `${shared}
 
 LANE OBJECTIVE (PA missing-info owner-answer follow-up):
-OUTPUT: Return ONLY one JSON object:
-{"customerReply":"<short WhatsApp reply>","needsFollowup":false,"missingInfoType":null}
+OUTPUT: Return STRICT JSON:
+{"customerReply":"<short WhatsApp reply>","needsFollowup":false,"missingInfoType":null,"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 TASK:
 - Customer previously asked a missing-info question. A verified answer is now available for THIS request only (OWNER_ANSWER_FOR_THIS_REQUEST).
@@ -178,13 +218,19 @@ STRICT SAFETY:
 - Do NOT persist or imply saving to business knowledge.
 - Do NOT mention internal tokens, Brain, Firestore, or systems.
 - Do NOT create/cancel/change bookings.
-- Money from owner answer: include PKR if an amount is stated.`;
+- Money from owner answer: include PKR if an amount is stated.
+- replySemantics.claims must only list claims supported by verified facts / allowedClaims.`;
 
-  const userPayload =
+  const userBase =
     `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\n` +
     `MISSING_INFO_TYPE:\n${type || "other"}\n\n` +
     `ORIGINAL_CUSTOMER_QUESTION:\n${question || "(none)"}\n\n` +
-    `OWNER_ANSWER_FOR_THIS_REQUEST:\n${answer}`;
+    `OWNER_ANSWER_FOR_THIS_REQUEST:\n${answer}\n\n` +
+    `CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
+      allowedClaims: replyContract.allowedClaims,
+      forbiddenClaims: replyContract.forbiddenClaims,
+      requiredMeaning: replyContract.requiredMeaning,
+    })}`;
 
   const completionFn =
     typeof __chatCompletionsCreateForTests === "function"
@@ -199,80 +245,108 @@ STRICT SAFETY:
   if (!completionFn) {
     return {
       ok: false,
-      reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      reply: "",
       source: "technical_fallback",
       reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
     };
   }
 
   try {
-    const createPromise = Promise.resolve(
-      completionFn({
-        model: resolveOpenAiChatModel(),
-        temperature: 0.35,
-        max_tokens: 180,
-        messages: [
-          { role: "system", content: system },
-          {
-            role: "user",
-            content:
-              userPayload +
-              "\n\nRemember: JSON only; answer from owner answer; no inventing; no knowledge persist.",
-          },
-        ],
-      })
-    );
-    const timed =
-      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-        ? Promise.race([
-            createPromise,
-            new Promise((_, reject) => {
-              setTimeout(
-                () =>
-                  reject(new Error("PA_MISSING_INFO_FOLLOWUP_OPENAI_TIMEOUT")),
-                Math.floor(Number(timeoutMs))
-              );
-            }),
-          ])
-        : createPromise;
+    let lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
+      const userContent =
+        attempt === 1
+          ? `${userBase}\n\nRemember: JSON only; answer from owner answer; no inventing; no knowledge persist.`
+          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
+      const createPromise = Promise.resolve(
+        completionFn({
+          model: resolveOpenAiChatModel(),
+          temperature: 0.35,
+          max_tokens: 180,
+          response_format: responseFormat,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userContent },
+          ],
+        })
+      );
+      const timed =
+        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+          ? Promise.race([
+              createPromise,
+              new Promise((_, reject) => {
+                setTimeout(
+                  () =>
+                    reject(new Error("PA_MISSING_INFO_FOLLOWUP_OPENAI_TIMEOUT")),
+                  Math.floor(Number(timeoutMs))
+                );
+              }),
+            ])
+          : createPromise;
 
-    const resp = await timed;
-    const raw = resp?.choices?.[0]?.message?.content ?? "";
-    let text = String(raw ?? "").trim();
-    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fence) text = fence[1].trim();
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start >= 0 && end > start) text = text.slice(start, end + 1);
-    let customerReply = "";
-    try {
-      const parsed = JSON.parse(text);
-      customerReply = String(parsed?.customerReply ?? parsed?.reply ?? "")
-        .replace(/^\s*["']|["']\s*$/g, "")
-        .trim();
-    } catch {
-      customerReply = text.replace(/^\s*["']|["']\s*$/g, "").trim();
-    }
-    if (!customerReply) {
+      const resp = await timed;
+      const raw = resp?.choices?.[0]?.message?.content ?? "";
+      let text = String(raw ?? "").trim();
+      const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fence) text = fence[1].trim();
+      const start = text.indexOf("{");
+      const end = text.lastIndexOf("}");
+      if (start >= 0 && end > start) text = text.slice(start, end + 1);
+      let customerReply = "";
+      let semantics = null;
+      try {
+        const parsed = JSON.parse(text);
+        customerReply = String(parsed?.customerReply ?? parsed?.reply ?? "")
+          .replace(/^\s*["']|["']\s*$/g, "")
+          .trim();
+        semantics = normalizeReplySemantics(parsed?.replySemantics);
+      } catch {
+        customerReply = "";
+      }
+      if (!customerReply) {
+        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+        };
+      }
+      if (type && !isAllowedPaMissingInfoType(type)) {
+        // type is context only for wording; ignore invalid
+      }
+      const guard = validateCustomerReplyAgainstContract(
+        customerReply,
+        replyContract,
+        semantics
+      );
+      if (!guard.ok) {
+        lastReason = guard.reason || "customer_reply_guard_failed";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+        };
+      }
       return {
-        ok: false,
-        reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
-        source: "technical_fallback",
-        reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+        ok: true,
+        reply: customerReply.slice(0, 500),
+        source: "openai",
       };
     }
-    if (type && !isAllowedPaMissingInfoType(type)) {
-      // type is context only for wording; ignore invalid
-    }
     return {
-      ok: true,
-      reply: customerReply.slice(0, 500),
-      source: "openai",
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: lastReason,
     };
   } catch (err) {
     return {
       ok: false,
-      reply: CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      reply: "",
       source: "technical_fallback",
       reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
     };

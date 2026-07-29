@@ -134,6 +134,14 @@ test("1: group_post_execute system prompt includes shared policy; one OpenAI att
       action: "reply",
       shouldReply: true,
       confidence: 0.9,
+      safetyNotes: null,
+      reason: "ok",
+      replySemantics: {
+        claims: ["resource_availability_unconfirmed"],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
     })
   );
   const result = await executeGroupPostExecuteLaneDecision({
@@ -181,6 +189,12 @@ test("2: waiting_confirm_dm keeps action schema and includes shared DM policy", 
       confidence: 0.95,
       safetyNotes: null,
       reason: "natural_confirm",
+      replySemantics: {
+        claims: [],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
     })
   );
   const result = await executeWaitingConfirmDmLaneDecision({
@@ -200,7 +214,10 @@ test("2: waiting_confirm_dm keeps action schema and includes shared DM policy", 
     systems[0],
     /action: confirm_booking\|decline_request\|change_request\|reply\|silence\|clarify\|none/
   );
-  assert.match(systems[0], /Natural confirm after book prompt → confirm_booking/);
+  assert.match(
+    systems[0],
+    /Natural confirm after Emily's book-confirm prompt[\s\S]*action=confirm_booking/
+  );
 });
 
 test("3: post_confirm_pa keeps escalation schema and includes shared DM policy", async () => {
@@ -214,6 +231,12 @@ test("3: post_confirm_pa keeps escalation schema and includes shared DM policy",
       shouldReply: false,
       customerReply: "",
       action: "silence",
+      replySemantics: {
+        claims: [],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
     })
   );
   const result = await executePostConfirmPaLaneDecision({
@@ -235,7 +258,15 @@ test("3: post_confirm_pa keeps escalation schema and includes shared DM policy",
 
 test("4: unavailable compose includes shared group policy; one OpenAI call", async () => {
   const { create, systems, getCalls } = captureSystem(
-    JSON.stringify({ reply: "Corolla ab available nahi hai" })
+    JSON.stringify({
+      reply: "Corolla ab available nahi hai",
+      replySemantics: {
+        claims: ["resource_unavailable"],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
+    })
   );
   const reply = await composeUnavailableCustomerReplyFromFacts({
     conversationalLabel: "Corolla",
@@ -247,7 +278,7 @@ test("4: unavailable compose includes shared group policy; one OpenAI call", asy
   assert.ok(String(reply || "").length > 0);
   assert.match(systems[0], new RegExp(CUSTOMER_COMMUNICATION_POLICY_MARKER));
   assert.match(systems[0], /LENGTH \(group\)/);
-  assert.match(systems[0], /Return ONLY JSON: \{"reply":"\.\.\."\}/);
+  assert.match(systems[0], /replySemantics/);
   assert.match(systems[0], /verifiedAlternatives is empty/);
 });
 
@@ -257,6 +288,12 @@ test("5: PA missing-info follow-up includes shared DM policy; one OpenAI call", 
       customerReply: "Driver included hai, PKR 5000 per day",
       needsFollowup: false,
       missingInfoType: null,
+      replySemantics: {
+        claims: [],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
     })
   );
   const result = await generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
