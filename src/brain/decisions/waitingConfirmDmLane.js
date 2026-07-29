@@ -7,6 +7,20 @@ import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { resolveAvailabilityApprovedPriceQuote } from "../../services/availabilityMessageBuilder.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
+import {
+  buildWaitingConfirmVerifiedQuotationContract,
+  normalizeReplySemantics,
+  stripInternalReplySemantics,
+} from "../contracts/customerReplyContract.js";
+import {
+  buildCustomerReplyGuardCorrection,
+  validateCustomerReplyAgainstContract,
+} from "../guards/customerReplyGuard.js";
+import {
+  buildStrictJsonSchemaResponseFormat,
+  MAX_CUSTOMER_REPLY_ATTEMPTS,
+  REPLY_SEMANTICS_SCHEMA,
+} from "../openai/strictJsonSchema.js";
 
 export const WAITING_CONFIRM_DM_LANE = "waiting_confirm_dm";
 
@@ -345,6 +359,7 @@ export function parseWaitingConfirmDmDecision(raw) {
     confidence,
     safetyNotes: clean(parsed.safetyNotes, 200) || null,
     reason: clean(parsed.reason, 120) || null,
+    replySemantics: normalizeReplySemantics(parsed.replySemantics),
   };
 }
 
@@ -362,15 +377,69 @@ function defaultDecision(overrides = {}) {
     asksForBookingConfirmation: false,
     outboundPromptType: null,
     requestedInfoType: null,
-    shouldReply: true,
-    customerReply: TECHNICAL_FALLBACK,
-    action: "reply",
+    shouldReply: false,
+    customerReply: "",
+    action: "silence",
     confidence: null,
     safetyNotes: null,
     reason: null,
     ...overrides,
   };
 }
+
+const WAITING_CONFIRM_DM_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    conversationStage: { type: ["string", "null"] },
+    customerMood: { type: ["string", "null"] },
+    customerIntent: { type: ["string", "null"] },
+    situation: { type: ["string", "null"] },
+    customerIsConfirmingBooking: { type: "boolean" },
+    customerIsAskingQuestion: { type: "boolean" },
+    customerIsDeclining: { type: "boolean" },
+    customerWantsChange: { type: "boolean" },
+    requestedInfoType: { type: ["string", "null"] },
+    shouldReply: { type: "boolean" },
+    customerReply: { type: "string" },
+    action: {
+      type: "string",
+      enum: [
+        "reply",
+        "silence",
+        "clarify",
+        "confirm_booking",
+        "decline_request",
+        "change_request",
+        "none",
+      ],
+    },
+    confidence: { type: ["number", "null"] },
+    safetyNotes: { type: ["string", "null"] },
+    reason: { type: ["string", "null"] },
+    asksForBookingConfirmation: { type: "boolean" },
+    replySemantics: REPLY_SEMANTICS_SCHEMA,
+  },
+  required: [
+    "conversationStage",
+    "customerMood",
+    "customerIntent",
+    "situation",
+    "customerIsConfirmingBooking",
+    "customerIsAskingQuestion",
+    "customerIsDeclining",
+    "customerWantsChange",
+    "requestedInfoType",
+    "shouldReply",
+    "customerReply",
+    "action",
+    "confidence",
+    "safetyNotes",
+    "reason",
+    "asksForBookingConfirmation",
+    "replySemantics",
+  ],
+};
 
 /** @param {{ turnContext: Record<string, unknown>, timeoutMs?: number, __chatCompletionsCreateForTests?: Function | null }} p */
 export async function executeWaitingConfirmDmLaneDecision({
@@ -392,19 +461,47 @@ export async function executeWaitingConfirmDmLaneDecision({
     channel: "dm",
     styleKey,
   });
+  let factsObj =
+    ctx.facts && typeof ctx.facts === "object" ? { ...ctx.facts } : {};
+  if (
+    (!factsObj.quotedPrice || typeof factsObj.quotedPrice !== "object") &&
+    factsJson
+  ) {
+    try {
+      const parsedFacts = JSON.parse(factsJson);
+      if (parsedFacts && typeof parsedFacts === "object") {
+        factsObj = { ...parsedFacts, ...factsObj };
+      }
+    } catch {
+      // verifiedFactsJson may be non-JSON in some injectors; keep factsObj
+    }
+  }
+  const replyContract = buildWaitingConfirmVerifiedQuotationContract(factsObj);
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "waiting_confirm_dm_decision",
+    WAITING_CONFIRM_DM_OUTPUT_SCHEMA
+  );
+
   const system = `${shared}
 
 LANE OBJECTIVE (waiting_confirm_dm):
 AVR approved, waiting_confirm Cloud DM.
 Decide meaning from latest message + last Emily + history + VERIFIED_FACTS_JSON (not keyword lists).
-JSON only: {"conversationStage":"booking_offer","customerMood":null,"customerIntent":"confirm_booking","situation":"awaiting_confirm","customerIsConfirmingBooking":true,"customerIsAskingQuestion":false,"customerIsDeclining":false,"customerWantsChange":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"confirm_booking","confidence":0.9,"safetyNotes":null,"reason":"natural_confirm"}
+Return STRICT JSON only (schema enforced). Include replySemantics for validation.
+Example shape: {"conversationStage":"booking_offer","customerMood":null,"customerIntent":"ask_fact","situation":"awaiting_confirm","customerIsConfirmingBooking":false,"customerIsAskingQuestion":true,"customerIsDeclining":false,"customerWantsChange":false,"requestedInfoType":null,"shouldReply":true,"customerReply":"...","action":"reply","confidence":0.9,"safetyNotes":null,"reason":"price_question","asksForBookingConfirmation":false,"replySemantics":{"claims":["quotation_verified"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 action: confirm_booking|decline_request|change_request|reply|silence|clarify|none
 Natural confirm after book prompt → confirm_booking. After Q&A ambiguous ack ≠ confirm. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social no/thanks after Q&A → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up.
-If your reply intentionally asks the customer to confirm booking again, set asksForBookingConfirmation=true (structured). Do not set it for ordinary Q&A answers.`;
+If your reply intentionally asks the customer to confirm booking again, set asksForBookingConfirmation=true (structured). Do not set it for ordinary Q&A answers.
+When stating a verified total from facts.quotedPrice, include the exact total number in customerReply and claim quotation_verified.`;
 
   let userPayload =
     `VERIFIED_FACTS_JSON:\n${factsJson}\n\nLAST_EMILY_MESSAGE:\n${lastEmily || "(none)"}\n\nCUSTOMER_MESSAGE:\n${userLine || "(empty)"}`;
   if (historyLine) userPayload += `\n\nRECENT_CONVERSATION:\n${historyLine}`;
+  userPayload += `\n\nCUSTOMER_REPLY_CONTRACT:\n${JSON.stringify({
+    allowedClaims: replyContract.allowedClaims,
+    forbiddenClaims: replyContract.forbiddenClaims,
+    requiredMeaning: replyContract.requiredMeaning,
+  })}`;
 
   const completionFn =
     typeof __chatCompletionsCreateForTests === "function"
@@ -425,46 +522,112 @@ If your reply intentionally asks the customer to confirm booking again, set asks
     };
   }
 
-  try {
+  const ms =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Math.floor(Number(timeoutMs))
+      : 8000;
+
+  async function runOne(userContent) {
     const createPromise = Promise.resolve(
       completionFn({
         model: resolveOpenAiChatModel(),
         temperature: 0.3,
         max_tokens: 320,
+        response_format: responseFormat,
         messages: [
           { role: "system", content: system },
-          {
-            role: "user",
-            content: `${userPayload}\n\nJSON only; facts only; confirm only when context supports it.`,
-          },
+          { role: "user", content: userContent },
         ],
       })
     );
-    const timed =
-      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-        ? Promise.race([
-            createPromise,
-            new Promise((_, reject) => {
-              setTimeout(
-                () => reject(new Error("WAITING_CONFIRM_DM_OPENAI_TIMEOUT")),
-                Math.floor(Number(timeoutMs))
-              );
-            }),
-          ])
-        : createPromise;
+    const timed = Promise.race([
+      createPromise,
+      new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error("WAITING_CONFIRM_DM_OPENAI_TIMEOUT")),
+          ms
+        );
+      }),
+    ]);
     const resp = await timed;
-    const decision = parseWaitingConfirmDmDecision(
-      resp?.choices?.[0]?.message?.content ?? ""
-    );
-    if (!decision) {
+    return String(resp?.choices?.[0]?.message?.content ?? "").trim();
+  }
+
+  try {
+    let lastReason = null;
+    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
+      const userContent =
+        attempt === 1
+          ? `${userPayload}\n\nStrict JSON only; facts only; confirm only when context supports it.`
+          : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason || "validation_failed")}`;
+
+      const raw = await runOne(userContent);
+      const decision = parseWaitingConfirmDmDecision(raw);
+      if (!decision) {
+        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          decision: defaultDecision({ reason: "PARSE_FAILED" }),
+          source: "content_safety_fail_closed",
+          reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      // Guard customer wording only when a reply would be sent.
+      const replyText = String(decision.customerReply ?? "").trim();
+      if (replyText) {
+        const claims = Array.isArray(decision.replySemantics?.claims)
+          ? decision.replySemantics.claims
+          : [];
+        const askNeedsQuote =
+          decision.customerIsAskingQuestion === true ||
+          claims.includes("quotation_verified");
+        const hasQuote =
+          factsObj?.quotedPrice?.total != null &&
+          Number.isFinite(Number(factsObj.quotedPrice.total));
+        const guard = validateCustomerReplyAgainstContract(
+          replyText,
+          {
+            ...replyContract,
+            requiredMeaning:
+              askNeedsQuote && hasQuote
+                ? "state_verified_quotation"
+                : replyContract.requiredMeaning,
+            replyRequired:
+              decision.action === "reply" || decision.shouldReply === true,
+          },
+          decision.replySemantics
+        );
+        if (!guard.ok) {
+          lastReason = guard.reason || "customer_reply_guard_failed";
+          if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+          return {
+            ok: false,
+            decision: defaultDecision({ reason: lastReason }),
+            source: "content_safety_fail_closed",
+            reason: lastReason,
+            contentSafetyAttempts: attempt,
+          };
+        }
+      }
+
       return {
-        ok: false,
-        decision: defaultDecision({ reason: "PARSE_FAILED" }),
-        source: "technical_fallback",
-        reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+        ok: true,
+        decision: stripInternalReplySemantics(decision),
+        source: attempt === 1 ? "openai" : "openai_content_safety_regenerated",
+        contentSafetyAttempts: attempt,
       };
     }
-    return { ok: true, decision, source: "openai" };
+
+    return {
+      ok: false,
+      decision: defaultDecision({ reason: lastReason || "CONTENT_SAFETY_FAIL_CLOSED" }),
+      source: "content_safety_fail_closed",
+      reason: lastReason || "CONTENT_SAFETY_FAIL_CLOSED",
+      contentSafetyAttempts: MAX_CUSTOMER_REPLY_ATTEMPTS,
+    };
   } catch (err) {
     return {
       ok: false,

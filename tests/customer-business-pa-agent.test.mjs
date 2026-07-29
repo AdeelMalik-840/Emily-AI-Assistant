@@ -204,7 +204,55 @@ function baseApprovedBooking(overrides = {}) {
 
 function mockOpenAiReply(text) {
   return async () => ({
-    choices: [{ message: { content: text } }],
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            situation: "new_question",
+            conversationAct: "information_request",
+            customerIntent: "ask_fact",
+            customerIsAskingQuestion: true,
+            requestedInfoType: null,
+            shouldReply: true,
+            customerReply: text,
+            action: "reply",
+            replySemantics: {
+              claims: [],
+              languageStyle: "roman_urdu",
+              containsTimingPromise: false,
+              exposesInternalProcess: false,
+            },
+          }),
+        },
+      },
+    ],
+  });
+}
+
+function mockOpenAiSocialReply(text) {
+  return async () => ({
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            situation: "acknowledgement_after_answer",
+            conversationAct: "chit_chat",
+            customerIntent: "ack",
+            customerIsAskingQuestion: false,
+            requestedInfoType: null,
+            shouldReply: true,
+            customerReply: text,
+            action: "reply",
+            replySemantics: {
+              claims: [],
+              languageStyle: "roman_urdu",
+              containsTimingPromise: false,
+              exposesInternalProcess: false,
+            },
+          }),
+        },
+      },
+    ],
   });
 }
 
@@ -388,7 +436,7 @@ test("active booking + hello → OpenAI called; reply equals mock", async () => 
       __chatCompletionsCreateForTests: async (args) => {
         openaiCalls += 1;
         lastPayload = JSON.stringify(args);
-        return { choices: [{ message: { content: mockReply } }] };
+        return mockOpenAiSocialReply(mockReply)(args);
       },
     });
     assert.equal(result.handled, true);
@@ -433,7 +481,7 @@ test("Advance / Driver / Rent questions call OpenAI with Brain facts", async () 
         __chatCompletionsCreateForTests: async (args) => {
           openaiCalls += 1;
           userContent = String(args?.messages?.[1]?.content ?? "");
-          return { choices: [{ message: { content: mockReply } }] };
+          return mockOpenAiReply(mockReply)(args);
         },
       })
     );
@@ -539,8 +587,8 @@ test("OpenAI failure → one technical fallback; handled true", async () => {
     });
     assert.equal(result.handled, true);
     assert.equal(result.openaiUsed, false);
-    assert.equal(sent, CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK);
-    assert.equal(result.reply, CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK);
+    assert.equal(sent, "");
+    assert.equal(result.reply, "");
   });
 });
 

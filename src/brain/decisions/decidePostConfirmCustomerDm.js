@@ -12,6 +12,20 @@ import {
   PA_MISSING_INFO_TYPES,
 } from "../../services/paMissingInfoRequestService.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
+import {
+  buildPostConfirmPaReplyContract,
+  normalizeReplySemantics,
+  stripInternalReplySemantics,
+} from "../contracts/customerReplyContract.js";
+import {
+  buildCustomerReplyGuardCorrection,
+  validateCustomerReplyAgainstContract,
+} from "../guards/customerReplyGuard.js";
+import {
+  buildStrictJsonSchemaResponseFormat,
+  MAX_CUSTOMER_REPLY_ATTEMPTS,
+  REPLY_SEMANTICS_SCHEMA,
+} from "../openai/strictJsonSchema.js";
 
 export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "information_request",
@@ -338,9 +352,9 @@ function defaultDecision(overrides = {}) {
     customerIntent: "unclear",
     customerIsAskingQuestion: false,
     requestedInfoType: null,
-    customerReply: POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
-    action: "reply",
-    shouldReply: true,
+    customerReply: "",
+    action: "silence",
+    shouldReply: false,
     situation: "unclear",
     ...overrides,
   };
@@ -374,6 +388,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
         customerReply: plain.slice(0, 500),
         situation: "unclear",
         shouldReply: true,
+        action: "reply",
       }),
       userMessage
     );
@@ -502,6 +517,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       action,
       shouldReply,
       situation,
+      replySemantics: normalizeReplySemantics(parsed.replySemantics),
     },
     userMessage
   );
@@ -603,13 +619,51 @@ export async function executePostConfirmPaLaneDecision({
           ? { tone: facts.tone }
           : null,
   });
+  const replyContract = buildPostConfirmPaReplyContract(
+    facts && typeof facts === "object" ? facts : {}
+  );
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "post_confirm_pa_decision",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        situation: { type: "string", enum: [...POST_CONFIRM_SITUATIONS] },
+        conversationAct: {
+          type: "string",
+          enum: [...POST_CONFIRM_CONVERSATION_ACTS],
+        },
+        customerIntent: {
+          type: "string",
+          enum: [...POST_CONFIRM_CUSTOMER_INTENTS],
+        },
+        customerIsAskingQuestion: { type: "boolean" },
+        requestedInfoType: { type: ["string", "null"] },
+        shouldReply: { type: "boolean" },
+        customerReply: { type: "string" },
+        action: { type: "string", enum: [...POST_CONFIRM_ACTIONS] },
+        replySemantics: REPLY_SEMANTICS_SCHEMA,
+      },
+      required: [
+        "situation",
+        "conversationAct",
+        "customerIntent",
+        "customerIsAskingQuestion",
+        "requestedInfoType",
+        "shouldReply",
+        "customerReply",
+        "action",
+        "replySemantics",
+      ],
+    }
+  );
 
   const system = `${shared}
 
 LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
-Return ONLY one JSON object (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence"}
+Return STRICT JSON (no markdown fences):
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
@@ -661,6 +715,7 @@ LANE FACT RULES:
       ? "Active booking is BACKGROUND. Do not onboard as a new visitor."
       : "No active booking object."
   }
+- replySemantics.claims must only list claims supported by verified facts / allowedClaims.
 
 STRICT SAFETY:
 - Do NOT invent amounts or policies.
@@ -672,6 +727,11 @@ STRICT SAFETY:
   if (historyLine) {
     userPayload += `\n\nRECENT_CONVERSATION:\n${historyLine}`;
   }
+  userPayload += `\n\nCUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
+    allowedClaims: replyContract.allowedClaims,
+    forbiddenClaims: replyContract.forbiddenClaims,
+    requiredMeaning: replyContract.requiredMeaning,
+  })}`;
 
   const completionFn =
     typeof __chatCompletionsCreateForTests === "function"
@@ -686,86 +746,117 @@ STRICT SAFETY:
   if (!completionFn) {
     return {
       ok: false,
-      decision: defaultDecision(),
+      decision: stripInternalReplySemantics(defaultDecision()),
       source: "technical_fallback",
       reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
     };
   }
 
   try {
-    const createPromise = Promise.resolve(
-      completionFn({
-        model: resolveOpenAiChatModel(),
-        temperature: 0.35,
-        max_tokens: 300,
-        messages: [
-          { role: "system", content: system },
-          {
-            role: "user",
-            content:
-              userPayload +
-              "\n\nRemember: JSON only; never mirror the customer; silence ok for farewells; social 'no' is decline_more_help not clarification; never escalate acknowledgements; only verified facts.",
-          },
-        ],
-      })
-    );
+    let lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
+      const userContent =
+        attempt === 1
+          ? `${userPayload}\n\nRemember: JSON only; never mirror the customer; silence ok for farewells; social 'no' is decline_more_help not clarification; never escalate acknowledgements; only verified facts.`
+          : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
+      const createPromise = Promise.resolve(
+        completionFn({
+          model: resolveOpenAiChatModel(),
+          temperature: 0.35,
+          max_tokens: 300,
+          response_format: responseFormat,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userContent },
+          ],
+        })
+      );
 
-    const timed =
-      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-        ? Promise.race([
-            createPromise,
-            new Promise((_, reject) => {
-              setTimeout(
-                () =>
-                  reject(new Error("POST_CONFIRM_CUSTOMER_DM_OPENAI_TIMEOUT")),
-                Math.floor(Number(timeoutMs))
-              );
-            }),
-          ])
-        : createPromise;
+      const timed =
+        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+          ? Promise.race([
+              createPromise,
+              new Promise((_, reject) => {
+                setTimeout(
+                  () =>
+                    reject(new Error("POST_CONFIRM_CUSTOMER_DM_OPENAI_TIMEOUT")),
+                  Math.floor(Number(timeoutMs))
+                );
+              }),
+            ])
+          : createPromise;
 
-    const resp = await timed;
-    const raw = resp?.choices?.[0]?.message?.content ?? "";
-    const decision = parsePostConfirmCustomerDmDecision(raw, {
-      userMessage: userLine,
-    });
-    const hasSendableReply = Boolean(clean(decision?.customerReply));
-    const isSilence =
-      decision?.action === "silence" || decision?.shouldReply === false;
-    if (!decision || (!hasSendableReply && !isSilence)) {
+      const resp = await timed;
+      const raw = resp?.choices?.[0]?.message?.content ?? "";
+      const decision = parsePostConfirmCustomerDmDecision(raw, {
+        userMessage: userLine,
+      });
+      const hasSendableReply = Boolean(clean(decision?.customerReply));
+      const isSilence =
+        decision?.action === "silence" || decision?.shouldReply === false;
+      if (!decision || (!hasSendableReply && !isSilence)) {
+        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: lastReason,
+        };
+      }
+
+      // Hard: never escalate when loop not fully enabled.
+      if (!loopOn && decision.action === "escalate_missing_info") {
+        decision.action = "reply";
+      }
+
+      // Hard: never escalate if type already open in facts.
+      if (
+        decision.action === "escalate_missing_info" &&
+        hasOpenPaMissingInfoForType(facts, decision.requestedInfoType)
+      ) {
+        decision.action = "reply";
+        decision.situation = "pending_owner_answer";
+      }
+
+      const finalized = applyPostConfirmAntiEchoAndSilence(decision, userLine);
+      const replyText = clean(finalized?.customerReply);
+      const guard = validateCustomerReplyAgainstContract(
+        replyText,
+        {
+          ...replyContract,
+          replyRequired:
+            finalized.action === "reply" || finalized.shouldReply === true,
+        },
+        finalized.replySemantics || decision.replySemantics
+      );
+      if (!guard.ok) {
+        lastReason = guard.reason || "customer_reply_guard_failed";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: lastReason,
+        };
+      }
+
       return {
-        ok: false,
-        decision: defaultDecision(),
-        source: "technical_fallback",
-        reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+        ok: true,
+        decision: stripInternalReplySemantics(finalized),
+        source: "openai",
       };
     }
-
-    // Hard: never escalate when loop not fully enabled.
-    if (!loopOn && decision.action === "escalate_missing_info") {
-      decision.action = "reply";
-    }
-
-    // Hard: never escalate if type already open in facts.
-    if (
-      decision.action === "escalate_missing_info" &&
-      hasOpenPaMissingInfoForType(facts, decision.requestedInfoType)
-    ) {
-      decision.action = "reply";
-      decision.situation = "pending_owner_answer";
-    }
-
-    const finalized = applyPostConfirmAntiEchoAndSilence(decision, userLine);
-
     return {
-      ok: true,
-      decision: finalized,
-      source: "openai",
+      ok: false,
+      decision: stripInternalReplySemantics(defaultDecision()),
+      source: "technical_fallback",
+      reason: lastReason,
     };
   } catch (err) {
     return {
       ok: false,
-      decision: defaultDecision(),
+      decision: stripInternalReplySemantics(defaultDecision()),
       source: "technical_fallback",
       reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
     };

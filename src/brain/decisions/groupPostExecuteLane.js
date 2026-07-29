@@ -14,6 +14,20 @@
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
+import {
+  buildGroupPostExecutePendingAvailabilityContract,
+  normalizeReplySemantics,
+  stripInternalReplySemantics,
+} from "../contracts/customerReplyContract.js";
+import {
+  buildCustomerReplyGuardCorrection,
+  validateCustomerReplyAgainstContract,
+} from "../guards/customerReplyGuard.js";
+import {
+  buildStrictJsonSchemaResponseFormat,
+  MAX_CUSTOMER_REPLY_ATTEMPTS,
+  REPLY_SEMANTICS_SCHEMA,
+} from "../openai/strictJsonSchema.js";
 
 export const GROUP_POST_EXECUTE_LANE = "group_post_execute";
 
@@ -28,14 +42,30 @@ const FAIL_CLOSED_DISPOSITIONS = new Set([
 ]);
 
 /** One same-lane regeneration after unsafe customer wording. */
-const MAX_CONTENT_SAFETY_ATTEMPTS = 2;
+const MAX_CONTENT_SAFETY_ATTEMPTS = MAX_CUSTOMER_REPLY_ATTEMPTS;
 
-const CONTENT_SAFETY_CORRECTION = `CORRECTION: Your previous reply exposed internal process details.
-Never mention owner, staff, human involvement, approval, notification, AVR, template, or executor.
-Describe only the customer-safe business status from VERIFIED_FACTS_JSON.
-Do not use vague wording like "ab dekhte hain kya hota hai".
-Do not promise availability until verified.
-Return JSON only.`;
+const GROUP_POST_EXECUTE_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    customerReply: { type: "string" },
+    action: { type: "string", enum: ["reply", "silence"] },
+    shouldReply: { type: "boolean" },
+    confidence: { type: ["number", "null"] },
+    safetyNotes: { type: ["string", "null"] },
+    reason: { type: ["string", "null"] },
+    replySemantics: REPLY_SEMANTICS_SCHEMA,
+  },
+  required: [
+    "customerReply",
+    "action",
+    "shouldReply",
+    "confidence",
+    "safetyNotes",
+    "reason",
+    "replySemantics",
+  ],
+};
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -219,6 +249,7 @@ function parseGroupPostExecuteDecision(raw) {
     confidence,
     safetyNotes: clean(parsed.safetyNotes ?? "", 200) || null,
     reason: clean(parsed.reason ?? "", 120) || null,
+    replySemantics: normalizeReplySemantics(parsed.replySemantics),
   };
 }
 
@@ -285,12 +316,13 @@ actionsAllowed: false — do not instruct any action, executor, notification, bo
 This is a reply-only pass. Your only output is a short natural customer reply or silence.
 
 OUTPUT FORMAT (JSON only, no markdown):
-{"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"..."}
+{"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"...","replySemantics":{"claims":["resource_availability_unconfirmed"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 or for silence:
-{"customerReply":"","action":"silence","shouldReply":false,"confidence":0.95,"safetyNotes":null,"reason":"..."}
+{"customerReply":"","action":"silence","shouldReply":false,"confidence":0.95,"safetyNotes":null,"reason":"...","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 action must be "reply" or "silence" only.
 customerReply must be empty when action is "silence".
+replySemantics is required for validation: list only claims supported by VERIFIED_FACTS_JSON / allowedClaims.
 Do not include any field that requests an action, executor, or mutation.`;
 }
 
@@ -416,6 +448,19 @@ export async function executeGroupPostExecuteLaneDecision({
     };
   }
 
+  const replyContract = buildGroupPostExecutePendingAvailabilityContract({
+    itemLabel: customerSafeFacts.itemLabel,
+    durationDays: customerSafeFacts.durationDays,
+    availabilityCheckingInProgress: customerSafeFacts.availabilityCheckingInProgress,
+    customerBusinessStatus: customerSafeFacts.customerBusinessStatus,
+    dmGuidanceAllowed: customerSafeFacts.dmGuidanceAllowed,
+  });
+
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "group_post_execute_decision",
+    GROUP_POST_EXECUTE_OUTPUT_SCHEMA
+  );
+
   const ms =
     Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : 8000;
 
@@ -428,6 +473,7 @@ export async function executeGroupPostExecuteLaneDecision({
         model: resolveOpenAiChatModel(),
         temperature: 0.3,
         max_tokens: 280,
+        response_format: responseFormat,
         messages: [
           { role: "system", content: system },
           { role: "user", content: userContent },
@@ -450,17 +496,23 @@ export async function executeGroupPostExecuteLaneDecision({
     for (let attempt = 1; attempt <= MAX_CONTENT_SAFETY_ATTEMPTS; attempt++) {
       const userContent =
         attempt === 1
-          ? `${baseUserPayload}\n\nJSON only; customer-safe facts only; reply or silence; no actions; never mention owner/staff/notification/human process.`
-          : `${baseUserPayload}\n\n${CONTENT_SAFETY_CORRECTION}`;
+          ? `${baseUserPayload}\n\nCUSTOMER_REPLY_CONTRACT:\n${JSON.stringify({
+              allowedClaims: replyContract.allowedClaims,
+              forbiddenClaims: replyContract.forbiddenClaims,
+              requiredMeaning: replyContract.requiredMeaning,
+            })}\n\nReturn strict JSON matching the schema; do not claim availability is confirmed.`
+          : `${baseUserPayload}\n\n${buildCustomerReplyGuardCorrection(lastUnsafeReason || "validation_failed")}`;
 
       const raw = await runOneBrainAttempt(userContent);
       const decision = parseGroupPostExecuteDecision(raw);
 
       if (!decision) {
+        lastUnsafeReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        if (attempt < MAX_CONTENT_SAFETY_ATTEMPTS) continue;
         return {
           ok: false,
           decision: defaultDecision({ reason: "PARSE_FAILED" }),
-          source: "technical_fallback",
+          source: "content_safety_fail_closed",
           reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
           contentSafetyAttempts: attempt,
         };
@@ -469,19 +521,28 @@ export async function executeGroupPostExecuteLaneDecision({
       try {
         assertGroupPostExecuteReplyOnly(decision);
         assertGroupPostExecuteCustomerContentSafe(decision);
+        const guard = validateCustomerReplyAgainstContract(
+          decision.customerReply,
+          {
+            ...replyContract,
+            replyRequired:
+              decision.action === "reply" || decision.shouldReply === true,
+          },
+          decision.replySemantics
+        );
+        if (!guard.ok) {
+          throw new Error(guard.reason || "customer_reply_guard_failed");
+        }
       } catch (guardErr) {
         const reason = String(guardErr?.message ?? "OUTPUT_GUARD_FAILED");
         lastUnsafeReason = reason;
-        const isContentLeak =
-          reason === "group_post_execute_lane_forbidden_customer_lifecycle_disclosure";
-        if (isContentLeak && attempt < MAX_CONTENT_SAFETY_ATTEMPTS) {
-          // Same Brain lane only — no actionRouter / AVR / notify rerun.
+        if (attempt < MAX_CONTENT_SAFETY_ATTEMPTS) {
           continue;
         }
         return {
           ok: false,
           decision: defaultDecision({ reason }),
-          source: isContentLeak ? "content_safety_fail_closed" : "output_guard_failed",
+          source: "content_safety_fail_closed",
           reason,
           contentSafetyAttempts: attempt,
         };
@@ -489,7 +550,7 @@ export async function executeGroupPostExecuteLaneDecision({
 
       return {
         ok: true,
-        decision,
+        decision: stripInternalReplySemantics(decision),
         source: attempt === 1 ? "openai" : "openai_content_safety_regenerated",
         contentSafetyAttempts: attempt,
       };

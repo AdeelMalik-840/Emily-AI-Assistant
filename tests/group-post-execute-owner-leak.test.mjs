@@ -68,6 +68,16 @@ function replyJson(text, action = "reply") {
     confidence: 0.9,
     safetyNotes: null,
     reason: "test",
+    replySemantics: {
+      claims: text && /available hai/i.test(text) && !/check|dekh/i.test(text)
+        ? ["resource_availability_confirmed"]
+        : text
+          ? ["resource_availability_unconfirmed"]
+          : [],
+      languageStyle: "roman_urdu",
+      containsTimingPromise: false,
+      exposesInternalProcess: /owner|notify|staff/i.test(text),
+    },
   });
 }
 
