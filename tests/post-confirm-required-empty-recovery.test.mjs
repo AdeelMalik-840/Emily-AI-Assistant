@@ -124,7 +124,6 @@ function decision(overrides = {}) {
       itemId: STONIC_ITEM_ID,
       durationDays: 4,
       bookingStatus: "approved",
-      bookingReference: "STONIC-4",
     }),
     replySemantics: {
       claims: [],
