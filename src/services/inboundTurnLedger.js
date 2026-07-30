@@ -3,13 +3,14 @@
  * Survives process restart; blocks old customer row replay.
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setMessageState } from "./messageState.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
 
-/** @typedef {"processing" | "done" | "failed" | "baseline_absorbed" | "outbound_locked"} InboundTurnLedgerState */
+/** @typedef {"received" | "processing" | "done" | "failed" | "baseline_absorbed" | "outbound_locked"} InboundTurnLedgerState */
 
 /** @typedef {"pending_send" | "send_attempted" | "sent"} OutboundIntentStatus */
 
@@ -40,6 +41,11 @@ import { normalizeTitle } from "./playwrightTitleNormalize.js";
  *   replySent?: boolean,
  *   replySentAt?: number | null,
  *   processingAt?: number | null,
+ *   sourceKind?: string | null,
+ *   receivedAt?: number | null,
+ *   retryCount?: number,
+ *   nextRetryAt?: number | null,
+ *   cloudRecoveryContext?: Record<string, unknown> | null,
  *   updatedAt: number,
  * }} InboundTurnLedgerEntry */
 
@@ -98,6 +104,7 @@ const PROCESSING_STALE_MS = Math.max(
 const ledgerByKey = new Map();
 let persistLoaded = false;
 let ledgerPath = resolveLedgerPath();
+let ledgerPathOverrideForTests = null;
 
 function envTruthy(name) {
   const v = String(process.env[name] ?? "").trim().toLowerCase();
@@ -145,8 +152,8 @@ function pruneLedger(now = Date.now()) {
   }
 }
 
-function persistLedger() {
-  if (!isInboundTurnLedgerEnabled()) return;
+function persistLedger(force = false) {
+  if (!force && !isInboundTurnLedgerEnabled()) return;
   try {
     const dir = path.dirname(ledgerPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -160,11 +167,11 @@ function persistLedger() {
   }
 }
 
-export function initInboundTurnLedger() {
-  if (!isInboundTurnLedgerEnabled()) return;
+export function initInboundTurnLedger(force = false) {
+  if (!force && !isInboundTurnLedgerEnabled()) return;
   if (persistLoaded) return;
   persistLoaded = true;
-  ledgerPath = resolveLedgerPath();
+  ledgerPath = ledgerPathOverrideForTests || resolveLedgerPath();
   try {
     if (!existsSync(ledgerPath)) return;
     const raw = readFileSync(ledgerPath, "utf8");
@@ -222,15 +229,16 @@ export function hydrateInboundTurnLedgerIntoMessageState() {
  * @param {string} stableId
  * @returns {InboundTurnLedgerEntry | undefined}
  */
-export function getInboundTurnLedgerEntry(chatKey, stableId) {
-  if (!isInboundTurnLedgerEnabled()) return undefined;
-  initInboundTurnLedger();
+export function getInboundTurnLedgerEntry(chatKey, stableId, opts = {}) {
+  const force = opts?.force === true;
+  if (!force && !isInboundTurnLedgerEnabled()) return undefined;
+  initInboundTurnLedger(force);
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
   if (!key) return undefined;
   return ledgerByKey.get(key);
 }
 
-function upsertEntry(key, patch) {
+function upsertEntry(key, patch, force = false) {
   const prev = ledgerByKey.get(key);
   const next = {
     ...(prev || {}),
@@ -238,7 +246,7 @@ function upsertEntry(key, patch) {
     updatedAt: Date.now(),
   };
   ledgerByKey.set(key, /** @type {InboundTurnLedgerEntry} */ (next));
-  persistLedger();
+  persistLedger(force);
   return next;
 }
 
@@ -454,8 +462,9 @@ export function isInboundTurnLedgerDone(chatKey, stableId) {
  * }} p
  */
 export function markInboundTurnLedgerOutboundLocked(p) {
-  if (!isInboundTurnLedgerEnabled()) return;
-  initInboundTurnLedger();
+  const force = p?.force === true;
+  if (!force && !isInboundTurnLedgerEnabled()) return;
+  initInboundTurnLedger(force);
   const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
   const stableId = String(p.stableId ?? "").trim();
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
@@ -516,7 +525,7 @@ export function markInboundTurnLedgerOutboundLocked(p) {
         : existing?.sourceMessageIndex ?? null,
     lastError: String(p.lastError ?? existing?.lastError ?? "").slice(0, 160) || null,
     processingAt: null,
-  });
+  }, force);
   console.log("[inbound_turn_ledger_outbound_locked]", {
     chatKey,
     stableId,
@@ -863,10 +872,11 @@ export function classifyOutboundLockedRecovery(entry, opts = {}) {
  * @returns {{ claimed: boolean, reason: string, entry?: InboundTurnLedgerEntry }}
  */
 export function claimOutboundLockedRecovery(p) {
-  if (!isInboundTurnLedgerEnabled()) {
+  const force = p?.force === true;
+  if (!force && !isInboundTurnLedgerEnabled()) {
     return { claimed: false, reason: "ledger_disabled" };
   }
-  initInboundTurnLedger();
+  initInboundTurnLedger(force);
   const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
   const stableId = String(p.stableId ?? "").trim();
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
@@ -897,7 +907,7 @@ export function claimOutboundLockedRecovery(p) {
     recoveryClaimedAt: now,
     recoveryClaimOwner: claimOwner,
     outboundIntentStatus: "send_attempted",
-  });
+  }, force);
   console.log("[inbound_turn_ledger_recovery_claimed]", {
     chatKey,
     stableId,
@@ -917,8 +927,9 @@ export function claimOutboundLockedRecovery(p) {
  * }} p
  */
 export function markOutboundLockedRecoverySent(p) {
-  if (!isInboundTurnLedgerEnabled()) return;
-  initInboundTurnLedger();
+  const force = p?.force === true;
+  if (!force && !isInboundTurnLedgerEnabled()) return;
+  initInboundTurnLedger(force);
   const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
   const stableId = String(p.stableId ?? "").trim();
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
@@ -934,14 +945,35 @@ export function markOutboundLockedRecoverySent(p) {
     recoveryClaimedAt: null,
     recoveryClaimOwner: null,
     deliveryStatus: "sent",
-  });
-  markInboundTurnLedgerDone({
-    chatKey,
-    stableId,
-    guaranteeKey: String(p.guaranteeKey ?? existing?.guaranteeKey ?? "").trim() || key,
-    replySent: true,
-    textPreview: p.textPreview ?? existing?.textPreview,
-  });
+  }, force);
+  if (force) {
+    const now = Date.now();
+    upsertEntry(
+      key,
+      {
+        ...(getInboundTurnLedgerEntry(chatKey, stableId, { force: true }) || {}),
+        chatKey,
+        stableId,
+        guaranteeKey:
+          String(p.guaranteeKey ?? existing?.guaranteeKey ?? "").trim() || key,
+        state: "done",
+        replySent: true,
+        replySentAt: now,
+        processingAt: null,
+        nextRetryAt: null,
+      },
+      true
+    );
+  } else {
+    markInboundTurnLedgerDone({
+      chatKey,
+      stableId,
+      guaranteeKey:
+        String(p.guaranteeKey ?? existing?.guaranteeKey ?? "").trim() || key,
+      replySent: true,
+      textPreview: p.textPreview ?? existing?.textPreview,
+    });
+  }
 }
 
 /**
@@ -950,8 +982,9 @@ export function markOutboundLockedRecoverySent(p) {
  * @param {{ chatKey: string, stableId: string, claimOwner: string, resetToPending?: boolean }} p
  */
 export function releaseOutboundLockedRecoveryClaim(p) {
-  if (!isInboundTurnLedgerEnabled()) return;
-  initInboundTurnLedger();
+  const force = p?.force === true;
+  if (!force && !isInboundTurnLedgerEnabled()) return;
+  initInboundTurnLedger(force);
   const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
   const stableId = String(p.stableId ?? "").trim();
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
@@ -972,7 +1005,7 @@ export function releaseOutboundLockedRecoveryClaim(p) {
     recoveryClaimOwner: null,
     outboundIntentStatus:
       p.resetToPending === true ? "pending_send" : existing.outboundIntentStatus,
-  });
+  }, force);
 }
 
 /**
@@ -985,9 +1018,316 @@ export function getInboundTurnLedgerEntryByGuaranteeKey(guaranteeKey) {
   return getInboundTurnLedgerEntry(chatKey, stableId);
 }
 
+function canonicalCloudPhone(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return digits.length >= 10 && digits.length <= 15 ? digits : "";
+}
+
+function sanitizeCloudRecoveryContext(context = {}) {
+  const source = context && typeof context === "object" ? context : {};
+  return {
+    businessId: String(source.businessId ?? "").trim().slice(0, 160),
+    customerPhone: canonicalCloudPhone(source.customerPhone),
+    messageText: String(source.messageText ?? "").trim().slice(0, 4000),
+    messageId: String(source.messageId ?? "").trim().slice(0, 300),
+    userPhone: canonicalCloudPhone(
+      source.userPhone ?? source.customerPhone
+    ),
+    sessionKey: String(source.sessionKey ?? "").trim().slice(0, 500),
+    whatsappReplyTo: canonicalCloudPhone(
+      source.whatsappReplyTo ?? source.customerPhone
+    ),
+    whatsappRecipientType: "individual",
+    conversationCustomerNumber: canonicalCloudPhone(
+      source.conversationCustomerNumber ?? source.customerPhone
+    ),
+    phoneNumberId: String(source.phoneNumberId ?? "").trim().slice(0, 160),
+  };
+}
+
+/**
+ * Stable identity for a Cloud DM turn. The chat scope is a hash of the exact
+ * business/customer pair; the stable ID preserves the real provider message ID.
+ */
+export function buildCloudInboundLifecycleIdentity({
+  businessId,
+  customerPhone,
+  messageId,
+} = {}) {
+  const uid = String(businessId ?? "").trim();
+  const phone = canonicalCloudPhone(customerPhone);
+  const providerMessageId = String(messageId ?? "").trim();
+  if (!uid || !phone || !providerMessageId) {
+    return { chatKey: "", stableId: "", guaranteeKey: "" };
+  }
+  const scopeHash = createHash("sha256")
+    .update(uid, "utf8")
+    .update("\u0000", "utf8")
+    .update(phone, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  const chatKey = `cloud-dm-${scopeHash}`;
+  const stableId = `cloud::${providerMessageId}`;
+  return {
+    chatKey,
+    stableId,
+    guaranteeKey: buildInboundTurnLedgerKey(chatKey, stableId),
+  };
+}
+
+/**
+ * Claim one Cloud post-confirm turn in the existing durable ledger.
+ */
+export function claimCloudInboundTurn({
+  businessId,
+  customerPhone,
+  messageId,
+  recoveryContext,
+  resumeProcessing = false,
+  provisionalOwnership = false,
+} = {}) {
+  initInboundTurnLedger(true);
+  const identity = buildCloudInboundLifecycleIdentity({
+    businessId,
+    customerPhone,
+    messageId,
+  });
+  if (!identity.guaranteeKey) {
+    return { claimed: false, action: "invalid", reason: "invalid_cloud_identity" };
+  }
+  const context = sanitizeCloudRecoveryContext(recoveryContext);
+  const key = identity.guaranteeKey;
+  const existing = getInboundTurnLedgerEntry(
+    identity.chatKey,
+    identity.stableId,
+    { force: true }
+  );
+  if (existing?.state === "done") {
+    return {
+      claimed: false,
+      action: "done",
+      reason: "already_answered",
+      identity,
+      entry: existing,
+    };
+  }
+  if (existing?.state === "outbound_locked") {
+    return {
+      claimed: false,
+      action: "outbound_locked",
+      reason: "resume_send_only",
+      identity,
+      entry: existing,
+    };
+  }
+  if (existing?.state === "processing" && resumeProcessing !== true) {
+    const started = Number(existing.processingAt ?? existing.updatedAt ?? 0);
+    if (
+      Number.isFinite(started) &&
+      Date.now() - started <= PROCESSING_STALE_MS
+    ) {
+      return {
+        claimed: false,
+        action: "processing",
+        reason: "recent_processing_duplicate",
+        identity,
+        entry: existing,
+      };
+    }
+  }
+
+  const now = Date.now();
+  const sourceKind =
+    existing?.sourceKind === "cloud_post_confirm_pa"
+      ? "cloud_post_confirm_pa"
+      : provisionalOwnership === true
+        ? "cloud_dm_ownership_probe"
+        : "cloud_post_confirm_pa";
+  if (!existing) {
+    upsertEntry(
+      key,
+      {
+        chatKey: identity.chatKey,
+        stableId: identity.stableId,
+        guaranteeKey: identity.guaranteeKey,
+        state: "received",
+        sourceKind,
+        receivedAt: now,
+        textPreview: context.messageText.slice(0, 120),
+        cloudRecoveryContext: context,
+        retryCount: 0,
+      },
+      true
+    );
+  }
+  const next = upsertEntry(
+    key,
+    {
+      ...(existing || {}),
+      chatKey: identity.chatKey,
+      stableId: identity.stableId,
+      guaranteeKey: identity.guaranteeKey,
+      state: "processing",
+      sourceKind,
+      receivedAt: Number(existing?.receivedAt ?? 0) || now,
+      processingAt: now,
+      nextRetryAt: null,
+      textPreview: context.messageText.slice(0, 120),
+      cloudRecoveryContext: context,
+    },
+    true
+  );
+  return {
+    claimed: true,
+    action: "process",
+    reason:
+      existing?.state === "failed" || existing?.state === "processing"
+        ? "retry_claimed"
+        : "received_claimed",
+    identity,
+    entry: next,
+  };
+}
+
+export function markCloudInboundTurnPostConfirmOwned({ identity } = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return null;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  if (!existing || existing.state === "done") return existing ?? null;
+  return upsertEntry(
+    key,
+    {
+      ...existing,
+      sourceKind: "cloud_post_confirm_pa",
+    },
+    true
+  );
+}
+
+export function releaseCloudInboundTurnOwnershipProbe({ identity } = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return false;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  if (existing?.sourceKind !== "cloud_dm_ownership_probe") return false;
+  ledgerByKey.delete(key);
+  persistLedger(true);
+  return true;
+}
+
+export function markCloudInboundTurnRetryableFailure({
+  identity,
+  lastError,
+  retryDelayMs = 1000,
+} = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return null;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  if (!existing || existing.state === "done") {
+    return existing ?? null;
+  }
+  const retryCount = Math.max(0, Number(existing.retryCount ?? 0)) + 1;
+  return upsertEntry(
+    key,
+    {
+      ...existing,
+      state:
+        existing.state === "outbound_locked" ? "outbound_locked" : "failed",
+      processingAt: null,
+      retryCount,
+      nextRetryAt: Date.now() + Math.max(250, Number(retryDelayMs) || 1000),
+      lastError: String(lastError ?? "cloud_processing_failed").slice(0, 160),
+    },
+    true
+  );
+}
+
+export function markCloudInboundTurnDone({
+  identity,
+  replySent = true,
+} = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return null;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  if (!existing) return null;
+  return upsertEntry(
+    key,
+    {
+      ...existing,
+      state: "done",
+      replySent: replySent !== false,
+      replySentAt: Date.now(),
+      processingAt: null,
+      nextRetryAt: null,
+      recoveryClaimedAt: null,
+      recoveryClaimOwner: null,
+    },
+    true
+  );
+}
+
+export function markCloudInboundTurnOutboundLocked({
+  identity,
+  finalReplyText,
+  finalReplySource,
+  traceId,
+} = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const guaranteeKey =
+    String(identity?.guaranteeKey ?? "").trim() ||
+    buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!guaranteeKey) return;
+  markInboundTurnLedgerOutboundLocked({
+    force: true,
+    chatKey,
+    stableId,
+    guaranteeKey,
+    finalReplyText: String(finalReplyText ?? ""),
+    replyPreview: String(finalReplyText ?? "").slice(0, 160),
+    finalReplySource:
+      String(finalReplySource ?? "").trim() || "openai_post_confirm_pa",
+    outboundLockStage: "cloud_buffer_send_start",
+    sendVia: "CLOUD_API",
+    dryRun: false,
+    traceId: String(traceId ?? "").trim() || null,
+    textPreview:
+      getInboundTurnLedgerEntry(chatKey, stableId, { force: true })
+        ?.textPreview ?? "",
+  });
+}
+
+export function listRecoverableCloudInboundTurns({
+  maxRetryCount = 5,
+} = {}) {
+  initInboundTurnLedger(true);
+  const max = Math.max(1, Number(maxRetryCount) || 5);
+  return [...ledgerByKey.values()]
+    .filter(
+      (entry) =>
+        entry?.sourceKind === "cloud_post_confirm_pa" ||
+        entry?.sourceKind === "cloud_dm_ownership_probe"
+    )
+    .filter((entry) => entry.state !== "done")
+    .filter(
+      (entry) =>
+        entry.state === "outbound_locked" ||
+        Number(entry.retryCount ?? 0) < max
+    )
+    .map((entry) => ({ ...entry }));
+}
+
 /** @param {string} [customPath] */
 export function __setInboundTurnLedgerPathForTests(customPath) {
-  ledgerPath = customPath ? path.resolve(customPath) : resolveLedgerPath();
+  ledgerPathOverrideForTests = customPath ? path.resolve(customPath) : null;
+  ledgerPath = ledgerPathOverrideForTests || resolveLedgerPath();
   persistLoaded = false;
   ledgerByKey.clear();
 }

@@ -35,6 +35,10 @@ const CHECKING_LANGUAGE_RE =
 const BOOKING_SUCCESS_CLAIM_RE =
   /\b(booking (has been |is )?created|booking (has been |is )?confirm(ed)?|successfully booked|booked successfully|reservation (has been |is )?created|reservation (has been |is )?confirm(ed)?|reservation completed|appointment (has been |is )?confirm(ed)?|order (has been |is )?created|confirm ho gaya|book ho gaya|booking ho gayi|booking confirm(ed)?|book confirm(ed)?|your booking is confirm(ed)?)\b/i;
 
+/** Completion wording for a booking change; guard-only, never intent routing. */
+const BOOKING_MUTATION_SUCCESS_CLAIM_RE =
+  /\b(booking|reservation|date|dates|duration|item|vehicle|car|pickup|pick[- ]?up|delivery)\b.{0,48}\b(has been|have been|is|was|were|successfully|ho gaya|ho gayi|kar di|kar diya)\b.{0,32}\b(cancelled|canceled|extended|changed|updated|rescheduled|modified|cancel|extend|change|update)\b|\b(cancelled|canceled|extended|changed|updated|rescheduled|modified)\b.{0,48}\b(booking|reservation|date|dates|duration|item|vehicle|car|pickup|pick[- ]?up|delivery)\b/iu;
+
 const ROMAN_URDU_REPLY_CUE =
   /\b(hai|hain|kya|ke|ki|ka|liye|bata|batata|bataunga|bataungi|batati|karo|kar|karke|karunga|karungi|nahi|haan|abhi|kitna|chahiye|din|theek|leta|raha|rahi|hun|houn|hoon|mein|mai|gaya|gayi|gyi|hua|hui|ho|tha|thi|hoga|hogi|dena|ji|galat)\b/i;
 
@@ -273,40 +277,314 @@ function extractExplicitReplyDurationDays(replyText) {
   return durations;
 }
 
-function validateVerifiedReplyEntities(text, contract) {
+function normalizeComparableText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalBookingStatus(value) {
+  const normalized = normalizeComparableText(value);
+  if (!normalized) return "";
+  if (["approved", "confirmed", "confirm"].includes(normalized)) return "approved";
+  if (["cancelled", "canceled", "cancel"].includes(normalized)) return "cancelled";
+  if (["completed", "complete", "closed"].includes(normalized)) return "completed";
+  if (["pending", "processing"].includes(normalized)) return "pending";
+  if (["rejected", "declined"].includes(normalized)) return "rejected";
+  return normalized;
+}
+
+function extractExplicitBookingStatuses(text) {
+  const out = [];
+  const statusRe =
+    /\b(?:booking|reservation)\s+(?:is\s+|status\s+(?:is\s+)?)?(approved|confirmed|cancelled|canceled|completed|closed|pending|processing|rejected|declined)\b/giu;
+  for (const match of String(text ?? "").matchAll(statusRe)) {
+    const status = canonicalBookingStatus(match[1]);
+    if (status) out.push(status);
+  }
+  return out;
+}
+
+function extractExplicitBookingReferences(text) {
+  const out = [];
+  const referenceRe =
+    /\b(?:booking|reservation)?\s*(?:ref(?:erence)?|number|no\.?|id|#)\s*[:#-]?\s*([a-z0-9][a-z0-9_-]{3,})\b/giu;
+  for (const match of String(text ?? "").matchAll(referenceRe)) {
+    const normalized = normalizeComparableText(match[1]);
+    if (normalized) out.push(normalized);
+  }
+  return out;
+}
+
+function extractExplicitMoneyAmounts(text) {
+  const amounts = [];
+  const moneyRe =
+    /(?:\b(?:pkr|rs\.?|rupees?)\s*([\d,]+(?:\.\d+)?)\b|\b([\d,]+(?:\.\d+)?)\s*(?:pkr|rs\.?|rupees?)\b)/giu;
+  for (const match of String(text ?? "").matchAll(moneyRe)) {
+    const value = Number(String(match[1] ?? match[2] ?? "").replace(/,/g, ""));
+    if (Number.isFinite(value)) amounts.push(value);
+  }
+  return amounts;
+}
+
+function normalizeDateClaim(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  const iso = text.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
+  if (iso) {
+    return `${iso[1]}-${String(iso[2]).padStart(2, "0")}-${String(iso[3]).padStart(2, "0")}`;
+  }
+  const dmy = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/);
+  if (dmy) {
+    return `${dmy[3]}-${String(dmy[2]).padStart(2, "0")}-${String(dmy[1]).padStart(2, "0")}`;
+  }
+  return normalizeComparableText(text);
+}
+
+function extractExplicitDateClaims(text) {
+  const out = [];
+  const dateRe = /\b(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b/gu;
+  for (const match of String(text ?? "").matchAll(dateRe)) {
+    const normalized = normalizeDateClaim(match[0]);
+    if (normalized) out.push(normalized);
+  }
+  return out;
+}
+
+function normalizeTimeClaim(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/^(\d{1,2}):00(am|pm)$/i, "$1$2");
+}
+
+function extractExplicitTimeClaims(text) {
+  const out = [];
+  const timeRe = /\b(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*(?:am|pm))?\b|\b\d{1,2}\s*(?:am|pm)\b/giu;
+  for (const match of String(text ?? "").matchAll(timeRe)) {
+    const normalized = normalizeTimeClaim(match[0]);
+    if (normalized) out.push(normalized);
+  }
+  return out;
+}
+
+function verifiedFactRows(facts) {
+  const rows = [facts];
+  if (Array.isArray(facts?.activeBookings)) rows.push(...facts.activeBookings);
+  if (Array.isArray(facts?.pendingAvailabilityRequests)) {
+    rows.push(...facts.pendingAvailabilityRequests);
+  }
+  return rows.filter((row) => row && typeof row === "object");
+}
+
+function verifiedMoneyValues(facts) {
+  return verifiedFactRows(facts)
+    .flatMap((row) => [
+      row?.totalAmount,
+      row?.dailyRate,
+      row?.advanceAmount,
+    ])
+    .map(Number)
+    .filter(Number.isFinite);
+}
+
+function validateDeclaredGroundedFacts(declared, facts) {
+  const d = declared && typeof declared === "object" ? declared : {};
+  const rows = verifiedFactRows(facts);
+  const catalogItems = Array.isArray(facts?.catalogItems) ? facts.catalogItems : [];
+  const verifiedItemIds = new Set(
+    rows
+      .map((row) => resolveVerifiedCatalogItemId(row, catalogItems))
+      .filter(Boolean)
+  );
+  if (
+    d.itemId != null &&
+    verifiedItemIds.size > 0 &&
+    !verifiedItemIds.has(normalizeItemId(d.itemId))
+  ) {
+    return { ok: false, reason: "verified_item_mismatch" };
+  }
+
+  const verifiedDurations = new Set(
+    rows
+      .map((row) => Number(row?.durationDays))
+      .filter((value) => Number.isFinite(value) && value >= 1)
+      .map((value) => Math.floor(value))
+  );
+  if (
+    d.durationDays != null &&
+    verifiedDurations.size > 0 &&
+    !verifiedDurations.has(Math.floor(Number(d.durationDays)))
+  ) {
+    return { ok: false, reason: "verified_duration_mismatch" };
+  }
+
+  const verifiedStatuses = new Set(
+    rows.map((row) => canonicalBookingStatus(row?.bookingStatus)).filter(Boolean)
+  );
+  if (
+    d.bookingStatus != null &&
+    verifiedStatuses.size > 0 &&
+    !verifiedStatuses.has(canonicalBookingStatus(d.bookingStatus))
+  ) {
+    return { ok: false, reason: "verified_booking_status_mismatch" };
+  }
+
+  const verifiedReferences = new Set(
+    rows.map((row) => normalizeComparableText(row?.bookingReference)).filter(Boolean)
+  );
+  if (
+    d.bookingReference != null &&
+    verifiedReferences.size > 0 &&
+    !verifiedReferences.has(normalizeComparableText(d.bookingReference))
+  ) {
+    return { ok: false, reason: "verified_booking_reference_mismatch" };
+  }
+
+  for (const key of ["totalAmount", "dailyRate", "advanceAmount"]) {
+    const verifiedValues = new Set(
+      rows.map((row) => Number(row?.[key])).filter(Number.isFinite)
+    );
+    if (
+      d[key] != null &&
+      verifiedValues.size > 0 &&
+      !verifiedValues.has(Number(d[key]))
+    ) {
+      return { ok: false, reason: "verified_price_mismatch" };
+    }
+  }
+
+  for (const key of ["startDate", "endDate", "pickupTime", "deliveryTime"]) {
+    const normalize = key.includes("Date") ? normalizeDateClaim : normalizeTimeClaim;
+    const verifiedValues = new Set(
+      rows.map((row) => normalize(row?.[key])).filter(Boolean)
+    );
+    if (
+      d[key] != null &&
+      verifiedValues.size > 0 &&
+      !verifiedValues.has(normalize(d[key]))
+    ) {
+      return {
+        ok: false,
+        reason: key.includes("Date")
+          ? "verified_booking_date_mismatch"
+          : "verified_booking_time_mismatch",
+      };
+    }
+  }
+
+  const knownPolicies =
+    facts?.knownPolicies && typeof facts.knownPolicies === "object"
+      ? facts.knownPolicies
+      : {};
+  for (const claim of Array.isArray(d.policyClaims) ? d.policyClaims : []) {
+    const key = String(claim?.key ?? "").trim();
+    const value = normalizeComparableText(claim?.value);
+    const verified = normalizeComparableText(knownPolicies[key]);
+    if (!key || !value || !verified || value !== verified) {
+      return { ok: false, reason: "verified_policy_mismatch" };
+    }
+  }
+
+  return { ok: true };
+}
+
+function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
   const facts =
     contract?.verifiedCustomerFacts &&
     typeof contract.verifiedCustomerFacts === "object"
       ? contract.verifiedCustomerFacts
       : {};
   const catalogItems = Array.isArray(facts.catalogItems) ? facts.catalogItems : [];
-  const verifiedItemId = resolveVerifiedCatalogItemId(facts, catalogItems);
+  const rows = verifiedFactRows(facts);
+  const verifiedItemIds = new Set(
+    rows
+      .map((row) => resolveVerifiedCatalogItemId(row, catalogItems))
+      .filter(Boolean)
+  );
   const replyItemIds =
     catalogItems.length > 0
       ? resolveExplicitReplyItemIds(text, catalogItems)
       : new Set();
   if (
-    verifiedItemId &&
-    [...replyItemIds].some((replyItemId) => replyItemId !== verifiedItemId)
+    verifiedItemIds.size > 0 &&
+    [...replyItemIds].some((replyItemId) => !verifiedItemIds.has(replyItemId))
   ) {
     return { ok: false, reason: "verified_item_mismatch" };
   }
 
-  const verifiedDuration = Number(facts.durationDays);
-  if (Number.isFinite(verifiedDuration) && verifiedDuration >= 1) {
-    const normalizedVerifiedDuration = Math.max(
-      1,
-      Math.floor(verifiedDuration)
-    );
+  const verifiedDurations = new Set(
+    rows
+      .map((row) => Number(row?.durationDays))
+      .filter((value) => Number.isFinite(value) && value >= 1)
+      .map((value) => Math.floor(value))
+  );
+  if (verifiedDurations.size > 0) {
     const replyDurations = extractExplicitReplyDurationDays(text);
     if (
       replyDurations.some(
-        (replyDuration) => replyDuration !== normalizedVerifiedDuration
+        (replyDuration) => !verifiedDurations.has(replyDuration)
       )
     ) {
       return { ok: false, reason: "verified_duration_mismatch" };
     }
   }
+
+  const verifiedStatuses = new Set(
+    rows.map((row) => canonicalBookingStatus(row?.bookingStatus)).filter(Boolean)
+  );
+  if (verifiedStatuses.size > 0) {
+    const statuses = extractExplicitBookingStatuses(text);
+    if (statuses.some((status) => !verifiedStatuses.has(status))) {
+      return { ok: false, reason: "verified_booking_status_mismatch" };
+    }
+  }
+
+  const verifiedReferences = new Set(
+    rows.map((row) => normalizeComparableText(row?.bookingReference)).filter(Boolean)
+  );
+  if (verifiedReferences.size > 0) {
+    const references = extractExplicitBookingReferences(text);
+    if (references.some((reference) => !verifiedReferences.has(reference))) {
+      return { ok: false, reason: "verified_booking_reference_mismatch" };
+    }
+  }
+
+  const verifiedAmounts = verifiedMoneyValues(facts);
+  if (verifiedAmounts.length > 0) {
+    const amounts = extractExplicitMoneyAmounts(text);
+    if (amounts.some((amount) => !verifiedAmounts.includes(amount))) {
+      return { ok: false, reason: "verified_price_mismatch" };
+    }
+  }
+
+  const verifiedDates = rows
+    .flatMap((row) => [row.startDate, row.endDate])
+    .map(normalizeDateClaim)
+    .filter(Boolean);
+  if (verifiedDates.length > 0) {
+    const dateClaims = extractExplicitDateClaims(text);
+    if (dateClaims.some((date) => !verifiedDates.includes(date))) {
+      return { ok: false, reason: "verified_booking_date_mismatch" };
+    }
+  }
+
+  const verifiedTimes = rows
+    .flatMap((row) => [row.pickupTime, row.deliveryTime])
+    .map(normalizeTimeClaim)
+    .filter(Boolean);
+  if (verifiedTimes.length > 0) {
+    const timeClaims = extractExplicitTimeClaims(text);
+    if (timeClaims.some((time) => !verifiedTimes.includes(time))) {
+      return { ok: false, reason: "verified_booking_time_mismatch" };
+    }
+  }
+
+  const declaredGrounding = validateDeclaredGroundedFacts(groundedFacts, facts);
+  if (!declaredGrounding.ok) return declaredGrounding;
 
   return { ok: true };
 }
@@ -320,7 +598,8 @@ function validateVerifiedReplyEntities(text, contract) {
 export function validateCustomerReplyAgainstContract(
   replyText,
   contract,
-  semantics = null
+  semantics = null,
+  groundedFacts = null
 ) {
   const text = String(replyText ?? "").trim();
   const channel = normalizeCustomerReplyChannel(contract?.channel);
@@ -342,7 +621,11 @@ export function validateCustomerReplyAgainstContract(
   }
   if (!text) return { ok: true };
 
-  const entityGrounding = validateVerifiedReplyEntities(text, contract);
+  const entityGrounding = validateVerifiedReplyEntities(
+    text,
+    contract,
+    groundedFacts
+  );
   if (!entityGrounding.ok) return entityGrounding;
 
   if (channel === "group") {
@@ -421,6 +704,34 @@ export function validateCustomerReplyAgainstContract(
   if (successClaimForbidden && BOOKING_SUCCESS_CLAIM_RE.test(text)) {
     return { ok: false, reason: "pre_execution_booking_success_claim" };
   }
+  if (
+    contract?.verifiedCustomerFacts?.pendingAvailabilityExecutionRequested ===
+      true &&
+    String(
+      contract?.verifiedCustomerFacts?.pendingAvailabilityExecutionStatus ??
+        "not_executed"
+    )
+      .trim()
+      .toLowerCase() !== "succeeded" &&
+    BOOKING_SUCCESS_CLAIM_RE.test(text)
+  ) {
+    return {
+      ok: false,
+      reason: "pre_execution_pending_availability_success_claim",
+    };
+  }
+
+  const mutationExecutionStatus = String(
+    contract?.verifiedCustomerFacts?.mutationExecutionStatus ?? "not_executed"
+  )
+    .trim()
+    .toLowerCase();
+  if (
+    mutationExecutionStatus !== "succeeded" &&
+    BOOKING_MUTATION_SUCCESS_CLAIM_RE.test(text)
+  ) {
+    return { ok: false, reason: "unverified_booking_mutation_success_claim" };
+  }
 
   if (
     !bookingExecutionVerified &&
@@ -483,6 +794,7 @@ export function validateCustomerReplyAgainstContract(
 export function buildCustomerReplyGuardCorrection(reason) {
   return `CORRECTION: Your previous customer reply failed validation (${reason}).
 Use ONLY verified customer-safe facts.
+If the failure is dm_reply_too_long or group_reply_too_long, return a materially shorter customerReply within the contract limit.
 Match the customer's language in replySemantics.languageStyle and in customerReply wording:
 - english customer → english reply
 - roman_urdu customer → roman_urdu reply

@@ -3,11 +3,15 @@
  * Used by the thin Business PA lane. Does not understand turns or produce replies.
  * Closed paMissingInfoRequest owner answers overlay as booking-scoped known facts only.
  */
-import { getAvailabilityRequest } from "../../services/availabilityRequestService.js";
+import {
+  findWaitingConfirmCloudAvailabilityRequestsByPhone,
+  getAvailabilityRequest,
+} from "../../services/availabilityRequestService.js";
 import {
   listClosedPaMissingInfoAnswersForBooking,
   listOpenPaMissingInfoRequestsForBooking,
 } from "../../services/paMissingInfoRequestService.js";
+import { normalizePhoneE164 } from "../../services/connections.js";
 import { resolveBusinessProfileFacts } from "./resolveBusinessProfileFacts.js";
 
 const ACTIVE_APPROVAL_STAGES = [
@@ -30,23 +34,21 @@ function clean(value, max = 500) {
   return text ? text.slice(0, max) : "";
 }
 
-function phoneDigitsOnly(value) {
-  return String(value ?? "").replace(/\D/g, "");
+function canonicalCustomerPhone(value) {
+  return normalizePhoneE164(value) || "";
 }
 
 function bookingMatchesCustomerPhone(booking, customerPhone) {
-  const inbound = phoneDigitsOnly(customerPhone);
+  const inbound = canonicalCustomerPhone(customerPhone);
   if (!inbound) return false;
   const targets = [
-    phoneDigitsOnly(booking?.customerPhone),
-    phoneDigitsOnly(booking?.dmTargetPhone),
-    phoneDigitsOnly(booking?.originalCustomerPhone),
-    phoneDigitsOnly(booking?.sourceParticipantPhone),
-    phoneDigitsOnly(booking?.participantPhoneForDm),
+    canonicalCustomerPhone(booking?.customerPhone),
+    canonicalCustomerPhone(booking?.dmTargetPhone),
+    canonicalCustomerPhone(booking?.originalCustomerPhone),
+    canonicalCustomerPhone(booking?.sourceParticipantPhone),
+    canonicalCustomerPhone(booking?.participantPhoneForDm),
   ].filter(Boolean);
-  return targets.some(
-    (target) => target === inbound || target.endsWith(inbound) || inbound.endsWith(target)
-  );
+  return targets.some((target) => target === inbound);
 }
 
 function isActiveApprovedBooking(booking) {
@@ -76,6 +78,208 @@ function compactPriceQuote(quote) {
     total,
     dailyRate,
   };
+}
+
+function toCustomerSafeDate(value) {
+  if (value == null || value === "") return null;
+  try {
+    if (typeof value?.toDate === "function") {
+      return value.toDate().toISOString();
+    }
+    if (value instanceof Date) return value.toISOString();
+  } catch {
+    return null;
+  }
+  return clean(value, 80) || null;
+}
+
+function customerSafeBookingReference(booking) {
+  return (
+    clean(
+      booking?.customerBookingReference ??
+        booking?.bookingReference ??
+        booking?.bookingRef ??
+        booking?.reference,
+      120
+    ) || null
+  );
+}
+
+function compactCatalogItems(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.slice(0, 200).map((row) => ({
+    id: clean(row?.id ?? row?.itemId, 160) || null,
+    name: clean(row?.name, 240) || null,
+    label: clean(row?.label, 240) || null,
+    displayLabel: clean(row?.displayLabel, 240) || null,
+    normalizedLabel: clean(row?.normalizedLabel, 240) || null,
+    aliases: Array.isArray(row?.aliases)
+      ? row.aliases.map((alias) => clean(alias, 160)).filter(Boolean).slice(0, 20)
+      : [],
+  }));
+}
+
+function compactBookingFacts(booking, availabilityRequest = null) {
+  const bookingPriceQuote = compactPriceQuote(booking?.priceQuote);
+  const totalAmount =
+    toFiniteNumber(booking?.totalAmount) ??
+    toFiniteNumber(booking?.total) ??
+    bookingPriceQuote?.total ??
+    availabilityRequest?.priceQuote?.total ??
+    null;
+  const dailyRate =
+    toFiniteNumber(booking?.dailyRate) ??
+    bookingPriceQuote?.dailyRate ??
+    availabilityRequest?.priceQuote?.dailyRate ??
+    null;
+  const durationDays =
+    toFiniteNumber(booking?.durationDays) ??
+    availabilityRequest?.requestedDuration ??
+    null;
+  const itemLabel =
+    clean(booking?.itemLabel) ||
+    clean(booking?.itemName) ||
+    clean(availabilityRequest?.itemLabel) ||
+    null;
+
+  return {
+    id: clean(booking?.id) || null,
+    customerSafeReference: customerSafeBookingReference(booking),
+    status: clean(booking?.status) || null,
+    approvalStage: clean(booking?.approvalStage) || null,
+    itemId: clean(booking?.itemId) || null,
+    itemLabel,
+    itemName: clean(booking?.itemName) || itemLabel,
+    durationDays:
+      durationDays != null ? Math.max(1, Math.floor(durationDays)) : null,
+    startDate: toCustomerSafeDate(
+      booking?.startDate ?? booking?.startAt ?? booking?.pickupDate
+    ),
+    endDate: toCustomerSafeDate(
+      booking?.endDate ?? booking?.endAt ?? booking?.returnDate
+    ),
+    pickupTime:
+      clean(booking?.pickupTime ?? booking?.pickupAt ?? booking?.collectionTime, 120) ||
+      null,
+    deliveryTime: clean(booking?.deliveryTime, 120) || null,
+    deliveryMethod:
+      clean(booking?.deliveryMethod ?? booking?.fulfillmentMethod, 80) || null,
+    deliveryAddress:
+      clean(booking?.deliveryAddress ?? booking?.pickupLocation, 300) || null,
+    totalAmount,
+    dailyRate,
+    priceQuote: bookingPriceQuote,
+    availabilityRequestId: clean(booking?.availabilityRequestId) || null,
+    dmTargetPhone: canonicalCustomerPhone(booking?.dmTargetPhone) || null,
+  };
+}
+
+function requestMatchesCustomerPhone(request, customerPhone) {
+  const inbound = canonicalCustomerPhone(customerPhone);
+  if (!inbound) return false;
+  return [
+    request?.customerDmTarget,
+    request?.customerPhone,
+    request?.customerPhoneNormalized,
+    request?.customerWaId,
+  ].some((value) => canonicalCustomerPhone(value) === inbound);
+}
+
+function timestampMs(value) {
+  if (value == null || value === "") return null;
+  const date =
+    value instanceof Date
+      ? value
+      : typeof value?.toDate === "function"
+        ? value.toDate()
+        : new Date(value);
+  const ms = date.getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isTrustedLinkedAvailabilityRequest({
+  request,
+  businessId,
+  booking,
+  customerPhone,
+  requestId,
+}) {
+  if (!request || typeof request !== "object") return false;
+  const expectedRequestId = clean(requestId);
+  const actualRequestId = clean(request.requestId ?? request.id);
+  if (!expectedRequestId || actualRequestId !== expectedRequestId) return false;
+  const rowBusinessId = clean(request.businessId);
+  if (rowBusinessId && rowBusinessId !== clean(businessId)) return false;
+  if (!requestMatchesCustomerPhone(request, customerPhone)) return false;
+  if (clean(request.linkedBookingId) !== clean(booking?.id)) return false;
+  if (clean(request.status) !== "approved") return false;
+  if (clean(request.customerConfirmationStatus) !== "confirmed") return false;
+  if (clean(request.supersededByAvailabilityRequestId)) return false;
+  return true;
+}
+
+function isTrustedPendingAvailabilityRequest(request, businessId, customerPhone) {
+  if (!request || typeof request !== "object") return false;
+  const rowBusinessId = clean(request.businessId);
+  if (rowBusinessId && rowBusinessId !== clean(businessId)) return false;
+  if (!requestMatchesCustomerPhone(request, customerPhone)) return false;
+  if (clean(request.status) !== "approved") return false;
+  if (clean(request.customerConfirmationStatus) !== "waiting_confirm") return false;
+  if (clean(request.linkedBookingId)) return false;
+  if (clean(request.supersededByAvailabilityRequestId)) return false;
+  const expiresAt = timestampMs(request.confirmExpiresAt);
+  if (expiresAt != null && expiresAt <= Date.now()) return false;
+  return Boolean(clean(request.requestId ?? request.id));
+}
+
+async function loadTrustedPendingAvailabilityRequests(
+  connection,
+  businessId,
+  customerPhone
+) {
+  try {
+    const rows = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
+      db: connection,
+      businessId,
+      customerPhone,
+    });
+    return rows
+      .filter((row) =>
+        isTrustedPendingAvailabilityRequest(row, businessId, customerPhone)
+      )
+      .map((row, index) => ({
+        request: row,
+        requestId: clean(row.requestId ?? row.id),
+        selectionIndex: index + 1,
+        itemId: clean(row.itemId) || null,
+        itemLabel: clean(row.itemLabel) || null,
+        requestedDuration: toFiniteNumber(row.requestedDuration),
+        requestedDates: Array.isArray(row.requestedDates)
+          ? row.requestedDates.map(toCustomerSafeDate).filter(Boolean)
+          : [],
+        priceQuote: compactPriceQuote(row.priceQuote),
+        status: "approved",
+        customerConfirmationStatus: "waiting_confirm",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+async function loadCatalogItems(connection, businessId) {
+  try {
+    const snap = await connection
+      .collection("businesses")
+      .doc(businessId)
+      .collection("items")
+      .limit(200)
+      .get();
+    return compactCatalogItems(
+      (snap?.docs ?? []).map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    );
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -139,7 +343,7 @@ export async function resolveActiveCustomerBookingFacts({
   listOpenPaMissingInfoRequestsFn = listOpenPaMissingInfoRequestsForBooking,
 } = {}) {
   const uid = clean(businessId);
-  const phone = phoneDigitsOnly(customerPhone);
+  const phone = canonicalCustomerPhone(customerPhone);
   if (!connection || !uid || !phone) {
     return { ok: false, reason: "MISSING_CONTEXT", facts: null };
   }
@@ -155,6 +359,14 @@ export async function resolveActiveCustomerBookingFacts({
         .catch(() => null)
     )
   );
+  if (snaps.some((snap) => snap == null)) {
+    return {
+      ok: false,
+      reason: "BOOKING_LOOKUP_FAILED",
+      retryable: true,
+      facts: null,
+    };
+  }
 
   const candidates = [];
   const seen = new Set();
@@ -173,12 +385,94 @@ export async function resolveActiveCustomerBookingFacts({
   if (candidates.length === 0) {
     return { ok: false, reason: "NO_ACTIVE_BOOKING", facts: null };
   }
+
+  const profileGetter =
+    typeof getBusinessProfileFn === "function"
+      ? getBusinessProfileFn
+      : async (businessUid) => {
+          const snap = await connection
+            .collection("businesses")
+            .doc(businessUid)
+            .get();
+          return snap?.exists ? snap.data() ?? null : null;
+        };
+  const profileFacts = await resolveBusinessProfileFacts(uid, profileGetter);
+  const biz =
+    profileFacts.business && typeof profileFacts.business === "object"
+      ? profileFacts.business
+      : {};
+  const catalogItems = await loadCatalogItems(connection, uid);
+  const pendingAvailabilityRequests =
+    await loadTrustedPendingAvailabilityRequests(connection, uid, phone);
+
   if (candidates.length > 1) {
+    const compactActiveBookings = candidates.map((booking) =>
+      compactBookingFacts(booking)
+    );
     return {
-      ok: false,
+      ok: true,
       reason: "AMBIGUOUS_BOOKINGS",
-      facts: null,
-      candidateBookingIds: candidates.map((b) => clean(b.id)).filter(Boolean),
+      facts: {
+        business: biz,
+        booking: null,
+        activeBookings: compactActiveBookings.map((safe) => {
+          return {
+            customerSafeReference: safe.customerSafeReference,
+            status: safe.status,
+            approvalStage: safe.approvalStage,
+            itemLabel: safe.itemLabel,
+            durationDays: safe.durationDays,
+            startDate: safe.startDate,
+            endDate: safe.endDate,
+            pickupTime: safe.pickupTime,
+            deliveryTime: safe.deliveryTime,
+            deliveryMethod: safe.deliveryMethod,
+            totalAmount: safe.totalAmount,
+            dailyRate: safe.dailyRate,
+          };
+        }),
+        pendingAvailabilityRequests,
+        availabilityRequest: null,
+        known: {
+          advanceAmount: toFiniteNumber(biz.advanceAmount) ?? null,
+          advancePolicy: clean(biz.advancePolicy) || null,
+          driverPolicy: clean(biz.driverPolicy) || null,
+          paymentPolicy: clean(biz.paymentPolicy) || null,
+          documentsPolicy: clean(biz.documentsPolicy) || null,
+          deliveryPolicy: clean(biz.deliveryPolicy) || null,
+          knowledgeExcerpt: biz.instructions ?? null,
+        },
+        openMissingInfoRequests: [],
+        latestClosedMissingInfoAnswers: [],
+        replyGuardFacts: {
+          catalogItems,
+          advanceAmount: toFiniteNumber(biz.advanceAmount) ?? null,
+          activeBookings: compactActiveBookings.map((safe) => ({
+            itemId: safe.itemId,
+            itemLabel: safe.itemLabel,
+            durationDays: safe.durationDays,
+            bookingStatus: safe.status,
+            bookingReference: safe.customerSafeReference,
+            totalAmount: safe.totalAmount,
+            dailyRate: safe.dailyRate,
+            startDate: safe.startDate,
+            endDate: safe.endDate,
+            pickupTime: safe.pickupTime,
+            deliveryTime: safe.deliveryTime,
+          })),
+        },
+        policy: {
+          readOnly: true,
+          doNotInventAmounts: true,
+          doNotInventPolicies: true,
+          doNotMutateBooking: true,
+          ambiguousBookingSelection: true,
+        },
+        sourceEvidence: {
+          business: profileFacts.sourceEvidence?.business ?? null,
+          activeBookingCount: candidates.length,
+        },
+      },
     };
   }
 
@@ -192,43 +486,34 @@ export async function resolveActiveCustomerBookingFacts({
       requestId: availabilityRequestId,
     }).catch(() => null);
     if (avr && typeof avr === "object") {
-      availabilityRequest = {
-        id: clean(avr.requestId ?? avr.id) || availabilityRequestId,
-        itemLabel: clean(avr.itemLabel) || null,
-        requestedDuration: toFiniteNumber(avr.requestedDuration),
-        status: clean(avr.status) || null,
-        priceQuote: compactPriceQuote(avr.priceQuote),
-      };
+      if (
+        isTrustedLinkedAvailabilityRequest({
+          request: avr,
+          businessId: uid,
+          booking,
+          customerPhone: phone,
+          requestId: availabilityRequestId,
+        })
+      ) {
+        availabilityRequest = {
+          id: clean(avr.requestId ?? avr.id) || availabilityRequestId,
+          itemLabel: clean(avr.itemLabel) || null,
+          requestedDuration: toFiniteNumber(avr.requestedDuration),
+          status: clean(avr.status) || null,
+          customerConfirmationStatus:
+            clean(avr.customerConfirmationStatus) || null,
+          priceQuote: compactPriceQuote(avr.priceQuote),
+        };
+      }
     }
   }
 
-  const profileFacts = await resolveBusinessProfileFacts(uid, getBusinessProfileFn);
-  const bookingPriceQuote = compactPriceQuote(booking.priceQuote);
-  const totalAmount =
-    toFiniteNumber(booking.totalAmount) ??
-    toFiniteNumber(booking.total) ??
-    bookingPriceQuote?.total ??
-    availabilityRequest?.priceQuote?.total ??
-    null;
-  const dailyRate =
-    toFiniteNumber(booking.dailyRate) ??
-    bookingPriceQuote?.dailyRate ??
-    availabilityRequest?.priceQuote?.dailyRate ??
-    null;
-  const durationDays =
-    toFiniteNumber(booking.durationDays) ??
-    availabilityRequest?.requestedDuration ??
-    null;
-  const itemLabel =
-    clean(booking.itemLabel) ||
-    clean(booking.itemName) ||
-    clean(availabilityRequest?.itemLabel) ||
-    null;
-
-  const biz =
-    profileFacts.business && typeof profileFacts.business === "object"
-      ? profileFacts.business
-      : {};
+  const compactBooking = compactBookingFacts(booking, availabilityRequest);
+  const bookingPriceQuote = compactBooking.priceQuote;
+  const totalAmount = compactBooking.totalAmount;
+  const dailyRate = compactBooking.dailyRate;
+  const durationDays = compactBooking.durationDays;
+  const itemLabel = compactBooking.itemLabel;
   let advanceAmount = toFiniteNumber(biz.advanceAmount) ?? null;
   let advancePolicy = clean(biz.advancePolicy) || null;
   let driverPolicy = clean(biz.driverPolicy) || null;
@@ -326,25 +611,39 @@ export async function resolveActiveCustomerBookingFacts({
         documentsPolicy,
         deliveryPolicy,
       },
-      booking: {
-        id: bookingIdClean,
-        status: clean(booking.status) || null,
-        approvalStage: clean(booking.approvalStage) || null,
-        itemId: clean(booking.itemId) || null,
-        itemLabel,
-        itemName: clean(booking.itemName) || itemLabel,
-        durationDays:
-          durationDays != null ? Math.max(1, Math.floor(durationDays)) : null,
-        totalAmount,
-        dailyRate,
-        priceQuote: bookingPriceQuote,
-        availabilityRequestId: availabilityRequestId || null,
-        dmTargetPhone: phoneDigitsOnly(booking.dmTargetPhone) || null,
-      },
+      booking: compactBooking,
+      activeBookings: [],
+      pendingAvailabilityRequests,
       availabilityRequest,
       known,
       openMissingInfoRequests,
       latestClosedMissingInfoAnswers,
+      replyGuardFacts: {
+        bookingExecutionVerified: true,
+        itemId: compactBooking.itemId,
+        itemLabel: compactBooking.itemLabel,
+        durationDays: compactBooking.durationDays,
+        bookingStatus: compactBooking.status,
+        bookingReference: compactBooking.customerSafeReference,
+        totalAmount: compactBooking.totalAmount,
+        dailyRate: compactBooking.dailyRate,
+        advanceAmount: known.advanceAmount ?? null,
+        startDate: compactBooking.startDate,
+        endDate: compactBooking.endDate,
+        pickupTime: compactBooking.pickupTime,
+        deliveryTime: compactBooking.deliveryTime,
+        deliveryMethod: compactBooking.deliveryMethod,
+        deliveryAddress: compactBooking.deliveryAddress,
+        knownPolicies: {
+          advancePolicy: known.advancePolicy ?? null,
+          driverPolicy: known.driverPolicy ?? null,
+          paymentPolicy: known.paymentPolicy ?? null,
+          documentsPolicy: known.documentsPolicy ?? null,
+          deliveryPolicy: known.deliveryPolicy ?? null,
+        },
+        activeBookings: [],
+        catalogItems,
+      },
       policy: {
         readOnly: true,
         doNotInventAmounts: true,

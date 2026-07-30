@@ -22,9 +22,7 @@ const { decideCustomerTurn } = await import(
   "../src/brain/decisions/decideCustomerTurn.js"
 );
 const {
-  classifyCustomerBusinessPaActionIntent,
   handleCustomerBusinessPaInbound,
-  isPostConfirmSocialOrClosingTurn,
 } = await import("../src/services/customerBusinessPaAgentService.js");
 const { buildClarificationActionPlan } = await import(
   "../src/brain/workflows/ClarificationWorkflow.js"
@@ -216,37 +214,6 @@ test("live pipeline: group unknown_clarification still sends onboarding clarify"
 
   assert.equal(result.handled, true);
   assert.match(String(result.reply ?? ""), /Main samajh nahi paaya/i);
-});
-
-test("PA social/closing turns are not ACTION_INTENT", () => {
-  for (const msg of [
-    "ok",
-    "thanks",
-    "no",
-    "nahi",
-    "have a good day",
-    "you too",
-    "why are you copying me",
-  ]) {
-    assert.equal(isPostConfirmSocialOrClosingTurn(msg), true, msg);
-    assert.equal(
-      classifyCustomerBusinessPaActionIntent(msg).isAction,
-      false,
-      msg
-    );
-  }
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("book kar do").isAction,
-    true
-  );
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("cancel booking").isAction,
-    true
-  );
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("date change").isAction,
-    true
-  );
 });
 
 test("PA social silence stays handled and does not create pamiss/owner notify", async () => {

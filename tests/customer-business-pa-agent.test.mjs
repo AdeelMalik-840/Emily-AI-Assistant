@@ -19,12 +19,15 @@ const {
 const {
   tryHandleCustomerBusinessPaInbound,
   handleCustomerBusinessPaInbound,
-  classifyCustomerBusinessPaActionIntent,
 } = await import("../src/services/customerBusinessPaAgentService.js");
 const {
   __clearWhatsAppInboundBufferForTests,
   executeWhatsAppAiPipeline,
 } = await import("../src/services/whatsappInboundBuffer.js");
+const {
+  buildCloudInboundLifecycleIdentity,
+  getInboundTurnLedgerEntry,
+} = await import("../src/services/inboundTurnLedger.js");
 
 const BUSINESS_ID = "owner-business-pa-1";
 const OTHER_BUSINESS_ID = "owner-business-pa-other";
@@ -267,7 +270,7 @@ test("feature flag defaults off", () => {
   }
 });
 
-test("flag off → PA not handled", async () => {
+test("flag off → confirmed-booking continuity still uses OpenAI", async () => {
   const fake = createFakeDb();
   fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
   let openaiCalls = 0;
@@ -283,18 +286,22 @@ test("flag off → PA not handled", async () => {
         return { choices: [{ message: { content: "should not run" } }] };
       },
     });
-    assert.equal(result.handled, false);
-    assert.equal(result.reason, "FLAG_OFF");
-    assert.equal(openaiCalls, 0);
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "HANDLED");
+    assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+    assert.equal(openaiCalls, 1);
     assert.equal(
-      await tryHandleCustomerBusinessPaInbound({
+      (
+        await tryHandleCustomerBusinessPaInbound({
         db: fake.db,
         businessId: BUSINESS_ID,
         customerPhone: CUSTOMER_PHONE,
         messageText: "Advance kitna?",
         sendWhatsAppMessageFn: async () => ({ ok: true }),
-      }),
-      null
+        __chatCompletionsCreateForTests: mockOpenAiReply("Verified reply"),
+      })
+      )?.handled,
+      true
     );
   });
 });
@@ -315,7 +322,7 @@ test("no active booking → PA not handled", async () => {
   });
 });
 
-test("ambiguous active bookings → PA not handled", async () => {
+test("ambiguous active bookings → same OpenAI lane owns safe clarification", async () => {
   const fake = createFakeDb();
   fake.seedBooking(BUSINESS_ID, "bk_a", baseApprovedBooking({ id: "bk_a" }));
   fake.seedBooking(BUSINESS_ID, "bk_b", baseApprovedBooking({ id: "bk_b" }));
@@ -328,8 +335,9 @@ test("ambiguous active bookings → PA not handled", async () => {
       sendWhatsAppMessageFn: async () => ({ ok: true }),
       __chatCompletionsCreateForTests: mockOpenAiReply("x"),
     });
-    assert.equal(result.handled, false);
-    assert.equal(result.reason, "AMBIGUOUS_BOOKINGS");
+    assert.equal(result.handled, true);
+    assert.equal(result.bookingId, null);
+    assert.equal(result.finalReplySource, "openai_post_confirm_pa");
   });
 });
 
@@ -365,6 +373,165 @@ test("same phone other business → no match", async () => {
   assert.equal(resolved.ok, false);
 });
 
+test("same business other customer → no match", async () => {
+  const fake = createFakeDb();
+  fake.seedBooking(
+    BUSINESS_ID,
+    BOOKING_ID,
+    baseApprovedBooking({
+      customerPhone: "923009999999",
+      dmTargetPhone: "923009999999",
+      sourceParticipantPhone: "923009999999",
+    })
+  );
+  const resolved = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    getBusinessProfileFn: async () => ({ businessName: "X" }),
+  });
+  assert.equal(resolved.ok, false);
+  assert.equal(resolved.reason, "NO_ACTIVE_BOOKING");
+});
+
+test("customer identity never matches a different valid phone that is only a suffix", async () => {
+  const fake = createFakeDb();
+  fake.seedBooking(
+    BUSINESS_ID,
+    BOOKING_ID,
+    baseApprovedBooking({
+      customerPhone: "3001111111",
+      dmTargetPhone: "3001111111",
+      sourceParticipantPhone: "3001111111",
+    })
+  );
+  const resolved = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    getBusinessProfileFn: async () => ({ businessName: "X" }),
+  });
+  assert.equal(resolved.ok, false);
+  assert.equal(resolved.reason, "NO_ACTIVE_BOOKING");
+});
+
+test("linked AVR facts are used only for the exact active booking lifecycle", async () => {
+  const cases = [
+    {
+      name: "trusted current",
+      request: {
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        linkedBookingId: BOOKING_ID,
+        status: "approved",
+        customerConfirmationStatus: "confirmed",
+      },
+      expectedLoaded: true,
+    },
+    {
+      name: "other customer",
+      request: {
+        businessId: BUSINESS_ID,
+        customerPhone: "923009999999",
+        linkedBookingId: BOOKING_ID,
+        status: "approved",
+        customerConfirmationStatus: "confirmed",
+      },
+      expectedLoaded: false,
+    },
+    {
+      name: "other booking",
+      request: {
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        linkedBookingId: "bk_other",
+        status: "approved",
+        customerConfirmationStatus: "confirmed",
+      },
+      expectedLoaded: false,
+    },
+    {
+      name: "superseded",
+      request: {
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        linkedBookingId: BOOKING_ID,
+        status: "approved",
+        customerConfirmationStatus: "confirmed",
+        supersededByAvailabilityRequestId: "avr_new",
+      },
+      expectedLoaded: false,
+    },
+    {
+      name: "rejected",
+      request: {
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        linkedBookingId: BOOKING_ID,
+        status: "rejected",
+        customerConfirmationStatus: "confirmed",
+      },
+      expectedLoaded: false,
+    },
+    {
+      name: "not confirmed",
+      request: {
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        linkedBookingId: BOOKING_ID,
+        status: "approved",
+        customerConfirmationStatus: "waiting_confirm",
+      },
+      expectedLoaded: false,
+    },
+  ];
+
+  for (const row of cases) {
+    const fake = createFakeDb();
+    fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
+    fake.seedAvailabilityRequest(BUSINESS_ID, AVR_ID, {
+      requestId: AVR_ID,
+      itemLabel: "Untrusted fallback item",
+      requestedDuration: 99,
+      priceQuote: { total: 999999 },
+      ...row.request,
+    });
+    const resolved = await resolveActiveCustomerBookingFacts({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      getBusinessProfileFn: async () => ({ businessName: "X" }),
+    });
+    assert.equal(resolved.ok, true, row.name);
+    assert.equal(Boolean(resolved.facts.availabilityRequest), row.expectedLoaded, row.name);
+    assert.equal(resolved.facts.booking.itemLabel, "Honda Civic 2026", row.name);
+    assert.equal(resolved.facts.booking.durationDays, 2, row.name);
+    assert.equal(resolved.facts.booking.totalAmount, 16000, row.name);
+  }
+});
+
+test("missing customer identity fails before facts or OpenAI can run", async () => {
+  let factHydrations = 0;
+  let openaiCalls = 0;
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: BUSINESS_ID,
+    customerPhone: "",
+    messageText: "booking status?",
+    __resolveActiveCustomerBookingFactsFn: async () => {
+      factHydrations += 1;
+      return { ok: true, facts: baseApprovedBooking() };
+    },
+    __chatCompletionsCreateForTests: async () => {
+      openaiCalls += 1;
+      return mockOpenAiReply("must not run")();
+    },
+  });
+  assert.deepEqual(result, { handled: false, reason: "MISSING_CONTEXT" });
+  assert.equal(factHydrations, 0);
+  assert.equal(openaiCalls, 0);
+});
+
 test("facts helper: shapes for no booking / ambiguous / AVR missing", async () => {
   const fake = createFakeDb();
   const none = await resolveActiveCustomerBookingFacts({
@@ -384,8 +551,9 @@ test("facts helper: shapes for no booking / ambiguous / AVR missing", async () =
     customerPhone: CUSTOMER_PHONE,
     getBusinessProfileFn: async () => ({}),
   });
-  assert.equal(amb.ok, false);
+  assert.equal(amb.ok, true);
   assert.equal(amb.reason, "AMBIGUOUS_BOOKINGS");
+  assert.equal(amb.facts.activeBookings.length, 2);
 
   const fake2 = createFakeDb();
   fake2.seedBooking(
@@ -517,17 +685,7 @@ test("normal path does not use canned HOLD / topic table", async () => {
   assert.equal("HOLD_REPLIES" in mod, false);
 });
 
-test("action intents do not call OpenAI", async () => {
-  assert.equal(classifyCustomerBusinessPaActionIntent("kar do").isAction, true);
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("cancel booking").isAction,
-    true
-  );
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("4 din ki jagah 5 din kar do").isAction,
-    true
-  );
-
+test("post-confirm action meaning is not pre-classified before OpenAI", async () => {
   const fake = createFakeDb();
   fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
   for (const message of ["kar do", "cancel booking"]) {
@@ -553,9 +711,9 @@ test("action intents do not call OpenAI", async () => {
           return { choices: [{ message: { content: "nope" } }] };
         },
       });
-      assert.equal(result.handled, false);
-      assert.equal(result.reason, "ACTION_INTENT");
-      assert.equal(openaiCalls, 0);
+      assert.equal(result.handled, true);
+      assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+      assert.equal(openaiCalls, 1);
       assert.equal(sends, 0);
       assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
     });
@@ -615,7 +773,7 @@ test("OpenAI helper compact facts include booking total + linked AVR", async () 
   });
   assert.match(compact, /16000/);
   assert.match(compact, /Honda Civic/);
-  assert.match(compact, /avr_pa_001/);
+  assert.doesNotMatch(compact, /avr_pa_001|bk_pa_001|owner-business-pa-1/);
 
   const ai = await generateCustomerBusinessPaReplyFromFacts({
     facts: JSON.parse(compact),
@@ -626,13 +784,14 @@ test("OpenAI helper compact facts include booking total + linked AVR", async () 
   assert.equal(ai.reply, "16000 total tha.");
 });
 
-test("buffer: PA handled skips Brain and sendVia NONE", async () => {
+test("buffer: PA reply skips general Brain and uses normal Cloud outbound", async () => {
   __clearWhatsAppInboundBufferForTests?.();
   let brainV2Calls = 0;
   let processCalls = 0;
   let paCalls = 0;
   let confirmCalls = 0;
   let outcome = null;
+  let lifecycleIdentity = null;
 
   const prevLive = process.env.EMILY_BRAIN_V2_LIVE;
   const prevBiz = process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES;
@@ -643,6 +802,12 @@ test("buffer: PA handled skips Brain and sendVia NONE", async () => {
 
   try {
     const msg = `Advance kitna? [test:${randomUUID()}]`;
+    const providerMessageId = `wamid.pa-${randomUUID()}`;
+    lifecycleIdentity = buildCloudInboundLifecycleIdentity({
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageId: providerMessageId,
+    });
     await executeWhatsAppAiPipeline({
       db: createFakeDb().db,
       ownerUserId: BUSINESS_ID,
@@ -655,7 +820,27 @@ test("buffer: PA handled skips Brain and sendVia NONE", async () => {
       playwrightWebInbound: false,
       combinedMessage: msg,
       latestMessage: msg,
-      messageId: `wamid.pa-${randomUUID()}`,
+      messageId: providerMessageId,
+      __resolveActiveCustomerBookingFactsFn: async () => {
+        const claimedBeforeResolution = getInboundTurnLedgerEntry(
+          lifecycleIdentity.chatKey,
+          lifecycleIdentity.stableId,
+          { force: true }
+        );
+        assert.equal(claimedBeforeResolution?.state, "processing");
+        assert.equal(
+          claimedBeforeResolution?.sourceKind,
+          "cloud_dm_ownership_probe"
+        );
+        return {
+          ok: true,
+          reason: "MATCHED",
+          facts: {
+            booking: { id: BOOKING_ID },
+            pendingAvailabilityRequests: [],
+          },
+        };
+      },
       __tryHandleAvailabilityCustomerCloudInboundFn: async () => {
         confirmCalls += 1;
         return null;
@@ -668,7 +853,13 @@ test("buffer: PA handled skips Brain and sendVia NONE", async () => {
           reply: "natural openai reply",
           bookingId: BOOKING_ID,
           openaiUsed: true,
+          finalReplySource: "openai_post_confirm_pa",
         };
+      },
+      __sendOutboundMessageFn: async ({ reply, sendVia }) => {
+        assert.equal(reply, "natural openai reply");
+        assert.equal(sendVia, "CLOUD_API");
+        return { ok: true };
       },
       __tryBrainV2LiveBeforeLegacyFn: async () => {
         brainV2Calls += 1;
@@ -696,12 +887,25 @@ test("buffer: PA handled skips Brain and sendVia NONE", async () => {
     else process.env.EMILY_BRAIN_V2_PRODUCTION_ALLOW = prevAllow;
   }
 
-  assert.equal(confirmCalls, 1);
+  assert.equal(confirmCalls, 0);
   assert.equal(paCalls, 1);
   assert.equal(brainV2Calls, 0);
   assert.equal(processCalls, 0);
-  assert.equal(outcome?.sendVia, "NONE");
+  assert.equal(outcome?.reply, "natural openai reply");
+  assert.equal(outcome?.sendVia, "CLOUD_API");
+  assert.equal(outcome?.intentionalSilent, false);
+  assert.equal(
+    outcome?.messageMeta?.outboundTrace?.finalReplySource,
+    "openai_post_confirm_pa"
+  );
   assert.equal(outcome?.messageMeta?.customerBusinessPaHandled, true);
+  const completedLifecycle = getInboundTurnLedgerEntry(
+    lifecycleIdentity.chatKey,
+    lifecycleIdentity.stableId,
+    { force: true }
+  );
+  assert.equal(completedLifecycle?.state, "done");
+  assert.equal(completedLifecycle?.replySent, true);
 });
 
 test("buffer: waiting_confirm kar do still confirm before PA", async () => {

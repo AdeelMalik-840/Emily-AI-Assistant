@@ -11,6 +11,7 @@ process.env.NODE_ENV = "test";
 
 import {
   buildGroupPostExecutePendingAvailabilityContract,
+  buildPostConfirmPaReplyContract,
   buildPostExecutionBookingSuccessContract,
   buildWaitingConfirmPreExecutionConfirmContract,
   buildWaitingConfirmVerifiedQuotationContract,
@@ -944,4 +945,72 @@ test("waiting_confirm: confirm_booking rejects pre-execution success claim then 
   assert.equal(result.decision.action, "confirm_booking");
   assert.doesNotMatch(String(result.decision.customerReply), /booking confirm/i);
   assert.equal(result.decision.replySemantics, undefined);
+});
+
+test("post-confirm guard rejects mismatched status, price, date, and policy grounding", () => {
+  const contract = buildPostConfirmPaReplyContract({
+    booking: {
+      status: "approved",
+      itemId: "st-1",
+      itemLabel: "Kia Stonic EX Plus 2021",
+      durationDays: 3,
+    },
+    replyGuardFacts: {
+      bookingExecutionVerified: true,
+      itemId: "st-1",
+      itemLabel: "Kia Stonic EX Plus 2021",
+      durationDays: 3,
+      bookingStatus: "approved",
+      totalAmount: 16500,
+      dailyRate: 5500,
+      startDate: "2026-08-01",
+      endDate: "2026-08-04",
+      knownPolicies: {
+        paymentPolicy: "Payment is due at pickup.",
+      },
+      catalogItems: RENTAL_CATALOG,
+    },
+    customerMessageText: "booking detail?",
+  });
+
+  assert.equal(
+    validateCustomerReplyAgainstContract(
+      "The booking is cancelled.",
+      contract,
+      { ...SEM, languageStyle: "english" },
+      { bookingStatus: "cancelled" }
+    ).reason,
+    "verified_booking_status_mismatch"
+  );
+  assert.equal(
+    validateCustomerReplyAgainstContract(
+      "The total is 17000 PKR.",
+      contract,
+      { ...SEM, languageStyle: "english" },
+      { totalAmount: 17000 }
+    ).reason,
+    "verified_price_mismatch"
+  );
+  assert.equal(
+    validateCustomerReplyAgainstContract(
+      "Pickup is on 2026-08-02.",
+      contract,
+      { ...SEM, languageStyle: "english" },
+      { startDate: "2026-08-02" }
+    ).reason,
+    "verified_booking_date_mismatch"
+  );
+  assert.equal(
+    validateCustomerReplyAgainstContract(
+      "You can pay later.",
+      contract,
+      { ...SEM, languageStyle: "english" },
+      {
+        policyClaims: [
+          { key: "paymentPolicy", value: "Payment can be made later." },
+        ],
+      }
+    ).reason,
+    "verified_policy_mismatch"
+  );
 });
