@@ -157,6 +157,26 @@ function positiveIntegerOrNull(value) {
   return Number.isInteger(number) && number >= 1 ? number : null;
 }
 
+/**
+ * Coerce a verified numeric fact without turning null/empty into 0.
+ * Explicit numeric zero is preserved.
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+export function finiteNumberOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const number = Number(trimmed);
+    return Number.isFinite(number) ? number : null;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  return null;
+}
+
 function normalizeGroundedFacts(raw) {
   const o = raw && typeof raw === "object" ? raw : {};
   const nullableNumber = (value) =>
@@ -410,7 +430,7 @@ function compactCustomerSafeBookingCandidate(booking, fallbackIndex) {
  * Resolve the trusted focused booking row from already-resolved facts only.
  * @param {Record<string, unknown> | null | undefined} facts
  */
-function resolveTrustedFocusedBookingRow(facts) {
+export function resolveTrustedFocusedBookingRow(facts) {
   if (!hasTrustedPostConfirmBookingFocus(facts)) return null;
   const focusIndex = positiveIntegerOrNull(
     facts?.bookingFocus?.selectedBookingIndex
@@ -426,6 +446,20 @@ function resolveTrustedFocusedBookingRow(facts) {
     return facts.booking;
   }
   return null;
+}
+
+/**
+ * AVR may only fill focused gaps when its id matches the focused booking AVR id.
+ * @param {Record<string, unknown> | null | undefined} booking
+ * @param {Record<string, unknown> | null | undefined} avr
+ */
+function linkedAvailabilityRequestForFocusedBooking(booking, avr) {
+  if (!booking || typeof booking !== "object") return null;
+  if (!avr || typeof avr !== "object") return null;
+  const bookingAvrId = clean(booking.availabilityRequestId, 120);
+  const avrId = clean(avr.id || avr.requestId || avr.availabilityRequestId, 120);
+  if (!bookingAvrId || !avrId || bookingAvrId !== avrId) return null;
+  return avr;
 }
 
 /**
@@ -446,18 +480,20 @@ export function resolveTrustedFocusedBookingIdentity(facts) {
     f.availabilityRequest && typeof f.availabilityRequest === "object"
       ? f.availabilityRequest
       : null;
+  const linkedAvr = linkedAvailabilityRequestForFocusedBooking(booking, avr);
   const itemLabel =
     clean(booking?.itemLabel || booking?.itemName, 200) ||
-    clean(avr?.itemLabel || avr?.itemName, 200) ||
+    clean(linkedAvr?.itemLabel || linkedAvr?.itemName, 200) ||
     null;
-  const durationRaw = booking?.durationDays ?? avr?.requestedDuration;
-  const durationDays = Number.isFinite(Number(durationRaw))
-    ? Number(durationRaw)
-    : null;
-  const totalRaw =
-    booking?.totalAmount ?? avr?.priceQuote?.total ?? f.known?.totalAmount;
-  const dailyRaw =
-    booking?.dailyRate ?? avr?.priceQuote?.dailyRate ?? f.known?.dailyRate;
+  const durationDays =
+    finiteNumberOrNull(booking?.durationDays) ??
+    finiteNumberOrNull(linkedAvr?.requestedDuration);
+  const totalAmount =
+    finiteNumberOrNull(booking?.totalAmount) ??
+    finiteNumberOrNull(linkedAvr?.priceQuote?.total);
+  const dailyRate =
+    finiteNumberOrNull(booking?.dailyRate) ??
+    finiteNumberOrNull(linkedAvr?.priceQuote?.dailyRate);
   return {
     source:
       focus.source === "latest_confirmed_linked_avr"
@@ -468,18 +504,21 @@ export function resolveTrustedFocusedBookingIdentity(facts) {
     bookingId:
       clean(booking?.id || focus.selectedBookingId, 120) || null,
     availabilityRequestId:
-      clean(
-        booking?.availabilityRequestId ||
-          avr?.id ||
-          avr?.requestId ||
-          avr?.availabilityRequestId,
-        120
-      ) || null,
-    itemId: clean(booking?.itemId || avr?.itemId, 160) || null,
+      clean(booking?.availabilityRequestId, 120) ||
+      (linkedAvr
+        ? clean(
+            linkedAvr.id ||
+              linkedAvr.requestId ||
+              linkedAvr.availabilityRequestId,
+            120
+          )
+        : null) ||
+      null,
+    itemId: clean(booking?.itemId || linkedAvr?.itemId, 160) || null,
     itemLabel,
     durationDays,
-    totalAmount: Number.isFinite(Number(totalRaw)) ? Number(totalRaw) : null,
-    dailyRate: Number.isFinite(Number(dailyRaw)) ? Number(dailyRaw) : null,
+    totalAmount,
+    dailyRate,
     bookingStatus: clean(booking?.status, 60) || null,
     scope: "CURRENT_BOOKING_IN_SCOPE",
   };
@@ -1035,7 +1074,14 @@ export function compactPostConfirmFactsForPrompt(facts) {
   const known = f.known && typeof f.known === "object" ? f.known : {};
   const policy = f.policy && typeof f.policy === "object" ? f.policy : {};
   const trustedFocusIdentity = resolveTrustedFocusedBookingIdentity(f);
+  const trustedFocusedBookingRow = trustedFocusIdentity
+    ? resolveTrustedFocusedBookingRow(f)
+    : null;
   const trustedFocusIndex = trustedFocusIdentity?.selectedBookingIndex ?? null;
+  const linkedFocusedAvr = linkedAvailabilityRequestForFocusedBooking(
+    trustedFocusedBookingRow,
+    avr
+  );
   const bookingCandidates = bookingCandidatesForFacts(f)
     .map((row, index) => {
       const selectionIndex =
@@ -1172,34 +1218,62 @@ export function compactPostConfirmFactsForPrompt(facts) {
         business.documentsPolicy ?? known.documentsPolicy ?? null,
       deliveryPolicy: business.deliveryPolicy ?? known.deliveryPolicy ?? null,
     },
-    booking: Object.keys(booking).length > 0
+    booking: trustedFocusedBookingRow
       ? {
-          ...compactCustomerSafeBooking(booking),
-          ...(trustedFocusIdentity
-            ? {
-                itemId: trustedFocusIdentity.itemId,
-                scope: "CURRENT_BOOKING_IN_SCOPE",
-              }
-            : {}),
+          ...compactCustomerSafeBooking(trustedFocusedBookingRow),
+          itemId: clean(trustedFocusedBookingRow.itemId, 160) || null,
+          scope: "CURRENT_BOOKING_IN_SCOPE",
         }
-      : null,
+      : Object.keys(booking).length > 0
+        ? compactCustomerSafeBooking(booking)
+        : null,
     bookingCandidates,
     bookingFocus,
     activeBookings,
     pendingAvailabilityRequests,
     mutationExecution,
     pendingAvailabilityExecution,
-    availabilityRequest: avr
-      ? {
-          itemLabel: avr.itemLabel ?? null,
-          itemId: trustedFocusIdentity
-            ? trustedFocusIdentity.itemId || clean(avr.itemId, 160) || null
-            : null,
-          requestedDuration: avr.requestedDuration ?? null,
-          priceQuote: avr.priceQuote ?? null,
-          status: avr.status ?? null,
+    availabilityRequest: (() => {
+      if (trustedFocusIdentity) {
+        if (linkedFocusedAvr) {
+          return {
+            itemLabel: linkedFocusedAvr.itemLabel ?? null,
+            itemId:
+              clean(linkedFocusedAvr.itemId, 160) ||
+              trustedFocusIdentity.itemId ||
+              null,
+            requestedDuration: linkedFocusedAvr.requestedDuration ?? null,
+            priceQuote: linkedFocusedAvr.priceQuote ?? null,
+            status: linkedFocusedAvr.status ?? null,
+          };
         }
-      : null,
+        // Unlinked AVR must not leak into focused prompt facts.
+        return trustedFocusIdentity.availabilityRequestId
+          ? {
+              itemLabel: trustedFocusIdentity.itemLabel,
+              itemId: trustedFocusIdentity.itemId,
+              requestedDuration: trustedFocusIdentity.durationDays,
+              priceQuote:
+                trustedFocusIdentity.totalAmount != null ||
+                trustedFocusIdentity.dailyRate != null
+                  ? {
+                      total: trustedFocusIdentity.totalAmount,
+                      dailyRate: trustedFocusIdentity.dailyRate,
+                    }
+                  : null,
+              status: null,
+            }
+          : null;
+      }
+      if (!avr) return null;
+      return {
+        itemLabel: avr.itemLabel ?? null,
+        itemId: null,
+        requestedDuration: avr.requestedDuration ?? null,
+        priceQuote: avr.priceQuote ?? null,
+        status: avr.status ?? null,
+      };
+    })(),
     known: {
       totalAmount: known.totalAmount ?? null,
       dailyRate: known.dailyRate ?? null,

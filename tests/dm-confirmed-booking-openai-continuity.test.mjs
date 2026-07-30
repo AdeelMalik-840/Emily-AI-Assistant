@@ -10,6 +10,8 @@ const { handleCustomerBusinessPaInbound } = await import(
 const {
   compactPostConfirmFactsForPrompt,
   buildPostConfirmVerifiedItemMismatchCorrection,
+  resolveTrustedFocusedBookingIdentity,
+  finiteNumberOrNull,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
 
 const BUSINESS_ID = "dm-continuity-business";
@@ -1427,6 +1429,136 @@ test("trusted focus compact facts include Stonic identity and mark others out-of
   assert.ok(
     outOfScope.some((row) => /[Cc]orolla/.test(String(row.itemLabel || "")))
   );
+});
+
+test("finiteNumberOrNull preserves nullish emptiness and explicit zero", () => {
+  assert.equal(finiteNumberOrNull(null), null);
+  assert.equal(finiteNumberOrNull(undefined), null);
+  assert.equal(finiteNumberOrNull(""), null);
+  assert.equal(finiteNumberOrNull("   "), null);
+  assert.equal(finiteNumberOrNull(4), 4);
+  assert.equal(finiteNumberOrNull("22000"), 22000);
+  assert.equal(finiteNumberOrNull(0), 0);
+  assert.equal(finiteNumberOrNull("0"), 0);
+  assert.equal(finiteNumberOrNull("not-a-number"), null);
+});
+
+test("trusted focus identity keeps missing numeric fields null instead of zero", () => {
+  const facts = trustedStonicFocusFacts();
+  facts.booking = {
+    ...facts.booking,
+    durationDays: null,
+    totalAmount: "",
+    dailyRate: undefined,
+  };
+  facts.bookingCandidates = facts.bookingCandidates.map((row) =>
+    row.selectionIndex === 1
+      ? {
+          ...row,
+          durationDays: null,
+          totalAmount: "",
+          dailyRate: undefined,
+        }
+      : row
+  );
+  facts.availabilityRequest = {
+    ...facts.availabilityRequest,
+    requestedDuration: null,
+    priceQuote: { total: null, dailyRate: "" },
+  };
+  const identity = resolveTrustedFocusedBookingIdentity(facts);
+  assert.equal(identity.durationDays, null);
+  assert.equal(identity.totalAmount, null);
+  assert.equal(identity.dailyRate, null);
+  assert.notEqual(identity.durationDays, 0);
+  assert.notEqual(identity.totalAmount, 0);
+  assert.notEqual(identity.dailyRate, 0);
+});
+
+test("trusted focus identity preserves explicit zero numeric values", () => {
+  const facts = trustedStonicFocusFacts();
+  facts.booking = {
+    ...facts.booking,
+    durationDays: 0,
+    totalAmount: 0,
+    dailyRate: 0,
+  };
+  facts.bookingCandidates = facts.bookingCandidates.map((row) =>
+    row.selectionIndex === 1
+      ? { ...row, durationDays: 0, totalAmount: 0, dailyRate: 0 }
+      : row
+  );
+  const identity = resolveTrustedFocusedBookingIdentity(facts);
+  assert.equal(identity.durationDays, 0);
+  assert.equal(identity.totalAmount, 0);
+  assert.equal(identity.dailyRate, 0);
+});
+
+test("compact booking uses focused Stonic row even when facts.booking is Corolla", () => {
+  const facts = trustedStonicFocusFacts();
+  facts.booking = {
+    id: "booking-corolla",
+    selectionIndex: 3,
+    status: "approved",
+    approvalStage: "owner_approved_waiting_customer_details",
+    itemId: "toyota_corolla_metallic_grey_0e2cd610",
+    itemLabel: "Toyota corolla (Metallic Grey)",
+    durationDays: 9,
+    totalAmount: 99999,
+    dailyRate: 1111,
+    availabilityRequestId: "avr-corolla",
+  };
+  facts.availabilityRequest = {
+    id: "avr-corolla",
+    itemId: "toyota_corolla_metallic_grey_0e2cd610",
+    itemLabel: "Toyota corolla (Metallic Grey)",
+    requestedDuration: 9,
+    status: "approved",
+    priceQuote: { total: 99999, dailyRate: 1111 },
+  };
+  const compact = JSON.parse(compactPostConfirmFactsForPrompt(facts));
+  assert.equal(compact.bookingFocus.bookingId, "CdqHuG0ZJpIZW3DDPlbI");
+  assert.equal(
+    compact.bookingFocus.itemId,
+    "kia_stonic_ex_plus_2021_white_color_1df55684"
+  );
+  assert.equal(
+    compact.bookingFocus.itemLabel,
+    "Kia Stonic EX Plus 2021 (White Color)"
+  );
+  assert.equal(compact.bookingFocus.durationDays, 4);
+  assert.equal(compact.bookingFocus.totalAmount, 22000);
+  assert.equal(compact.bookingFocus.dailyRate, 5500);
+  assert.equal(
+    compact.bookingFocus.availabilityRequestId,
+    "avr_f45af5f434e2f71cf33a1f2c"
+  );
+  assert.equal(compact.booking.scope, "CURRENT_BOOKING_IN_SCOPE");
+  assert.equal(compact.booking.itemId, "kia_stonic_ex_plus_2021_white_color_1df55684");
+  assert.equal(
+    compact.booking.itemLabel,
+    "Kia Stonic EX Plus 2021 (White Color)"
+  );
+  assert.equal(compact.booking.durationDays, 4);
+  assert.equal(compact.booking.totalAmount, 22000);
+  assert.equal(compact.booking.dailyRate, 5500);
+  assert.doesNotMatch(
+    JSON.stringify(compact.booking),
+    /Corolla|99999|1111|avr-corolla|"durationDays":9/
+  );
+  assert.doesNotMatch(
+    JSON.stringify(compact.bookingFocus),
+    /Corolla|99999|1111|avr-corolla/
+  );
+  assert.doesNotMatch(
+    JSON.stringify(compact.availabilityRequest),
+    /Corolla|99999|1111|avr-corolla/
+  );
+  assert.equal(
+    compact.availabilityRequest.itemId,
+    "kia_stonic_ex_plus_2021_white_color_1df55684"
+  );
+  assert.equal(compact.availabilityRequest.requestedDuration, 4);
 });
 
 test("verified_item_mismatch correction pins trusted Stonic identity", () => {
