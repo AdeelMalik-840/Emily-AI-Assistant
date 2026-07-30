@@ -6,12 +6,43 @@ import { dirname, join } from "node:path";
 import {
   canSendAvailabilityCustomerCloudApi,
   isPhase4CustomerPhoneManaged,
-  sendAvailabilityCustomerNotification,
+  sendAvailabilityCustomerNotification as sendAvailabilityCustomerNotificationReal,
 } from "../src/services/availabilityCustomerNotificationService.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BUSINESS_ID = "biz-phase4-cloud";
 const REQUEST_ID = "avr_phase4_cloud_1";
+const inventoryFirestore = (await import("../src/config/firebase.js")).default;
+const catalogDoc = {
+  id: "honda_civic_2026",
+  data: () => ({
+    name: "Honda Civic 2026 Oriel (White)",
+    displayLabel: "Honda Civic 2026 Oriel (White)",
+    dailyRate: 8000,
+    available: true,
+  }),
+};
+inventoryFirestore.collection = () => ({
+  doc: () => ({
+    collection: () => ({
+      doc: () => ({
+        get: async () => ({
+          exists: true,
+          id: catalogDoc.id,
+          data: catalogDoc.data,
+        }),
+      }),
+      get: async () => ({ docs: [catalogDoc] }),
+    }),
+  }),
+});
+
+function sendAvailabilityCustomerNotification(params) {
+  return sendAvailabilityCustomerNotificationReal({
+    getBookingsForItemFn: async () => [],
+    ...params,
+  });
+}
 
 class FakeDocSnap {
   constructor(store, key) {
@@ -39,6 +70,12 @@ class FakeDocRef {
   }
   async get() {
     return new FakeDocSnap(this.store, this.key);
+  }
+  collection(name) {
+    return new FakeCollectionRef(this.store, [
+      ...this.key.split("/"),
+      String(name),
+    ]);
   }
   async set(data, options = {}) {
     const prev = this.store.docs.get(this.key) || {};
@@ -70,13 +107,20 @@ class FakeDb {
     this.docs = new Map();
   }
   collection(name) {
-    return {
-      doc: (id) => ({
-        collection: (childName) =>
-          new FakeCollectionRef(this, [name, String(id), childName]),
-      }),
-    };
+    return new FakeCollectionRef(this, [String(name)]);
   }
+  async runTransaction(fn) {
+    return fn({
+      get: (ref) => ref.get(),
+      set: (ref, data, options) => ref.set(data, options),
+    });
+  }
+}
+
+function conversationMessages(fakeDb) {
+  return (
+    fakeDb.docs.get(`conversations/${BUSINESS_ID}_923365149142`)?.messages ?? []
+  );
 }
 
 function avrKey(requestId = REQUEST_ID) {
@@ -192,6 +236,67 @@ test("1–5. Phase 4 resolved cloud_api sends Cloud and preserves phone fields",
   assert.ok(stored.confirmExpiresAt);
   assert.ok(stored.lastCustomerNotifyAt);
   assert.match(String(stored.lastCustomerNotifyMessage || ""), /Book kar du\?/);
+  const history = conversationMessages(fakeDb);
+  assert.equal(history.length, 1);
+  assert.equal(
+    history[0].sourceMessageId,
+    `availability_request:${REQUEST_ID}:customer_notification`
+  );
+  assert.equal(history[0].providerMessageId, "wamid.TEST123");
+  assert.match(history[0].text, /Book kar du\?/);
+});
+
+for (const [label, sendResult] of [
+  ["undefined", undefined],
+  ["explicit failure", { ok: false }],
+]) {
+  test(`Phase 4 ${label} Cloud send writes no delivered assistant history`, async () => {
+    const fakeDb = new FakeDb();
+    seedPhase4Resolved(fakeDb);
+    const result = await sendAvailabilityCustomerNotification({
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      requestId: REQUEST_ID,
+      sendWhatsAppMessageFn: async () => sendResult,
+      replyPrivatelyFn: async () => {
+        throw new Error("must not use Reply Privately");
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.sent, false);
+    assert.equal(conversationMessages(fakeDb).length, 0);
+    assert.equal(
+      fakeDb.docs.get(avrKey()).approvalCustomerNotificationStatus,
+      "failed"
+    );
+  });
+}
+
+test("duplicate successful owner-approved prompt appends one assistant entry", async () => {
+  const fakeDb = new FakeDb();
+  seedPhase4Resolved(fakeDb);
+  let sends = 0;
+  const params = {
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: REQUEST_ID,
+    sendWhatsAppMessageFn: async () => {
+      sends += 1;
+      return { ok: true, providerMessageId: "wamid.owner-prompt" };
+    },
+    replyPrivatelyFn: async () => {
+      throw new Error("must not use Reply Privately");
+    },
+  };
+  const first = await sendAvailabilityCustomerNotification(params);
+  const second = await sendAvailabilityCustomerNotification(params);
+
+  assert.equal(first.sent, true);
+  assert.equal(second.skipped, true);
+  assert.equal(second.reason, "ALREADY_SENT");
+  assert.equal(sends, 1);
+  assert.equal(conversationMessages(fakeDb).length, 1);
 });
 
 test("6–7. Reply Privately / Playwright DM not used for cloud_api", async () => {

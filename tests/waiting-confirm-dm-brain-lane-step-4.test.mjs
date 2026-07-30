@@ -277,6 +277,12 @@ async function handleBrainInbound(fake, messageText, opts = {}) {
     },
     availabilityConfirmExecute: true,
     __waitingConfirmDmBrainEnabled: opts.brainEnabled !== false,
+    __catalogRowForTests: {
+      id: "civic-1",
+      name: "Honda Civic 2026",
+      displayLabel: "Honda Civic 2026",
+      dailyRate: 8000,
+    },
     __decideCustomerTurnForTests:
       opts.decideFn || injectDecision(opts.decision || {}),
   });

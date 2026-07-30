@@ -134,6 +134,7 @@ function basePipelineParams({
   onGeneral,
   onSend,
   onOutcome,
+  messageTimestamp = null,
 }) {
   return {
     db,
@@ -149,6 +150,7 @@ function basePipelineParams({
     combinedMessage: messageText,
     latestMessage: messageText,
     messageId,
+    messageTimestamp,
     __resolveActiveCustomerBookingFactsFn: resolveFacts,
     __tryHandleAvailabilityCustomerCloudInboundFn: async () => {
       onConfirm?.();
@@ -499,6 +501,7 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
   const providerMessageId = `wamid.restart-${randomUUID()}`;
   const messageText =
     `Kitny din k lye book ki h? [restart:${randomUUID()}]`;
+  const originalInboundTimestamp = Date.now() - 2_000;
   const identity = buildCloudInboundLifecycleIdentity({
     businessId: BUSINESS_ID,
     customerPhone: CUSTOMER_PHONE,
@@ -515,7 +518,9 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
     db: fake.db,
     messageId: providerMessageId,
     messageText,
-    resolveFacts: async () => {
+    messageTimestamp: originalInboundTimestamp,
+    resolveFacts: async ({ inboundReceivedAtMs }) => {
+      assert.equal(inboundReceivedAtMs, originalInboundTimestamp);
       resolutionCalls += 1;
       return resolutionCalls === 1 ? noActiveFacts() : activeFacts();
     },
@@ -532,6 +537,10 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
   );
   assert.equal(queuedBeforeRestart?.state, "processing");
   assert.equal(queuedBeforeRestart?.cloudOwnershipQueue?.status, "queued");
+  assert.equal(
+    queuedBeforeRestart?.cloudRecoveryContext?.messageTimestamp,
+    originalInboundTimestamp
+  );
   const originalReceivedAt = queuedBeforeRestart?.receivedAt;
   const originalClaimOwner = queuedBeforeRestart?.processingOwner;
   assert.equal(globalThis.__messageQueue.length, 1);
@@ -570,7 +579,10 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
       recoveredPayload = payload;
       return executeWhatsAppAiPipeline({
         ...payload,
-        __resolveActiveCustomerBookingFactsFn: async () => {
+        __resolveActiveCustomerBookingFactsFn: async ({
+          inboundReceivedAtMs,
+        }) => {
+          assert.equal(inboundReceivedAtMs, originalInboundTimestamp);
           resolutionCalls += 1;
           return activeFacts();
         },
@@ -624,6 +636,10 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
   assert.equal(recoveredPayload?.ownerUserId, BUSINESS_ID);
   assert.equal(recoveredPayload?.conversationCustomerNumber, CUSTOMER_PHONE);
   assert.equal(recoveredPayload?.combinedMessage, messageText);
+  assert.equal(
+    recoveredPayload?.messageTimestamp,
+    originalInboundTimestamp
+  );
   assert.equal(recoveredPayload?.__cloudQueuedOwnershipResume, true);
   assert.equal(recoveredPayload?.__cloudClaimOwner, originalClaimOwner);
   assert.equal(resolutionCalls, 2);

@@ -487,6 +487,7 @@ export function stripInternalReplySemantics(decision) {
   const {
     replySemantics: _drop,
     groundedFacts: _dropGroundedFacts,
+    candidateGroundings: _dropCandidateGroundings,
     ...rest
   } = decision;
   return rest;

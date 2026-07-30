@@ -59,6 +59,48 @@ function recoveryContext(overrides = {}) {
   };
 }
 
+function createConversationDb() {
+  const docs = new Map();
+  class Ref {
+    constructor(id) {
+      this.id = id;
+    }
+    async get() {
+      const data = docs.get(this.id);
+      return {
+        exists: Boolean(data),
+        data: () => (data ? structuredClone(data) : undefined),
+      };
+    }
+  }
+  const db = {
+    collection(name) {
+      assert.equal(name, "conversations");
+      return { doc: (id) => new Ref(id) };
+    },
+    async runTransaction(fn) {
+      return fn({
+        get: (ref) => ref.get(),
+        set(ref, data, options) {
+          const prior = docs.get(ref.id) ?? {};
+          docs.set(
+            ref.id,
+            structuredClone(options?.merge ? { ...prior, ...data } : data)
+          );
+        },
+      });
+    },
+  };
+  return {
+    db,
+    messages() {
+      return (
+        docs.get(`${BUSINESS_ID}_${CUSTOMER_PHONE}`)?.messages ?? []
+      );
+    },
+  };
+}
+
 test("Cloud guarantee identity is exact across business, customer and provider message", () => {
   const a = buildCloudInboundLifecycleIdentity({
     businessId: BUSINESS_ID,
@@ -194,6 +236,7 @@ test("OpenAI failure before lock remains durable and resumes processing after re
 
 test("outbound_locked restart recovery is send-only and preserves full OpenAI reply", async () => {
   await withFreshLedger(async ({ ledgerPath }) => {
+    const conversation = createConversationDb();
     const first = claimCloudInboundTurn({
       businessId: BUSINESS_ID,
       customerPhone: CUSTOMER_PHONE,
@@ -218,9 +261,8 @@ test("outbound_locked restart recovery is send-only and preserves full OpenAI re
 
     let sends = 0;
     let sentText = "";
-    let historyText = "";
     const recovered = await tryRecoverCloudOutboundLockedTurn({
-      db: {},
+      db: conversation.db,
       entry: locked.entry,
       sendCredentials: {
         accessToken: "runtime-only-token",
@@ -229,16 +271,22 @@ test("outbound_locked restart recovery is send-only and preserves full OpenAI re
       __sendOutboundMessageFn: async (payload) => {
         sends += 1;
         sentText = payload.reply;
-        return { ok: true };
-      },
-      __appendConversationMessageFn: async (_db, payload) => {
-        historyText = payload.text;
+        return {
+          ok: true,
+          providerMessageId: "wamid.cloud-recovery-out-1",
+        };
       },
     });
     assert.equal(recovered.sent, true);
     assert.equal(sends, 1);
     assert.equal(sentText, FULL_REPLY);
-    assert.equal(historyText, FULL_REPLY);
+    assert.equal(conversation.messages().length, 1);
+    assert.equal(conversation.messages()[0].text, FULL_REPLY);
+    assert.equal(conversation.messages()[0].sourceMessageId, MESSAGE_ID);
+    assert.equal(
+      conversation.messages()[0].providerMessageId,
+      "wamid.cloud-recovery-out-1"
+    );
 
     const done = getInboundTurnLedgerEntry(
       first.identity.chatKey,
@@ -255,12 +303,27 @@ test("outbound_locked restart recovery is send-only and preserves full OpenAI re
       recoveryContext: recoveryContext(),
     });
     assert.equal(duplicate.action, "done");
+    const duplicateRecovery = await tryRecoverCloudOutboundLockedTurn({
+      db: conversation.db,
+      entry: locked.entry,
+      sendCredentials: {
+        accessToken: "runtime-only-token",
+        phoneNumberId: "phone-number-id",
+      },
+      __sendOutboundMessageFn: async () => {
+        sends += 1;
+        return { ok: true };
+      },
+    });
+    assert.equal(duplicateRecovery.sent, false);
     assert.equal(sends, 1);
+    assert.equal(conversation.messages().length, 1);
   });
 });
 
 test("clear outbound failure keeps locked reply and increments bounded retry state", async () => {
   await withFreshLedger(async () => {
+    const conversation = createConversationDb();
     const first = claimCloudInboundTurn({
       businessId: BUSINESS_ID,
       customerPhone: CUSTOMER_PHONE,
@@ -280,6 +343,7 @@ test("clear outbound failure keeps locked reply and increments bounded retry sta
       recoveryContext: recoveryContext(),
     });
     const failed = await tryRecoverCloudOutboundLockedTurn({
+      db: conversation.db,
       entry: locked.entry,
       sendCredentials: {
         accessToken: "runtime-only-token",
@@ -298,5 +362,6 @@ test("clear outbound failure keeps locked reply and increments bounded retry sta
     assert.equal(durable.finalReplyText, FULL_REPLY);
     assert.equal(durable.outboundIntentStatus, "pending_send");
     assert.equal(durable.retryCount, 1);
+    assert.equal(conversation.messages().length, 0);
   });
 });

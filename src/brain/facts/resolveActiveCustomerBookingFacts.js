@@ -28,6 +28,7 @@ const CLOSED_BOOKING_STATUSES = new Set([
   "rejected",
   "declined",
 ]);
+const MAX_TRUSTED_CONFIRMATION_FUTURE_MS = 5 * 60 * 1000;
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -203,19 +204,106 @@ function isTrustedLinkedAvailabilityRequest({
   booking,
   customerPhone,
   requestId,
+  requireExplicitBusinessIdentity = false,
 }) {
   if (!request || typeof request !== "object") return false;
   const expectedRequestId = clean(requestId);
   const actualRequestId = clean(request.requestId ?? request.id);
   if (!expectedRequestId || actualRequestId !== expectedRequestId) return false;
   const rowBusinessId = clean(request.businessId);
-  if (rowBusinessId && rowBusinessId !== clean(businessId)) return false;
+  if (
+    requireExplicitBusinessIdentity
+      ? rowBusinessId !== clean(businessId)
+      : rowBusinessId && rowBusinessId !== clean(businessId)
+  ) {
+    return false;
+  }
   if (!requestMatchesCustomerPhone(request, customerPhone)) return false;
   if (clean(request.linkedBookingId) !== clean(booking?.id)) return false;
   if (clean(request.status) !== "approved") return false;
   if (clean(request.customerConfirmationStatus) !== "confirmed") return false;
   if (clean(request.supersededByAvailabilityRequestId)) return false;
   return true;
+}
+
+function linkedAvailabilityConfirmationMs(request) {
+  return timestampMs(
+    request?.customerConfirmationAt ??
+      request?.confirmedAt ??
+      request?.bookingConfirmedAt
+  );
+}
+
+function compactCustomerSafeBookingCandidate(booking, selectionIndex) {
+  const safe = compactBookingFacts(booking);
+  return {
+    id: safe.id,
+    selectionIndex,
+    customerSafeReference: safe.customerSafeReference,
+    status: safe.status,
+    approvalStage: safe.approvalStage,
+    itemId: safe.itemId,
+    itemLabel: safe.itemLabel,
+    durationDays: safe.durationDays,
+    startDate: safe.startDate,
+    endDate: safe.endDate,
+    pickupTime: safe.pickupTime,
+    deliveryTime: safe.deliveryTime,
+    deliveryMethod: safe.deliveryMethod,
+    deliveryAddress: safe.deliveryAddress,
+    totalAmount: safe.totalAmount,
+    dailyRate: safe.dailyRate,
+    availabilityRequestId: safe.availabilityRequestId,
+  };
+}
+
+function stripInternalBookingCandidate(candidate) {
+  if (!candidate || typeof candidate !== "object") return null;
+  return {
+    selectionIndex: candidate.selectionIndex,
+    customerSafeReference: candidate.customerSafeReference,
+    status: candidate.status,
+    approvalStage: candidate.approvalStage,
+    itemLabel: candidate.itemLabel,
+    durationDays: candidate.durationDays,
+    startDate: candidate.startDate,
+    endDate: candidate.endDate,
+    pickupTime: candidate.pickupTime,
+    deliveryTime: candidate.deliveryTime,
+    deliveryMethod: candidate.deliveryMethod,
+    deliveryAddress: candidate.deliveryAddress,
+    totalAmount: candidate.totalAmount,
+    dailyRate: candidate.dailyRate,
+  };
+}
+
+function bookingReplyGuardFacts(booking, catalogItems, known = {}) {
+  return {
+    bookingExecutionVerified: true,
+    itemId: booking?.itemId ?? null,
+    itemLabel: booking?.itemLabel ?? null,
+    durationDays: booking?.durationDays ?? null,
+    bookingStatus: booking?.status ?? null,
+    bookingReference: booking?.customerSafeReference ?? null,
+    totalAmount: booking?.totalAmount ?? null,
+    dailyRate: booking?.dailyRate ?? null,
+    advanceAmount: known?.advanceAmount ?? null,
+    startDate: booking?.startDate ?? null,
+    endDate: booking?.endDate ?? null,
+    pickupTime: booking?.pickupTime ?? null,
+    deliveryTime: booking?.deliveryTime ?? null,
+    deliveryMethod: booking?.deliveryMethod ?? null,
+    deliveryAddress: booking?.deliveryAddress ?? null,
+    knownPolicies: {
+      advancePolicy: known?.advancePolicy ?? null,
+      driverPolicy: known?.driverPolicy ?? null,
+      paymentPolicy: known?.paymentPolicy ?? null,
+      documentsPolicy: known?.documentsPolicy ?? null,
+      deliveryPolicy: known?.deliveryPolicy ?? null,
+    },
+    activeBookings: [],
+    catalogItems,
+  };
 }
 
 function isTrustedPendingAvailabilityRequest(request, businessId, customerPhone) {
@@ -327,6 +415,7 @@ export function applyClosedPaMissingInfoAnswersToKnown(known, answers) {
  *   db?: unknown,
  *   businessId: string,
  *   customerPhone: string,
+ *   inboundReceivedAtMs?: number | null,
  *   getBusinessProfileFn?: (uid: string) => Promise<unknown>,
  *   getAvailabilityRequestFn?: typeof getAvailabilityRequest,
  *   listClosedPaMissingInfoAnswersFn?: typeof listClosedPaMissingInfoAnswersForBooking,
@@ -337,6 +426,7 @@ export async function resolveActiveCustomerBookingFacts({
   db: connection,
   businessId,
   customerPhone,
+  inboundReceivedAtMs = null,
   getBusinessProfileFn,
   getAvailabilityRequestFn = getAvailabilityRequest,
   listClosedPaMissingInfoAnswersFn = listClosedPaMissingInfoAnswersForBooking,
@@ -344,6 +434,11 @@ export async function resolveActiveCustomerBookingFacts({
 } = {}) {
   const uid = clean(businessId);
   const phone = canonicalCustomerPhone(customerPhone);
+  const inboundMs =
+    Number.isFinite(Number(inboundReceivedAtMs)) &&
+    Number(inboundReceivedAtMs) > 0
+      ? Number(inboundReceivedAtMs)
+      : null;
   if (!connection || !uid || !phone) {
     return { ok: false, reason: "MISSING_CONTEXT", facts: null };
   }
@@ -381,6 +476,7 @@ export async function resolveActiveCustomerBookingFacts({
       candidates.push(row);
     }
   }
+  candidates.sort((a, b) => clean(a?.id).localeCompare(clean(b?.id)));
 
   if (candidates.length === 0) {
     return { ok: false, reason: "NO_ACTIVE_BOOKING", facts: null };
@@ -405,86 +501,166 @@ export async function resolveActiveCustomerBookingFacts({
   const pendingAvailabilityRequests =
     await loadTrustedPendingAvailabilityRequests(connection, uid, phone);
 
+  const bookingCandidates = candidates.map((booking, index) =>
+    compactCustomerSafeBookingCandidate(booking, index + 1)
+  );
+  let booking = candidates[0];
+  let bookingFocus = null;
+  let preloadedAvailabilityRequest = null;
+
   if (candidates.length > 1) {
-    const compactActiveBookings = candidates.map((booking) =>
-      compactBookingFacts(booking)
+    const linkedRows = await Promise.all(
+      candidates.map(async (candidate, index) => {
+        const requestId = clean(candidate?.availabilityRequestId);
+        if (!requestId) return null;
+        const request = await getAvailabilityRequestFn({
+          db: connection,
+          businessId: uid,
+          requestId,
+        }).catch(() => null);
+        if (
+          !isTrustedLinkedAvailabilityRequest({
+            request,
+            businessId: uid,
+            booking: candidate,
+            customerPhone: phone,
+            requestId,
+            requireExplicitBusinessIdentity: true,
+          })
+        ) {
+          return null;
+        }
+        const confirmedAtMs = linkedAvailabilityConfirmationMs(request);
+        if (confirmedAtMs == null) return null;
+        return {
+          booking: candidate,
+          request,
+          requestId,
+          confirmedAtMs,
+          selectionIndex: index + 1,
+        };
+      })
     );
-    return {
-      ok: true,
-      reason: "AMBIGUOUS_BOOKINGS",
-      facts: {
-        business: biz,
-        booking: null,
-        activeBookings: compactActiveBookings.map((safe) => {
-          return {
-            customerSafeReference: safe.customerSafeReference,
-            status: safe.status,
-            approvalStage: safe.approvalStage,
-            itemLabel: safe.itemLabel,
-            durationDays: safe.durationDays,
-            startDate: safe.startDate,
-            endDate: safe.endDate,
-            pickupTime: safe.pickupTime,
-            deliveryTime: safe.deliveryTime,
-            deliveryMethod: safe.deliveryMethod,
-            totalAmount: safe.totalAmount,
-            dailyRate: safe.dailyRate,
-          };
-        }),
-        pendingAvailabilityRequests,
-        availabilityRequest: null,
-        known: {
-          advanceAmount: toFiniteNumber(biz.advanceAmount) ?? null,
-          advancePolicy: clean(biz.advancePolicy) || null,
-          driverPolicy: clean(biz.driverPolicy) || null,
-          paymentPolicy: clean(biz.paymentPolicy) || null,
-          documentsPolicy: clean(biz.documentsPolicy) || null,
-          deliveryPolicy: clean(biz.deliveryPolicy) || null,
-          knowledgeExcerpt: biz.instructions ?? null,
+    const trusted = linkedRows.filter(Boolean);
+    const nowMs = Date.now();
+    const hasUnreasonableFutureConfirmation = trusted.some(
+      (row) =>
+        row.confirmedAtMs > nowMs + MAX_TRUSTED_CONFIRMATION_FUTURE_MS
+    );
+    const eligibleAtInbound =
+      inboundMs == null
+        ? []
+        : trusted
+            .filter((row) => row.confirmedAtMs <= inboundMs)
+            .sort((a, b) => b.confirmedAtMs - a.confirmedAtMs);
+    const newest = eligibleAtInbound[0] ?? null;
+    const exactRankingTie =
+      newest != null &&
+      eligibleAtInbound.some(
+        (row, index) =>
+          index > 0 && row.confirmedAtMs === newest.confirmedAtMs
+      );
+
+    const incompleteTrustedEvidence = trusted.length !== candidates.length;
+    if (
+      !newest ||
+      exactRankingTie ||
+      incompleteTrustedEvidence ||
+      hasUnreasonableFutureConfirmation
+    ) {
+      const safeCandidates = bookingCandidates
+        .map(stripInternalBookingCandidate)
+        .filter(Boolean);
+      return {
+        ok: true,
+        reason: "AMBIGUOUS_BOOKINGS",
+        facts: {
+          businessId: uid,
+          customerPhoneDigits: phone,
+          business: biz,
+          booking: null,
+          bookingCandidates,
+          bookingFocus: null,
+          activeBookings: safeCandidates,
+          pendingAvailabilityRequests,
+          availabilityRequest: null,
+          known: {
+            advanceAmount: toFiniteNumber(biz.advanceAmount) ?? null,
+            advancePolicy: clean(biz.advancePolicy) || null,
+            driverPolicy: clean(biz.driverPolicy) || null,
+            paymentPolicy: clean(biz.paymentPolicy) || null,
+            documentsPolicy: clean(biz.documentsPolicy) || null,
+            deliveryPolicy: clean(biz.deliveryPolicy) || null,
+            knowledgeExcerpt: biz.instructions ?? null,
+          },
+          openMissingInfoRequests: [],
+          latestClosedMissingInfoAnswers: [],
+          replyGuardFacts: {
+            catalogItems,
+            advanceAmount: toFiniteNumber(biz.advanceAmount) ?? null,
+            activeBookings: bookingCandidates.map((safe) => ({
+              itemId: safe.itemId,
+              itemLabel: safe.itemLabel,
+              durationDays: safe.durationDays,
+              bookingStatus: safe.status,
+              bookingReference: safe.customerSafeReference,
+              totalAmount: safe.totalAmount,
+              dailyRate: safe.dailyRate,
+              startDate: safe.startDate,
+              endDate: safe.endDate,
+              pickupTime: safe.pickupTime,
+              deliveryTime: safe.deliveryTime,
+            })),
+          },
+          policy: {
+            readOnly: true,
+            doNotInventAmounts: true,
+            doNotInventPolicies: true,
+            doNotMutateBooking: true,
+            ambiguousBookingSelection: true,
+          },
+          sourceEvidence: {
+            business: profileFacts.sourceEvidence?.business ?? null,
+            activeBookingCount: candidates.length,
+            trustedBookingFocus: false,
+            trustedBookingFocusReason: exactRankingTie
+              ? "CONFIRMATION_TIMESTAMP_TIE"
+              : inboundMs == null
+                ? "MISSING_OR_INVALID_INBOUND_TIMESTAMP"
+                : hasUnreasonableFutureConfirmation
+                  ? "UNREASONABLE_FUTURE_CONFIRMATION_TIMESTAMP"
+                  : trusted.length > 0 && eligibleAtInbound.length === 0
+                    ? "INBOUND_PRECEDES_CONFIRMATION"
+              : incompleteTrustedEvidence
+                ? "INCOMPLETE_TRUSTED_CONFIRMED_LINKAGE"
+                : "NO_TRUSTED_CONFIRMED_LINKED_AVR",
+          },
         },
-        openMissingInfoRequests: [],
-        latestClosedMissingInfoAnswers: [],
-        replyGuardFacts: {
-          catalogItems,
-          advanceAmount: toFiniteNumber(biz.advanceAmount) ?? null,
-          activeBookings: compactActiveBookings.map((safe) => ({
-            itemId: safe.itemId,
-            itemLabel: safe.itemLabel,
-            durationDays: safe.durationDays,
-            bookingStatus: safe.status,
-            bookingReference: safe.customerSafeReference,
-            totalAmount: safe.totalAmount,
-            dailyRate: safe.dailyRate,
-            startDate: safe.startDate,
-            endDate: safe.endDate,
-            pickupTime: safe.pickupTime,
-            deliveryTime: safe.deliveryTime,
-          })),
-        },
-        policy: {
-          readOnly: true,
-          doNotInventAmounts: true,
-          doNotInventPolicies: true,
-          doNotMutateBooking: true,
-          ambiguousBookingSelection: true,
-        },
-        sourceEvidence: {
-          business: profileFacts.sourceEvidence?.business ?? null,
-          activeBookingCount: candidates.length,
-        },
-      },
+      };
+    }
+
+    booking = newest.booking;
+    preloadedAvailabilityRequest = newest.request;
+    bookingFocus = {
+      source: "latest_confirmed_linked_avr",
+      confidence: "trusted",
+      selectedBookingIndex: newest.selectionIndex,
+      selectedBookingId: clean(newest.booking?.id),
+      confirmedAtMs: newest.confirmedAtMs,
+      inboundReceivedAtMs: inboundMs,
     };
   }
 
-  const booking = candidates[0];
   const availabilityRequestId = clean(booking.availabilityRequestId);
   let availabilityRequest = null;
   if (availabilityRequestId) {
-    const avr = await getAvailabilityRequestFn({
-      db: connection,
-      businessId: uid,
-      requestId: availabilityRequestId,
-    }).catch(() => null);
+    const avr =
+      preloadedAvailabilityRequest ||
+      (await getAvailabilityRequestFn({
+        db: connection,
+        businessId: uid,
+        requestId: availabilityRequestId,
+      }).catch(() => null));
     if (avr && typeof avr === "object") {
       if (
         isTrustedLinkedAvailabilityRequest({
@@ -598,7 +774,7 @@ export async function resolveActiveCustomerBookingFacts({
 
   return {
     ok: true,
-    reason: "MATCHED",
+    reason: bookingFocus ? "MATCHED_TRUSTED_FOCUS" : "MATCHED",
     facts: {
       businessId: uid,
       customerPhoneDigits: phone,
@@ -612,43 +788,30 @@ export async function resolveActiveCustomerBookingFacts({
         deliveryPolicy,
       },
       booking: compactBooking,
-      activeBookings: [],
+      bookingCandidates,
+      bookingFocus,
+      activeBookings:
+        candidates.length > 1
+          ? bookingCandidates
+              .map(stripInternalBookingCandidate)
+              .filter(Boolean)
+          : [],
       pendingAvailabilityRequests,
       availabilityRequest,
       known,
       openMissingInfoRequests,
       latestClosedMissingInfoAnswers,
-      replyGuardFacts: {
-        bookingExecutionVerified: true,
-        itemId: compactBooking.itemId,
-        itemLabel: compactBooking.itemLabel,
-        durationDays: compactBooking.durationDays,
-        bookingStatus: compactBooking.status,
-        bookingReference: compactBooking.customerSafeReference,
-        totalAmount: compactBooking.totalAmount,
-        dailyRate: compactBooking.dailyRate,
-        advanceAmount: known.advanceAmount ?? null,
-        startDate: compactBooking.startDate,
-        endDate: compactBooking.endDate,
-        pickupTime: compactBooking.pickupTime,
-        deliveryTime: compactBooking.deliveryTime,
-        deliveryMethod: compactBooking.deliveryMethod,
-        deliveryAddress: compactBooking.deliveryAddress,
-        knownPolicies: {
-          advancePolicy: known.advancePolicy ?? null,
-          driverPolicy: known.driverPolicy ?? null,
-          paymentPolicy: known.paymentPolicy ?? null,
-          documentsPolicy: known.documentsPolicy ?? null,
-          deliveryPolicy: known.deliveryPolicy ?? null,
-        },
-        activeBookings: [],
+      replyGuardFacts: bookingReplyGuardFacts(
+        compactBooking,
         catalogItems,
-      },
+        known
+      ),
       policy: {
         readOnly: true,
         doNotInventAmounts: true,
         doNotInventPolicies: true,
         doNotMutateBooking: true,
+        ambiguousBookingSelection: false,
       },
       sourceEvidence: {
         business: profileFacts.sourceEvidence?.business ?? null,
@@ -658,6 +821,14 @@ export async function resolveActiveCustomerBookingFacts({
         paMissingInfoClosedAnswers: closedAnswerEvidence,
         openMissingInfoCount: openMissingInfoRequests.length,
         closedMissingInfoCount: latestClosedMissingInfoAnswers.length,
+        activeBookingCount: candidates.length,
+        bookingFocus: bookingFocus
+          ? {
+              source: bookingFocus.source,
+              confidence: bookingFocus.confidence,
+              selectedBookingIndex: bookingFocus.selectedBookingIndex,
+            }
+          : null,
       },
     },
   };

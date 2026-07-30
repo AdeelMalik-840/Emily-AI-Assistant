@@ -115,6 +115,9 @@ function decisionJson(reply, overrides = {}) {
     mutationIntent: "none",
     mutationExecutionRequested: false,
     mutationExecutionStatus: "not_executed",
+    bookingSelectionMode: "none",
+    selectedBookingIndex: null,
+    candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     groundedFacts: {
       itemId: null,
@@ -567,6 +570,422 @@ test("multiple active bookings stay in the same OpenAI lane and expose only safe
   assert.match(prompt, /REF-A/);
   assert.match(prompt, /REF-B/);
   assert.doesNotMatch(prompt, /internal-booking-id|customerPhoneDigits|businessId/);
+});
+
+function trustedMultiBookingFacts({ withFocus = true } = {}) {
+  const civic = {
+    id: "booking-civic",
+    selectionIndex: 1,
+    customerSafeReference: "CIVIC-5",
+    status: "approved",
+    approvalStage: "owner_approved_waiting_customer_details",
+    itemId: "civic-2026",
+    itemLabel: "Honda Civic 2026",
+    durationDays: 5,
+    totalAmount: 40000,
+    dailyRate: 8000,
+    availabilityRequestId: "avr-civic",
+  };
+  const corolla = {
+    id: "booking-corolla",
+    selectionIndex: 2,
+    customerSafeReference: "COROLLA-4",
+    status: "approved",
+    approvalStage: "owner_approved_waiting_customer_details",
+    itemId: "corolla-grey",
+    itemLabel: "Toyota Corolla Metallic Grey",
+    durationDays: 4,
+    totalAmount: 20000,
+    dailyRate: 5000,
+    availabilityRequestId: "avr-corolla",
+  };
+  return {
+    businessId: BUSINESS_ID,
+    customerPhoneDigits: CUSTOMER_PHONE,
+    business: { name: "Emily Rentals", tone: "friendly" },
+    booking: withFocus ? corolla : null,
+    bookingCandidates: [civic, corolla],
+    bookingFocus: withFocus
+      ? {
+          source: "latest_confirmed_linked_avr",
+          confidence: "trusted",
+          selectedBookingIndex: 2,
+          selectedBookingId: "booking-corolla",
+        }
+      : null,
+    activeBookings: [civic, corolla].map(
+      ({ id: _id, itemId: _itemId, availabilityRequestId: _avr, ...safe }) =>
+        safe
+    ),
+    known: {},
+    pendingAvailabilityRequests: [],
+    replyGuardFacts: {
+      catalogItems: CATALOG,
+      activeBookings: [civic, corolla],
+    },
+    policy: {
+      readOnly: true,
+      doNotMutateBooking: true,
+      ambiguousBookingSelection: !withFocus,
+    },
+  };
+}
+
+test("trusted latest-confirmed focus answers generic duration from Corolla only", async () => {
+  const counters = {};
+  const result = await runOwnedTurn({
+    message: "Kitny din k lye book ki h?",
+    facts: trustedMultiBookingFacts(),
+    responses: [
+      decisionJson("Toyota Corolla 4 din ke liye book hai.", {
+        bookingSelectionMode: "focused",
+        groundedFacts: {
+          itemId: "corolla-grey",
+          durationDays: 4,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 1);
+  assert.equal(result.reply, "Toyota Corolla 4 din ke liye book hai.");
+  assert.equal(result.bookingId, "booking-corolla");
+  assert.equal(result.bookingSelectionMode, "focused");
+  assert.equal(result.selectedBookingIndex, 2);
+  const prompt = String(counters.lastOpenAiArgs.messages[1].content);
+  assert.match(prompt, /"selectedBookingIndex":2/);
+  assert.doesNotMatch(prompt, /booking-corolla|booking-civic|avr-corolla|avr-civic/);
+});
+
+test("OpenAI can explicitly select Civic instead of the trusted Corolla focus", async () => {
+  const result = await runOwnedTurn({
+    message: "Civic wali kitny din ki hai?",
+    facts: trustedMultiBookingFacts(),
+    responses: [
+      decisionJson("Honda Civic 2026 5 din ke liye book hai.", {
+        bookingSelectionMode: "candidate",
+        selectedBookingIndex: 1,
+        groundedFacts: {
+          itemId: "civic-2026",
+          durationDays: 5,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+    ],
+  });
+  assert.equal(result.bookingId, "booking-civic");
+  assert.equal(result.selectedBookingIndex, 1);
+  assert.equal(result.reply, "Honda Civic 2026 5 din ke liye book hai.");
+});
+
+test("all_candidates grounds Civic and Corolla claims against their exact bookings", async () => {
+  const reply =
+    "Honda Civic 2026 5 din ke liye hai. Toyota Corolla Metallic Grey 4 din ke liye hai.";
+  const result = await runOwnedTurn({
+    message: "Meri sari bookings batao",
+    facts: trustedMultiBookingFacts(),
+    responses: [
+      decisionJson(reply, {
+        bookingSelectionMode: "all_candidates",
+        candidateGroundings: [
+          {
+            selectionIndex: 1,
+            replySegment: "Honda Civic 2026 5 din ke liye hai.",
+            groundedFacts: {
+              itemId: "civic-2026",
+              durationDays: 5,
+              bookingStatus: "approved",
+              bookingReference: "CIVIC-5",
+              totalAmount: 40000,
+              dailyRate: 8000,
+              advanceAmount: null,
+              startDate: null,
+              endDate: null,
+              pickupTime: null,
+              deliveryTime: null,
+              policyClaims: [],
+            },
+          },
+          {
+            selectionIndex: 2,
+            replySegment:
+              "Toyota Corolla Metallic Grey 4 din ke liye hai.",
+            groundedFacts: {
+              itemId: "corolla-grey",
+              durationDays: 4,
+              bookingStatus: "approved",
+              bookingReference: "COROLLA-4",
+              totalAmount: 20000,
+              dailyRate: 5000,
+              advanceAmount: null,
+              startDate: null,
+              endDate: null,
+              pickupTime: null,
+              deliveryTime: null,
+              policyClaims: [],
+            },
+          },
+        ],
+      }),
+    ],
+  });
+  assert.equal(result.reply, reply);
+  assert.equal(result.bookingSelectionMode, "all_candidates");
+  assert.equal(result.bookingId, null);
+});
+
+test("all_candidates rejects cross-booking duration swaps and regenerates once", async () => {
+  const counters = {};
+  const wrong =
+    "Honda Civic 2026 4 din ke liye hai. Toyota Corolla Metallic Grey 5 din ke liye hai.";
+  const corrected =
+    "Honda Civic 2026 5 din ke liye hai. Toyota Corolla Metallic Grey 4 din ke liye hai.";
+  const grounding = (civicDays, corollaDays, reply) => {
+    const [civicSegment, corollaTail] = reply.split(" Toyota");
+    return [
+      {
+        selectionIndex: 1,
+        replySegment: civicSegment,
+        groundedFacts: {
+          itemId: "civic-2026",
+          durationDays: civicDays,
+          bookingStatus: "approved",
+          bookingReference: "CIVIC-5",
+          totalAmount: 40000,
+          dailyRate: 8000,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      },
+      {
+        selectionIndex: 2,
+        replySegment: `Toyota${corollaTail}`,
+        groundedFacts: {
+          itemId: "corolla-grey",
+          durationDays: corollaDays,
+          bookingStatus: "approved",
+          bookingReference: "COROLLA-4",
+          totalAmount: 20000,
+          dailyRate: 5000,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      },
+    ];
+  };
+  const result = await runOwnedTurn({
+    message: "Civic aur Corolla dono kitny din ki hain?",
+    facts: trustedMultiBookingFacts(),
+    responses: [
+      decisionJson(wrong, {
+        bookingSelectionMode: "all_candidates",
+        candidateGroundings: grounding(4, 5, wrong),
+      }),
+      decisionJson(corrected, {
+        bookingSelectionMode: "all_candidates",
+        candidateGroundings: grounding(5, 4, corrected),
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.equal(result.reply, corrected);
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+  assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
+});
+
+test("customer-indistinguishable bookings cannot be selected by index", async () => {
+  const facts = trustedMultiBookingFacts();
+  const original = {
+    ...facts.bookingCandidates[1],
+    selectionIndex: 2,
+    customerSafeReference: null,
+  };
+  const identical = {
+    ...original,
+    id: "booking-corolla-second",
+    selectionIndex: 1,
+  };
+  facts.bookingCandidates = [identical, original];
+  facts.activeBookings = facts.bookingCandidates.map(
+    ({ id: _id, itemId: _itemId, availabilityRequestId: _avr, ...safe }) =>
+      safe
+  );
+  facts.booking = original;
+  facts.bookingFocus = {
+    source: "latest_confirmed_linked_avr",
+    confidence: "trusted",
+    selectedBookingIndex: 2,
+    selectedBookingId: original.id,
+  };
+  facts.replyGuardFacts.activeBookings = facts.bookingCandidates;
+
+  const counters = {};
+  const result = await runOwnedTurn({
+    message: "Corolla booking kitny din ki hai?",
+    facts,
+    responses: [
+      decisionJson("Toyota Corolla Metallic Grey 4 din ki hai.", {
+        bookingSelectionMode: "candidate",
+        selectedBookingIndex: 1,
+      }),
+      decisionJson(
+        "Aapki do milti-julti bookings hain. Kis booking ki baat hai, koi pehchan wali tafseel bata dein.",
+        {
+          bookingSelectionMode: "clarification_required",
+        }
+      ),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.ok(result.reply, JSON.stringify(result));
+  assert.match(result.reply, /do milti-julti bookings/i);
+  assert.equal(result.bookingId, null);
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+  assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
+});
+
+test("selected Corolla rejects Civic duration and regenerates without repeating actions", async () => {
+  const counters = {};
+  const result = await runOwnedTurn({
+    message: "Kitny din k lye book ki h?",
+    facts: trustedMultiBookingFacts(),
+    responses: [
+      decisionJson("Toyota Corolla 5 din ke liye book hai.", {
+        bookingSelectionMode: "focused",
+        groundedFacts: {
+          itemId: "corolla-grey",
+          durationDays: 5,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+      decisionJson("Toyota Corolla 4 din ke liye book hai.", {
+        bookingSelectionMode: "focused",
+        groundedFacts: {
+          itemId: "corolla-grey",
+          durationDays: 4,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.equal(result.reply, "Toyota Corolla 4 din ke liye book hai.");
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+  assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
+});
+
+test("no trusted focus asks OpenAI clarification and generic mutation cannot select implicitly", async () => {
+  const noFocus = trustedMultiBookingFacts({ withFocus: false });
+  const clarified = await runOwnedTurn({
+    message: "Booking kitny din ki hai?",
+    facts: noFocus,
+    responses: [
+      decisionJson("Civic wali ya Corolla wali booking?", {
+        bookingSelectionMode: "clarification_required",
+      }),
+    ],
+  });
+  assert.equal(clarified.bookingId, null);
+  assert.equal(clarified.reply, "Civic wali ya Corolla wali booking?");
+
+  const counters = {};
+  const mutation = await runOwnedTurn({
+    message: "Cancel kar do",
+    facts: trustedMultiBookingFacts(),
+    responses: [
+      decisionJson("Corolla cancel kar deta hun.", {
+        situation: "protected_action",
+        conversationAct: "action_request",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
+        action: "request_booking_mutation",
+        mutationIntent: "cancel_booking",
+        bookingSelectionMode: "focused",
+      }),
+      decisionJson("Civic wali ya Corolla wali booking cancel karni hai?", {
+        bookingSelectionMode: "clarification_required",
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.equal(mutation.decisionAction, "reply");
+  assert.equal(
+    mutation.reply,
+    "Civic wali ya Corolla wali booking cancel karni hai?"
+  );
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+  assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
+});
+
+test("explicit multi-booking mutation maps to the exact candidate but remains unexecuted", async () => {
+  const result = await runOwnedTurn({
+    message: "Civic wali cancel kar do",
+    facts: trustedMultiBookingFacts(),
+    responses: [
+      decisionJson("Civic cancellation request abhi execute nahi hui.", {
+        situation: "protected_action",
+        conversationAct: "action_request",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
+        action: "request_booking_mutation",
+        mutationIntent: "cancel_booking",
+        bookingSelectionMode: "candidate",
+        selectedBookingIndex: 1,
+      }),
+    ],
+  });
+  assert.equal(result.bookingId, "booking-civic");
+  assert.equal(result.mutationExecutionStatus, "not_executed");
+  assert.equal(result.selectedBookingIndex, 1);
 });
 
 test("no active booking leaves the existing general path unclaimed", async () => {

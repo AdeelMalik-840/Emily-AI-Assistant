@@ -47,6 +47,14 @@ export const POST_CONFIRM_ACTIONS = Object.freeze([
   "decline_pending_availability",
 ]);
 
+export const POST_CONFIRM_BOOKING_SELECTION_MODES = Object.freeze([
+  "focused",
+  "candidate",
+  "all_candidates",
+  "none",
+  "clarification_required",
+]);
+
 export const POST_CONFIRM_MUTATION_INTENTS = Object.freeze([
   "none",
   "extend_booking",
@@ -139,6 +147,16 @@ function cleanMutationExecutionStatus(value) {
     : "not_executed";
 }
 
+function cleanBookingSelectionMode(value) {
+  const mode = clean(value, 40).toLowerCase();
+  return POST_CONFIRM_BOOKING_SELECTION_MODES.includes(mode) ? mode : "none";
+}
+
+function positiveIntegerOrNull(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1 ? number : null;
+}
+
 function normalizeGroundedFacts(raw) {
   const o = raw && typeof raw === "object" ? raw : {};
   const nullableNumber = (value) =>
@@ -166,6 +184,23 @@ function normalizeGroundedFacts(raw) {
           .slice(0, 12)
       : [],
   };
+}
+
+function normalizeCandidateGroundings(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((row) => {
+      const selectionIndex = positiveIntegerOrNull(row?.selectionIndex);
+      const replySegment = clean(row?.replySegment, 900);
+      if (selectionIndex == null || !replySegment) return null;
+      return {
+        selectionIndex,
+        replySegment,
+        groundedFacts: normalizeGroundedFacts(row?.groundedFacts),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 12);
 }
 
 /**
@@ -294,6 +329,468 @@ function compactCustomerSafeBooking(booking) {
   };
 }
 
+function compactCustomerSafeBookingCandidate(booking, fallbackIndex) {
+  const compact = compactCustomerSafeBooking(booking);
+  if (!compact) return null;
+  return {
+    selectionIndex:
+      positiveIntegerOrNull(booking?.selectionIndex) ?? fallbackIndex,
+    ...compact,
+  };
+}
+
+function bookingCandidatesForFacts(facts) {
+  const explicit = Array.isArray(facts?.bookingCandidates)
+    ? facts.bookingCandidates
+    : [];
+  if (explicit.length > 0) {
+    return explicit
+      .map((row, index) => ({
+        ...(row && typeof row === "object" ? row : {}),
+        selectionIndex:
+          positiveIntegerOrNull(row?.selectionIndex) ?? index + 1,
+      }))
+      .filter((row) => row && typeof row === "object");
+  }
+  if (facts?.booking && typeof facts.booking === "object") {
+    return [{ ...facts.booking, selectionIndex: 1 }];
+  }
+  return Array.isArray(facts?.activeBookings)
+    ? facts.activeBookings.map((row, index) => ({
+        ...(row && typeof row === "object" ? row : {}),
+        selectionIndex:
+          positiveIntegerOrNull(row?.selectionIndex) ?? index + 1,
+      }))
+    : [];
+}
+
+function normalizeCustomerSafeIdentityValue(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function customerSafeBookingFingerprint(booking) {
+  return JSON.stringify([
+    normalizeCustomerSafeIdentityValue(booking?.customerSafeReference),
+    normalizeCustomerSafeIdentityValue(booking?.itemLabel),
+    Number.isFinite(Number(booking?.durationDays))
+      ? Math.floor(Number(booking.durationDays))
+      : null,
+    normalizeCustomerSafeIdentityValue(booking?.startDate),
+    normalizeCustomerSafeIdentityValue(booking?.endDate),
+    normalizeCustomerSafeIdentityValue(booking?.pickupTime),
+    normalizeCustomerSafeIdentityValue(booking?.deliveryTime),
+    normalizeCustomerSafeIdentityValue(booking?.deliveryMethod),
+    normalizeCustomerSafeIdentityValue(booking?.deliveryAddress),
+    Number.isFinite(Number(booking?.totalAmount))
+      ? Number(booking.totalAmount)
+      : null,
+    Number.isFinite(Number(booking?.dailyRate))
+      ? Number(booking.dailyRate)
+      : null,
+  ]);
+}
+
+function hasCustomerIndistinguishableBookingCandidates(candidates) {
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const fingerprint = customerSafeBookingFingerprint(candidate);
+    if (seen.has(fingerprint)) return true;
+    seen.add(fingerprint);
+  }
+  return false;
+}
+
+function replyGuardFactsForSelectedBooking(facts, booking) {
+  const base =
+    facts?.replyGuardFacts && typeof facts.replyGuardFacts === "object"
+      ? facts.replyGuardFacts
+      : {};
+  const known =
+    facts?.known && typeof facts.known === "object" ? facts.known : {};
+  return {
+    ...base,
+    bookingExecutionVerified: true,
+    itemId: booking?.itemId ?? null,
+    itemLabel: booking?.itemLabel ?? null,
+    durationDays: booking?.durationDays ?? null,
+    bookingStatus: booking?.status ?? null,
+    bookingReference: booking?.customerSafeReference ?? null,
+    totalAmount: booking?.totalAmount ?? null,
+    dailyRate: booking?.dailyRate ?? null,
+    advanceAmount: known.advanceAmount ?? base.advanceAmount ?? null,
+    startDate: booking?.startDate ?? null,
+    endDate: booking?.endDate ?? null,
+    pickupTime: booking?.pickupTime ?? null,
+    deliveryTime: booking?.deliveryTime ?? null,
+    deliveryMethod: booking?.deliveryMethod ?? null,
+    deliveryAddress: booking?.deliveryAddress ?? null,
+    activeBookings: [],
+    bookingSelectionRequired: false,
+  };
+}
+
+function replyGuardFactsWithoutSelectedBooking(facts) {
+  const base =
+    facts?.replyGuardFacts && typeof facts.replyGuardFacts === "object"
+      ? facts.replyGuardFacts
+      : {};
+  return {
+    catalogItems: Array.isArray(base.catalogItems) ? base.catalogItems : [],
+    knownPolicies:
+      base.knownPolicies && typeof base.knownPolicies === "object"
+        ? base.knownPolicies
+        : {},
+    advanceAmount: base.advanceAmount ?? facts?.known?.advanceAmount ?? null,
+    activeBookings: [],
+    bookingSelectionRequired: true,
+  };
+}
+
+function replyGuardFactsForAllCandidates(facts, candidates) {
+  const base =
+    facts?.replyGuardFacts && typeof facts.replyGuardFacts === "object"
+      ? facts.replyGuardFacts
+      : {};
+  return {
+    catalogItems: Array.isArray(base.catalogItems) ? base.catalogItems : [],
+    knownPolicies:
+      base.knownPolicies && typeof base.knownPolicies === "object"
+        ? base.knownPolicies
+        : {},
+    advanceAmount: base.advanceAmount ?? facts?.known?.advanceAmount ?? null,
+    activeBookings: candidates.map((booking) => ({
+      itemId: booking?.itemId ?? null,
+      itemLabel: booking?.itemLabel ?? null,
+      durationDays: booking?.durationDays ?? null,
+      bookingStatus: booking?.status ?? null,
+      bookingReference: booking?.customerSafeReference ?? null,
+      totalAmount: booking?.totalAmount ?? null,
+      dailyRate: booking?.dailyRate ?? null,
+      startDate: booking?.startDate ?? null,
+      endDate: booking?.endDate ?? null,
+      pickupTime: booking?.pickupTime ?? null,
+      deliveryTime: booking?.deliveryTime ?? null,
+    })),
+    bookingSelectionRequired: false,
+  };
+}
+
+function collapseReplyWhitespace(value) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function segmentNamesCustomerSafeBooking(segment, booking) {
+  const normalizedSegment = normalizeCustomerSafeIdentityValue(segment);
+  if (!normalizedSegment) return false;
+  const safeNames = [
+    booking?.customerSafeReference,
+    booking?.itemLabel,
+  ]
+    .map(normalizeCustomerSafeIdentityValue)
+    .filter(Boolean);
+  return safeNames.some(
+    (value) =>
+      normalizedSegment === value ||
+      normalizedSegment.startsWith(`${value} `) ||
+      normalizedSegment.endsWith(` ${value}`) ||
+      normalizedSegment.includes(` ${value} `)
+  );
+}
+
+function validateAllCandidateReplyGrounding({
+  replyText,
+  candidateGroundings,
+  candidates,
+  facts,
+  userLine,
+  historyLine,
+  styleKey,
+}) {
+  const fullReply = collapseReplyWhitespace(replyText);
+  const rows = Array.isArray(candidateGroundings)
+    ? candidateGroundings
+    : [];
+  if (
+    !fullReply ||
+    rows.length !== candidates.length ||
+    candidates.length < 2
+  ) {
+    return { ok: false, reason: "all_candidates_grounding_incomplete" };
+  }
+
+  const byIndex = new Map(
+    candidates.map((candidate) => [
+      positiveIntegerOrNull(candidate?.selectionIndex),
+      candidate,
+    ])
+  );
+  const seenIndexes = new Set();
+  const occupied = [];
+
+  for (const row of rows) {
+    const selectionIndex = positiveIntegerOrNull(row?.selectionIndex);
+    const candidate = byIndex.get(selectionIndex);
+    const segment = collapseReplyWhitespace(row?.replySegment);
+    if (
+      selectionIndex == null ||
+      seenIndexes.has(selectionIndex) ||
+      !candidate ||
+      !segment ||
+      !segmentNamesCustomerSafeBooking(segment, candidate)
+    ) {
+      return {
+        ok: false,
+        reason: "all_candidates_grounding_invalid_selection",
+      };
+    }
+    const start = fullReply.indexOf(segment);
+    if (
+      start < 0 ||
+      occupied.some(
+        (range) =>
+          start < range.end && start + segment.length > range.start
+      )
+    ) {
+      return {
+        ok: false,
+        reason: "all_candidates_grounding_segment_mismatch",
+      };
+    }
+    occupied.push({ start, end: start + segment.length });
+    seenIndexes.add(selectionIndex);
+
+    const selectedFacts = {
+      ...(facts && typeof facts === "object" ? facts : {}),
+      booking: candidate,
+      activeBookings: [],
+      replyGuardFacts: replyGuardFactsForSelectedBooking(facts, candidate),
+    };
+    const contract = buildPostConfirmPaReplyContract({
+      ...selectedFacts,
+      customerMessageText: userLine,
+      recentDialogue: historyLine || null,
+      styleKey,
+    });
+    const guarded = validateCustomerReplyAgainstContract(
+      segment,
+      { ...contract, replyRequired: true },
+      null,
+      row?.groundedFacts
+    );
+    if (!guarded.ok) return guarded;
+  }
+
+  if (seenIndexes.size !== candidates.length) {
+    return { ok: false, reason: "all_candidates_grounding_incomplete" };
+  }
+
+  const remainderChars = [...fullReply];
+  for (const range of occupied) {
+    for (let index = range.start; index < range.end; index += 1) {
+      remainderChars[index] = " ";
+    }
+  }
+  const remainder = collapseReplyWhitespace(remainderChars.join(""));
+  if (remainder) {
+    const remainderFacts = {
+      ...(facts && typeof facts === "object" ? facts : {}),
+      booking: null,
+      activeBookings: [],
+      replyGuardFacts: replyGuardFactsWithoutSelectedBooking(facts),
+    };
+    const remainderContract = buildPostConfirmPaReplyContract({
+      ...remainderFacts,
+      customerMessageText: userLine,
+      recentDialogue: historyLine || null,
+      styleKey,
+    });
+    const remainderGuard = validateCustomerReplyAgainstContract(
+      remainder,
+      { ...remainderContract, replyRequired: false },
+      null,
+      null
+    );
+    if (!remainderGuard.ok) return remainderGuard;
+  }
+
+  return { ok: true };
+}
+
+export function resolvePostConfirmBookingSelection(decision, facts) {
+  const candidates = bookingCandidatesForFacts(facts);
+  const mode = cleanBookingSelectionMode(decision?.bookingSelectionMode);
+  const requestedIndex = positiveIntegerOrNull(decision?.selectedBookingIndex);
+  const mutationRequested =
+    cleanAction(decision?.action) === "request_booking_mutation";
+  const pendingAvailabilityAction =
+    cleanAction(decision?.action) === "confirm_pending_availability" ||
+    cleanAction(decision?.action) === "decline_pending_availability";
+  const focusIndex = positiveIntegerOrNull(
+    facts?.bookingFocus?.selectedBookingIndex
+  );
+  const indistinguishableCandidates =
+    candidates.length > 1 &&
+    hasCustomerIndistinguishableBookingCandidates(candidates);
+
+  if (
+    mutationRequested &&
+    candidates.length > 1 &&
+    mode !== "candidate"
+  ) {
+    return {
+      ok: false,
+      reason: "ambiguous_booking_mutation_requires_candidate",
+      mode,
+      selectedBookingIndex: null,
+      booking: null,
+      bookings: [],
+    };
+  }
+
+  if (mode === "all_candidates") {
+    const readOnlyInformationRequest =
+      !mutationRequested &&
+      cleanAction(decision?.action) === "reply" &&
+      (decision?.conversationAct === "information_request" ||
+        decision?.customerIntent === "ask_fact");
+    if (
+      candidates.length < 2 ||
+      !readOnlyInformationRequest ||
+      indistinguishableCandidates
+    ) {
+      return {
+        ok: false,
+        reason: indistinguishableCandidates
+          ? "indistinguishable_booking_candidates"
+          : "all_candidates_read_only_only",
+        mode,
+        selectedBookingIndex: null,
+        booking: null,
+        bookings: [],
+      };
+    }
+    return {
+      ok: true,
+      reason: "ALL_CANDIDATES_SELECTED",
+      mode,
+      selectedBookingIndex: null,
+      booking: null,
+      bookings: candidates,
+    };
+  }
+
+  let selectedIndex = null;
+  if (mode === "candidate") {
+    selectedIndex = requestedIndex;
+  } else if (mode === "focused") {
+    selectedIndex = focusIndex ?? (candidates.length === 1 ? 1 : null);
+  } else if (
+    candidates.length === 1 &&
+    mode === "none" &&
+    (mutationRequested ||
+      decision?.conversationAct === "information_request" ||
+      decision?.customerIntent === "ask_fact")
+  ) {
+    // One active booking has no selection ambiguity; preserve main behavior.
+    selectedIndex = 1;
+  }
+
+  if (selectedIndex != null) {
+    if (indistinguishableCandidates) {
+      return {
+        ok: false,
+        reason: "indistinguishable_booking_candidates",
+        mode,
+        selectedBookingIndex: null,
+        booking: null,
+        bookings: [],
+      };
+    }
+    const booking =
+      candidates.find(
+        (row) => positiveIntegerOrNull(row?.selectionIndex) === selectedIndex
+      ) ?? null;
+    if (!booking) {
+      return {
+        ok: false,
+        reason: "invalid_or_stale_booking_selection",
+        mode,
+        selectedBookingIndex: selectedIndex,
+        booking: null,
+        bookings: [],
+      };
+    }
+    return {
+      ok: true,
+      reason: "SELECTED",
+      mode,
+      selectedBookingIndex: selectedIndex,
+      booking,
+      bookings: [booking],
+    };
+  }
+
+  if (mode === "focused" || mode === "candidate") {
+    return {
+      ok: false,
+      reason: "invalid_or_stale_booking_selection",
+      mode,
+      selectedBookingIndex: null,
+      booking: null,
+      bookings: [],
+    };
+  }
+
+  const bookingScopedTurn =
+    decision?.conversationAct === "information_request" ||
+    decision?.conversationAct === "action_request" ||
+    decision?.customerIntent === "ask_fact" ||
+    decision?.customerIntent === "ask_action";
+  if (
+    candidates.length > 1 &&
+    bookingScopedTurn &&
+    !pendingAvailabilityAction &&
+    mode !== "clarification_required" &&
+    !(mode === "none" && facts?.policy?.ambiguousBookingSelection === true)
+  ) {
+    return {
+      ok: false,
+      reason: "booking_selection_required",
+      mode,
+      selectedBookingIndex: null,
+      booking: null,
+      bookings: [],
+    };
+  }
+
+  return {
+    ok: true,
+    reason:
+      mode === "clarification_required" ||
+      (mode === "none" &&
+        candidates.length > 1 &&
+        facts?.policy?.ambiguousBookingSelection === true)
+        ? "CLARIFICATION_REQUIRED"
+        : "NO_BOOKING_SELECTED",
+    mode:
+      mode === "none" &&
+      candidates.length > 1 &&
+      facts?.policy?.ambiguousBookingSelection === true
+        ? "clarification_required"
+        : mode,
+    selectedBookingIndex: null,
+    booking: null,
+    bookings: [],
+  };
+}
+
 /**
  * Compact verified facts for the decision prompt (read-only).
  * Includes booking-scoped missing-info situation (open + closed follow-ups).
@@ -312,6 +809,26 @@ export function compactPostConfirmFactsForPrompt(facts) {
   const activeBookings = Array.isArray(f.activeBookings)
     ? f.activeBookings.map(compactCustomerSafeBooking).filter(Boolean).slice(0, 12)
     : [];
+  const bookingCandidates = bookingCandidatesForFacts(f)
+    .map((row, index) =>
+      compactCustomerSafeBookingCandidate(row, index + 1)
+    )
+    .filter(Boolean)
+    .slice(0, 12);
+  const bookingFocus =
+    f.bookingFocus && typeof f.bookingFocus === "object"
+      ? {
+          source:
+            f.bookingFocus.source === "latest_confirmed_linked_avr"
+              ? "latest_confirmed_linked_avr"
+              : null,
+          confidence:
+            f.bookingFocus.confidence === "trusted" ? "trusted" : null,
+          selectedBookingIndex: positiveIntegerOrNull(
+            f.bookingFocus.selectedBookingIndex
+          ),
+        }
+      : null;
   const pendingAvailabilityRequests = Array.isArray(
     f.pendingAvailabilityRequests
   )
@@ -376,6 +893,8 @@ export function compactPostConfirmFactsForPrompt(facts) {
     booking: Object.keys(booking).length > 0
       ? compactCustomerSafeBooking(booking)
       : null,
+    bookingCandidates,
+    bookingFocus,
     activeBookings,
     pendingAvailabilityRequests,
     mutationExecution,
@@ -441,6 +960,9 @@ function defaultDecision(overrides = {}) {
     mutationIntent: "none",
     mutationExecutionRequested: false,
     mutationExecutionStatus: "not_executed",
+    bookingSelectionMode: "none",
+    selectedBookingIndex: null,
+    candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     ...overrides,
   };
@@ -509,6 +1031,12 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     null;
   let situation = cleanSituation(parsed.situation);
   const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
+  const bookingSelectionMode = cleanBookingSelectionMode(
+    parsed.bookingSelectionMode
+  );
+  const selectedBookingIndex = positiveIntegerOrNull(
+    parsed.selectedBookingIndex
+  );
   const pendingAvailabilitySelectionIndex =
     Number.isInteger(Number(parsed.pendingAvailabilitySelectionIndex)) &&
     Number(parsed.pendingAvailabilitySelectionIndex) >= 1
@@ -629,6 +1157,11 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       mutationExecutionStatus: cleanMutationExecutionStatus(
         parsed.mutationExecutionStatus
       ),
+      bookingSelectionMode,
+      selectedBookingIndex,
+      candidateGroundings: normalizeCandidateGroundings(
+        parsed.candidateGroundings
+      ),
       pendingAvailabilitySelectionIndex,
       replySemantics: normalizeReplySemantics(parsed.replySemantics),
       groundedFacts: normalizeGroundedFacts(parsed.groundedFacts),
@@ -709,8 +1242,14 @@ export async function executePostConfirmPaLaneDecision({
     (facts?.booking && typeof facts.booking === "object" && facts.booking.id) ||
       (Array.isArray(facts?.activeBookings) && facts.activeBookings.length > 0)
   );
-  const hasAmbiguousBookings =
+  const hasMultipleBookings =
     Array.isArray(facts?.activeBookings) && facts.activeBookings.length > 1;
+  const hasTrustedBookingFocus =
+    facts?.bookingFocus?.source === "latest_confirmed_linked_avr" &&
+    facts?.bookingFocus?.confidence === "trusted" &&
+    positiveIntegerOrNull(facts?.bookingFocus?.selectedBookingIndex) != null;
+  const hasAmbiguousBookings =
+    hasMultipleBookings && !hasTrustedBookingFocus;
 
   const escalateGuidance = loopOn
     ? `- Set action="escalate_missing_info" ONLY when ALL are true:
@@ -736,7 +1275,7 @@ export async function executePostConfirmPaLaneDecision({
           ? { tone: facts.tone }
           : null,
   });
-  const replyContract = buildPostConfirmPaReplyContract({
+  const baseReplyContract = buildPostConfirmPaReplyContract({
     ...(facts && typeof facts === "object" ? facts : {}),
     customerMessageText: userLine,
     recentDialogue: historyLine || null,
@@ -770,6 +1309,68 @@ export async function executePostConfirmPaLaneDecision({
         mutationExecutionStatus: {
           type: "string",
           enum: [...POST_CONFIRM_MUTATION_EXECUTION_STATUSES],
+        },
+        bookingSelectionMode: {
+          type: "string",
+          enum: [...POST_CONFIRM_BOOKING_SELECTION_MODES],
+        },
+        selectedBookingIndex: {
+          type: ["integer", "null"],
+        },
+        candidateGroundings: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              selectionIndex: { type: "integer" },
+              replySegment: { type: "string" },
+              groundedFacts: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  itemId: { type: ["string", "null"] },
+                  durationDays: { type: ["number", "null"] },
+                  bookingStatus: { type: ["string", "null"] },
+                  bookingReference: { type: ["string", "null"] },
+                  totalAmount: { type: ["number", "null"] },
+                  dailyRate: { type: ["number", "null"] },
+                  advanceAmount: { type: ["number", "null"] },
+                  startDate: { type: ["string", "null"] },
+                  endDate: { type: ["string", "null"] },
+                  pickupTime: { type: ["string", "null"] },
+                  deliveryTime: { type: ["string", "null"] },
+                  policyClaims: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        key: { type: "string" },
+                        value: { type: "string" },
+                      },
+                      required: ["key", "value"],
+                    },
+                  },
+                },
+                required: [
+                  "itemId",
+                  "durationDays",
+                  "bookingStatus",
+                  "bookingReference",
+                  "totalAmount",
+                  "dailyRate",
+                  "advanceAmount",
+                  "startDate",
+                  "endDate",
+                  "pickupTime",
+                  "deliveryTime",
+                  "policyClaims",
+                ],
+              },
+            },
+            required: ["selectionIndex", "replySegment", "groundedFacts"],
+          },
         },
         pendingAvailabilitySelectionIndex: {
           type: ["integer", "null"],
@@ -831,6 +1432,9 @@ export async function executePostConfirmPaLaneDecision({
         "mutationIntent",
         "mutationExecutionRequested",
         "mutationExecutionStatus",
+        "bookingSelectionMode",
+        "selectedBookingIndex",
+        "candidateGroundings",
         "pendingAvailabilitySelectionIndex",
         "groundedFacts",
         "replySemantics",
@@ -843,7 +1447,7 @@ export async function executePostConfirmPaLaneDecision({
 LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
 Return STRICT JSON (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
@@ -879,6 +1483,18 @@ STEP 4 — action:
 - confirm_pending_availability / decline_pending_availability: use only when the customer clearly intends that action for one listed pendingAvailabilityRequests entry. Set pendingAvailabilitySelectionIndex to that entry's selectionIndex. If intent or selection is unclear, ask a natural clarification with action="reply".
 - mutationExecutionRequested=true only with request_booking_mutation.
 - mutationExecutionStatus must reflect VERIFIED_BUSINESS_PA_FACTS_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
+- bookingSelectionMode controls booking scope:
+  focused = use bookingFocus.selectedBookingIndex for a read-only informational question;
+  candidate = customer explicitly identified one bookingCandidates row, and selectedBookingIndex must be that row;
+  all_candidates = customer explicitly asked for facts about all listed bookingCandidates; read-only information only;
+  clarification_required = more than one booking could apply and the customer did not identify one;
+  none = no booking is relevant (for example social conversation).
+- A trusted focused booking may default only read-only informational questions. Never use focused for a booking mutation.
+- For all_candidates, set selectedBookingIndex=null and provide exactly one candidateGroundings row for every bookingCandidates row. Each replySegment must be an exact non-overlapping substring of customerReply, name that booking using customer-safe facts, and contain only facts for its selectionIndex.
+- Never use all_candidates for a mutation or action request.
+- If two candidates have no customer-safe distinction, use clarification_required and naturally request a date, reference, or other safe distinguishing detail. Never guess an index.
+- For any request_booking_mutation with multiple bookings, use candidate only when the customer clearly identified that exact booking. Otherwise action="reply", bookingSelectionMode="clarification_required", selectedBookingIndex=null, and ask naturally which booking.
+- bookingCandidates indexes apply only to this decision. Do not quote indexes or internal identifiers to the customer.
 - Never fall through to another conversational router.
 - When pendingAvailabilityExecution exists, report that verified outcome naturally with action="reply"; do not request the same action again.
 
@@ -901,9 +1517,11 @@ LANE FACT RULES:
       : "No active booking object."
   }
 - ${
-    hasAmbiguousBookings
-      ? "Multiple active bookings are present. Ask a natural clarification using only their customer-safe facts. Do not select or mutate one."
-      : "There is no multi-booking ambiguity."
+    hasTrustedBookingFocus
+      ? "Multiple active bookings are present with a trusted latest-confirmed focus. For a generic read-only booking question use bookingSelectionMode=focused. If the customer explicitly names another booking, use bookingSelectionMode=candidate with its selectionIndex."
+      : hasAmbiguousBookings
+        ? "Multiple active bookings are present without trusted focus. Generic booking questions require bookingSelectionMode=clarification_required and a natural clarification. Do not guess or mutate one."
+        : "There is no multi-booking ambiguity."
   }
 - replySemantics.claims must only list claims supported by verified facts / allowedClaims.
 - groundedFacts is internal validation metadata. Populate every verified booking,
@@ -922,10 +1540,10 @@ STRICT SAFETY:
     userPayload += `\n\nRECENT_CONVERSATION:\n${historyLine}`;
   }
   userPayload += `\n\nCUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
-    allowedClaims: replyContract.allowedClaims,
-    forbiddenClaims: replyContract.forbiddenClaims,
-    requiredMeaning: replyContract.requiredMeaning,
-    customerLanguageStyle: replyContract.customerLanguageStyle,
+    allowedClaims: baseReplyContract.allowedClaims,
+    forbiddenClaims: baseReplyContract.forbiddenClaims,
+    requiredMeaning: baseReplyContract.requiredMeaning,
+    customerLanguageStyle: baseReplyContract.customerLanguageStyle,
   })}`;
 
   const completionFn =
@@ -1027,6 +1645,26 @@ STRICT SAFETY:
       } else {
         finalized.mutationIntent = "none";
       }
+      const bookingSelection = resolvePostConfirmBookingSelection(
+        finalized,
+        facts
+      );
+      if (!bookingSelection.ok) {
+        lastReason =
+          bookingSelection.reason || "invalid_or_stale_booking_selection";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: lastReason,
+        };
+      }
+      finalized.bookingSelectionMode = bookingSelection.mode;
+      finalized.selectedBookingIndex =
+        bookingSelection.selectedBookingIndex;
+      finalized.selectedBookingId = bookingSelection.booking?.id ?? null;
+
       const replyText = cleanCustomerReply(finalized?.customerReply);
       if (isPostConfirmNearEchoViolation(userLine, replyText, finalized)) {
         lastReason = "near_echo_reply";
@@ -1049,6 +1687,61 @@ STRICT SAFETY:
       const pendingAvailabilityAction =
         finalized.action === "confirm_pending_availability" ||
         finalized.action === "decline_pending_availability";
+      if (bookingSelection.mode === "all_candidates") {
+        const allCandidateGuard = validateAllCandidateReplyGrounding({
+          replyText,
+          candidateGroundings: finalized.candidateGroundings,
+          candidates: bookingSelection.bookings,
+          facts,
+          userLine,
+          historyLine,
+          styleKey,
+        });
+        if (!allCandidateGuard.ok) {
+          lastReason =
+            allCandidateGuard.reason ||
+            "all_candidates_grounding_failed";
+          if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+          return {
+            ok: false,
+            decision: stripInternalReplySemantics(defaultDecision()),
+            source: "technical_fallback",
+            reason: lastReason,
+          };
+        }
+      }
+      const selectedContractFacts = bookingSelection.booking
+        ? {
+            ...(facts && typeof facts === "object" ? facts : {}),
+            booking: bookingSelection.booking,
+            activeBookings: [],
+            replyGuardFacts: replyGuardFactsForSelectedBooking(
+              facts,
+              bookingSelection.booking
+            ),
+          }
+        : bookingSelection.mode === "all_candidates"
+          ? {
+              ...(facts && typeof facts === "object" ? facts : {}),
+              booking: null,
+              activeBookings: bookingSelection.bookings,
+              replyGuardFacts: replyGuardFactsForAllCandidates(
+                facts,
+                bookingSelection.bookings
+              ),
+            }
+        : {
+            ...(facts && typeof facts === "object" ? facts : {}),
+            booking: null,
+            activeBookings: [],
+            replyGuardFacts: replyGuardFactsWithoutSelectedBooking(facts),
+          };
+      const replyContract = buildPostConfirmPaReplyContract({
+        ...selectedContractFacts,
+        customerMessageText: userLine,
+        recentDialogue: historyLine || null,
+        styleKey,
+      });
       const guard = validateCustomerReplyAgainstContract(
         replyText,
         {

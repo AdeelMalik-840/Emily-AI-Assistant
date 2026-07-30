@@ -58,6 +58,7 @@ import {
 } from "./availabilityRequestService.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
 import { normalizePhoneE164 } from "./connections.js";
+import { appendConversationMessage } from "./conversationStore.js";
 
 export {
   classifyAvailabilityConfirmationIntent,
@@ -69,6 +70,38 @@ export {
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
+}
+
+function timestampMs(value) {
+  if (value == null) return null;
+  if (typeof value?.toMillis === "function") {
+    const ms = Number(value.toMillis());
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  if (typeof value?.seconds === "number") {
+    const ms =
+      Number(value.seconds) * 1000 +
+      Math.floor(Number(value.nanoseconds ?? 0) / 1e6);
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function needsConfirmedBookingReplyRecovery(request, messageId) {
+  if (
+    clean(request?.customerConfirmationStatus) !== "confirmed" ||
+    !clean(request?.linkedBookingId) ||
+    !clean(messageId) ||
+    clean(request?.customerConfirmationMessageId) !== clean(messageId)
+  ) {
+    return false;
+  }
+  const confirmedAt = timestampMs(request?.customerConfirmationAt);
+  const outboundAt = timestampMs(request?.lastCustomerDmOutboundAt);
+  return confirmedAt != null && (outboundAt == null || outboundAt < confirmedAt);
 }
 
 function normalizePhone(value) {
@@ -264,11 +297,23 @@ async function sendCustomerDmReply({
   businessId,
   requestId,
   promptType,
+  sourceMessageId = null,
+  recordOutboundOnSuccess = true,
+  includeDeliveryStatus = false,
 }) {
-  await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-    recipientType: "individual",
-  }).catch(() => null);
-  if (requestId) {
+  const sendResult = await sendWhatsAppMessageFn(
+    phone,
+    reply,
+    sendCredentials ?? undefined,
+    {
+      recipientType: "individual",
+    }
+  ).catch(() => null);
+  const providerAccepted =
+    sendResult === true ||
+    sendResult?.ok === true ||
+    sendResult?.success === true;
+  if (providerAccepted && recordOutboundOnSuccess && requestId) {
     await recordAvailabilityCustomerDmOutbound({
       db: connection,
       businessId,
@@ -277,7 +322,25 @@ async function sendCustomerDmReply({
       promptType,
     }).catch(() => null);
   }
-  return reply;
+  if (providerAccepted) {
+    await appendConversationMessage(connection, {
+      ownerUserId: businessId,
+      customerNumber: phone,
+      role: "assistant",
+      text: reply,
+      sourceMessageId,
+      providerMessageId:
+        sendResult?.providerMessageId ?? sendResult?.messages?.[0]?.id ?? null,
+    }).catch(() => null);
+  }
+  return includeDeliveryStatus
+    ? {
+        reply,
+        providerAccepted,
+        providerMessageId:
+          sendResult?.providerMessageId ?? sendResult?.messages?.[0]?.id ?? null,
+      }
+    : reply;
 }
 
 const PRE_CLAIM_CONFIRM_FAILURE_REASONS = new Set([
@@ -930,6 +993,7 @@ async function handleWaitingConfirmDmBrainCloudTurn({
         businessId,
         requestId,
         promptType: recordedPromptType,
+        sourceMessageId: inboundMessageId || null,
       });
     }
     await recordCloudInboundIdempotency({
@@ -987,17 +1051,31 @@ async function handleWaitingConfirmDmBrainCloudTurn({
         ? result.reply || buildAvailabilityConfirmSuccessReply()
         : clean(decision.customerReply) ||
           buildAvailabilityConfirmClarificationReply();
-    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-      recipientType: "individual",
-    }).catch(() => null);
-    if (result.ok === true) {
-      await recordAvailabilityCustomerDmOutbound({
-        db: connection,
-        businessId,
+    const sendOutcome = await sendCustomerDmReply({
+      phone,
+      reply,
+      sendWhatsAppMessageFn,
+      sendCredentials,
+      connection,
+      businessId,
+      requestId,
+      promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
+      sourceMessageId: inboundMessageId || null,
+      recordOutboundOnSuccess: result.ok === true,
+      includeDeliveryStatus: true,
+    });
+    if (sendOutcome?.providerAccepted !== true) {
+      return waitingConfirmBrainMeta({
+        handled: false,
+        retryable: true,
+        action: "confirm_reply_send_failed",
+        reason: "CLOUD_CONFIRM_REPLY_NOT_DELIVERED",
+        reply: "",
+        result,
+        decision,
         requestId,
-        reply,
-        promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
-      }).catch(() => null);
+        actionType: "confirm_booking",
+      });
     }
     await recordCloudInboundIdempotency({
       connection,
@@ -1111,11 +1189,50 @@ export async function handleAvailabilityCustomerCloudInbound({
       messageId: inboundMessageId,
     });
     if (prior) {
+      const priorRequestId = clean(prior.requestId ?? prior.id) || null;
+      if (
+        priorRequestId &&
+        needsConfirmedBookingReplyRecovery(prior, inboundMessageId)
+      ) {
+        const recoveryReply = buildAvailabilityConfirmSuccessReply();
+        const recoverySend = await sendCustomerDmReply({
+          phone,
+          reply: recoveryReply,
+          sendWhatsAppMessageFn,
+          sendCredentials,
+          connection,
+          businessId: uid,
+          requestId: priorRequestId,
+          promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
+          sourceMessageId: inboundMessageId,
+          recordOutboundOnSuccess: true,
+          includeDeliveryStatus: true,
+        });
+        if (recoverySend?.providerAccepted === true) {
+          return {
+            handled: true,
+            action: "confirmed_booking_reply_recovered",
+            reply: recoveryReply,
+            requestId: priorRequestId,
+            duplicate: true,
+            recoveredOutbound: true,
+          };
+        }
+        return {
+          handled: false,
+          retryable: true,
+          action: "confirm_reply_send_failed",
+          reason: "CLOUD_CONFIRM_REPLY_NOT_DELIVERED",
+          reply: "",
+          requestId: priorRequestId,
+          duplicate: true,
+        };
+      }
       return {
         handled: true,
         action: "duplicate_inbound",
         reply: null,
-        requestId: clean(prior.requestId ?? prior.id) || null,
+        requestId: priorRequestId,
         duplicate: true,
       };
     }
@@ -1260,6 +1377,7 @@ export async function handleAvailabilityCustomerCloudInbound({
       businessId: uid,
       requestId,
       promptType: decision.outboundPromptType,
+      sourceMessageId: inboundMessageId || null,
     });
     await recordCloudInboundIdempotency({
       connection,
@@ -1285,17 +1403,33 @@ export async function handleAvailabilityCustomerCloudInbound({
       result.ok === true
         ? result.reply || buildAvailabilityConfirmSuccessReply()
         : buildAvailabilityConfirmClarificationReply();
-    await sendWhatsAppMessageFn(phone, reply, sendCredentials ?? undefined, {
-      recipientType: "individual",
-    }).catch(() => null);
-    if (result.ok === true) {
-      await recordAvailabilityCustomerDmOutbound({
-        db: connection,
-        businessId: uid,
+    const sendOutcome = await sendCustomerDmReply({
+      phone,
+      reply,
+      sendWhatsAppMessageFn,
+      sendCredentials,
+      connection,
+      businessId: uid,
+      requestId,
+      promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
+      sourceMessageId: inboundMessageId || null,
+      recordOutboundOnSuccess: result.ok === true,
+      includeDeliveryStatus: true,
+    });
+    if (sendOutcome?.providerAccepted !== true) {
+      return {
+        handled: false,
+        retryable: true,
+        action: "confirm_reply_send_failed",
+        reason: "CLOUD_CONFIRM_REPLY_NOT_DELIVERED",
+        reply: "",
+        result,
+        decision,
         requestId,
-        reply,
-        promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
-      }).catch(() => null);
+        actionType: decision.actionType,
+        failureReason: "CLOUD_CONFIRM_REPLY_NOT_DELIVERED",
+        failureStage: "customer_confirmation_reply_send",
+      };
     }
     await recordCloudInboundIdempotency({
       connection,
@@ -1333,6 +1467,7 @@ export async function handleAvailabilityCustomerCloudInbound({
     businessId: uid,
     requestId,
     promptType: decision.outboundPromptType,
+    sourceMessageId: inboundMessageId || null,
   });
   await recordCloudInboundIdempotency({
     connection,

@@ -28,6 +28,8 @@ function conversationDocId(ownerUserId, customerNumber) {
  * @param {string} p.customerNumber - WhatsApp sender (E.164 digits ok)
  * @param {'user'|'assistant'} p.role
  * @param {string} p.text
+ * @param {string | null} [p.sourceMessageId] - inbound provider id that caused this entry
+ * @param {string | null} [p.providerMessageId] - provider id for this exact message
  */
 export async function appendConversationMessage(db, p) {
   const docId = conversationDocId(p.ownerUserId, p.customerNumber);
@@ -36,19 +38,46 @@ export async function appendConversationMessage(db, p) {
   const ref = db.collection("conversations").doc(docId);
   const text = String(p.text ?? "").trim();
   if (!text) return;
+  const role = p.role === "assistant" ? "assistant" : "user";
+  const sourceMessageId = String(p.sourceMessageId ?? "").trim().slice(0, 320);
+  const providerMessageId = String(p.providerMessageId ?? "")
+    .trim()
+    .slice(0, 320);
 
   const entry = {
-    role: p.role === "assistant" ? "assistant" : "user",
+    role,
     text,
+    ...(sourceMessageId ? { sourceMessageId } : {}),
+    ...(providerMessageId ? { providerMessageId } : {}),
     // Firestore forbids FieldValue.serverTimestamp() inside array elements
     timestamp: new Date(),
   };
 
+  let appended = false;
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const data = snap.data();
     const messages = Array.isArray(data?.messages) ? [...data.messages] : [];
+    if (sourceMessageId) {
+      const existing = messages.find(
+        (message) =>
+          message?.role === role &&
+          String(message?.sourceMessageId ?? "").trim() === sourceMessageId
+      );
+      if (existing) {
+        if (String(existing.text ?? "").trim() !== text) {
+          console.warn("[conversation_identity_conflict]", {
+            role,
+            sourceMessageId,
+            existingTextLength: String(existing.text ?? "").trim().length,
+            incomingTextLength: text.length,
+          });
+        }
+        return;
+      }
+    }
     messages.push(entry);
+    appended = true;
     while (messages.length > MAX_MESSAGES) {
       messages.shift();
     }
@@ -63,6 +92,7 @@ export async function appendConversationMessage(db, p) {
       { merge: true }
     );
   });
+  return appended;
 }
 
 /**

@@ -39,10 +39,33 @@ import {
   maskCustomerPhone,
   normalizeCustomerPhoneDigits,
 } from "./availabilityCustomerPhone.js";
+import { appendConversationMessage } from "./conversationStore.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
+}
+
+async function persistCloudCustomerNotificationConversation({
+  db,
+  businessId,
+  customerPhone,
+  requestId,
+  request,
+  text,
+  providerMessageId,
+}) {
+  const sourceMessageId =
+    clean(request?.sourceMessageId, 320) ||
+    `availability_request:${clean(requestId, 160)}:customer_notification`;
+  await appendConversationMessage(db, {
+    ownerUserId: businessId,
+    customerNumber: customerPhone,
+    role: "assistant",
+    text,
+    sourceMessageId,
+    providerMessageId: clean(providerMessageId, 320) || null,
+  }).catch(() => null);
 }
 
 /**
@@ -291,7 +314,7 @@ async function sendCloudAvailabilityMessage({
     recipientType: "individual",
   });
   const sendOk =
-    result === undefined || result === true || result?.ok === true || result?.success === true;
+    result === true || result?.ok === true || result?.success === true;
   if (!sendOk) {
     return { ok: false, reason: "CLOUD_DM_SEND_FAILED", method };
   }
@@ -370,7 +393,7 @@ async function sendCloudAvailabilityTemplateMessage({
     caller: "availabilityCustomerTemplateNotify",
   });
   const sendOk =
-    result === undefined || result === true || result?.ok === true || result?.success === true;
+    result === true || result?.ok === true || result?.success === true;
   if (!sendOk) {
     return {
       ok: false,
@@ -835,6 +858,15 @@ export async function sendAvailabilityCustomerNotification({
           reply: templatePlan.renderedMessage,
           promptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
         }).catch(() => null);
+        await persistCloudCustomerNotificationConversation({
+          db: firestore,
+          businessId: uid,
+          customerPhone: phase4Phone,
+          requestId: rid,
+          request: current,
+          text: templatePlan.renderedMessage,
+          providerMessageId: cloudSend.providerMessageId,
+        });
         await supersedeSiblingWaitingConfirmAfterCloudPrompt({
           db: firestore,
           businessId: uid,
@@ -945,6 +977,15 @@ export async function sendAvailabilityCustomerNotification({
           reply: built.message,
           promptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
         }).catch(() => null);
+        await persistCloudCustomerNotificationConversation({
+          db: firestore,
+          businessId: uid,
+          customerPhone: phase4Phone,
+          requestId: rid,
+          request: current,
+          text: built.message,
+          providerMessageId: cloudSend.providerMessageId,
+        });
         await supersedeSiblingWaitingConfirmAfterCloudPrompt({
           db: firestore,
           businessId: uid,
@@ -1136,6 +1177,15 @@ export async function sendAvailabilityCustomerNotification({
     businessId: uid,
     requestId: rid,
     approvalCustomerNotificationMethod: "cloud_dm",
+  });
+  await persistCloudCustomerNotificationConversation({
+    db: firestore,
+    businessId: uid,
+    customerPhone: cloudSend.phone,
+    requestId: rid,
+    request: current,
+    text: built.message,
+    providerMessageId: cloudSend.providerMessageId,
   });
 
   return {

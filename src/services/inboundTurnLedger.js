@@ -1231,6 +1231,11 @@ function sanitizeCloudRecoveryContext(context = {}) {
       source.conversationCustomerNumber ?? source.customerPhone
     ),
     phoneNumberId: String(source.phoneNumberId ?? "").trim().slice(0, 160),
+    messageTimestamp:
+      Number.isFinite(Number(source.messageTimestamp)) &&
+      Number(source.messageTimestamp) > 0
+        ? Number(source.messageTimestamp)
+        : null,
   };
 }
 

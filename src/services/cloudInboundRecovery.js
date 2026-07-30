@@ -222,6 +222,11 @@ export async function tryRecoverCloudOutboundLockedTurn({
             ).trim(),
             role: "assistant",
             text: replyText,
+            sourceMessageId: String(context.messageId ?? "").trim() || null,
+            providerMessageId:
+              sendResult?.providerMessageId ??
+              sendResult?.messages?.[0]?.id ??
+              null,
           });
         } catch (historyErr) {
           console.warn("[cloud_inbound_recovery_history_failed]", {
@@ -335,6 +340,11 @@ function buildPipelinePayload(entry, db, sendCredentials) {
     messageId: String(
       queuedOwnershipLifecycle?.providerMessageId ?? context.messageId ?? ""
     ).trim(),
+    messageTimestamp:
+      Number.isFinite(Number(context.messageTimestamp)) &&
+      Number(context.messageTimestamp) > 0
+        ? Number(context.messageTimestamp)
+        : null,
     fragmentCount: 1,
     hasMultipleFragments: false,
     isGreetingFirst: false,
