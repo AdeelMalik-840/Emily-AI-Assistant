@@ -497,7 +497,7 @@ test("active booking plus pending availability action stays in one OpenAI lane a
   assert.equal(result.finalReplySource, "openai_post_confirm_pa");
 });
 
-test("two unsupported OpenAI replies fail closed and remain retryable", async () => {
+test("two unsupported OpenAI replies fail closed and become terminal (not Cloud-retryable)", async () => {
   const counters = {};
   const wrong = decisionJson("Toyota Corolla 2 din ke liye book hai.", {
     groundedFacts: {
@@ -522,8 +522,9 @@ test("two unsupported OpenAI replies fail closed and remain retryable", async ()
 
   assert.equal(counters.openaiCalls, 2);
   assert.equal(result.handled, true);
-  assert.equal(result.retryable, true);
-  assert.equal(result.action, "business_pa_retryable_failure");
+  assert.equal(result.retryable, false);
+  assert.equal(result.terminalFailure, true);
+  assert.equal(result.action, "business_pa_terminal_model_failure");
   assert.equal(result.reply, "");
   assert.equal(result.sentReply, false);
   assert.equal(counters.customerSends || 0, 0);
@@ -1008,4 +1009,274 @@ test("no active booking leaves the existing general path unclaimed", async () =>
   assert.equal(result.handled, false);
   assert.equal(result.reason, "NO_ACTIVE_BOOKING");
   assert.equal(openaiCalls, 0);
+});
+
+test("trusted focus + ask_fact + bookingSelectionMode none auto-selects focused booking", async () => {
+  const counters = {};
+  const reply = "Toyota Corolla 4 din ke liye book hai.";
+  const result = await runOwnedTurn({
+    message: "Kitny din k lye book ki h?",
+    facts: trustedMultiBookingFacts({ withFocus: true }),
+    responses: [
+      decisionJson(reply, {
+        bookingSelectionMode: "none",
+        selectedBookingIndex: null,
+        groundedFacts: {
+          itemId: "corolla-grey",
+          durationDays: 4,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 1);
+  assert.equal(result.reply, reply);
+  assert.equal(result.bookingId, "booking-corolla");
+  assert.equal(result.bookingSelectionMode, "focused");
+  assert.equal(result.selectedBookingIndex, 2);
+  assert.equal(result.retryable, false);
+  assert.equal(result.terminalFailure, false);
+});
+
+test("trusted focus auto-select covers rent, pickup, and status ask_fact with mode none", async () => {
+  const cases = [
+    [
+      "4 din ka total rent kitna hoga?",
+      "Corolla ka total rent 20000 PKR hai.",
+      { totalAmount: 20000, itemId: "corolla-grey", durationDays: 4 },
+    ],
+    [
+      "pickup ho jye ga?",
+      "Toyota Corolla Metallic Grey booking approved hai; pickup detail abhi confirm nahi.",
+      { bookingStatus: "approved", itemId: "corolla-grey", durationDays: 4 },
+    ],
+    [
+      "booking status?",
+      "Booking approved hai.",
+      { bookingStatus: "approved", itemId: "corolla-grey", durationDays: 4 },
+    ],
+  ];
+  for (const [message, reply, grounded] of cases) {
+    const counters = {};
+    const result = await runOwnedTurn({
+      message,
+      facts: trustedMultiBookingFacts({ withFocus: true }),
+      responses: [
+        decisionJson(reply, {
+          bookingSelectionMode: "none",
+          groundedFacts: {
+            itemId: grounded.itemId ?? null,
+            durationDays: grounded.durationDays ?? null,
+            bookingStatus: grounded.bookingStatus ?? null,
+            bookingReference: null,
+            totalAmount: grounded.totalAmount ?? null,
+            dailyRate: null,
+            advanceAmount: null,
+            startDate: null,
+            endDate: null,
+            pickupTime: grounded.pickupTime ?? null,
+            deliveryTime: null,
+            policyClaims: [],
+          },
+          replySemantics: {
+            claims:
+              grounded.totalAmount != null ? ["quotation_verified"] : [],
+            languageStyle: "roman_urdu",
+            containsTimingPromise: false,
+            exposesInternalProcess: false,
+          },
+        }),
+      ],
+      counters,
+    });
+    assert.equal(result.bookingSelectionMode, "focused", message);
+    assert.equal(result.selectedBookingIndex, 2, message);
+    assert.equal(result.reply, reply, message);
+    assert.equal(counters.openaiCalls, 1, message);
+  }
+});
+
+test("live semantic-drift silence recovers with one corrective Brain regeneration", async () => {
+  const counters = {};
+  const finalReply = "Toyota Corolla 4 din ke liye book hai.";
+  const result = await runOwnedTurn({
+    message: "Kitny din k lye book ki h?",
+    facts: trustedMultiBookingFacts({ withFocus: true }),
+    history:
+      "User: kar do\nAssistant: Booking confirm ho gayi. Toyota Corolla 4 din ke liye.",
+    responses: [
+      decisionJson("", {
+        situation: "acknowledgement_after_answer",
+        conversationAct: "acknowledgement",
+        customerIntent: "ack",
+        customerIsAskingQuestion: false,
+        shouldReply: false,
+        action: "silence",
+        bookingSelectionMode: "none",
+      }),
+      decisionJson(finalReply, {
+        bookingSelectionMode: "none",
+        groundedFacts: {
+          itemId: "corolla-grey",
+          durationDays: 4,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.equal(result.silenceRecoveryAttempts, 1);
+  assert.equal(result.reply, finalReply);
+  assert.equal(result.bookingId, "booking-corolla");
+  assert.equal(result.bookingSelectionMode, "focused");
+  assert.equal(result.action, "business_pa_reply");
+  assert.notEqual(result.failureReason, "booking_selection_required");
+  assert.notEqual(result.reason, "OPENAI_POST_CONFIRM_FAILED");
+  const corrective = String(counters.lastOpenAiArgs.messages[1].content);
+  assert.match(corrective, /CORRECTIVE REGENERATION/);
+  assert.match(corrective, /Kitny din k lye book ki h/);
+});
+
+test("pure social acknowledgement may stay silence after corrective Brain pass", async () => {
+  const counters = {};
+  const result = await runOwnedTurn({
+    message: "ok shukriya",
+    facts: trustedMultiBookingFacts({ withFocus: true }),
+    responses: [
+      decisionJson("", {
+        situation: "acknowledgement_after_answer",
+        conversationAct: "acknowledgement",
+        customerIntent: "ack",
+        customerIsAskingQuestion: false,
+        shouldReply: false,
+        action: "silence",
+      }),
+      decisionJson("", {
+        situation: "acknowledgement_after_answer",
+        conversationAct: "acknowledgement",
+        customerIntent: "thanks",
+        customerIsAskingQuestion: false,
+        shouldReply: false,
+        action: "silence",
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.equal(result.silenceRecoveryAttempts, 1);
+  assert.equal(result.action, "business_pa_silence");
+  assert.equal(result.reply, "");
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+  assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
+});
+
+test("trusted focus does not auto-select for multi-booking mutation without candidate", async () => {
+  const counters = {};
+  const result = await runOwnedTurn({
+    message: "cancel kar do",
+    facts: trustedMultiBookingFacts({ withFocus: true }),
+    responses: [
+      decisionJson("Cancel request received.", {
+        situation: "protected_action",
+        conversationAct: "action_request",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
+        action: "request_booking_mutation",
+        mutationIntent: "cancel_booking",
+        bookingSelectionMode: "none",
+      }),
+      decisionJson("Kaunsi booking cancel karni hai — Civic ya Corolla?", {
+        bookingSelectionMode: "clarification_required",
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.match(String(result.reply || result.reason || ""), /./);
+  assert.notEqual(result.bookingSelectionMode, "focused");
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+});
+
+test("model-contract failure after regeneration is terminal (not Cloud-retryable)", async () => {
+  const counters = {};
+  const result = await runOwnedTurn({
+    message: "Kitny din k lye book ki h?",
+    facts: trustedMultiBookingFacts({ withFocus: false }),
+    responses: [
+      decisionJson("Honda Civic 5 din aur Corolla 4 din book hain.", {
+        bookingSelectionMode: "none",
+        groundedFacts: {
+          itemId: "civic-2026",
+          durationDays: 5,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+      decisionJson("Honda Civic 5 din aur Corolla 4 din book hain.", {
+        bookingSelectionMode: "none",
+        groundedFacts: {
+          itemId: "civic-2026",
+          durationDays: 5,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+    ],
+    counters,
+  });
+  assert.equal(result.handled, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.terminalFailure, true);
+  assert.equal(result.action, "business_pa_terminal_model_failure");
+  assert.equal(result.reply, "");
+  assert.ok(counters.openaiCalls >= 1);
+});
+
+test("buffer default routeGate reason is POST_CONFIRM_PA_OWNERSHIP_HANDLED after PA", async () => {
+  const src = await import("node:fs").then((fs) =>
+    fs.readFileSync(
+      new URL("../src/services/whatsappInboundBuffer.js", import.meta.url),
+      "utf8"
+    )
+  );
+  assert.match(src, /POST_CONFIRM_PA_OWNERSHIP_HANDLED/);
+  assert.match(src, /postConfirmPaOwnershipHandled/);
+  assert.match(src, /postConfirmTerminalFailure/);
+  assert.match(src, /markCloudInboundTurnTerminalTechnicalFailure/);
 });

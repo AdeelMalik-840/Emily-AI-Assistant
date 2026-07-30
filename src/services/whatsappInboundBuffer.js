@@ -48,6 +48,7 @@ import {
   markCloudInboundTurnPostConfirmOwned,
   markCloudInboundTurnOutboundLocked,
   markCloudInboundTurnRetryableFailure,
+  markCloudInboundTurnTerminalTechnicalFailure,
   markCloudInboundTurnDone,
   markInboundTurnLedgerDoneForGuarantee,
   markInboundTurnLedgerFailedForGuarantee,
@@ -2239,6 +2240,7 @@ export async function executeWhatsAppAiPipeline(p) {
       : null;
 
   let skipGeneralBrainForWaitingConfirmOwnership = false;
+  let postConfirmPaOwnershipHandled = false;
   const hasFreshWaitingConfirmOwnership =
     Boolean(preResolvedFreshWaitingConfirmRequest);
   const canTryCloudConfirmOwnership =
@@ -2464,6 +2466,7 @@ export async function executeWhatsAppAiPipeline(p) {
           );
         }
         skipGeneralBrainForWaitingConfirmOwnership = true;
+        postConfirmPaOwnershipHandled = true;
         console.log("[customer_business_pa_ownership_handled]", {
           traceId,
           businessId: ownerUserId,
@@ -2475,9 +2478,28 @@ export async function executeWhatsAppAiPipeline(p) {
           missingInfoRequestId: businessPaResult.missingInfoRequestId ?? null,
           missingInfoType: businessPaResult.missingInfoType ?? null,
           ownerNotifyStatus: businessPaResult.ownerNotifyStatus ?? null,
+          terminalFailure: businessPaResult.terminalFailure === true,
           isGroupInbound,
           messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
         });
+        if (businessPaResult.terminalFailure === true) {
+          reply = "";
+          sendVia = "NONE";
+          messageMeta = {
+            handledWithoutOutbound: true,
+            customerBusinessPaHandled: true,
+            postConfirmTerminalFailure: true,
+            failureReason: businessPaResult.failureReason ?? null,
+            bookingId: businessPaResult.bookingId ?? null,
+            availabilityRequestId: businessPaResult.availabilityRequestId ?? null,
+            finalReplySource: "openai_post_confirm_pa",
+            outboundTrace: {
+              kind: "silent_noop",
+              finalReplySource: "openai_post_confirm_pa",
+              reason: "POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
+            },
+          };
+        } else {
         reply = String(businessPaResult.reply ?? "").trim();
         const hasBusinessPaReply = reply.length > 0;
         sendVia = hasBusinessPaReply ? "CLOUD_API" : "NONE";
@@ -2495,6 +2517,7 @@ export async function executeWhatsAppAiPipeline(p) {
             finalReplySource: "openai_post_confirm_pa",
           },
         };
+        }
       }
     }
   }
@@ -2502,7 +2525,10 @@ export async function executeWhatsAppAiPipeline(p) {
   let routeGate = {
     selected: "legacy",
     route: "ownership_skipped",
-    rejectReason: "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP",
+    rejectReason:
+      hasActivePostConfirmOwnership || postConfirmPaOwnershipHandled
+        ? "POST_CONFIRM_PA_OWNERSHIP_HANDLED"
+        : "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP",
     businessAllowlisted: false,
     hasV2LivePipeline: false,
     allowlistConfigError: false,
@@ -3438,13 +3464,24 @@ export async function executeWhatsAppAiPipeline(p) {
     intentionalSilent &&
     cloudLifecycleIdentity?.guaranteeKey
   ) {
-    markCloudInboundTurnDone({
-      identity: cloudLifecycleIdentity,
-      replySent: false,
-      terminalOutcome: cloudNormalRoutingClaimed
-        ? "intentional_silent"
-        : "post_confirm_intentional_silent",
-    });
+    if (messageMeta?.postConfirmTerminalFailure === true) {
+      markCloudInboundTurnTerminalTechnicalFailure({
+        identity: cloudLifecycleIdentity,
+        lastError:
+          String(messageMeta?.failureReason ?? "").trim() ||
+          "POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
+        deliveryStatus: "post_confirm_model_contract_terminal",
+        terminalReason: "POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
+      });
+    } else {
+      markCloudInboundTurnDone({
+        identity: cloudLifecycleIdentity,
+        replySent: false,
+        terminalOutcome: cloudNormalRoutingClaimed
+          ? "intentional_silent"
+          : "post_confirm_intentional_silent",
+      });
+    }
   }
   } catch (err) {
     console.error("❌ Processing error:", err);
