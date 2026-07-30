@@ -551,6 +551,34 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
     catalogItems.length > 0
       ? resolveExplicitReplyItemIds(text, catalogItems)
       : new Set();
+  if (facts.bookingSelectionRequired === true) {
+    const declared =
+      groundedFacts && typeof groundedFacts === "object"
+        ? groundedFacts
+        : {};
+    const declaredBookingFact = [
+      declared.itemId,
+      declared.durationDays,
+      declared.bookingStatus,
+      declared.bookingReference,
+      declared.totalAmount,
+      declared.dailyRate,
+      declared.startDate,
+      declared.endDate,
+      declared.pickupTime,
+      declared.deliveryTime,
+    ].some((value) => value != null && String(value).trim() !== "");
+    const explicitBookingFact =
+      extractExplicitReplyDurationDays(text).length > 0 ||
+      extractExplicitBookingStatuses(text).length > 0 ||
+      extractExplicitBookingReferences(text).length > 0 ||
+      extractExplicitMoneyAmounts(text).length > 0 ||
+      extractExplicitDateClaims(text).length > 0 ||
+      extractExplicitTimeClaims(text).length > 0;
+    if (declaredBookingFact || explicitBookingFact) {
+      return { ok: false, reason: "booking_selection_required" };
+    }
+  }
   if (
     verifiedItemIds.size > 0 &&
     [...replyItemIds].some((replyItemId) => !verifiedItemIds.has(replyItemId))

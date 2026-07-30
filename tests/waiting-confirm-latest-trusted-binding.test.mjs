@@ -459,7 +459,10 @@ test("9: failed Cloud prompt path does not call supersede (source order)", () =>
   // Supersede only appears after successful outbound record helpers.
   const firstSupersede = src.indexOf("await supersedeSiblingWaitingConfirmAfterCloudPrompt");
   assert.ok(firstSupersede > 0);
-  const beforeFirstSupersede = src.slice(Math.max(0, firstSupersede - 500), firstSupersede);
+  const beforeFirstSupersede = src.slice(
+    Math.max(0, firstSupersede - 1400),
+    firstSupersede
+  );
   assert.match(
     beforeFirstSupersede,
     /recordAvailabilityCustomerDmOutbound|markAvailabilityRequestCustomerNotificationSent/

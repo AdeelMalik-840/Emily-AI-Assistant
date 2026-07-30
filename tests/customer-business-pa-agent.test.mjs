@@ -205,6 +205,38 @@ function baseApprovedBooking(overrides = {}) {
   };
 }
 
+function seedTrustedConfirmedBooking(fake, {
+  bookingId,
+  requestId,
+  itemId,
+  itemLabel,
+  durationDays,
+  confirmedAt,
+  confirmExpiresAt = null,
+}) {
+  fake.seedBooking(
+    BUSINESS_ID,
+    bookingId,
+    baseApprovedBooking({
+      id: bookingId,
+      itemId,
+      itemLabel,
+      durationDays,
+      availabilityRequestId: requestId,
+    })
+  );
+  fake.seedAvailabilityRequest(BUSINESS_ID, requestId, {
+    requestId,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    linkedBookingId: bookingId,
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    customerConfirmationAt: new Date(confirmedAt),
+    ...(confirmExpiresAt ? { confirmExpiresAt: new Date(confirmExpiresAt) } : {}),
+  });
+}
+
 function mockOpenAiReply(text) {
   return async () => ({
     choices: [
@@ -339,6 +371,340 @@ test("ambiguous active bookings → same OpenAI lane owns safe clarification", a
     assert.equal(result.bookingId, null);
     assert.equal(result.finalReplySource, "openai_post_confirm_pa");
   });
+});
+
+test("multiple active bookings use the latest trusted confirmed linked AVR as focus", async () => {
+  const fake = createFakeDb();
+  fake.seedBooking(
+    BUSINESS_ID,
+    "bk_civic",
+    baseApprovedBooking({
+      id: "bk_civic",
+      itemId: "civic-1",
+      itemLabel: "Honda Civic 2026",
+      durationDays: 5,
+      totalAmount: 40000,
+      availabilityRequestId: "avr_civic",
+    })
+  );
+  fake.seedBooking(
+    BUSINESS_ID,
+    "bk_corolla",
+    baseApprovedBooking({
+      id: "bk_corolla",
+      itemId: "corolla-1",
+      itemLabel: "Toyota Corolla",
+      durationDays: 4,
+      totalAmount: 20000,
+      availabilityRequestId: "avr_corolla",
+    })
+  );
+  fake.seedAvailabilityRequest(BUSINESS_ID, "avr_civic", {
+    requestId: "avr_civic",
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    linkedBookingId: "bk_civic",
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    customerConfirmationAt: new Date("2026-07-30T12:00:00Z"),
+  });
+  fake.seedAvailabilityRequest(BUSINESS_ID, "avr_corolla", {
+    requestId: "avr_corolla",
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    linkedBookingId: "bk_corolla",
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    customerConfirmationAt: new Date("2026-07-30T13:18:51Z"),
+  });
+
+  const resolved = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    inboundReceivedAtMs: Date.parse("2026-07-30T14:00:00Z"),
+    getBusinessProfileFn: async () => ({ businessName: "Emily Cars" }),
+  });
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.reason, "MATCHED_TRUSTED_FOCUS");
+  assert.equal(resolved.facts.booking.id, "bk_corolla");
+  assert.equal(resolved.facts.booking.durationDays, 4);
+  assert.equal(resolved.facts.bookingFocus.source, "latest_confirmed_linked_avr");
+  assert.equal(resolved.facts.bookingFocus.confidence, "trusted");
+  assert.equal(resolved.facts.bookingFocus.selectedBookingIndex, 2);
+  assert.equal(resolved.facts.bookingCandidates.length, 2);
+});
+
+test("trusted focus is evaluated at the original inbound timestamp", async () => {
+  const fake = createFakeDb();
+  seedTrustedConfirmedBooking(fake, {
+    bookingId: "bk_civic",
+    requestId: "avr_civic",
+    itemId: "civic-1",
+    itemLabel: "Honda Civic 2026",
+    durationDays: 5,
+    confirmedAt: "2026-07-30T12:00:00Z",
+  });
+  seedTrustedConfirmedBooking(fake, {
+    bookingId: "bk_corolla",
+    requestId: "avr_corolla",
+    itemId: "corolla-1",
+    itemLabel: "Toyota Corolla",
+    durationDays: 4,
+    confirmedAt: "2026-07-30T13:00:00Z",
+  });
+
+  for (const [label, inbound, expected] of [
+    ["before newer confirmation", "2026-07-30T12:59:59Z", "bk_civic"],
+    ["equal to newer confirmation", "2026-07-30T13:00:00Z", "bk_corolla"],
+    ["after newer confirmation", "2026-07-30T13:00:01Z", "bk_corolla"],
+  ]) {
+    const resolved = await resolveActiveCustomerBookingFacts({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      inboundReceivedAtMs: Date.parse(inbound),
+      getBusinessProfileFn: async () => ({}),
+    });
+    assert.equal(resolved.reason, "MATCHED_TRUSTED_FOCUS", label);
+    assert.equal(resolved.facts.booking.id, expected, label);
+  }
+  const missingInbound = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    inboundReceivedAtMs: null,
+    getBusinessProfileFn: async () => ({}),
+  });
+  assert.equal(missingInbound.reason, "AMBIGUOUS_BOOKINGS");
+  assert.equal(
+    missingInbound.facts.sourceEvidence.trustedBookingFocusReason,
+    "MISSING_OR_INVALID_INBOUND_TIMESTAMP"
+  );
+});
+
+test("newer third booking becomes focus only after its confirmation", async () => {
+  const fake = createFakeDb();
+  for (const row of [
+    {
+      bookingId: "bk_civic",
+      requestId: "avr_civic",
+      itemId: "civic-1",
+      itemLabel: "Honda Civic 2026",
+      durationDays: 5,
+      confirmedAt: "2026-07-30T12:00:00Z",
+    },
+    {
+      bookingId: "bk_corolla",
+      requestId: "avr_corolla",
+      itemId: "corolla-1",
+      itemLabel: "Toyota Corolla",
+      durationDays: 4,
+      confirmedAt: "2026-07-30T13:00:00Z",
+    },
+    {
+      bookingId: "bk_stonic",
+      requestId: "avr_stonic",
+      itemId: "stonic-1",
+      itemLabel: "Kia Stonic",
+      durationDays: 3,
+      confirmedAt: "2026-07-30T14:00:00Z",
+    },
+  ]) {
+    seedTrustedConfirmedBooking(fake, row);
+  }
+
+  const before = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    inboundReceivedAtMs: Date.parse("2026-07-30T13:30:00Z"),
+    getBusinessProfileFn: async () => ({}),
+  });
+  const after = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    inboundReceivedAtMs: Date.parse("2026-07-30T14:00:01Z"),
+    getBusinessProfileFn: async () => ({}),
+  });
+  assert.equal(before.facts.booking.id, "bk_corolla");
+  assert.equal(after.facts.booking.id, "bk_stonic");
+});
+
+test("extra linked AVR rows and expired confirmation windows do not invalidate confirmed focus", async () => {
+  const fake = createFakeDb();
+  seedTrustedConfirmedBooking(fake, {
+    bookingId: "bk_civic",
+    requestId: "avr_civic",
+    itemId: "civic-1",
+    itemLabel: "Honda Civic 2026",
+    durationDays: 5,
+    confirmedAt: "2026-07-30T12:00:00Z",
+  });
+  seedTrustedConfirmedBooking(fake, {
+    bookingId: "bk_corolla",
+    requestId: "avr_corolla",
+    itemId: "corolla-1",
+    itemLabel: "Toyota Corolla",
+    durationDays: 4,
+    confirmedAt: "2026-07-30T13:00:00Z",
+    confirmExpiresAt: "2026-07-30T13:05:00Z",
+  });
+  fake.seedAvailabilityRequest(BUSINESS_ID, "avr_corolla_duplicate", {
+    requestId: "avr_corolla_duplicate",
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    linkedBookingId: "bk_corolla",
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    customerConfirmationAt: new Date("2026-07-30T12:30:00Z"),
+  });
+
+  const resolved = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    inboundReceivedAtMs: Date.parse("2026-07-30T14:00:00Z"),
+    getBusinessProfileFn: async () => ({}),
+  });
+  assert.equal(resolved.reason, "MATCHED_TRUSTED_FOCUS");
+  assert.equal(resolved.facts.booking.id, "bk_corolla");
+});
+
+test("missing, tied, superseded, or mismatched AVR evidence cannot establish focus", async () => {
+  const cases = [
+    {
+      name: "missing timestamp",
+      patch: { customerConfirmationAt: null },
+    },
+    {
+      name: "exact timestamp tie",
+      patch: { customerConfirmationAt: new Date("2026-07-30T12:00:00Z") },
+    },
+    {
+      name: "superseded",
+      patch: { supersededByAvailabilityRequestId: "avr_new" },
+    },
+    {
+      name: "linked to another booking",
+      patch: { linkedBookingId: "bk_other" },
+    },
+    {
+      name: "different customer",
+      patch: { customerPhone: "923009999999" },
+    },
+    {
+      name: "missing business identity",
+      patch: { businessId: null },
+    },
+    {
+      name: "different business",
+      patch: { businessId: OTHER_BUSINESS_ID },
+    },
+  ];
+
+  for (const row of cases) {
+    const fake = createFakeDb();
+    for (const [bookingId, requestId, itemLabel] of [
+      ["bk_civic", "avr_civic", "Honda Civic 2026"],
+      ["bk_corolla", "avr_corolla", "Toyota Corolla"],
+    ]) {
+      fake.seedBooking(
+        BUSINESS_ID,
+        bookingId,
+        baseApprovedBooking({
+          id: bookingId,
+          itemLabel,
+          availabilityRequestId: requestId,
+        })
+      );
+    }
+    fake.seedAvailabilityRequest(BUSINESS_ID, "avr_civic", {
+      requestId: "avr_civic",
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      linkedBookingId: "bk_civic",
+      status: "approved",
+      customerConfirmationStatus: "confirmed",
+      customerConfirmationAt: new Date("2026-07-30T12:00:00Z"),
+    });
+    fake.seedAvailabilityRequest(BUSINESS_ID, "avr_corolla", {
+      requestId: "avr_corolla",
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      linkedBookingId: "bk_corolla",
+      status: "approved",
+      customerConfirmationStatus: "confirmed",
+      customerConfirmationAt: new Date("2026-07-30T13:00:00Z"),
+      ...row.patch,
+    });
+    const resolved = await resolveActiveCustomerBookingFacts({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      inboundReceivedAtMs: Date.parse("2026-07-30T14:00:00Z"),
+      getBusinessProfileFn: async () => ({}),
+    });
+    assert.equal(resolved.ok, true, row.name);
+    assert.equal(resolved.reason, "AMBIGUOUS_BOOKINGS", row.name);
+    assert.equal(resolved.facts.booking, null, row.name);
+    assert.equal(resolved.facts.bookingFocus, null, row.name);
+  }
+});
+
+test("a cancelled newest booking cannot remain the trusted focus", async () => {
+  const fake = createFakeDb();
+  fake.seedBooking(
+    BUSINESS_ID,
+    "bk_civic",
+    baseApprovedBooking({
+      id: "bk_civic",
+      itemLabel: "Honda Civic 2026",
+      durationDays: 5,
+      availabilityRequestId: "avr_civic",
+    })
+  );
+  fake.seedBooking(
+    BUSINESS_ID,
+    "bk_corolla",
+    baseApprovedBooking({
+      id: "bk_corolla",
+      status: "cancelled",
+      itemLabel: "Toyota Corolla",
+      durationDays: 4,
+      availabilityRequestId: "avr_corolla",
+    })
+  );
+  fake.seedAvailabilityRequest(BUSINESS_ID, "avr_civic", {
+    requestId: "avr_civic",
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    linkedBookingId: "bk_civic",
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    customerConfirmationAt: new Date("2026-07-30T12:00:00Z"),
+  });
+  fake.seedAvailabilityRequest(BUSINESS_ID, "avr_corolla", {
+    requestId: "avr_corolla",
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    linkedBookingId: "bk_corolla",
+    status: "approved",
+    customerConfirmationStatus: "confirmed",
+    customerConfirmationAt: new Date("2026-07-30T13:00:00Z"),
+  });
+
+  const resolved = await resolveActiveCustomerBookingFacts({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    getBusinessProfileFn: async () => ({}),
+  });
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.reason, "MATCHED");
+  assert.equal(resolved.facts.booking.id, "bk_civic");
+  assert.equal(resolved.facts.bookingFocus, null);
 });
 
 test("booking continuity has no one-hour timeout and ends for every terminal status", async () => {

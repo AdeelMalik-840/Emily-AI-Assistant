@@ -27,6 +27,7 @@ function cleanCustomerReply(value) {
  *   customerPhone: string,
  *   messageText: string,
  *   messageId?: string | null,
+ *   inboundReceivedAtMs?: number | null,
  *   conversationHistory?: string | null,
  *   preResolvedBookingFacts?: Record<string, unknown> | null,
  *   __resolveActiveCustomerBookingFactsFn?: typeof resolveActiveCustomerBookingFacts,
@@ -42,6 +43,7 @@ export async function handleCustomerBusinessPaInbound({
   customerPhone,
   messageText,
   messageId = null,
+  inboundReceivedAtMs = null,
   conversationHistory = null,
   preResolvedBookingFacts = null,
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
@@ -68,6 +70,7 @@ export async function handleCustomerBusinessPaInbound({
           db: connection,
           businessId: uid,
           customerPhone: phone,
+          inboundReceivedAtMs,
         });
   if (!resolved?.ok || !resolved.facts) {
     return {
@@ -171,8 +174,31 @@ export async function handleCustomerBusinessPaInbound({
     const guardRows = Array.isArray(facts.replyGuardFacts?.activeBookings)
       ? facts.replyGuardFacts.activeBookings
       : [];
+    const executedBookingCandidate =
+      executionResult?.ok === true &&
+      decision.action === "confirm_pending_availability"
+        ? {
+            id: clean(executionResult?.bookingId) || "verified-executed-booking",
+            selectionIndex: 1,
+            status: "approved",
+            itemId: selected?.itemId ?? null,
+            itemLabel: selected?.itemLabel ?? null,
+            durationDays: selected?.requestedDuration ?? null,
+            totalAmount: selected?.priceQuote?.total ?? null,
+            dailyRate: selected?.priceQuote?.dailyRate ?? null,
+            availabilityRequestId: selected?.requestId ?? null,
+          }
+        : null;
     const finalFacts = {
       ...facts,
+      ...(executedBookingCandidate
+        ? {
+            booking: executedBookingCandidate,
+            bookingCandidates: [executedBookingCandidate],
+            bookingFocus: null,
+            activeBookings: [],
+          }
+        : {}),
       pendingAvailabilityRequests: [],
       pendingAvailabilityExecution,
       replyGuardFacts: {
@@ -249,9 +275,28 @@ export async function handleCustomerBusinessPaInbound({
   const openaiUsed = true;
   const reason = shouldSend ? "HANDLED" : "HANDLED_SILENCE";
 
-  const bookingId = clean(facts.booking?.id) || null;
+  const selectedBookingId = clean(decision.selectedBookingId) || null;
+  const bookingSelectionMode =
+    clean(decision.bookingSelectionMode, 40) || "none";
+  const selectedBooking =
+    selectedBookingId && Array.isArray(facts.bookingCandidates)
+      ? facts.bookingCandidates.find(
+          (row) => clean(row?.id) === selectedBookingId
+        ) ?? null
+      : null;
+  const hasNoExactBookingSelection =
+    bookingSelectionMode === "all_candidates" ||
+    bookingSelectionMode === "clarification_required";
+  const bookingId =
+    hasNoExactBookingSelection
+      ? null
+      : selectedBookingId || clean(facts.booking?.id) || null;
   const availabilityRequestId =
-    clean(facts.booking?.availabilityRequestId) || null;
+    hasNoExactBookingSelection
+      ? null
+      : clean(selectedBooking?.availabilityRequestId) ||
+        clean(facts.booking?.availabilityRequestId) ||
+        null;
 
   console.log("[customer_business_pa_result]", {
     businessId: uid,
@@ -287,6 +332,8 @@ export async function handleCustomerBusinessPaInbound({
       decision.mutationExecutionRequested === true,
     mutationExecutionStatus:
       decision.mutationExecutionStatus ?? "not_executed",
+    bookingSelectionMode,
+    selectedBookingIndex: decision.selectedBookingIndex ?? null,
     pendingAvailabilityExecution,
     situation: decision.situation ?? "unclear",
     decisionAction: decision.action,

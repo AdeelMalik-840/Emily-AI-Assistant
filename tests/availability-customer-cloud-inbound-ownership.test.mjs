@@ -31,7 +31,7 @@ const CUSTOMER_PHONE = "+923001111111";
 const CUSTOMER_WA = "923001111111";
 
 function createFakeDb() {
-  const store = { businesses: {} };
+  const store = { businesses: {}, conversations: {} };
   let autoId = 0;
 
   function ensureBusiness(id) {
@@ -59,6 +59,16 @@ function createFakeDb() {
     }
     async set(data, opts = {}) {
       const [rootCollection, rootId, subCollection, docId] = this.path;
+      if (rootCollection === "conversations" && !subCollection) {
+        store.conversations[rootId] ||= { data: {} };
+        store.conversations[rootId].data = opts.merge
+          ? {
+              ...store.conversations[rootId].data,
+              ...structuredClone(data),
+            }
+          : structuredClone(data);
+        return;
+      }
       const business = ensureBusiness(rootId);
       if (rootCollection === "businesses" && !subCollection) {
         business.data = opts.merge
@@ -82,6 +92,10 @@ function createFakeDb() {
       for (let i = 0; i < this.path.length; i += 2) {
         const collection = this.path[i];
         const id = this.path[i + 1];
+        if (collection === "conversations" && i === 0) {
+          node = store.conversations[id];
+          continue;
+        }
         if (collection === "businesses" && i === 0) {
           node = ensureBusiness(id);
           continue;
@@ -203,6 +217,19 @@ function createFakeDb() {
     );
   }
 
+  function getConversationMessages(customerPhone = CUSTOMER_WA) {
+    const digits = String(customerPhone ?? "").replace(/\D/g, "");
+    return (
+      store.conversations[`${BUSINESS_ID}_${digits}`]?.data?.messages ?? []
+    );
+  }
+
+  function getAllConversationMessages() {
+    return Object.values(store.conversations).flatMap(
+      (row) => row?.data?.messages ?? []
+    );
+  }
+
   return {
     db,
     seedAvailabilityRequest,
@@ -210,6 +237,8 @@ function createFakeDb() {
     getRequestDoc,
     getBookingCount,
     getBookings,
+    getConversationMessages,
+    getAllConversationMessages,
     store,
   };
 }
@@ -329,7 +358,9 @@ test("fresh waiting-confirm ownership requires delivered prompt before inbound",
 test("Kar do on waiting_confirm_cloud confirms via cloud inbound handler", async () => {
   const fake = createFakeDb();
   fake.seedInventoryItem();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseCloudWaitingRequest());
+  const request = baseCloudWaitingRequest();
+  const priorOutboundAt = request.lastCustomerDmOutboundAt;
+  fake.seedAvailabilityRequest(REQUEST_ID, request);
   const sendCalls = [];
   const result = await handleAvailabilityCustomerCloudInbound({
     db: fake.db,
@@ -339,7 +370,7 @@ test("Kar do on waiting_confirm_cloud confirms via cloud inbound handler", async
     messageId: "wamid.kar-do-1",
     sendWhatsAppMessageFn: async (...args) => {
       sendCalls.push(args);
-      return { ok: true };
+      return { ok: true, providerMessageId: "wamid.out-confirm-1" };
     },
     availabilityConfirmExecute: true,
   });
@@ -347,6 +378,93 @@ test("Kar do on waiting_confirm_cloud confirms via cloud inbound handler", async
   assert.equal(result.action, "confirmed_booking");
   assert.equal(sendCalls.length, 1);
   assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
+  assert.ok(
+    Number(fake.getRequestDoc(REQUEST_ID).lastCustomerDmOutboundAt) >
+      Number(priorOutboundAt)
+  );
+  const history = fake.getConversationMessages();
+  assert.equal(history.length, 1);
+  assert.equal(history[0].role, "assistant");
+  assert.equal(history[0].sourceMessageId, "wamid.kar-do-1");
+  assert.equal(history[0].providerMessageId, "wamid.out-confirm-1");
+});
+
+for (const [label, sendResult] of [
+  ["undefined", undefined],
+  ["explicit failure", { ok: false }],
+]) {
+  test(`${label} confirmation send writes no outbound success or assistant history`, async () => {
+    const fake = createFakeDb();
+    fake.seedInventoryItem();
+    const request = baseCloudWaitingRequest();
+    const priorOutboundAt = request.lastCustomerDmOutboundAt;
+    fake.seedAvailabilityRequest(REQUEST_ID, request);
+    let sends = 0;
+    const result = await handleAvailabilityCustomerCloudInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_WA,
+      messageText: "Kar do",
+      messageId: `wamid.${label.replace(/\s+/g, "-")}`,
+      sendWhatsAppMessageFn: async () => {
+        sends += 1;
+        return sendResult;
+      },
+      availabilityConfirmExecute: true,
+    });
+
+    assert.equal(result.handled, false);
+    assert.equal(result.retryable, true);
+    assert.equal(result.action, "confirm_reply_send_failed");
+    assert.equal(result.reason, "CLOUD_CONFIRM_REPLY_NOT_DELIVERED");
+    assert.equal(sends, 1);
+    assert.equal(fake.getBookingCount(), 1);
+    assert.equal(
+      Number(fake.getRequestDoc(REQUEST_ID).lastCustomerDmOutboundAt),
+      Number(priorOutboundAt)
+    );
+    assert.equal(fake.getConversationMessages().length, 0);
+  });
+}
+
+test("retry after failed confirmation send does not execute or send twice", async () => {
+  const fake = createFakeDb();
+  fake.seedInventoryItem();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseCloudWaitingRequest());
+  let sends = 0;
+  const params = {
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_WA,
+    messageText: "Kar do",
+    messageId: "wamid.failed-confirm-retry",
+    sendWhatsAppMessageFn: async () => {
+      sends += 1;
+      return sends === 1
+        ? { ok: false }
+        : { ok: true, providerMessageId: "wamid.confirm-recovered" };
+    },
+    availabilityConfirmExecute: true,
+  };
+  const first = await handleAvailabilityCustomerCloudInbound(params);
+  const second = await handleAvailabilityCustomerCloudInbound(params);
+
+  assert.equal(first.action, "confirm_reply_send_failed");
+  assert.equal(first.retryable, true);
+  assert.equal(second.handled, true);
+  assert.equal(second.action, "confirmed_booking_reply_recovered");
+  assert.equal(second.recoveredOutbound, true);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 2);
+  assert.equal(fake.getConversationMessages().length, 1);
+  assert.equal(
+    fake.getConversationMessages()[0].sourceMessageId,
+    "wamid.failed-confirm-retry"
+  );
+  assert.equal(
+    fake.getConversationMessages()[0].providerMessageId,
+    "wamid.confirm-recovered"
+  );
 });
 
 test("duplicate same Cloud messageId does not double-book or double-send", async () => {
@@ -695,6 +813,153 @@ test("fresh Corolla waiting-confirm wins over older Civic post-confirm ownership
   assert.deepEqual(activeFacts, activeFactsBefore);
 });
 
+test("full pipeline retries a failed confirmed-booking reply as send-only recovery", async () => {
+  resetPipelineTestIsolation();
+  const fake = createFakeDb();
+  fake.seedInventoryItem();
+  fake.seedAvailabilityRequest(
+    REQUEST_ID,
+    baseCloudWaitingRequest({
+      itemId: "corolla-1",
+      itemLabel: "Toyota Corolla",
+      requestedDuration: 3,
+      priceQuote: {
+        status: "quoted",
+        total: 15000,
+        currency: "PKR",
+        durationDays: 3,
+        dailyRate: 5000,
+      },
+    })
+  );
+
+  const providerMessageId = `wamid.confirm-recovery-${randomUUID()}`;
+  const inboundText = `Han done kro [test:${randomUUID()}]`;
+  let openAiCalls = 0;
+  let bookingPaCalls = 0;
+  let sends = 0;
+  const params = {
+    db: fake.db,
+    ownerUserId: BUSINESS_ID,
+    userPhone: CUSTOMER_WA,
+    conversationCustomerNumber: CUSTOMER_WA,
+    participantPhoneForDm: CUSTOMER_WA,
+    sessionKey: `${BUSINESS_ID}::${CUSTOMER_WA}::${randomUUID()}`,
+    sendCredentials: { accessToken: "t", phoneNumberId: "1" },
+    isGroupMessage: false,
+    playwrightWebInbound: false,
+    combinedMessage: inboundText,
+    latestMessage: inboundText,
+    messageId: providerMessageId,
+    messageTimestamp: Math.floor(Date.now() / 1000),
+    __resolveActiveCustomerBookingFactsFn: async () =>
+      activeCivicPostConfirmFacts(),
+    __tryHandleAvailabilityCustomerCloudInboundFn: async (handlerParams) =>
+      handleAvailabilityCustomerCloudInbound({
+        ...handlerParams,
+        db: fake.db,
+        availabilityConfirmExecute: true,
+        __waitingConfirmDmBrainEnabled: true,
+        __catalogRowForTests: {
+          id: "corolla-1",
+          name: "Toyota Corolla",
+          displayLabel: "Toyota Corolla",
+          dailyRate: 5000,
+        },
+        __decideCustomerTurnForTests: async (turnContext) => {
+          openAiCalls += 1;
+          return {
+            ok: true,
+            source: "test_openai",
+            lane: "waiting_confirm_dm",
+            turnContext,
+            decision: waitingConfirmOpenAiDecision({
+              customerIntent: "confirm_booking",
+              customerIsConfirmingBooking: true,
+              shouldReply: true,
+              customerReply: "OpenAI understood the confirmation.",
+              action: "confirm_booking",
+              requiredExecutor: "confirm_booking_executor",
+            }),
+          };
+        },
+        sendWhatsAppMessageFn: async () => {
+          sends += 1;
+          return sends === 1
+            ? { ok: false }
+            : {
+                ok: true,
+                providerMessageId: "wamid.confirm-recovery-out",
+              };
+        },
+      }),
+    __tryHandleCustomerBusinessPaInboundFn: async () => {
+      bookingPaCalls += 1;
+      return {
+        handled: true,
+        reply: "post_confirm_pa must not run for send-only recovery",
+      };
+    },
+    __tryBrainV2LiveBeforeLegacyFn: async () => {
+      throw new Error("general Brain must not run");
+    },
+    __processMessageFn: async () => {
+      throw new Error("legacy processor must not run");
+    },
+  };
+
+  await executeWhatsAppAiPipeline(params);
+  assert.equal(openAiCalls, 1);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 1);
+  assert.equal(
+    fake
+      .getConversationMessages()
+      .filter((row) => row.role === "assistant").length,
+    0
+  );
+
+  const retryDeadline = Date.now() + 3_000;
+  while (
+    fake
+      .getConversationMessages()
+      .filter((row) => row.role === "assistant").length < 1 &&
+    Date.now() < retryDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  assert.equal(openAiCalls, 1);
+  assert.equal(bookingPaCalls, 0);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 2);
+  const historyAfterRecovery = fake.getConversationMessages();
+  assert.equal(
+    historyAfterRecovery.filter((row) => row.role === "assistant").length,
+    1
+  );
+  assert.equal(
+    historyAfterRecovery.find((row) => row.role === "assistant")
+      ?.sourceMessageId,
+    providerMessageId
+  );
+
+  await executeWhatsAppAiPipeline({
+    ...params,
+    __cloudResumeProcessing: true,
+  });
+  assert.equal(openAiCalls, 1);
+  assert.equal(bookingPaCalls, 0);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 2);
+  assert.equal(
+    fake
+      .getConversationMessages()
+      .filter((row) => row.role === "assistant").length,
+    1
+  );
+});
+
 test("fresh Corolla waiting-confirm Q&A stays in OpenAI lane with zero booking", async () => {
   let paCalls = 0;
   let waitingConfirmSends = 0;
@@ -998,13 +1263,13 @@ test("expired AVR falls back to Brain unchanged", async () => {
   assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, undefined);
 });
 
-test("group inbound does not run Cloud confirm ownership gate", async () => {
+test("group inbound does not run Cloud confirm ownership gate or persist Cloud identities", async () => {
   let cloudConfirmCalls = 0;
-  const { brainV2Calls, outcome } = await runCloudOwnershipPipeline({
+  const { brainV2Calls, outcome, fake } = await runCloudOwnershipPipeline({
     pipelineParams: {
       isGroupMessage: true,
       userPhone: "unknown",
-      conversationCustomerNumber: "grpabc",
+      conversationCustomerNumber: "grpabcdefabcdefabcdefabcdef",
       groupName: "Rental Leads",
       playwrightChatKey: "rental-leads",
       playwrightWebTitleIdentity: true,
@@ -1031,16 +1296,22 @@ test("group inbound does not run Cloud confirm ownership gate", async () => {
   assert.equal(cloudConfirmCalls, 0);
   assert.equal(brainV2Calls, 1);
   assert.equal(outcome?.reply, "group-ok");
+  const persisted = fake.getAllConversationMessages();
+  assert.ok(persisted.length >= 1);
+  for (const row of persisted) {
+    assert.equal(Object.hasOwn(row, "sourceMessageId"), false);
+    assert.equal(Object.hasOwn(row, "providerMessageId"), false);
+  }
 });
 
-test("Playwright web inbound does not run Cloud confirm ownership gate", async () => {
+test("Playwright web inbound does not run Cloud confirm ownership gate or persist Cloud identities", async () => {
   let cloudConfirmCalls = 0;
-  const { outcome } = await runCloudOwnershipPipeline({
+  const { outcome, fake } = await runCloudOwnershipPipeline({
     pipelineParams: {
       playwrightWebInbound: true,
-      userPhone: "unknown",
-      conversationCustomerNumber: "unknown",
-      participantPhoneForDm: "",
+      userPhone: "923009999999",
+      conversationCustomerNumber: "923009999999",
+      participantPhoneForDm: "923009999999",
       dmPlaywrightChatKey: "adeel",
       dmChatTitle: "Adeel",
       source: "PLAYWRIGHT_DM",
@@ -1061,4 +1332,10 @@ test("Playwright web inbound does not run Cloud confirm ownership gate", async (
   });
   assert.equal(cloudConfirmCalls, 0);
   assert.ok(outcome == null || outcome?.messageMeta?.availabilityCloudConfirmHandled !== true);
+  const persisted = fake.getAllConversationMessages();
+  assert.ok(persisted.length >= 1);
+  for (const row of persisted) {
+    assert.equal(Object.hasOwn(row, "sourceMessageId"), false);
+    assert.equal(Object.hasOwn(row, "providerMessageId"), false);
+  }
 });
