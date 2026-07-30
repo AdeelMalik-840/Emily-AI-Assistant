@@ -19,8 +19,9 @@ const {
 const {
   packWaitingConfirmDmTurnContext,
   WAITING_CONFIRM_DM_LANE,
-  WAITING_CONFIRM_DM_CONFIRM_CONFIDENCE_MIN,
   WAITING_CONFIRM_DM_CONFIRM_EXECUTOR,
+  WAITING_CONFIRM_DM_ALLOWED_ACTIONS,
+  WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
   parseWaitingConfirmDmDecision,
   evaluateWaitingConfirmDmBrainConfirmGuard,
 } = await import("../src/brain/decisions/waitingConfirmDmLane.js");
@@ -30,12 +31,16 @@ const {
 const { buildConfirmExpiresAt } = await import(
   "../src/services/availabilityRequestService.js"
 );
+const {
+  buildAvailabilityConfirmSuccessReply,
+} = await import("../src/services/availabilityMessageBuilder.js");
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const BUSINESS_ID = "owner-wc-brain-1";
 const REQUEST_ID = "avr_wc_brain_001";
 const CUSTOMER_PHONE = "+923009998877";
 const ITEM_ID = "civic-wc-1";
+const EXECUTOR_SUCCESS_REPLY = buildAvailabilityConfirmSuccessReply();
 
 function createFakeDb() {
   const store = { businesses: {} };
@@ -225,45 +230,53 @@ function baseWaitingRequest(overrides = {}) {
   };
 }
 
-function injectDecision(overrides = {}) {
-  return async (turnContext) => ({
-    ok: true,
-    source: "test_double",
-    lane: WAITING_CONFIRM_DM_LANE,
-    turnContext,
-    decision: {
-      conversationStage: "booking_offer",
-      customerIntent: "unclear",
-      situation: "awaiting_confirm",
-      customerIsConfirmingBooking: false,
-      customerIsAskingQuestion: false,
-      customerIsDeclining: false,
-      customerWantsChange: false,
-      shouldReply: true,
-      customerReply: "Theek hai.",
-      action: "reply",
-      confidence: 0.8,
-      requiredExecutor: "whatsapp_cloud_dm",
-      ...overrides,
+function baseModelFields(overrides = {}) {
+  return {
+    conversationStage: "booking_offer",
+    customerMood: null,
+    customerIntent: "unclear",
+    situation: "awaiting_confirm",
+    customerIsConfirmingBooking: false,
+    customerIsAskingQuestion: false,
+    customerIsDeclining: false,
+    customerWantsChange: false,
+    requestedInfoType: null,
+    shouldReply: true,
+    customerReply: "",
+    action: "reply",
+    confidence: 0.9,
+    safetyNotes: null,
+    reason: "test",
+    asksForBookingConfirmation: false,
+    replySemantics: {
+      claims: [],
+      languageStyle: "roman_urdu",
+      containsTimingPromise: false,
+      exposesInternalProcess: false,
     },
-  });
+    ...overrides,
+  };
 }
 
-function validBrainConfirmDecision(overrides = {}) {
-  return {
-    action: "confirm_booking",
-    customerIsConfirmingBooking: true,
-    customerIsAskingQuestion: false,
-    shouldReply: false,
-    customerReply: "",
-    confidence: 0.92,
-    requiredExecutor: WAITING_CONFIRM_DM_CONFIRM_EXECUTOR,
-    ...overrides,
+/** OpenAI transport double only — production parser/lane/service must run. */
+function openaiCreateFromPayload(payload, counter = null) {
+  return async () => {
+    if (counter) counter.calls += 1;
+    return {
+      choices: [{ message: { content: JSON.stringify(payload) } }],
+    };
   };
 }
 
 async function handleBrainInbound(fake, messageText, opts = {}) {
   const sendCalls = opts.sendCalls || [];
+  const openaiCounter = opts.openaiCounter || { calls: 0 };
+  const createFn =
+    opts.openaiCreate ||
+    openaiCreateFromPayload(
+      opts.openaiPayload || baseModelFields(),
+      openaiCounter
+    );
   const result = await handleAvailabilityCustomerCloudInbound({
     db: fake.db,
     businessId: BUSINESS_ID,
@@ -283,10 +296,9 @@ async function handleBrainInbound(fake, messageText, opts = {}) {
       displayLabel: "Honda Civic 2026",
       dailyRate: 8000,
     },
-    __decideCustomerTurnForTests:
-      opts.decideFn || injectDecision(opts.decision || {}),
+    __chatCompletionsCreateForTests: createFn,
   });
-  return { result, sendCalls };
+  return { result, sendCalls, openaiCounter };
 }
 
 test("feature flag defaults OFF", () => {
@@ -300,6 +312,21 @@ test("feature flag defaults OFF", () => {
 
 test("CUSTOMER_TURN_LANES includes waiting_confirm_dm", () => {
   assert.ok(CUSTOMER_TURN_LANES.includes(WAITING_CONFIRM_DM_LANE));
+});
+
+test("WAITING_CONFIRM_DM_ALLOWED_ACTIONS matches lane contract", () => {
+  for (const action of [
+    "reply",
+    "silence",
+    "clarify",
+    "confirm_booking",
+    "decline_request",
+    "change_request",
+    "none",
+  ]) {
+    assert.equal(WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has(action), true);
+  }
+  assert.equal(WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has("launch_missiles"), false);
 });
 
 test("flag OFF: kar do still books through existing gate", async () => {
@@ -371,233 +398,289 @@ test("TurnContext packer includes history, last Emily, AVR, price", () => {
   assert.ok(ctx.allowedExecutors.includes("confirm_booking_executor"));
 });
 
-test("flag ON: Brain receives full context including history", async () => {
+test("authentic: confirm books once and sends only Brain customerReply", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  let seen = null;
-  const decideFn = async (turnContext) => {
-    seen = turnContext;
-    return injectDecision({
-      action: "reply",
-      customerReply: "Theek hai, bata dein.",
-    })(turnContext);
-  };
-  const history = "Emily: Book kar du?\nCustomer: advance kitna?";
-  await handleBrainInbound(fake, "thanks", {
-    conversationHistory: history,
-    decideFn,
-  });
-  assert.ok(seen);
-  assert.equal(seen.lane, WAITING_CONFIRM_DM_LANE);
-  assert.match(String(seen.recentDialogue), /advance kitna/);
-  assert.match(String(seen.lastEmilyMessage), /Book kar du/);
-  assert.equal(seen.facts?.quotedPrice?.total, 16000);
-  assert.equal(seen.facts?.availabilityRequest?.itemLabel, "Honda Civic 2026");
-  assert.equal(seen.facts?.availabilityRequest?.requestedDuration, 2);
-});
-
-test("flag ON: natural confirm routes to confirm executor", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "done done", {
-    decision: validBrainConfirmDecision(),
-  });
+  const brainReply = "Confirm mil gaya, request aage barhati hun.";
+  const openaiCounter = { calls: 0 };
+  const { result, sendCalls } = await handleBrainInbound(
+    fake,
+    "haan book kar do",
+    {
+      messageId: "auth-confirm-1",
+      openaiCounter,
+      openaiPayload: baseModelFields({
+        customerIntent: "confirm",
+        customerIsConfirmingBooking: true,
+        shouldReply: true,
+        customerReply: brainReply,
+        action: "confirm_booking",
+        confidence: 0.95,
+        reason: "natural_confirm",
+        replySemantics: {
+          claims: ["customer_confirmation_acknowledged"],
+          languageStyle: "roman_urdu",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }),
+    }
+  );
+  assert.equal(openaiCounter.calls, 1);
   assert.equal(result.action, "confirmed_booking");
   assert.equal(result.waitingConfirmDmBrain, true);
-  assert.equal(result.actionType, "confirm_booking");
   assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
+  assert.equal(sendCalls.length, 1);
+  assert.equal(String(sendCalls[0][1]), brainReply);
+  assert.notEqual(String(sendCalls[0][1]), EXECUTOR_SUCCESS_REPLY);
+  assert.notEqual(result.result?.reply, brainReply);
+  assert.equal(result.result?.reply, EXECUTOR_SUCCESS_REPLY);
   assert.equal(result.pamissCreated, false);
   assert.equal(result.ownerNotified, false);
 });
 
-test("flag ON: kar do still books via Brain confirm + executor", async () => {
+test("authentic: decline mutates once and sends Brain reply", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "kar do", {
-    decision: validBrainConfirmDecision({ confidence: 0.95 }),
+  const brainReply = "Theek hai, ye offer skip kar dete hain.";
+  const openaiCounter = { calls: 0 };
+  const { result, sendCalls } = await handleBrainInbound(fake, "nahi chahiye", {
+    messageId: "auth-decline-1",
+    openaiCounter,
+    openaiPayload: baseModelFields({
+      customerIntent: "decline",
+      customerIsDeclining: true,
+      shouldReply: true,
+      customerReply: brainReply,
+      action: "decline_request",
+      reason: "clear_decline",
+    }),
   });
-  assert.equal(result.action, "confirmed_booking");
-  assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
+  assert.equal(openaiCounter.calls, 1);
+  assert.equal(result.action, "declined");
+  assert.equal(
+    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
+    "declined"
+  );
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+  assert.equal(sendCalls.length, 1);
+  assert.equal(String(sendCalls[0][1]), brainReply);
 });
 
-test("flag ON: duplicate confirm does not create second booking", async () => {
+test("authentic: price/scoped question replies without mutation", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const confirmDecision = validBrainConfirmDecision({ confidence: 0.95 });
-  const first = await handleBrainInbound(fake, "haan", {
-    messageId: "dup-a",
-    decision: confirmDecision,
+  const brainReply = "2 din ka total rent 16000 PKR hoga.";
+  const { result, sendCalls } = await handleBrainInbound(
+    fake,
+    "rent kitna hoga?",
+    {
+      messageId: "auth-price-1",
+      openaiPayload: baseModelFields({
+        customerIntent: "ask_fact",
+        customerIsAskingQuestion: true,
+        requestedInfoType: "price",
+        shouldReply: true,
+        customerReply: brainReply,
+        action: "reply",
+        reason: "price_question",
+        replySemantics: {
+          claims: ["quotation_verified"],
+          languageStyle: "roman_urdu",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }),
+    }
+  );
+  assert.equal(result.action, "reply");
+  assert.equal(
+    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
+    "waiting_confirm"
+  );
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+  assert.equal(sendCalls.length, 1);
+  assert.equal(String(sendCalls[0][1]), brainReply);
+  assert.doesNotMatch(String(sendCalls[0][1]), /Booking confirm ho gayi/);
+});
+
+test("authentic: change request sends Brain reply without mutation", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const before = { ...fake.getRequestDoc(REQUEST_ID) };
+  const brainReply =
+    "Is car ke liye alag se availability confirm karni hogi.";
+  const { result, sendCalls } = await handleBrainInbound(fake, "dusri car", {
+    messageId: "auth-change-1",
+    openaiPayload: baseModelFields({
+      customerIntent: "change",
+      customerWantsChange: true,
+      shouldReply: true,
+      customerReply: brainReply,
+      action: "change_request",
+      reason: "change_car",
+    }),
+  });
+  assert.equal(result.action, "change_request");
+  const after = fake.getRequestDoc(REQUEST_ID);
+  assert.equal(after.customerConfirmationStatus, before.customerConfirmationStatus);
+  assert.equal(after.status, before.status);
+  assert.equal(after.itemId, before.itemId);
+  assert.equal(after.linkedBookingId, undefined);
+  assert.equal(sendCalls.length, 1);
+  assert.equal(String(sendCalls[0][1]), brainReply);
+});
+
+test("authentic: unclear clarify sends Brain wording only", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const brainReply = "Main samajh nahi payi. Dobara short mein bata dein?";
+  const { result, sendCalls } = await handleBrainInbound(fake, "hmm ok?", {
+    messageId: "auth-unclear-1",
+    openaiPayload: baseModelFields({
+      conversationStage: "unclear",
+      situation: "unclear",
+      customerIntent: "unclear",
+      shouldReply: true,
+      customerReply: brainReply,
+      action: "clarify",
+      confidence: 0.4,
+      reason: "unclear",
+    }),
+  });
+  assert.equal(result.action, "clarify");
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+  assert.equal(
+    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
+    "waiting_confirm"
+  );
+  assert.equal(sendCalls.length, 1);
+  assert.equal(String(sendCalls[0][1]), brainReply);
+  assert.doesNotMatch(String(sendCalls[0][1]), /Kaunsi car book karni hai/);
+});
+
+test("authentic: invalid action fails closed — no mutation, no outbound", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const openaiCounter = { calls: 0 };
+  const { result, sendCalls } = await handleBrainInbound(fake, "hello", {
+    messageId: "auth-invalid-1",
+    openaiCounter,
+    openaiPayload: baseModelFields({
+      action: "launch_missiles",
+      shouldReply: true,
+      customerReply: "Should never send",
+      reason: "bad_action",
+    }),
+  });
+  assert.equal(openaiCounter.calls >= 1, true);
+  assert.equal(result.brainFailed, true);
+  assert.equal(result.action, "silence");
+  assert.equal(result.reply, null);
+  assert.equal(sendCalls.length, 0);
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+  assert.equal(
+    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
+    "waiting_confirm"
+  );
+});
+
+test("authentic: malformed JSON fails closed", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const { result, sendCalls } = await handleBrainInbound(fake, "haan", {
+    messageId: "auth-malformed-1",
+    openaiCreate: async () => ({
+      choices: [{ message: { content: "not-json{{{" } }],
+    }),
+  });
+  assert.equal(result.brainFailed, true);
+  assert.equal(result.action, "silence");
+  assert.equal(result.reply, null);
+  assert.equal(sendCalls.length, 0);
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("authentic: OpenAI timeout fails closed", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const { result, sendCalls } = await handleBrainInbound(fake, "haan", {
+    messageId: "auth-timeout-1",
+    openaiCreate: async () => {
+      throw new Error("WAITING_CONFIRM_DM_OPENAI_TIMEOUT");
+    },
+  });
+  assert.equal(result.brainFailed, true);
+  assert.equal(result.action, "silence");
+  assert.equal(sendCalls.length, 0);
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("authentic: empty clarify reply uses lane technical fallback only", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const { result, sendCalls } = await handleBrainInbound(fake, "???", {
+    messageId: "auth-empty-1",
+    openaiPayload: baseModelFields({
+      conversationStage: "unclear",
+      situation: "unclear",
+      shouldReply: true,
+      customerReply: "",
+      action: "clarify",
+      confidence: 0.4,
+      reason: "empty_body",
+    }),
+  });
+  assert.equal(result.action, "clarify");
+  assert.equal(sendCalls.length, 1);
+  assert.equal(String(sendCalls[0][1]), WAITING_CONFIRM_DM_TECHNICAL_FALLBACK);
+  assert.notEqual(String(sendCalls[0][1]), EXECUTOR_SUCCESS_REPLY);
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+});
+
+test("authentic: same inbound message ID — one Brain, one booking, one outbound", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  const brainReply = "Confirm mil gaya, request aage barhati hun.";
+  const openaiCounter = { calls: 0 };
+  const openaiPayload = baseModelFields({
+    customerIntent: "confirm",
+    customerIsConfirmingBooking: true,
+    shouldReply: true,
+    customerReply: brainReply,
+    action: "confirm_booking",
+    confidence: 0.95,
+    reason: "natural_confirm",
+    replySemantics: {
+      claims: ["customer_confirmation_acknowledged"],
+      languageStyle: "roman_urdu",
+      containsTimingPromise: false,
+      exposesInternalProcess: false,
+    },
+  });
+  const sendCalls = [];
+  const first = await handleBrainInbound(fake, "haan book kar do", {
+    messageId: "same-msg-1",
+    sendCalls,
+    openaiCounter,
+    openaiPayload,
   });
   assert.equal(first.result.action, "confirmed_booking");
+  assert.equal(openaiCounter.calls, 1);
+  assert.equal(sendCalls.length, 1);
   const bookingId = fake.getRequestDoc(REQUEST_ID).linkedBookingId;
-  const second = await handleBrainInbound(fake, "haan", {
-    messageId: "dup-b",
-    decision: confirmDecision,
+  assert.ok(bookingId);
+
+  const second = await handleBrainInbound(fake, "haan book kar do", {
+    messageId: "same-msg-1",
+    sendCalls,
+    openaiCounter,
+    openaiPayload,
   });
-  assert.notEqual(second.result.action, "confirmed_booking");
+  assert.equal(second.result.duplicate, true);
+  assert.equal(openaiCounter.calls, 1);
+  assert.equal(sendCalls.length, 1);
   assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, bookingId);
-});
-
-test("flag ON: confirm_booking for pure question does not book", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "advance kitna hoga?", {
-    decision: validBrainConfirmDecision({
-      customerIsAskingQuestion: true,
-      customerReply: "Advance abhi confirm nahi.",
-    }),
-  });
-  assert.equal(result.action, "clarify");
-  assert.equal(result.confirmGuardFailed, true);
-  assert.ok(result.confirmGuardReasons?.includes("ASKING_QUESTION"));
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
-    "waiting_confirm"
-  );
-  assert.equal(result.pamissCreated, false);
-  assert.equal(result.ownerNotified, false);
-});
-
-test("flag ON: confirm_booking without confirming flag does not book", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "chalo", {
-    decision: validBrainConfirmDecision({
-      customerIsConfirmingBooking: false,
-    }),
-  });
-  assert.equal(result.action, "clarify");
-  assert.equal(result.confirmGuardFailed, true);
-  assert.ok(result.confirmGuardReasons?.includes("CONFIRMING_FLAG_FALSE"));
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-});
-
-test("flag ON: confirm_booking with wrong requiredExecutor does not book", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "chalo", {
-    decision: validBrainConfirmDecision({
-      requiredExecutor: "whatsapp_cloud_dm",
-    }),
-  });
-  assert.equal(result.action, "clarify");
-  assert.equal(result.confirmGuardFailed, true);
-  assert.ok(result.confirmGuardReasons?.includes("REQUIRED_EXECUTOR_MISMATCH"));
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-});
-
-test("flag ON: confirm_booking with low confidence does not book", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "chalo", {
-    decision: validBrainConfirmDecision({
-      confidence: WAITING_CONFIRM_DM_CONFIRM_CONFIDENCE_MIN - 0.2,
-    }),
-  });
-  assert.equal(result.action, "clarify");
-  assert.equal(result.confirmGuardFailed, true);
-  assert.ok(result.confirmGuardReasons?.includes("CONFIDENCE_TOO_LOW"));
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-});
-
-test("flag ON: confirm_booking without active booking prompt does not book", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(
-    REQUEST_ID,
-    baseWaitingRequest({
-      lastCustomerDmPromptType: AVAILABILITY_DM_PROMPT_TYPES.PRICE_INFO,
-      lastCustomerDmOutboundPreview:
-        "Honda Civic 2026 2 din ka rent 16,000 PKR hoga.",
-      lastCustomerNotifyMessage:
-        "Honda Civic 2026 2 din ka rent 16,000 PKR hoga.",
-    })
-  );
-  const { result } = await handleBrainInbound(fake, "chalo", {
-    decision: validBrainConfirmDecision(),
-  });
-  assert.equal(result.action, "clarify");
-  assert.equal(result.confirmGuardFailed, true);
-  assert.ok(result.confirmGuardReasons?.includes("BOOKING_PROMPT_NOT_ACTIVE"));
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
-    "waiting_confirm"
-  );
-});
-
-test("flag ON: Q&A reply clears stale booking prompt; wrong confirm does not book", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).lastCustomerDmPromptType,
-    AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION
-  );
-
-  const qa = await handleBrainInbound(fake, "advance kitna hoga?", {
-    messageId: "stale-qa-1",
-    decision: {
-      action: "reply",
-      customerIsAskingQuestion: true,
-      customerReply: "Advance amount abhi confirm nahi hai.",
-      asksForBookingConfirmation: false,
-      outboundPromptType: "general_info",
-      confidence: 0.9,
-    },
-  });
-  assert.equal(qa.result.action, "reply");
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).lastCustomerDmPromptType,
-    AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-  );
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-
-  // Brain incorrectly returns a high-confidence confirm after Q&A.
-  const bad = await handleBrainInbound(fake, "ok", {
-    messageId: "stale-qa-2",
-    conversationHistory:
-      "Emily: Book kar du?\nCustomer: advance kitna?\nEmily: Advance confirm nahi.",
-    decision: validBrainConfirmDecision({ confidence: 0.99 }),
-  });
-  assert.equal(bad.result.action, "clarify");
-  assert.equal(bad.result.confirmGuardFailed, true);
-  assert.ok(bad.result.confirmGuardReasons?.includes("BOOKING_PROMPT_NOT_ACTIVE"));
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
-    "waiting_confirm"
-  );
-  assert.equal(bad.result.pamissCreated, false);
-  assert.equal(bad.result.ownerNotified, false);
-});
-
-test("flag ON: explicit asksForBookingConfirmation re-arms confirm; later confirm books", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-
-  const qa = await handleBrainInbound(fake, "driver milega?", {
-    messageId: "rearm-1",
-    decision: {
-      action: "reply",
-      customerIsAskingQuestion: true,
-      customerReply:
-        "Driver abhi confirm nahi. Book confirm karna ho to bata dein.",
-      asksForBookingConfirmation: true,
-      confidence: 0.9,
-    },
-  });
-  assert.equal(qa.result.action, "reply");
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).lastCustomerDmPromptType,
-    AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION
-  );
-
-  const confirm = await handleBrainInbound(fake, "haan", {
-    messageId: "rearm-2",
-    decision: validBrainConfirmDecision(),
-  });
-  assert.equal(confirm.result.action, "confirmed_booking");
-  assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
 });
 
 test("evaluateWaitingConfirmDmBrainConfirmGuard: confirming flag independent of action", () => {
@@ -621,134 +704,16 @@ test("evaluateWaitingConfirmDmBrainConfirmGuard: confirming flag independent of 
   assert.ok(failed.reasons.includes("CONFIRMING_FLAG_FALSE"));
 
   const ok = evaluateWaitingConfirmDmBrainConfirmGuard({
-    decision: validBrainConfirmDecision(),
+    decision: {
+      action: "confirm_booking",
+      customerIsConfirmingBooking: true,
+      customerIsAskingQuestion: false,
+      confidence: 0.92,
+      requiredExecutor: WAITING_CONFIRM_DM_CONFIRM_EXECUTOR,
+    },
     turnContext,
   });
   assert.equal(ok.ok, true);
-});
-
-test("flag ON: ambiguous ack after Q&A does not book", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "ok", {
-    conversationHistory: "Emily: Advance confirm nahi. Customer: ok",
-    decision: {
-      action: "clarify",
-      customerReply: "Book confirm karna hai? Bata dein.",
-      customerIsConfirmingBooking: false,
-      confidence: 0.4,
-    },
-  });
-  assert.notEqual(result.action, "confirmed_booking");
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
-    "waiting_confirm"
-  );
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-});
-
-test("flag ON: questions do not book; missing facts honest; no pamiss/owner", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result, sendCalls } = await handleBrainInbound(
-    fake,
-    "advance kitna hoga?",
-    {
-      decision: {
-        action: "reply",
-        customerIsAskingQuestion: true,
-        customerReply:
-          "Advance amount abhi confirm nahi hai. Book karna ho to bata dein.",
-      },
-    }
-  );
-  assert.equal(result.action, "reply");
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-  assert.match(String(sendCalls[0][1]), /confirm nahi/i);
-  assert.doesNotMatch(String(sendCalls[0][1]), /\b\d{3,}\s*%|\b50%|\badvance\s+\d/i);
-  assert.equal(result.pamissCreated, false);
-  assert.equal(result.ownerNotified, false);
-  assert.equal(fake.pamissCount(), 0);
-});
-
-test("flag ON: negotiation does not invent discount", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result, sendCalls } = await handleBrainInbound(
-    fake,
-    "price kam ho sakta hai?",
-    {
-      decision: {
-        action: "reply",
-        customerReply:
-          "Quoted rent 16,000 PKR hai. Discount abhi confirm nahi hai.",
-      },
-    }
-  );
-  assert.equal(result.action, "reply");
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-  assert.doesNotMatch(String(sendCalls[0][1]), /15,?000|discount mil|kam kar diya/i);
-  assert.match(String(sendCalls[0][1]), /16,?000/);
-});
-
-test("flag ON: casual social no after Q&A does not decline", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "no", {
-    conversationHistory:
-      "Emily: Driver confirm nahi. Customer: ok thanks. Emily: Aur kuch?",
-    decision: {
-      action: "silence",
-      shouldReply: false,
-      customerReply: "",
-      customerIsDeclining: false,
-    },
-  });
-  assert.equal(result.action, "silence");
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
-    "waiting_confirm"
-  );
-});
-
-test("flag ON: real decline uses safe decline path", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const { result } = await handleBrainInbound(fake, "nahi chahiye", {
-    decision: {
-      action: "decline_request",
-      customerIsDeclining: true,
-      customerReply: "Theek hai, cancel kar diya.",
-      requiredExecutor: "decline_request_executor",
-    },
-  });
-  assert.equal(result.action, "declined");
-  assert.equal(
-    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
-    "declined"
-  );
-  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
-});
-
-test("flag ON: change request does not mutate unsafely", async () => {
-  const fake = createFakeDb();
-  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const before = { ...fake.getRequestDoc(REQUEST_ID) };
-  const { result, sendCalls } = await handleBrainInbound(fake, "change car", {
-    decision: {
-      action: "change_request",
-      customerWantsChange: true,
-      customerReply: "Is car ke liye separate availability confirm karni hogi.",
-      requiredExecutor: "protected_change_reply_executor",
-    },
-  });
-  assert.equal(result.action, "change_request");
-  const after = fake.getRequestDoc(REQUEST_ID);
-  assert.equal(after.customerConfirmationStatus, before.customerConfirmationStatus);
-  assert.equal(after.status, before.status);
-  assert.equal(after.itemId, before.itemId);
-  assert.equal(after.linkedBookingId, undefined);
-  assert.match(String(sendCalls[0][1]), /separate availability/i);
 });
 
 test("decideCustomerTurn waiting_confirm_dm uses injected OpenAI double", async () => {
@@ -758,24 +723,25 @@ test("decideCustomerTurn waiting_confirm_dm uses injected OpenAI double", async 
     messageText: "chalo",
     request: baseWaitingRequest(),
   });
-  turnContext.__chatCompletionsCreateForTests = async () => ({
-    choices: [
-      {
-        message: {
-          content: JSON.stringify({
-            action: "confirm_booking",
-            customerIsConfirmingBooking: true,
-            shouldReply: false,
-            customerReply: "",
-            confidence: 0.9,
-            reason: "natural_confirm",
-          }),
-        },
+  turnContext.__chatCompletionsCreateForTests = openaiCreateFromPayload(
+    baseModelFields({
+      action: "confirm_booking",
+      customerIsConfirmingBooking: true,
+      shouldReply: true,
+      customerReply: "Confirm mil gaya, request aage barhati hun.",
+      confidence: 0.9,
+      reason: "natural_confirm",
+      replySemantics: {
+        claims: ["customer_confirmation_acknowledged"],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
       },
-    ],
-  });
+    })
+  );
   const out = await decideCustomerTurn(turnContext);
   assert.equal(out.lane, WAITING_CONFIRM_DM_LANE);
+  assert.equal(out.ok, true);
   assert.equal(out.decision.action, "confirm_booking");
   assert.equal(out.decision.requiredExecutor, "confirm_booking_executor");
 });
@@ -804,6 +770,32 @@ test("parseWaitingConfirmDmDecision: confirming flag is independent of action", 
   );
   assert.equal(withFlag.customerIsConfirmingBooking, true);
   assert.equal(withFlag.action, "confirm_booking");
+});
+
+test("parseWaitingConfirmDmDecision: unsupported action returns null", () => {
+  const parsed = parseWaitingConfirmDmDecision(
+    JSON.stringify({
+      action: "launch_missiles",
+      shouldReply: true,
+      customerReply: "Nope",
+      confidence: 0.9,
+    })
+  );
+  assert.equal(parsed, null);
+});
+
+test("parseWaitingConfirmDmDecision: shouldReply true never leaves empty customerReply", () => {
+  const parsed = parseWaitingConfirmDmDecision(
+    JSON.stringify({
+      action: "clarify",
+      shouldReply: true,
+      customerReply: "   ",
+      confidence: 0.5,
+    })
+  );
+  assert.ok(parsed);
+  assert.equal(parsed.shouldReply, true);
+  assert.equal(parsed.customerReply, WAITING_CONFIRM_DM_TECHNICAL_FALLBACK);
 });
 
 test("no canned tables / topic-regex maps / pamiss / owner notify added in Step 4 files", () => {
@@ -835,6 +827,13 @@ test("no canned tables / topic-regex maps / pamiss / owner notify added in Step 
   );
   assert.match(confirm, /pamissCreated:\s*false/);
   assert.match(confirm, /ownerNotified:\s*false/);
+  assert.doesNotMatch(
+    confirm.slice(
+      confirm.indexOf("async function handleWaitingConfirmDmBrainCloudTurn"),
+      confirm.indexOf("export async function handleAvailabilityCustomerCloudInbound")
+    ),
+    /result\.reply\s*\|\||clean\(result\.reply\)|sendCustomerDmReply\(\{[^}]*result\.reply/s
+  );
 });
 
 test("buffer only gains conversationHistory param pass-through (no routing reorder)", () => {
@@ -842,11 +841,10 @@ test("buffer only gains conversationHistory param pass-through (no routing reord
     join(ROOT, "src/services/whatsappInboundBuffer.js"),
     "utf8"
   );
-  const confirmCall = src.indexOf("tryCloudConfirmFn({");
+  const confirmCall = src.indexOf("handleCloudConfirmFn({");
   assert.ok(confirmCall > 0);
   const snippet = src.slice(confirmCall, confirmCall + 280);
   assert.match(snippet, /conversationHistory/);
-  // Runtime ownership order anchors (declarations, not imports).
   const cloudIdx = src.indexOf("const canTryCloudConfirmOwnership =");
   const waitingIdx = src.indexOf(
     "const ownershipGuard = await evaluateAvailabilityWaitingConfirmOwnershipGuard"

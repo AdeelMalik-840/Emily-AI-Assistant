@@ -8,6 +8,8 @@ import {
   evaluateWaitingConfirmDmBrainConfirmGuard,
   packWaitingConfirmDmTurnContext,
   resolveWaitingConfirmDmOutboundPromptType,
+  WAITING_CONFIRM_DM_ALLOWED_ACTIONS,
+  WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/waitingConfirmDmLane.js";
 import {
   AVAILABILITY_DM_PROMPT_TYPES,
@@ -310,6 +312,10 @@ async function buildQuestionReplyForRequest(request, message) {
   });
 }
 
+/**
+ * Legacy flag-OFF path only: invents customer wording from deterministic intent.
+ * Brain-enabled waiting-confirm must never call this — lane owns customerReply.
+ */
 async function resolveReplyForBrainDecision(request, decision, messageText) {
   if (decision.reply) return decision.reply;
   if (decision.intent === "price") {
@@ -322,6 +328,40 @@ async function resolveReplyForBrainDecision(request, decision, messageText) {
     return buildQuestionReplyForRequest(request, messageText);
   }
   return buildAvailabilityGenericAckPromptReply();
+}
+
+/**
+ * Brain-enabled outbound wording: only the lane decision, else technical/silence.
+ * Never maps intent → canned semantic reply.
+ * @param {Record<string, unknown> | null | undefined} decision
+ * @returns {string | null}
+ */
+function resolveBrainEnabledOutboundReply(decision) {
+  const action = clean(decision?.action, 40);
+  if (
+    !WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has(action) ||
+    action === "silence" ||
+    action === "none" ||
+    decision?.shouldReply === false
+  ) {
+    return null;
+  }
+  const reply = clean(decision?.customerReply);
+  if (reply) return reply;
+  // shouldReply implied/true but empty body — technical only (never intent canned).
+  return WAITING_CONFIRM_DM_TECHNICAL_FALLBACK;
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} turnResult
+ */
+function isUsableWaitingConfirmBrainTurn(turnResult) {
+  if (!turnResult || typeof turnResult !== "object") return false;
+  if (turnResult.ok === false) return false;
+  const decision = turnResult.decision;
+  if (!decision || typeof decision !== "object") return false;
+  const action = clean(decision.action, 40);
+  return WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has(action);
 }
 
 async function sendCustomerDmReply({
@@ -994,6 +1034,7 @@ async function handleWaitingConfirmDmBrainCloudTurn({
   availabilityConfirmExecute,
   decideCustomerTurnFn,
   catalogRowOverride,
+  chatCompletionsCreateForTests = null,
 }) {
   const catalogRow =
     catalogRowOverride !== undefined
@@ -1008,8 +1049,41 @@ async function handleWaitingConfirmDmBrainCloudTurn({
     request,
     catalogRow,
   });
-  const decision = (await decideCustomerTurnFn(turnContext))?.decision || {};
-  const action = clean(decision.action, 40) || "reply";
+  if (typeof chatCompletionsCreateForTests === "function") {
+    turnContext.__chatCompletionsCreateForTests = chatCompletionsCreateForTests;
+  }
+  const turnResult = await decideCustomerTurnFn(turnContext);
+  if (!isUsableWaitingConfirmBrainTurn(turnResult)) {
+    // Fail closed: no booking / decline / fabricated semantic reply.
+    await recordCloudInboundIdempotency({
+      connection,
+      businessId,
+      requestId,
+      messageId: inboundMessageId,
+      messageText: text,
+    });
+    return waitingConfirmBrainMeta({
+      handled: true,
+      action: "silence",
+      reply: null,
+      decision: turnResult?.decision || null,
+      requestId,
+      turnContext,
+      brainFailed: true,
+      reason:
+        clean(turnResult?.reason) ||
+        (turnResult?.ok === false
+          ? "BRAIN_TURN_NOT_OK"
+          : !WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has(
+                clean(turnResult?.decision?.action, 40)
+              )
+            ? "BRAIN_ACTION_INVALID"
+            : "BRAIN_DECISION_MISSING"),
+    });
+  }
+
+  const decision = turnResult.decision;
+  const action = clean(decision.action, 40);
 
   const finish = async (payload, replyText = null, promptType = null) => {
     let reply = replyText;
@@ -1056,15 +1130,14 @@ async function handleWaitingConfirmDmBrainCloudTurn({
     });
     if (!confirmGuard.ok) {
       // Soft fail: no booking / decline / AVR mutate / pamiss / owner notify.
-      // Do not re-activate booking prompt unless Brain explicitly asked to confirm.
+      // Outbound wording stays Brain-owned (or silence / technical only).
       return finish(
         {
           action: "clarify",
           confirmGuardFailed: true,
           confirmGuardReasons: confirmGuard.reasons,
         },
-        clean(decision.customerReply) ||
-          "Book confirm karna hai? Bata dein.",
+        resolveBrainEnabledOutboundReply(decision),
         resolveWaitingConfirmDmOutboundPromptType(
           decision,
           AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
@@ -1082,11 +1155,28 @@ async function handleWaitingConfirmDmBrainCloudTurn({
       availabilityConfirmExecute,
       brainAuthorizedConfirm: true,
     });
-    const reply =
-      result.ok === true
-        ? result.reply || buildAvailabilityConfirmSuccessReply()
-        : clean(decision.customerReply) ||
-          buildAvailabilityConfirmClarificationReply();
+    // Brain owns customer wording — never send executor-built reply text.
+    const reply = resolveBrainEnabledOutboundReply(decision);
+    if (reply == null) {
+      await recordCloudInboundIdempotency({
+        connection,
+        businessId,
+        requestId,
+        messageId: inboundMessageId,
+        messageText: text,
+      });
+      return waitingConfirmBrainMeta({
+        handled: true,
+        action: result.ok ? "confirmed_booking" : "confirm_failed",
+        reply: null,
+        result,
+        decision,
+        requestId,
+        actionType: "confirm_booking",
+        failureReason: result.ok === true ? null : result.reason ?? null,
+        failureStage: result.ok === true ? null : result.failureStage ?? null,
+      });
+    }
     const sendOutcome = await sendCustomerDmReply({
       phone,
       reply,
@@ -1147,7 +1237,7 @@ async function handleWaitingConfirmDmBrainCloudTurn({
     });
     return finish(
       { action: "declined" },
-      clean(decision.customerReply) || buildAvailabilityDeclineAckReply(),
+      resolveBrainEnabledOutboundReply(decision),
       AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
     );
   }
@@ -1156,24 +1246,23 @@ async function handleWaitingConfirmDmBrainCloudTurn({
     return finish({ action: "silence" });
   }
 
-  return finish(
-    {
-      action:
-        action === "change_request"
-          ? "change_request"
-          : action === "clarify"
-            ? "clarify"
-            : "reply",
-    },
-    clean(decision.customerReply) ||
-      (action === "change_request"
-        ? buildAvailabilityChangeCarReply()
-        : buildAvailabilityGenericAckPromptReply()),
-    resolveWaitingConfirmDmOutboundPromptType(
-      decision,
-      AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-    )
-  );
+  if (action === "change_request" || action === "clarify" || action === "reply") {
+    return finish(
+      { action },
+      resolveBrainEnabledOutboundReply(decision),
+      resolveWaitingConfirmDmOutboundPromptType(
+        decision,
+        AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
+      )
+    );
+  }
+
+  // Defensive: allowed-set check above should already have failed closed.
+  return finish({
+    action: "silence",
+    brainFailed: true,
+    reason: "BRAIN_ACTION_INVALID",
+  });
 }
 
 /**
@@ -1192,6 +1281,7 @@ async function handleWaitingConfirmDmBrainCloudTurn({
  *   __waitingConfirmDmBrainEnabled?: boolean,
  *   __decideCustomerTurnForTests?: Function | null,
  *   __catalogRowForTests?: Record<string, unknown> | null,
+ *   __chatCompletionsCreateForTests?: Function | null,
  * }} params
  */
 export async function handleAvailabilityCustomerCloudInbound({
@@ -1209,6 +1299,7 @@ export async function handleAvailabilityCustomerCloudInbound({
   __waitingConfirmDmBrainEnabled = null,
   __decideCustomerTurnForTests = null,
   __catalogRowForTests = undefined,
+  __chatCompletionsCreateForTests = null,
 }) {
   const uid = clean(businessId);
   const phone = normalizePhone(customerPhone);
@@ -1389,6 +1480,7 @@ export async function handleAvailabilityCustomerCloudInbound({
       availabilityConfirmExecute,
       decideCustomerTurnFn: decideFn,
       catalogRowOverride: __catalogRowForTests,
+      chatCompletionsCreateForTests: __chatCompletionsCreateForTests,
     });
   }
 

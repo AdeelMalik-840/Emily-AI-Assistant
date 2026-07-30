@@ -41,8 +41,14 @@ const ACTIONS = new Set([
   "none",
 ]);
 
+/** Allowed waiting-confirm Brain actions (lane contract). */
+export const WAITING_CONFIRM_DM_ALLOWED_ACTIONS = ACTIONS;
+
 const TECHNICAL_FALLBACK =
   "Abhi ye detail confirm nahi hai. Book karna ho to bata dein.";
+
+/** Technical-only fallback when a sendable reply is required but wording is empty. */
+export const WAITING_CONFIRM_DM_TECHNICAL_FALLBACK = TECHNICAL_FALLBACK;
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -256,6 +262,18 @@ export function packWaitingConfirmDmTurnContext({
 }
 
 /** @param {string} raw */
+/**
+ * Ensure shouldReply=true decisions always carry non-empty customer wording.
+ * @param {Record<string, unknown>} decision
+ */
+function ensureSendableWaitingConfirmReply(decision) {
+  const next = decision && typeof decision === "object" ? { ...decision } : {};
+  if (next.shouldReply === true && !clean(next.customerReply)) {
+    next.customerReply = TECHNICAL_FALLBACK;
+  }
+  return next;
+}
+
 export function parseWaitingConfirmDmDecision(raw) {
   let text = String(raw ?? "").trim();
   if (!text) return null;
@@ -273,7 +291,7 @@ export function parseWaitingConfirmDmDecision(raw) {
   if (!parsed || typeof parsed !== "object") return null;
 
   let action = clean(parsed.action, 40).toLowerCase();
-  if (!ACTIONS.has(action)) action = "reply";
+  // Legacy alias only — unknown actions must not coerce into reply.
   if (action === "escalate_missing_info") action = "reply";
   let customerReply = clean(parsed.customerReply ?? parsed.reply, 500);
 
@@ -311,6 +329,9 @@ export function parseWaitingConfirmDmDecision(raw) {
   if (isConfirmingBooking) action = "confirm_booking";
   else if (customerIsDeclining) action = "decline_request";
   else if (customerWantsChange && action !== "reply") action = "change_request";
+
+  // Fail closed: missing/unsupported action never becomes a normal reply.
+  if (!action || !ACTIONS.has(action)) return null;
 
   let shouldReply =
     parsed.shouldReply === false
@@ -351,6 +372,11 @@ export function parseWaitingConfirmDmDecision(raw) {
     action = "clarify";
     customerReply = customerReply || "Book confirm karna hai? Bata dein.";
     shouldReply = true;
+  }
+
+  // Final contract: every sendable decision must carry non-empty customer wording.
+  if (shouldReply === true && !clean(customerReply)) {
+    customerReply = TECHNICAL_FALLBACK;
   }
 
   return {
@@ -695,7 +721,9 @@ When action=confirm_booking and customerReply is non-empty: write a short natura
 
       return {
         ok: true,
-        decision: stripInternalReplySemantics(decision),
+        decision: stripInternalReplySemantics(
+          ensureSendableWaitingConfirmReply(decision)
+        ),
         source: attempt === 1 ? "openai" : "openai_content_safety_regenerated",
         contentSafetyAttempts: attempt,
       };
