@@ -55,6 +55,7 @@ import {
   updateAvailabilityRequestFields,
 } from "./availabilityRequestService.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import { normalizePhoneE164 } from "./connections.js";
 
 export {
   classifyAvailabilityConfirmationIntent,
@@ -649,6 +650,85 @@ export async function executeAvailabilityCustomerConfirmBooking({
     bookingId: clean(bookingResult.booking.id),
     reply: buildAvailabilityConfirmSuccessReply(),
   };
+}
+
+/**
+ * Execute an OpenAI-authorized decline for one already trusted Cloud
+ * waiting-confirm request. Produces no customer wording.
+ */
+export async function executeAvailabilityCustomerDecline({
+  db: connection,
+  businessId,
+  request,
+  customerPhone,
+  messageId = null,
+  messageText = "",
+}) {
+  const uid = clean(businessId);
+  const requestId = clean(request?.requestId ?? request?.id);
+  const expectedPhone = normalizePhoneE164(customerPhone);
+  if (!uid || !requestId || !expectedPhone) {
+    return { ok: false, reason: "MISSING_CONTEXT" };
+  }
+  const fresh = await getAvailabilityRequest({
+    db: connection,
+    businessId: uid,
+    requestId,
+  });
+  if (!fresh) return { ok: false, reason: "REQUEST_NOT_FOUND" };
+  const freshBusinessId = clean(fresh.businessId);
+  if (freshBusinessId && freshBusinessId !== uid) {
+    return { ok: false, reason: "BUSINESS_MISMATCH" };
+  }
+  const requestPhones = [
+    fresh.customerDmTarget,
+    fresh.customerPhone,
+    fresh.customerPhoneNormalized,
+    fresh.customerWaId,
+  ]
+    .map(normalizePhoneE164)
+    .filter(Boolean);
+  if (!requestPhones.includes(expectedPhone)) {
+    return { ok: false, reason: "CUSTOMER_MISMATCH" };
+  }
+  if (clean(fresh.status) !== "approved") {
+    return { ok: false, reason: "REQUEST_NOT_APPROVED" };
+  }
+  if (clean(fresh.customerConfirmationStatus) !== "waiting_confirm") {
+    return { ok: false, reason: "REQUEST_NOT_WAITING_CONFIRM" };
+  }
+  if (clean(fresh.linkedBookingId)) {
+    return { ok: false, reason: "BOOKING_ALREADY_LINKED" };
+  }
+  if (clean(fresh.supersededByAvailabilityRequestId)) {
+    return { ok: false, reason: "REQUEST_SUPERSEDED" };
+  }
+  const expiresAt = fresh.confirmExpiresAt
+    ? new Date(fresh.confirmExpiresAt)
+    : null;
+  if (
+    expiresAt &&
+    Number.isFinite(expiresAt.getTime()) &&
+    expiresAt.getTime() <= Date.now()
+  ) {
+    return { ok: false, reason: "REQUEST_EXPIRED" };
+  }
+  const updated = await updateAvailabilityRequestCustomerConfirmationState({
+    db: connection,
+    businessId: uid,
+    requestId,
+    customerConfirmationStatus: "declined",
+    extra: {
+      customerConfirmationAt: new Date(),
+      customerConfirmationMessageId: clean(messageId) || null,
+      customerConfirmationTextPreview:
+        clean(messageText).slice(0, 160) || null,
+      customerConfirmProcessingStatus: "done",
+    },
+  });
+  return updated
+    ? { ok: true, requestId }
+    : { ok: false, reason: "DECLINE_UPDATE_FAILED" };
 }
 
 /**

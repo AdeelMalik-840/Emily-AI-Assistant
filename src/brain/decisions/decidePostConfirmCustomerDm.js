@@ -42,7 +42,26 @@ export const POST_CONFIRM_ACTIONS = Object.freeze([
   "reply",
   "silence",
   "escalate_missing_info",
-  "fallthrough_action",
+  "request_booking_mutation",
+  "confirm_pending_availability",
+  "decline_pending_availability",
+]);
+
+export const POST_CONFIRM_MUTATION_INTENTS = Object.freeze([
+  "none",
+  "extend_booking",
+  "cancel_booking",
+  "change_dates",
+  "change_duration",
+  "change_item",
+  "update_pickup",
+  "update_delivery",
+]);
+
+export const POST_CONFIRM_MUTATION_EXECUTION_STATUSES = Object.freeze([
+  "not_executed",
+  "succeeded",
+  "failed",
 ]);
 
 export const POST_CONFIRM_SITUATIONS = Object.freeze([
@@ -74,12 +93,13 @@ export const POST_CONFIRM_CUSTOMER_INTENTS = Object.freeze([
 export const POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK =
   "Abhi ye detail confirm nahi hai.";
 
-/** Short non-echo close used only when anti-echo must replace a mirrored reply. */
-export const POST_CONFIRM_NON_ECHO_CLOSE = "Theek hai.";
-
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
+}
+
+function cleanCustomerReply(value) {
+  return String(value ?? "").trim();
 }
 
 function cleanAct(value) {
@@ -105,6 +125,47 @@ function cleanIntent(value) {
 function cleanType(value) {
   const t = clean(value, 40).toLowerCase();
   return t || null;
+}
+
+function cleanMutationIntent(value) {
+  const intent = clean(value, 60).toLowerCase();
+  return POST_CONFIRM_MUTATION_INTENTS.includes(intent) ? intent : "none";
+}
+
+function cleanMutationExecutionStatus(value) {
+  const status = clean(value, 40).toLowerCase();
+  return POST_CONFIRM_MUTATION_EXECUTION_STATUSES.includes(status)
+    ? status
+    : "not_executed";
+}
+
+function normalizeGroundedFacts(raw) {
+  const o = raw && typeof raw === "object" ? raw : {};
+  const nullableNumber = (value) =>
+    value != null && Number.isFinite(Number(value)) ? Number(value) : null;
+  const nullableText = (value, max = 300) => clean(value, max) || null;
+  return {
+    itemId: nullableText(o.itemId, 160),
+    durationDays: nullableNumber(o.durationDays),
+    bookingStatus: nullableText(o.bookingStatus, 80),
+    bookingReference: nullableText(o.bookingReference, 160),
+    totalAmount: nullableNumber(o.totalAmount),
+    dailyRate: nullableNumber(o.dailyRate),
+    advanceAmount: nullableNumber(o.advanceAmount),
+    startDate: nullableText(o.startDate, 80),
+    endDate: nullableText(o.endDate, 80),
+    pickupTime: nullableText(o.pickupTime, 120),
+    deliveryTime: nullableText(o.deliveryTime, 120),
+    policyClaims: Array.isArray(o.policyClaims)
+      ? o.policyClaims
+          .map((row) => ({
+            key: nullableText(row?.key, 80),
+            value: nullableText(row?.value, 500),
+          }))
+          .filter((row) => row.key && row.value)
+          .slice(0, 12)
+      : [],
+  };
 }
 
 /**
@@ -140,46 +201,19 @@ export function isNearEchoReply(userMessage, reply) {
   return false;
 }
 
-function isSocialOrClosingAct(conversationAct, customerIntent, situation) {
-  if (
-    conversationAct === "acknowledgement" ||
-    conversationAct === "thanks" ||
-    conversationAct === "chit_chat"
-  ) {
-    return true;
-  }
-  if (
-    customerIntent === "ack" ||
-    customerIntent === "farewell" ||
-    customerIntent === "thanks" ||
-    customerIntent === "social_challenge" ||
-    customerIntent === "decline_more_help"
-  ) {
-    return true;
-  }
-  if (
-    situation === "conversation_closing" ||
-    situation === "social_repair" ||
-    situation === "decline_more_help" ||
-    situation === "acknowledgement_after_answer"
-  ) {
-    return true;
-  }
-  return false;
-}
 
 /**
- * Apply silence / anti-echo hardening to a decision (generic, not phrase maps).
+ * Normalize model-declared silence only. Never blank a non-empty OpenAI reply.
  * @param {Record<string, unknown>} decision
- * @param {string} userMessage
+ * @param {string} [_userMessage]
  */
-export function applyPostConfirmAntiEchoAndSilence(decision, userMessage) {
+export function applyPostConfirmAntiEchoAndSilence(decision, _userMessage) {
   const next = { ...(decision && typeof decision === "object" ? decision : {}) };
   let action = cleanAction(next.action);
   let conversationAct = cleanAct(next.conversationAct);
   let situation = cleanSituation(next.situation);
   let customerIntent = cleanIntent(next.customerIntent);
-  let customerReply = clean(next.customerReply, 500);
+  let customerReply = cleanCustomerReply(next.customerReply);
   let shouldReply =
     next.shouldReply === false
       ? false
@@ -187,34 +221,12 @@ export function applyPostConfirmAntiEchoAndSilence(decision, userMessage) {
         ? true
         : action !== "silence" && action !== "none";
 
+  // Model-declared silence only — never invent silence from echo heuristics.
   if (action === "silence" || shouldReply === false) {
     action = "silence";
     shouldReply = false;
     customerReply = "";
-  }
-
-  if (
-    customerReply &&
-    isSocialOrClosingAct(conversationAct, customerIntent, situation) &&
-    isNearEchoReply(userMessage, customerReply)
-  ) {
-    // Prefer silence for pure farewell/ack echo; tiny non-echo close for repair contexts.
-    if (
-      situation === "social_repair" ||
-      customerIntent === "social_challenge" ||
-      customerIntent === "complain"
-    ) {
-      customerReply = POST_CONFIRM_NON_ECHO_CLOSE;
-      action = "reply";
-      shouldReply = true;
-    } else {
-      customerReply = "";
-      action = "silence";
-      shouldReply = false;
-    }
-  }
-
-  if (action === "none" && !customerReply) {
+  } else if (action === "none" && !customerReply) {
     action = "silence";
     shouldReply = false;
   }
@@ -230,29 +242,56 @@ export function applyPostConfirmAntiEchoAndSilence(decision, userMessage) {
   };
 }
 
+/**
+ * Near-echo is a contract violation (regen), not deterministic silence.
+ * @param {string} userMessage
+ * @param {string} reply
+ * @param {Record<string, unknown>} decision
+ */
+export function isPostConfirmNearEchoViolation(userMessage, reply, decision) {
+  const text = cleanCustomerReply(reply);
+  if (!text) return false;
+  if (cleanAction(decision?.action) === "silence") return false;
+  return isNearEchoReply(userMessage, text);
+}
+
 function compactOpenMissingInfo(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.slice(0, 12).map((row) => ({
-    requestId: row?.requestId ?? null,
     missingInfoType: row?.missingInfoType ?? null,
     customerQuestion: row?.customerQuestion ?? null,
     status: row?.status ?? null,
-    createdAt: row?.createdAt ?? null,
-    ownerNotifyStatus: row?.ownerNotifyStatus ?? null,
   }));
 }
 
 function compactClosedMissingInfo(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.slice(0, 12).map((row) => ({
-    requestId: row?.requestId ?? null,
     missingInfoType: row?.missingInfoType ?? null,
     customerQuestion: row?.customerQuestion ?? null,
     ownerAnswer: row?.ownerAnswer ?? null,
     customerFollowupText: row?.customerFollowupText ?? null,
     customerFollowupStatus: row?.customerFollowupStatus ?? null,
-    closedAt: row?.closedAt ?? null,
   }));
+}
+
+function compactCustomerSafeBooking(booking) {
+  if (!booking || typeof booking !== "object") return null;
+  return {
+    customerSafeReference: booking.customerSafeReference ?? null,
+    status: booking.status ?? null,
+    approvalStage: booking.approvalStage ?? null,
+    itemLabel: booking.itemLabel ?? null,
+    durationDays: booking.durationDays ?? null,
+    startDate: booking.startDate ?? null,
+    endDate: booking.endDate ?? null,
+    pickupTime: booking.pickupTime ?? null,
+    deliveryTime: booking.deliveryTime ?? null,
+    deliveryMethod: booking.deliveryMethod ?? null,
+    deliveryAddress: booking.deliveryAddress ?? null,
+    totalAmount: booking.totalAmount ?? null,
+    dailyRate: booking.dailyRate ?? null,
+  };
 }
 
 /**
@@ -270,10 +309,57 @@ export function compactPostConfirmFactsForPrompt(facts) {
       : null;
   const known = f.known && typeof f.known === "object" ? f.known : {};
   const policy = f.policy && typeof f.policy === "object" ? f.policy : {};
+  const activeBookings = Array.isArray(f.activeBookings)
+    ? f.activeBookings.map(compactCustomerSafeBooking).filter(Boolean).slice(0, 12)
+    : [];
+  const pendingAvailabilityRequests = Array.isArray(
+    f.pendingAvailabilityRequests
+  )
+    ? f.pendingAvailabilityRequests.slice(0, 12).map((row) => ({
+        selectionIndex:
+          Number.isFinite(Number(row?.selectionIndex))
+            ? Number(row.selectionIndex)
+            : null,
+        itemLabel: row?.itemLabel ?? null,
+        requestedDuration: row?.requestedDuration ?? null,
+        requestedDates: Array.isArray(row?.requestedDates)
+          ? row.requestedDates
+          : [],
+        priceQuote: row?.priceQuote ?? null,
+        status: row?.status ?? null,
+        customerConfirmationStatus:
+          row?.customerConfirmationStatus ?? null,
+      }))
+    : [];
+  const mutationExecution =
+    f.mutationExecution && typeof f.mutationExecution === "object"
+      ? {
+          requested: f.mutationExecution.requested === true,
+          status:
+            String(f.mutationExecution.status ?? "not_executed").trim() ||
+            "not_executed",
+          intent: cleanMutationIntent(f.mutationExecution.intent),
+        }
+      : { requested: false, status: "not_executed", intent: "none" };
+  const pendingAvailabilityExecution =
+    f.pendingAvailabilityExecution &&
+    typeof f.pendingAvailabilityExecution === "object"
+      ? {
+          action:
+            clean(f.pendingAvailabilityExecution.action, 60) || "none",
+          status:
+            clean(f.pendingAvailabilityExecution.status, 60) ||
+            "not_executed",
+          itemLabel:
+            clean(f.pendingAvailabilityExecution.itemLabel, 200) || null,
+          durationDays:
+            Number.isFinite(Number(f.pendingAvailabilityExecution.durationDays))
+              ? Number(f.pendingAvailabilityExecution.durationDays)
+              : null,
+        }
+      : null;
 
   return JSON.stringify({
-    businessId: f.businessId ?? null,
-    customerPhoneDigits: f.customerPhoneDigits ?? null,
     business: {
       name: business.name ?? null,
       category: business.category ?? null,
@@ -287,20 +373,15 @@ export function compactPostConfirmFactsForPrompt(facts) {
         business.documentsPolicy ?? known.documentsPolicy ?? null,
       deliveryPolicy: business.deliveryPolicy ?? known.deliveryPolicy ?? null,
     },
-    booking: {
-      id: booking.id ?? null,
-      status: booking.status ?? null,
-      approvalStage: booking.approvalStage ?? null,
-      itemId: booking.itemId ?? null,
-      itemLabel: booking.itemLabel ?? null,
-      durationDays: booking.durationDays ?? null,
-      totalAmount: booking.totalAmount ?? null,
-      dailyRate: booking.dailyRate ?? null,
-      availabilityRequestId: booking.availabilityRequestId ?? null,
-    },
+    booking: Object.keys(booking).length > 0
+      ? compactCustomerSafeBooking(booking)
+      : null,
+    activeBookings,
+    pendingAvailabilityRequests,
+    mutationExecution,
+    pendingAvailabilityExecution,
     availabilityRequest: avr
       ? {
-          id: avr.id ?? null,
           itemLabel: avr.itemLabel ?? null,
           requestedDuration: avr.requestedDuration ?? null,
           priceQuote: avr.priceQuote ?? null,
@@ -329,6 +410,7 @@ export function compactPostConfirmFactsForPrompt(facts) {
       doNotInventAmounts: policy.doNotInventAmounts !== false,
       doNotInventPolicies: policy.doNotInventPolicies !== false,
       doNotMutateBooking: policy.doNotMutateBooking !== false,
+      ambiguousBookingSelection: policy.ambiguousBookingSelection === true,
     },
   });
 }
@@ -356,6 +438,10 @@ function defaultDecision(overrides = {}) {
     action: "silence",
     shouldReply: false,
     situation: "unclear",
+    mutationIntent: "none",
+    mutationExecutionRequested: false,
+    mutationExecutionStatus: "not_executed",
+    pendingAvailabilitySelectionIndex: null,
     ...overrides,
   };
 }
@@ -385,7 +471,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     if (!plain || plain.startsWith("{")) return null;
     return applyPostConfirmAntiEchoAndSilence(
       defaultDecision({
-        customerReply: plain.slice(0, 500),
+        customerReply: plain,
         situation: "unclear",
         shouldReply: true,
         action: "reply",
@@ -422,6 +508,12 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     cleanType(parsed.missingInfoType) ||
     null;
   let situation = cleanSituation(parsed.situation);
+  const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
+  const pendingAvailabilitySelectionIndex =
+    Number.isInteger(Number(parsed.pendingAvailabilitySelectionIndex)) &&
+    Number(parsed.pendingAvailabilitySelectionIndex) >= 1
+      ? Number(parsed.pendingAvailabilitySelectionIndex)
+      : null;
 
   // Legacy fields must never drive escalate by themselves.
   if (parsed.needsFollowup === true && action === "reply") {
@@ -500,10 +592,22 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     }
   }
 
-  // fallthrough_action is reserved for protected action intents handled outside this helper.
-  if (action === "fallthrough_action") {
-    action = "reply";
-    if (situation === "new_question") situation = "protected_action";
+  if (action === "request_booking_mutation") {
+    situation = "protected_action";
+    conversationAct = "action_request";
+    customerIntent = "ask_action";
+    customerIsAskingQuestion = false;
+    requestedInfoType = null;
+  }
+  if (
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability"
+  ) {
+    situation = "protected_action";
+    conversationAct = "action_request";
+    customerIntent = "ask_action";
+    customerIsAskingQuestion = false;
+    requestedInfoType = null;
   }
 
   return applyPostConfirmAntiEchoAndSilence(
@@ -513,11 +617,21 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       customerIsAskingQuestion,
       requestedInfoType:
         conversationAct === "information_request" ? requestedInfoType : null,
-      customerReply: customerReply.slice(0, 500),
+      customerReply,
       action,
       shouldReply,
       situation,
+      mutationIntent:
+        action === "request_booking_mutation" ? mutationIntent : "none",
+      mutationExecutionRequested:
+        action === "request_booking_mutation" &&
+        parsed.mutationExecutionRequested === true,
+      mutationExecutionStatus: cleanMutationExecutionStatus(
+        parsed.mutationExecutionStatus
+      ),
+      pendingAvailabilitySelectionIndex,
       replySemantics: normalizeReplySemantics(parsed.replySemantics),
+      groundedFacts: normalizeGroundedFacts(parsed.groundedFacts),
     },
     userMessage
   );
@@ -592,8 +706,11 @@ export async function executePostConfirmPaLaneDecision({
   const loopOn = missingInfoLoopFullyEnabled === true;
 
   const hasActiveBooking = Boolean(
-    facts?.booking && typeof facts.booking === "object" && facts.booking.id
+    (facts?.booking && typeof facts.booking === "object" && facts.booking.id) ||
+      (Array.isArray(facts?.activeBookings) && facts.activeBookings.length > 0)
   );
+  const hasAmbiguousBookings =
+    Array.isArray(facts?.activeBookings) && facts.activeBookings.length > 1;
 
   const escalateGuidance = loopOn
     ? `- Set action="escalate_missing_info" ONLY when ALL are true:
@@ -645,6 +762,61 @@ export async function executePostConfirmPaLaneDecision({
         shouldReply: { type: "boolean" },
         customerReply: { type: "string" },
         action: { type: "string", enum: [...POST_CONFIRM_ACTIONS] },
+        mutationIntent: {
+          type: "string",
+          enum: [...POST_CONFIRM_MUTATION_INTENTS],
+        },
+        mutationExecutionRequested: { type: "boolean" },
+        mutationExecutionStatus: {
+          type: "string",
+          enum: [...POST_CONFIRM_MUTATION_EXECUTION_STATUSES],
+        },
+        pendingAvailabilitySelectionIndex: {
+          type: ["integer", "null"],
+        },
+        groundedFacts: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            itemId: { type: ["string", "null"] },
+            durationDays: { type: ["number", "null"] },
+            bookingStatus: { type: ["string", "null"] },
+            bookingReference: { type: ["string", "null"] },
+            totalAmount: { type: ["number", "null"] },
+            dailyRate: { type: ["number", "null"] },
+            advanceAmount: { type: ["number", "null"] },
+            startDate: { type: ["string", "null"] },
+            endDate: { type: ["string", "null"] },
+            pickupTime: { type: ["string", "null"] },
+            deliveryTime: { type: ["string", "null"] },
+            policyClaims: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  key: { type: "string" },
+                  value: { type: "string" },
+                },
+                required: ["key", "value"],
+              },
+            },
+          },
+          required: [
+            "itemId",
+            "durationDays",
+            "bookingStatus",
+            "bookingReference",
+            "totalAmount",
+            "dailyRate",
+            "advanceAmount",
+            "startDate",
+            "endDate",
+            "pickupTime",
+            "deliveryTime",
+            "policyClaims",
+          ],
+        },
         replySemantics: REPLY_SEMANTICS_SCHEMA,
       },
       required: [
@@ -656,6 +828,11 @@ export async function executePostConfirmPaLaneDecision({
         "shouldReply",
         "customerReply",
         "action",
+        "mutationIntent",
+        "mutationExecutionRequested",
+        "mutationExecutionStatus",
+        "pendingAvailabilitySelectionIndex",
+        "groundedFacts",
         "replySemantics",
       ],
     }
@@ -666,7 +843,7 @@ export async function executePostConfirmPaLaneDecision({
 LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
 Return STRICT JSON (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
@@ -698,7 +875,12 @@ STEP 4 — action:
 - none: rare; prefer silence when empty
 - reply: send customerReply
 - escalate_missing_info: only situation=new_question per escalate rules
-- Do NOT use fallthrough_action here
+- request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, pickup, or delivery. Set the matching mutationIntent. Do not claim execution succeeded.
+- confirm_pending_availability / decline_pending_availability: use only when the customer clearly intends that action for one listed pendingAvailabilityRequests entry. Set pendingAvailabilitySelectionIndex to that entry's selectionIndex. If intent or selection is unclear, ask a natural clarification with action="reply".
+- mutationExecutionRequested=true only with request_booking_mutation.
+- mutationExecutionStatus must reflect VERIFIED_BUSINESS_PA_FACTS_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
+- Never fall through to another conversational router.
+- When pendingAvailabilityExecution exists, report that verified outcome naturally with action="reply"; do not request the same action again.
 
 SITUATION RULES:
 - Ack after Emily already answered (customerFollowupText / known) → acknowledgement_after_answer; reply brief or silence; never escalate.
@@ -718,11 +900,20 @@ LANE FACT RULES:
       ? "Active booking is BACKGROUND. Do not onboard as a new visitor."
       : "No active booking object."
   }
+- ${
+    hasAmbiguousBookings
+      ? "Multiple active bookings are present. Ask a natural clarification using only their customer-safe facts. Do not select or mutate one."
+      : "There is no multi-booking ambiguity."
+  }
 - replySemantics.claims must only list claims supported by verified facts / allowedClaims.
+- groundedFacts is internal validation metadata. Populate every verified booking,
+  price, date, time, reference, or policy value used in customerReply; otherwise
+  use null/[] exactly as the schema requires.
 
 STRICT SAFETY:
 - Do NOT invent amounts or policies.
 - Do NOT create/cancel/change bookings.
+- A requested booking mutation is not completed unless verified mutationExecution.status is succeeded.
 - Do NOT mention Brain, Firestore, OpenAI, or internal tokens.
 - Never escalate social/closing/acknowledgement turns.`;
 
@@ -795,7 +986,7 @@ STRICT SAFETY:
       const decision = parsePostConfirmCustomerDmDecision(raw, {
         userMessage: userLine,
       });
-      const hasSendableReply = Boolean(clean(decision?.customerReply));
+      const hasSendableReply = Boolean(cleanCustomerReply(decision?.customerReply));
       const isSilence =
         decision?.action === "silence" || decision?.shouldReply === false;
       if (!decision || (!hasSendableReply && !isSilence)) {
@@ -824,15 +1015,64 @@ STRICT SAFETY:
       }
 
       const finalized = applyPostConfirmAntiEchoAndSilence(decision, userLine);
-      const replyText = clean(finalized?.customerReply);
+      finalized.mutationExecutionRequested =
+        finalized.action === "request_booking_mutation";
+      finalized.mutationExecutionStatus = cleanMutationExecutionStatus(
+        facts?.mutationExecution?.status
+      );
+      if (finalized.action === "request_booking_mutation") {
+        finalized.mutationIntent = cleanMutationIntent(
+          finalized.mutationIntent
+        );
+      } else {
+        finalized.mutationIntent = "none";
+      }
+      const replyText = cleanCustomerReply(finalized?.customerReply);
+      if (isPostConfirmNearEchoViolation(userLine, replyText, finalized)) {
+        lastReason = "near_echo_reply";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: lastReason,
+        };
+      }
+      const replyRequired =
+        hasAmbiguousBookings ||
+        finalized.conversationAct === "information_request" ||
+        finalized.conversationAct === "action_request" ||
+        finalized.customerIntent === "ask_fact" ||
+        finalized.customerIntent === "ask_action" ||
+        finalized.customerIsAskingQuestion === true ||
+        finalized.action === "request_booking_mutation";
+      const pendingAvailabilityAction =
+        finalized.action === "confirm_pending_availability" ||
+        finalized.action === "decline_pending_availability";
       const guard = validateCustomerReplyAgainstContract(
         replyText,
         {
           ...replyContract,
+          verifiedCustomerFacts: {
+            ...(replyContract.verifiedCustomerFacts || {}),
+            pendingAvailabilityExecutionRequested: pendingAvailabilityAction,
+            pendingAvailabilityExecutionStatus:
+              clean(facts?.pendingAvailabilityExecution?.status, 60) ||
+              "not_executed",
+            mutationIntent: finalized.mutationIntent ?? "none",
+            mutationExecutionRequested:
+              finalized.mutationExecutionRequested === true,
+            mutationExecutionStatus:
+              finalized.mutationExecutionStatus ?? "not_executed",
+          },
           replyRequired:
-            finalized.action === "reply" || finalized.shouldReply === true,
+            replyRequired ||
+            pendingAvailabilityAction ||
+            finalized.action === "reply" ||
+            finalized.shouldReply === true,
         },
-        finalized.replySemantics || decision.replySemantics
+        finalized.replySemantics || decision.replySemantics,
+        finalized.groundedFacts || decision.groundedFacts
       );
       if (!guard.ok) {
         lastReason = guard.reason || "customer_reply_guard_failed";
@@ -899,7 +1139,7 @@ export async function decidePostConfirmCustomerDm(p = {}) {
     latestClosedMissingInfoAnswers: facts.latestClosedMissingInfoAnswers ?? null,
     ownershipLane: "post_confirm_pa",
     safetyPolicy: facts.policy ?? null,
-    allowedExecutors: ["whatsapp_cloud_dm", "pa_missing_info_escalate"],
+    allowedExecutors: ["whatsapp_cloud_dm"],
     facts,
     styleKey: p.styleKey,
     timeoutMs: p.timeoutMs,

@@ -345,19 +345,74 @@ export function buildPostExecutionBookingSuccessContract(facts = {}) {
 /** Post-confirm PA: facts-only Q&A / social; no invented money or process. */
 export function buildPostConfirmPaReplyContract(facts = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
+  const baseGuardFacts =
+    f.replyGuardFacts && typeof f.replyGuardFacts === "object"
+      ? f.replyGuardFacts
+      : {
+          bookingExecutionVerified: Boolean(f.booking),
+          itemId: f.booking?.itemId ?? null,
+          itemLabel: f.booking?.itemLabel ?? null,
+          durationDays: f.booking?.durationDays ?? null,
+          bookingStatus: f.booking?.status ?? null,
+          bookingReference: f.booking?.customerSafeReference ?? null,
+          totalAmount: f.booking?.totalAmount ?? f.known?.totalAmount ?? null,
+          dailyRate: f.booking?.dailyRate ?? f.known?.dailyRate ?? null,
+          advanceAmount: f.known?.advanceAmount ?? null,
+          startDate: f.booking?.startDate ?? null,
+          endDate: f.booking?.endDate ?? null,
+          pickupTime: f.booking?.pickupTime ?? null,
+          deliveryTime: f.booking?.deliveryTime ?? null,
+          knownPolicies: {
+            advancePolicy: f.known?.advancePolicy ?? null,
+            driverPolicy: f.known?.driverPolicy ?? null,
+            paymentPolicy: f.known?.paymentPolicy ?? null,
+            documentsPolicy: f.known?.documentsPolicy ?? null,
+            deliveryPolicy: f.known?.deliveryPolicy ?? null,
+          },
+          activeBookings: Array.isArray(f.activeBookings)
+            ? f.activeBookings
+            : [],
+          catalogItems: Array.isArray(f.catalogItems) ? f.catalogItems : [],
+        };
+  const guardFacts = {
+    ...baseGuardFacts,
+    pendingAvailabilityRequests: Array.isArray(
+      f.pendingAvailabilityRequests
+    )
+      ? f.pendingAvailabilityRequests.slice(0, 12).map((row) => ({
+          itemId: row?.itemId ?? null,
+          itemLabel: row?.itemLabel ?? null,
+          durationDays: row?.requestedDuration ?? null,
+          totalAmount: row?.priceQuote?.total ?? null,
+          dailyRate: row?.priceQuote?.dailyRate ?? null,
+        }))
+      : [],
+    mutationExecutionRequested:
+      f.mutationExecution?.requested === true,
+    mutationExecutionStatus:
+      String(f.mutationExecution?.status ?? "not_executed").trim() ||
+      "not_executed",
+  };
   const lang = langOptsFromFacts(f);
   return buildCustomerReplyContract({
     channel: "dm",
     conversationalGoal:
       "Handle post-confirm Business PA conversation using verified facts only. Prefer silence for social closes. Never invent amounts or policies. Match the customer's language.",
     replyRequired: false,
-    verifiedCustomerFacts: f,
+    verifiedCustomerFacts: {
+      ...guardFacts,
+      customerMessageText: f.customerMessageText ?? null,
+      recentDialogue: f.recentDialogue ?? null,
+      styleKey: f.styleKey ?? null,
+    },
     requiredMeaning: "post_confirm_facts_or_silence",
-    allowedClaims: [CUSTOMER_CLAIMS.QUOTATION_VERIFIED],
+    allowedClaims: [
+      CUSTOMER_CLAIMS.QUOTATION_VERIFIED,
+      CUSTOMER_CLAIMS.RESERVATION_CREATED,
+    ],
     forbiddenClaims: [
       CUSTOMER_CLAIMS.INTERNAL_PROCESS_DISCLOSED,
       CUSTOMER_CLAIMS.SPECIFIC_TIMING_VERIFIED,
-      CUSTOMER_CLAIMS.RESERVATION_CREATED,
       CUSTOMER_CLAIMS.ORDER_CREATED,
       CUSTOMER_CLAIMS.PAYMENT_RECEIVED,
     ],
@@ -429,7 +484,11 @@ export function buildPaMissingInfoFollowupContract(facts = {}) {
  */
 export function stripInternalReplySemantics(decision) {
   if (!decision || typeof decision !== "object") return decision;
-  const { replySemantics: _drop, ...rest } = decision;
+  const {
+    replySemantics: _drop,
+    groundedFacts: _dropGroundedFacts,
+    ...rest
+  } = decision;
   return rest;
 }
 

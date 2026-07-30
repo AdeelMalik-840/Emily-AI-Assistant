@@ -21,8 +21,18 @@ const FieldValue = admin.firestore.FieldValue;
  * @returns {string | null} E.164 e.g. +923001234567
  */
 export function normalizePhoneE164(phone) {
-  const digits = String(phone).replace(/\D/g, "");
-  if (digits.length < 10) return null;
+  let digits = String(phone ?? "").replace(/\D/g, "");
+  if (!digits) return null;
+
+  // Pakistan local mobile 03xxxxxxxxx → 923xxxxxxxxx (exact identity, no suffix match).
+  if (/^03\d{9}$/.test(digits)) {
+    digits = `92${digits.slice(1)}`;
+  }
+
+  // Reject remaining leading-zero national forms (ambiguous / unsafe).
+  if (digits.startsWith("0")) return null;
+
+  if (digits.length < 10 || digits.length > 15) return null;
   return `+${digits}`;
 }
 
@@ -41,9 +51,7 @@ export function normalizeJoinCode(code) {
 export function normalizeTwilioWhatsAppFrom(from) {
   if (!from) return null;
   const raw = String(from).replace(/^whatsapp:/i, "").trim();
-  const digits = raw.replace(/\D/g, "");
-  if (digits.length < 10) return null;
-  return `+${digits}`;
+  return normalizePhoneE164(raw);
 }
 
 /**

@@ -41,12 +41,22 @@ import {
   notifyPlaywrightGuaranteeReleased,
 } from "./playwrightGuaranteeBridge.js";
 import {
+  claimCloudInboundTurn,
+  claimOutboundLockedRecovery,
+  markCloudInboundTurnPostConfirmOwned,
+  markCloudInboundTurnOutboundLocked,
+  markCloudInboundTurnRetryableFailure,
+  markCloudInboundTurnDone,
   markInboundTurnLedgerDoneForGuarantee,
   markInboundTurnLedgerFailedForGuarantee,
   markInboundTurnLedgerOutboundLockedForGuarantee,
+  markOutboundLockedRecoverySent,
+  releaseCloudInboundTurnOwnershipProbe,
+  releaseOutboundLockedRecoveryClaim,
   resolveInboundTurnAdmissionBlock,
 } from "./inboundTurnLedger.js";
 import { tryRecoverOutboundLockedInboundTurn } from "./outboundLockedRecovery.js";
+import { tryRecoverCloudOutboundLockedTurn } from "./cloudInboundRecovery.js";
 import { setMessageState } from "./messageState.js";
 import {
   normalizePlaywrightOutboundTrace,
@@ -558,6 +568,30 @@ const recentInboundByOwnerAndText = new Map();
  * @type {Map<string, object[]>}
  */
 const pendingPlaywrightPipelineBySession = new Map();
+const pendingCloudRetryTimersByGuarantee = new Map();
+
+function scheduleCloudPostConfirmRetry(p, identity, retryCount) {
+  const guaranteeKey = String(identity?.guaranteeKey ?? "").trim();
+  if (!guaranteeKey || retryCount > 5) return;
+  if (pendingCloudRetryTimersByGuarantee.has(guaranteeKey)) return;
+  const delayMs = Math.min(30_000, 500 * 2 ** Math.max(0, retryCount - 1));
+  const timer = setTimeout(() => {
+    pendingCloudRetryTimersByGuarantee.delete(guaranteeKey);
+    void executeWhatsAppAiPipeline({
+      ...p,
+      __cloudResumeProcessing: true,
+      __cloudClaimOwner: String(p.__cloudClaimOwner ?? "").trim() || null,
+      traceId: randomUUID(),
+    }).catch((err) => {
+      console.warn("[cloud_post_confirm_retry_failed]", {
+        guaranteeKey,
+        error: String(err?.message ?? err ?? "").slice(0, 160),
+      });
+    });
+  }, delayMs);
+  timer.unref?.();
+  pendingCloudRetryTimersByGuarantee.set(guaranteeKey, timer);
+}
 /** @type {Array<object>} */
 globalThis.__messageQueue = Array.isArray(globalThis.__messageQueue)
   ? globalThis.__messageQueue
@@ -1429,6 +1463,7 @@ export async function executeWhatsAppAiPipeline(p) {
   const nowForCrossSourceDedupe = Date.now();
   const lastInboundAt = recentInboundByOwnerAndText.get(dedupeMessageKey);
   if (
+    p.__cloudResumeProcessing !== true &&
     lastInboundAt != null &&
     nowForCrossSourceDedupe - lastInboundAt < CROSS_SOURCE_DEDUPE_WINDOW_MS
   ) {
@@ -1511,6 +1546,164 @@ export async function executeWhatsAppAiPipeline(p) {
     fingerprint,
   });
 
+  let processingSuccess = false;
+  /** Hoisted for guarantee bridge (Playwright deliver vs release). */
+  let outboundReplyDelivered = false;
+  /** Intentional handled-without-outbound (e.g. PURE_ACK_SILENT). */
+  let intentionalSilent = false;
+  let cloudLifecycleIdentity = null;
+  let cloudLifecycleClaimed = false;
+  let cloudLifecycleClaimOwner = null;
+  /** Hoisted for finally-block guarantee completion (declared inside try is TDZ in finally). */
+  let messageMeta = null;
+  const isGroupInbound =
+    isGroupMessage === true && String(userPhone ?? "").trim() === "unknown";
+  const latestMessage = String(latestMessageRaw ?? combinedMessage ?? "").trim();
+  const cloudConfirmPhone =
+    String(conversationCustomerNumber ?? "").trim() ||
+    String(userPhone ?? "").trim() ||
+    String(participantPhoneForDmRaw ?? "").trim();
+  const parsedAvailabilityApproval =
+    parseAvailabilityApprovalMessage(combinedMessage);
+  const parsedApproval = parseApprovalMessage(combinedMessage);
+  let preResolvedPostConfirmBookingFacts = null;
+  const canResolvePostConfirmOwnership =
+    !parsedAvailabilityApproval &&
+    !parsedApproval &&
+    !isGroupInbound &&
+    !playwrightWebInbound &&
+    Boolean(String(ownerUserId ?? "").trim()) &&
+    Boolean(cloudConfirmPhone) &&
+    cloudConfirmPhone !== "unknown";
+  if (canResolvePostConfirmOwnership) {
+    const cloudClaim = claimCloudInboundTurn({
+      businessId: ownerUserId,
+      customerPhone: cloudConfirmPhone,
+      messageId,
+      resumeProcessing: p.__cloudResumeProcessing === true,
+      provisionalOwnership: true,
+      claimOwner:
+        String(p.__cloudClaimOwner ?? "").trim() ||
+        null,
+      recoveryContext: {
+        businessId: ownerUserId,
+        customerPhone: cloudConfirmPhone,
+        messageText: latestMessage,
+        messageId,
+        userPhone,
+        sessionKey,
+        whatsappReplyTo,
+        conversationCustomerNumber,
+        phoneNumberId:
+          phoneNumberId ?? sendCredentials?.phoneNumberId ?? null,
+      },
+    });
+    cloudLifecycleIdentity = cloudClaim.identity ?? null;
+    if (cloudClaim.claimed === true) {
+      cloudLifecycleClaimOwner =
+        String(cloudClaim.claimOwner ?? "").trim() || null;
+    }
+    if (cloudClaim.action === "done") {
+      console.log("[cloud_post_confirm_duplicate_done]", {
+        guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+        messageId,
+      });
+      return;
+    }
+    if (cloudClaim.action === "processing") {
+      console.log("[cloud_post_confirm_duplicate_processing]", {
+        guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+        messageId,
+      });
+      return;
+    }
+    if (cloudClaim.action === "outbound_locked") {
+      const recovery = await tryRecoverCloudOutboundLockedTurn({
+        db,
+        entry: cloudClaim.entry,
+        sendCredentials,
+        __sendOutboundMessageFn:
+          typeof p.__sendOutboundMessageFn === "function"
+            ? p.__sendOutboundMessageFn
+            : undefined,
+      });
+      console.log("[cloud_post_confirm_outbound_locked_recovery]", {
+        guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+        action: recovery.action,
+        reason: recovery.reason,
+        sent: recovery.sent === true,
+      });
+      if (
+        recovery.action === "send_failed" &&
+        Number(recovery.retryCount ?? 0) <= 5
+      ) {
+        scheduleCloudPostConfirmRetry(
+          p,
+          cloudLifecycleIdentity,
+          Number(recovery.retryCount ?? 1)
+        );
+      }
+      return;
+    }
+    if (!cloudClaim.claimed) {
+      throw new Error(cloudClaim.reason || "CLOUD_LEDGER_CLAIM_FAILED");
+    }
+
+    const resolvePostConfirmFactsFn =
+      typeof p.__resolveActiveCustomerBookingFactsFn === "function"
+        ? p.__resolveActiveCustomerBookingFactsFn
+        : (
+            await import("../brain/facts/resolveActiveCustomerBookingFacts.js")
+          ).resolveActiveCustomerBookingFacts;
+    let resolvedPostConfirm;
+    try {
+      resolvedPostConfirm = await resolvePostConfirmFactsFn({
+        db,
+        businessId: ownerUserId,
+        customerPhone: cloudConfirmPhone,
+      });
+    } catch (err) {
+      const failed = markCloudInboundTurnRetryableFailure({
+        identity: cloudLifecycleIdentity,
+        lastError: String(err?.message ?? err ?? "BOOKING_LOOKUP_FAILED"),
+        retryDelayMs: 1000,
+      });
+      scheduleCloudPostConfirmRetry(
+        p,
+        cloudLifecycleIdentity,
+        Number(failed?.retryCount ?? 1)
+      );
+      return;
+    }
+    if (resolvedPostConfirm?.retryable === true) {
+      const failed = markCloudInboundTurnRetryableFailure({
+        identity: cloudLifecycleIdentity,
+        lastError: String(
+          resolvedPostConfirm.reason ?? "BOOKING_LOOKUP_FAILED"
+        ),
+        retryDelayMs: 1000,
+      });
+      scheduleCloudPostConfirmRetry(
+        p,
+        cloudLifecycleIdentity,
+        Number(failed?.retryCount ?? 1)
+      );
+      return;
+    }
+    if (resolvedPostConfirm?.ok === true && resolvedPostConfirm.facts) {
+      preResolvedPostConfirmBookingFacts = resolvedPostConfirm;
+    }
+  }
+  const hasActivePostConfirmOwnership =
+    preResolvedPostConfirmBookingFacts?.ok === true;
+  if (hasActivePostConfirmOwnership) {
+    markCloudInboundTurnPostConfirmOwned({ identity: cloudLifecycleIdentity });
+    cloudLifecycleClaimed = true;
+  } else if (cloudLifecycleIdentity?.guaranteeKey) {
+    releaseCloudInboundTurnOwnershipProbe({ identity: cloudLifecycleIdentity });
+    cloudLifecycleIdentity = null;
+  }
+
   releaseStaleActiveJobIfNeeded();
   if (globalThis.__activeJob && !globalThis.__forceProcessing) {
     if (isPlaywrightWebTabInbound(p)) {
@@ -1530,19 +1723,19 @@ export async function executeWhatsAppAiPipeline(p) {
         activeJob: globalThis.__activeJob,
         incoming: fingerprint,
       });
-      globalThis.__messageQueue.push(p);
+      globalThis.__messageQueue.push(
+        cloudLifecycleClaimed
+          ? {
+              ...p,
+              __cloudResumeProcessing: true,
+              __cloudClaimOwner: cloudLifecycleClaimOwner,
+            }
+          : p
+      );
     }
     return;
   }
   globalThis.__forceProcessing = false;
-
-  let processingSuccess = false;
-  /** Hoisted for guarantee bridge (Playwright deliver vs release). */
-  let outboundReplyDelivered = false;
-  /** Intentional handled-without-outbound (e.g. PURE_ACK_SILENT). */
-  let intentionalSilent = false;
-  /** Hoisted for finally-block guarantee completion (declared inside try is TDZ in finally). */
-  let messageMeta = null;
 
   const groupLogFields =
     isGroupMessage === true
@@ -1553,6 +1746,7 @@ export async function executeWhatsAppAiPipeline(p) {
   const nowMs = Date.now();
   const prevSent = lastSentReplies.get(sessionKey);
   if (
+    p.__cloudResumeProcessing !== true &&
     prevSent &&
     prevSent.hash === messageHash &&
     nowMs - prevSent.timestamp < REPLY_DEDUPE_WINDOW_MS
@@ -1680,9 +1874,6 @@ export async function executeWhatsAppAiPipeline(p) {
     const { customerId, channel } = normalizeWhatsAppInboundContext(userPhone);
 
     console.log("📩 Approval message received:", combinedMessage);
-    const parsedAvailabilityApproval =
-      parseAvailabilityApprovalMessage(combinedMessage);
-    const parsedApproval = parseApprovalMessage(combinedMessage);
     console.log("🧠 Parsed approval:", parsedApproval);
     if (parsedAvailabilityApproval) {
       console.log("🛠 Availability approval command detected:", parsedAvailabilityApproval);
@@ -1748,9 +1939,6 @@ export async function executeWhatsAppAiPipeline(p) {
   console.log("[DEBUG] messageText (combined):", combinedMessage);
   console.log("[DEBUG] processMessage userId (owner):", ownerUserId);
 
-  const isGroupInbound =
-    isGroupMessage === true && String(userPhone ?? "").trim() === "unknown";
-
   const shadowEligible = isEmilyBrainV2ShadowQuickGate(ownerUserId);
   const v2LiveMemoryNeeded = isEmilyBrainV2LiveQuickGate(ownerUserId);
   const memorySnapshotParams = {
@@ -1796,7 +1984,6 @@ export async function executeWhatsAppAiPipeline(p) {
   });
 
   console.log("🧠 Generating AI response");
-  const latestMessage = String(latestMessageRaw ?? combinedMessage ?? "").trim();
   const contextMessages = Array.isArray(contextMessagesRaw)
     ? contextMessagesRaw
         .map((m) => String(m ?? "").trim())
@@ -1831,7 +2018,6 @@ export async function executeWhatsAppAiPipeline(p) {
   let reply;
   let sendVia;
   let dmRecipientPhone;
-  let messageMeta;
   let handledByBrainV2Live = false;
   let handledByBrainV2InfoLive = false;
   let handledByBrainV2HardBlock = false;
@@ -1867,11 +2053,8 @@ export async function executeWhatsAppAiPipeline(p) {
       : null;
 
   let skipGeneralBrainForWaitingConfirmOwnership = false;
-  const cloudConfirmPhone =
-    String(conversationCustomerNumber ?? "").trim() ||
-    String(userPhone ?? "").trim() ||
-    String(participantPhoneForDmRaw ?? "").trim();
   const canTryCloudConfirmOwnership =
+    !hasActivePostConfirmOwnership &&
     !isGroupInbound &&
     !playwrightWebInbound &&
     Boolean(String(ownerUserId ?? "").trim()) &&
@@ -1936,7 +2119,10 @@ export async function executeWhatsAppAiPipeline(p) {
     }
   }
 
-  if (!skipGeneralBrainForWaitingConfirmOwnership) {
+  if (
+    !hasActivePostConfirmOwnership &&
+    !skipGeneralBrainForWaitingConfirmOwnership
+  ) {
   const ownershipGuard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
     db,
     businessId: ownerUserId,
@@ -1978,7 +2164,10 @@ export async function executeWhatsAppAiPipeline(p) {
 
   // Business PA missing-info Phase 2: owner answer → customer follow-up.
   // After confirm + waiting-confirm ownership; before Business PA / Brain.
-  if (!skipGeneralBrainForWaitingConfirmOwnership) {
+  if (
+    !hasActivePostConfirmOwnership &&
+    !skipGeneralBrainForWaitingConfirmOwnership
+  ) {
     const canTryOwnerAnswer =
       !isGroupInbound &&
       !playwrightWebInbound &&
@@ -2055,8 +2244,18 @@ export async function executeWhatsAppAiPipeline(p) {
         messageId,
         conversationHistory,
         sendCredentials,
+        preResolvedBookingFacts: preResolvedPostConfirmBookingFacts,
       });
       if (businessPaResult) {
+        if (businessPaResult.retryable === true) {
+          throw new Error(
+            String(
+              businessPaResult.failureReason ??
+                businessPaResult.reason ??
+                "OPENAI_POST_CONFIRM_FAILED"
+            )
+          );
+        }
         skipGeneralBrainForWaitingConfirmOwnership = true;
         console.log("[customer_business_pa_ownership_handled]", {
           traceId,
@@ -2072,19 +2271,21 @@ export async function executeWhatsAppAiPipeline(p) {
           isGroupInbound,
           messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
         });
-        reply = "";
-        sendVia = "NONE";
+        reply = String(businessPaResult.reply ?? "").trim();
+        const hasBusinessPaReply = reply.length > 0;
+        sendVia = hasBusinessPaReply ? "CLOUD_API" : "NONE";
         messageMeta = {
-          handledWithoutOutbound: true,
+          ...(hasBusinessPaReply ? {} : { handledWithoutOutbound: true }),
           customerBusinessPaHandled: true,
           bookingId: businessPaResult.bookingId ?? null,
           availabilityRequestId: businessPaResult.availabilityRequestId ?? null,
           missingInfoEscalated: businessPaResult.missingInfoEscalated === true,
           missingInfoRequestId: businessPaResult.missingInfoRequestId ?? null,
           missingInfoType: businessPaResult.missingInfoType ?? null,
+          finalReplySource: "openai_post_confirm_pa",
           outboundTrace: {
             kind: "business_pa_outbound",
-            finalReplySource: "CUSTOMER_BUSINESS_PA",
+            finalReplySource: "openai_post_confirm_pa",
           },
         };
       }
@@ -2553,6 +2754,7 @@ export async function executeWhatsAppAiPipeline(p) {
   );
   const isFalseProcessingResponse =
     !intentionalSilent &&
+    finalReplySourceFromMeta !== "openai_post_confirm_pa" &&
     confirmationIntent === true &&
     !messageMeta?.bookingCreated &&
     !messageMeta?.bookingBlocked;
@@ -2697,6 +2899,7 @@ export async function executeWhatsAppAiPipeline(p) {
     } else {
       let groupSendFailed = false;
       let outboundStartedAt = 0;
+      let cloudOutboundClaimOwner = "";
       try {
         const accessToken = String(sendCredentials?.accessToken ?? "").trim();
         const phoneNumberIdForSend = String(
@@ -2749,6 +2952,31 @@ export async function executeWhatsAppAiPipeline(p) {
                 : null,
           });
         }
+        const cloudPostConfirmSend =
+          cloudLifecycleClaimed &&
+          cloudLifecycleIdentity?.guaranteeKey &&
+          finalReplySourceForLifecycle === "openai_post_confirm_pa" &&
+          sendVia === "CLOUD_API";
+        if (cloudPostConfirmSend) {
+          markCloudInboundTurnOutboundLocked({
+            identity: cloudLifecycleIdentity,
+            finalReplyText: replyText,
+            finalReplySource: finalReplySourceForLifecycle,
+            traceId,
+          });
+          cloudOutboundClaimOwner = `cloud-send:${traceId}`;
+          const outboundClaim = claimOutboundLockedRecovery({
+            force: true,
+            chatKey: cloudLifecycleIdentity.chatKey,
+            stableId: cloudLifecycleIdentity.stableId,
+            claimOwner: cloudOutboundClaimOwner,
+          });
+          if (!outboundClaim.claimed) {
+            throw new Error(
+              `CLOUD_OUTBOUND_LOCK_CLAIM_FAILED:${outboundClaim.reason}`
+            );
+          }
+        }
         console.log("📤 Sending reply");
         logOutboundLifecycle("buffer_send_start", {
           ...outboundLifecycleBase,
@@ -2756,7 +2984,23 @@ export async function executeWhatsAppAiPipeline(p) {
           finalReplySource: finalReplySourceForLifecycle || null,
         });
         outboundStartedAt = Date.now();
-        const sendResult = await sendOutboundMessage({
+        if (cloudPostConfirmSend) {
+          const { markOutboundSendInFlight } = await import(
+            "./inboundTurnLedger.js"
+          );
+          markOutboundSendInFlight({
+            force: true,
+            chatKey: cloudLifecycleIdentity.chatKey,
+            stableId: cloudLifecycleIdentity.stableId,
+            claimOwner: cloudOutboundClaimOwner,
+            outboundLockStage: "cloud_buffer_send_in_flight",
+          });
+        }
+        const sendOutboundMessageFn =
+          typeof p.__sendOutboundMessageFn === "function"
+            ? p.__sendOutboundMessageFn
+            : sendOutboundMessage;
+        const sendResult = await sendOutboundMessageFn({
           sendVia,
           reply: replyText,
           messageMeta,
@@ -2796,22 +3040,59 @@ export async function executeWhatsAppAiPipeline(p) {
         groupSendFailed = Boolean(sendResult?.groupSendFailed);
         if (sendResult?.ok === true) {
           outboundReplyDelivered = true;
+          if (cloudPostConfirmSend) {
+            markOutboundLockedRecoverySent({
+              force: true,
+              chatKey: cloudLifecycleIdentity.chatKey,
+              stableId: cloudLifecycleIdentity.stableId,
+              guaranteeKey: cloudLifecycleIdentity.guaranteeKey,
+              textPreview: String(combinedMessage ?? "").slice(0, 120),
+              providerOutboundMessageId:
+                sendResult?.providerMessageId ??
+                sendResult?.messages?.[0]?.id ??
+                null,
+            });
+          }
         } else {
+          if (cloudPostConfirmSend && cloudOutboundClaimOwner) {
+            releaseOutboundLockedRecoveryClaim({
+              force: true,
+              chatKey: cloudLifecycleIdentity.chatKey,
+              stableId: cloudLifecycleIdentity.stableId,
+              claimOwner: cloudOutboundClaimOwner,
+              resetToPending: true,
+            });
+          }
           console.warn("⚠️ Outbound message failed:", {
             sendVia,
             ownerUserId,
             conversationCustomerNumber,
           });
         }
-        lastSentReplies.set(sessionKey, {
-          hash: messageHash,
-          timestamp: Date.now(),
-        });
+        if (outboundReplyDelivered) {
+          lastSentReplies.set(sessionKey, {
+            hash: messageHash,
+            timestamp: Date.now(),
+          });
+        }
         console.log(
           "[whatsappInboundBuffer] deliverWhatsAppOutbound finished for",
           userPhone
         );
       } catch (sendErr) {
+        if (
+          cloudOutboundClaimOwner &&
+          cloudLifecycleIdentity?.chatKey &&
+          cloudLifecycleIdentity?.stableId
+        ) {
+          releaseOutboundLockedRecoveryClaim({
+            force: true,
+            chatKey: cloudLifecycleIdentity.chatKey,
+            stableId: cloudLifecycleIdentity.stableId,
+            claimOwner: cloudOutboundClaimOwner,
+            resetToPending: false,
+          });
+        }
         if (outboundStartedAt) {
           logLatency("outbound send", outboundStartedAt, {
             sendVia,
@@ -2833,15 +3114,17 @@ export async function executeWhatsAppAiPipeline(p) {
         sendVia: String(sendVia ?? "").trim() || null,
       });
 
-      try {
-        await appendConversationMessage(db, {
-          ownerUserId,
-          customerNumber: conversationCustomerNumber,
-          role: "assistant",
-          text: replyText,
-        });
-      } catch (e) {
-        console.error("[whatsappInboundBuffer] save assistant message:", e);
+      if (outboundReplyDelivered) {
+        try {
+          await appendConversationMessage(db, {
+            ownerUserId,
+            customerNumber: conversationCustomerNumber,
+            role: "assistant",
+            text: replyText,
+          });
+        } catch (e) {
+          console.error("[whatsappInboundBuffer] save assistant message:", e);
+        }
       }
 
       try {
@@ -2922,8 +3205,30 @@ export async function executeWhatsAppAiPipeline(p) {
     throw new Error("outbound_not_delivered");
   }
   processingSuccess = true;
+  if (
+    cloudLifecycleClaimed &&
+    intentionalSilent &&
+    cloudLifecycleIdentity?.guaranteeKey
+  ) {
+    markCloudInboundTurnDone({
+      identity: cloudLifecycleIdentity,
+      replySent: false,
+    });
+  }
   } catch (err) {
     console.error("❌ Processing error:", err);
+    if (cloudLifecycleClaimed && cloudLifecycleIdentity?.guaranteeKey) {
+      const failed = markCloudInboundTurnRetryableFailure({
+        identity: cloudLifecycleIdentity,
+        lastError: String(err?.message ?? err ?? "processing_error"),
+        retryDelayMs: 1000,
+      });
+      scheduleCloudPostConfirmRetry(
+        p,
+        cloudLifecycleIdentity,
+        Number(failed?.retryCount ?? 1)
+      );
+    }
     if (guaranteeKey) {
       setMessageState(guaranteeKey, "failed");
       const pendingFail =

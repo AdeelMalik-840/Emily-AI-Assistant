@@ -18,7 +18,11 @@ import {
   saveManualWhatsAppPending,
   confirmManualWhatsAppByPhone,
 } from "./services/businessWhatsApp.js";
-import { scheduleBufferedWhatsAppInbound } from "./services/whatsappInboundBuffer.js";
+import {
+  executeWhatsAppAiPipeline,
+  scheduleBufferedWhatsAppInbound,
+} from "./services/whatsappInboundBuffer.js";
+import { scheduleCloudInboundRecoverySweep } from "./services/cloudInboundRecovery.js";
 import { webhookPayloadIndicatesGroupMessage } from "./services/whatsappGroupInboundGate.js";
 import { sendWhatsAppMessage } from "./services/whatsappCloud.js";
 import {
@@ -999,6 +1003,11 @@ const PORT = 3000;
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  scheduleCloudInboundRecoverySweep({
+    db,
+    getCredentialsFn: getBusinessWhatsAppCredentials,
+    executePipelineFn: executeWhatsAppAiPipeline,
+  });
   if (isWhatsAppGroupDebugEnabled()) {
     console.warn(
       "[server] WHATSAPP_GROUP_DEBUG is enabled — group inbound gate is bypassed (AI can reply to every group line). For production set WHATSAPP_GROUP_DEBUG=false or unset."
