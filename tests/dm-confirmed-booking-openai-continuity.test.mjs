@@ -7,6 +7,10 @@ process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || "test-key";
 const { handleCustomerBusinessPaInbound } = await import(
   "../src/services/customerBusinessPaAgentService.js"
 );
+const {
+  compactPostConfirmFactsForPrompt,
+  buildPostConfirmVerifiedItemMismatchCorrection,
+} = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
 
 const BUSINESS_ID = "dm-continuity-business";
 const CUSTOMER_PHONE = "923001234567";
@@ -29,6 +33,22 @@ const CATALOG = [
     name: "Kia Stonic",
     displayLabel: "Kia Stonic EX Plus 2021 White",
     aliases: ["Stonic", "Stonic EX Plus"],
+  },
+];
+
+const STONIC_FOCUS_CATALOG = [
+  ...CATALOG,
+  {
+    id: "kia_stonic_ex_plus_2021_white_color_1df55684",
+    name: "Kia Stonic EX Plus 2021 (White Color)",
+    displayLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    aliases: ["Stonic", "Kia Stonic", "Stonic EX Plus"],
+  },
+  {
+    id: "toyota_corolla_metallic_grey_0e2cd610",
+    name: "Toyota corolla (Metallic Grey)",
+    displayLabel: "Toyota corolla (Metallic Grey)",
+    aliases: ["Toyota corolla Metallic Grey"],
   },
 ];
 
@@ -195,6 +215,8 @@ async function runOwnedTurn({
     __chatCompletionsCreateForTests: async (args) => {
       counters.openaiCalls = (counters.openaiCalls || 0) + 1;
       counters.lastOpenAiArgs = args;
+      counters.openaiPrompts = counters.openaiPrompts || [];
+      counters.openaiPrompts.push(String(args?.messages?.[1]?.content ?? ""));
       const next = responses[Math.min(responseIndex, responses.length - 1)];
       responseIndex += 1;
       return completion(next);
@@ -665,7 +687,13 @@ test("trusted latest-confirmed focus answers generic duration from Corolla only"
   assert.equal(result.selectedBookingIndex, 2);
   const prompt = String(counters.lastOpenAiArgs.messages[1].content);
   assert.match(prompt, /"selectedBookingIndex":2/);
-  assert.doesNotMatch(prompt, /booking-corolla|booking-civic|avr-corolla|avr-civic/);
+  assert.match(prompt, /"bookingId":"booking-corolla"/);
+  assert.match(prompt, /"itemId":"corolla-grey"/);
+  assert.match(prompt, /CURRENT_BOOKING_IN_SCOPE/);
+  assert.match(prompt, /OUT_OF_SCOPE_CONTEXT_ONLY/);
+  assert.match(prompt, /Honda Civic 2026/);
+  assert.doesNotMatch(prompt, /"totalAmount":40000/);
+  assert.doesNotMatch(prompt, /"itemId":"civic-2026"/);
 });
 
 test("OpenAI can explicitly select Civic instead of the trusted Corolla focus", async () => {
@@ -1279,4 +1307,388 @@ test("buffer default routeGate reason is POST_CONFIRM_PA_OWNERSHIP_HANDLED after
   assert.match(src, /postConfirmPaOwnershipHandled/);
   assert.match(src, /postConfirmTerminalFailure/);
   assert.match(src, /markCloudInboundTurnTerminalTechnicalFailure/);
+});
+
+function trustedStonicFocusFacts() {
+  const stonic = {
+    id: "CdqHuG0ZJpIZW3DDPlbI",
+    selectionIndex: 1,
+    customerSafeReference: null,
+    status: "approved",
+    approvalStage: "owner_approved_waiting_customer_details",
+    itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 4,
+    totalAmount: 22000,
+    dailyRate: 5500,
+    availabilityRequestId: "avr_f45af5f434e2f71cf33a1f2c",
+  };
+  const civic = {
+    id: "booking-civic",
+    selectionIndex: 2,
+    customerSafeReference: "CIVIC-5",
+    status: "approved",
+    approvalStage: "owner_approved_waiting_customer_details",
+    itemId: "civic-2026",
+    itemLabel: "Honda Civic 2026 Oriel (White)",
+    durationDays: 5,
+    totalAmount: 40000,
+    dailyRate: 8000,
+    availabilityRequestId: "avr-civic",
+  };
+  const corolla = {
+    id: "booking-corolla",
+    selectionIndex: 3,
+    customerSafeReference: "COROLLA-4",
+    status: "approved",
+    approvalStage: "owner_approved_waiting_customer_details",
+    itemId: "toyota_corolla_metallic_grey_0e2cd610",
+    itemLabel: "Toyota corolla (Metallic Grey)",
+    durationDays: 4,
+    totalAmount: 20000,
+    dailyRate: 5000,
+    availabilityRequestId: "avr-corolla",
+  };
+  return {
+    businessId: BUSINESS_ID,
+    customerPhoneDigits: CUSTOMER_PHONE,
+    business: { name: "Emily Rentals", tone: "friendly" },
+    booking: stonic,
+    bookingCandidates: [stonic, civic, corolla],
+    bookingFocus: {
+      source: "latest_confirmed_linked_avr",
+      confidence: "trusted",
+      selectedBookingIndex: 1,
+      selectedBookingId: "CdqHuG0ZJpIZW3DDPlbI",
+    },
+    activeBookings: [stonic, civic, corolla].map(
+      ({ id: _id, itemId: _itemId, availabilityRequestId: _avr, ...safe }) =>
+        safe
+    ),
+    availabilityRequest: {
+      id: "avr_f45af5f434e2f71cf33a1f2c",
+      itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+      itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+      requestedDuration: 4,
+      status: "approved",
+      priceQuote: { total: 22000, dailyRate: 5500 },
+    },
+    known: {},
+    pendingAvailabilityRequests: [],
+    replyGuardFacts: {
+      catalogItems: STONIC_FOCUS_CATALOG,
+      activeBookings: [stonic, civic, corolla],
+    },
+    policy: {
+      readOnly: true,
+      doNotMutateBooking: true,
+      ambiguousBookingSelection: false,
+    },
+  };
+}
+
+test("trusted focus compact facts include Stonic identity and mark others out-of-scope", () => {
+  const compact = JSON.parse(
+    compactPostConfirmFactsForPrompt(trustedStonicFocusFacts())
+  );
+  assert.equal(compact.bookingFocus.scope, "CURRENT_BOOKING_IN_SCOPE");
+  assert.equal(
+    compact.bookingFocus.itemId,
+    "kia_stonic_ex_plus_2021_white_color_1df55684"
+  );
+  assert.equal(
+    compact.bookingFocus.itemLabel,
+    "Kia Stonic EX Plus 2021 (White Color)"
+  );
+  assert.equal(compact.bookingFocus.bookingId, "CdqHuG0ZJpIZW3DDPlbI");
+  assert.equal(
+    compact.bookingFocus.availabilityRequestId,
+    "avr_f45af5f434e2f71cf33a1f2c"
+  );
+  assert.equal(compact.bookingFocus.durationDays, 4);
+  assert.equal(compact.bookingFocus.totalAmount, 22000);
+  assert.equal(compact.bookingFocus.dailyRate, 5500);
+  assert.equal(compact.bookingFocus.bookingStatus, "approved");
+  assert.equal(compact.booking.itemId, "kia_stonic_ex_plus_2021_white_color_1df55684");
+  assert.equal(compact.booking.scope, "CURRENT_BOOKING_IN_SCOPE");
+  const focused = compact.bookingCandidates.find(
+    (row) => row.scope === "CURRENT_BOOKING_IN_SCOPE"
+  );
+  const outOfScope = compact.bookingCandidates.filter(
+    (row) => row.scope === "OUT_OF_SCOPE_CONTEXT_ONLY"
+  );
+  assert.equal(focused.itemId, "kia_stonic_ex_plus_2021_white_color_1df55684");
+  assert.equal(outOfScope.length, 2);
+  assert.ok(outOfScope.every((row) => row.itemId == null));
+  assert.ok(outOfScope.every((row) => row.totalAmount == null));
+  assert.ok(
+    outOfScope.some((row) => /Civic/i.test(String(row.itemLabel || "")))
+  );
+  assert.ok(
+    outOfScope.some((row) => /[Cc]orolla/.test(String(row.itemLabel || "")))
+  );
+});
+
+test("verified_item_mismatch correction pins trusted Stonic identity", () => {
+  const text = buildPostConfirmVerifiedItemMismatchCorrection(
+    trustedStonicFocusFacts(),
+    "verified_item_mismatch"
+  );
+  assert.match(text, /verified_item_mismatch/);
+  assert.match(text, /kia_stonic_ex_plus_2021_white_color_1df55684/);
+  assert.match(text, /Kia Stonic EX Plus 2021 \(White Color\)/);
+  assert.match(text, /CdqHuG0ZJpIZW3DDPlbI/);
+  assert.match(text, /selectedBookingIndex: 1/);
+  assert.match(text, /groundedFacts\.itemId MUST refer only/);
+});
+
+test("trusted Stonic focus recovers duration ask after Corolla verified_item_mismatch", async () => {
+  const counters = {};
+  const wrong = decisionJson("Toyota Corolla 4 din ke liye book hai.", {
+    bookingSelectionMode: "none",
+    groundedFacts: {
+      itemId: "toyota_corolla_metallic_grey_0e2cd610",
+      durationDays: 4,
+      bookingStatus: "approved",
+      bookingReference: null,
+      totalAmount: null,
+      dailyRate: null,
+      advanceAmount: null,
+      startDate: null,
+      endDate: null,
+      pickupTime: null,
+      deliveryTime: null,
+      policyClaims: [],
+    },
+  });
+  const right = decisionJson("Kia Stonic 4 din ke liye book hai.", {
+    bookingSelectionMode: "focused",
+    selectedBookingIndex: 1,
+    groundedFacts: {
+      itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+      durationDays: 4,
+      bookingStatus: "approved",
+      bookingReference: null,
+      totalAmount: null,
+      dailyRate: null,
+      advanceAmount: null,
+      startDate: null,
+      endDate: null,
+      pickupTime: null,
+      deliveryTime: null,
+      policyClaims: [],
+    },
+  });
+  const result = await runOwnedTurn({
+    message: "Kitny din k lye book ki h?",
+    facts: trustedStonicFocusFacts(),
+    responses: [wrong, right],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.equal(result.action, "business_pa_reply");
+  assert.equal(result.reply, "Kia Stonic 4 din ke liye book hai.");
+  assert.equal(result.bookingId, "CdqHuG0ZJpIZW3DDPlbI");
+  assert.equal(result.bookingSelectionMode, "focused");
+  assert.equal(result.selectedBookingIndex, 1);
+  assert.equal(result.terminalFailure, false);
+  assert.equal(result.retryable, false);
+  assert.equal(counters.customerSends || 0, 0);
+  const corrective = String(counters.openaiPrompts[1] || "");
+  assert.match(corrective, /verified_item_mismatch/);
+  assert.match(corrective, /kia_stonic_ex_plus_2021_white_color_1df55684/);
+  assert.match(corrective, /Kia Stonic EX Plus 2021 \(White Color\)/);
+  assert.match(corrective, /CdqHuG0ZJpIZW3DDPlbI/);
+  assert.match(corrective, /CURRENT_BOOKING_IN_SCOPE/);
+  assert.match(corrective, /OUT_OF_SCOPE_CONTEXT_ONLY/);
+});
+
+test("trusted Stonic focus recovers rent, pickup, and status after wrong-item attempt", async () => {
+  const cases = [
+    [
+      "4 din ka total rent kitna hoga?",
+      "Corolla ka total rent 22000 PKR hai.",
+      "Kia Stonic ka total rent 22000 PKR hai.",
+      {
+        wrong: {
+          itemId: "toyota_corolla_metallic_grey_0e2cd610",
+          totalAmount: 22000,
+          durationDays: 4,
+        },
+        right: {
+          itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+          totalAmount: 22000,
+          durationDays: 4,
+        },
+        claims: ["quotation_verified"],
+      },
+    ],
+    [
+      "pickup ho jye ga?",
+      "Toyota corolla (Metallic Grey) booking approved hai; pickup detail abhi confirm nahi.",
+      "Kia Stonic booking approved hai; pickup detail abhi confirm nahi.",
+      {
+        wrong: {
+          itemId: "toyota_corolla_metallic_grey_0e2cd610",
+          bookingStatus: "approved",
+          durationDays: 4,
+        },
+        right: {
+          itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+          bookingStatus: "approved",
+          durationDays: 4,
+        },
+        claims: [],
+      },
+    ],
+    [
+      "booking status?",
+      "Toyota corolla (Metallic Grey) booking approved hai.",
+      "Kia Stonic booking approved hai.",
+      {
+        wrong: {
+          itemId: "toyota_corolla_metallic_grey_0e2cd610",
+          bookingStatus: "approved",
+          durationDays: 4,
+        },
+        right: {
+          itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+          bookingStatus: "approved",
+          durationDays: 4,
+        },
+        claims: [],
+      },
+    ],
+  ];
+  for (const [message, wrongReply, rightReply, meta] of cases) {
+    const counters = {};
+    const result = await runOwnedTurn({
+      message,
+      facts: trustedStonicFocusFacts(),
+      responses: [
+        decisionJson(wrongReply, {
+          bookingSelectionMode: "none",
+          groundedFacts: {
+            itemId: meta.wrong.itemId,
+            durationDays: meta.wrong.durationDays ?? null,
+            bookingStatus: meta.wrong.bookingStatus ?? null,
+            bookingReference: null,
+            totalAmount: meta.wrong.totalAmount ?? null,
+            dailyRate: null,
+            advanceAmount: null,
+            startDate: null,
+            endDate: null,
+            pickupTime: null,
+            deliveryTime: null,
+            policyClaims: [],
+          },
+          replySemantics: {
+            claims: meta.claims,
+            languageStyle: "roman_urdu",
+            containsTimingPromise: false,
+            exposesInternalProcess: false,
+          },
+        }),
+        decisionJson(rightReply, {
+          bookingSelectionMode: "focused",
+          selectedBookingIndex: 1,
+          groundedFacts: {
+            itemId: meta.right.itemId,
+            durationDays: meta.right.durationDays ?? null,
+            bookingStatus: meta.right.bookingStatus ?? null,
+            bookingReference: null,
+            totalAmount: meta.right.totalAmount ?? null,
+            dailyRate: null,
+            advanceAmount: null,
+            startDate: null,
+            endDate: null,
+            pickupTime: null,
+            deliveryTime: null,
+            policyClaims: [],
+          },
+          replySemantics: {
+            claims: meta.claims,
+            languageStyle: "roman_urdu",
+            containsTimingPromise: false,
+            exposesInternalProcess: false,
+          },
+        }),
+      ],
+      counters,
+    });
+    assert.equal(counters.openaiCalls, 2, message);
+    assert.equal(result.reply, rightReply, message);
+    assert.equal(result.bookingId, "CdqHuG0ZJpIZW3DDPlbI", message);
+    assert.equal(result.terminalFailure, false, message);
+    assert.match(
+      String(counters.openaiPrompts[1] || ""),
+      /verified_item_mismatch/,
+      message
+    );
+  }
+});
+
+test("two wrong-item attempts on trusted Stonic focus are terminal with zero outbound", async () => {
+  const counters = {};
+  const wrong = decisionJson("Toyota Corolla 4 din ke liye book hai.", {
+    bookingSelectionMode: "none",
+    groundedFacts: {
+      itemId: "toyota_corolla_metallic_grey_0e2cd610",
+      durationDays: 4,
+      bookingStatus: "approved",
+      bookingReference: null,
+      totalAmount: null,
+      dailyRate: null,
+      advanceAmount: null,
+      startDate: null,
+      endDate: null,
+      pickupTime: null,
+      deliveryTime: null,
+      policyClaims: [],
+    },
+  });
+  const result = await runOwnedTurn({
+    message: "Kitny din k lye book ki h?",
+    facts: trustedStonicFocusFacts(),
+    responses: [wrong, wrong],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.equal(result.handled, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.terminalFailure, true);
+  assert.equal(result.action, "business_pa_terminal_model_failure");
+  assert.equal(result.reply, "");
+  assert.equal(result.failureReason, "verified_item_mismatch");
+  assert.equal(counters.customerSends || 0, 0);
+  assert.match(String(counters.openaiPrompts[1] || ""), /verified_item_mismatch/);
+});
+
+test("trusted focus mutation still requires explicit candidate after prompt dominance", async () => {
+  const counters = {};
+  const result = await runOwnedTurn({
+    message: "cancel kar do",
+    facts: trustedStonicFocusFacts(),
+    responses: [
+      decisionJson("Cancel request received.", {
+        situation: "protected_action",
+        conversationAct: "action_request",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
+        action: "request_booking_mutation",
+        mutationIntent: "cancel_booking",
+        bookingSelectionMode: "none",
+      }),
+      decisionJson("Kaunsi booking cancel karni hai — Stonic, Civic, ya Corolla?", {
+        bookingSelectionMode: "clarification_required",
+      }),
+    ],
+    counters,
+  });
+  assert.equal(counters.openaiCalls, 2);
+  assert.notEqual(result.bookingSelectionMode, "focused");
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+  const firstPrompt = String(counters.openaiPrompts[0] || "");
+  assert.match(firstPrompt, /OUT_OF_SCOPE_CONTEXT_ONLY/);
+  assert.match(firstPrompt, /CURRENT_BOOKING_IN_SCOPE/);
 });
