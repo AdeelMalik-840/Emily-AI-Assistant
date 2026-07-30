@@ -20,6 +20,24 @@ function cleanCustomerReply(value) {
   return String(value ?? "").trim();
 }
 
+function nonNegativeInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
+}
+
+function logPostConfirmTerminalDiagnostic(decided) {
+  const diagnostic = {
+    failureReason:
+      clean(decided?.reason, 160) || "OPENAI_POST_CONFIRM_FAILED",
+    silenceRecoveryAttempts: nonNegativeInteger(
+      decided?.silenceRecoveryAttempts
+    ),
+    contentSafetyAttempts: nonNegativeInteger(decided?.contentSafetyAttempts),
+  };
+  console.error("[post_confirm_model_terminal_diagnostic]", diagnostic);
+  return diagnostic;
+}
+
 /**
  * @param {{
  *   db?: unknown,
@@ -109,6 +127,9 @@ export async function handleCustomerBusinessPaInbound({
 
   if (decided?.ok !== true || decided?.source !== "openai") {
     const retryable = decided?.retryable === true;
+    const terminalDiagnostic = retryable
+      ? null
+      : logPostConfirmTerminalDiagnostic(decided);
     return {
       handled: true,
       action: retryable
@@ -129,6 +150,9 @@ export async function handleCustomerBusinessPaInbound({
       finalReplySource: "openai_post_confirm_pa",
       failureReason: clean(decided?.reason, 160) || "OPENAI_POST_CONFIRM_FAILED",
       silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+      contentSafetyAttempts:
+        terminalDiagnostic?.contentSafetyAttempts ??
+        nonNegativeInteger(decided?.contentSafetyAttempts),
     };
   }
 
@@ -252,6 +276,9 @@ export async function handleCustomerBusinessPaInbound({
     });
     if (finalDecision?.ok !== true || finalDecision?.source !== "openai") {
       const retryable = finalDecision?.retryable === true;
+      const terminalDiagnostic = retryable
+        ? null
+        : logPostConfirmTerminalDiagnostic(finalDecision);
       return {
         handled: true,
         action: retryable
@@ -275,6 +302,9 @@ export async function handleCustomerBusinessPaInbound({
         pendingAvailabilityExecution,
         silenceRecoveryAttempts:
           Number(finalDecision?.silenceRecoveryAttempts ?? 0) || 0,
+        contentSafetyAttempts:
+          terminalDiagnostic?.contentSafetyAttempts ??
+          nonNegativeInteger(finalDecision?.contentSafetyAttempts),
       };
     }
     decision = finalDecision.decision;
