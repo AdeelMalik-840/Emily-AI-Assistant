@@ -436,10 +436,12 @@ test("F. cursor recovery does not collapse old visible row with current fresh ro
   assert.equal(decision.candidate?.__burstMerged, undefined);
 });
 
-test("G. cursor recovery may collapse only rows proven current-fresh", () => {
+test("G. cursor recovery keeps distinct WHATSAPP_DATA_ID rows independent", () => {
   initPlaywrightGuaranteeMaps();
   __clearInboundTurnLedgerForTests();
   __reloadInboundTurnLedgerForTests();
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
 
   const civic = waRow("Civic", 30, "3EB0FRESH_A");
   const picture = waRow("picture bhej do", 31, "3EB0FRESH_B");
@@ -469,6 +471,7 @@ test("G. cursor recovery may collapse only rows proven current-fresh", () => {
   });
 
   assert.equal(decision.action, "forward");
-  assert.equal(decision.candidate?.text, "Civic | picture bhej do");
-  assert.equal(decision.candidate?.__catchupMergedRowCount, 2);
+  assert.equal(decision.candidate?.text, "Civic");
+  assert.doesNotMatch(String(decision.candidate?.text ?? ""), /picture bhej do/i);
+  assert.equal(decision.candidate?.__catchupMergedRowCount, undefined);
 });

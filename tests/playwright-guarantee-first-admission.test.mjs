@@ -396,7 +396,7 @@ test("guarantee-first: done/outbound_locked/baseline rows cannot be merge source
   assert.equal(candidate.__burstMerged, undefined);
 });
 
-test("guarantee-first: true fresh same-participant burst still merges", () => {
+test("guarantee-first: distinct durable WA IDs stay independent turns", () => {
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
   const civic = mkRow({
@@ -425,8 +425,9 @@ test("guarantee-first: true fresh same-participant burst still merges", () => {
   });
 
   assert.ok(candidate);
-  assert.equal(candidate.text, "Civic picture bhej do");
-  assert.equal(candidate.__burstMergedCount, 2);
+  assert.equal(candidate.text, "Civic");
+  assert.equal(Boolean(candidate.__burstMerged), false);
+  assert.doesNotMatch(String(candidate.text), /picture bhej do/i);
 });
 
 test("guarantee-first: different participants and weak identity do not multi-row merge", () => {

@@ -64,6 +64,7 @@ import {
 } from "./forwardDecision.js";
 import {
   canMergeBurstRowPair,
+  hasDistinctDurableWhatsAppIds,
   isBurstMergeContinuationText as isBurstMergeContinuationTextPolicy,
   resolveBurstMergeCatalogItems,
   shouldBurstSupersedeOlderRow,
@@ -1832,9 +1833,16 @@ function collapseRowsForForward(rows, opts = {}) {
     return latest ? [latest] : [];
   }
   if (cleanRows.length <= 1) return cleanRows;
+  const lastTwo = cleanRows.slice(-2);
+  // Distinct durable WhatsApp IDs stay independent — never catchup-collapse them.
+  if (
+    lastTwo.length === 2 &&
+    hasDistinctDurableWhatsAppIds(lastTwo[0], lastTwo[1])
+  ) {
+    return cleanRows;
+  }
   const latest = cleanRows[cleanRows.length - 1];
-  const mergedText = cleanRows
-    .slice(-2)
+  const mergedText = lastTwo
     .map((row) => String(row?.text ?? "").trim())
     .filter(Boolean)
     .join(" | ");
@@ -2177,7 +2185,10 @@ export function attachBurstMergeContinuations(
       tickFirstSeenByStableId,
       extractedMessages
     );
-    if (gapMs != null && gapMs > burstMs) {
+    if (gapMs == null) {
+      // Missing trusted WhatsApp source timestamp → no merge.
+      break;
+    } else if (gapMs > burstMs) {
       console.log("[burst_merge_rejected_old_timestamp]", {
         chatKey,
         gapMs,
@@ -2935,19 +2946,6 @@ function buildTextFingerprint(text) {
 }
 
 /**
- * @param {{ text?: string, timestamp?: string | number, __ts?: number }} row
- * @returns {number | null}
- */
-function parseRowTimestampMs(row) {
-  const raw = row?.timestamp != null ? row.timestamp : row?.__ts;
-  const ts = Number(raw);
-  if (!Number.isFinite(ts) || ts <= 0) return null;
-  if (ts > 1_000_000_000_000) return ts;
-  if (ts > 1_000_000_000) return ts * 1000;
-  return null;
-}
-
-/**
  * Bottom-most visible row anchor (any sender).
  * @param {Array<object>} sorted
  * @param {string} chatKey
@@ -3036,22 +3034,59 @@ function arePositionsBurstAdjacent(sorted, posA, posB) {
 }
 
 /**
- * @param {object} a
- * @param {object} b
- * @param {Map<string, number>} tickFirstSeenByStableId
- * @param {Array<object>} extractedList
+ * Trusted WhatsApp source time only (row.timestamp or prePlainText clock).
+ * Never uses __ts, extraction index, or observation/tickFirstSeen time.
+ * @param {object | null | undefined} row
  * @returns {number | null}
  */
-function burstPairGapMs(a, b, tickFirstSeenByStableId, extractedList) {
-  const ta = parseRowTimestampMs(a);
-  const tb = parseRowTimestampMs(b);
-  if (ta != null && tb != null) return Math.abs(tb - ta);
-  const sidA = getMessageIdFromExtracted(a, extractedList);
-  const sidB = getMessageIdFromExtracted(b, extractedList);
-  const fa = sidA ? tickFirstSeenByStableId.get(sidA) : undefined;
-  const fb = sidB ? tickFirstSeenByStableId.get(sidB) : undefined;
-  if (fa != null && fb != null) return Math.abs(fb - fa);
+function trustedWhatsAppSourceTimestampMs(row) {
+  const rawTs = Number(row?.timestamp ?? 0);
+  if (Number.isFinite(rawTs) && rawTs > 0) {
+    return rawTs < 1_000_000_000_000 ? rawTs * 1000 : rawTs;
+  }
+  const fromPrePlain = parsePrePlainTextTimestampMs(row?.prePlainText);
+  if (Number.isFinite(fromPrePlain) && fromPrePlain > 0) return fromPrePlain;
   return null;
+}
+
+/**
+ * @param {object} a
+ * @param {object} b
+ * @param {Map<string, number>} _tickFirstSeenByStableId unused — observation time must not drive merge
+ * @param {Array<object>} _extractedList
+ * @returns {number | null} gap ms, or null when either row lacks a trusted source timestamp
+ */
+function burstPairGapMs(a, b, _tickFirstSeenByStableId, _extractedList) {
+  const ta = trustedWhatsAppSourceTimestampMs(a);
+  const tb = trustedWhatsAppSourceTimestampMs(b);
+  if (ta != null && tb != null) return Math.abs(tb - ta);
+  return null;
+}
+
+/**
+ * Order forwarded turns by original WhatsApp time, then source/DOM order.
+ * @param {object} a
+ * @param {object} b
+ */
+function compareRowsByWhatsAppTimeThenSource(a, b) {
+  const ta = trustedWhatsAppSourceTimestampMs(a);
+  const tb = trustedWhatsAppSourceTimestampMs(b);
+  if (ta != null && tb != null && ta !== tb) return ta - tb;
+  const posA = Number(
+    a?.__position ?? a?.sourceMessageIndex ?? Number.NaN
+  );
+  const posB = Number(
+    b?.__position ?? b?.sourceMessageIndex ?? Number.NaN
+  );
+  if (Number.isFinite(posA) && Number.isFinite(posB) && posA !== posB) {
+    return posA - posB;
+  }
+  const tsA = Number(a?.__ts);
+  const tsB = Number(b?.__ts);
+  if (Number.isFinite(tsA) && Number.isFinite(tsB) && tsA !== tsB) {
+    return tsA - tsB;
+  }
+  return 0;
 }
 
 /**
@@ -4813,7 +4848,12 @@ export function splitBurstMergeRuns(
       continue;
     }
     const gapMs = burstPairGapMs(prev, next, tickFirstSeenByStableId, extractedList);
-    if (gapMs != null && gapMs > burstMs) {
+    if (gapMs == null) {
+      // Missing trusted WhatsApp source timestamp → no merge.
+      runs.push(currentRun);
+      currentRun = [next];
+      continue;
+    } else if (gapMs > burstMs) {
       console.log("[burst_merge_rejected_old_timestamp]", {
         chatKey,
         gapMs,
@@ -8605,9 +8645,7 @@ async function runListenerBody() {
               textPreview: String(candidate.text ?? "").slice(0, 120),
             });
           }
-          newUserMessages.sort(
-            (a, b) => (Number(a?.__ts) || 0) - (Number(b?.__ts) || 0)
-          );
+          newUserMessages.sort(compareRowsByWhatsAppTimeThenSource);
 
           console.log("🆕 New user msgs:", newUserMessages.length);
 
@@ -8705,7 +8743,7 @@ async function runListenerBody() {
           }
 
           const messagesToForward = [...processableMessages].sort(
-            (a, b) => (Number(a?.__ts) || 0) - (Number(b?.__ts) || 0)
+            compareRowsByWhatsAppTimeThenSource
           );
           const newMessages = messagesToForward;
 
@@ -8737,307 +8775,18 @@ async function runListenerBody() {
             }
           }
 
-          // Acquire hard chat lock for this chatKey before forwarding (prevents any chat switching).
-          if (!activeChatLockKey()) {
-            globalThis.__activeChatLock = { chatKey, inProgress: true, startedAtMs: Date.now() };
-            console.log("[chat_lock_acquired]", { chatKey });
-          }
-          globalThis.__ACTIVE_PROCESSING_CHAT = chatKey;
-          let anyForwarded = false;
-          try {
-            for (const [index, msg] of messagesToForward.entries()) {
-            const lastUserText = String(msg?.text ?? "").trim();
-            if (!lastUserText) {
-              continue;
-            }
-            if (String(msg?.sender ?? "").trim() !== "user") {
-              console.log("[forward_skipped_non_user_sender]", {
-                sender: msg?.sender ?? null,
-                textPreview: lastUserText.slice(0, 80),
-              });
-              continue;
-            }
-            if (isLikelyAssistantOutboundCopy(lastUserText)) {
-              console.log("[forward_skipped_assistant_copy]", {
-                textPreview: lastUserText.slice(0, 120),
-                reason: "assistant_copy_template",
-              });
-              continue;
-            }
-            if (isRegisteredPlaywrightOutboundEcho(chatKey, lastUserText)) {
-              console.log("[outbound_echo_blocked]", {
-                chatKey,
-                stableId: getMessageIdFromExtracted(msg, extractedMessages) || null,
-                rowKey: String(msg?.__rowKey ?? "").trim() || null,
-                textPreview: lastUserText.slice(0, 120),
-                reason: "registered_outbound_echo",
-                matchedOutboundPreview: lastUserText.slice(0, 120),
-              });
-              continue;
-            }
-            const inboundOrigin = resolveInboundSourceOrigin({
-              text: lastUserText,
-              chatKey,
-              sender: msg.sender,
-            });
-            if (inboundOrigin.blocked || inboundOrigin.sourceOrigin !== INBOUND_SOURCE_REAL_CUSTOMER) {
-              console.log("[outbound_echo_blocked]", {
-                chatKey,
-                stableId: getMessageIdFromExtracted(msg, extractedMessages) || null,
-                rowKey: String(msg?.__rowKey ?? "").trim() || null,
-                textPreview: lastUserText.slice(0, 120),
-                reason: inboundOrigin.reason || inboundOrigin.sourceOrigin,
-                matchedOutboundPreview: lastUserText.slice(0, 120),
-              });
-              continue;
-            }
-            /** Every `messagesToForward` entry is from the user-delta batch. */
-            const isAfterAnchor = true;
-
-            const { messageId, guaranteeKey, source: idSource } =
-              resolvePlaywrightForwardIdentity(
-                chatKey,
-                msg,
-                index,
-                extractedMessages
-              );
-
-            const burstStableIds = Array.isArray(msg?.__burstStableIds)
-              ? msg.__burstStableIds
-                  .map((id) => String(id ?? "").trim())
-                  .filter(Boolean)
-              : [];
-            const claimIds =
-              burstStableIds.length > 0
-                ? burstStableIds
-                : [String(messageId ?? "").trim()].filter(Boolean);
-
-            const stateEntry = getMessageState(guaranteeKey);
-            const inFlight = stateEntry?.state === "processing";
-            const done = stateEntry?.state === "done";
-            const failed = stateEntry?.state === "failed";
-
-            console.log("🧠 Decision:", {
-              isAfterAnchor,
-              inFlight,
-              done,
-              failed,
-              willProcess: !inFlight && !done,
-            });
-
-            console.log("🧾 Message Identity:", {
-              groupName: openTitle,
-              messageId,
-              source: idSource,
-            });
-
-            if (inFlight) {
-              console.log("🔁 Already processing — skip");
-              continue;
-            }
-
-            if (done) {
-              console.log("⏭ Skipping message because already processed");
-              continue;
-            }
-            if (failed) {
-              const priorRetries =
-                globalThis.__playwrightFailedRetryCount instanceof Map
-                  ? Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0)
-                  : 0;
-              if (priorRetries >= PLAYWRIGHT_FAILED_RETRY_MAX) {
-                console.log("[failed_retry_cap_reached]", {
-                  guaranteeKey,
-                  priorRetries,
-                  max: PLAYWRIGHT_FAILED_RETRY_MAX,
-                });
-                continue;
-              }
-              console.log("♻️ Retrying failed message", {
-                guaranteeKey,
-                attempt: priorRetries + 1,
-              });
-            }
-            const chatLocked =
-              globalThis.__processingChats instanceof Map
-                ? globalThis.__processingChats.get(chatKey) === true
-                : false;
-            if (chatLocked) {
-              console.log("⏳ Chat processing lock active — skipping for retry:", {
-                chatKey,
-              });
-              continue;
-            }
-
-            const activeChatOk = await ensureExpectedChatBeforeForward(
-              page,
-              String(chatName),
-              chatKey
-            );
-            if (!activeChatOk) {
-              continue;
-            }
-
-            console.log("🚀 Forwarding to pipeline");
-            if (isPlaywrightGroupFreshDeltaOnlyEnabled()) {
-              console.log("[fresh_delta_forwarded]", {
-                chatKey,
-                messageId,
-                burstMerged: Boolean(msg?.__burstMerged),
-                burstCount: msg?.__burstMergedCount ?? 1,
-                textPreview: String(msg?.text ?? "").slice(0, 120) || null,
-              });
-            }
-            globalThis.__chatResponding =
-              globalThis.__chatResponding || Object.create(null);
-            globalThis.__chatResponding[chatKey] = true;
-            globalThis.__processingChats.set(chatKey, true);
-            for (const stableId of claimIds) {
-              const claimKey = playwrightGuaranteeKeyForStableId(chatKey, stableId);
-              if (claimKey) setMessageState(claimKey, "processing");
-              if (isInboundTurnLedgerEnabled()) {
-                markInboundTurnLedgerProcessing({
-                  chatKey,
-                  stableId,
-                  guaranteeKey: claimKey,
-                  textPreview: String(msg?.text ?? "").slice(0, 120),
-                });
-              }
-            }
-            setMessageState(guaranteeKey, "processing");
-            try {
-              const listenerInboundId =
-                String(msg?.__listenerInboundId ?? "").trim() ||
-                getMessageIdFromExtracted(msg, extractedMessages);
-              const forwarded = await forwardPlaywrightGroupToPipeline({
-                messageId,
-                text: msg.text,
-                sender: msg.sender,
-                senderName: msg.participantName || msg.sender,
-                participantPhoneForDm: msg.participantPhone || undefined,
-                participantKey: msg.participantKey || undefined,
-                senderAnchor: msg.senderAnchor || undefined,
-                timestamp: msg.timestamp,
-                groupName: String(
-                  globalThis.__currentOpenChatTitle ?? activeChat ?? ""
-                ).trim(),
-                playwrightWebTitleIdentity: true,
-                playwrightChatKey: chatKey,
-                sourceRowKey: String(msg.__rowKey ?? "").trim(),
-                sourceMessageIndex:
-                  msg.sourceMessageIndex != null &&
-                  Number.isFinite(Number(msg.sourceMessageIndex))
-                    ? Number(msg.sourceMessageIndex)
-                    : msg.__position,
-                inboundSourceOrigin: INBOUND_SOURCE_REAL_CUSTOMER,
-                startupCatchup: Boolean(msg.__startupCatchup),
-                suppressAckNoopOutbound: Boolean(msg.__suppressAckNoopOutbound),
-                cursorLastAssistantOutboundTrace:
-                  msg.__persistedCursor?.lastAssistantOutboundTrace || null,
-              });
-              if (forwarded) {
-                anyForwarded = true;
-                globalThis.__playwrightChatLastProcessedAt =
-                  globalThis.__playwrightChatLastProcessedAt ||
-                  Object.create(null);
-                globalThis.__playwrightChatLastProcessedAt[chatKey] =
-                  Date.now();
-                if (
-                  globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map
-                ) {
-                  globalThis.__playwrightListenerMsgIdByGuarantee.set(
-                    guaranteeKey,
-                    listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages)
-                  );
-                }
-                recordPlaywrightInboundScheduled({
-                  guaranteeKey,
-                  chatKey,
-                  rowKey: String(msg.__rowKey ?? "").trim(),
-                  participantCursorKey: participantCursorKeyForMessage(chatKey, msg),
-                  burstStableIds: claimIds,
-                  ownerUserId: ownerUserIdForCursor,
-                  groupChatKey: chatKey,
-                  participantKey: String(msg.participantKey ?? "").trim(),
-                  inboundId:
-                    listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages),
-                  sourceMessageIndex:
-                    msg.sourceMessageIndex != null &&
-                    Number.isFinite(Number(msg.sourceMessageIndex))
-                      ? Number(msg.sourceMessageIndex)
-                      : msg.__position,
-                });
-                if (
-                  freshState &&
-                  matchesBaselineDeferredTailUser(msg, freshState, extractedMessages)
-                ) {
-                  if (freshState.baselineDeferredTailUser) {
-                    freshState.baselineDeferredTailUser.consumed = true;
-                  }
-                  if (freshState.anchorHoldUserForward) {
-                    freshState.anchorHoldUserForward.consumed = true;
-                  }
-                }
-                if (freshState) {
-                  // Advance runtime anchor only after a successfully admitted/forwarded turn.
-                  advanceTailAnchor(
-                    freshState,
-                    msg,
-                    sortedWithPos,
-                    chatKey,
-                    extractedMessages
-                  );
-                  recordSessionVisibilityLedger(
-                    freshState,
-                    sortedWithPos,
-                    Number(msg?.__position) >= 0
-                      ? Number(msg.__position)
-                      : sortedWithPos.length - 1,
-                    chatKey,
-                    sortedWithPos
-                  );
-                }
-              } else {
-                globalThis.__chatResponding[chatKey] = false;
-                globalThis.__processingChats.delete(chatKey);
-                if (globalThis.__playwrightFailedRetryCount instanceof Map) {
-                  globalThis.__playwrightFailedRetryCount.set(
-                    guaranteeKey,
-                    Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0) + 1
-                  );
-                }
-                notifyPlaywrightGuaranteeReleased(guaranteeKey);
-              }
-            } catch (fwdErr) {
-              globalThis.__chatResponding[chatKey] = false;
-              globalThis.__processingChats.delete(chatKey);
-              if (globalThis.__playwrightFailedRetryCount instanceof Map) {
-                globalThis.__playwrightFailedRetryCount.set(
-                  guaranteeKey,
-                  Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0) + 1
-                );
-              }
-              notifyPlaywrightGuaranteeReleased(guaranteeKey);
-              console.error(
-                "[Playwright] forwardPlaywrightGroupToPipeline error:",
-                fwdErr instanceof Error ? fwdErr.message : fwdErr
-              );
-            }
-            }
-          } finally {
-            globalThis.__ACTIVE_PROCESSING_CHAT = null;
-            // Release lock if nothing was forwarded (pipeline errored before any send could happen).
-            // If at least one forward succeeded, Playwright outbound releases after send completes.
-            if (!anyForwarded && activeChatLockKey() === chatKey) {
-              releaseChatLock();
-            }
-            if (globalThis.__pendingChats && globalThis.__pendingChats.size > 0) {
-              const nextChat = globalThis.__pendingChats.values().next().value;
-              globalThis.__pendingChats.delete(nextChat);
-              console.log("🔁 Processing queued chat:", nextChat);
-              globalThis.__forceNextChat = nextChat;
-            }
-          }
+          await runPlaywrightForwardPass({
+            messagesToForward,
+            chatKey,
+            chatName,
+            openTitle,
+            activeChat,
+            extractedMessages,
+            freshState,
+            sortedWithPos,
+            ownerUserIdForCursor,
+            page,
+          });
 
           const updatedSeen = new Set(prevSeenBase);
           for (const msg of messagesToForward) {
@@ -9364,6 +9113,348 @@ export function __playwrightMessageRowSelectorsForTests() {
     legacy: PLAYWRIGHT_LEGACY_MESSAGE_ROW_SELECTOR,
     msgContainer: PLAYWRIGHT_MSG_CONTAINER_ROW_SELECTOR,
   };
+}
+
+/**
+ * Production forward pass for selected processable messages.
+ * Acquires the chat processing lock; lock-skipped admitted turns stay pending
+ * until a later pass successfully schedules them (never marked done here).
+ * @param {object} p
+ * @returns {Promise<{ anyForwarded: boolean, scheduledStableIds: string[], lockSkippedStableIds: string[] }>}
+ */
+export async function runPlaywrightForwardPass(p = {}) {
+  const messagesToForward = Array.isArray(p.messagesToForward) ? p.messagesToForward : [];
+  const chatKey = String(p.chatKey ?? "").trim();
+  const chatName = p.chatName;
+  const openTitle = p.openTitle;
+  const activeChat = p.activeChat;
+  const extractedMessages = Array.isArray(p.extractedMessages) ? p.extractedMessages : [];
+  const freshState = p.freshState ?? null;
+  const sortedWithPos = Array.isArray(p.sortedWithPos) ? p.sortedWithPos : [];
+  const ownerUserIdForCursor = p.ownerUserIdForCursor;
+  const page = p.page ?? null;
+  const ensureActiveChatFn =
+    typeof p.ensureActiveChat === "function"
+      ? p.ensureActiveChat
+      : ensureExpectedChatBeforeForward;
+  const forwardToPipeline =
+    typeof p.forwardToPipeline === "function"
+      ? p.forwardToPipeline
+      : forwardPlaywrightGroupToPipeline;
+
+  const scheduledStableIds = [];
+  const lockSkippedStableIds = [];
+
+  // Acquire hard chat lock for this chatKey before forwarding (prevents any chat switching).
+  if (!activeChatLockKey()) {
+    globalThis.__activeChatLock = { chatKey, inProgress: true, startedAtMs: Date.now() };
+    console.log("[chat_lock_acquired]", { chatKey });
+  }
+  globalThis.__ACTIVE_PROCESSING_CHAT = chatKey;
+  let anyForwarded = false;
+  try {
+    for (const [index, msg] of messagesToForward.entries()) {
+    const lastUserText = String(msg?.text ?? "").trim();
+    if (!lastUserText) {
+      continue;
+    }
+    if (String(msg?.sender ?? "").trim() !== "user") {
+      console.log("[forward_skipped_non_user_sender]", {
+        sender: msg?.sender ?? null,
+        textPreview: lastUserText.slice(0, 80),
+      });
+      continue;
+    }
+    if (isLikelyAssistantOutboundCopy(lastUserText)) {
+      console.log("[forward_skipped_assistant_copy]", {
+        textPreview: lastUserText.slice(0, 120),
+        reason: "assistant_copy_template",
+      });
+      continue;
+    }
+    if (isRegisteredPlaywrightOutboundEcho(chatKey, lastUserText)) {
+      console.log("[outbound_echo_blocked]", {
+        chatKey,
+        stableId: getMessageIdFromExtracted(msg, extractedMessages) || null,
+        rowKey: String(msg?.__rowKey ?? "").trim() || null,
+        textPreview: lastUserText.slice(0, 120),
+        reason: "registered_outbound_echo",
+        matchedOutboundPreview: lastUserText.slice(0, 120),
+      });
+      continue;
+    }
+    const inboundOrigin = resolveInboundSourceOrigin({
+      text: lastUserText,
+      chatKey,
+      sender: msg.sender,
+    });
+    if (inboundOrigin.blocked || inboundOrigin.sourceOrigin !== INBOUND_SOURCE_REAL_CUSTOMER) {
+      console.log("[outbound_echo_blocked]", {
+        chatKey,
+        stableId: getMessageIdFromExtracted(msg, extractedMessages) || null,
+        rowKey: String(msg?.__rowKey ?? "").trim() || null,
+        textPreview: lastUserText.slice(0, 120),
+        reason: inboundOrigin.reason || inboundOrigin.sourceOrigin,
+        matchedOutboundPreview: lastUserText.slice(0, 120),
+      });
+      continue;
+    }
+    /** Every `messagesToForward` entry is from the user-delta batch. */
+    const isAfterAnchor = true;
+
+    const { messageId, guaranteeKey, source: idSource } =
+      resolvePlaywrightForwardIdentity(
+        chatKey,
+        msg,
+        index,
+        extractedMessages
+      );
+
+    const burstStableIds = Array.isArray(msg?.__burstStableIds)
+      ? msg.__burstStableIds
+          .map((id) => String(id ?? "").trim())
+          .filter(Boolean)
+      : [];
+    const claimIds =
+      burstStableIds.length > 0
+        ? burstStableIds
+        : [String(messageId ?? "").trim()].filter(Boolean);
+
+    const stateEntry = getMessageState(guaranteeKey);
+    const inFlight = stateEntry?.state === "processing";
+    const done = stateEntry?.state === "done";
+    const failed = stateEntry?.state === "failed";
+
+    console.log("🧠 Decision:", {
+      isAfterAnchor,
+      inFlight,
+      done,
+      failed,
+      willProcess: !inFlight && !done,
+    });
+
+    console.log("🧾 Message Identity:", {
+      groupName: openTitle,
+      messageId,
+      source: idSource,
+    });
+
+    if (inFlight) {
+      console.log("🔁 Already processing — skip");
+      continue;
+    }
+
+    if (done) {
+      console.log("⏭ Skipping message because already processed");
+      continue;
+    }
+    if (failed) {
+      const priorRetries =
+        globalThis.__playwrightFailedRetryCount instanceof Map
+          ? Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0)
+          : 0;
+      if (priorRetries >= PLAYWRIGHT_FAILED_RETRY_MAX) {
+        console.log("[failed_retry_cap_reached]", {
+          guaranteeKey,
+          priorRetries,
+          max: PLAYWRIGHT_FAILED_RETRY_MAX,
+        });
+        continue;
+      }
+      console.log("♻️ Retrying failed message", {
+        guaranteeKey,
+        attempt: priorRetries + 1,
+      });
+    }
+    const chatLocked =
+      globalThis.__processingChats instanceof Map
+        ? globalThis.__processingChats.get(chatKey) === true
+        : false;
+    if (chatLocked) {
+      console.log("⏳ Chat processing lock active — skipping for retry:", {
+        chatKey,
+      });
+      for (const sid of claimIds) {
+        if (sid) lockSkippedStableIds.push(sid);
+      }
+      continue;
+    }
+
+    const activeChatOk = await ensureActiveChatFn(
+        page,
+        String(chatName),
+        chatKey
+      );
+    if (!activeChatOk) {
+      continue;
+    }
+
+    console.log("🚀 Forwarding to pipeline");
+    if (isPlaywrightGroupFreshDeltaOnlyEnabled()) {
+      console.log("[fresh_delta_forwarded]", {
+        chatKey,
+        messageId,
+        burstMerged: Boolean(msg?.__burstMerged),
+        burstCount: msg?.__burstMergedCount ?? 1,
+        textPreview: String(msg?.text ?? "").slice(0, 120) || null,
+      });
+    }
+    globalThis.__chatResponding =
+      globalThis.__chatResponding || Object.create(null);
+    globalThis.__chatResponding[chatKey] = true;
+    globalThis.__processingChats.set(chatKey, true);
+    for (const stableId of claimIds) {
+      const claimKey = playwrightGuaranteeKeyForStableId(chatKey, stableId);
+      if (claimKey) setMessageState(claimKey, "processing");
+      if (isInboundTurnLedgerEnabled()) {
+        markInboundTurnLedgerProcessing({
+          chatKey,
+          stableId,
+          guaranteeKey: claimKey,
+          textPreview: String(msg?.text ?? "").slice(0, 120),
+        });
+      }
+    }
+    setMessageState(guaranteeKey, "processing");
+    try {
+      const listenerInboundId =
+        String(msg?.__listenerInboundId ?? "").trim() ||
+        getMessageIdFromExtracted(msg, extractedMessages);
+      const forwarded = await forwardToPipeline({
+        messageId,
+        text: msg.text,
+        sender: msg.sender,
+        senderName: msg.participantName || msg.sender,
+        participantPhoneForDm: msg.participantPhone || undefined,
+        participantKey: msg.participantKey || undefined,
+        senderAnchor: msg.senderAnchor || undefined,
+        timestamp: msg.timestamp,
+        groupName: String(
+          globalThis.__currentOpenChatTitle ?? activeChat ?? ""
+        ).trim(),
+        playwrightWebTitleIdentity: true,
+        playwrightChatKey: chatKey,
+        sourceRowKey: String(msg.__rowKey ?? "").trim(),
+        sourceMessageIndex:
+          msg.sourceMessageIndex != null &&
+          Number.isFinite(Number(msg.sourceMessageIndex))
+            ? Number(msg.sourceMessageIndex)
+            : msg.__position,
+        inboundSourceOrigin: INBOUND_SOURCE_REAL_CUSTOMER,
+        startupCatchup: Boolean(msg.__startupCatchup),
+        suppressAckNoopOutbound: Boolean(msg.__suppressAckNoopOutbound),
+        cursorLastAssistantOutboundTrace:
+          msg.__persistedCursor?.lastAssistantOutboundTrace || null,
+      });
+      if (forwarded) {
+        anyForwarded = true;
+        for (const sid of claimIds) {
+          if (sid) scheduledStableIds.push(sid);
+        }
+        globalThis.__playwrightChatLastProcessedAt =
+          globalThis.__playwrightChatLastProcessedAt ||
+          Object.create(null);
+        globalThis.__playwrightChatLastProcessedAt[chatKey] =
+          Date.now();
+        if (
+          globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map
+        ) {
+          globalThis.__playwrightListenerMsgIdByGuarantee.set(
+            guaranteeKey,
+            listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages)
+          );
+        }
+        recordPlaywrightInboundScheduled({
+          guaranteeKey,
+          chatKey,
+          rowKey: String(msg.__rowKey ?? "").trim(),
+          participantCursorKey: participantCursorKeyForMessage(chatKey, msg),
+          burstStableIds: claimIds,
+          ownerUserId: ownerUserIdForCursor,
+          groupChatKey: chatKey,
+          participantKey: String(msg.participantKey ?? "").trim(),
+          inboundId:
+            listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages),
+          sourceMessageIndex:
+            msg.sourceMessageIndex != null &&
+            Number.isFinite(Number(msg.sourceMessageIndex))
+              ? Number(msg.sourceMessageIndex)
+              : msg.__position,
+        });
+        if (
+          freshState &&
+          matchesBaselineDeferredTailUser(msg, freshState, extractedMessages)
+        ) {
+          if (freshState.baselineDeferredTailUser) {
+            freshState.baselineDeferredTailUser.consumed = true;
+          }
+          if (freshState.anchorHoldUserForward) {
+            freshState.anchorHoldUserForward.consumed = true;
+          }
+        }
+        if (freshState) {
+          // Advance runtime anchor only after a successfully admitted/forwarded turn.
+          advanceTailAnchor(
+            freshState,
+            msg,
+            sortedWithPos,
+            chatKey,
+            extractedMessages
+          );
+          recordSessionVisibilityLedger(
+            freshState,
+            sortedWithPos,
+            Number(msg?.__position) >= 0
+              ? Number(msg.__position)
+              : sortedWithPos.length - 1,
+            chatKey,
+            sortedWithPos
+          );
+        }
+      } else {
+        globalThis.__chatResponding[chatKey] = false;
+        globalThis.__processingChats.delete(chatKey);
+        if (globalThis.__playwrightFailedRetryCount instanceof Map) {
+          globalThis.__playwrightFailedRetryCount.set(
+            guaranteeKey,
+            Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0) + 1
+          );
+        }
+        notifyPlaywrightGuaranteeReleased(guaranteeKey);
+      }
+    } catch (fwdErr) {
+      globalThis.__chatResponding[chatKey] = false;
+      globalThis.__processingChats.delete(chatKey);
+      if (globalThis.__playwrightFailedRetryCount instanceof Map) {
+        globalThis.__playwrightFailedRetryCount.set(
+          guaranteeKey,
+          Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0) + 1
+        );
+      }
+      notifyPlaywrightGuaranteeReleased(guaranteeKey);
+      console.error(
+        "[Playwright] forwardPlaywrightGroupToPipeline error:",
+        fwdErr instanceof Error ? fwdErr.message : fwdErr
+      );
+    }
+    }
+  } finally {
+    globalThis.__ACTIVE_PROCESSING_CHAT = null;
+    // Release lock if nothing was forwarded (pipeline errored before any send could happen).
+    // If at least one forward succeeded, Playwright outbound releases after send completes.
+    if (!anyForwarded && activeChatLockKey() === chatKey) {
+      releaseChatLock();
+    }
+    if (globalThis.__pendingChats && globalThis.__pendingChats.size > 0) {
+      const nextChat = globalThis.__pendingChats.values().next().value;
+      globalThis.__pendingChats.delete(nextChat);
+      console.log("🔁 Processing queued chat:", nextChat);
+      globalThis.__forceNextChat = nextChat;
+    }
+  }
+
+
+  return { anyForwarded, scheduledStableIds, lockSkippedStableIds };
 }
 
 export async function startPlaywrightListener() {
