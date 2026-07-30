@@ -813,6 +813,153 @@ test("fresh Corolla waiting-confirm wins over older Civic post-confirm ownership
   assert.deepEqual(activeFacts, activeFactsBefore);
 });
 
+test("full pipeline retries a failed confirmed-booking reply as send-only recovery", async () => {
+  resetPipelineTestIsolation();
+  const fake = createFakeDb();
+  fake.seedInventoryItem();
+  fake.seedAvailabilityRequest(
+    REQUEST_ID,
+    baseCloudWaitingRequest({
+      itemId: "corolla-1",
+      itemLabel: "Toyota Corolla",
+      requestedDuration: 3,
+      priceQuote: {
+        status: "quoted",
+        total: 15000,
+        currency: "PKR",
+        durationDays: 3,
+        dailyRate: 5000,
+      },
+    })
+  );
+
+  const providerMessageId = `wamid.confirm-recovery-${randomUUID()}`;
+  const inboundText = `Han done kro [test:${randomUUID()}]`;
+  let openAiCalls = 0;
+  let bookingPaCalls = 0;
+  let sends = 0;
+  const params = {
+    db: fake.db,
+    ownerUserId: BUSINESS_ID,
+    userPhone: CUSTOMER_WA,
+    conversationCustomerNumber: CUSTOMER_WA,
+    participantPhoneForDm: CUSTOMER_WA,
+    sessionKey: `${BUSINESS_ID}::${CUSTOMER_WA}::${randomUUID()}`,
+    sendCredentials: { accessToken: "t", phoneNumberId: "1" },
+    isGroupMessage: false,
+    playwrightWebInbound: false,
+    combinedMessage: inboundText,
+    latestMessage: inboundText,
+    messageId: providerMessageId,
+    messageTimestamp: Math.floor(Date.now() / 1000),
+    __resolveActiveCustomerBookingFactsFn: async () =>
+      activeCivicPostConfirmFacts(),
+    __tryHandleAvailabilityCustomerCloudInboundFn: async (handlerParams) =>
+      handleAvailabilityCustomerCloudInbound({
+        ...handlerParams,
+        db: fake.db,
+        availabilityConfirmExecute: true,
+        __waitingConfirmDmBrainEnabled: true,
+        __catalogRowForTests: {
+          id: "corolla-1",
+          name: "Toyota Corolla",
+          displayLabel: "Toyota Corolla",
+          dailyRate: 5000,
+        },
+        __decideCustomerTurnForTests: async (turnContext) => {
+          openAiCalls += 1;
+          return {
+            ok: true,
+            source: "test_openai",
+            lane: "waiting_confirm_dm",
+            turnContext,
+            decision: waitingConfirmOpenAiDecision({
+              customerIntent: "confirm_booking",
+              customerIsConfirmingBooking: true,
+              shouldReply: true,
+              customerReply: "OpenAI understood the confirmation.",
+              action: "confirm_booking",
+              requiredExecutor: "confirm_booking_executor",
+            }),
+          };
+        },
+        sendWhatsAppMessageFn: async () => {
+          sends += 1;
+          return sends === 1
+            ? { ok: false }
+            : {
+                ok: true,
+                providerMessageId: "wamid.confirm-recovery-out",
+              };
+        },
+      }),
+    __tryHandleCustomerBusinessPaInboundFn: async () => {
+      bookingPaCalls += 1;
+      return {
+        handled: true,
+        reply: "post_confirm_pa must not run for send-only recovery",
+      };
+    },
+    __tryBrainV2LiveBeforeLegacyFn: async () => {
+      throw new Error("general Brain must not run");
+    },
+    __processMessageFn: async () => {
+      throw new Error("legacy processor must not run");
+    },
+  };
+
+  await executeWhatsAppAiPipeline(params);
+  assert.equal(openAiCalls, 1);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 1);
+  assert.equal(
+    fake
+      .getConversationMessages()
+      .filter((row) => row.role === "assistant").length,
+    0
+  );
+
+  const retryDeadline = Date.now() + 3_000;
+  while (
+    fake
+      .getConversationMessages()
+      .filter((row) => row.role === "assistant").length < 1 &&
+    Date.now() < retryDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  assert.equal(openAiCalls, 1);
+  assert.equal(bookingPaCalls, 0);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 2);
+  const historyAfterRecovery = fake.getConversationMessages();
+  assert.equal(
+    historyAfterRecovery.filter((row) => row.role === "assistant").length,
+    1
+  );
+  assert.equal(
+    historyAfterRecovery.find((row) => row.role === "assistant")
+      ?.sourceMessageId,
+    providerMessageId
+  );
+
+  await executeWhatsAppAiPipeline({
+    ...params,
+    __cloudResumeProcessing: true,
+  });
+  assert.equal(openAiCalls, 1);
+  assert.equal(bookingPaCalls, 0);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 2);
+  assert.equal(
+    fake
+      .getConversationMessages()
+      .filter((row) => row.role === "assistant").length,
+    1
+  );
+});
+
 test("fresh Corolla waiting-confirm Q&A stays in OpenAI lane with zero booking", async () => {
   let paCalls = 0;
   let waitingConfirmSends = 0;

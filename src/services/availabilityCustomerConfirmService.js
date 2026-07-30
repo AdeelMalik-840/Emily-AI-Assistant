@@ -90,8 +90,19 @@ function timestampMs(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-function needsConfirmedBookingReplyRecovery(request, messageId) {
+export function isConfirmedBookingReplyRecoveryCandidate({
+  request,
+  businessId,
+  customerPhone,
+  messageId,
+} = {}) {
+  const uid = clean(businessId);
+  const phone = normalizePhone(customerPhone);
   if (
+    !uid ||
+    !phone ||
+    clean(request?.businessId) !== uid ||
+    !availabilityRequestMatchesCloudCustomerPhone(request, phone) ||
     clean(request?.customerConfirmationStatus) !== "confirmed" ||
     !clean(request?.linkedBookingId) ||
     !clean(messageId) ||
@@ -102,6 +113,31 @@ function needsConfirmedBookingReplyRecovery(request, messageId) {
   const confirmedAt = timestampMs(request?.customerConfirmationAt);
   const outboundAt = timestampMs(request?.lastCustomerDmOutboundAt);
   return confirmedAt != null && (outboundAt == null || outboundAt < confirmedAt);
+}
+
+export async function findConfirmedBookingReplyRecoveryCandidate({
+  db: connection,
+  businessId,
+  customerPhone,
+  messageId,
+} = {}) {
+  const uid = clean(businessId);
+  const phone = normalizePhone(customerPhone);
+  const inboundMessageId = clean(messageId);
+  if (!connection || !uid || !phone || !inboundMessageId) return null;
+  const request = await findAvailabilityRequestByCloudInboundMessageId({
+    db: connection,
+    businessId: uid,
+    messageId: inboundMessageId,
+  });
+  return isConfirmedBookingReplyRecoveryCandidate({
+    request,
+    businessId: uid,
+    customerPhone: phone,
+    messageId: inboundMessageId,
+  })
+    ? request
+    : null;
 }
 
 function normalizePhone(value) {
@@ -1192,7 +1228,12 @@ export async function handleAvailabilityCustomerCloudInbound({
       const priorRequestId = clean(prior.requestId ?? prior.id) || null;
       if (
         priorRequestId &&
-        needsConfirmedBookingReplyRecovery(prior, inboundMessageId)
+        isConfirmedBookingReplyRecoveryCandidate({
+          request: prior,
+          businessId: uid,
+          customerPhone: phone,
+          messageId: inboundMessageId,
+        })
       ) {
         const recoveryReply = buildAvailabilityConfirmSuccessReply();
         const recoverySend = await sendCustomerDmReply({

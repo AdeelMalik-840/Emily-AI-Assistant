@@ -1580,6 +1580,7 @@ export async function executeWhatsAppAiPipeline(p) {
   const parsedApproval = parseApprovalMessage(combinedMessage);
   let preResolvedPostConfirmBookingFacts = null;
   let preResolvedFreshWaitingConfirmRequest = null;
+  let preResolvedConfirmedBookingReplyRecovery = null;
   let resolvedPostConfirm = null;
   const inboundReceivedAtMs =
     Number.isFinite(tsNum) && tsNum > 0
@@ -1680,6 +1681,38 @@ export async function executeWhatsAppAiPipeline(p) {
       throw new Error(cloudClaim.reason || "CLOUD_LEDGER_CLAIM_FAILED");
     }
 
+    if (p.__cloudResumeProcessing === true) {
+      try {
+        const findConfirmedReplyRecoveryFn = (
+          await import("./availabilityCustomerConfirmService.js")
+        ).findConfirmedBookingReplyRecoveryCandidate;
+        preResolvedConfirmedBookingReplyRecovery =
+          await findConfirmedReplyRecoveryFn({
+            db,
+            businessId: ownerUserId,
+            customerPhone: cloudConfirmPhone,
+            messageId,
+          });
+      } catch (err) {
+        const failed = markCloudInboundTurnRetryableFailure({
+          identity: cloudLifecycleIdentity,
+          lastError: String(
+            err?.message ??
+              err ??
+              "CONFIRMED_BOOKING_REPLY_RECOVERY_LOOKUP_FAILED"
+          ),
+          retryDelayMs: 1000,
+        });
+        scheduleCloudPostConfirmRetry(
+          p,
+          cloudLifecycleIdentity,
+          Number(failed?.retryCount ?? 1),
+          cloudLifecycleClaimOwner
+        );
+        return;
+      }
+    }
+
     const resolveFreshWaitingConfirmFn =
       typeof p.__resolveFreshWaitingConfirmCloudOwnershipCandidateFn === "function"
         ? p.__resolveFreshWaitingConfirmCloudOwnershipCandidateFn
@@ -1769,9 +1802,13 @@ export async function executeWhatsAppAiPipeline(p) {
       reason: String(resolvedPostConfirm?.reason ?? "").trim() || null,
     });
   }
+  const hasConfirmedBookingReplyRecovery =
+    Boolean(preResolvedConfirmedBookingReplyRecovery);
   const hasActivePostConfirmOwnership =
     preResolvedPostConfirmBookingFacts?.ok === true;
-  if (hasActivePostConfirmOwnership) {
+  if (hasConfirmedBookingReplyRecovery) {
+    cloudLifecycleClaimed = true;
+  } else if (hasActivePostConfirmOwnership) {
     markCloudInboundTurnPostConfirmOwned({ identity: cloudLifecycleIdentity });
     cloudLifecycleClaimed = true;
   }
@@ -1855,6 +1892,7 @@ export async function executeWhatsAppAiPipeline(p) {
 
   if (
     !hasActivePostConfirmOwnership &&
+    !hasConfirmedBookingReplyRecovery &&
     cloudLifecycleIdentity?.guaranteeKey
   ) {
     console.log("[cloud_post_confirm_ownership_probe_released]", {
@@ -2204,7 +2242,9 @@ export async function executeWhatsAppAiPipeline(p) {
   const hasFreshWaitingConfirmOwnership =
     Boolean(preResolvedFreshWaitingConfirmRequest);
   const canTryCloudConfirmOwnership =
-    (!hasActivePostConfirmOwnership || hasFreshWaitingConfirmOwnership) &&
+    (hasConfirmedBookingReplyRecovery ||
+      !hasActivePostConfirmOwnership ||
+      hasFreshWaitingConfirmOwnership) &&
     !isGroupInbound &&
     !playwrightWebInbound &&
     Boolean(String(ownerUserId ?? "").trim()) &&
@@ -2269,9 +2309,15 @@ export async function executeWhatsAppAiPipeline(p) {
           finalReplySource: "AVAILABILITY_CUSTOMER_CLOUD_CONFIRM",
         },
       };
-    } else if (hasFreshWaitingConfirmOwnership) {
+    } else if (
+      hasFreshWaitingConfirmOwnership ||
+      hasConfirmedBookingReplyRecovery
+    ) {
       const noMatchReason = String(cloudConfirmResult?.reason ?? "").trim();
-      if (!["NO_MATCH", "NO_WAITING_REQUEST"].includes(noMatchReason)) {
+      if (
+        hasConfirmedBookingReplyRecovery ||
+        !["NO_MATCH", "NO_WAITING_REQUEST"].includes(noMatchReason)
+      ) {
         throw new Error(
           noMatchReason || "WAITING_CONFIRM_OWNERSHIP_UNRESOLVED"
         );
