@@ -14,7 +14,13 @@ import { deliverWhatsAppOutbound } from "../whatsappCloud.js";
  *     recipientType: "group" | "individual",
  *   }
  * }} p
- * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   groupSendFailed?: boolean,
+ *   httpStatus?: number,
+ *   tokenSource?: string,
+ *   providerMessageId?: string | null,
+ * }>}
  */
 export async function sendViaCloudAPI({
   reply,
@@ -34,7 +40,7 @@ export async function sendViaCloudAPI({
   const target = String(to ?? "").trim();
   if (!target) {
     console.warn("⚠️ Missing reply target, skipping send");
-    return { ok: false };
+    return { ok: false, providerMessageId: null };
   }
 
   const deliverResult = await deliverWhatsAppOutbound(
@@ -54,10 +60,13 @@ export async function sendViaCloudAPI({
   );
   const groupSendFailed = Boolean(deliverResult?.groupSendFailed);
   const sendOk = deliverResult?.ok === true;
+  const providerMessageId =
+    String(deliverResult?.providerMessageId ?? "").trim() || null;
   console.log("[cloud_send_result_propagated]", {
     ok: sendOk,
     httpStatus: deliverResult?.httpStatus ?? null,
     tokenSource: deliverResult?.tokenSource ?? null,
+    hasProviderMessageId: Boolean(providerMessageId),
     caller: "cloudApiAdapter.sendViaCloudAPI",
   });
   if (!sendOk) {
@@ -68,6 +77,7 @@ export async function sendViaCloudAPI({
     ...(groupSendFailed ? { groupSendFailed: true } : {}),
     ...(deliverResult?.httpStatus != null ? { httpStatus: deliverResult.httpStatus } : {}),
     ...(deliverResult?.tokenSource ? { tokenSource: deliverResult.tokenSource } : {}),
+    providerMessageId,
   };
 }
 

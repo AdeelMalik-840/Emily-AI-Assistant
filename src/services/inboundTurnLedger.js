@@ -3,16 +3,17 @@
  * Survives process restart; blocks old customer row replay.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setMessageState } from "./messageState.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
+import { normalizePhoneE164 } from "./connections.js";
 
 /** @typedef {"received" | "processing" | "done" | "failed" | "baseline_absorbed" | "outbound_locked"} InboundTurnLedgerState */
 
-/** @typedef {"pending_send" | "send_attempted" | "sent"} OutboundIntentStatus */
+/** @typedef {"pending_send" | "send_claimed" | "send_in_flight" | "send_attempted" | "provider_accepted" | "sent"} OutboundIntentStatus */
 
 /** @typedef {{
  *   chatKey: string,
@@ -46,6 +47,9 @@ import { normalizeTitle } from "./playwrightTitleNormalize.js";
  *   retryCount?: number,
  *   nextRetryAt?: number | null,
  *   cloudRecoveryContext?: Record<string, unknown> | null,
+ *   providerOutboundMessageId?: string | null,
+ *   processingOwner?: string | null,
+ *   manualReviewAlert?: Record<string, unknown> | null,
  *   updatedAt: number,
  * }} InboundTurnLedgerEntry */
 
@@ -485,10 +489,14 @@ export function markInboundTurnLedgerOutboundLocked(p) {
       : existing?.finalReplySource != null
         ? String(existing.finalReplySource).trim() || null
         : null;
-  // Preserve send_attempted/sent across re-lock; otherwise start as pending_send.
+  // Preserve post-claim / in-flight / sent across re-lock; otherwise start as pending_send.
   const existingIntent = String(existing?.outboundIntentStatus ?? "").trim();
   const outboundIntentStatus =
-    existingIntent === "sent" || existingIntent === "send_attempted"
+    existingIntent === "sent" ||
+    existingIntent === "provider_accepted" ||
+    existingIntent === "send_attempted" ||
+    existingIntent === "send_in_flight" ||
+    existingIntent === "send_claimed"
       ? existingIntent
       : nextFinalReply
         ? "pending_send"
@@ -777,16 +785,18 @@ export function markInboundTurnLedgerOutboundLockedForGuarantee(p) {
 
 /**
  * Classify how an outbound_locked turn should be recovered.
+ * Distinguishes pre-flight claim (send_claimed) from in-flight uncertainty.
  * @param {InboundTurnLedgerEntry | null | undefined} entry
- * @param {{ hasOutboundEcho?: boolean }} [opts]
+ * @param {{ hasOutboundEcho?: boolean, nowMs?: number }} [opts]
  * @returns {{
- *   action: "resume_send" | "complete_ledger" | "uncertain_fail_closed" | "not_recoverable",
+ *   action: "resume_send" | "complete_ledger" | "uncertain_fail_closed" | "corrupted_locked_reply" | "not_recoverable" | "lease_held",
  *   reason: string,
  *   finalReplyText: string,
  *   replyHash: string | null,
  *   groupChatKey: string | null,
  *   sendVia: string | null,
  *   guaranteeKey: string | null,
+ *   providerOutboundMessageId?: string | null,
  * }}
  */
 export function classifyOutboundLockedRecovery(entry, opts = {}) {
@@ -813,40 +823,89 @@ export function classifyOutboundLockedRecovery(entry, opts = {}) {
     null;
   const intent = String(e.outboundIntentStatus ?? "").trim();
   const hasEcho = opts.hasOutboundEcho === true;
+  const providerOutboundMessageId =
+    String(e.providerOutboundMessageId ?? "").trim() || null;
+  const now = Number.isFinite(Number(opts.nowMs))
+    ? Number(opts.nowMs)
+    : Date.now();
+  const claimedAt = Number(e.recoveryClaimedAt ?? 0);
+  const hasLiveLease =
+    Boolean(String(e.recoveryClaimOwner ?? "").trim()) &&
+    Number.isFinite(claimedAt) &&
+    now - claimedAt <= RECOVERY_CLAIM_TTL_MS;
 
-  if (hasEcho || intent === "sent") {
+  if (
+    providerOutboundMessageId ||
+    hasEcho ||
+    intent === "sent" ||
+    intent === "provider_accepted"
+  ) {
     return {
       action: "complete_ledger",
-      reason: hasEcho ? "outbound_echo_registered" : "intent_already_sent",
+      reason: providerOutboundMessageId
+        ? "provider_outbound_message_id_present"
+        : hasEcho
+          ? "outbound_echo_registered"
+          : "intent_already_sent",
       finalReplyText,
       replyHash,
       groupChatKey,
       sendVia,
       guaranteeKey,
+      providerOutboundMessageId,
     };
   }
 
-  if (intent === "send_attempted") {
+  // In-flight / legacy send_attempted without receipt → uncertain (no blind resend).
+  if (intent === "send_in_flight" || intent === "send_attempted") {
     return {
       action: "uncertain_fail_closed",
-      reason: "send_attempted_without_echo",
+      reason: "send_in_flight_without_provider_receipt",
       finalReplyText,
       replyHash,
       groupChatKey,
       sendVia,
       guaranteeKey,
+      providerOutboundMessageId,
     };
   }
 
   if (!finalReplyText) {
     return {
-      action: "not_recoverable",
+      action: "corrupted_locked_reply",
       reason: "missing_final_reply_text",
       finalReplyText: "",
       replyHash,
       groupChatKey,
       sendVia,
       guaranteeKey,
+      providerOutboundMessageId,
+    };
+  }
+
+  // Pre-flight ownership: live lease cannot be stolen; stale claim can resume send-only.
+  if (intent === "send_claimed") {
+    if (hasLiveLease) {
+      return {
+        action: "lease_held",
+        reason: "send_claimed_lease_live",
+        finalReplyText,
+        replyHash,
+        groupChatKey,
+        sendVia,
+        guaranteeKey,
+        providerOutboundMessageId,
+      };
+    }
+    return {
+      action: "resume_send",
+      reason: "stale_send_claimed_resume",
+      finalReplyText,
+      replyHash,
+      groupChatKey,
+      sendVia,
+      guaranteeKey,
+      providerOutboundMessageId,
     };
   }
 
@@ -858,18 +917,13 @@ export function classifyOutboundLockedRecovery(entry, opts = {}) {
     groupChatKey,
     sendVia,
     guaranteeKey,
+    providerOutboundMessageId,
   };
 }
 
 /**
- * Claim exclusive ownership of an outbound_locked recovery send.
- * @param {{
- *   chatKey: string,
- *   stableId: string,
- *   claimOwner: string,
- *   claimTtlMs?: number,
- * }} p
- * @returns {{ claimed: boolean, reason: string, entry?: InboundTurnLedgerEntry }}
+ * Claim exclusive ownership to *start* an outbound send (pre-flight).
+ * Sets outboundIntentStatus=send_claimed — not yet in-flight.
  */
 export function claimOutboundLockedRecovery(p) {
   const force = p?.force === true;
@@ -884,6 +938,18 @@ export function claimOutboundLockedRecovery(p) {
   const entry = ledgerByKey.get(key);
   if (!entry || entry.state !== "outbound_locked") {
     return { claimed: false, reason: "not_outbound_locked" };
+  }
+  const intent = String(entry.outboundIntentStatus ?? "").trim();
+  if (
+    intent === "send_in_flight" ||
+    intent === "send_attempted" ||
+    intent === "sent" ||
+    intent === "provider_accepted"
+  ) {
+    return { claimed: false, reason: "send_already_in_flight_or_done", entry };
+  }
+  if (entry.autoRetryAllowed === false && intent !== "send_claimed" && intent !== "pending_send") {
+    return { claimed: false, reason: "auto_retry_disabled", entry };
   }
   const claimOwner = String(p.claimOwner ?? "").trim();
   if (!claimOwner) return { claimed: false, reason: "missing_claim_owner" };
@@ -902,19 +968,127 @@ export function claimOutboundLockedRecovery(p) {
   ) {
     return { claimed: false, reason: "recovery_claim_held", entry };
   }
-  const next = upsertEntry(key, {
-    ...entry,
-    recoveryClaimedAt: now,
-    recoveryClaimOwner: claimOwner,
-    outboundIntentStatus: "send_attempted",
-  }, force);
+  const next = upsertEntry(
+    key,
+    {
+      ...entry,
+      recoveryClaimedAt: now,
+      recoveryClaimOwner: claimOwner,
+      outboundIntentStatus: "send_claimed",
+    },
+    force
+  );
   console.log("[inbound_turn_ledger_recovery_claimed]", {
     chatKey,
     stableId,
     claimOwner,
     guaranteeKey: entry.guaranteeKey ?? null,
+    outboundIntentStatus: "send_claimed",
   });
   return { claimed: true, reason: "claimed", entry: next };
+}
+
+/**
+ * Mark that the Meta/network send request is actually starting.
+ * Transitions send_claimed → send_in_flight (persisted before/as request begins).
+ */
+export function markOutboundSendInFlight(p) {
+  const force = p?.force === true;
+  if (!force && !isInboundTurnLedgerEnabled()) return null;
+  initInboundTurnLedger(force);
+  const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
+  const stableId = String(p.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return null;
+  const existing = ledgerByKey.get(key);
+  if (!existing || existing.state !== "outbound_locked") return null;
+  const claimOwner = String(p.claimOwner ?? "").trim();
+  if (
+    claimOwner &&
+    String(existing.recoveryClaimOwner ?? "").trim() &&
+    String(existing.recoveryClaimOwner).trim() !== claimOwner
+  ) {
+    return null;
+  }
+  return upsertEntry(
+    key,
+    {
+      ...existing,
+      outboundIntentStatus: "send_in_flight",
+      outboundLockStage:
+        String(p.outboundLockStage ?? existing.outboundLockStage ?? "").trim() ||
+        "send_in_flight",
+    },
+    force
+  );
+}
+
+/**
+ * Create one deduplicated durable owner/admin manual-review alert on the ledger.
+ * No customer-facing text. No full phone / message body.
+ */
+export function ensureOutboundManualReviewAlert({
+  chatKey,
+  stableId,
+  reason,
+  deliveryStatus,
+} = {}) {
+  initInboundTurnLedger(true);
+  const ck = normalizeTitle(String(chatKey ?? "").trim());
+  const sid = String(stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(ck, sid);
+  if (!key) return { created: false, reason: "invalid_key" };
+  const existing = ledgerByKey.get(key);
+  if (!existing) return { created: false, reason: "missing_entry" };
+  const alertReason = String(reason ?? "outbound_manual_review").slice(0, 120);
+  const alertId = createHash("sha256")
+    .update(key, "utf8")
+    .update("\u0000", "utf8")
+    .update(alertReason, "utf8")
+    .digest("hex")
+    .slice(0, 24);
+  const prior = existing.manualReviewAlert;
+  if (
+    prior &&
+    typeof prior === "object" &&
+    String(prior.alertId ?? "") === alertId &&
+    String(prior.status ?? "") === "open"
+  ) {
+    return { created: false, reason: "already_open", alert: prior };
+  }
+  const alert = {
+    alertId,
+    status: "open",
+    reason: alertReason,
+    deliveryStatus: String(deliveryStatus ?? "manual_review_required").slice(0, 80),
+    guaranteeKey: existing.guaranteeKey ?? key,
+    chatKey: ck,
+    stableId: sid,
+    finalReplySource: existing.finalReplySource ?? null,
+    sourceKind: existing.sourceKind ?? null,
+    hasFinalReplyText: Boolean(String(existing.finalReplyText ?? "").trim()),
+    createdAt: Date.now(),
+  };
+  const next = upsertEntry(
+    key,
+    {
+      ...existing,
+      manualReviewAlert: alert,
+      deliveryStatus: alert.deliveryStatus,
+      autoRetryAllowed: false,
+      replySent: false,
+    },
+    true
+  );
+  console.warn("[outbound_manual_review_required]", {
+    alertId,
+    reason: alertReason,
+    deliveryStatus: alert.deliveryStatus,
+    guaranteeKey: alert.guaranteeKey,
+    sourceKind: alert.sourceKind,
+    hasFinalReplyText: alert.hasFinalReplyText,
+  });
+  return { created: true, reason: "created", alert: next.manualReviewAlert };
 }
 
 /**
@@ -935,16 +1109,25 @@ export function markOutboundLockedRecoverySent(p) {
   const key = buildInboundTurnLedgerKey(chatKey, stableId);
   if (!key) return;
   const existing = ledgerByKey.get(key);
+  const providerOutboundMessageId =
+    String(p.providerOutboundMessageId ?? existing?.providerOutboundMessageId ?? "")
+      .trim()
+      .slice(0, 300) || null;
   upsertEntry(key, {
     ...(existing || {}),
     chatKey,
     stableId,
     guaranteeKey:
       String(p.guaranteeKey ?? existing?.guaranteeKey ?? "").trim() || key,
-    outboundIntentStatus: "sent",
+    outboundIntentStatus: providerOutboundMessageId
+      ? "provider_accepted"
+      : "sent",
+    providerOutboundMessageId,
     recoveryClaimedAt: null,
     recoveryClaimOwner: null,
     deliveryStatus: "sent",
+    processingOwner: null,
+    autoRetryAllowed: false,
   }, force);
   if (force) {
     const now = Date.now();
@@ -1019,7 +1202,9 @@ export function getInboundTurnLedgerEntryByGuaranteeKey(guaranteeKey) {
 }
 
 function canonicalCloudPhone(value) {
-  const digits = String(value ?? "").replace(/\D/g, "");
+  const e164 = normalizePhoneE164(value);
+  if (!e164) return "";
+  const digits = e164.replace(/\D/g, "");
   return digits.length >= 10 && digits.length <= 15 ? digits : "";
 }
 
@@ -1077,6 +1262,7 @@ export function buildCloudInboundLifecycleIdentity({
 
 /**
  * Claim one Cloud post-confirm turn in the existing durable ledger.
+ * Live non-stale processing leases cannot be stolen by recovery or duplicates.
  */
 export function claimCloudInboundTurn({
   businessId,
@@ -1085,6 +1271,7 @@ export function claimCloudInboundTurn({
   recoveryContext,
   resumeProcessing = false,
   provisionalOwnership = false,
+  claimOwner = null,
 } = {}) {
   initInboundTurnLedger(true);
   const identity = buildCloudInboundLifecycleIdentity({
@@ -1120,23 +1307,31 @@ export function claimCloudInboundTurn({
       entry: existing,
     };
   }
-  if (existing?.state === "processing" && resumeProcessing !== true) {
+
+  const now = Date.now();
+  const owner = String(claimOwner ?? "").trim() || `cloud-claim:${randomUUID()}`;
+  if (existing?.state === "processing") {
     const started = Number(existing.processingAt ?? existing.updatedAt ?? 0);
-    if (
-      Number.isFinite(started) &&
-      Date.now() - started <= PROCESSING_STALE_MS
-    ) {
-      return {
-        claimed: false,
-        action: "processing",
-        reason: "recent_processing_duplicate",
-        identity,
-        entry: existing,
-      };
+    const leaseFresh =
+      Number.isFinite(started) && now - started <= PROCESSING_STALE_MS;
+    const existingOwner = String(existing.processingOwner ?? "").trim();
+    const sameOwner = Boolean(existingOwner) && existingOwner === owner;
+    if (leaseFresh) {
+      // Live lease: only the same owner may resume; recovery/duplicates must wait.
+      if (!(resumeProcessing === true && sameOwner)) {
+        return {
+          claimed: false,
+          action: "processing",
+          reason: sameOwner
+            ? "processing_lease_held"
+            : "processing_lease_held",
+          identity,
+          entry: existing,
+        };
+      }
     }
   }
 
-  const now = Date.now();
   const sourceKind =
     existing?.sourceKind === "cloud_post_confirm_pa"
       ? "cloud_post_confirm_pa"
@@ -1171,6 +1366,7 @@ export function claimCloudInboundTurn({
       sourceKind,
       receivedAt: Number(existing?.receivedAt ?? 0) || now,
       processingAt: now,
+      processingOwner: owner,
       nextRetryAt: null,
       textPreview: context.messageText.slice(0, 120),
       cloudRecoveryContext: context,
@@ -1186,6 +1382,7 @@ export function claimCloudInboundTurn({
         : "received_claimed",
     identity,
     entry: next,
+    claimOwner: owner,
   };
 }
 
@@ -1239,12 +1436,102 @@ export function markCloudInboundTurnRetryableFailure({
       state:
         existing.state === "outbound_locked" ? "outbound_locked" : "failed",
       processingAt: null,
+      processingOwner: null,
       retryCount,
       nextRetryAt: Date.now() + Math.max(250, Number(retryDelayMs) || 1000),
       lastError: String(lastError ?? "cloud_processing_failed").slice(0, 160),
     },
     true
   );
+}
+
+/**
+ * Mark uncertain in-flight delivery for manual review without claiming answered/done.
+ * Preserves finalReplyText on outbound_locked for operator recovery.
+ */
+export function markOutboundUncertainManualReview({
+  chatKey,
+  stableId,
+  reason = "send_in_flight_without_provider_receipt",
+  deliveryStatus = "uncertain_delivery_manual_review",
+} = {}) {
+  initInboundTurnLedger(true);
+  const ck = normalizeTitle(String(chatKey ?? "").trim());
+  const sid = String(stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(ck, sid);
+  if (!key) return null;
+  const existing = ledgerByKey.get(key);
+  if (!existing || existing.state === "done") return existing ?? null;
+  const next = upsertEntry(
+    key,
+    {
+      ...existing,
+      state: "outbound_locked",
+      outboundIntentStatus:
+        String(existing.outboundIntentStatus ?? "").trim() === "send_attempted"
+          ? "send_in_flight"
+          : String(existing.outboundIntentStatus ?? "").trim() || "send_in_flight",
+      autoRetryAllowed: false,
+      replySent: false,
+      recoveryClaimedAt: null,
+      recoveryClaimOwner: null,
+      nextRetryAt: null,
+      deliveryStatus: String(deliveryStatus).slice(0, 80),
+      lastError: String(reason).slice(0, 160),
+    },
+    true
+  );
+  ensureOutboundManualReviewAlert({
+    chatKey: ck,
+    stableId: sid,
+    reason,
+    deliveryStatus,
+  });
+  return getInboundTurnLedgerEntry(ck, sid, { force: true }) || next;
+}
+
+/**
+ * Terminal technical failure for corrupted outbound_locked rows (no reply text)
+ * or unrecoverable technical windows. Does not re-run OpenAI/actions.
+ * Does not mark the customer as answered (replySent=false, state=failed).
+ */
+export function markCloudInboundTurnTerminalTechnicalFailure({
+  identity,
+  lastError,
+  deliveryStatus = "technical_failure",
+} = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return null;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  if (!existing || existing.state === "done") {
+    return existing ?? null;
+  }
+  const next = upsertEntry(
+    key,
+    {
+      ...existing,
+      state: "failed",
+      autoRetryAllowed: false,
+      replySent: false,
+      processingAt: null,
+      processingOwner: null,
+      recoveryClaimedAt: null,
+      recoveryClaimOwner: null,
+      nextRetryAt: null,
+      deliveryStatus: String(deliveryStatus ?? "technical_failure").slice(0, 80),
+      lastError: String(lastError ?? "cloud_technical_failure").slice(0, 160),
+    },
+    true
+  );
+  ensureOutboundManualReviewAlert({
+    chatKey,
+    stableId,
+    reason: String(lastError ?? "cloud_technical_failure").slice(0, 120),
+    deliveryStatus,
+  });
+  return next;
 }
 
 export function markCloudInboundTurnDone({
@@ -1316,11 +1603,22 @@ export function listRecoverableCloudInboundTurns({
         entry?.sourceKind === "cloud_dm_ownership_probe"
     )
     .filter((entry) => entry.state !== "done")
-    .filter(
-      (entry) =>
-        entry.state === "outbound_locked" ||
-        Number(entry.retryCount ?? 0) < max
-    )
+    .filter((entry) => {
+      if (entry.state === "outbound_locked") {
+        // Classify decides resume vs uncertain; do not drop pending_send because
+        // outbound_locked defaults autoRetryAllowed=false for Playwright semantics.
+        return true;
+      }
+      if (entry.autoRetryAllowed === false) return false;
+      if (entry.state === "processing") {
+        const started = Number(entry.processingAt ?? entry.updatedAt ?? 0);
+        return (
+          !Number.isFinite(started) ||
+          Date.now() - started > PROCESSING_STALE_MS
+        );
+      }
+      return Number(entry.retryCount ?? 0) < max;
+    })
     .map((entry) => ({ ...entry }));
 }
 

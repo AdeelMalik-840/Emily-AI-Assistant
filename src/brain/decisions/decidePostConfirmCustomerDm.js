@@ -201,40 +201,13 @@ export function isNearEchoReply(userMessage, reply) {
   return false;
 }
 
-function isSocialOrClosingAct(conversationAct, customerIntent, situation) {
-  if (
-    conversationAct === "acknowledgement" ||
-    conversationAct === "thanks" ||
-    conversationAct === "chit_chat"
-  ) {
-    return true;
-  }
-  if (
-    customerIntent === "ack" ||
-    customerIntent === "farewell" ||
-    customerIntent === "thanks" ||
-    customerIntent === "social_challenge" ||
-    customerIntent === "decline_more_help"
-  ) {
-    return true;
-  }
-  if (
-    situation === "conversation_closing" ||
-    situation === "social_repair" ||
-    situation === "decline_more_help" ||
-    situation === "acknowledgement_after_answer"
-  ) {
-    return true;
-  }
-  return false;
-}
 
 /**
- * Apply silence / anti-echo hardening to a decision (generic, not phrase maps).
+ * Normalize model-declared silence only. Never blank a non-empty OpenAI reply.
  * @param {Record<string, unknown>} decision
- * @param {string} userMessage
+ * @param {string} [_userMessage]
  */
-export function applyPostConfirmAntiEchoAndSilence(decision, userMessage) {
+export function applyPostConfirmAntiEchoAndSilence(decision, _userMessage) {
   const next = { ...(decision && typeof decision === "object" ? decision : {}) };
   let action = cleanAction(next.action);
   let conversationAct = cleanAct(next.conversationAct);
@@ -248,23 +221,12 @@ export function applyPostConfirmAntiEchoAndSilence(decision, userMessage) {
         ? true
         : action !== "silence" && action !== "none";
 
+  // Model-declared silence only — never invent silence from echo heuristics.
   if (action === "silence" || shouldReply === false) {
     action = "silence";
     shouldReply = false;
     customerReply = "";
-  }
-
-  if (
-    customerReply &&
-    isSocialOrClosingAct(conversationAct, customerIntent, situation) &&
-    isNearEchoReply(userMessage, customerReply)
-  ) {
-    customerReply = "";
-    action = "silence";
-    shouldReply = false;
-  }
-
-  if (action === "none" && !customerReply) {
+  } else if (action === "none" && !customerReply) {
     action = "silence";
     shouldReply = false;
   }
@@ -278,6 +240,19 @@ export function applyPostConfirmAntiEchoAndSilence(decision, userMessage) {
     action,
     shouldReply,
   };
+}
+
+/**
+ * Near-echo is a contract violation (regen), not deterministic silence.
+ * @param {string} userMessage
+ * @param {string} reply
+ * @param {Record<string, unknown>} decision
+ */
+export function isPostConfirmNearEchoViolation(userMessage, reply, decision) {
+  const text = cleanCustomerReply(reply);
+  if (!text) return false;
+  if (cleanAction(decision?.action) === "silence") return false;
+  return isNearEchoReply(userMessage, text);
 }
 
 function compactOpenMissingInfo(rows) {
@@ -1053,6 +1028,16 @@ STRICT SAFETY:
         finalized.mutationIntent = "none";
       }
       const replyText = cleanCustomerReply(finalized?.customerReply);
+      if (isPostConfirmNearEchoViolation(userLine, replyText, finalized)) {
+        lastReason = "near_echo_reply";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: lastReason,
+        };
+      }
       const replyRequired =
         hasAmbiguousBookings ||
         finalized.conversationAct === "information_request" ||
@@ -1074,6 +1059,11 @@ STRICT SAFETY:
             pendingAvailabilityExecutionStatus:
               clean(facts?.pendingAvailabilityExecution?.status, 60) ||
               "not_executed",
+            mutationIntent: finalized.mutationIntent ?? "none",
+            mutationExecutionRequested:
+              finalized.mutationExecutionRequested === true,
+            mutationExecutionStatus:
+              finalized.mutationExecutionStatus ?? "not_executed",
           },
           replyRequired:
             replyRequired ||
@@ -1149,7 +1139,7 @@ export async function decidePostConfirmCustomerDm(p = {}) {
     latestClosedMissingInfoAnswers: facts.latestClosedMissingInfoAnswers ?? null,
     ownershipLane: "post_confirm_pa",
     safetyPolicy: facts.policy ?? null,
-    allowedExecutors: ["whatsapp_cloud_dm", "pa_missing_info_escalate"],
+    allowedExecutors: ["whatsapp_cloud_dm"],
     facts,
     styleKey: p.styleKey,
     timeoutMs: p.timeoutMs,

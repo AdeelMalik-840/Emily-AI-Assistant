@@ -326,9 +326,13 @@ test("7: truly uncertain send — no blind duplicate send", async () => {
 
   assert.equal(result.recovered, false);
   assert.equal(result.action, "uncertain_fail_closed");
-  assert.equal(result.reason, "send_attempted_without_echo");
+  assert.equal(result.reason, "send_in_flight_without_provider_receipt");
   assert.equal(sendCalls.length, 0);
   assert.equal(getInboundTurnLedgerEntry(CHAT, stableId)?.state, "outbound_locked");
+  assert.equal(
+    getInboundTurnLedgerEntry(CHAT, stableId)?.manualReviewAlert?.status,
+    "open"
+  );
 });
 
 test("claim helper: second claim while first is live is rejected", () => {

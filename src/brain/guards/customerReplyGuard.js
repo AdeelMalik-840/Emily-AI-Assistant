@@ -35,9 +35,51 @@ const CHECKING_LANGUAGE_RE =
 const BOOKING_SUCCESS_CLAIM_RE =
   /\b(booking (has been |is )?created|booking (has been |is )?confirm(ed)?|successfully booked|booked successfully|reservation (has been |is )?created|reservation (has been |is )?confirm(ed)?|reservation completed|appointment (has been |is )?confirm(ed)?|order (has been |is )?created|confirm ho gaya|book ho gaya|booking ho gayi|booking confirm(ed)?|book confirm(ed)?|your booking is confirm(ed)?)\b/i;
 
-/** Completion wording for a booking change; guard-only, never intent routing. */
+/**
+ * Completion wording for a booking *change* (mutation), not status facts.
+ * Guard-only; never intent routing; never rewrites customer wording.
+ */
 const BOOKING_MUTATION_SUCCESS_CLAIM_RE =
-  /\b(booking|reservation|date|dates|duration|item|vehicle|car|pickup|pick[- ]?up|delivery)\b.{0,48}\b(has been|have been|is|was|were|successfully|ho gaya|ho gayi|kar di|kar diya)\b.{0,32}\b(cancelled|canceled|extended|changed|updated|rescheduled|modified|cancel|extend|change|update)\b|\b(cancelled|canceled|extended|changed|updated|rescheduled|modified)\b.{0,48}\b(booking|reservation|date|dates|duration|item|vehicle|car|pickup|pick[- ]?up|delivery)\b/iu;
+  /\b(booking|reservation)\b.{0,48}\b(has been|have been|was|were|successfully)\b.{0,24}\b(cancelled|canceled|extended|changed|updated|rescheduled|modified|replaced)\b|\b(booking|reservation)\b.{0,40}\b(cancel|cancelled|canceled|extend|extended|update|updated|change|changed|modify|modified|replace|replaced)\b.{0,32}\b(ho gaya|ho gayi|ho chuka|ho chuki|kar di|kar diya|kar diye|complete|completed)\b|\b(cancel|cancelled|canceled)\b.{0,32}\b(complete|completed|ho gayi|ho gaya|ho chuki|ho chuka|kar di|kar diya)\b|\b(extend|extension)\b.{0,32}\b(ho gaya|ho gayi|ho chuka|kar diya|kar di|complete|completed)\b|\b(\d+\s*din|do\s*din|\d+\s*day)\b.{0,40}\b(aur\s+)?(add|extend|barha|badha)\b.{0,32}\b(kar di|kar diye|kar diya|ho gaye|ho gaya|ho gayi|hain)\b|\b(dates?|date)\b.{0,40}\b(change|changed|update|updated|move|moved|shift|shifted|modify|modified)\b.{0,32}\b(ho chuki|ho chuka|ho gayi|ho gaya|kar di|kar diya|kar di gayi|hain)\b|\b(pickup|pick[- ]?up|delivery)\b.{0,40}\b(move|moved|shift|shifted|change|changed|complete|completed)\b.{0,32}\b(kar di|kar diya|ho gaya|ho gayi|hai)?|\b(duration|din)\b.{0,40}\b(barha|badha|extend|extended)\b.{0,32}\b(di hai|di gayi|diya|kar di|kar diya|ho gaya)\b|\b(gaari|gari|item|vehicle|car)\b.{0,40}\b(change|changed|replace|replaced)\b.{0,32}\b(kar di|kar diya|ho gayi|ho gaya)\b|\beverything\b.{0,40}\b(has been|have been|is|was)?\s*(updated|changed|completed|done|applied)\b|\b(change|request|booking\s+update|update)\b.{0,40}\b(has been|have been)?\s*(updated|completed|done|applied|complete)\b|\b(change apply ho gaya|request complete ho gayi|booking update ho chuki|pickup shift complete|car replace ho gayi|dates modify kar di)\b|\bi (have|ve|'ve)\s+(cancelled|canceled|extended|changed|updated|moved|rescheduled|replaced)\b|\b(maine|main ne)\b.{0,48}\b(cancel|extend|change|move|barha|badha|replace|update|modify)\b.{0,24}\b(kar di|kar diya|kar diye|hai)?/iu;
+
+/** Negated / incomplete change wording must not trip the mutation guard. */
+const MUTATION_COMPLETION_NEGATED_RE =
+  /\b(nahi|nahin|not yet|not been|hasn't|haven't|has not|have not|did not|incomplete|pending)\b|\babhi\s+(tak\s+)?(complete\s+)?nahi\b|\b(complete|completed|done|updated|changed)\s+nahi\b|\bnahi\s+(hua|hui|huya|complete|completed|done)\b/i;
+
+/**
+ * True when reply asserts a booking/reservation change completed.
+ * Independent of model-declared mutationIntent (guard-only).
+ * @param {string} text
+ */
+function looksLikeUnverifiedBookingMutationCompletion(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return false;
+  if (MUTATION_COMPLETION_NEGATED_RE.test(raw)) return false;
+  if (BOOKING_MUTATION_SUCCESS_CLAIM_RE.test(raw)) return true;
+  const lower = raw.toLowerCase();
+  // Require a mutation *action* word — not mere status nouns like "booking".
+  const hasMutationAction =
+    /\b(cancel|cancelled|canceled|extend|extended|extension|reschedule|rescheduled|modify|modified|replace|replaced|shift|shifted|apply|applied|barha|badha|update|updated|change|changed)\b/i.test(
+      raw
+    );
+  const hasSuccessAssert =
+    /\b(done|complete|completed|successfully|success|ho gaya|ho gayi|ho chuka|ho chuki|ho gaye|kar di|kar diya|kar diye|kar di gayi|apply ho gaya|applied|updated|modified|replaced|add ho gaye|add kar diye)\b/i.test(
+      raw
+    );
+  if (hasMutationAction && hasSuccessAssert) return true;
+  if (
+    /\beverything\b.{0,24}\b(updated|changed|done|complete)/i.test(lower) ||
+    /\b(request|change)\b.{0,32}\b(complete|completed|done|updated|applied)\b/i.test(
+      lower
+    ) ||
+    /\bbooking\s+update\b.{0,24}\b(ho chuki|ho chuka|complete|completed|done)\b/i.test(
+      lower
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
 
 const ROMAN_URDU_REPLY_CUE =
   /\b(hai|hain|kya|ke|ki|ka|liye|bata|batata|bataunga|bataungi|batati|karo|kar|karke|karunga|karungi|nahi|haan|abhi|kitna|chahiye|din|theek|leta|raha|rahi|hun|houn|hoon|mein|mai|gaya|gayi|gyi|hua|hui|ho|tha|thi|hoga|hogi|dena|ji|galat)\b/i;
@@ -726,9 +768,10 @@ export function validateCustomerReplyAgainstContract(
   )
     .trim()
     .toLowerCase();
+  // Do not trust model-declared mutationIntent alone — scan reply text.
   if (
     mutationExecutionStatus !== "succeeded" &&
-    BOOKING_MUTATION_SUCCESS_CLAIM_RE.test(text)
+    looksLikeUnverifiedBookingMutationCompletion(text)
   ) {
     return { ok: false, reason: "unverified_booking_mutation_success_claim" };
   }

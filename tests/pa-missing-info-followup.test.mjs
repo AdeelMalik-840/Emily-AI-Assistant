@@ -12,8 +12,16 @@ const { resolveActiveCustomerBookingFacts } = await import(
 );
 const {
   handleCustomerBusinessPaInbound,
-  classifyCustomerBusinessPaActionIntent,
 } = await import("../src/services/customerBusinessPaAgentService.js");
+
+/** Local test helper only — production no longer keyword-routes post-booking intent. */
+function classifyCustomerBusinessPaActionIntent(messageText) {
+  const text = String(messageText ?? "").trim();
+  return {
+    isAction: false,
+    reason: text ? "openai_owns_post_booking_intent" : "empty",
+  };
+}
 const {
   findOpenPaMissingInfoRequest,
   isPaMissingInfoFactMissing,
@@ -335,6 +343,9 @@ function seedActiveContext(fake, opts = {}) {
       if (resolved.facts.business) {
         resolved.facts.business.advanceAmount = opts.advanceAmount;
       }
+      if (resolved.facts.replyGuardFacts) {
+        resolved.facts.replyGuardFacts.advanceAmount = opts.advanceAmount;
+      }
     }
     return resolved;
   };
@@ -391,7 +402,7 @@ test("acknowledgement cannot escalate even if malformed model implies follow-up"
   assert.equal(parsed.situation, "acknowledgement_after_answer");
 });
 
-test("missing advance with missing-info flag ON creates one request and notifies owner", async () => {
+test("missing advance with missing-info flag ON does not create request or notify owner", async () => {
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
   const ownerSends = [];
@@ -414,7 +425,7 @@ test("missing advance with missing-info flag ON creates one request and notifies
       },
       __resolveActiveCustomerBookingFactsFn: resolveFacts,
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Advance confirm karke batata hoon.",
+        customerReply: "Advance abhi confirm nahi hai.",
         needsFollowup: true,
         missingInfoType: "advance",
       }),
@@ -422,35 +433,20 @@ test("missing advance with missing-info flag ON creates one request and notifies
 
     assert.equal(result.handled, true);
     assert.equal(result.openaiUsed, true);
-    assert.equal(result.reply, "Advance confirm karke batata hoon.");
-    assert.equal(result.missingInfoEscalated, true);
-    assert.ok(result.missingInfoRequestId);
-    assert.equal(result.missingInfoType, "advance");
-    assert.equal(result.ownerNotifyStatus, "sent");
-    assert.equal(customerSends.length, 1);
-    assert.equal(ownerSends.length, 1);
-    assert.match(ownerSends[0].text, /missing info \(advance\)/i);
-    assert.match(ownerSends[0].text, /Advance kitna dena hoga/);
-    assert.match(ownerSends[0].text, new RegExp(result.missingInfoRequestId));
-
-    const rows = fake.listMissingInfo(BUSINESS_ID);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].status, "owner_notified");
-    assert.equal(rows[0].ownerNotifyStatus, "sent");
-    assert.equal(rows[0].bookingId, BOOKING_ID);
+    assert.equal(result.reply, "Advance abhi confirm nahi hai.");
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(result.missingInfoRequestId, null);
+    assert.equal(result.missingInfoType, null);
+    assert.equal(result.ownerNotifyStatus, null);
+    // Buffer owns WhatsApp send; PA prepares reply only.
+    assert.equal(customerSends.length, 0);
+    assert.equal(ownerSends.length, 0);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
     assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
-    assert.equal(
-      fake.getBooking(BUSINESS_ID, BOOKING_ID).approvalStage,
-      "owner_approved_waiting_customer_details"
-    );
-    assert.equal(
-      fake.getAvr(BUSINESS_ID, AVR_ID).customerConfirmationStatus,
-      "confirmed"
-    );
   });
 });
 
-test("duplicate missing advance does not create a second request", async () => {
+test("duplicate missing advance still creates no missing-info records", async () => {
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
   let ownerNotifyCalls = 0;
@@ -463,7 +459,7 @@ test("duplicate missing advance does not create a second request", async () => {
       messageText: "Advance kitna?",
       __resolveActiveCustomerBookingFactsFn: resolveFacts,
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Advance abhi confirm nahi — check karke batata hoon.",
+        customerReply: "Advance abhi confirm nahi hai.",
         needsFollowup: true,
         missingInfoType: "advance",
         situation: "new_question",
@@ -483,20 +479,12 @@ test("duplicate missing advance does not create a second request", async () => {
       messageId: "wamid.b",
     });
 
-    assert.equal(first.missingInfoEscalated, true);
+    assert.equal(first.missingInfoEscalated, false);
     assert.equal(second.missingInfoEscalated, false);
-    // Second turn sees open request in Brain facts → pending; no new ledger row / notify.
-    assert.equal(second.situation, "pending_owner_answer");
-    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
-    assert.equal(ownerNotifyCalls, 1);
-
-    const open = await findOpenPaMissingInfoRequest({
-      db: fake.db,
-      businessId: BUSINESS_ID,
-      bookingId: BOOKING_ID,
-      missingInfoType: "advance",
-    });
-    assert.ok(open);
+    assert.equal(first.reply, "Advance abhi confirm nahi hai.");
+    assert.equal(second.reply, "Advance abhi confirm nahi hai.");
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
+    assert.equal(ownerNotifyCalls, 0);
   });
 });
 
@@ -559,19 +547,21 @@ test("known advance does not escalate", async () => {
     });
 
     assert.equal(result.handled, true);
+    assert.equal(result.openaiUsed, true);
+    assert.equal(result.reply, "Advance 5,000 PKR hai.");
     assert.equal(result.missingInfoEscalated, false);
     assert.equal(createCalled, false);
     assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
   });
 });
 
-test("action intent kar do does not escalate or call OpenAI", async () => {
+test("action intent kar do reaches OpenAI and does not escalate", async () => {
   const fake = createFakeDb();
-  fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
+  const resolveFacts = seedActiveContext(fake);
   let openaiCalls = 0;
   let createCalled = false;
 
-  assert.equal(classifyCustomerBusinessPaActionIntent("kar do").isAction, true);
+  assert.equal(classifyCustomerBusinessPaActionIntent("kar do").isAction, false);
 
   await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
@@ -579,29 +569,48 @@ test("action intent kar do does not escalate or call OpenAI", async () => {
       businessId: BUSINESS_ID,
       customerPhone: CUSTOMER_PHONE,
       messageText: "kar do",
-      sendWhatsAppMessageFn: async () => {
-        throw new Error("should not send");
-      },
-      __resolveActiveCustomerBookingFactsFn: async (p) =>
-        resolveActiveCustomerBookingFacts({
-          ...p,
-          getBusinessProfileFn: async () => ({}),
-        }),
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
       __createOrGetOpenPaMissingInfoRequestFn: async () => {
         createCalled = true;
         return { ok: false };
       },
       __chatCompletionsCreateForTests: async () => {
         openaiCalls += 1;
-        return { choices: [{ message: { content: "{}" } }] };
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  situation: "unclear",
+                  conversationAct: "action_request",
+                  customerIntent: "ask_action",
+                  customerIsAskingQuestion: false,
+                  requestedInfoType: null,
+                  shouldReply: true,
+                  customerReply: "Kaunsi detail update karni hai?",
+                  action: "reply",
+                  mutationIntent: "none",
+                  replySemantics: {
+                    claims: [],
+                    languageStyle: "roman_urdu",
+                    containsTimingPromise: false,
+                    exposesInternalProcess: false,
+                  },
+                }),
+              },
+            },
+          ],
+        };
       },
     });
 
-    assert.equal(result.handled, false);
-    assert.equal(result.reason, "ACTION_INTENT");
-    assert.equal(openaiCalls, 0);
+    assert.equal(result.handled, true);
+    assert.equal(openaiCalls, 1);
+    assert.equal(result.openaiUsed, true);
+    assert.equal(result.missingInfoEscalated, false);
     assert.equal(createCalled, false);
-    assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
+    assert.equal(result.reply, "Kaunsi detail update karni hai?");
   });
 });
 
@@ -725,7 +734,7 @@ test("delivery question does not escalate when deliveryPolicy exists", async () 
   });
 });
 
-test("advance still escalates when no advanceAmount/advancePolicy", async () => {
+test("unknown advance answers naturally without escalate when no advanceAmount/advancePolicy", async () => {
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake, {
     profile: {
@@ -751,16 +760,19 @@ test("advance still escalates when no advanceAmount/advancePolicy", async () => 
       },
       __resolveActiveCustomerBookingFactsFn: resolveFacts,
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Advance confirm karke batata hoon.",
+        customerReply: "Advance abhi confirm nahi hai.",
         needsFollowup: true,
         missingInfoType: "advance",
       }),
     });
 
-    assert.equal(result.missingInfoEscalated, true);
-    assert.equal(result.missingInfoType, "advance");
-    assert.equal(ownerSends.length, 1);
-    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+    assert.equal(result.handled, true);
+    assert.equal(result.openaiUsed, true);
+    assert.equal(result.reply, "Advance abhi confirm nahi hai.");
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(result.missingInfoType, null);
+    assert.equal(ownerSends.length, 0);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
   });
 });
 
@@ -1078,7 +1090,7 @@ test("thanks after customerFollowupText exists → no escalation", async () => {
   });
 });
 
-test("ok driver milega? → new_question information_request can escalate", async () => {
+test("ok driver milega? → OpenAI answers without missing-info escalate", async () => {
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
   const ownerSends = [];
@@ -1097,7 +1109,7 @@ test("ok driver milega? → new_question information_request can escalate", asyn
       },
       __resolveActiveCustomerBookingFactsFn: resolveFacts,
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Driver confirm karke batata hoon.",
+        customerReply: "Driver detail abhi confirm nahi hai.",
         conversationAct: "information_request",
         customerIsAskingQuestion: true,
         missingInfoType: "driver",
@@ -1109,10 +1121,11 @@ test("ok driver milega? → new_question information_request can escalate", asyn
 
     assert.equal(result.situation, "new_question");
     assert.equal(result.conversationAct, "information_request");
-    assert.equal(result.missingInfoEscalated, true);
-    assert.equal(result.missingInfoType, "driver");
-    assert.equal(ownerSends.length, 1);
-    assert.match(ownerSends[0], /pamiss_/);
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(result.missingInfoType, null);
+    assert.equal(result.reply, "Driver detail abhi confirm nahi hai.");
+    assert.equal(ownerSends.length, 0);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
   });
 });
 
@@ -1235,7 +1248,7 @@ test("same missing type while request open → no duplicate request", async () =
         return { ok: false };
       },
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Abhi confirm kar raha hun.",
+        customerReply: "Advance ki detail abhi available nahi.",
         conversationAct: "information_request",
         customerIsAskingQuestion: true,
         needsFollowup: true,
@@ -1248,12 +1261,13 @@ test("same missing type while request open → no duplicate request", async () =
     assert.equal(result.missingInfoEscalated, false);
     assert.equal(createCalled, false);
     assert.equal(ownerNotifyCalls, 0);
-    assert.equal(result.situation, "pending_owner_answer");
+    assert.equal(result.reply, "Advance ki detail abhi available nahi.");
+    // Existing open pamiss row is left untouched; post-booking path does not escalate.
     assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
   });
 });
 
-test("new missing advance with no open/closed answer → escalate still works", async () => {
+test("new missing advance with no open/closed answer → no escalate side effects", async () => {
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
   let ownerNotifyCalls = 0;
@@ -1270,7 +1284,7 @@ test("new missing advance with no open/closed answer → escalate still works", 
       },
       __resolveActiveCustomerBookingFactsFn: resolveFacts,
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Advance confirm karke batata hoon.",
+        customerReply: "Advance abhi confirm nahi hai.",
         needsFollowup: true,
         missingInfoType: "advance",
         situation: "new_question",
@@ -1278,9 +1292,10 @@ test("new missing advance with no open/closed answer → escalate still works", 
     });
 
     assert.equal(result.situation, "new_question");
-    assert.equal(result.missingInfoEscalated, true);
-    assert.equal(ownerNotifyCalls, 1);
-    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(result.reply, "Advance abhi confirm nahi hai.");
+    assert.equal(ownerNotifyCalls, 0);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
   });
 });
 
@@ -1403,29 +1418,18 @@ test("no PA knowledge store and decision under brain/decisions", async () => {
   assert.equal(typeof agent.PA_TOPIC_REPLY_MAP, "undefined");
 });
 
-test("bare no/nahi is not protected ACTION_INTENT (reaches Brain)", () => {
-  for (const msg of ["no", "No", "nahi", "nahin", "nope"]) {
+test("bare no/nahi is not keyword-routed away from OpenAI Brain", () => {
+  for (const msg of ["no", "No", "nahi", "nahin", "nope", "cancel booking", "book kar do", "confirm kar do"]) {
     const r = classifyCustomerBusinessPaActionIntent(msg);
     assert.equal(r.isAction, false, msg);
   }
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("cancel booking").isAction,
-    true
-  );
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("book kar do").isAction,
-    true
-  );
-  assert.equal(
-    classifyCustomerBusinessPaActionIntent("confirm kar do").isAction,
-    true
-  );
 });
 
-test("anti-echo: Have a good day is not mirrored exactly", async () => {
+test("anti-echo: Have a good day near-echo is rejected for regen, not blanked", async () => {
   const {
     parsePostConfirmCustomerDmDecision,
     isNearEchoReply,
+    isPostConfirmNearEchoViolation,
   } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
   assert.equal(isNearEchoReply("Have a good day", "Have a good day"), true);
   const parsed = parsePostConfirmCustomerDmDecision(
@@ -1437,55 +1441,67 @@ test("anti-echo: Have a good day is not mirrored exactly", async () => {
       shouldReply: true,
       customerReply: "Have a good day",
       action: "reply",
+      mutationIntent: "none",
     }),
     { userMessage: "Have a good day" }
   );
-  assert.notEqual(
-    String(parsed.customerReply || "").toLowerCase().trim(),
-    "have a good day"
-  );
-  assert.ok(
-    parsed.action === "silence" ||
-      (parsed.shouldReply === false && !parsed.customerReply) ||
-      (parsed.customerReply &&
-        !isNearEchoReply("Have a good day", parsed.customerReply))
+  // Deterministic parse must not blank OpenAI text.
+  assert.equal(String(parsed.customerReply || "").trim(), "Have a good day");
+  assert.equal(
+    isPostConfirmNearEchoViolation("Have a good day", parsed.customerReply, parsed),
+    true
   );
 
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
-  let sends = [];
-  const memory = [];
+  let openaiCalls = 0;
   await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
       customerPhone: CUSTOMER_PHONE,
       messageText: "Have a good day",
-      sendWhatsAppMessageFn: async (to, text) => {
-        sends.push(text);
-        return { ok: true };
-      },
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
       __resolveActiveCustomerBookingFactsFn: resolveFacts,
-      __appendConversationMessageFn: async (_db, p) => {
-        memory.push(p);
+      __chatCompletionsCreateForTests: async () => {
+        openaiCalls += 1;
+        const reply =
+          openaiCalls === 1 ? "Have a good day" : "Khuda hafiz, take care.";
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  situation: "conversation_closing",
+                  conversationAct: "chit_chat",
+                  customerIntent: "farewell",
+                  customerIsAskingQuestion: false,
+                  requestedInfoType: null,
+                  shouldReply: true,
+                  customerReply: reply,
+                  action: "reply",
+                  mutationIntent: "none",
+                  replySemantics: {
+                    claims: [],
+                    languageStyle: "english",
+                    containsTimingPromise: false,
+                    exposesInternalProcess: false,
+                  },
+                }),
+              },
+            },
+          ],
+        };
       },
-      __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Have a good day",
-        conversationAct: "chit_chat",
-        customerIntent: "farewell",
-        situation: "conversation_closing",
-        action: "reply",
-      }),
     });
     assert.equal(result.handled, true);
+    assert.equal(openaiCalls, 2);
+    assert.equal(result.reply, "Khuda hafiz, take care.");
     assert.equal(result.missingInfoEscalated, false);
-    for (const s of sends) {
-      assert.notEqual(String(s).toLowerCase().trim(), "have a good day");
-    }
   });
 });
 
-test("anti-echo: you too is not mirrored exactly", async () => {
+test("anti-echo: you too near-echo regenerates instead of deterministic silence", async () => {
   const { parsePostConfirmCustomerDmDecision, isNearEchoReply } = await import(
     "../src/brain/decisions/decidePostConfirmCustomerDm.js"
   );
@@ -1497,39 +1513,58 @@ test("anti-echo: you too is not mirrored exactly", async () => {
       customerIsAskingQuestion: false,
       customerReply: "you too",
       action: "reply",
+      mutationIntent: "none",
     }),
     { userMessage: "you too" }
   );
-  assert.equal(isNearEchoReply("you too", parsed.customerReply || ""), false);
-  assert.ok(parsed.action === "silence" || parsed.shouldReply === false);
+  assert.equal(String(parsed.customerReply || "").trim(), "you too");
+  assert.equal(isNearEchoReply("you too", parsed.customerReply || ""), true);
 
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
-  let sends = 0;
+  let openaiCalls = 0;
   await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handleCustomerBusinessPaInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
       customerPhone: CUSTOMER_PHONE,
       messageText: "you too",
-      sendWhatsAppMessageFn: async () => {
-        sends += 1;
-        return { ok: true };
-      },
+      sendWhatsAppMessageFn: async () => ({ ok: true }),
       __resolveActiveCustomerBookingFactsFn: resolveFacts,
       __appendConversationMessageFn: async () => {},
-      __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "you too",
-        conversationAct: "chit_chat",
-        customerIntent: "farewell",
-        situation: "conversation_closing",
-        action: "reply",
-      }),
+      __chatCompletionsCreateForTests: async () => {
+        openaiCalls += 1;
+        const reply = openaiCalls === 1 ? "you too" : "Take care!";
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  situation: "conversation_closing",
+                  conversationAct: "chit_chat",
+                  customerIntent: "farewell",
+                  customerIsAskingQuestion: false,
+                  requestedInfoType: null,
+                  shouldReply: true,
+                  customerReply: reply,
+                  action: "reply",
+                  mutationIntent: "none",
+                  replySemantics: {
+                    claims: [],
+                    languageStyle: "english",
+                    containsTimingPromise: false,
+                    exposesInternalProcess: false,
+                  },
+                }),
+              },
+            },
+          ],
+        };
+      },
     });
     assert.equal(result.handled, true);
-    assert.equal(result.sentReply, false);
-    assert.equal(sends, 0);
-    assert.equal(result.decisionAction, "silence");
+    assert.equal(openaiCalls, 2);
+    assert.equal(result.reply, "Take care!");
   });
 });
 
@@ -1563,9 +1598,10 @@ test("why are you copying me → social repair, not clarification", async () => 
     assert.equal(result.handled, true);
     assert.equal(result.situation, "social_repair");
     assert.equal(result.missingInfoEscalated, false);
-    assert.equal(sends.length, 1);
-    assert.doesNotMatch(sends[0], /Main samajh nahi paaya/i);
-    assert.doesNotMatch(sends[0], /availability, price, ya booking/i);
+    assert.equal(result.reply, "Sorry about that — that was a mistake.");
+    assert.doesNotMatch(result.reply, /Main samajh nahi paaya/i);
+    assert.doesNotMatch(result.reply, /availability, price, ya booking/i);
+    assert.equal(sends.length, 0);
     assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
   });
 });
@@ -1649,7 +1685,7 @@ test("silence action sends nothing but still handled", async () => {
   });
 });
 
-test("PA reply is appended to conversation memory", async () => {
+test("PA reply is prepared for buffer delivery without local memory write", async () => {
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
   const memory = [];
@@ -1665,18 +1701,18 @@ test("PA reply is appended to conversation memory", async () => {
         memory.push(p);
       },
       __chatCompletionsCreateForTests: jsonAiReply({
-        customerReply: "Advance 5000 PKR dena hoga.",
+        customerReply: "Advance abhi confirm nahi hai.",
         conversationAct: "information_request",
         customerIntent: "ask_fact",
-        situation: "repeat_question_answered",
+        situation: "new_question",
         action: "reply",
       }),
     });
     assert.equal(result.handled, true);
-    assert.equal(result.sentReply, true);
-    assert.equal(memory.length, 1);
-    assert.equal(memory[0].role, "assistant");
-    assert.equal(memory[0].text, "Advance 5000 PKR dena hoga.");
-    assert.equal(memory[0].ownerUserId, BUSINESS_ID);
+    assert.equal(result.openaiUsed, true);
+    assert.equal(result.reply, "Advance abhi confirm nahi hai.");
+    assert.equal(result.sentReply, false);
+    // Conversation memory append is owned by the Cloud buffer send path.
+    assert.equal(memory.length, 0);
   });
 });

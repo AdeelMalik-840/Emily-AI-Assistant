@@ -382,6 +382,16 @@ test("unverified booking mutations cannot be claimed complete", async () => {
     ["change_dates", "Booking dates have been changed."],
     ["change_duration", "Booking duration has been changed."],
     ["change_item", "Booking vehicle has been changed."],
+    ["cancel_booking", "Cancel complete hai"],
+    ["extend_booking", "Do din aur add ho gaye hain"],
+    ["change_duration", "Duration barha di gayi hai"],
+    ["change_item", "Everything has been updated"],
+    ["cancel_booking", "Request complete ho gayi hai"],
+    ["change_dates", "Change apply ho gaya hai"],
+    ["change_dates", "Booking update ho chuki hai"],
+    ["change_pickup", "Pickup shift complete hai"],
+    ["change_item", "Car replace ho gayi hai"],
+    ["change_dates", "Dates modify kar di gayi hain"],
   ];
   for (const [mutationIntent, falseCompletion] of cases) {
     const counters = {};

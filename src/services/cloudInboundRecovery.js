@@ -10,7 +10,10 @@ import {
   classifyOutboundLockedRecovery,
   listRecoverableCloudInboundTurns,
   markCloudInboundTurnRetryableFailure,
+  markCloudInboundTurnTerminalTechnicalFailure,
   markOutboundLockedRecoverySent,
+  markOutboundSendInFlight,
+  markOutboundUncertainManualReview,
   releaseOutboundLockedRecoveryClaim,
 } from "./inboundTurnLedger.js";
 import { appendConversationMessage } from "./conversationStore.js";
@@ -32,6 +35,71 @@ export async function tryRecoverCloudOutboundLockedTurn({
   __appendConversationMessageFn = appendConversationMessage,
 } = {}) {
   const classified = classifyOutboundLockedRecovery(entry);
+  const identity = {
+    chatKey: entry?.chatKey,
+    stableId: entry?.stableId,
+    guaranteeKey: entry?.guaranteeKey,
+  };
+
+  if (classified.action === "complete_ledger") {
+    markOutboundLockedRecoverySent({
+      force: true,
+      chatKey: entry.chatKey,
+      stableId: entry.stableId,
+      guaranteeKey: classified.guaranteeKey || entry.guaranteeKey,
+      textPreview: entry.textPreview,
+      providerOutboundMessageId: classified.providerOutboundMessageId,
+    });
+    return {
+      recovered: true,
+      sent: false,
+      action: "complete_ledger",
+      reason: classified.reason,
+    };
+  }
+
+  if (classified.action === "uncertain_fail_closed") {
+    // Meta request may have started without a durable provider receipt.
+    // Do not resend. Keep outbound_locked + finalReplyText for manual review.
+    markOutboundUncertainManualReview({
+      chatKey: entry.chatKey,
+      stableId: entry.stableId,
+      reason: classified.reason || "send_in_flight_without_provider_receipt",
+      deliveryStatus: "uncertain_delivery_manual_review",
+    });
+    return {
+      recovered: false,
+      sent: false,
+      action: "uncertain_fail_closed",
+      reason: classified.reason,
+      residualLimitation:
+        "at_most_once_after_send_in_flight_without_provider_receipt",
+    };
+  }
+
+  if (classified.action === "corrupted_locked_reply") {
+    markCloudInboundTurnTerminalTechnicalFailure({
+      identity,
+      lastError: "corrupted_outbound_locked_missing_reply",
+      deliveryStatus: "corrupted_outbound_locked",
+    });
+    return {
+      recovered: false,
+      sent: false,
+      action: "corrupted_locked_reply",
+      reason: classified.reason,
+    };
+  }
+
+  if (classified.action === "lease_held") {
+    return {
+      recovered: false,
+      sent: false,
+      action: "lease_held",
+      reason: classified.reason,
+    };
+  }
+
   if (classified.action !== "resume_send") {
     return {
       recovered: false,
@@ -69,6 +137,14 @@ export async function tryRecoverCloudOutboundLockedTurn({
     const replyText = classified.finalReplyText;
     const guaranteeKey =
       String(classified.guaranteeKey ?? entry.guaranteeKey ?? "").trim();
+    // Persist in-flight only when the network request is about to begin.
+    markOutboundSendInFlight({
+      force: true,
+      chatKey: entry.chatKey,
+      stableId: entry.stableId,
+      claimOwner,
+      outboundLockStage: "cloud_outbound_locked_recovery_send",
+    });
     const sendResult = await __sendOutboundMessageFn({
       sendVia: "CLOUD_API",
       reply: replyText,
@@ -123,6 +199,10 @@ export async function tryRecoverCloudOutboundLockedTurn({
         stableId: entry.stableId,
         guaranteeKey,
         textPreview: entry.textPreview,
+        providerOutboundMessageId:
+          sendResult?.providerMessageId ??
+          sendResult?.messages?.[0]?.id ??
+          null,
       });
       if (
         db &&
@@ -183,12 +263,12 @@ export async function tryRecoverCloudOutboundLockedTurn({
       nextRetryAt: Number(failed?.nextRetryAt ?? 0) || null,
     };
   } catch (err) {
-    releaseOutboundLockedRecoveryClaim({
-      force: true,
+    // Network may have started after send_in_flight; do not blind-resend.
+    markOutboundUncertainManualReview({
       chatKey: entry.chatKey,
       stableId: entry.stableId,
-      claimOwner,
-      resetToPending: false,
+      reason: String(err?.message ?? err ?? "cloud_send_exception").slice(0, 160),
+      deliveryStatus: "uncertain_delivery_manual_review",
     });
     return {
       recovered: false,
@@ -198,6 +278,8 @@ export async function tryRecoverCloudOutboundLockedTurn({
         0,
         160
       ),
+      residualLimitation:
+        "at_most_once_after_send_in_flight_without_provider_receipt",
     };
   }
 }
@@ -235,6 +317,7 @@ function buildPipelinePayload(entry, db, sendCredentials) {
     hasMultipleFragments: false,
     isGreetingFirst: false,
     __cloudResumeProcessing: true,
+    __cloudClaimOwner: String(entry.processingOwner ?? "").trim() || null,
   };
 }
 

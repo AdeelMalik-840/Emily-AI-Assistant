@@ -11,6 +11,8 @@ import {
   claimOutboundLockedRecovery,
   getInboundTurnLedgerEntry,
   markOutboundLockedRecoverySent,
+  markOutboundSendInFlight,
+  markOutboundUncertainManualReview,
   parseGuaranteeKeyParts,
   releaseOutboundLockedRecoveryClaim,
 } from "./inboundTurnLedger.js";
@@ -140,6 +142,12 @@ async function doRecoverOutboundLockedInboundTurn(p) {
   }
 
   if (classified.action === "uncertain_fail_closed") {
+    markOutboundUncertainManualReview({
+      chatKey: p.chatKey,
+      stableId: p.stableId,
+      reason: classified.reason || "send_in_flight_without_provider_receipt",
+      deliveryStatus: "uncertain_delivery_manual_review",
+    });
     console.warn("[outbound_locked_recovery_uncertain_fail_closed]", {
       chatKey: p.chatKey,
       stableId: p.stableId,
@@ -148,6 +156,24 @@ async function doRecoverOutboundLockedInboundTurn(p) {
     return {
       recovered: false,
       action: "uncertain_fail_closed",
+      reason: classified.reason,
+      sent: false,
+      replyText: classified.finalReplyText || undefined,
+    };
+  }
+
+  if (classified.action === "lease_held" || classified.action === "corrupted_locked_reply") {
+    if (classified.action === "corrupted_locked_reply") {
+      markOutboundUncertainManualReview({
+        chatKey: p.chatKey,
+        stableId: p.stableId,
+        reason: classified.reason || "missing_final_reply_text",
+        deliveryStatus: "corrupted_outbound_locked",
+      });
+    }
+    return {
+      recovered: false,
+      action: classified.action,
       reason: classified.reason,
       sent: false,
       replyText: classified.finalReplyText || undefined,
@@ -192,6 +218,12 @@ async function doRecoverOutboundLockedInboundTurn(p) {
       : new Map();
 
   try {
+    markOutboundSendInFlight({
+      chatKey: p.chatKey,
+      stableId: p.stableId,
+      claimOwner: p.claimOwner,
+      outboundLockStage: "outbound_locked_recovery_send",
+    });
     const sendResult = await sendViaPlaywright({
       reply: replyText,
       messageMeta: {

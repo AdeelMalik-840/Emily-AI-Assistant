@@ -64,10 +64,17 @@ export async function sendOutboundMessage({
   dmRecipientPhone,
   context,
 }) {
-  const normalizeAdapterResult = (result) => ({
-    ok: result?.ok === true,
-    ...(result?.groupSendFailed ? { groupSendFailed: true } : {}),
-  });
+  const normalizeAdapterResult = (result) => {
+    const providerMessageId =
+      String(result?.providerMessageId ?? "").trim() ||
+      String(result?.messages?.[0]?.id ?? "").trim() ||
+      null;
+    return {
+      ok: result?.ok === true,
+      ...(result?.groupSendFailed ? { groupSendFailed: true } : {}),
+      ...(providerMessageId ? { providerMessageId } : { providerMessageId: null }),
+    };
+  };
 
   if (!sendVia) {
     console.warn("⚠️ Missing sendVia — skipping outbound message");

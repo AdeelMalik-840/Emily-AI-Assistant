@@ -580,6 +580,7 @@ function scheduleCloudPostConfirmRetry(p, identity, retryCount) {
     void executeWhatsAppAiPipeline({
       ...p,
       __cloudResumeProcessing: true,
+      __cloudClaimOwner: String(p.__cloudClaimOwner ?? "").trim() || null,
       traceId: randomUUID(),
     }).catch((err) => {
       console.warn("[cloud_post_confirm_retry_failed]", {
@@ -1552,6 +1553,7 @@ export async function executeWhatsAppAiPipeline(p) {
   let intentionalSilent = false;
   let cloudLifecycleIdentity = null;
   let cloudLifecycleClaimed = false;
+  let cloudLifecycleClaimOwner = null;
   /** Hoisted for finally-block guarantee completion (declared inside try is TDZ in finally). */
   let messageMeta = null;
   const isGroupInbound =
@@ -1580,6 +1582,9 @@ export async function executeWhatsAppAiPipeline(p) {
       messageId,
       resumeProcessing: p.__cloudResumeProcessing === true,
       provisionalOwnership: true,
+      claimOwner:
+        String(p.__cloudClaimOwner ?? "").trim() ||
+        null,
       recoveryContext: {
         businessId: ownerUserId,
         customerPhone: cloudConfirmPhone,
@@ -1594,6 +1599,10 @@ export async function executeWhatsAppAiPipeline(p) {
       },
     });
     cloudLifecycleIdentity = cloudClaim.identity ?? null;
+    if (cloudClaim.claimed === true) {
+      cloudLifecycleClaimOwner =
+        String(cloudClaim.claimOwner ?? "").trim() || null;
+    }
     if (cloudClaim.action === "done") {
       console.log("[cloud_post_confirm_duplicate_done]", {
         guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
@@ -1715,7 +1724,13 @@ export async function executeWhatsAppAiPipeline(p) {
         incoming: fingerprint,
       });
       globalThis.__messageQueue.push(
-        cloudLifecycleClaimed ? { ...p, __cloudResumeProcessing: true } : p
+        cloudLifecycleClaimed
+          ? {
+              ...p,
+              __cloudResumeProcessing: true,
+              __cloudClaimOwner: cloudLifecycleClaimOwner,
+            }
+          : p
       );
     }
     return;
@@ -2969,6 +2984,18 @@ export async function executeWhatsAppAiPipeline(p) {
           finalReplySource: finalReplySourceForLifecycle || null,
         });
         outboundStartedAt = Date.now();
+        if (cloudPostConfirmSend) {
+          const { markOutboundSendInFlight } = await import(
+            "./inboundTurnLedger.js"
+          );
+          markOutboundSendInFlight({
+            force: true,
+            chatKey: cloudLifecycleIdentity.chatKey,
+            stableId: cloudLifecycleIdentity.stableId,
+            claimOwner: cloudOutboundClaimOwner,
+            outboundLockStage: "cloud_buffer_send_in_flight",
+          });
+        }
         const sendOutboundMessageFn =
           typeof p.__sendOutboundMessageFn === "function"
             ? p.__sendOutboundMessageFn
@@ -3020,6 +3047,10 @@ export async function executeWhatsAppAiPipeline(p) {
               stableId: cloudLifecycleIdentity.stableId,
               guaranteeKey: cloudLifecycleIdentity.guaranteeKey,
               textPreview: String(combinedMessage ?? "").slice(0, 120),
+              providerOutboundMessageId:
+                sendResult?.providerMessageId ??
+                sendResult?.messages?.[0]?.id ??
+                null,
             });
           }
         } else {

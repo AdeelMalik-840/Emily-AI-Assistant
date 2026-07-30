@@ -830,13 +830,21 @@ const WHATSAPP_IMAGE_INTRO_FALLBACK = "Here are the images 👇";
  *   fallbackDmTo?: string,
  *   groupDmNoticeBody?: string,
  * }} [opts]
- * @returns {Promise<{ groupSendFailed: boolean }>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   groupSendFailed: boolean,
+ *   httpStatus?: number | null,
+ *   tokenSource?: string | null,
+ *   providerMessageId?: string | null,
+ * }>}
  */
 export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) {
   let groupSendFailed = false;
   let allOk = true;
   let lastHttpStatus = null;
   let lastTokenSource = null;
+  /** First successful Meta message id (customer-facing text preferred). */
+  let providerMessageId = null;
   const recipientType = opts.recipientType === "group" ? "group" : "individual";
   let includeGroupDmNotice = recipientType === "group";
 
@@ -846,10 +854,15 @@ export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) 
     if (r?.ok !== true) allOk = false;
     if (r?.httpStatus != null) lastHttpStatus = r.httpStatus;
     if (r?.tokenSource) lastTokenSource = r.tokenSource;
+    const pid = String(r?.providerMessageId ?? "").trim();
+    if (r?.ok === true && pid && !providerMessageId) {
+      providerMessageId = pid;
+    }
     console.log("[cloud_send_result_propagated]", {
       ok: r?.ok === true,
       httpStatus: r?.httpStatus ?? null,
       tokenSource: r?.tokenSource ?? null,
+      hasProviderMessageId: Boolean(pid),
       caller,
     });
     return r;
@@ -878,11 +891,19 @@ export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) 
 
   if (channel !== "whatsapp") {
     await track(sendWhatsAppMessage(to, text, credentials, nextTextOpts()), "deliver_non_whatsapp_text");
-    return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
+    return {
+      ok: allOk,
+      groupSendFailed,
+      httpStatus: lastHttpStatus,
+      tokenSource: lastTokenSource,
+      providerMessageId,
+    };
   }
 
   const raw = String(text ?? "").trim();
-  if (raw === "") return { ok: false, groupSendFailed: false };
+  if (raw === "") {
+    return { ok: false, groupSendFailed: false, providerMessageId: null };
+  }
 
   const deliveryIntent = String(opts.deliveryIntent ?? "")
     .trim()
@@ -913,13 +934,25 @@ export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) 
     for (const imageUrl of explicitUrls) {
       await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()), "deliver_show_images_image");
     }
-    return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
+    return {
+      ok: allOk,
+      groupSendFailed,
+      httpStatus: lastHttpStatus,
+      tokenSource: lastTokenSource,
+      providerMessageId,
+    };
   }
 
   const imageUrls = extractWhatsAppImageUrlsFromText(raw);
   if (imageUrls.length === 0) {
     await track(sendWhatsAppMessage(to, raw, credentials, nextTextOpts()), "deliver_text");
-    return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
+    return {
+      ok: allOk,
+      groupSendFailed,
+      httpStatus: lastHttpStatus,
+      tokenSource: lastTokenSource,
+      providerMessageId,
+    };
   }
 
   let textWithoutUrls = cleanTextAfterUrlRemoval(
@@ -940,5 +973,11 @@ export async function deliverWhatsAppOutbound(to, text, credentials, opts = {}) 
   for (const imageUrl of imageUrls) {
     await track(sendWhatsAppImage(to, imageUrl, credentials, imageOpts()), "deliver_embedded_image");
   }
-  return { ok: allOk, groupSendFailed, httpStatus: lastHttpStatus, tokenSource: lastTokenSource };
+  return {
+    ok: allOk,
+    groupSendFailed,
+    httpStatus: lastHttpStatus,
+    tokenSource: lastTokenSource,
+    providerMessageId,
+  };
 }
