@@ -157,6 +157,26 @@ function positiveIntegerOrNull(value) {
   return Number.isInteger(number) && number >= 1 ? number : null;
 }
 
+/**
+ * Coerce a verified numeric fact without turning null/empty into 0.
+ * Explicit numeric zero is preserved.
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+export function finiteNumberOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const number = Number(trimmed);
+    return Number.isFinite(number) ? number : null;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  return null;
+}
+
 function normalizeGroundedFacts(raw) {
   const o = raw && typeof raw === "object" ? raw : {};
   const nullableNumber = (value) =>
@@ -404,6 +424,138 @@ function compactCustomerSafeBookingCandidate(booking, fallbackIndex) {
       positiveIntegerOrNull(booking?.selectionIndex) ?? fallbackIndex,
     ...compact,
   };
+}
+
+/**
+ * Resolve the trusted focused booking row from already-resolved facts only.
+ * @param {Record<string, unknown> | null | undefined} facts
+ */
+export function resolveTrustedFocusedBookingRow(facts) {
+  if (!hasTrustedPostConfirmBookingFocus(facts)) return null;
+  const focusIndex = positiveIntegerOrNull(
+    facts?.bookingFocus?.selectedBookingIndex
+  );
+  if (focusIndex == null) return null;
+  const candidates = bookingCandidatesForFacts(facts);
+  // Fail closed: never substitute facts.booking for a stale/missing focus index.
+  // bookingCandidatesForFacts already surfaces a lone facts.booking as index 1.
+  return (
+    candidates.find(
+      (row) => positiveIntegerOrNull(row?.selectionIndex) === focusIndex
+    ) ?? null
+  );
+}
+
+/**
+ * AVR may only fill focused gaps when its id matches the focused booking AVR id.
+ * @param {Record<string, unknown> | null | undefined} booking
+ * @param {Record<string, unknown> | null | undefined} avr
+ */
+function linkedAvailabilityRequestForFocusedBooking(booking, avr) {
+  if (!booking || typeof booking !== "object") return null;
+  if (!avr || typeof avr !== "object") return null;
+  const bookingAvrId = clean(booking.availabilityRequestId, 120);
+  const avrId = clean(avr.id || avr.requestId || avr.availabilityRequestId, 120);
+  if (!bookingAvrId || !avrId || bookingAvrId !== avrId) return null;
+  return avr;
+}
+
+/**
+ * Verified focused booking identity for prompt + mismatch correction.
+ * @param {Record<string, unknown> | null | undefined} facts
+ */
+export function resolveTrustedFocusedBookingIdentity(facts) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  const focus = f.bookingFocus && typeof f.bookingFocus === "object"
+    ? f.bookingFocus
+    : null;
+  if (!hasTrustedPostConfirmBookingFocus(f) || !focus) return null;
+  const selectedBookingIndex = positiveIntegerOrNull(
+    focus.selectedBookingIndex
+  );
+  const booking = resolveTrustedFocusedBookingRow(f);
+  if (!booking) return null;
+  const avr =
+    f.availabilityRequest && typeof f.availabilityRequest === "object"
+      ? f.availabilityRequest
+      : null;
+  const linkedAvr = linkedAvailabilityRequestForFocusedBooking(booking, avr);
+  const itemLabel =
+    clean(booking?.itemLabel || booking?.itemName, 200) ||
+    clean(linkedAvr?.itemLabel || linkedAvr?.itemName, 200) ||
+    null;
+  const durationDays =
+    finiteNumberOrNull(booking?.durationDays) ??
+    finiteNumberOrNull(linkedAvr?.requestedDuration);
+  const totalAmount =
+    finiteNumberOrNull(booking?.totalAmount) ??
+    finiteNumberOrNull(linkedAvr?.priceQuote?.total);
+  const dailyRate =
+    finiteNumberOrNull(booking?.dailyRate) ??
+    finiteNumberOrNull(linkedAvr?.priceQuote?.dailyRate);
+  return {
+    source:
+      focus.source === "latest_confirmed_linked_avr"
+        ? "latest_confirmed_linked_avr"
+        : null,
+    confidence: "trusted",
+    selectedBookingIndex,
+    bookingId:
+      clean(booking?.id || focus.selectedBookingId, 120) || null,
+    availabilityRequestId:
+      clean(booking?.availabilityRequestId, 120) ||
+      (linkedAvr
+        ? clean(
+            linkedAvr.id ||
+              linkedAvr.requestId ||
+              linkedAvr.availabilityRequestId,
+            120
+          )
+        : null) ||
+      null,
+    itemId: clean(booking?.itemId || linkedAvr?.itemId, 160) || null,
+    itemLabel,
+    durationDays,
+    totalAmount,
+    dailyRate,
+    bookingStatus: clean(booking?.status, 60) || null,
+    scope: "CURRENT_BOOKING_IN_SCOPE",
+  };
+}
+
+/**
+ * Same-lane correction after verified_item_mismatch — pins trusted focus only.
+ * @param {Record<string, unknown> | null | undefined} facts
+ * @param {string} reason
+ */
+export function buildPostConfirmVerifiedItemMismatchCorrection(
+  facts,
+  reason
+) {
+  const identity = resolveTrustedFocusedBookingIdentity(facts);
+  const failureReason = clean(reason, 160) || "verified_item_mismatch";
+  if (!identity) {
+    return [
+      `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
+      "Use ONLY verified customer-safe facts from VERIFIED_BUSINESS_PA_FACTS_JSON.",
+      "Return the same required JSON schema. Return JSON only.",
+    ].join("\n");
+  }
+  return [
+    `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
+    "Answer and groundedFacts must use ONLY the trusted focused booking below.",
+    `selectedBookingIndex: ${identity.selectedBookingIndex}`,
+    `bookingId: ${identity.bookingId ?? "(none)"}`,
+    `itemId: ${identity.itemId ?? "(none)"}`,
+    `itemLabel: ${identity.itemLabel ?? "(none)"}`,
+    `durationDays: ${identity.durationDays ?? "(none)"}`,
+    `bookingStatus: ${identity.bookingStatus ?? "(none)"}`,
+    "The final customerReply and groundedFacts.itemId MUST refer only to this focused booking.",
+    "Do not use any OUT_OF_SCOPE_CONTEXT_ONLY candidate in customerReply or groundedFacts.",
+    "Use bookingSelectionMode=focused with this selectedBookingIndex for read-only factual answers.",
+    "Return the same required JSON schema, including honest replySemantics.claims and languageStyle.",
+    "Return JSON only.",
+  ].join("\n");
 }
 
 function bookingCandidatesForFacts(facts) {
@@ -920,29 +1072,92 @@ export function compactPostConfirmFactsForPrompt(facts) {
       : null;
   const known = f.known && typeof f.known === "object" ? f.known : {};
   const policy = f.policy && typeof f.policy === "object" ? f.policy : {};
-  const activeBookings = Array.isArray(f.activeBookings)
-    ? f.activeBookings.map(compactCustomerSafeBooking).filter(Boolean).slice(0, 12)
-    : [];
+  const trustedFocusIdentity = resolveTrustedFocusedBookingIdentity(f);
+  const trustedFocusedBookingRow = trustedFocusIdentity
+    ? resolveTrustedFocusedBookingRow(f)
+    : null;
+  const trustedFocusIndex = trustedFocusIdentity?.selectedBookingIndex ?? null;
+  const linkedFocusedAvr = linkedAvailabilityRequestForFocusedBooking(
+    trustedFocusedBookingRow,
+    avr
+  );
   const bookingCandidates = bookingCandidatesForFacts(f)
-    .map((row, index) =>
-      compactCustomerSafeBookingCandidate(row, index + 1)
-    )
+    .map((row, index) => {
+      const selectionIndex =
+        positiveIntegerOrNull(row?.selectionIndex) ?? index + 1;
+      if (trustedFocusIdentity) {
+        if (selectionIndex === trustedFocusIndex) {
+          const focused = compactCustomerSafeBookingCandidate(
+            row,
+            selectionIndex
+          );
+          if (!focused) return null;
+          return {
+            ...focused,
+            itemId: clean(row?.itemId, 160) || null,
+            scope: "CURRENT_BOOKING_IN_SCOPE",
+          };
+        }
+        // Keep minimal identity for mutation clarification only — not answer facts.
+        return {
+          selectionIndex,
+          scope: "OUT_OF_SCOPE_CONTEXT_ONLY",
+          itemLabel: clean(row?.itemLabel || row?.itemName, 200) || null,
+        };
+      }
+      return compactCustomerSafeBookingCandidate(row, selectionIndex);
+    })
     .filter(Boolean)
     .slice(0, 12);
-  const bookingFocus =
-    f.bookingFocus && typeof f.bookingFocus === "object"
-      ? {
-          source:
-            f.bookingFocus.source === "latest_confirmed_linked_avr"
-              ? "latest_confirmed_linked_avr"
-              : null,
-          confidence:
-            f.bookingFocus.confidence === "trusted" ? "trusted" : null,
-          selectedBookingIndex: positiveIntegerOrNull(
-            f.bookingFocus.selectedBookingIndex
-          ),
-        }
-      : null;
+  const activeBookings = trustedFocusIdentity
+    ? bookingCandidates
+        .filter((row) => row?.scope === "CURRENT_BOOKING_IN_SCOPE")
+        .map((row) => {
+          const {
+            selectionIndex: _selectionIndex,
+            scope: _scope,
+            itemId: _itemId,
+            ...safe
+          } = row;
+          return safe;
+        })
+        .slice(0, 1)
+    : Array.isArray(f.activeBookings)
+      ? f.activeBookings
+          .map(compactCustomerSafeBooking)
+          .filter(Boolean)
+          .slice(0, 12)
+      : [];
+  const bookingFocus = trustedFocusIdentity
+    ? {
+        source: trustedFocusIdentity.source,
+        confidence: trustedFocusIdentity.confidence,
+        selectedBookingIndex: trustedFocusIdentity.selectedBookingIndex,
+        bookingId: trustedFocusIdentity.bookingId,
+        availabilityRequestId: trustedFocusIdentity.availabilityRequestId,
+        itemId: trustedFocusIdentity.itemId,
+        itemLabel: trustedFocusIdentity.itemLabel,
+        durationDays: trustedFocusIdentity.durationDays,
+        totalAmount: trustedFocusIdentity.totalAmount,
+        dailyRate: trustedFocusIdentity.dailyRate,
+        bookingStatus: trustedFocusIdentity.bookingStatus,
+        scope: "CURRENT_BOOKING_IN_SCOPE",
+      }
+    : hasTrustedPostConfirmBookingFocus(f)
+      ? null
+      : f.bookingFocus && typeof f.bookingFocus === "object"
+        ? {
+            source:
+              f.bookingFocus.source === "latest_confirmed_linked_avr"
+                ? "latest_confirmed_linked_avr"
+                : null,
+            confidence:
+              f.bookingFocus.confidence === "trusted" ? "trusted" : null,
+            selectedBookingIndex: positiveIntegerOrNull(
+              f.bookingFocus.selectedBookingIndex
+            ),
+          }
+        : null;
   const pendingAvailabilityRequests = Array.isArray(
     f.pendingAvailabilityRequests
   )
@@ -1004,23 +1219,62 @@ export function compactPostConfirmFactsForPrompt(facts) {
         business.documentsPolicy ?? known.documentsPolicy ?? null,
       deliveryPolicy: business.deliveryPolicy ?? known.deliveryPolicy ?? null,
     },
-    booking: Object.keys(booking).length > 0
-      ? compactCustomerSafeBooking(booking)
-      : null,
+    booking: trustedFocusedBookingRow
+      ? {
+          ...compactCustomerSafeBooking(trustedFocusedBookingRow),
+          itemId: clean(trustedFocusedBookingRow.itemId, 160) || null,
+          scope: "CURRENT_BOOKING_IN_SCOPE",
+        }
+      : Object.keys(booking).length > 0
+        ? compactCustomerSafeBooking(booking)
+        : null,
     bookingCandidates,
     bookingFocus,
     activeBookings,
     pendingAvailabilityRequests,
     mutationExecution,
     pendingAvailabilityExecution,
-    availabilityRequest: avr
-      ? {
-          itemLabel: avr.itemLabel ?? null,
-          requestedDuration: avr.requestedDuration ?? null,
-          priceQuote: avr.priceQuote ?? null,
-          status: avr.status ?? null,
+    availabilityRequest: (() => {
+      if (trustedFocusIdentity) {
+        if (linkedFocusedAvr) {
+          return {
+            itemLabel: linkedFocusedAvr.itemLabel ?? null,
+            itemId:
+              clean(linkedFocusedAvr.itemId, 160) ||
+              trustedFocusIdentity.itemId ||
+              null,
+            requestedDuration: linkedFocusedAvr.requestedDuration ?? null,
+            priceQuote: linkedFocusedAvr.priceQuote ?? null,
+            status: linkedFocusedAvr.status ?? null,
+          };
         }
-      : null,
+        // Unlinked AVR must not leak into focused prompt facts.
+        return trustedFocusIdentity.availabilityRequestId
+          ? {
+              itemLabel: trustedFocusIdentity.itemLabel,
+              itemId: trustedFocusIdentity.itemId,
+              requestedDuration: trustedFocusIdentity.durationDays,
+              priceQuote:
+                trustedFocusIdentity.totalAmount != null ||
+                trustedFocusIdentity.dailyRate != null
+                  ? {
+                      total: trustedFocusIdentity.totalAmount,
+                      dailyRate: trustedFocusIdentity.dailyRate,
+                    }
+                  : null,
+              status: null,
+            }
+          : null;
+      }
+      if (!avr) return null;
+      return {
+        itemLabel: avr.itemLabel ?? null,
+        itemId: null,
+        requestedDuration: avr.requestedDuration ?? null,
+        priceQuote: avr.priceQuote ?? null,
+        status: avr.status ?? null,
+      };
+    })(),
     known: {
       totalAmount: known.totalAmount ?? null,
       dailyRate: known.dailyRate ?? null,
@@ -1641,7 +1895,7 @@ LANE FACT RULES:
   }
 - ${
     hasTrustedBookingFocus
-      ? "Multiple active bookings are present with a trusted latest-confirmed focus. For a generic read-only booking question use bookingSelectionMode=focused. If the customer explicitly names another booking, use bookingSelectionMode=candidate with its selectionIndex."
+      ? "Multiple active bookings are present with a trusted latest-confirmed focus. bookingFocus and any CURRENT_BOOKING_IN_SCOPE row are the only booking to answer for generic/read-only questions. Use bookingFocus.itemId and bookingFocus.itemLabel in groundedFacts when stating that booking. Entries marked OUT_OF_SCOPE_CONTEXT_ONLY are context for clarification/mutation only — never put them in customerReply or groundedFacts.itemId unless the customer explicitly identified that booking (bookingSelectionMode=candidate with its selectionIndex). For generic read-only questions use bookingSelectionMode=focused."
       : hasAmbiguousBookings
         ? "Multiple active bookings are present without trusted focus. Generic booking questions require bookingSelectionMode=clarification_required and a natural clarification. Do not guess or mutate one."
         : "There is no multi-booking ambiguity."
@@ -1705,7 +1959,12 @@ STRICT SAFETY:
                 userLine,
                 lastEmily
               )}`
-            : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
+            : lastReason === "verified_item_mismatch"
+              ? `${userPayload}\n\n${buildPostConfirmVerifiedItemMismatchCorrection(
+                  facts,
+                  lastReason
+                )}`
+              : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
       const createPromise = Promise.resolve(
         completionFn({
           model: resolveOpenAiChatModel(),
