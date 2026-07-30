@@ -38,12 +38,14 @@ import { executeCreateBooking } from "./executors/createBookingExecutor.js";
 import { findItemByName } from "./inventoryService.js";
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
 import {
+  availabilityRequestMatchesCloudCustomerPhone,
   claimAvailabilityRequestCustomerConfirmProcessing,
   findAvailabilityRequestByCloudInboundMessageId,
   findLatestWaitingConfirmAvailabilityRequest,
   findSupersededCloudAvailabilityRequestsByPhone,
   findWaitingConfirmCloudAvailabilityRequestsByPhone,
   getAvailabilityRequest,
+  isFreshTrustedWaitingConfirmCloudOwnershipCandidate,
   isDuplicateAvailabilityCustomerInboundDm,
   isTrustedWaitingConfirmBookingPromptCandidate,
   patchAvailabilityConfirmBookingMetadata,
@@ -892,8 +894,12 @@ async function handleWaitingConfirmDmBrainCloudTurn({
   sendWhatsAppMessageFn,
   availabilityConfirmExecute,
   decideCustomerTurnFn,
+  catalogRowOverride,
 }) {
-  const catalogRow = await loadCatalogRowForRequest(businessId, request);
+  const catalogRow =
+    catalogRowOverride !== undefined
+      ? catalogRowOverride
+      : await loadCatalogRowForRequest(businessId, request);
   const turnContext = packWaitingConfirmDmTurnContext({
     businessId,
     customerPhone: phone,
@@ -1067,8 +1073,11 @@ async function handleWaitingConfirmDmBrainCloudTurn({
  *   sendCredentials?: Record<string, unknown> | null,
  *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
  *   availabilityConfirmExecute?: boolean,
+ *   preselectedWaitingConfirmRequest?: Record<string, unknown> | null,
+ *   inboundReceivedAtMs?: number | null,
  *   __waitingConfirmDmBrainEnabled?: boolean,
  *   __decideCustomerTurnForTests?: Function | null,
+ *   __catalogRowForTests?: Record<string, unknown> | null,
  * }} params
  */
 export async function handleAvailabilityCustomerCloudInbound({
@@ -1081,8 +1090,11 @@ export async function handleAvailabilityCustomerCloudInbound({
   sendCredentials = null,
   sendWhatsAppMessageFn = sendWhatsAppMessage,
   availabilityConfirmExecute = isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
+  preselectedWaitingConfirmRequest = null,
+  inboundReceivedAtMs = null,
   __waitingConfirmDmBrainEnabled = null,
   __decideCustomerTurnForTests = null,
+  __catalogRowForTests = undefined,
 }) {
   const uid = clean(businessId);
   const phone = normalizePhone(customerPhone);
@@ -1109,11 +1121,33 @@ export async function handleAvailabilityCustomerCloudInbound({
     }
   }
 
-  const waiting = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
-    db: connection,
-    businessId: uid,
-    customerPhone: phone,
-  });
+  let waiting = [];
+  const preselectedRequestId = clean(
+    preselectedWaitingConfirmRequest?.requestId ??
+      preselectedWaitingConfirmRequest?.id
+  );
+  if (preselectedRequestId) {
+    const freshPreselected = await getAvailabilityRequest({
+      db: connection,
+      businessId: uid,
+      requestId: preselectedRequestId,
+    });
+    if (
+      freshPreselected &&
+      availabilityRequestMatchesCloudCustomerPhone(freshPreselected, phone) &&
+      isFreshTrustedWaitingConfirmCloudOwnershipCandidate(freshPreselected, {
+        inboundReceivedAtMs,
+      })
+    ) {
+      waiting = [{ requestId: preselectedRequestId, ...freshPreselected }];
+    }
+  } else {
+    waiting = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
+      db: connection,
+      businessId: uid,
+      customerPhone: phone,
+    });
+  }
   const inactiveOrSuperseded = await findSupersededCloudAvailabilityRequestsByPhone({
     db: connection,
     businessId: uid,
@@ -1196,6 +1230,7 @@ export async function handleAvailabilityCustomerCloudInbound({
       sendWhatsAppMessageFn,
       availabilityConfirmExecute,
       decideCustomerTurnFn: decideFn,
+      catalogRowOverride: __catalogRowForTests,
     });
   }
 

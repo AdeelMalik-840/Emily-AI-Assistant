@@ -104,7 +104,7 @@ function hasBookingCommitmentSignal(text, signals = {}) {
  * @param {string} text
  */
 function explicitlyAsksAmount(text) {
-  return /\b(price|rate|cost|charges?|amount|quote|quotation|kitna|kitni|kitne|ktna|how much|per\s*day|daily|monthly|mahina|maheena|mahine|\/day)\b/i.test(
+  return /\b(price|rate|cost|charges?|amount|quote|quotation|total|overall|kitna|kitni|kitne|ktna|how much|per\s*day|daily|monthly|mahina|maheena|mahine|\/day)\b/i.test(
     text
   );
 }
@@ -182,19 +182,20 @@ export function extractTurnSignals(p) {
       : detectAskedField(p.message);
   const askedField = normalizeRequestedField(askedFieldRaw);
   const rentAvailabilityCompound = isRentAvailabilityCompound(text);
+  const explicitAmountAsk = explicitlyAsksAmount(text);
 
   const priceAsk =
-    isPriceField(askedField) ||
-    askedFieldRaw === "price_daily" ||
-    askedFieldRaw === "price_monthly" ||
-    askedFieldRaw === "price_with_duration" ||
-    /\b(price|pricing|rate|rates|charges?|cost|amount|quote|quotation)\b/i.test(text) ||
-    (/\b(per\s*day|per\s*month|per\s*week|daily|monthly|weekly|mahina|maheena|mahine|\/day|\/month)\b/i.test(
-      text
-    ) &&
-      !rentAvailabilityCompound) ||
-    (/\b(price|rate|cost|charges?|rent|kiraya|kitna|kitni|kitne|ktna)\b/i.test(text) &&
-      !rentAvailabilityCompound);
+    explicitAmountAsk &&
+    (isPriceField(askedField) ||
+      askedFieldRaw === "price_daily" ||
+      askedFieldRaw === "price_monthly" ||
+      askedFieldRaw === "price_with_duration" ||
+      /\b(price|pricing|rate|rates|charges?|cost|amount|quote|quotation|total|overall|kitna|kitni|kitne|ktna|how much)\b/i.test(
+        text
+      ) ||
+      /\b(per\s*day|per\s*month|per\s*week|daily|monthly|weekly|mahina|maheena|mahine|\/day|\/month)\b/i.test(
+        text
+      ));
 
   const explicitMediaAsk = hasExplicitMediaAsk(text, askedField);
   const photoAsk = explicitMediaAsk;
@@ -284,10 +285,10 @@ export function resolveTurnIntentShape(p) {
 
   const text = String(p.message ?? "").trim().toLowerCase();
   const isPriceWithDurationQuote =
-    signals.askedFieldRaw === "price_with_duration" ||
-    signals.askedFieldRaw === "price_daily" ||
-    signals.askedFieldRaw === "price_monthly" ||
-    (signals.priceAsk &&
+    signals.priceAsk &&
+    (signals.askedFieldRaw === "price_with_duration" ||
+      signals.askedFieldRaw === "price_daily" ||
+      signals.askedFieldRaw === "price_monthly" ||
       signals.durationMentioned &&
       (explicitlyAsksAmount(text) ||
         /\b(total|overall|kitna|ktna|banega|banayega|batao|bata)\b/i.test(text)));

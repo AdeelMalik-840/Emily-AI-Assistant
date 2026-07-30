@@ -130,7 +130,6 @@ const PRICING_WITH_DURATION = [
   "14 days ka rent kitna hoga?",
   "2 weeks ka overall kitna banega?",
   "per day rate kia hai?",
-  "corolla 2 weeks ka rent?",
 ];
 
 for (const msg of PRICING_WITH_DURATION) {
@@ -160,6 +159,12 @@ for (const msg of PRICING_WITH_DURATION) {
     assert.equal(priority.intents.booking, false);
   });
 }
+
+test("item plus duration with bare rent remains a rental need, not a price question", () => {
+  const msg = "corolla 2 weeks ka rent?";
+  assert.equal(isExplicitPricingOrDetailsQuestion(msg), false);
+  assert.equal(hasStrongBookingCommitPhrase(msg), false);
+});
 
 const BOOKING_WITH_DURATION = [
   "2 weeks chahiye",
