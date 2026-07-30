@@ -40,7 +40,7 @@ const BOOKING_SUCCESS_CLAIM_RE =
  * Guard-only; never intent routing; never rewrites customer wording.
  */
 const BOOKING_MUTATION_SUCCESS_CLAIM_RE =
-  /\b(booking|reservation)\b.{0,48}\b(has been|have been|was|were|successfully)\b.{0,24}\b(cancelled|canceled|extended|changed|updated|rescheduled|modified|replaced)\b|\b(booking|reservation)\b.{0,40}\b(cancel|cancelled|canceled|extend|extended|update|updated|change|changed|modify|modified|replace|replaced)\b.{0,32}\b(ho gaya|ho gayi|ho chuka|ho chuki|kar di|kar diya|kar diye|complete|completed)\b|\b(cancel|cancelled|canceled)\b.{0,32}\b(complete|completed|ho gayi|ho gaya|ho chuki|ho chuka|kar di|kar diya)\b|\b(extend|extension)\b.{0,32}\b(ho gaya|ho gayi|ho chuka|kar diya|kar di|complete|completed)\b|\b(\d+\s*din|do\s*din|\d+\s*day)\b.{0,40}\b(aur\s+)?(add|extend|barha|badha)\b.{0,32}\b(kar di|kar diye|kar diya|ho gaye|ho gaya|ho gayi|hain)\b|\b(dates?|date)\b.{0,40}\b(change|changed|update|updated|move|moved|shift|shifted|modify|modified)\b.{0,32}\b(ho chuki|ho chuka|ho gayi|ho gaya|kar di|kar diya|kar di gayi|hain)\b|\b(pickup|pick[- ]?up|delivery)\b.{0,40}\b(move|moved|shifted|shift|change|changed|complete|completed)\b.{0,32}\b(kar di|kar diya|ho gaya|ho gayi|hai)?|\b(duration|din)\b.{0,40}\b(barha|badha|extend|extended)\b.{0,32}\b(di hai|di gayi|diya|kar di|kar diya|ho gaya)\b|\b(gaari|gari|item|vehicle|car)\b.{0,40}\b(change|changed|replace|replaced)\b.{0,32}\b(kar di|kar diya|ho gayi|ho gaya)\b|\beverything\b.{0,40}\b(has been|have been|is|was)?\s*(updated|changed|completed|done|applied)\b|\b(change|request|booking\s+update|update)\b.{0,40}\b(has been|have been)?\s*(updated|completed|done|applied|complete)\b|\b(change apply ho gaya|request complete ho gayi|booking update ho chuki|pickup shift complete|car replace ho gayi|dates modify kar di)\b|\bi (have|ve|'ve)\s+(cancelled|canceled|extended|changed|updated|moved|rescheduled|replaced)\b|\b(maine|main ne)\b.{0,48}\b(cancel|extend|change|move|barha|badha|replace|update|modify)\b.{0,24}\b(kar di|kar diya|kar diye|hai)?/iu;
+  /\b(booking|reservation)\b.{0,48}\b(has been|have been|was|were|successfully)\b.{0,24}\b(cancelled|canceled|extended|changed|updated|rescheduled|modified|replaced)\b|\b(booking|reservation)\b.{0,40}\b(cancel|cancelled|canceled|extend|extended|update|updated|change|changed|modify|modified|replace|replaced)\b.{0,32}\b(ho gaya|ho gayi|ho chuka|ho chuki|kar di|kar diya|kar diye|complete|completed)\b|\b(cancel|cancelled|canceled)\b.{0,32}\b(complete|completed|ho gayi|ho gaya|ho chuki|ho chuka|kar di|kar diya)\b|\b(extend|extension)\b.{0,32}\b(ho gaya|ho gayi|ho chuka|kar diya|kar di|complete|completed)\b|\b(\d+\s*din|do\s*din|\d+\s*day)\b.{0,40}\b(aur\s+)?(add|extend|barha|badha)\b.{0,32}\b(kar di|kar diye|kar diya|ho gaye|ho gaya|ho gayi|hain)\b|\b(dates?|date)\b.{0,40}\b(change|changed|update|updated|move|moved|shift|shifted|modify|modified)\b.{0,32}\b(ho chuki|ho chuka|ho gayi|ho gaya|kar di|kar diya|kar di gayi|hain)\b|\b(pickup|pick[- ]?up|delivery)\b.{0,40}\b(move|moved|shift|shifted|change|changed|complete|completed)\b.{0,32}\b(kar di|kar diya|ho gaya|ho gayi|hai)?|\b(duration|din)\b.{0,40}\b(barha|badha|extend|extended)\b.{0,32}\b(di hai|di gayi|diya|kar di|kar diya|ho gaya)\b|\b(gaari|gari|item|vehicle|car)\b.{0,40}\b(change|changed|replace|replaced)\b.{0,32}\b(kar di|kar diya|ho gayi|ho gaya)\b|\beverything\b.{0,40}\b(has been|have been|is|was)?\s*(updated|changed|completed|done|applied)\b|\b(change|request|booking\s+update|update)\b.{0,40}\b(has been|have been)?\s*(updated|completed|done|applied|complete)\b|\b(change apply ho gaya|request complete ho gayi|booking update ho chuki|pickup shift complete|car replace ho gayi|dates modify kar di)\b|\bi (have|ve|'ve)\s+(cancelled|canceled|extended|changed|updated|moved|rescheduled|replaced)\b|\b(maine|main ne)\b.{0,48}\b(cancel|extend|change|move|barha|badha|replace|update|modify)\b.{0,24}\b(kar di|kar diya|kar diye|hai)?/iu;
 
 /** Negated / incomplete change wording must not trip the mutation guard. */
 const MUTATION_COMPLETION_NEGATED_RE =
@@ -57,6 +57,7 @@ function looksLikeUnverifiedBookingMutationCompletion(text) {
   if (MUTATION_COMPLETION_NEGATED_RE.test(raw)) return false;
   if (BOOKING_MUTATION_SUCCESS_CLAIM_RE.test(raw)) return true;
   const lower = raw.toLowerCase();
+  // Require a mutation *action* word — not mere status nouns like "booking".
   const hasMutationAction =
     /\b(cancel|cancelled|canceled|extend|extended|extension|reschedule|rescheduled|modify|modified|replace|replaced|shift|shifted|apply|applied|barha|badha|update|updated|change|changed)\b/i.test(
       raw
@@ -86,12 +87,24 @@ const ROMAN_URDU_REPLY_CUE =
 const ENGLISH_REPLY_CUE =
   /\b(the|is|are|please|available|checking|check|for|two|days|will|confirm|once|ready|total|price|book|it|yes)\b/i;
 
+/**
+ * @param {string} customerLang
+ * @param {string} replyLang
+ * @returns {boolean}
+ */
 function isClearLanguageMismatch(customerLang, replyLang) {
+  // Clear English customers must get English (not Roman Urdu / RU-dominant mixed).
   if (customerLang === "english" && replyLang !== "english") return true;
+  // Clear Roman Urdu customers must not get English-only replies.
   if (customerLang === "roman_urdu" && replyLang === "english") return true;
   return false;
 }
 
+/**
+ * @param {string} replyText
+ * @param {string} declaredStyle
+ * @returns {"english"|"roman_urdu"|"mixed"}
+ */
 function inferReplyLanguageFromText(replyText, declaredStyle) {
   const text = String(replyText ?? "").trim();
   const hasRu = ROMAN_URDU_REPLY_CUE.test(text);
@@ -125,7 +138,7 @@ function hasExplicitValue(value) {
   return typeof value !== "string" || value.trim() !== "";
 }
 
-/** Missing and empty values stay missing; an explicit numeric zero stays zero. */
+/** Missing and empty values stay missing; explicit numeric zero stays zero. */
 function finiteNumberOrNull(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === "number") {
@@ -255,6 +268,11 @@ function catalogItemIdentityTokens(row) {
     );
 }
 
+/**
+ * Resolve every confidently explicit catalog item in a generated reply.
+ * Exact full labels/aliases and catalog-unique identity tokens are authoritative.
+ * Conservative fuzzy matching contributes only when it resolves one unambiguous item.
+ */
 function resolveExplicitReplyItemIds(replyText, catalogItems) {
   const normalizedReply = normalizeItemLabel(replyText);
   if (!normalizedReply || !Array.isArray(catalogItems) || catalogItems.length === 0) {
@@ -301,6 +319,10 @@ function resolveExplicitReplyItemIds(replyText, catalogItems) {
   return resolvedIds;
 }
 
+/**
+ * Extract every explicit day-duration claim from generated customer wording.
+ * This is deliberately guard-local; it does not change booking-flow parsing.
+ */
 function extractExplicitReplyDurationDays(replyText) {
   const text = String(replyText ?? "");
   const durations = [];
@@ -683,7 +705,10 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
   const mismatchedAmount = amounts.find(
     (amount) => !verifiedAmounts.includes(amount)
   );
-  if (amounts.length > 0 && (verifiedAmounts.length === 0 || mismatchedAmount != null)) {
+  if (
+    amounts.length > 0 &&
+    (verifiedAmounts.length === 0 || mismatchedAmount != null)
+  ) {
     logVerifiedPriceMismatchDiagnostic({
       mismatchSource: "reply_text",
       mismatchField: "explicitMoneyAmount",
@@ -725,6 +750,12 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
   return { ok: true };
 }
 
+/**
+ * @param {string} replyText
+ * @param {Record<string, unknown>} contract
+ * @param {{ claims?: string[], languageStyle?: string, containsTimingPromise?: boolean, exposesInternalProcess?: boolean } | null} semantics
+ * @returns {{ ok: boolean, reason?: string }}
+ */
 export function validateCustomerReplyAgainstContract(
   replyText,
   contract,
@@ -856,6 +887,7 @@ export function validateCustomerReplyAgainstContract(
   )
     .trim()
     .toLowerCase();
+  // Do not trust model-declared mutationIntent alone — scan reply text.
   if (
     mutationExecutionStatus !== "succeeded" &&
     looksLikeUnverifiedBookingMutationCompletion(text)
@@ -919,6 +951,10 @@ export function validateCustomerReplyAgainstContract(
   return { ok: true };
 }
 
+/**
+ * @param {string} reason
+ * @returns {string}
+ */
 export function buildCustomerReplyGuardCorrection(reason) {
   return `CORRECTION: Your previous customer reply failed validation (${reason}).
 Use ONLY verified customer-safe facts.
