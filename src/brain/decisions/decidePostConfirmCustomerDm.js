@@ -278,6 +278,73 @@ export function applyPostConfirmAntiEchoAndSilence(decision, _userMessage) {
 }
 
 /**
+ * First-pass silence/empty-ack on non-empty customer text may be semantic drift.
+ * One same-lane corrective regeneration is allowed — not a keyword classifier.
+ * Non-empty social replies (e.g. chit_chat with wording) are not treated as drift.
+ * @param {Record<string, unknown> | null | undefined} decision
+ * @param {string} userMessage
+ */
+export function isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(
+  decision,
+  userMessage
+) {
+  if (!cleanCustomerReply(userMessage)) return false;
+  const d = decision && typeof decision === "object" ? decision : {};
+  const action = cleanAction(d.action);
+  const reply = cleanCustomerReply(d.customerReply);
+  if (action === "silence" || d.shouldReply === false || !reply) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @param {Record<string, unknown>} firstDecision
+ * @param {string} userMessage
+ * @param {string} lastEmily
+ */
+function buildPostConfirmSuspiciousSilenceCorrection(
+  firstDecision,
+  userMessage,
+  lastEmily
+) {
+  const compact = {
+    situation: firstDecision?.situation ?? null,
+    conversationAct: firstDecision?.conversationAct ?? null,
+    customerIntent: firstDecision?.customerIntent ?? null,
+    shouldReply: firstDecision?.shouldReply === true,
+    action: firstDecision?.action ?? null,
+    bookingSelectionMode: firstDecision?.bookingSelectionMode ?? null,
+    selectedBookingIndex: firstDecision?.selectedBookingIndex ?? null,
+    customerReply: firstDecision?.customerReply ?? "",
+  };
+  return [
+    "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — not a second classifier).",
+    "The previous structured decision treated the customer turn as acknowledgement/silence,",
+    "but the customer sent non-empty text.",
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    `Immediately preceding assistant message: ${clean(lastEmily, 500) || "(none)"}`,
+    `Previous decision (invalid/suspicious): ${JSON.stringify(compact)}`,
+    "Rules:",
+    "- Silence is valid ONLY for a purely social acknowledgement with no question, request, concern, or requested information.",
+    "- When the customer asks anything about the booking, answer naturally from VERIFIED_FACTS_JSON with action=reply, shouldReply=true, and a non-empty customerReply.",
+    "- For read-only informational questions with a trusted bookingFocus, use bookingSelectionMode=focused (or leave none — the system may apply trusted focus).",
+    "- Never invent amounts, dates, policies, or booking mutations. Strict JSON only.",
+  ].join("\n");
+}
+
+function isTransientPostConfirmOpenAiFailureReason(reason) {
+  const r = clean(reason, 160);
+  return (
+    r === "MISSING_OPENAI_API_KEY_OR_INJECTOR" ||
+    r.includes("TIMEOUT") ||
+    r.includes("OPENAI_ERROR") ||
+    r.includes("ECONN") ||
+    r.includes("fetch failed")
+  );
+}
+
+/**
  * Near-echo is a contract violation (regen), not deterministic silence.
  * @param {string} userMessage
  * @param {string} reply
@@ -623,6 +690,40 @@ function validateAllCandidateReplyGrounding({
   return { ok: true };
 }
 
+/**
+ * Read-only informational turn (not a booking mutation / pending AVR action).
+ * Uses structured decision fields only — never customer-text keywords.
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+function isPostConfirmReadOnlyInformationalDecision(decision) {
+  const action = cleanAction(decision?.action);
+  if (
+    action === "request_booking_mutation" ||
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability"
+  ) {
+    return false;
+  }
+  return (
+    decision?.conversationAct === "information_request" ||
+    decision?.customerIntent === "ask_fact" ||
+    decision?.customerIntent === "ask_action" ||
+    decision?.customerIsAskingQuestion === true ||
+    action === "reply"
+  );
+}
+
+/**
+ * Trusted MATCHED_TRUSTED_FOCUS evidence already on facts.
+ * @param {Record<string, unknown> | null | undefined} facts
+ */
+function hasTrustedPostConfirmBookingFocus(facts) {
+  const focus = facts?.bookingFocus;
+  if (!focus || typeof focus !== "object") return false;
+  if (clean(focus.confidence, 40).toLowerCase() !== "trusted") return false;
+  return positiveIntegerOrNull(focus.selectedBookingIndex) != null;
+}
+
 export function resolvePostConfirmBookingSelection(decision, facts) {
   const candidates = bookingCandidatesForFacts(facts);
   const mode = cleanBookingSelectionMode(decision?.bookingSelectionMode);
@@ -687,10 +788,23 @@ export function resolvePostConfirmBookingSelection(decision, facts) {
   }
 
   let selectedIndex = null;
+  let resolvedMode = mode;
   if (mode === "candidate") {
     selectedIndex = requestedIndex;
   } else if (mode === "focused") {
     selectedIndex = focusIndex ?? (candidates.length === 1 ? 1 : null);
+  } else if (
+    mode === "none" &&
+    hasTrustedPostConfirmBookingFocus(facts) &&
+    focusIndex != null &&
+    !mutationRequested &&
+    !pendingAvailabilityAction &&
+    isPostConfirmReadOnlyInformationalDecision(decision)
+  ) {
+    // System already resolved MATCHED_TRUSTED_FOCUS — do not require the model
+    // to echo bookingSelectionMode=focused for read-only informational turns.
+    selectedIndex = focusIndex;
+    resolvedMode = "focused";
   } else if (
     candidates.length === 1 &&
     mode === "none" &&
@@ -707,7 +821,7 @@ export function resolvePostConfirmBookingSelection(decision, facts) {
       return {
         ok: false,
         reason: "indistinguishable_booking_candidates",
-        mode,
+        mode: resolvedMode,
         selectedBookingIndex: null,
         booking: null,
         bookings: [],
@@ -721,7 +835,7 @@ export function resolvePostConfirmBookingSelection(decision, facts) {
       return {
         ok: false,
         reason: "invalid_or_stale_booking_selection",
-        mode,
+        mode: resolvedMode,
         selectedBookingIndex: selectedIndex,
         booking: null,
         bookings: [],
@@ -730,7 +844,7 @@ export function resolvePostConfirmBookingSelection(decision, facts) {
     return {
       ok: true,
       reason: "SELECTED",
-      mode,
+      mode: resolvedMode,
       selectedBookingIndex: selectedIndex,
       booking,
       bookings: [booking],
@@ -1235,6 +1349,15 @@ export async function executePostConfirmPaLaneDecision({
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 1200);
+  const lastEmilyMatch = String(conversationHistory ?? "").match(
+    /(?:Assistant|Emily)\s*:\s*([^\n]+)/gi
+  );
+  const lastEmily = lastEmilyMatch?.length
+    ? String(lastEmilyMatch[lastEmilyMatch.length - 1])
+        .replace(/^(?:Assistant|Emily)\s*:\s*/i, "")
+        .trim()
+        .slice(0, 500)
+    : "";
   const factsJson = compactPostConfirmFactsForPrompt(facts);
   const loopOn = missingInfoLoopFullyEnabled === true;
 
@@ -1562,16 +1685,27 @@ STRICT SAFETY:
       decision: stripInternalReplySemantics(defaultDecision()),
       source: "technical_fallback",
       reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+      retryable: true,
+      silenceRecoveryAttempts: 0,
     };
   }
 
   try {
     let lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+    /** @type {Record<string, unknown> | null} */
+    let lastSuspiciousDecision = null;
+    let silenceRecoveryAttempts = 0;
     for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
       const userContent =
         attempt === 1
           ? `${userPayload}\n\nRemember: JSON only; never mirror the customer; silence ok for farewells; social 'no' is decline_more_help not clarification; never escalate acknowledgements; only verified facts.`
-          : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
+          : lastReason === "SUSPICIOUS_SILENCE_ON_NONEMPTY_CUSTOMER_TEXT"
+            ? `${userPayload}\n\n${buildPostConfirmSuspiciousSilenceCorrection(
+                lastSuspiciousDecision || {},
+                userLine,
+                lastEmily
+              )}`
+            : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
       const createPromise = Promise.resolve(
         completionFn({
           model: resolveOpenAiChatModel(),
@@ -1615,6 +1749,9 @@ STRICT SAFETY:
           decision: stripInternalReplySemantics(defaultDecision()),
           source: "technical_fallback",
           reason: lastReason,
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
         };
       }
 
@@ -1658,6 +1795,9 @@ STRICT SAFETY:
           decision: stripInternalReplySemantics(defaultDecision()),
           source: "technical_fallback",
           reason: lastReason,
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
         };
       }
       finalized.bookingSelectionMode = bookingSelection.mode;
@@ -1666,6 +1806,23 @@ STRICT SAFETY:
       finalized.selectedBookingId = bookingSelection.booking?.id ?? null;
 
       const replyText = cleanCustomerReply(finalized?.customerReply);
+      if (
+        finalized.shouldReply === true &&
+        finalized.action !== "silence" &&
+        !replyText
+      ) {
+        lastReason = "customer_reply_required_but_empty";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: lastReason,
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
       if (isPostConfirmNearEchoViolation(userLine, replyText, finalized)) {
         lastReason = "near_echo_reply";
         if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
@@ -1674,6 +1831,9 @@ STRICT SAFETY:
           decision: stripInternalReplySemantics(defaultDecision()),
           source: "technical_fallback",
           reason: lastReason,
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
         };
       }
       const replyRequired =
@@ -1707,6 +1867,9 @@ STRICT SAFETY:
             decision: stripInternalReplySemantics(defaultDecision()),
             source: "technical_fallback",
             reason: lastReason,
+            retryable: false,
+            silenceRecoveryAttempts,
+            contentSafetyAttempts: attempt,
           };
         }
       }
@@ -1775,13 +1938,29 @@ STRICT SAFETY:
           decision: stripInternalReplySemantics(defaultDecision()),
           source: "technical_fallback",
           reason: lastReason,
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
         };
+      }
+
+      // One same-Brain corrective regeneration for ack/silence on non-empty text.
+      if (
+        attempt === 1 &&
+        isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(finalized, userLine)
+      ) {
+        lastReason = "SUSPICIOUS_SILENCE_ON_NONEMPTY_CUSTOMER_TEXT";
+        lastSuspiciousDecision = finalized;
+        silenceRecoveryAttempts = 1;
+        continue;
       }
 
       return {
         ok: true,
         decision: stripInternalReplySemantics(finalized),
         source: "openai",
+        silenceRecoveryAttempts,
+        contentSafetyAttempts: attempt,
       };
     }
     return {
@@ -1789,13 +1968,19 @@ STRICT SAFETY:
       decision: stripInternalReplySemantics(defaultDecision()),
       source: "technical_fallback",
       reason: lastReason,
+      retryable: false,
+      silenceRecoveryAttempts,
+      contentSafetyAttempts: MAX_CUSTOMER_REPLY_ATTEMPTS,
     };
   } catch (err) {
+    const reason = String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160);
     return {
       ok: false,
       decision: stripInternalReplySemantics(defaultDecision()),
       source: "technical_fallback",
-      reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
+      reason,
+      retryable: isTransientPostConfirmOpenAiFailureReason(reason),
+      silenceRecoveryAttempts: 0,
     };
   }
 }

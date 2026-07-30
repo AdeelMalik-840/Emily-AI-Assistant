@@ -108,20 +108,27 @@ export async function handleCustomerBusinessPaInbound({
   });
 
   if (decided?.ok !== true || decided?.source !== "openai") {
+    const retryable = decided?.retryable === true;
     return {
       handled: true,
-      action: "business_pa_retryable_failure",
+      action: retryable
+        ? "business_pa_retryable_failure"
+        : "business_pa_terminal_model_failure",
       reply: "",
       sentReply: false,
       bookingId: clean(facts.booking?.id) || null,
       availabilityRequestId:
         clean(facts.booking?.availabilityRequestId) || null,
-      reason: "OPENAI_POST_CONFIRM_FAILED",
-      retryable: true,
+      reason: retryable
+        ? "OPENAI_POST_CONFIRM_FAILED"
+        : "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
+      retryable,
+      terminalFailure: !retryable,
       openaiUsed: false,
       openaiSource: decided?.source ?? "technical_fallback",
       finalReplySource: "openai_post_confirm_pa",
       failureReason: clean(decided?.reason, 160) || "OPENAI_POST_CONFIRM_FAILED",
+      silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
     };
   }
 
@@ -244,15 +251,21 @@ export async function handleCustomerBusinessPaInbound({
       __chatCompletionsCreateForTests,
     });
     if (finalDecision?.ok !== true || finalDecision?.source !== "openai") {
+      const retryable = finalDecision?.retryable === true;
       return {
         handled: true,
-        action: "business_pa_retryable_failure",
+        action: retryable
+          ? "business_pa_retryable_failure"
+          : "business_pa_terminal_model_failure",
         reply: "",
         sentReply: false,
         bookingId: clean(facts.booking?.id) || null,
         availabilityRequestId: selected?.requestId ?? null,
-        reason: "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED",
-        retryable: true,
+        reason: retryable
+          ? "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED"
+          : "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
+        retryable,
+        terminalFailure: !retryable,
         openaiUsed: false,
         openaiSource: finalDecision?.source ?? "technical_fallback",
         finalReplySource: "openai_post_confirm_pa",
@@ -260,6 +273,8 @@ export async function handleCustomerBusinessPaInbound({
           clean(finalDecision?.reason, 160) ||
           "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED",
         pendingAvailabilityExecution,
+        silenceRecoveryAttempts:
+          Number(finalDecision?.silenceRecoveryAttempts ?? 0) || 0,
       };
     }
     decision = finalDecision.decision;
@@ -342,6 +357,9 @@ export async function handleCustomerBusinessPaInbound({
     missingInfoRequestId: null,
     missingInfoType: null,
     ownerNotifyStatus: null,
+    silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+    retryable: false,
+    terminalFailure: false,
   };
 }
 
