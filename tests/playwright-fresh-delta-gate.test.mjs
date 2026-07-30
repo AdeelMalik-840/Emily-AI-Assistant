@@ -428,7 +428,7 @@ test("D: catch-up admits fresh row after anchor", () => {
   assert.equal(survivors.length, 1);
 });
 
-test("E: burst merge meaningful row + continuation (guarantee-first)", () => {
+test("E: distinct WHATSAPP_DATA_ID rows stay independent (guarantee-first)", () => {
   clearPlaywrightExtractedMessageState();
   process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
   process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
@@ -460,7 +460,7 @@ test("E: burst merge meaningful row + continuation (guarantee-first)", () => {
       currentFreshAdmittedStableIds instanceof Set
         ? currentFreshAdmittedStableIds
         : new Set(survivors.map((row) => buildStableMessageKey(row, sorted).id));
-    const merged = buildParticipantForwardCandidate({
+    const candidate = buildParticipantForwardCandidate({
       participantMessages: survivors,
       allParticipantUserRows: userRows,
       lastProcessedUserMsgId: "",
@@ -472,9 +472,10 @@ test("E: burst merge meaningful row + continuation (guarantee-first)", () => {
       tickFirstSeenByStableId: st.tickFirstSeenByStableId,
       currentFreshAdmittedStableIds: admittedIds,
     });
-    assert.ok(merged);
-    assert.equal(Boolean(merged.__burstMerged), true);
-    assert.equal(merged.__burstMergedCount, 2);
+    assert.ok(candidate);
+    assert.equal(Boolean(candidate.__burstMerged), false);
+    assert.equal(candidate.text, "Corolla available");
+    assert.doesNotMatch(String(candidate.text), /picture bhej do/i);
   } finally {
     process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "false";
   }

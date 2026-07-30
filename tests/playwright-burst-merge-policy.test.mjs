@@ -140,6 +140,10 @@ test("guarantee-first forward candidate returns Civic alone when Corolla follows
     dataId: "false_corolla@c.us",
   });
   const sorted = [civic, corolla];
+  const admitted = new Set([
+    `wa::${civic.id._serialized}`,
+    `wa::${corolla.id._serialized}`,
+  ]);
   const candidate = buildParticipantForwardCandidate({
     participantMessages: sorted,
     allParticipantUserRows: sorted,
@@ -149,6 +153,7 @@ test("guarantee-first forward candidate returns Civic alone when Corolla follows
     sorted,
     normalizedGroupChatKeyForCompare: CHAT,
     catalogItems: CATALOG,
+    currentFreshAdmittedStableIds: admitted,
   });
   assert.match(candidate.text, /Civic available/i);
   assert.doesNotMatch(candidate.text, /Corolla/i);

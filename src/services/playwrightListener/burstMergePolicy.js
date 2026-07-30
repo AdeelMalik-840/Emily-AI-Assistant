@@ -95,6 +95,35 @@ function tokensOverlap(tokensA, tokensB) {
 }
 
 /**
+ * Durable WhatsApp Web data-id from an extracted row (not synthetic fallbacks).
+ * @param {object | null | undefined} row
+ * @returns {string}
+ */
+export function resolveDurableWhatsAppDataId(row) {
+  const fromId =
+    row?.id?._serialized ||
+    row?._data?.id?._serialized ||
+    row?.id?.id ||
+    row?._data?.id?.id;
+  if (fromId != null && String(fromId).trim() !== "") {
+    return String(fromId).trim();
+  }
+  const direct = String(row?.dataId ?? "").trim();
+  return direct || "";
+}
+
+/**
+ * Two rows with different real WhatsApp data-ids are independent turns.
+ * @param {object | null | undefined} rowA
+ * @param {object | null | undefined} rowB
+ */
+export function hasDistinctDurableWhatsAppIds(rowA, rowB) {
+  const a = resolveDurableWhatsAppDataId(rowA);
+  const b = resolveDurableWhatsAppDataId(rowB);
+  return Boolean(a && b && a !== b);
+}
+
+/**
  * Whether two adjacent participant rows may be burst-merged.
  * @param {object | null | undefined} rowA
  * @param {object | null | undefined} rowB
@@ -107,6 +136,12 @@ export function canMergeBurstRowPair(rowA, rowB, catalogItems = []) {
 
   if (isBurstMergeContinuationText(textB) || isPunctuationOnlyBurstText(textB)) {
     return true;
+  }
+
+  // Distinct real WhatsApp IDs are independent admitted turns — never merge
+  // meaningful bodies together (punctuation continuations handled above).
+  if (hasDistinctDurableWhatsAppIds(rowA, rowB)) {
+    return false;
   }
 
   const items = Array.isArray(catalogItems) ? catalogItems : [];
@@ -143,6 +178,11 @@ export function canMergeBurstRowPair(rowA, rowB, catalogItems = []) {
  * @param {unknown[]} [catalogItems]
  */
 export function shouldBurstSupersedeOlderRow(olderRow, newerRow, catalogItems = []) {
+  // Never drop an older durable WhatsApp ID in favor of a newer distinct one.
+  if (hasDistinctDurableWhatsAppIds(olderRow, newerRow)) {
+    return false;
+  }
+
   if (canMergeBurstRowPair(olderRow, newerRow, catalogItems)) return true;
 
   const textA = String(olderRow?.text ?? "").trim();
