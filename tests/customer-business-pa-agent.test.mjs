@@ -341,24 +341,47 @@ test("ambiguous active bookings → same OpenAI lane owns safe clarification", a
   });
 });
 
-test("cancelled/completed booking → PA not handled", async () => {
-  const fake = createFakeDb();
-  fake.seedBooking(
+test("booking continuity has no one-hour timeout and ends for every terminal status", async () => {
+  const active = createFakeDb();
+  active.seedBooking(
     BUSINESS_ID,
     BOOKING_ID,
-    baseApprovedBooking({ status: "cancelled" })
+    baseApprovedBooking({
+      createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      updatedAt: new Date(Date.now() - 90 * 60 * 1000),
+    })
   );
-  await withFlag(true, async () => {
-    const result = await handleCustomerBusinessPaInbound({
-      db: fake.db,
+  const activeResolved = await resolveActiveCustomerBookingFacts({
+    db: active.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+  });
+  assert.equal(activeResolved.ok, true);
+  assert.equal(activeResolved.reason, "MATCHED");
+
+  for (const status of [
+    "cancelled",
+    "canceled",
+    "completed",
+    "closed",
+    "expired",
+    "rejected",
+    "declined",
+  ]) {
+    const terminal = createFakeDb();
+    terminal.seedBooking(
+      BUSINESS_ID,
+      `${BOOKING_ID}-${status}`,
+      baseApprovedBooking({ id: `${BOOKING_ID}-${status}`, status })
+    );
+    const resolved = await resolveActiveCustomerBookingFacts({
+      db: terminal.db,
       businessId: BUSINESS_ID,
       customerPhone: CUSTOMER_PHONE,
-      messageText: "Advance kitna?",
-      sendWhatsAppMessageFn: async () => ({ ok: true }),
-      __chatCompletionsCreateForTests: mockOpenAiReply("x"),
     });
-    assert.equal(result.handled, false);
-  });
+    assert.equal(resolved.ok, false, status);
+    assert.equal(resolved.reason, "NO_ACTIVE_BOOKING", status);
+  }
 });
 
 test("same phone other business → no match", async () => {

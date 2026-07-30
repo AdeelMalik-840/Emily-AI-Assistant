@@ -47,8 +47,12 @@ import { normalizePhoneE164 } from "./connections.js";
  *   retryCount?: number,
  *   nextRetryAt?: number | null,
  *   cloudRecoveryContext?: Record<string, unknown> | null,
+ *   cloudOwnershipQueue?: Record<string, unknown> | null,
+ *   cloudOriginalClaimOwner?: string | null,
  *   providerOutboundMessageId?: string | null,
  *   processingOwner?: string | null,
+ *   terminalAt?: number | null,
+ *   terminalReason?: string | null,
  *   manualReviewAlert?: Record<string, unknown> | null,
  *   updatedAt: number,
  * }} InboundTurnLedgerEntry */
@@ -1260,6 +1264,12 @@ export function buildCloudInboundLifecycleIdentity({
   };
 }
 
+export function getCloudInboundProcessingLeaseExpiresAt(entry) {
+  const started = Number(entry?.processingAt ?? entry?.updatedAt ?? 0);
+  if (!Number.isFinite(started) || started <= 0) return null;
+  return started + PROCESSING_STALE_MS + 1;
+}
+
 /**
  * Claim one Cloud post-confirm turn in the existing durable ledger.
  * Live non-stale processing leases cannot be stolen by recovery or duplicates.
@@ -1270,6 +1280,7 @@ export function claimCloudInboundTurn({
   messageId,
   recoveryContext,
   resumeProcessing = false,
+  resumeQueuedOwnership = false,
   provisionalOwnership = false,
   claimOwner = null,
 } = {}) {
@@ -1307,24 +1318,76 @@ export function claimCloudInboundTurn({
       entry: existing,
     };
   }
+  if (
+    existing?.state === "failed" &&
+    existing?.autoRetryAllowed === false &&
+    Number(existing?.terminalAt ?? 0) > 0
+  ) {
+    return {
+      claimed: false,
+      action: "terminal",
+      reason:
+        String(existing?.terminalReason ?? "").trim() ||
+        "cloud_terminal_failure",
+      identity,
+      entry: existing,
+    };
+  }
 
   const now = Date.now();
   const owner = String(claimOwner ?? "").trim() || `cloud-claim:${randomUUID()}`;
+  const queuedOwnership =
+    existing?.cloudOwnershipQueue &&
+    typeof existing.cloudOwnershipQueue === "object"
+      ? existing.cloudOwnershipQueue
+      : null;
+  const queuedOwnershipResume =
+    resumeQueuedOwnership === true &&
+    queuedOwnership?.mode === "cloud_post_confirm_ownership_queue" &&
+    queuedOwnership?.status === "queued" &&
+    String(queuedOwnership?.claimOwner ?? "").trim() === owner;
+  const queuedOwnershipRetryResume =
+    resumeProcessing === true &&
+    resumeQueuedOwnership !== true &&
+    queuedOwnership?.mode === "cloud_post_confirm_ownership_queue" &&
+    queuedOwnership?.status === "retryable" &&
+    String(queuedOwnership?.claimOwner ?? "").trim() === owner;
+  if (resumeQueuedOwnership === true && !queuedOwnershipResume) {
+    return {
+      claimed: false,
+      action: "processing",
+      reason: "queued_ownership_marker_unavailable",
+      identity,
+      entry: existing,
+    };
+  }
+  if (
+    existing?.state === "failed" &&
+    queuedOwnership?.mode === "cloud_post_confirm_ownership_queue" &&
+    queuedOwnership?.status === "retryable" &&
+    !queuedOwnershipRetryResume
+  ) {
+    return {
+      claimed: false,
+      action: "processing",
+      reason: "queued_ownership_retry_owner_mismatch",
+      identity,
+      entry: existing,
+    };
+  }
   if (existing?.state === "processing") {
     const started = Number(existing.processingAt ?? existing.updatedAt ?? 0);
     const leaseFresh =
       Number.isFinite(started) && now - started <= PROCESSING_STALE_MS;
-    const existingOwner = String(existing.processingOwner ?? "").trim();
-    const sameOwner = Boolean(existingOwner) && existingOwner === owner;
     if (leaseFresh) {
-      // Live lease: only the same owner may resume; recovery/duplicates must wait.
-      if (!(resumeProcessing === true && sameOwner)) {
+      // The explicit queued -> resuming token is the only operation allowed to
+      // cross a fresh processing lease. Every tokenless recovery waits, even
+      // when it carries the same original owner.
+      if (!queuedOwnershipResume) {
         return {
           claimed: false,
           action: "processing",
-          reason: sameOwner
-            ? "processing_lease_held"
-            : "processing_lease_held",
+          reason: "processing_lease_held",
           identity,
           entry: existing,
         };
@@ -1335,6 +1398,8 @@ export function claimCloudInboundTurn({
   const sourceKind =
     existing?.sourceKind === "cloud_post_confirm_pa"
       ? "cloud_post_confirm_pa"
+      : existing?.sourceKind === "cloud_normal_routing"
+        ? "cloud_normal_routing"
       : provisionalOwnership === true
         ? "cloud_dm_ownership_probe"
         : "cloud_post_confirm_pa";
@@ -1370,6 +1435,20 @@ export function claimCloudInboundTurn({
       nextRetryAt: null,
       textPreview: context.messageText.slice(0, 120),
       cloudRecoveryContext: context,
+      cloudOwnershipQueue:
+        queuedOwnershipResume || queuedOwnershipRetryResume
+        ? {
+            ...queuedOwnership,
+            status: "resuming",
+            resumedAt: now,
+          }
+        : queuedOwnership,
+      cloudOriginalClaimOwner:
+        String(
+          existing?.cloudOriginalClaimOwner ??
+            queuedOwnership?.claimOwner ??
+            owner
+        ).trim() || owner,
     },
     true
   );
@@ -1398,6 +1477,110 @@ export function markCloudInboundTurnPostConfirmOwned({ identity } = {}) {
     {
       ...existing,
       sourceKind: "cloud_post_confirm_pa",
+      cloudOriginalClaimOwner:
+        String(
+          existing.cloudOriginalClaimOwner ??
+            existing.cloudOwnershipQueue?.claimOwner ??
+            existing.processingOwner ??
+            ""
+        ).trim() || null,
+      cloudOwnershipQueue: null,
+    },
+    true
+  );
+}
+
+export function markCloudInboundTurnNormalRouting({
+  identity,
+  bookingResolutionReason = null,
+} = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return null;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  if (!existing || existing.state === "done") return existing ?? null;
+  return upsertEntry(
+    key,
+    {
+      ...existing,
+      sourceKind: "cloud_normal_routing",
+      cloudOriginalClaimOwner:
+        String(
+          existing.cloudOriginalClaimOwner ??
+            existing.cloudOwnershipQueue?.claimOwner ??
+            existing.processingOwner ??
+            ""
+        ).trim() || null,
+      cloudOwnershipQueue: null,
+      cloudNormalRouting: {
+        status: "processing",
+        startedAt: Date.now(),
+        bookingResolutionReason:
+          String(bookingResolutionReason ?? "").trim().slice(0, 160) || null,
+      },
+    },
+    true
+  );
+}
+
+export function markCloudInboundTurnOwnershipQueued({
+  identity,
+  claimOwner,
+  businessId,
+  customerPhone,
+  messageId,
+  messageText,
+  latestBookingResolutionReason = null,
+} = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const guaranteeKey =
+    String(identity?.guaranteeKey ?? "").trim() ||
+    buildInboundTurnLedgerKey(chatKey, stableId);
+  const owner = String(claimOwner ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key || !guaranteeKey || !owner) return null;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  if (
+    !existing ||
+    existing.state !== "processing" ||
+    String(existing.processingOwner ?? "").trim() !== owner
+  ) {
+    return null;
+  }
+  const context =
+    existing.cloudRecoveryContext &&
+    typeof existing.cloudRecoveryContext === "object"
+      ? existing.cloudRecoveryContext
+      : {};
+  const queuedAt = Date.now();
+  return upsertEntry(
+    key,
+    {
+      ...existing,
+      cloudOwnershipQueue: {
+        mode: "cloud_post_confirm_ownership_queue",
+        status: "queued",
+        queuedAt,
+        providerMessageId: String(
+          messageId ?? context.messageId ?? ""
+        ).trim().slice(0, 300),
+        guaranteeKey,
+        claimOwner: owner,
+        businessId: String(
+          businessId ?? context.businessId ?? ""
+        ).trim().slice(0, 160),
+        customerPhone: canonicalCloudPhone(
+          customerPhone ?? context.customerPhone
+        ),
+        messageText: String(
+          messageText ?? context.messageText ?? ""
+        ).trim().slice(0, 4000),
+        latestBookingResolutionReason:
+          String(latestBookingResolutionReason ?? "").trim().slice(0, 160) ||
+          null,
+      },
     },
     true
   );
@@ -1419,6 +1602,7 @@ export function markCloudInboundTurnRetryableFailure({
   identity,
   lastError,
   retryDelayMs = 1000,
+  maxRetryCount = 5,
 } = {}) {
   const chatKey = String(identity?.chatKey ?? "").trim();
   const stableId = String(identity?.stableId ?? "").trim();
@@ -1429,6 +1613,18 @@ export function markCloudInboundTurnRetryableFailure({
     return existing ?? null;
   }
   const retryCount = Math.max(0, Number(existing.retryCount ?? 0)) + 1;
+  const max = Math.max(1, Number(maxRetryCount) || 5);
+  if (existing.state !== "outbound_locked" && retryCount > max) {
+    return markCloudInboundTurnTerminalTechnicalFailure({
+      identity,
+      lastError:
+        String(lastError ?? "cloud_processing_failed").slice(0, 120) ||
+        "cloud_processing_failed",
+      deliveryStatus: "cloud_retry_exhausted_manual_review",
+      terminalReason: "CLOUD_INBOUND_RETRY_EXHAUSTED",
+      retryCount,
+    });
+  }
   return upsertEntry(
     key,
     {
@@ -1440,6 +1636,13 @@ export function markCloudInboundTurnRetryableFailure({
       retryCount,
       nextRetryAt: Date.now() + Math.max(250, Number(retryDelayMs) || 1000),
       lastError: String(lastError ?? "cloud_processing_failed").slice(0, 160),
+      cloudOwnershipQueue: existing.cloudOwnershipQueue
+        ? {
+            ...existing.cloudOwnershipQueue,
+            status: "retryable",
+            retryableAt: Date.now(),
+          }
+        : null,
     },
     true
   );
@@ -1499,6 +1702,8 @@ export function markCloudInboundTurnTerminalTechnicalFailure({
   identity,
   lastError,
   deliveryStatus = "technical_failure",
+  terminalReason = null,
+  retryCount = null,
 } = {}) {
   const chatKey = String(identity?.chatKey ?? "").trim();
   const stableId = String(identity?.stableId ?? "").trim();
@@ -1508,6 +1713,11 @@ export function markCloudInboundTurnTerminalTechnicalFailure({
   if (!existing || existing.state === "done") {
     return existing ?? null;
   }
+  const terminalAt = Date.now();
+  const reason =
+    String(terminalReason ?? lastError ?? "cloud_technical_failure")
+      .trim()
+      .slice(0, 160) || "cloud_technical_failure";
   const next = upsertEntry(
     key,
     {
@@ -1520,8 +1730,24 @@ export function markCloudInboundTurnTerminalTechnicalFailure({
       recoveryClaimedAt: null,
       recoveryClaimOwner: null,
       nextRetryAt: null,
+      retryCount:
+        retryCount != null
+          ? Math.max(0, Number(retryCount) || 0)
+          : Math.max(0, Number(existing.retryCount ?? 0)),
       deliveryStatus: String(deliveryStatus ?? "technical_failure").slice(0, 80),
       lastError: String(lastError ?? "cloud_technical_failure").slice(0, 160),
+      terminalAt,
+      terminalReason: reason,
+      cloudOwnershipQueue:
+        existing.cloudOwnershipQueue &&
+        typeof existing.cloudOwnershipQueue === "object"
+          ? {
+              ...existing.cloudOwnershipQueue,
+              status: "terminal",
+              terminalAt,
+              terminalReason: reason,
+            }
+          : null,
     },
     true
   );
@@ -1537,6 +1763,7 @@ export function markCloudInboundTurnTerminalTechnicalFailure({
 export function markCloudInboundTurnDone({
   identity,
   replySent = true,
+  terminalOutcome = null,
 } = {}) {
   const chatKey = String(identity?.chatKey ?? "").trim();
   const stableId = String(identity?.stableId ?? "").trim();
@@ -1555,6 +1782,20 @@ export function markCloudInboundTurnDone({
       nextRetryAt: null,
       recoveryClaimedAt: null,
       recoveryClaimOwner: null,
+      cloudNormalRouting:
+        existing.sourceKind === "cloud_normal_routing"
+          ? {
+              ...(existing.cloudNormalRouting &&
+              typeof existing.cloudNormalRouting === "object"
+                ? existing.cloudNormalRouting
+                : {}),
+              status: "done",
+              completedAt: Date.now(),
+              terminalOutcome:
+                String(terminalOutcome ?? "").trim().slice(0, 120) ||
+                (replySent === false ? "intentional_silent" : "delivered"),
+            }
+          : existing.cloudNormalRouting ?? null,
     },
     true
   );
@@ -1600,7 +1841,8 @@ export function listRecoverableCloudInboundTurns({
     .filter(
       (entry) =>
         entry?.sourceKind === "cloud_post_confirm_pa" ||
-        entry?.sourceKind === "cloud_dm_ownership_probe"
+        entry?.sourceKind === "cloud_dm_ownership_probe" ||
+        entry?.sourceKind === "cloud_normal_routing"
     )
     .filter((entry) => entry.state !== "done")
     .filter((entry) => {
@@ -1611,13 +1853,30 @@ export function listRecoverableCloudInboundTurns({
       }
       if (entry.autoRetryAllowed === false) return false;
       if (entry.state === "processing") {
+        const queuedOwnership =
+          entry.cloudOwnershipQueue &&
+          typeof entry.cloudOwnershipQueue === "object"
+            ? entry.cloudOwnershipQueue
+            : null;
+        if (
+          queuedOwnership?.mode === "cloud_post_confirm_ownership_queue" &&
+          queuedOwnership?.status === "queued"
+        ) {
+          return true;
+        }
+        if (
+          queuedOwnership?.mode === "cloud_post_confirm_ownership_queue" &&
+          queuedOwnership?.status === "resuming"
+        ) {
+          return true;
+        }
         const started = Number(entry.processingAt ?? entry.updatedAt ?? 0);
         return (
           !Number.isFinite(started) ||
           Date.now() - started > PROCESSING_STALE_MS
         );
       }
-      return Number(entry.retryCount ?? 0) < max;
+      return Number(entry.retryCount ?? 0) <= max;
     })
     .map((entry) => ({ ...entry }));
 }
