@@ -11,6 +11,7 @@ const {
   compactPostConfirmFactsForPrompt,
   buildPostConfirmVerifiedItemMismatchCorrection,
   resolveTrustedFocusedBookingIdentity,
+  resolveTrustedFocusedBookingRow,
   finiteNumberOrNull,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
 
@@ -1559,6 +1560,119 @@ test("compact booking uses focused Stonic row even when facts.booking is Corolla
     "kia_stonic_ex_plus_2021_white_color_1df55684"
   );
   assert.equal(compact.availabilityRequest.requestedDuration, 4);
+});
+
+test("stale trusted focus index does not fall back to facts.booking", () => {
+  const facts = trustedStonicFocusFacts();
+  facts.bookingFocus = {
+    source: "latest_confirmed_linked_avr",
+    confidence: "trusted",
+    selectedBookingIndex: 99,
+    selectedBookingId: "booking-corolla",
+  };
+  facts.booking = {
+    id: "booking-corolla",
+    selectionIndex: 3,
+    status: "approved",
+    itemId: "toyota_corolla_metallic_grey_0e2cd610",
+    itemLabel: "Toyota corolla (Metallic Grey)",
+    durationDays: 9,
+    totalAmount: 99999,
+    dailyRate: 1111,
+    availabilityRequestId: "avr-corolla",
+  };
+  facts.availabilityRequest = {
+    id: "avr-corolla",
+    itemId: "toyota_corolla_metallic_grey_0e2cd610",
+    itemLabel: "Toyota corolla (Metallic Grey)",
+    requestedDuration: 9,
+    status: "approved",
+    priceQuote: { total: 99999, dailyRate: 1111 },
+  };
+  assert.equal(resolveTrustedFocusedBookingRow(facts), null);
+  assert.equal(resolveTrustedFocusedBookingIdentity(facts), null);
+  const compact = JSON.parse(compactPostConfirmFactsForPrompt(facts));
+  assert.equal(compact.bookingFocus, null);
+  assert.equal(compact.booking?.scope, undefined);
+  assert.ok(
+    !(compact.bookingCandidates || []).some(
+      (row) => row?.scope === "CURRENT_BOOKING_IN_SCOPE"
+    )
+  );
+  assert.doesNotMatch(
+    JSON.stringify(compact.booking || {}),
+    /CURRENT_BOOKING_IN_SCOPE/
+  );
+  assert.equal(compact.bookingFocus, null);
+  assert.doesNotMatch(
+    JSON.stringify({
+      bookingFocus: compact.bookingFocus,
+      scopes: (compact.bookingCandidates || []).map((row) => row?.scope),
+    }),
+    /CURRENT_BOOKING_IN_SCOPE/
+  );
+});
+
+test("valid single-booking trusted focus index 1 still resolves facts.booking candidate", () => {
+  const booking = {
+    id: "booking-only",
+    status: "approved",
+    itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+    itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+    durationDays: 4,
+    totalAmount: 22000,
+    dailyRate: 5500,
+    availabilityRequestId: "avr_f45af5f434e2f71cf33a1f2c",
+  };
+  const facts = {
+    businessId: BUSINESS_ID,
+    customerPhoneDigits: CUSTOMER_PHONE,
+    business: { name: "Emily Rentals", tone: "friendly" },
+    booking,
+    bookingCandidates: undefined,
+    bookingFocus: {
+      source: "latest_confirmed_linked_avr",
+      confidence: "trusted",
+      selectedBookingIndex: 1,
+      selectedBookingId: "booking-only",
+    },
+    activeBookings: [],
+    availabilityRequest: {
+      id: "avr_f45af5f434e2f71cf33a1f2c",
+      itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+      itemLabel: "Kia Stonic EX Plus 2021 (White Color)",
+      requestedDuration: 4,
+      status: "approved",
+      priceQuote: { total: 22000, dailyRate: 5500 },
+    },
+    known: {},
+    replyGuardFacts: { catalogItems: STONIC_FOCUS_CATALOG },
+    policy: { readOnly: true, doNotMutateBooking: true },
+  };
+  const row = resolveTrustedFocusedBookingRow(facts);
+  assert.equal(row?.id, "booking-only");
+  const identity = resolveTrustedFocusedBookingIdentity(facts);
+  assert.equal(identity?.itemId, "kia_stonic_ex_plus_2021_white_color_1df55684");
+  assert.equal(identity?.durationDays, 4);
+  const compact = JSON.parse(compactPostConfirmFactsForPrompt(facts));
+  assert.equal(compact.booking.scope, "CURRENT_BOOKING_IN_SCOPE");
+  assert.equal(compact.bookingFocus.bookingId, "booking-only");
+  assert.equal(compact.bookingFocus.durationDays, 4);
+});
+
+test("valid Stonic candidate trusted focus still works after stale-index fail-closed", () => {
+  const facts = trustedStonicFocusFacts();
+  const row = resolveTrustedFocusedBookingRow(facts);
+  assert.equal(row?.id, "CdqHuG0ZJpIZW3DDPlbI");
+  const identity = resolveTrustedFocusedBookingIdentity(facts);
+  assert.equal(
+    identity?.itemId,
+    "kia_stonic_ex_plus_2021_white_color_1df55684"
+  );
+  const compact = JSON.parse(compactPostConfirmFactsForPrompt(facts));
+  assert.equal(compact.booking.scope, "CURRENT_BOOKING_IN_SCOPE");
+  assert.equal(compact.bookingFocus.selectedBookingIndex, 1);
+  assert.equal(compact.bookingFocus.totalAmount, 22000);
 });
 
 test("verified_item_mismatch correction pins trusted Stonic identity", () => {

@@ -437,15 +437,13 @@ export function resolveTrustedFocusedBookingRow(facts) {
   );
   if (focusIndex == null) return null;
   const candidates = bookingCandidatesForFacts(facts);
-  const fromCandidates =
+  // Fail closed: never substitute facts.booking for a stale/missing focus index.
+  // bookingCandidatesForFacts already surfaces a lone facts.booking as index 1.
+  return (
     candidates.find(
       (row) => positiveIntegerOrNull(row?.selectionIndex) === focusIndex
-    ) ?? null;
-  if (fromCandidates) return fromCandidates;
-  if (facts?.booking && typeof facts.booking === "object") {
-    return facts.booking;
-  }
-  return null;
+    ) ?? null
+  );
 }
 
 /**
@@ -476,6 +474,7 @@ export function resolveTrustedFocusedBookingIdentity(facts) {
     focus.selectedBookingIndex
   );
   const booking = resolveTrustedFocusedBookingRow(f);
+  if (!booking) return null;
   const avr =
     f.availabilityRequest && typeof f.availabilityRequest === "object"
       ? f.availabilityRequest
@@ -1144,19 +1143,21 @@ export function compactPostConfirmFactsForPrompt(facts) {
         bookingStatus: trustedFocusIdentity.bookingStatus,
         scope: "CURRENT_BOOKING_IN_SCOPE",
       }
-    : f.bookingFocus && typeof f.bookingFocus === "object"
-      ? {
-          source:
-            f.bookingFocus.source === "latest_confirmed_linked_avr"
-              ? "latest_confirmed_linked_avr"
-              : null,
-          confidence:
-            f.bookingFocus.confidence === "trusted" ? "trusted" : null,
-          selectedBookingIndex: positiveIntegerOrNull(
-            f.bookingFocus.selectedBookingIndex
-          ),
-        }
-      : null;
+    : hasTrustedPostConfirmBookingFocus(f)
+      ? null
+      : f.bookingFocus && typeof f.bookingFocus === "object"
+        ? {
+            source:
+              f.bookingFocus.source === "latest_confirmed_linked_avr"
+                ? "latest_confirmed_linked_avr"
+                : null,
+            confidence:
+              f.bookingFocus.confidence === "trusted" ? "trusted" : null,
+            selectedBookingIndex: positiveIntegerOrNull(
+              f.bookingFocus.selectedBookingIndex
+            ),
+          }
+        : null;
   const pendingAvailabilityRequests = Array.isArray(
     f.pendingAvailabilityRequests
   )
