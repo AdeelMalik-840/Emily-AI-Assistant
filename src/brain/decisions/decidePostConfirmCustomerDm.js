@@ -2065,6 +2065,44 @@ STRICT SAFETY:
       finalized.selectedBookingId = bookingSelection.booking?.id ?? null;
 
       const replyText = cleanCustomerReply(finalized?.customerReply);
+      const replyRequired =
+        hasAmbiguousBookings ||
+        finalized.conversationAct === "information_request" ||
+        finalized.conversationAct === "action_request" ||
+        finalized.customerIntent === "ask_fact" ||
+        finalized.customerIntent === "ask_action" ||
+        finalized.customerIsAskingQuestion === true ||
+        finalized.action === "request_booking_mutation";
+      const pendingAvailabilityAction =
+        finalized.action === "confirm_pending_availability" ||
+        finalized.action === "decline_pending_availability";
+      const trustedFocusedBooking = resolveTrustedFocusedBookingRow(facts);
+      const trustedFocusIndex = positiveIntegerOrNull(
+        facts?.bookingFocus?.selectedBookingIndex
+      );
+      const resolvedTrustedFocus =
+        hasTrustedPostConfirmBookingFocus(facts) &&
+        Boolean(trustedFocusedBooking) &&
+        bookingSelection.mode === "focused" &&
+        bookingSelection.selectedBookingIndex === trustedFocusIndex;
+
+      // A verified read-only booking question must not terminalize before the
+      // existing same-Brain silence correction gets one chance to answer.
+      if (
+        attempt === 1 &&
+        resolvedTrustedFocus &&
+        replyRequired &&
+        isPostConfirmReadOnlyInformationalDecision(finalized) &&
+        !pendingAvailabilityAction &&
+        finalized.action !== "request_booking_mutation" &&
+        isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(finalized, userLine)
+      ) {
+        lastReason = "SUSPICIOUS_SILENCE_ON_NONEMPTY_CUSTOMER_TEXT";
+        lastSuspiciousDecision = finalized;
+        silenceRecoveryAttempts = 1;
+        continue;
+      }
+
       if (
         finalized.shouldReply === true &&
         finalized.action !== "silence" &&
@@ -2095,17 +2133,6 @@ STRICT SAFETY:
           contentSafetyAttempts: attempt,
         };
       }
-      const replyRequired =
-        hasAmbiguousBookings ||
-        finalized.conversationAct === "information_request" ||
-        finalized.conversationAct === "action_request" ||
-        finalized.customerIntent === "ask_fact" ||
-        finalized.customerIntent === "ask_action" ||
-        finalized.customerIsAskingQuestion === true ||
-        finalized.action === "request_booking_mutation";
-      const pendingAvailabilityAction =
-        finalized.action === "confirm_pending_availability" ||
-        finalized.action === "decline_pending_availability";
       if (bookingSelection.mode === "all_candidates") {
         const allCandidateGuard = validateAllCandidateReplyGrounding({
           replyText,
@@ -2152,12 +2179,12 @@ STRICT SAFETY:
                 bookingSelection.bookings
               ),
             }
-        : {
-            ...(facts && typeof facts === "object" ? facts : {}),
-            booking: null,
-            activeBookings: [],
-            replyGuardFacts: replyGuardFactsWithoutSelectedBooking(facts),
-          };
+          : {
+              ...(facts && typeof facts === "object" ? facts : {}),
+              booking: null,
+              activeBookings: [],
+              replyGuardFacts: replyGuardFactsWithoutSelectedBooking(facts),
+            };
       const replyContract = buildPostConfirmPaReplyContract({
         ...selectedContractFacts,
         customerMessageText: userLine,
