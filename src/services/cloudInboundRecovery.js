@@ -8,6 +8,8 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   claimOutboundLockedRecovery,
   classifyOutboundLockedRecovery,
+  getCloudInboundProcessingLeaseExpiresAt,
+  getInboundTurnLedgerEntry,
   listRecoverableCloudInboundTurns,
   markCloudInboundTurnRetryableFailure,
   markCloudInboundTurnTerminalTechnicalFailure,
@@ -290,11 +292,29 @@ function buildPipelinePayload(entry, db, sendCredentials) {
     typeof entry.cloudRecoveryContext === "object"
       ? entry.cloudRecoveryContext
       : {};
-  const messageText = String(context.messageText ?? "").trim();
+  const queuedOwnershipLifecycle =
+    entry?.cloudOwnershipQueue &&
+    typeof entry.cloudOwnershipQueue === "object" &&
+    entry.cloudOwnershipQueue.mode === "cloud_post_confirm_ownership_queue" &&
+    ["queued", "resuming", "retryable"].includes(
+      entry.cloudOwnershipQueue.status
+    )
+      ? entry.cloudOwnershipQueue
+      : null;
+  const queuedOwnershipResume =
+    queuedOwnershipLifecycle?.status === "queued";
+  const messageText = String(
+    queuedOwnershipLifecycle?.messageText ?? context.messageText ?? ""
+  ).trim();
+  const customerPhone = String(
+    queuedOwnershipLifecycle?.customerPhone ?? context.customerPhone ?? ""
+  ).trim();
   return {
     db,
-    ownerUserId: String(context.businessId ?? "").trim(),
-    userPhone: String(context.userPhone ?? context.customerPhone ?? "").trim(),
+    ownerUserId: String(
+      queuedOwnershipLifecycle?.businessId ?? context.businessId ?? ""
+    ).trim(),
+    userPhone: String(context.userPhone ?? customerPhone).trim(),
     sessionKey: String(context.sessionKey ?? "").trim(),
     sendCredentials,
     phoneNumberId:
@@ -306,18 +326,33 @@ function buildPipelinePayload(entry, db, sendCredentials) {
     structuredSnapshot: messageText,
     isGroupMessage: false,
     whatsappReplyTo: String(
-      context.whatsappReplyTo ?? context.customerPhone ?? ""
+      context.whatsappReplyTo ?? customerPhone
     ).trim(),
     whatsappRecipientType: "individual",
     conversationCustomerNumber: String(
-      context.conversationCustomerNumber ?? context.customerPhone ?? ""
+      context.conversationCustomerNumber ?? customerPhone
     ).trim(),
-    messageId: String(context.messageId ?? "").trim(),
+    messageId: String(
+      queuedOwnershipLifecycle?.providerMessageId ?? context.messageId ?? ""
+    ).trim(),
     fragmentCount: 1,
     hasMultipleFragments: false,
     isGreetingFirst: false,
     __cloudResumeProcessing: true,
-    __cloudClaimOwner: String(entry.processingOwner ?? "").trim() || null,
+    __cloudQueuedOwnershipResume: queuedOwnershipResume,
+    __cloudClaimOwner:
+      String(
+        queuedOwnershipLifecycle?.claimOwner ??
+          entry.cloudOriginalClaimOwner ??
+          entry.processingOwner ??
+          ""
+      ).trim() || null,
+    __cloudOwnershipQueuedAtMs:
+      Number(queuedOwnershipLifecycle?.queuedAt ?? 0) || null,
+    __cloudOwnershipInitialResolution:
+      String(
+        queuedOwnershipLifecycle?.latestBookingResolutionReason ?? ""
+      ).trim() || null,
   };
 }
 
@@ -340,21 +375,74 @@ export function scheduleCloudInboundRecoverySweep({
   }
   const timers = [];
   const scheduleEntry = (entry, explicitDelay = null) => {
+    const scheduledQueueStatus =
+      entry?.cloudOwnershipQueue?.mode ===
+      "cloud_post_confirm_ownership_queue"
+        ? String(entry.cloudOwnershipQueue.status ?? "").trim()
+        : "";
     const run = async () => {
+      const currentEntry = getInboundTurnLedgerEntry(
+        entry?.chatKey,
+        entry?.stableId,
+        { force: true }
+      );
+      if (!currentEntry || currentEntry.state === "done") return;
+      const currentQueueStatus =
+        currentEntry?.cloudOwnershipQueue?.mode ===
+        "cloud_post_confirm_ownership_queue"
+          ? String(currentEntry.cloudOwnershipQueue.status ?? "").trim()
+          : "";
+      if (scheduledQueueStatus === "queued") {
+        if (
+          currentEntry.state !== "processing" ||
+          currentQueueStatus !== "queued"
+        ) {
+          return;
+        }
+      } else if (scheduledQueueStatus === "resuming") {
+        if (
+          currentEntry.state !== "processing" ||
+          currentQueueStatus !== "resuming"
+        ) {
+          return;
+        }
+        const leaseExpiresAt =
+          getCloudInboundProcessingLeaseExpiresAt(currentEntry);
+        if (
+          Number.isFinite(leaseExpiresAt) &&
+          leaseExpiresAt > Date.now()
+        ) {
+          scheduleEntry(currentEntry, leaseExpiresAt - Date.now());
+          return;
+        }
+      } else if (scheduledQueueStatus === "retryable") {
+        if (
+          currentEntry.state !== "failed" ||
+          currentQueueStatus !== "retryable" ||
+          currentEntry.autoRetryAllowed === false
+        ) {
+          return;
+        }
+        const nextRetryAt = Number(currentEntry.nextRetryAt ?? 0);
+        if (Number.isFinite(nextRetryAt) && nextRetryAt > Date.now()) {
+          scheduleEntry(currentEntry, nextRetryAt - Date.now());
+          return;
+        }
+      }
       const context =
-        entry.cloudRecoveryContext &&
-        typeof entry.cloudRecoveryContext === "object"
-          ? entry.cloudRecoveryContext
+        currentEntry.cloudRecoveryContext &&
+        typeof currentEntry.cloudRecoveryContext === "object"
+          ? currentEntry.cloudRecoveryContext
           : {};
       const credentials = await getCredentialsFn(
         db,
         String(context.businessId ?? "").trim()
       );
       if (!credentials?.accessToken || !credentials?.phoneNumberId) return;
-      if (entry.state === "outbound_locked") {
+      if (currentEntry.state === "outbound_locked") {
         const recovery = await tryRecoverCloudOutboundLockedTurn({
           db,
-          entry,
+          entry: currentEntry,
           sendCredentials: credentials,
         });
         const retryCount = Number(recovery?.retryCount ?? 0);
@@ -367,24 +455,38 @@ export function scheduleCloudInboundRecoverySweep({
             30_000,
             500 * 2 ** Math.max(0, retryCount - 1)
           );
-          scheduleEntry(entry, retryDelay);
+          scheduleEntry(currentEntry, retryDelay);
         }
         return;
       }
-      await executePipelineFn(buildPipelinePayload(entry, db, credentials));
+      await executePipelineFn(
+        buildPipelinePayload(currentEntry, db, credentials)
+      );
     };
-    const delay =
+    const retryDelay =
       explicitDelay != null
-        ? Math.max(0, Math.min(30_000, Number(explicitDelay) || 0))
+        ? Math.max(0, Number(explicitDelay) || 0)
         : Math.max(
             0,
-            Math.min(
-              30_000,
-              Number(entry.nextRetryAt ?? 0) > Date.now()
-                ? Number(entry.nextRetryAt) - Date.now()
-                : 0
-            )
+            Number(entry.nextRetryAt ?? 0) > Date.now()
+              ? Number(entry.nextRetryAt) - Date.now()
+              : 0
           );
+    const leaseExpiresAt =
+      scheduledQueueStatus === "resuming"
+        ? getCloudInboundProcessingLeaseExpiresAt(entry)
+        : null;
+    const leaseDelay =
+      Number.isFinite(leaseExpiresAt) && leaseExpiresAt > Date.now()
+        ? leaseExpiresAt - Date.now()
+        : 0;
+    const delay =
+      scheduledQueueStatus === "resuming"
+        ? Math.max(
+            0,
+            Math.min(31 * 60 * 1000, Math.max(leaseDelay, retryDelay))
+          )
+        : Math.max(0, Math.min(30_000, retryDelay));
     const timer = setTimeout(() => {
       void run().catch((err) => {
         console.warn("[cloud_inbound_recovery_failed]", {

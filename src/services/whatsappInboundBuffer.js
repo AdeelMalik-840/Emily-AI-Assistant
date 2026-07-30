@@ -43,6 +43,8 @@ import {
 import {
   claimCloudInboundTurn,
   claimOutboundLockedRecovery,
+  markCloudInboundTurnOwnershipQueued,
+  markCloudInboundTurnNormalRouting,
   markCloudInboundTurnPostConfirmOwned,
   markCloudInboundTurnOutboundLocked,
   markCloudInboundTurnRetryableFailure,
@@ -51,7 +53,6 @@ import {
   markInboundTurnLedgerFailedForGuarantee,
   markInboundTurnLedgerOutboundLockedForGuarantee,
   markOutboundLockedRecoverySent,
-  releaseCloudInboundTurnOwnershipProbe,
   releaseOutboundLockedRecoveryClaim,
   resolveInboundTurnAdmissionBlock,
 } from "./inboundTurnLedger.js";
@@ -570,7 +571,12 @@ const recentInboundByOwnerAndText = new Map();
 const pendingPlaywrightPipelineBySession = new Map();
 const pendingCloudRetryTimersByGuarantee = new Map();
 
-function scheduleCloudPostConfirmRetry(p, identity, retryCount) {
+function scheduleCloudPostConfirmRetry(
+  p,
+  identity,
+  retryCount,
+  claimOwner = null
+) {
   const guaranteeKey = String(identity?.guaranteeKey ?? "").trim();
   if (!guaranteeKey || retryCount > 5) return;
   if (pendingCloudRetryTimersByGuarantee.has(guaranteeKey)) return;
@@ -580,7 +586,10 @@ function scheduleCloudPostConfirmRetry(p, identity, retryCount) {
     void executeWhatsAppAiPipeline({
       ...p,
       __cloudResumeProcessing: true,
-      __cloudClaimOwner: String(p.__cloudClaimOwner ?? "").trim() || null,
+      // The queued token is single-use: only queued -> resuming may consume it.
+      __cloudQueuedOwnershipResume: false,
+      __cloudClaimOwner:
+        String(claimOwner ?? p.__cloudClaimOwner ?? "").trim() || null,
       traceId: randomUUID(),
     }).catch((err) => {
       console.warn("[cloud_post_confirm_retry_failed]", {
@@ -1553,6 +1562,7 @@ export async function executeWhatsAppAiPipeline(p) {
   let intentionalSilent = false;
   let cloudLifecycleIdentity = null;
   let cloudLifecycleClaimed = false;
+  let cloudNormalRoutingClaimed = false;
   let cloudLifecycleClaimOwner = null;
   /** Hoisted for finally-block guarantee completion (declared inside try is TDZ in finally). */
   let messageMeta = null;
@@ -1567,6 +1577,7 @@ export async function executeWhatsAppAiPipeline(p) {
     parseAvailabilityApprovalMessage(combinedMessage);
   const parsedApproval = parseApprovalMessage(combinedMessage);
   let preResolvedPostConfirmBookingFacts = null;
+  let resolvedPostConfirm = null;
   const canResolvePostConfirmOwnership =
     !parsedAvailabilityApproval &&
     !parsedApproval &&
@@ -1581,6 +1592,7 @@ export async function executeWhatsAppAiPipeline(p) {
       customerPhone: cloudConfirmPhone,
       messageId,
       resumeProcessing: p.__cloudResumeProcessing === true,
+      resumeQueuedOwnership: p.__cloudQueuedOwnershipResume === true,
       provisionalOwnership: true,
       claimOwner:
         String(p.__cloudClaimOwner ?? "").trim() ||
@@ -1617,6 +1629,14 @@ export async function executeWhatsAppAiPipeline(p) {
       });
       return;
     }
+    if (cloudClaim.action === "terminal") {
+      console.log("[cloud_post_confirm_terminal_blocked]", {
+        guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+        messageId,
+        reason: cloudClaim.reason,
+      });
+      return;
+    }
     if (cloudClaim.action === "outbound_locked") {
       const recovery = await tryRecoverCloudOutboundLockedTurn({
         db,
@@ -1640,7 +1660,8 @@ export async function executeWhatsAppAiPipeline(p) {
         scheduleCloudPostConfirmRetry(
           p,
           cloudLifecycleIdentity,
-          Number(recovery.retryCount ?? 1)
+          Number(recovery.retryCount ?? 1),
+          cloudLifecycleClaimOwner
         );
       }
       return;
@@ -1655,7 +1676,6 @@ export async function executeWhatsAppAiPipeline(p) {
         : (
             await import("../brain/facts/resolveActiveCustomerBookingFacts.js")
           ).resolveActiveCustomerBookingFacts;
-    let resolvedPostConfirm;
     try {
       resolvedPostConfirm = await resolvePostConfirmFactsFn({
         db,
@@ -1671,7 +1691,8 @@ export async function executeWhatsAppAiPipeline(p) {
       scheduleCloudPostConfirmRetry(
         p,
         cloudLifecycleIdentity,
-        Number(failed?.retryCount ?? 1)
+        Number(failed?.retryCount ?? 1),
+        cloudLifecycleClaimOwner
       );
       return;
     }
@@ -1686,22 +1707,31 @@ export async function executeWhatsAppAiPipeline(p) {
       scheduleCloudPostConfirmRetry(
         p,
         cloudLifecycleIdentity,
-        Number(failed?.retryCount ?? 1)
+        Number(failed?.retryCount ?? 1),
+        cloudLifecycleClaimOwner
       );
       return;
     }
     if (resolvedPostConfirm?.ok === true && resolvedPostConfirm.facts) {
       preResolvedPostConfirmBookingFacts = resolvedPostConfirm;
     }
+    console.log("[cloud_post_confirm_booking_resolution]", {
+      traceId,
+      messageId,
+      guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+      stage:
+        p.__cloudOwnershipQueuedAtMs != null
+          ? "post_active_job_resume"
+          : "initial",
+      ok: resolvedPostConfirm?.ok === true,
+      reason: String(resolvedPostConfirm?.reason ?? "").trim() || null,
+    });
   }
   const hasActivePostConfirmOwnership =
     preResolvedPostConfirmBookingFacts?.ok === true;
   if (hasActivePostConfirmOwnership) {
     markCloudInboundTurnPostConfirmOwned({ identity: cloudLifecycleIdentity });
     cloudLifecycleClaimed = true;
-  } else if (cloudLifecycleIdentity?.guaranteeKey) {
-    releaseCloudInboundTurnOwnershipProbe({ identity: cloudLifecycleIdentity });
-    cloudLifecycleIdentity = null;
   }
 
   releaseStaleActiveJobIfNeeded();
@@ -1722,13 +1752,57 @@ export async function executeWhatsAppAiPipeline(p) {
       console.log("⏳ Job active — queueing message", {
         activeJob: globalThis.__activeJob,
         incoming: fingerprint,
+        cloudGuaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+        cloudProviderMessageId: messageId || null,
+        cloudOwnershipResolution:
+          String(resolvedPostConfirm?.reason ?? "").trim() || null,
       });
+      const preserveCloudLifecycle =
+        Boolean(cloudLifecycleIdentity?.guaranteeKey) &&
+        Boolean(cloudLifecycleClaimOwner);
+      const queuedCloudEntry = preserveCloudLifecycle
+        ? markCloudInboundTurnOwnershipQueued({
+            identity: cloudLifecycleIdentity,
+            claimOwner: cloudLifecycleClaimOwner,
+            businessId: ownerUserId,
+            customerPhone: cloudConfirmPhone,
+            messageId,
+            messageText: latestMessage,
+            latestBookingResolutionReason:
+              String(resolvedPostConfirm?.reason ?? "").trim() || null,
+          })
+        : null;
+      if (preserveCloudLifecycle && !queuedCloudEntry) {
+        const failed = markCloudInboundTurnRetryableFailure({
+          identity: cloudLifecycleIdentity,
+          lastError: "CLOUD_OWNERSHIP_QUEUE_MARKER_PERSIST_FAILED",
+          retryDelayMs: 1000,
+        });
+        scheduleCloudPostConfirmRetry(
+          {
+            ...p,
+            __cloudResumeProcessing: true,
+            __cloudClaimOwner: cloudLifecycleClaimOwner,
+            __cloudQueuedOwnershipResume: false,
+          },
+          cloudLifecycleIdentity,
+          Number(failed?.retryCount ?? 1)
+        );
+        return;
+      }
       globalThis.__messageQueue.push(
-        cloudLifecycleClaimed
+        preserveCloudLifecycle
           ? {
               ...p,
               __cloudResumeProcessing: true,
+              __cloudQueuedOwnershipResume: true,
               __cloudClaimOwner: cloudLifecycleClaimOwner,
+              __cloudOwnershipQueuedAtMs:
+                Number(
+                  queuedCloudEntry?.cloudOwnershipQueue?.queuedAt ?? 0
+                ) || Date.now(),
+              __cloudOwnershipInitialResolution:
+                String(resolvedPostConfirm?.reason ?? "").trim() || null,
             }
           : p
       );
@@ -1736,6 +1810,32 @@ export async function executeWhatsAppAiPipeline(p) {
     return;
   }
   globalThis.__forceProcessing = false;
+
+  if (
+    !hasActivePostConfirmOwnership &&
+    cloudLifecycleIdentity?.guaranteeKey
+  ) {
+    console.log("[cloud_post_confirm_ownership_probe_released]", {
+      traceId,
+      messageId,
+      guaranteeKey: cloudLifecycleIdentity.guaranteeKey,
+      stage:
+        p.__cloudOwnershipQueuedAtMs != null
+          ? "post_active_job_resume"
+          : "initial",
+      initialResolution:
+        String(p.__cloudOwnershipInitialResolution ?? "").trim() || null,
+      finalResolution:
+        String(resolvedPostConfirm?.reason ?? "").trim() || null,
+    });
+    markCloudInboundTurnNormalRouting({
+      identity: cloudLifecycleIdentity,
+      bookingResolutionReason:
+        String(resolvedPostConfirm?.reason ?? "").trim() || null,
+    });
+    cloudLifecycleClaimed = true;
+    cloudNormalRoutingClaimed = true;
+  }
 
   const groupLogFields =
     isGroupMessage === true
@@ -2952,16 +3052,19 @@ export async function executeWhatsAppAiPipeline(p) {
                 : null,
           });
         }
-        const cloudPostConfirmSend =
+        const cloudLifecycleSend =
           cloudLifecycleClaimed &&
           cloudLifecycleIdentity?.guaranteeKey &&
-          finalReplySourceForLifecycle === "openai_post_confirm_pa" &&
           sendVia === "CLOUD_API";
-        if (cloudPostConfirmSend) {
+        if (cloudLifecycleSend) {
           markCloudInboundTurnOutboundLocked({
             identity: cloudLifecycleIdentity,
             finalReplyText: replyText,
-            finalReplySource: finalReplySourceForLifecycle,
+            finalReplySource:
+              finalReplySourceForLifecycle ||
+              (cloudNormalRoutingClaimed
+                ? "cloud_normal_routing"
+                : "openai_post_confirm_pa"),
             traceId,
           });
           cloudOutboundClaimOwner = `cloud-send:${traceId}`;
@@ -2984,7 +3087,7 @@ export async function executeWhatsAppAiPipeline(p) {
           finalReplySource: finalReplySourceForLifecycle || null,
         });
         outboundStartedAt = Date.now();
-        if (cloudPostConfirmSend) {
+        if (cloudLifecycleSend) {
           const { markOutboundSendInFlight } = await import(
             "./inboundTurnLedger.js"
           );
@@ -3040,7 +3143,7 @@ export async function executeWhatsAppAiPipeline(p) {
         groupSendFailed = Boolean(sendResult?.groupSendFailed);
         if (sendResult?.ok === true) {
           outboundReplyDelivered = true;
-          if (cloudPostConfirmSend) {
+          if (cloudLifecycleSend) {
             markOutboundLockedRecoverySent({
               force: true,
               chatKey: cloudLifecycleIdentity.chatKey,
@@ -3054,7 +3157,7 @@ export async function executeWhatsAppAiPipeline(p) {
             });
           }
         } else {
-          if (cloudPostConfirmSend && cloudOutboundClaimOwner) {
+          if (cloudLifecycleSend && cloudOutboundClaimOwner) {
             releaseOutboundLockedRecoveryClaim({
               force: true,
               chatKey: cloudLifecycleIdentity.chatKey,
@@ -3204,6 +3307,13 @@ export async function executeWhatsAppAiPipeline(p) {
   if (replyText !== "" && !outboundReplyDelivered) {
     throw new Error("outbound_not_delivered");
   }
+  if (
+    cloudNormalRoutingClaimed &&
+    replyText === "" &&
+    !intentionalSilent
+  ) {
+    throw new Error("cloud_normal_routing_empty_unhandled");
+  }
   processingSuccess = true;
   if (
     cloudLifecycleClaimed &&
@@ -3213,6 +3323,9 @@ export async function executeWhatsAppAiPipeline(p) {
     markCloudInboundTurnDone({
       identity: cloudLifecycleIdentity,
       replySent: false,
+      terminalOutcome: cloudNormalRoutingClaimed
+        ? "intentional_silent"
+        : "post_confirm_intentional_silent",
     });
   }
   } catch (err) {
@@ -3226,7 +3339,8 @@ export async function executeWhatsAppAiPipeline(p) {
       scheduleCloudPostConfirmRetry(
         p,
         cloudLifecycleIdentity,
-        Number(failed?.retryCount ?? 1)
+        Number(failed?.retryCount ?? 1),
+        cloudLifecycleClaimOwner
       );
     }
     if (guaranteeKey) {
