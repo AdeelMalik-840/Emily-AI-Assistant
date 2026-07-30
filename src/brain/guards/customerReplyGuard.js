@@ -433,6 +433,29 @@ function verifiedMoneyValues(facts) {
     .filter(Number.isFinite);
 }
 
+function uniqueSortedFiniteNumbers(values) {
+  return [...new Set((values || []).map(Number).filter(Number.isFinite))].sort(
+    (a, b) => a - b
+  );
+}
+
+function logVerifiedPriceMismatchDiagnostic({
+  mismatchSource,
+  mismatchField,
+  actualNumericValue,
+  allowedVerifiedValues,
+}) {
+  console.error("[verified_price_mismatch_diagnostic]", {
+    failureReason: "verified_price_mismatch",
+    mismatchSource,
+    mismatchField,
+    actualNumericValue: Number.isFinite(Number(actualNumericValue))
+      ? Number(actualNumericValue)
+      : null,
+    allowedVerifiedValues: uniqueSortedFiniteNumbers(allowedVerifiedValues),
+  });
+}
+
 function validateDeclaredGroundedFacts(declared, facts) {
   const d = declared && typeof declared === "object" ? declared : {};
   const rows = verifiedFactRows(facts);
@@ -495,6 +518,12 @@ function validateDeclaredGroundedFacts(declared, facts) {
       verifiedValues.size > 0 &&
       !verifiedValues.has(Number(d[key]))
     ) {
+      logVerifiedPriceMismatchDiagnostic({
+        mismatchSource: "grounded_facts",
+        mismatchField: key,
+        actualNumericValue: Number(d[key]),
+        allowedVerifiedValues: [...verifiedValues],
+      });
       return { ok: false, reason: "verified_price_mismatch" };
     }
   }
@@ -626,7 +655,16 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
   const verifiedAmounts = verifiedMoneyValues(facts);
   if (verifiedAmounts.length > 0) {
     const amounts = extractExplicitMoneyAmounts(text);
-    if (amounts.some((amount) => !verifiedAmounts.includes(amount))) {
+    const mismatchedAmount = amounts.find(
+      (amount) => !verifiedAmounts.includes(amount)
+    );
+    if (mismatchedAmount != null) {
+      logVerifiedPriceMismatchDiagnostic({
+        mismatchSource: "reply_text",
+        mismatchField: "explicitMoneyAmount",
+        actualNumericValue: mismatchedAmount,
+        allowedVerifiedValues: verifiedAmounts,
+      });
       return { ok: false, reason: "verified_price_mismatch" };
     }
   }
