@@ -1238,6 +1238,45 @@ export function isTrustedWaitingConfirmBookingPromptCandidate(request, nowMs = D
 }
 
 /**
+ * Trusted Cloud ownership precedence for an inbound received after the latest
+ * successful booking-confirmation prompt. This is state-only routing evidence;
+ * customer wording never participates in lane selection.
+ *
+ * @param {Record<string, unknown>} request
+ * @param {{ nowMs?: number, inboundReceivedAtMs?: number | null }} [opts]
+ */
+export function isFreshTrustedWaitingConfirmCloudOwnershipCandidate(
+  request,
+  opts = {}
+) {
+  const nowMs = Number.isFinite(Number(opts.nowMs))
+    ? Number(opts.nowMs)
+    : Date.now();
+  if (!isTrustedWaitingConfirmBookingPromptCandidate(request, nowMs)) return false;
+
+  const deliveryStatus = clean(request?.customerDeliveryStatus).toLowerCase();
+  // approvalCustomerNotificationStatus="sent" already proves a successful Cloud
+  // send. A later explicit delivery failure revokes that ownership evidence.
+  if (deliveryStatus === "failed") return false;
+
+  const promptAtMs =
+    normalizeTimestampToMs(request?.customerDeliveryTimestamp) ??
+    normalizeTimestampToMs(request?.lastCustomerDmPromptAt) ??
+    normalizeTimestampToMs(request?.lastCustomerDmOutboundAt) ??
+    normalizeTimestampToMs(request?.approvalCustomerNotificationAt) ??
+    normalizeTimestampToMs(request?.lastCustomerNotifyAt);
+  const inboundReceivedAtMs = Number(opts.inboundReceivedAtMs);
+  if (
+    !Number.isFinite(promptAtMs) ||
+    !Number.isFinite(inboundReceivedAtMs) ||
+    inboundReceivedAtMs <= 0
+  ) {
+    return false;
+  }
+  return inboundReceivedAtMs >= promptAtMs;
+}
+
+/**
  * Desc sort key for latest-trusted waiting_confirm (notify → outbound → updated → created).
  * @param {Record<string, unknown>} a
  * @param {Record<string, unknown>} b
@@ -1307,6 +1346,39 @@ export async function findWaitingConfirmCloudAvailabilityRequestsByPhone({
     .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
     .filter((row) => isCloudWaitingConfirmAvailabilityRequestEligible(row, nowMs))
     .filter((row) => availabilityRequestMatchesCloudCustomerPhone(row, phone));
+}
+
+/**
+ * Latest fresh trusted Cloud waiting-confirm prompt for one customer/business.
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ *   inboundReceivedAtMs: number,
+ *   nowMs?: number,
+ * }} params
+ */
+export async function findFreshTrustedWaitingConfirmCloudOwnershipCandidate({
+  db: connection,
+  businessId,
+  customerPhone,
+  inboundReceivedAtMs,
+  nowMs = Date.now(),
+}) {
+  const waiting = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
+    db: connection,
+    businessId,
+    customerPhone,
+    nowMs,
+  });
+  const fresh = waiting.filter((request) =>
+    isFreshTrustedWaitingConfirmCloudOwnershipCandidate(request, {
+      nowMs,
+      inboundReceivedAtMs,
+    })
+  );
+  return pickLatestTrustedWaitingConfirmRequest(fresh, nowMs);
 }
 
 /**

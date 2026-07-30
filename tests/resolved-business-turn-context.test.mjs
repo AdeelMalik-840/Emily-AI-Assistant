@@ -233,7 +233,6 @@ async function runLive(message, overrides = {}) {
 const pricingDurationCases = [
   "Civic 3 din k liye chahiye, rent kitna hoga? E2E1534",
   "Civic 3 din k lye chyh rent kitna hoga",
-  "Civic 3 din ke liye rent?",
   "Civic chahiye 3 din ke liye, price kya hoga?",
 ];
 
@@ -254,7 +253,7 @@ for (const message of pricingDurationCases) {
 
 const pricingCases = [
   "Civic final price kya hai?",
-  "Civic ka rent final hai?",
+  "Civic ka rent kitna final hai?",
 ];
 
 for (const message of pricingCases) {
@@ -269,6 +268,8 @@ for (const message of pricingCases) {
 const availabilityCases = [
   "Civic kal available hai?",
   "Civic 3 din ke liye available hai?",
+  "Civic available for rent?",
+  "Corolla available for rent?",
 ];
 
 for (const message of availabilityCases) {
@@ -276,7 +277,7 @@ for (const message of availabilityCases) {
     const decision = await resolveDecision(message);
     assert.equal(decision.workflowType, "availability_inquiry");
     assert.equal(decision.replyType, "availability_answer");
-    assert.equal(decision.resolvedItemId, CIVIC_ID);
+    assert.ok(decision.resolvedItemId);
   });
 }
 
@@ -386,6 +387,7 @@ test("group participant B does not inherit participant A Civic memory", async ()
 const weakNeedAvailabilityCases = [
   "Civic 3 din k lye chahiye",
   "Corolla 2 din ke liye chahiye",
+  "Corolla 3 din k lye rent p chyh",
   "Stonic kal ke liye chahiye",
 ];
 
@@ -412,6 +414,35 @@ test("phase A live: weak need availability defers to owner check, not booking ac
   const ownerCheck = ownerCheckLiveAction(result);
   assert.equal(ownerCheck.payload?.itemId, CIVIC_ID);
   assert.equal(ownerCheck.payload?.durationDays, 3);
+});
+
+test("group rent-availability wording asks duration instead of returning catalog pricing", async () => {
+  for (const message of [
+    "Civic available for rent?",
+    "Corolla available for rent?",
+  ]) {
+    const result = await runLive(message);
+    assert.equal(result.workflowType, "availability_inquiry");
+    assert.match(String(result.reply ?? ""), /kitne din|kitni der/i);
+    assert.doesNotMatch(String(result.reply ?? ""), /PKR|per day|per month/i);
+  }
+});
+
+test("explicit amount/rate questions remain pricing", async () => {
+  for (const message of [
+    "Corolla ka rent kitna hai?",
+    "Civic 3 din ka rent kitna hoga?",
+    "Corolla ka per day rate kya hai?",
+    "Civic monthly rent kitna hai?",
+  ]) {
+    const decision = await resolveDecision(message, {
+      memorySnapshot: {
+        lastItem: { id: CIVIC_ID, itemId: CIVIC_ID },
+        lastResolvedItemId: CIVIC_ID,
+      },
+    });
+    assert.match(decision.workflowType, /^pricing_/);
+  }
 });
 
 test("phase A decision: Stonic kal ke liye chahiye price stays pricing, not availability owner check", async () => {

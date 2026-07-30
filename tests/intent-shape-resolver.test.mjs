@@ -20,8 +20,6 @@ function shape(message, extra = {}) {
 }
 
 const pricingCases = [
-  "Corolla rent?",
-  "corolla ka rent?",
   "corolla rent kitna hai?",
   "corolla per day rent?",
   "Corolla daily rate?",
@@ -71,22 +69,59 @@ test("rent+available compound is availability not pricing", () => {
   assert.equal(isPricingOrDetailsFieldQuestion("corolla rent pe available hai?"), false);
 });
 
-test("pricing after civic memory context: Corolla rent?", () => {
+for (const msg of ["Civic available for rent?", "Corolla available for rent?"]) {
+  test(`available-for-rent remains availability: ${msg}`, () => {
+    const s = shape(msg);
+    assert.equal(s.primaryIntent, "availability_check");
+    assert.equal(s.responsePolicy, "check_availability");
+    assert.equal(s.signals.priceAsk, false);
+    assert.equal(s.signals.availabilityAsk, true);
+  });
+}
+
+for (const msg of [
+  "Corolla ka rent kitna hai?",
+  "3 din ka rent kitna hoga?",
+  "Corolla ka per day rate kya hai?",
+  "Monthly rent kitna hai?",
+]) {
+  test(`explicit amount/rate request remains pricing: ${msg}`, () => {
+    const s = shape(msg);
+    assert.equal(s.primaryIntent, "pricing_question");
+    assert.equal(s.responsePolicy, "answer_requested_field");
+    assert.equal(s.signals.priceAsk, true);
+  });
+}
+
+test("bare rent does not become pricing from field detection alone", () => {
   const s = shape("Corolla rent?", {
     prioritizedIntent: { priorityIntent: "booking", askedField: "unknown" },
     llmIntentClassification: { primaryIntent: "booking" },
     itemMentioned: true,
   });
-  assert.equal(s.primaryIntent, "pricing_question");
-  assert.equal(s.responsePolicy, "answer_requested_field");
+  assert.equal(s.primaryIntent, "booking_request");
+  assert.notEqual(s.responsePolicy, "answer_requested_field");
+  assert.equal(s.signals.priceAsk, false);
 });
 
-test("explicit rent beats weak chahiye context", () => {
+test("rental-need wording is not treated as a price question", () => {
   const s = shape("Corolla rent k lye chahiye");
-  assert.equal(s.primaryIntent, "pricing_question");
-  assert.equal(s.responsePolicy, "answer_requested_field");
-  assert.equal(s.signals.bookingCommitment, false);
+  assert.equal(s.primaryIntent, "booking_request");
+  assert.equal(s.responsePolicy, "start_or_continue_booking");
+  assert.equal(s.signals.priceAsk, false);
 });
+
+for (const msg of [
+  "Corolla 3 din k lye rent p chyh",
+  "Civic 3 din ke liye chahiye",
+]) {
+  test(`item and duration rental need is not pricing: ${msg}`, () => {
+    const s = shape(msg, { itemMentioned: true });
+    assert.notEqual(s.primaryIntent, "pricing_question");
+    assert.notEqual(s.responsePolicy, "answer_requested_field");
+    assert.equal(s.signals.priceAsk, false);
+  });
+}
 
 const imageWithWeakCommitmentCases = [
   "Civic ki picture share kr dn live image final test 1529",
@@ -136,7 +171,7 @@ for (const msg of strongBookingCases) {
 const finalPricingCases = [
   "Civic final price kya hai?",
   "Civic final rate?",
-  "Civic ka rent final hai?",
+  "Civic ka rent kitna final hai?",
 ];
 
 for (const msg of finalPricingCases) {

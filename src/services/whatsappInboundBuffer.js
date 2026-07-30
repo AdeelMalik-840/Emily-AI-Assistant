@@ -1577,7 +1577,10 @@ export async function executeWhatsAppAiPipeline(p) {
     parseAvailabilityApprovalMessage(combinedMessage);
   const parsedApproval = parseApprovalMessage(combinedMessage);
   let preResolvedPostConfirmBookingFacts = null;
+  let preResolvedFreshWaitingConfirmRequest = null;
   let resolvedPostConfirm = null;
+  const inboundReceivedAtMs =
+    safeTimestamp < 1e12 ? safeTimestamp * 1000 : safeTimestamp;
   const canResolvePostConfirmOwnership =
     !parsedAvailabilityApproval &&
     !parsedApproval &&
@@ -1668,6 +1671,37 @@ export async function executeWhatsAppAiPipeline(p) {
     }
     if (!cloudClaim.claimed) {
       throw new Error(cloudClaim.reason || "CLOUD_LEDGER_CLAIM_FAILED");
+    }
+
+    const resolveFreshWaitingConfirmFn =
+      typeof p.__resolveFreshWaitingConfirmCloudOwnershipCandidateFn === "function"
+        ? p.__resolveFreshWaitingConfirmCloudOwnershipCandidateFn
+        : (
+            await import("./availabilityRequestService.js")
+          ).findFreshTrustedWaitingConfirmCloudOwnershipCandidate;
+    try {
+      preResolvedFreshWaitingConfirmRequest =
+        await resolveFreshWaitingConfirmFn({
+          db,
+          businessId: ownerUserId,
+          customerPhone: cloudConfirmPhone,
+          inboundReceivedAtMs,
+        });
+    } catch (err) {
+      const failed = markCloudInboundTurnRetryableFailure({
+        identity: cloudLifecycleIdentity,
+        lastError: String(
+          err?.message ?? err ?? "WAITING_CONFIRM_OWNERSHIP_LOOKUP_FAILED"
+        ),
+        retryDelayMs: 1000,
+      });
+      scheduleCloudPostConfirmRetry(
+        p,
+        cloudLifecycleIdentity,
+        Number(failed?.retryCount ?? 1),
+        cloudLifecycleClaimOwner
+      );
+      return;
     }
 
     const resolvePostConfirmFactsFn =
@@ -2153,8 +2187,10 @@ export async function executeWhatsAppAiPipeline(p) {
       : null;
 
   let skipGeneralBrainForWaitingConfirmOwnership = false;
+  const hasFreshWaitingConfirmOwnership =
+    Boolean(preResolvedFreshWaitingConfirmRequest);
   const canTryCloudConfirmOwnership =
-    !hasActivePostConfirmOwnership &&
+    (!hasActivePostConfirmOwnership || hasFreshWaitingConfirmOwnership) &&
     !isGroupInbound &&
     !playwrightWebInbound &&
     Boolean(String(ownerUserId ?? "").trim()) &&
@@ -2163,13 +2199,13 @@ export async function executeWhatsAppAiPipeline(p) {
     Boolean(String(latestMessage ?? "").trim());
 
   if (canTryCloudConfirmOwnership) {
-    const tryCloudConfirmFn =
+    const handleCloudConfirmFn =
       typeof p.__tryHandleAvailabilityCustomerCloudInboundFn === "function"
-        ? p.__tryHandleAvailabilityCustomerCloudInboundFn
-        : (
-            await import("./availabilityCustomerConfirmService.js")
-          ).tryHandleAvailabilityCustomerCloudInbound;
-    const cloudConfirmResult = await tryCloudConfirmFn({
+          ? p.__tryHandleAvailabilityCustomerCloudInboundFn
+          : (
+              await import("./availabilityCustomerConfirmService.js")
+            ).handleAvailabilityCustomerCloudInbound;
+    const cloudConfirmResult = await handleCloudConfirmFn({
       db,
       businessId: ownerUserId,
       customerPhone: cloudConfirmPhone,
@@ -2177,8 +2213,11 @@ export async function executeWhatsAppAiPipeline(p) {
       messageId,
       conversationHistory,
       sendCredentials,
+      preselectedWaitingConfirmRequest:
+        preResolvedFreshWaitingConfirmRequest,
+      inboundReceivedAtMs,
     });
-    if (cloudConfirmResult) {
+    if (cloudConfirmResult?.handled === true) {
       skipGeneralBrainForWaitingConfirmOwnership = true;
       console.log("[availability_cloud_confirm_ownership_handled]", {
         traceId,
@@ -2216,6 +2255,13 @@ export async function executeWhatsAppAiPipeline(p) {
           finalReplySource: "AVAILABILITY_CUSTOMER_CLOUD_CONFIRM",
         },
       };
+    } else if (hasFreshWaitingConfirmOwnership) {
+      const noMatchReason = String(cloudConfirmResult?.reason ?? "").trim();
+      if (!["NO_MATCH", "NO_WAITING_REQUEST"].includes(noMatchReason)) {
+        throw new Error(
+          noMatchReason || "WAITING_CONFIRM_OWNERSHIP_UNRESOLVED"
+        );
+      }
     }
   }
 

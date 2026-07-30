@@ -15,6 +15,8 @@ const {
 const {
   availabilityRequestMatchesCloudCustomerPhone,
   buildConfirmExpiresAt,
+  findFreshTrustedWaitingConfirmCloudOwnershipCandidate,
+  isFreshTrustedWaitingConfirmCloudOwnershipCandidate,
   isCloudWaitingConfirmAvailabilityRequestEligible,
 } = await import("../src/services/availabilityRequestService.js");
 const {
@@ -176,6 +178,15 @@ function createFakeDb() {
         available: true,
       },
     };
+    ensureBusiness(BUSINESS_ID).inventory["corolla-1"] = {
+      data: {
+        id: "corolla-1",
+        name: "Toyota Corolla",
+        label: "Toyota Corolla",
+        dailyRate: 5000,
+        available: true,
+      },
+    };
   }
 
   function getRequestDoc(requestId) {
@@ -186,11 +197,25 @@ function createFakeDb() {
     return Object.keys(store.businesses[BUSINESS_ID]?.bookings ?? {}).length;
   }
 
-  return { db, seedAvailabilityRequest, seedInventoryItem, getRequestDoc, getBookingCount, store };
+  function getBookings() {
+    return Object.entries(store.businesses[BUSINESS_ID]?.bookings ?? {}).map(
+      ([id, row]) => ({ id, ...(row?.data ?? {}) })
+    );
+  }
+
+  return {
+    db,
+    seedAvailabilityRequest,
+    seedInventoryItem,
+    getRequestDoc,
+    getBookingCount,
+    getBookings,
+    store,
+  };
 }
 
 function baseCloudWaitingRequest(overrides = {}) {
-  const sentAt = new Date();
+  const sentAt = new Date(Date.now() - 5_000);
   return {
     requestId: REQUEST_ID,
     businessId: BUSINESS_ID,
@@ -204,11 +229,15 @@ function baseCloudWaitingRequest(overrides = {}) {
     customerWaId: CUSTOMER_WA,
     approvalCustomerNotificationStatus: "sent",
     approvalCustomerNotificationAt: sentAt,
+    customerDeliveryStatus: "delivered",
+    customerDeliveryTimestamp: sentAt,
     customerConfirmationStatus: "waiting_confirm",
     customerConfirmationChannel: "waiting_confirm_cloud",
     confirmExpiresAt: buildConfirmExpiresAt(sentAt),
     customerConfirmProcessingStatus: "idle",
     lastCustomerDmPromptType: AVAILABILITY_DM_PROMPT_TYPES.BOOKING_CONFIRMATION,
+    lastCustomerDmPromptAt: sentAt,
+    lastCustomerDmOutboundAt: sentAt,
     lastCustomerNotifyMessage:
       "Honda Civic 2026 2 din ke liye available hai. Total rent 16,000 PKR hoga. Book kar du?",
     priceQuote: { status: "quoted", total: 16000, currency: "PKR", durationDays: 2 },
@@ -255,6 +284,46 @@ test("cloud eligibility requires waiting_confirm_cloud and rejects playwright ch
     ),
     false
   );
+});
+
+test("fresh waiting-confirm ownership requires delivered prompt before inbound", async () => {
+  const promptAt = Date.now() - 5_000;
+  const eligible = baseCloudWaitingRequest({
+    approvalCustomerNotificationAt: new Date(promptAt),
+    customerDeliveryStatus: "delivered",
+    customerDeliveryTimestamp: new Date(promptAt + 500),
+    lastCustomerDmPromptAt: new Date(promptAt),
+  });
+  assert.equal(
+    isFreshTrustedWaitingConfirmCloudOwnershipCandidate(eligible, {
+      inboundReceivedAtMs: promptAt + 1_000,
+    }),
+    true
+  );
+  assert.equal(
+    isFreshTrustedWaitingConfirmCloudOwnershipCandidate(eligible, {
+      inboundReceivedAtMs: promptAt,
+    }),
+    false
+  );
+  assert.equal(
+    isFreshTrustedWaitingConfirmCloudOwnershipCandidate(
+      { ...eligible, customerDeliveryStatus: "failed" },
+      { inboundReceivedAtMs: promptAt + 1_000 }
+    ),
+    false
+  );
+
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, eligible);
+  const selected =
+    await findFreshTrustedWaitingConfirmCloudOwnershipCandidate({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      inboundReceivedAtMs: promptAt + 1_000,
+    });
+  assert.equal(selected?.requestId, REQUEST_ID);
 });
 
 test("Kar do on waiting_confirm_cloud confirms via cloud inbound handler", async () => {
@@ -397,6 +466,8 @@ async function runCloudOwnershipPipeline({
     sendVia: "CLOUD_API",
     messageMeta: {},
   }),
+  waitingConfirmDecision = null,
+  waitingConfirmSendSpy = async () => ({ ok: true }),
   inboundText = "Kar do",
 } = {}) {
   resetPipelineTestIsolation();
@@ -448,7 +519,38 @@ async function runCloudOwnershipPipeline({
               .replace(/\s*\[test:[^\]]+\]\s*$/, "")
               .trim(),
             availabilityConfirmExecute: true,
-            sendWhatsAppMessageFn: async () => ({ ok: true }),
+            sendWhatsAppMessageFn: waitingConfirmSendSpy,
+            __waitingConfirmDmBrainEnabled:
+              waitingConfirmDecision == null ? null : true,
+            __decideCustomerTurnForTests:
+              waitingConfirmDecision == null
+                ? null
+                : async (turnContext) => ({
+                    ok: true,
+                    source: "test_openai",
+                    lane: "waiting_confirm_dm",
+                    turnContext,
+                    decision: {
+                      ...waitingConfirmDecision,
+                    },
+                  }),
+            __catalogRowForTests:
+              waitingConfirmDecision == null
+                ? undefined
+                : {
+                    id:
+                      params.preselectedWaitingConfirmRequest?.itemId ??
+                      "civic-1",
+                    name:
+                      params.preselectedWaitingConfirmRequest?.itemLabel ??
+                      "Honda Civic 2026",
+                    displayLabel:
+                      params.preselectedWaitingConfirmRequest?.itemLabel ??
+                      "Honda Civic 2026",
+                    dailyRate:
+                      params.preselectedWaitingConfirmRequest?.priceQuote
+                        ?.dailyRate ?? 8000,
+                  },
           });
         }),
       __tryBrainV2LiveBeforeLegacyFn: async (...args) => {
@@ -481,6 +583,41 @@ async function runCloudOwnershipPipeline({
   };
 }
 
+function activeCivicPostConfirmFacts() {
+  return {
+    ok: true,
+    reason: "MATCHED",
+    facts: {
+      booking: {
+        id: "booking-existing-civic",
+        itemId: "civic-1",
+        itemLabel: "Honda Civic 2026",
+        durationDays: 5,
+        status: "approved",
+      },
+      pendingAvailabilityRequests: [],
+    },
+  };
+}
+
+function waitingConfirmOpenAiDecision(overrides = {}) {
+  return {
+    conversationStage: "booking_offer",
+    customerIntent: "unclear",
+    situation: "awaiting_confirm",
+    customerIsConfirmingBooking: false,
+    customerIsAskingQuestion: false,
+    customerIsDeclining: false,
+    customerWantsChange: false,
+    shouldReply: true,
+    customerReply: "OpenAI waiting-confirm reply",
+    action: "reply",
+    confidence: 0.99,
+    requiredExecutor: "whatsapp_cloud_dm",
+    ...overrides,
+  };
+}
+
 test("buffer Cloud DM Kar do routes to confirm service and skips Brain", async () => {
   const { brainV2Calls, processCalls, cloudConfirmCalls, outcome, fake } =
     await runCloudOwnershipPipeline();
@@ -500,6 +637,309 @@ test("buffer Cloud DM Kar do routes to confirm service and skips Brain", async (
   );
   assert.equal(isIntentionalSilentInboundResult(outcome), true);
   assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
+});
+
+test("fresh Corolla waiting-confirm wins over older Civic post-confirm ownership", async () => {
+  let paCalls = 0;
+  let waitingConfirmSends = 0;
+  const activeFacts = activeCivicPostConfirmFacts();
+  const activeFactsBefore = structuredClone(activeFacts);
+  const request = baseCloudWaitingRequest({
+    itemId: "corolla-1",
+    itemLabel: "Toyota Corolla",
+    requestedDuration: 3,
+    priceQuote: {
+      status: "quoted",
+      total: 15000,
+      currency: "PKR",
+      durationDays: 3,
+      dailyRate: 5000,
+    },
+  });
+  const { fake, outcome } = await runCloudOwnershipPipeline({
+    availabilityRequestData: request,
+    inboundText: "Han kar do",
+    pipelineParams: {
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      __resolveActiveCustomerBookingFactsFn: async () => activeFacts,
+      __tryHandleCustomerBusinessPaInboundFn: async () => {
+        paCalls += 1;
+        return {
+          handled: true,
+          reply: "Civic post-confirm should not run",
+          bookingId: "booking-existing-civic",
+        };
+      },
+    },
+    waitingConfirmDecision: waitingConfirmOpenAiDecision({
+      customerIntent: "confirm_booking",
+      customerIsConfirmingBooking: true,
+      shouldReply: true,
+      customerReply: "OpenAI confirms the Corolla booking.",
+      action: "confirm_booking",
+      requiredExecutor: "confirm_booking_executor",
+    }),
+    waitingConfirmSendSpy: async () => {
+      waitingConfirmSends += 1;
+      return { ok: true };
+    },
+  });
+
+  assert.equal(paCalls, 0);
+  assert.equal(waitingConfirmSends, 1);
+  assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, true);
+  const updatedRequest = fake.getRequestDoc(REQUEST_ID);
+  assert.ok(updatedRequest.linkedBookingId);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(fake.getBookings()[0]?.itemId, "corolla-1");
+  assert.deepEqual(activeFacts, activeFactsBefore);
+});
+
+test("fresh Corolla waiting-confirm Q&A stays in OpenAI lane with zero booking", async () => {
+  let paCalls = 0;
+  let waitingConfirmSends = 0;
+  const { fake, outcome } = await runCloudOwnershipPipeline({
+    availabilityRequestData: baseCloudWaitingRequest({
+      itemId: "corolla-1",
+      itemLabel: "Toyota Corolla",
+      requestedDuration: 3,
+      priceQuote: {
+        status: "quoted",
+        total: 15000,
+        currency: "PKR",
+        durationDays: 3,
+        dailyRate: 5000,
+      },
+    }),
+    inboundText: "3 din ka rent kitna ho ga?",
+    pipelineParams: {
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      __resolveActiveCustomerBookingFactsFn: async () =>
+        activeCivicPostConfirmFacts(),
+      __tryHandleCustomerBusinessPaInboundFn: async () => {
+        paCalls += 1;
+        return { handled: true, reply: "wrong Civic lane" };
+      },
+    },
+    waitingConfirmDecision: waitingConfirmOpenAiDecision({
+      customerIntent: "price_question",
+      customerIsAskingQuestion: true,
+      customerReply: "Toyota Corolla ka 3 din ka verified rent 15,000 PKR hai.",
+      action: "reply",
+      requiredExecutor: "whatsapp_cloud_dm",
+    }),
+    waitingConfirmSendSpy: async (_phone, reply) => {
+      waitingConfirmSends += 1;
+      assert.match(reply, /Corolla/i);
+      assert.match(reply, /15,000 PKR/i);
+      return { ok: true };
+    },
+  });
+
+  assert.equal(paCalls, 0);
+  assert.equal(waitingConfirmSends, 1);
+  assert.equal(fake.getBookingCount(), 0);
+  assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
+  assert.equal(
+    fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
+    "waiting_confirm"
+  );
+  assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, true);
+});
+
+test("fresh waiting-confirm clarification is not silently completed by post-confirm", async () => {
+  let paCalls = 0;
+  let waitingConfirmSends = 0;
+  const { fake, outcome } = await runCloudOwnershipPipeline({
+    availabilityRequestData: baseCloudWaitingRequest({
+      itemId: "corolla-1",
+      itemLabel: "Toyota Corolla",
+      requestedDuration: 3,
+    }),
+    inboundText: "???",
+    pipelineParams: {
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      __resolveActiveCustomerBookingFactsFn: async () =>
+        activeCivicPostConfirmFacts(),
+      __tryHandleCustomerBusinessPaInboundFn: async () => {
+        paCalls += 1;
+        return { handled: true, reply: "" };
+      },
+    },
+    waitingConfirmDecision: waitingConfirmOpenAiDecision({
+      customerIntent: "unclear",
+      customerReply: "Toyota Corolla booking confirm karni hai?",
+      action: "clarify",
+      requiredExecutor: "whatsapp_cloud_dm",
+    }),
+    waitingConfirmSendSpy: async (_phone, reply) => {
+      waitingConfirmSends += 1;
+      assert.match(reply, /Corolla/i);
+      return { ok: true };
+    },
+  });
+
+  assert.equal(paCalls, 0);
+  assert.equal(waitingConfirmSends, 1);
+  assert.equal(fake.getBookingCount(), 0);
+  assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, true);
+});
+
+test("without eligible waiting-confirm, existing Civic post-confirm behavior is unchanged", async () => {
+  let paCalls = 0;
+  const { cloudConfirmCalls, outcome } = await runCloudOwnershipPipeline({
+    availabilityRequestData: null,
+    inboundText: "Pickup details?",
+    pipelineParams: {
+      __resolveActiveCustomerBookingFactsFn: async () =>
+        activeCivicPostConfirmFacts(),
+      __tryHandleCustomerBusinessPaInboundFn: async ({ preResolvedBookingFacts }) => {
+        paCalls += 1;
+        assert.equal(
+          preResolvedBookingFacts?.facts?.booking?.itemId,
+          "civic-1"
+        );
+        return {
+          handled: true,
+          reply: "OpenAI Civic post-confirm reply",
+          bookingId: "booking-existing-civic",
+          openaiUsed: true,
+          openaiSource: "openai_post_confirm_pa",
+        };
+      },
+    },
+  });
+
+  assert.equal(cloudConfirmCalls, 0);
+  assert.equal(paCalls, 1);
+  assert.equal(outcome?.reply, "OpenAI Civic post-confirm reply");
+  assert.equal(outcome?.messageMeta?.finalReplySource, "openai_post_confirm_pa");
+});
+
+for (const [label, requestPatch] of [
+  ["expired", { confirmExpiresAt: new Date(Date.now() - 60_000) }],
+  ["already-linked", { linkedBookingId: "booking-corolla-existing" }],
+]) {
+  test(`${label} waiting-confirm does not steal Civic post-confirm ownership`, async () => {
+    let paCalls = 0;
+    let confirmCalls = 0;
+    const { outcome } = await runCloudOwnershipPipeline({
+      availabilityRequestData: baseCloudWaitingRequest(requestPatch),
+      inboundText: "Pickup details?",
+      pipelineParams: {
+        __resolveActiveCustomerBookingFactsFn: async () =>
+          activeCivicPostConfirmFacts(),
+        __tryHandleCustomerBusinessPaInboundFn: async () => {
+          paCalls += 1;
+          return {
+            handled: true,
+            reply: "OpenAI Civic post-confirm reply",
+            bookingId: "booking-existing-civic",
+            openaiUsed: true,
+            openaiSource: "openai_post_confirm_pa",
+          };
+        },
+      },
+      cloudConfirmSpy: async () => {
+        confirmCalls += 1;
+        return { handled: true, reply: "must not run" };
+      },
+    });
+    assert.equal(confirmCalls, 0);
+    assert.equal(paCalls, 1);
+    assert.equal(outcome?.messageMeta?.finalReplySource, "openai_post_confirm_pa");
+  });
+}
+
+test("genuine waiting-confirm NO_MATCH falls through once to Civic post-confirm", async () => {
+  let confirmCalls = 0;
+  let paCalls = 0;
+  const { outcome } = await runCloudOwnershipPipeline({
+    availabilityRequestData: baseCloudWaitingRequest(),
+    inboundText: "Pickup details?",
+    pipelineParams: {
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      __resolveActiveCustomerBookingFactsFn: async () =>
+        activeCivicPostConfirmFacts(),
+      __tryHandleCustomerBusinessPaInboundFn: async () => {
+        paCalls += 1;
+        return {
+          handled: true,
+          reply: "OpenAI Civic fallback reply",
+          bookingId: "booking-existing-civic",
+          openaiUsed: true,
+          openaiSource: "openai_post_confirm_pa",
+        };
+      },
+    },
+    cloudConfirmSpy: async () => {
+      confirmCalls += 1;
+      return { handled: false, reason: "NO_MATCH" };
+    },
+  });
+  assert.equal(confirmCalls, 1);
+  assert.equal(paCalls, 1);
+  assert.equal(outcome?.reply, "OpenAI Civic fallback reply");
+  assert.equal(outcome?.messageMeta?.finalReplySource, "openai_post_confirm_pa");
+});
+
+test("duplicate provider ID executes waiting-confirm OpenAI, booking and send once", async () => {
+  const fake = createFakeDb();
+  fake.seedInventoryItem();
+  fake.seedAvailabilityRequest(
+    REQUEST_ID,
+    baseCloudWaitingRequest({
+      itemId: "corolla-1",
+      itemLabel: "Toyota Corolla",
+      requestedDuration: 3,
+    })
+  );
+  const providerMessageId = `wamid.waiting-dup-${randomUUID()}`;
+  let openAiCalls = 0;
+  let sends = 0;
+  const params = {
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "Han kar do",
+    messageId: providerMessageId,
+    availabilityConfirmExecute: true,
+    __waitingConfirmDmBrainEnabled: true,
+    __catalogRowForTests: {
+      id: "corolla-1",
+      name: "Toyota Corolla",
+      displayLabel: "Toyota Corolla",
+      dailyRate: 5000,
+    },
+    __decideCustomerTurnForTests: async (turnContext) => {
+      openAiCalls += 1;
+      return {
+        ok: true,
+        source: "test_openai",
+        lane: "waiting_confirm_dm",
+        turnContext,
+        decision: waitingConfirmOpenAiDecision({
+          customerIntent: "confirm_booking",
+          customerIsConfirmingBooking: true,
+          action: "confirm_booking",
+          customerReply: "OpenAI confirms the Corolla booking.",
+          requiredExecutor: "confirm_booking_executor",
+        }),
+      };
+    },
+    sendWhatsAppMessageFn: async () => {
+      sends += 1;
+      return { ok: true };
+    },
+  };
+  const first = await handleAvailabilityCustomerCloudInbound(params);
+  const second = await handleAvailabilityCustomerCloudInbound(params);
+
+  assert.equal(first.action, "confirmed_booking");
+  assert.equal(second.action, "duplicate_inbound");
+  assert.equal(openAiCalls, 1);
+  assert.equal(fake.getBookingCount(), 1);
+  assert.equal(sends, 1);
 });
 
 test("buffer does not send a second reply when confirm service handled", async () => {
