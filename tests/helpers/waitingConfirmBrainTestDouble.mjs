@@ -136,11 +136,20 @@ export async function decideWaitingConfirmFromLegacyClassifierForTests(turnConte
           : "reply";
 
   const reply = composeLegacyReply(request, legacy, messageText);
+  const actionDecision =
+    brainAction === "confirm_booking" ||
+    brainAction === "decline_request" ||
+    brainAction === "change_request";
   return {
     ok: true,
     decision: {
       action: brainAction,
-      customerReply: brainAction === "silence" || brainAction === "none" ? "" : reply,
+      // Action decisions: wording composed after execute (not initial decision reply).
+      customerReply: actionDecision
+        ? ""
+        : brainAction === "silence" || brainAction === "none"
+          ? ""
+          : reply,
       shouldReply: brainAction !== "silence" && brainAction !== "none",
       customerIsConfirmingBooking: brainAction === "confirm_booking",
       customerIsAskingQuestion: intent === "price" || intent === "question",
@@ -176,6 +185,104 @@ export async function decideWaitingConfirmFromLegacyClassifierForTests(turnConte
  * Default Playwright inbound for bridge regressions (Brain entry + test double).
  * @param {Record<string, unknown>} params
  */
+export async function composeWaitingConfirmExecutionReplyForTests({
+  frozenDecision,
+  executionResult,
+  userMessage = null,
+  facts = null,
+} = {}) {
+  const action = String(frozenDecision?.action ?? "");
+  const succeeded = executionResult?.succeeded === true;
+  const factsObj = facts && typeof facts === "object" ? facts : {};
+  const packedAvr =
+    factsObj.availabilityRequest && typeof factsObj.availabilityRequest === "object"
+      ? factsObj.availabilityRequest
+      : {};
+  const quoted =
+    factsObj.quotedPrice && typeof factsObj.quotedPrice === "object"
+      ? factsObj.quotedPrice
+      : null;
+  const requestForLegacy = {
+    ...packedAvr,
+    status: packedAvr.status || "approved",
+    approvalCustomerNotificationStatus:
+      packedAvr.approvalCustomerNotificationStatus || "sent",
+    customerConfirmationStatus:
+      packedAvr.customerConfirmationStatus || "waiting_confirm",
+    requestId: packedAvr.id || packedAvr.requestId || null,
+    lastCustomerDmPromptType:
+      factsObj.lastCustomerDmPromptType ||
+      packedAvr.lastCustomerDmPromptType ||
+      "booking_confirmation_prompt",
+    priceQuote: quoted
+      ? {
+          status: "quoted",
+          total: quoted.total ?? null,
+          dailyRate: quoted.dailyRate ?? null,
+          currency: quoted.currency || "PKR",
+          durationDays: packedAvr.requestedDuration ?? null,
+        }
+      : packedAvr.priceQuote ?? null,
+  };
+  const legacy =
+    action === "change_request" || action === "decline_request"
+      ? resolveAvailabilityConfirmationTurn({
+          request: requestForLegacy,
+          messageText: String(userMessage ?? "").trim(),
+        })
+      : null;
+  const legacyReply = String(legacy?.reply ?? "").trim();
+
+  if (action === "confirm_booking" && succeeded) {
+    return {
+      ok: true,
+      reply: "Booking confirm ho gayi.",
+      source: "test_compose",
+      frozenDecision,
+      executionResult,
+    };
+  }
+  if (action === "confirm_booking") {
+    return {
+      ok: true,
+      reply: "Abhi booking confirm nahi ho saki. Thori der baad try karein.",
+      source: "test_compose",
+      frozenDecision,
+      executionResult,
+    };
+  }
+  if (action === "decline_request") {
+    return {
+      ok: true,
+      reply: legacyReply || "Theek hai, ye offer skip kar dete hain.",
+      source: "test_compose",
+      frozenDecision,
+      executionResult,
+    };
+  }
+  if (action === "change_request") {
+    return {
+      ok: true,
+      reply:
+        legacyReply || "Change ke liye availability dobara check karni hogi.",
+      source: "test_compose",
+      frozenDecision,
+      executionResult,
+    };
+  }
+  return {
+    ok: true,
+    reply: WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
+    source: "test_compose",
+    frozenDecision,
+    executionResult,
+  };
+}
+
+/**
+ * Default Playwright inbound for bridge regressions (Brain entry + test double).
+ * @param {Record<string, unknown>} params
+ */
 export async function handlePlaywrightInboundWithTestBrain(params) {
   const { handleAvailabilityCustomerPlaywrightInbound } = await import(
     "../../src/services/availabilityCustomerConfirmService.js"
@@ -183,5 +290,8 @@ export async function handlePlaywrightInboundWithTestBrain(params) {
   return handleAvailabilityCustomerPlaywrightInbound({
     ...params,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests:
+      params.__composeWaitingConfirmExecutionReplyForTests ||
+      composeWaitingConfirmExecutionReplyForTests,
   });
 }

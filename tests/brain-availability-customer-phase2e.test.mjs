@@ -26,7 +26,8 @@ import {
   claimAvailabilityRequestCustomerConfirmProcessing,
 } from "../src/services/availabilityRequestService.js";
 import { isEmilyBrainV2AvailabilityConfirmExecuteEnabled } from "../src/brain/config/liveFeatureFlags.js";
-import { decideWaitingConfirmFromLegacyClassifierForTests } from "./helpers/waitingConfirmBrainTestDouble.mjs";
+import { decideWaitingConfirmFromLegacyClassifierForTests,
+  composeWaitingConfirmExecutionReplyForTests } from "./helpers/waitingConfirmBrainTestDouble.mjs";
 
 const BUSINESS_ID = "synthetic-car-rental-business-001";
 const CIVIC_REQUEST_ID = "avr_phase2e_civic";
@@ -445,6 +446,7 @@ test("cloud confirm without trusted waiting request sends clarification not book
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.handled, false);
   assert.equal(sendCalls.length, 0);
@@ -466,6 +468,7 @@ test("cloud confirm with waiting request but execute disabled does not create bo
     },
     availabilityConfirmExecute: false,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.handled, true);
   assert.equal(result.action, "confirm_failed");
@@ -486,6 +489,7 @@ test("cloud decline marks request declined", async () => {
     sendWhatsAppMessageFn: async () => ({ ok: true }),
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.handled, true);
   assert.equal(result.action, "declined");
@@ -508,6 +512,7 @@ test("cloud price question replies with approved quote context", async () => {
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.handled, true);
   assert.equal(result.action, "price");

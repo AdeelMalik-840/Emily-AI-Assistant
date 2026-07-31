@@ -24,9 +24,10 @@ const {
   executeWhatsAppAiPipeline,
   isIntentionalSilentInboundResult,
 } = await import("../src/services/whatsappInboundBuffer.js");
-const { decideWaitingConfirmFromLegacyClassifierForTests } = await import(
-  "./helpers/waitingConfirmBrainTestDouble.mjs"
-);
+const {
+  decideWaitingConfirmFromLegacyClassifierForTests,
+  composeWaitingConfirmExecutionReplyForTests,
+} = await import("./helpers/waitingConfirmBrainTestDouble.mjs");
 
 const BUSINESS_ID = "owner-cloud-confirm-1";
 const REQUEST_ID = "avr_cloud_own_001";
@@ -377,6 +378,7 @@ test("Kar do on waiting_confirm_cloud confirms via cloud inbound handler", async
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.handled, true);
   assert.equal(result.action, "confirmed_booking");
@@ -416,6 +418,7 @@ for (const [label, sendResult] of [
       },
       availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
     });
 
     assert.equal(result.handled, false);
@@ -451,6 +454,7 @@ test("retry after failed confirmation send does not execute or send twice", asyn
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   };
   const first = await handleAvailabilityCustomerCloudInbound(params);
   const second = await handleAvailabilityCustomerCloudInbound(params);
@@ -491,6 +495,7 @@ test("duplicate same Cloud messageId does not double-book or double-send", async
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(first.action, "confirmed_booking");
   const bookingsAfterFirst = fake.getBookingCount();
@@ -506,6 +511,7 @@ test("duplicate same Cloud messageId does not double-book or double-send", async
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(second.handled, true);
   assert.equal(second.action, "duplicate_inbound");
@@ -556,6 +562,7 @@ test("linked booking does not create a second booking", async () => {
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.handled, false);
   assert.equal(result.reason, "NO_WAITING_REQUEST");
@@ -657,8 +664,16 @@ async function runCloudOwnershipPipeline({
                     turnContext,
                     decision: {
                       ...waitingConfirmDecision,
+                      customerReply:
+                        waitingConfirmDecision.action === "confirm_booking" ||
+                        waitingConfirmDecision.action === "decline_request" ||
+                        waitingConfirmDecision.action === "change_request"
+                          ? ""
+                          : waitingConfirmDecision.customerReply,
                     },
                   }),
+            __composeWaitingConfirmExecutionReplyForTests:
+              composeWaitingConfirmExecutionReplyForTests,
             __catalogRowForTests:
               waitingConfirmDecision == null
                 ? undefined

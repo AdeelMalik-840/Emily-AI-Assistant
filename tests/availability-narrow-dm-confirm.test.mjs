@@ -174,7 +174,8 @@ function baseWaitingRequest(overrides = {}) {
 }
 
 async function handleInbound(fake, messageText, sendCalls) {
-  const { decideWaitingConfirmFromLegacyClassifierForTests } = await import(
+  const { decideWaitingConfirmFromLegacyClassifierForTests,
+  composeWaitingConfirmExecutionReplyForTests } = await import(
     "./helpers/waitingConfirmBrainTestDouble.mjs"
   );
   return handleAvailabilityCustomerCloudInbound({
@@ -189,6 +190,7 @@ async function handleInbound(fake, messageText, sendCalls) {
     },
     availabilityConfirmExecute: true,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
 }
 

@@ -12,6 +12,9 @@ import {
   WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/waitingConfirmDmLane.js";
 import {
+  composeWaitingConfirmExecutionReply,
+} from "../brain/decisions/composeWaitingConfirmExecutionReply.js";
+import {
   AVAILABILITY_DM_PROMPT_TYPES,
   buildAvailabilityAskConfirmPrompt,
   buildAvailabilityChangeCarReply,
@@ -934,6 +937,7 @@ export async function handleAvailabilityCustomerPlaywrightInbound({
   __decideCustomerTurnForTests = null,
   __catalogRowForTests = undefined,
   __chatCompletionsCreateForTests = null,
+  __composeWaitingConfirmExecutionReplyForTests = null,
 }) {
   const uid = clean(businessId);
   const text = clean(messageText);
@@ -973,6 +977,10 @@ export async function handleAvailabilityCustomerPlaywrightInbound({
     decideCustomerTurnFn: decideFn,
     catalogRowOverride: __catalogRowForTests,
     chatCompletionsCreateForTests: __chatCompletionsCreateForTests,
+    composeWaitingConfirmExecutionReplyFn:
+      typeof __composeWaitingConfirmExecutionReplyForTests === "function"
+        ? __composeWaitingConfirmExecutionReplyForTests
+        : null,
     sendReply: async ({ reply, promptType }) =>
       sendPlaywrightCustomerDmReply({
         reply,
@@ -1043,6 +1051,7 @@ function resolveBrainFailReason(turnResult) {
  *   catalogRowOverride?: Record<string, unknown> | null,
  *   chatCompletionsCreateForTests?: Function | null,
  *   sendCredentials?: Record<string, unknown> | null,
+ *   composeWaitingConfirmExecutionReplyFn?: Function | null,
  *   sendReply: (p: {
  *     reply: string,
  *     promptType: string,
@@ -1066,9 +1075,14 @@ async function runWaitingConfirmDmBrainTurn({
   catalogRowOverride,
   chatCompletionsCreateForTests = null,
   sendCredentials = null,
+  composeWaitingConfirmExecutionReplyFn = null,
   sendReply,
   afterHandled = null,
 }) {
+  const composeFn =
+    typeof composeWaitingConfirmExecutionReplyFn === "function"
+      ? composeWaitingConfirmExecutionReplyFn
+      : composeWaitingConfirmExecutionReply;
   const catalogRow =
     catalogRowOverride !== undefined
       ? catalogRowOverride
@@ -1113,6 +1127,17 @@ async function runWaitingConfirmDmBrainTurn({
   const decision = turnResult.decision;
   const action = clean(decision.action, 40);
   const resultAction = resolveWaitingConfirmResultAction(decision);
+  const quote = resolveAvailabilityApprovedPriceQuote(request, catalogRow).priceQuote;
+  const trustedFacts = {
+    itemId: clean(request?.itemId, 120) || null,
+    itemLabel: clean(request?.itemLabel, 160) || null,
+    durationDays:
+      request?.requestedDuration != null &&
+      Number.isFinite(Number(request.requestedDuration))
+        ? Math.floor(Number(request.requestedDuration))
+        : null,
+    quotedPrice: quote,
+  };
 
   const finish = async (payload, replyText = null, promptType = null) => {
     let reply = replyText;
@@ -1137,26 +1162,111 @@ async function runWaitingConfirmDmBrainTurn({
     });
   };
 
+  const composeAndFinish = async ({
+    executionResult,
+    payload,
+    promptType = AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
+    confirmResult = null,
+  }) => {
+    const composed = await composeFn({
+      facts: {
+        ...trustedFacts,
+        ...(turnContext.facts && typeof turnContext.facts === "object"
+          ? turnContext.facts
+          : {}),
+      },
+      userMessage: text,
+      frozenDecision: decision,
+      executionResult,
+      styleKey: turnContext.styleKey || "casual_local",
+      __chatCompletionsCreateForTests: chatCompletionsCreateForTests,
+    });
+    const reply =
+      clean(composed?.reply) || WAITING_CONFIRM_DM_TECHNICAL_FALLBACK;
+    if (confirmResult) {
+      const sendOutcome = await sendReply({
+        reply,
+        promptType,
+        confirmResult,
+      });
+      if (
+        sendOutcome &&
+        typeof sendOutcome === "object" &&
+        "providerAccepted" in sendOutcome &&
+        sendOutcome.providerAccepted !== true
+      ) {
+        return waitingConfirmBrainMeta({
+          handled: false,
+          retryable: true,
+          action: "confirm_reply_send_failed",
+          reason: "CLOUD_CONFIRM_REPLY_NOT_DELIVERED",
+          reply: "",
+          result: confirmResult,
+          decision,
+          requestId,
+          actionType: "confirm_booking",
+          composedAfterExecution: true,
+          executionResult,
+        });
+      }
+      if (typeof afterHandled === "function") await afterHandled();
+      return waitingConfirmBrainMeta({
+        handled: true,
+        decision,
+        requestId,
+        reply:
+          sendOutcome && typeof sendOutcome === "object" && "reply" in sendOutcome
+            ? sendOutcome.reply
+            : sendOutcome ?? reply,
+        turnContext,
+        ...payload,
+        action: payload.action != null ? payload.action : resultAction,
+        composedAfterExecution: true,
+        executionResult,
+        composeSource: composed?.source ?? null,
+      });
+    }
+    return finish(
+      {
+        ...payload,
+        composedAfterExecution: true,
+        executionResult,
+        composeSource: composed?.source ?? null,
+      },
+      reply,
+      promptType
+    );
+  };
+
   if (action === "confirm_booking") {
     const confirmGuard = evaluateWaitingConfirmDmBrainConfirmGuard({
       decision,
       turnContext,
     });
     if (!confirmGuard.ok) {
-      return finish(
-        {
+      return composeAndFinish({
+        executionResult: {
+          attempted: false,
+          succeeded: false,
+          status: "not_executed",
+          reason: "CONFIRM_GUARD_FAILED",
+          kind: "confirm_booking",
+          requestId,
+          ...trustedFacts,
+          totalAmount: quote?.total ?? null,
+          currency: quote?.currency ?? "PKR",
+          customerConfirmationStatusBefore: "waiting_confirm",
+          customerConfirmationStatusAfter: "waiting_confirm",
+        },
+        payload: {
           action: "clarify",
           confirmGuardFailed: true,
           confirmGuardReasons: confirmGuard.reasons,
         },
-        resolveBrainEnabledOutboundReply(decision),
-        resolveWaitingConfirmDmOutboundPromptType(
-          decision,
-          AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-        )
-      );
+      });
     }
 
+    const statusBefore = clean(request?.customerConfirmationStatus) || null;
     const result = await executeAvailabilityCustomerConfirmBooking({
       db: connection,
       businessId,
@@ -1167,88 +1277,93 @@ async function runWaitingConfirmDmBrainTurn({
       availabilityConfirmExecute,
       brainAuthorizedConfirm: true,
     });
-    const reply = resolveBrainEnabledOutboundReply(decision);
-    if (reply == null) {
-      if (typeof afterHandled === "function") await afterHandled();
-      return waitingConfirmBrainMeta({
-        handled: true,
+    const executionResult = {
+      attempted: true,
+      succeeded: result.ok === true,
+      status: result.ok === true ? "succeeded" : "failed",
+      reason: result.ok === true ? null : result.reason ?? "CONFIRM_FAILED",
+      bookingId: result.ok === true ? result.bookingId ?? null : null,
+      kind: "confirm_booking",
+      requestId,
+      ...trustedFacts,
+      totalAmount: quote?.total ?? null,
+      currency: quote?.currency ?? "PKR",
+      customerConfirmationStatusBefore: statusBefore,
+      customerConfirmationStatusAfter:
+        result.ok === true ? "confirmed" : statusBefore,
+    };
+    return composeAndFinish({
+      executionResult,
+      confirmResult: result,
+      payload: {
         action: result.ok ? "confirmed_booking" : "confirm_failed",
-        reply: null,
         result,
-        decision,
-        requestId,
         actionType: "confirm_booking",
         failureReason: result.ok === true ? null : result.reason ?? null,
         failureStage: result.ok === true ? null : result.failureStage ?? null,
-        turnContext,
-      });
-    }
-
-    const sendOutcome = await sendReply({
-      reply,
-      promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
-      confirmResult: result,
-    });
-    if (
-      sendOutcome &&
-      typeof sendOutcome === "object" &&
-      "providerAccepted" in sendOutcome &&
-      sendOutcome.providerAccepted !== true
-    ) {
-      return waitingConfirmBrainMeta({
-        handled: false,
-        retryable: true,
-        action: "confirm_reply_send_failed",
-        reason: "CLOUD_CONFIRM_REPLY_NOT_DELIVERED",
-        reply: "",
-        result,
-        decision,
-        requestId,
-        actionType: "confirm_booking",
-      });
-    }
-    if (typeof afterHandled === "function") await afterHandled();
-    return waitingConfirmBrainMeta({
-      handled: true,
-      action: result.ok ? "confirmed_booking" : "confirm_failed",
-      reply:
-        sendOutcome && typeof sendOutcome === "object" && "reply" in sendOutcome
-          ? sendOutcome.reply
-          : sendOutcome ?? reply,
-      result,
-      decision,
-      requestId,
-      actionType: "confirm_booking",
-      failureReason: result.ok === true ? null : result.reason ?? null,
-      failureStage: result.ok === true ? null : result.failureStage ?? null,
-      turnContext,
+      },
     });
   }
 
   if (action === "decline_request") {
-    await updateAvailabilityRequestCustomerConfirmationState({
+    const statusBefore = clean(request?.customerConfirmationStatus) || null;
+    const declineResult = await executeAvailabilityCustomerDecline({
       db: connection,
       businessId,
-      requestId,
-      customerConfirmationStatus: "declined",
-      extra: {
-        customerConfirmationAt: new Date(),
-        customerConfirmationMessageId: inboundMessageId || null,
-        customerConfirmationTextPreview: text.slice(0, 160),
+      request,
+      customerPhone,
+      messageId: inboundMessageId,
+      messageText: text,
+    });
+    return composeAndFinish({
+      executionResult: {
+        attempted: true,
+        succeeded: declineResult.ok === true,
+        status: declineResult.ok === true ? "succeeded" : "failed",
+        reason:
+          declineResult.ok === true
+            ? null
+            : declineResult.reason ?? "DECLINE_FAILED",
+        kind: "decline_request",
+        requestId,
+        ...trustedFacts,
+        totalAmount: quote?.total ?? null,
+        currency: quote?.currency ?? "PKR",
+        customerConfirmationStatusBefore: statusBefore,
+        customerConfirmationStatusAfter:
+          declineResult.ok === true ? "declined" : statusBefore,
+      },
+      payload: {
+        action: declineResult.ok === true ? "declined" : "decline_failed",
+        result: declineResult,
       },
     });
-    return finish(
-      { action: "declined" },
-      resolveBrainEnabledOutboundReply(decision),
-      AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-    );
+  }
+
+  if (action === "change_request") {
+    return composeAndFinish({
+      executionResult: {
+        attempted: false,
+        succeeded: false,
+        status: "not_executed",
+        reason: "CHANGE_REQUEST_NO_BOOKING_MUTATION",
+        kind: "change_request",
+        requestId,
+        ...trustedFacts,
+        totalAmount: quote?.total ?? null,
+        currency: quote?.currency ?? "PKR",
+        customerConfirmationStatusBefore: "waiting_confirm",
+        customerConfirmationStatusAfter: "waiting_confirm",
+      },
+      payload: { action: resultAction },
+    });
   }
 
   if (action === "silence" || action === "none") {
     return finish({ action: "silence" });
   }
 
-  if (action === "change_request" || action === "clarify" || action === "reply") {
+  if (action === "clarify" || action === "reply") {
     return finish(
       { action: resultAction },
       resolveBrainEnabledOutboundReply(decision),
@@ -1283,6 +1398,7 @@ async function runWaitingConfirmDmBrainTurn({
  *   __decideCustomerTurnForTests?: Function | null,
  *   __catalogRowForTests?: Record<string, unknown> | null,
  *   __chatCompletionsCreateForTests?: Function | null,
+ *   __composeWaitingConfirmExecutionReplyForTests?: Function | null,
  * }} params
  */
 export async function handleAvailabilityCustomerCloudInbound({
@@ -1301,6 +1417,7 @@ export async function handleAvailabilityCustomerCloudInbound({
   __decideCustomerTurnForTests = null,
   __catalogRowForTests = undefined,
   __chatCompletionsCreateForTests = null,
+  __composeWaitingConfirmExecutionReplyForTests = null,
 }) {
   const uid = clean(businessId);
   const phone = normalizePhone(customerPhone);
@@ -1477,6 +1594,10 @@ export async function handleAvailabilityCustomerCloudInbound({
     decideCustomerTurnFn: decideFn,
     catalogRowOverride: __catalogRowForTests,
     chatCompletionsCreateForTests: __chatCompletionsCreateForTests,
+    composeWaitingConfirmExecutionReplyFn:
+      typeof __composeWaitingConfirmExecutionReplyForTests === "function"
+        ? __composeWaitingConfirmExecutionReplyForTests
+        : null,
     sendCredentials,
     afterHandled: async () =>
       recordCloudInboundIdempotency({

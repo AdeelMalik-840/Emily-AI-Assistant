@@ -420,6 +420,58 @@ export function buildPostExecutionBookingSuccessContract(facts = {}) {
   });
 }
 
+/**
+ * Waiting-confirm post-execution failure / not-executed / decline / change wording.
+ * Success claims forbidden.
+ */
+export function buildWaitingConfirmPostExecutionFailureContract(facts = {}) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  const lang = langOptsFromFacts(f);
+  const guardFacts = buildWaitingConfirmGuardFacts(f);
+  const status = String(f.waitingConfirmExecutionStatus ?? "failed")
+    .trim()
+    .slice(0, 40);
+  const reason = String(f.waitingConfirmExecutionReason ?? "")
+    .trim()
+    .slice(0, 160);
+  const action = String(f.waitingConfirmAction ?? "")
+    .trim()
+    .slice(0, 40);
+  return buildCustomerReplyContract({
+    channel: "dm",
+    conversationalGoal:
+      "Explain the verified waiting-confirm outcome without claiming a booking was created. Match the customer's language. Ask a useful clarification only when the verified result requires it.",
+    replyRequired: true,
+    verifiedCustomerFacts: {
+      ...guardFacts,
+      bookingExecutionVerified: false,
+      waitingConfirmExecutionStatus: status || "failed",
+      waitingConfirmExecutionReason: reason || null,
+      waitingConfirmAction: action || null,
+    },
+    requiredMeaning: "post_execution_waiting_confirm_outcome",
+    allowedClaims: [
+      CUSTOMER_CLAIMS.CUSTOMER_CONFIRMATION_ACKNOWLEDGED,
+      CUSTOMER_CLAIMS.RESERVATION_REQUESTED,
+      ...(guardFacts.totalAmount != null
+        ? [CUSTOMER_CLAIMS.QUOTATION_VERIFIED]
+        : []),
+    ],
+    forbiddenClaims: [
+      CUSTOMER_CLAIMS.RESERVATION_CREATED,
+      CUSTOMER_CLAIMS.APPOINTMENT_CONFIRMED,
+      CUSTOMER_CLAIMS.ORDER_CREATED,
+      CUSTOMER_CLAIMS.PAYMENT_RECEIVED,
+      CUSTOMER_CLAIMS.DELIVERY_STATUS_VERIFIED,
+      CUSTOMER_CLAIMS.SPECIFIC_TIMING_VERIFIED,
+      CUSTOMER_CLAIMS.INTERNAL_PROCESS_DISCLOSED,
+    ],
+    verifiedTiming: { hasVerifiedTime: false },
+    privacyLevel: "dm_private",
+    ...lang,
+  });
+}
+
 function clarificationIdentityCandidates(facts) {
   const f = facts && typeof facts === "object" ? facts : {};
   const rows = Array.isArray(f.bookingCandidates)

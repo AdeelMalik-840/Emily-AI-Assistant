@@ -31,9 +31,13 @@ const { buildConfirmExpiresAt } = await import(
 const {
   WAITING_CONFIRM_DM_CONFIRM_EXECUTOR,
   WAITING_CONFIRM_DM_LANE,
+  WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
 } = await import("../src/brain/decisions/waitingConfirmDmLane.js");
 const { AVAILABILITY_DM_PROMPT_TYPES } = await import(
   "../src/brain/availabilityConfirmation/index.js"
+);
+const { composeWaitingConfirmExecutionReplyForTests } = await import(
+  "./helpers/waitingConfirmBrainTestDouble.mjs"
 );
 
 const BUSINESS_ID = "cont-pr1-biz";
@@ -217,7 +221,7 @@ function confirmDecision(overrides = {}) {
     ok: true,
     decision: {
       action: "confirm_booking",
-      customerReply: "Confirm mil gaya, request aage barhati hun.",
+      customerReply: "",
       shouldReply: true,
       customerIsConfirmingBooking: true,
       customerIsAskingQuestion: false,
@@ -239,6 +243,13 @@ function confirmDecision(overrides = {}) {
     source: "test",
     lane: WAITING_CONFIRM_DM_LANE,
   };
+}
+
+async function testCompose({ frozenDecision, executionResult }) {
+  return composeWaitingConfirmExecutionReplyForTests({
+    frozenDecision,
+    executionResult,
+  });
 }
 
 test("1. Cloud waiting_confirm: Yes book kr dain — decideCustomerTurn once, no unlisted, one execute", async () => {
@@ -271,12 +282,16 @@ test("1. Cloud waiting_confirm: Yes book kr dain — decideCustomerTurn once, no
       );
       return confirmDecision();
     },
+    __composeWaitingConfirmExecutionReplyForTests: testCompose,
   });
   assert.equal(decideCalls, 1, `result=${JSON.stringify({ action: result.action, reason: result.reason, failureReason: result.failureReason })}`);
   assert.equal(result.waitingConfirmDmBrain, true);
   assert.equal(result.action, "confirm_failed");
   assert.equal(result.failureReason, "CONFIRM_EXECUTE_DISABLED");
+  assert.equal(result.composedAfterExecution, true);
   assert.equal(sendCalls.length, 1);
+  assert.match(String(sendCalls[0][1]), /confirm nahi|try karein/i);
+  assert.doesNotMatch(String(sendCalls[0][1]), /aage barh|extend|process karti/i);
 
   const dup = await handleAvailabilityCustomerCloudInbound({
     db: fake.db,
@@ -290,6 +305,7 @@ test("1. Cloud waiting_confirm: Yes book kr dain — decideCustomerTurn once, no
       decideCalls += 1;
       return confirmDecision();
     },
+    __composeWaitingConfirmExecutionReplyForTests: testCompose,
   });
   assert.equal(dup.duplicate, true);
   assert.equal(decideCalls, 1);
@@ -312,15 +328,16 @@ test("2. Playwright waiting_confirm uses decideCustomerTurn — classifier not f
   const playwrightFnStart = src.indexOf(
     "export async function handleAvailabilityCustomerPlaywrightInbound"
   );
-  const playwrightFnEnd = src.indexOf(
-    "async function handleWaitingConfirmDmBrainPlaywrightTurn"
-  );
-  const playwrightSection = src.slice(playwrightFnStart, playwrightFnEnd);
+  const sharedStart = src.indexOf("async function runWaitingConfirmDmBrainTurn");
+  assert.ok(playwrightFnStart >= 0);
+  assert.ok(sharedStart >= 0);
+  const playwrightSection = src.slice(playwrightFnStart, sharedStart);
   assert.doesNotMatch(
     playwrightSection,
     /resolveAvailabilityConfirmationTurn/
   );
-  assert.match(playwrightSection, /decideCustomerTurn/);
+  assert.match(src, /runWaitingConfirmDmBrainTurn/);
+  assert.match(src, /composeWaitingConfirmExecutionReply/);
 
   const result = await handleAvailabilityCustomerPlaywrightInbound({
     db: fake.db,
@@ -338,6 +355,7 @@ test("2. Playwright waiting_confirm uses decideCustomerTurn — classifier not f
       assert.equal(ctx.continuation?.type, "waiting_confirm");
       return confirmDecision();
     },
+    __composeWaitingConfirmExecutionReplyForTests: testCompose,
   });
   assert.equal(decideCalls, 1);
   assert.equal(result.waitingConfirmDmBrain, true);
