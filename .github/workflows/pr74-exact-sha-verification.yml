@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - verify/pr74-6592c019
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
