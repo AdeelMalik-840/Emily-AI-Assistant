@@ -166,6 +166,19 @@ function decisionJson(reply, overrides = {}) {
   });
 }
 
+function composeJson(reply, overrides = {}) {
+  return JSON.stringify({
+    customerReply: reply,
+    replySemantics: {
+      claims: [],
+      languageStyle: "roman_urdu",
+      containsTimingPromise: false,
+      exposesInternalProcess: false,
+    },
+    ...overrides,
+  });
+}
+
 function completion(content) {
   return { choices: [{ message: { content } }] };
 }
@@ -297,43 +310,59 @@ test("varied post-booking questions all use the same OpenAI lane without side ef
       : message.includes("dates change")
         ? "change_dates"
         : "none";
+    const responses =
+      mutation !== "none"
+        ? [
+            decisionJson("", {
+              situation: "protected_action",
+              conversationAct: "action_request",
+              customerIntent: "ask_action",
+              customerIsAskingQuestion: false,
+              action: "request_booking_mutation",
+              mutationIntent: mutation,
+            }),
+            composeJson(reply),
+          ]
+        : [
+            decisionJson(reply, {
+              ...(englishReply
+                ? {
+                    replySemantics: {
+                      claims: [],
+                      languageStyle: "english",
+                      containsTimingPromise: false,
+                      exposesInternalProcess: false,
+                    },
+                  }
+                : {}),
+            }),
+          ];
     const result = await runOwnedTurn({
       message,
-      responses: [
-        decisionJson(reply, {
-          ...(englishReply
-            ? {
-                replySemantics: {
-                  claims: [],
-                  languageStyle: "english",
-                  containsTimingPromise: false,
-                  exposesInternalProcess: false,
-                },
-              }
-            : {}),
-          ...(mutation !== "none"
-            ? {
-                situation: "protected_action",
-                conversationAct: "action_request",
-                customerIntent: "ask_action",
-                customerIsAskingQuestion: false,
-                action: "request_booking_mutation",
-                mutationIntent: mutation,
-              }
-            : {}),
-        }),
-      ],
+      responses,
       counters,
     });
     assert.equal(result.handled, true, message);
     assert.equal(result.reply, reply, message);
-    assert.equal(result.finalReplySource, "openai_post_confirm_pa", message);
-    assert.equal(counters.openaiCalls, 1, message);
+    assert.equal(
+      result.finalReplySource,
+      mutation !== "none"
+        ? "openai_post_confirm_pa_mutation_compose"
+        : "openai_post_confirm_pa",
+      message
+    );
+    assert.equal(counters.openaiCalls, mutation !== "none" ? 2 : 1, message);
+    if (mutation !== "none") {
+      assert.equal(result.semanticDecisionCount, 1, message);
+      assert.equal(result.composeCalls, 1, message);
+      assert.equal(result.mutationExecutionStatus, "unsupported", message);
+      assert.equal(result.mutationExecution?.changedData, false, message);
+    }
     assert.equal(counters.customerSends || 0, 0, message);
     assert.equal(counters.missingInfoCreates || 0, 0, message);
     assert.equal(counters.ownerNotifications || 0, 0, message);
     assert.match(
-      String(counters.lastOpenAiArgs.messages[1].content),
+      String(counters.openaiPrompts[0] || ""),
       /RECENT_CONVERSATION/,
       message
     );
@@ -417,7 +446,7 @@ test("unverified booking mutations cannot be claimed complete", async () => {
     ["cancel_booking", "Request complete ho gayi hai"],
     ["change_dates", "Change apply ho gaya hai"],
     ["change_dates", "Booking update ho chuki hai"],
-    ["change_pickup", "Pickup shift complete hai"],
+    ["update_pickup", "Pickup shift complete hai"],
     ["change_item", "Car replace ho gayi hai"],
     ["change_dates", "Dates modify kar di gayi hain"],
   ];
@@ -439,15 +468,23 @@ test("unverified booking mutations cannot be claimed complete", async () => {
       message: "meri booking update kar dein",
       responses: [
         decisionJson(falseCompletion, mutationShape),
-        decisionJson(safeReply, mutationShape),
+        composeJson(falseCompletion),
+        composeJson(safeReply),
       ],
       counters,
     });
-    assert.equal(counters.openaiCalls, 2, mutationIntent);
+    assert.equal(result.semanticDecisionCount, 1, mutationIntent);
+    assert.equal(result.composeCalls, 1, mutationIntent);
     assert.equal(result.reply, safeReply, mutationIntent);
-    assert.equal(result.mutationExecutionStatus, "not_executed", mutationIntent);
+    assert.equal(result.mutationExecutionStatus, "unsupported", mutationIntent);
+    assert.equal(result.mutationExecution?.changedData, false, mutationIntent);
     assert.equal(counters.unexpectedConfirmExecutions || 0, 0, mutationIntent);
     assert.equal(counters.unexpectedDeclineExecutions || 0, 0, mutationIntent);
+    assert.match(
+      String(counters.openaiPrompts[1] || ""),
+      /FROZEN_DECISION_JSON/,
+      mutationIntent
+    );
   }
 });
 
@@ -973,7 +1010,7 @@ test("no trusted focus asks OpenAI clarification and generic mutation cannot sel
     message: "Cancel kar do",
     facts: trustedMultiBookingFacts(),
     responses: [
-      decisionJson("Corolla cancel kar deta hun.", {
+      decisionJson("", {
         situation: "protected_action",
         conversationAct: "action_request",
         customerIntent: "ask_action",
@@ -982,17 +1019,24 @@ test("no trusted focus asks OpenAI clarification and generic mutation cannot sel
         mutationIntent: "cancel_booking",
         bookingSelectionMode: "focused",
       }),
-      decisionJson("Civic wali ya Corolla wali booking cancel karni hai?", {
-        bookingSelectionMode: "clarification_required",
-      }),
+      composeJson(
+        "Corolla cancel abhi yahan auto complete nahi ho sakti — follow-up chahiye."
+      ),
     ],
     counters,
   });
+  assert.equal(mutation.semanticDecisionCount, 1);
+  assert.equal(mutation.composeCalls, 1);
   assert.equal(counters.openaiCalls, 2);
-  assert.equal(mutation.decisionAction, "reply");
+  assert.equal(mutation.decisionAction, "request_booking_mutation");
+  assert.equal(mutation.bookingSelectionMode, "focused");
+  assert.equal(mutation.selectedBookingIndex, 2);
+  assert.equal(mutation.bookingId, "booking-corolla");
+  assert.equal(mutation.mutationExecutionStatus, "unsupported");
+  assert.equal(mutation.mutationExecution?.changedData, false);
   assert.equal(
     mutation.reply,
-    "Civic wali ya Corolla wali booking cancel karni hai?"
+    "Corolla cancel abhi yahan auto complete nahi ho sakti — follow-up chahiye."
   );
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
   assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
@@ -1003,7 +1047,7 @@ test("explicit multi-booking mutation maps to the exact candidate but remains un
     message: "Civic wali cancel kar do",
     facts: trustedMultiBookingFacts(),
     responses: [
-      decisionJson("Civic cancellation request abhi execute nahi hui.", {
+      decisionJson("", {
         situation: "protected_action",
         conversationAct: "action_request",
         customerIntent: "ask_action",
@@ -1013,11 +1057,15 @@ test("explicit multi-booking mutation maps to the exact candidate but remains un
         bookingSelectionMode: "candidate",
         selectedBookingIndex: 1,
       }),
+      composeJson("Civic cancellation abhi auto complete nahi hui."),
     ],
   });
   assert.equal(result.bookingId, "booking-civic");
-  assert.equal(result.mutationExecutionStatus, "not_executed");
+  assert.equal(result.mutationExecutionStatus, "unsupported");
+  assert.equal(result.mutationExecution?.changedData, false);
   assert.equal(result.selectedBookingIndex, 1);
+  assert.equal(result.semanticDecisionCount, 1);
+  assert.equal(result.composeCalls, 1);
 });
 
 test("no active booking leaves the existing general path unclaimed", async () => {

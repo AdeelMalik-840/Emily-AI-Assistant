@@ -975,19 +975,30 @@ export function resolvePostConfirmBookingSelection(decision, facts) {
     candidates.length > 1 &&
     hasCustomerIndistinguishableBookingCandidates(candidates);
 
-  if (
-    mutationRequested &&
-    candidates.length > 1 &&
-    mode !== "candidate"
-  ) {
-    return {
-      ok: false,
-      reason: "ambiguous_booking_mutation_requires_candidate",
-      mode,
-      selectedBookingIndex: null,
-      booking: null,
-      bookings: [],
-    };
+  if (mutationRequested && candidates.length > 1) {
+    // Intentional focused = trusted CURRENT_BOOKING_IN_SCOPE only.
+    // Explicit other bookings must use candidate. Do not auto-upgrade none→focused.
+    if (mode === "focused") {
+      if (!hasTrustedPostConfirmBookingFocus(facts) || focusIndex == null) {
+        return {
+          ok: false,
+          reason: "invalid_or_stale_booking_selection",
+          mode,
+          selectedBookingIndex: null,
+          booking: null,
+          bookings: [],
+        };
+      }
+    } else if (mode !== "candidate") {
+      return {
+        ok: false,
+        reason: "ambiguous_booking_mutation_requires_candidate",
+        mode,
+        selectedBookingIndex: null,
+        booking: null,
+        bookings: [],
+      };
+    }
   }
 
   if (mode === "all_candidates") {
@@ -1467,7 +1478,14 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
         : action !== "silence" && action !== "none";
 
   // Silence / no-reply may have empty customerReply.
-  if ((action === "silence" || shouldReply === false) && !customerReply) {
+  // request_booking_mutation may also be empty: final wording is composed after
+  // deterministic validate/execute (semantic decision only in this Brain call).
+  if (
+    (action === "silence" ||
+      shouldReply === false ||
+      action === "request_booking_mutation") &&
+    !customerReply
+  ) {
     customerReply = "";
   } else if (!customerReply) {
     return null;
@@ -1939,7 +1957,7 @@ STEP 4 — action:
 - none: rare; prefer silence when empty
 - reply: send customerReply
 - escalate_missing_info: only situation=new_question per escalate rules
-- request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, pickup, or delivery. Set the matching mutationIntent. Do not claim execution succeeded.
+- request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, pickup, or delivery. Set the matching mutationIntent. Set customerReply to "" (final wording is composed after deterministic execution). Do not claim execution succeeded.
 - confirm_pending_availability / decline_pending_availability: use only when the customer clearly intends that action for one listed pendingAvailabilityRequests entry. Set pendingAvailabilitySelectionIndex to that entry's selectionIndex. If intent or selection is unclear, ask a natural clarification with action="reply".
 - mutationExecutionRequested=true only with request_booking_mutation.
 - mutationExecutionStatus must reflect VERIFIED_BUSINESS_PA_FACTS_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
@@ -1949,11 +1967,12 @@ STEP 4 — action:
   all_candidates = customer explicitly asked for facts about all listed bookingCandidates; read-only information only;
   clarification_required = more than one booking could apply and the customer did not identify one;
   none = no booking is relevant (for example social conversation).
-- A trusted focused booking may default only read-only informational questions. Never use focused for a booking mutation.
+- A trusted focused booking may default only read-only informational questions when bookingSelectionMode is none.
+- For request_booking_mutation with multiple bookings: use bookingSelectionMode=focused to mutate the trusted CURRENT_BOOKING_IN_SCOPE booking; use candidate + selectedBookingIndex when the customer clearly named a different booking. If unclear, clarification_required with selectedBookingIndex=null. Never treat mode=none as focused for mutations.
 - For all_candidates, set selectedBookingIndex=null and provide exactly one candidateGroundings row for every bookingCandidates row. Each replySegment must be an exact non-overlapping substring of customerReply, name that booking using customer-safe facts, and contain only facts for its selectionIndex.
 - Never use all_candidates for a mutation or action request.
 - If two candidates have no customer-safe distinction, use clarification_required and naturally request a date, reference, or other safe distinguishing detail. Never guess an index.
-- For any request_booking_mutation with multiple bookings, use candidate only when the customer clearly identified that exact booking. Otherwise action="reply", bookingSelectionMode="clarification_required", selectedBookingIndex=null, and ask naturally which booking.
+- For request_booking_mutation with multiple bookings: use focused for the trusted CURRENT_BOOKING_IN_SCOPE booking, or candidate + selectedBookingIndex when the customer clearly identified a different booking. If unclear, action="reply", bookingSelectionMode="clarification_required", selectedBookingIndex=null, and ask naturally which booking. Never use mode=none for multi-booking mutations.
 - bookingCandidates indexes apply only to this decision. Do not quote indexes or internal identifiers to the customer.
 - Never fall through to another conversational router.
 - When pendingAvailabilityExecution exists, report that verified outcome naturally with action="reply"; do not request the same action again.
@@ -2105,7 +2124,14 @@ STRICT SAFETY:
       const hasSendableReply = Boolean(cleanCustomerReply(decision?.customerReply));
       const isSilence =
         decision?.action === "silence" || decision?.shouldReply === false;
-      if (!decision || (!hasSendableReply && !isSilence)) {
+      const isMutationSemanticDecision =
+        decision?.action === "request_booking_mutation" &&
+        cleanMutationIntent(decision?.mutationIntent) !== "none";
+      // Mutations may return empty customerReply — wording is composed after execute.
+      if (
+        !decision ||
+        (!hasSendableReply && !isSilence && !isMutationSemanticDecision)
+      ) {
         lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
         if (attempt < attemptLimit) continue;
         return {
@@ -2175,6 +2201,26 @@ STRICT SAFETY:
       finalized.selectedBookingIndex =
         bookingSelection.selectedBookingIndex;
       finalized.selectedBookingId = bookingSelection.booking?.id ?? null;
+
+      // Mutation semantic decisions stop here: final customer wording is composed
+      // after deterministic validate/execute. Do not treat model customerReply as
+      // the outbound message (and do not run reply-content guards on it).
+      if (
+        finalized.action === "request_booking_mutation" &&
+        cleanMutationIntent(finalized.mutationIntent) !== "none"
+      ) {
+        finalized.customerReply = "";
+        finalized.shouldReply = true;
+        finalized.mutationExecutionRequested = true;
+        finalized.mutationExecutionStatus = "not_executed";
+        return {
+          ok: true,
+          decision: stripInternalReplySemantics(finalized),
+          source: "openai",
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
 
       const replyText = cleanCustomerReply(finalized?.customerReply);
       const replyRequired =
