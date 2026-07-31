@@ -1,0 +1,97 @@
+name: PR74 exact SHA verification
+
+on:
+  push:
+    branches:
+      - verify/pr74-6592c019
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr74-exact-sha-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      NODE_ENV: test
+      OPENAI_API_KEY: test-key
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@v4
+        with:
+          ref: 6592c019d170edaa7238194b5399b515aa8bc81c
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify exact SHA
+        run: |
+          test "$(git rev-parse HEAD)" = "6592c019d170edaa7238194b5399b515aa8bc81c"
+          git status --porcelain
+
+      - name: Clarification identity scope
+        run: node --test tests/post-confirm-clarification-identity-scope.test.mjs
+
+      - name: Post-confirm continuity
+        run: node --test tests/dm-confirmed-booking-openai-continuity.test.mjs
+
+      - name: Canonical booking facts
+        run: node --test tests/canonical-customer-booking-facts.test.mjs
+
+      - name: Shared guard supported facts
+        run: node --test tests/customer-reply-guard-supported-facts.test.mjs
+
+      - name: Post-confirm canonical integration
+        run: node --test tests/post-confirm-canonical-booking-facts-integration.test.mjs
+
+      - name: Pending availability canonical guard
+        run: node --test tests/pending-availability-canonical-guard.test.mjs
+
+      - name: Price mismatch diagnostic
+        run: node --test tests/verified-price-mismatch-diagnostic.test.mjs
+
+      - name: Required-empty recovery
+        run: node --test tests/post-confirm-required-empty-recovery.test.mjs
+
+      - name: Terminal diagnostic
+        run: node --test tests/post-confirm-terminal-diagnostic.test.mjs
+
+      - name: Customer Business PA agent
+        run: node --test tests/customer-business-pa-agent.test.mjs
+
+      - name: Waiting-confirm DM lane
+        run: node --test tests/waiting-confirm-dm-brain-lane-step-4.test.mjs
+
+      - name: Cloud ownership race
+        run: node --test tests/cloud-post-confirm-ownership-race.test.mjs
+
+      - name: Conversation idempotency
+        run: node --test tests/conversation-store-idempotency.test.mjs
+
+      - name: Syntax checks
+        run: |
+          node --check src/brain/facts/resolveActiveCustomerBookingFacts.js
+          node --check src/brain/guards/customerReplyGuard.js
+          node --check src/brain/contracts/customerReplyContract.js
+          node --check src/brain/decisions/decideCustomerTurn.js
+          node --check src/brain/decisions/waitingConfirmDmLane.js
+
+      - name: Diff and worktree checks
+        run: |
+          git diff --check 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
+          test -z "$(git status --porcelain)"
+          git diff --stat 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
+
+      - name: Full repository test suite
+        run: npm test
