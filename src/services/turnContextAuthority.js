@@ -10,11 +10,29 @@ import {
   hasExplicitNewItemMention,
 } from "./currentTurnAuthority.js";
 import { hasStrongBookingCommitPhrase } from "./conversationRouter.js";
+import {
+  EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
+  isAvailabilityDurationPendingAction,
+  readEmilyPendingFromMemory,
+} from "../brain/availability/emilyPendingContext.js";
 
 export const ITEMLESS_PRICE_CLARIFICATION_REPLY =
   "Kis car ke liye price pooch rahe hain?";
 export const AMBIGUOUS_SHORT_GROUP_CLARIFICATION_REPLY =
   "Kis item ke liye keh rahe hain?";
+
+/**
+ * Open availability-duration pending must outrank generic itemless-price "which car?" clarifies.
+ * @param {Record<string, unknown> | null | undefined} memory
+ */
+export function hasOpenAvailabilityDurationPendingMemory(memory) {
+  if (!memory || typeof memory !== "object" || Array.isArray(memory)) return false;
+  const emilyPending = readEmilyPendingFromMemory(memory);
+  if (emilyPending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION) {
+    return true;
+  }
+  return isAvailabilityDurationPendingAction(memory.pendingAction);
+}
 
 function normalizeId(raw) {
   const id = String(raw ?? "").trim();
@@ -80,7 +98,7 @@ function resolveItemlessPriceDurationAskedField(message) {
 
 function isBareDurationMessage(message) {
   const raw = String(message ?? "").trim();
-  return /^(\d+)(?:\s*(?:day|days|din|dino|hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey)(?:\s+\S+){0,3})?$/i.test(
+  return /^(\d+)(?:\s*(?:day|days|din|dino|hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey|week|weeks|hafta|haftay|month|months|mahina|mahinay|year|years|yr|yrs|saal)(?:\s+\S+){0,3})?$/i.test(
     raw
   );
 }
@@ -296,7 +314,17 @@ export function resolveTurnContext(opts = {}) {
   let clarificationReply = null;
   let clarificationReason = null;
 
-  if (itemlessPriceDurationFollowup && !authoritativeItem) {
+  const openAvailabilityDurationPending = hasOpenAvailabilityDurationPendingMemory(
+    opts.memory && typeof opts.memory === "object" ? opts.memory : null
+  );
+
+  // Availability-duration pending (Civic ask-duration, etc.) outranks generic
+  // itemless-price clarification so duration answers reach Brain continuity.
+  if (
+    itemlessPriceDurationFollowup &&
+    !authoritativeItem &&
+    !openAvailabilityDurationPending
+  ) {
     shouldClarifyItem = true;
     clarificationReply = ITEMLESS_PRICE_CLARIFICATION_REPLY;
     clarificationReason =
