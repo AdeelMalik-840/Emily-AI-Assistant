@@ -18,7 +18,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     env:
       NODE_ENV: test
       OPENAI_API_KEY: test-key
@@ -38,63 +38,72 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify exact SHA
+      - name: Create isolated Firebase test credential
         run: |
-          test "$(git rev-parse HEAD)" = "6592c019d170edaa7238194b5399b515aa8bc81c"
-          git status --porcelain
+          openssl genrsa -out /tmp/pr74-test-private-key.pem 2048
+          node <<'NODE'
+          const fs = require('fs');
+          const key = fs.readFileSync('/tmp/pr74-test-private-key.pem', 'utf8');
+          const credential = {
+            type: 'service_account',
+            project_id: 'pr74-verification',
+            private_key_id: 'pr74-verification-key',
+            private_key: key,
+            client_email: 'pr74-verification@pr74-verification.iam.gserviceaccount.com',
+            client_id: '100000000000000000001',
+            auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+            token_uri: 'https://oauth2.googleapis.com/token',
+            auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+            client_x509_cert_url: 'https://www.googleapis.com/robot/v1/metadata/x509/pr74-verification%40pr74-verification.iam.gserviceaccount.com'
+          };
+          fs.appendFileSync(process.env.GITHUB_ENV, `FIREBASE_KEY<<PR74EOF\n${JSON.stringify(credential)}\nPR74EOF\n`);
+          NODE
 
-      - name: Clarification identity scope
-        run: node --test tests/post-confirm-clarification-identity-scope.test.mjs
-
-      - name: Post-confirm continuity
-        run: node --test tests/dm-confirmed-booking-openai-continuity.test.mjs
-
-      - name: Canonical booking facts
-        run: node --test tests/canonical-customer-booking-facts.test.mjs
-
-      - name: Shared guard supported facts
-        run: node --test tests/customer-reply-guard-supported-facts.test.mjs
-
-      - name: Post-confirm canonical integration
-        run: node --test tests/post-confirm-canonical-booking-facts-integration.test.mjs
-
-      - name: Pending availability canonical guard
-        run: node --test tests/pending-availability-canonical-guard.test.mjs
-
-      - name: Price mismatch diagnostic
-        run: node --test tests/verified-price-mismatch-diagnostic.test.mjs
-
-      - name: Required-empty recovery
-        run: node --test tests/post-confirm-required-empty-recovery.test.mjs
-
-      - name: Terminal diagnostic
-        run: node --test tests/post-confirm-terminal-diagnostic.test.mjs
-
-      - name: Customer Business PA agent
-        run: node --test tests/customer-business-pa-agent.test.mjs
-
-      - name: Waiting-confirm DM lane
-        run: node --test tests/waiting-confirm-dm-brain-lane-step-4.test.mjs
-
-      - name: Cloud ownership race
-        run: node --test tests/cloud-post-confirm-ownership-race.test.mjs
-
-      - name: Conversation idempotency
-        run: node --test tests/conversation-store-idempotency.test.mjs
-
-      - name: Syntax checks
+      - name: Run complete verification matrix
+        shell: bash
         run: |
-          node --check src/brain/facts/resolveActiveCustomerBookingFacts.js
-          node --check src/brain/guards/customerReplyGuard.js
-          node --check src/brain/contracts/customerReplyContract.js
-          node --check src/brain/decisions/decideCustomerTurn.js
-          node --check src/brain/decisions/waitingConfirmDmLane.js
+          set +e
+          failed=0
 
-      - name: Diff and worktree checks
-        run: |
-          git diff --check 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
-          test -z "$(git status --porcelain)"
+          run_check() {
+            name="$1"
+            shift
+            echo "::group::$name"
+            "$@"
+            code=$?
+            echo "::endgroup::"
+            if [ "$code" -ne 0 ]; then
+              echo "FAILED: $name (exit $code)"
+              failed=1
+            else
+              echo "PASSED: $name"
+            fi
+          }
+
+          run_check "Exact SHA" bash -lc 'test "$(git rev-parse HEAD)" = "6592c019d170edaa7238194b5399b515aa8bc81c"'
+          run_check "Clarification identity scope" node --test tests/post-confirm-clarification-identity-scope.test.mjs
+          run_check "Post-confirm continuity" node --test tests/dm-confirmed-booking-openai-continuity.test.mjs
+          run_check "Canonical booking facts" node --test tests/canonical-customer-booking-facts.test.mjs
+          run_check "Shared guard supported facts" node --test tests/customer-reply-guard-supported-facts.test.mjs
+          run_check "Post-confirm canonical integration" node --test tests/post-confirm-canonical-booking-facts-integration.test.mjs
+          run_check "Pending availability canonical guard" node --test tests/pending-availability-canonical-guard.test.mjs
+          run_check "Price mismatch diagnostic" node --test tests/verified-price-mismatch-diagnostic.test.mjs
+          run_check "Required-empty recovery" node --test tests/post-confirm-required-empty-recovery.test.mjs
+          run_check "Terminal diagnostic" node --test tests/post-confirm-terminal-diagnostic.test.mjs
+          run_check "Customer Business PA agent" node --test tests/customer-business-pa-agent.test.mjs
+          run_check "Waiting-confirm DM lane" node --test tests/waiting-confirm-dm-brain-lane-step-4.test.mjs
+          run_check "Cloud ownership race" node --test tests/cloud-post-confirm-ownership-race.test.mjs
+          run_check "Conversation idempotency" node --test tests/conversation-store-idempotency.test.mjs
+
+          run_check "Syntax: booking facts" node --check src/brain/facts/resolveActiveCustomerBookingFacts.js
+          run_check "Syntax: reply guard" node --check src/brain/guards/customerReplyGuard.js
+          run_check "Syntax: reply contract" node --check src/brain/contracts/customerReplyContract.js
+          run_check "Syntax: customer turn" node --check src/brain/decisions/decideCustomerTurn.js
+          run_check "Syntax: waiting-confirm lane" node --check src/brain/decisions/waitingConfirmDmLane.js
+
+          run_check "Diff check" git diff --check 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
+          run_check "Clean worktree" bash -lc 'test -z "$(git status --porcelain)"'
+          run_check "Full repository test suite" npm test
+
           git diff --stat 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
-
-      - name: Full repository test suite
-        run: npm test
+          exit "$failed"
