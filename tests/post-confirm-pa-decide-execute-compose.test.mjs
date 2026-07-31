@@ -1,9 +1,12 @@
 /**
  * Post-confirm PA decide → validate/execute → compose architecture.
- * Scope: cloud_dm post_confirm_pa only.
+ * Architecture foundation only — no real mutation executors yet.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || "test-key";
@@ -13,19 +16,37 @@ const { handleCustomerBusinessPaInbound } = await import(
 );
 const {
   resolvePostConfirmBookingSelection,
+  normalizePostConfirmActionParameters,
+  emptyPostConfirmActionParameters,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
 const {
   executePostConfirmBookingMutation,
-  __resetPostConfirmBookingMutationIdempotencyForTests,
   POST_CONFIRM_BOOKING_MUTATION_INTENTS,
   POST_CONFIRM_SUPPORTED_BOOKING_MUTATION_INTENTS,
 } = await import("../src/services/postConfirmBookingMutationExecutor.js");
 const { composePostConfirmMutationCustomerReply } = await import(
   "../src/services/customerBusinessPaAiReply.js"
 );
+const {
+  __clearInboundTurnLedgerForTests,
+  __setInboundTurnLedgerPathForTests,
+  claimCloudInboundTurn,
+} = await import("../src/services/inboundTurnLedger.js");
 
 const BUSINESS_ID = "arch-business";
 const CUSTOMER_PHONE = "923009998877";
+
+function withFreshLedger(run) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "emily-arch-ledger-"));
+  const ledgerFile = path.join(dir, "ledger.json");
+  __setInboundTurnLedgerPathForTests(ledgerFile);
+  __clearInboundTurnLedgerForTests();
+  return Promise.resolve()
+    .then(() => run({ ledgerFile }))
+    .finally(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+}
 
 const CATALOG = [
   {
@@ -39,6 +60,12 @@ const CATALOG = [
     name: "Toyota Corolla",
     displayLabel: "Toyota Corolla",
     aliases: ["Corolla"],
+  },
+  {
+    id: "stonic-white",
+    name: "Kia Stonic",
+    displayLabel: "Kia Stonic EX Plus 2021 White",
+    aliases: ["Stonic", "Kia Stonic"],
   },
 ];
 
@@ -65,12 +92,23 @@ function multiFacts({ withFocus = true } = {}) {
     dailyRate: 5000,
     availabilityRequestId: "avr-corolla",
   };
+  const stonic = {
+    id: "booking-stonic",
+    selectionIndex: 3,
+    status: "approved",
+    itemId: "stonic-white",
+    itemLabel: "Kia Stonic EX Plus 2021 White",
+    durationDays: 3,
+    totalAmount: 16500,
+    dailyRate: 5500,
+    availabilityRequestId: "avr-stonic",
+  };
   return {
     businessId: BUSINESS_ID,
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Rentals", tone: "friendly" },
     booking: withFocus ? corolla : null,
-    bookingCandidates: [civic, corolla],
+    bookingCandidates: [civic, corolla, stonic],
     bookingFocus: withFocus
       ? {
           source: "latest_confirmed_linked_avr",
@@ -79,13 +117,16 @@ function multiFacts({ withFocus = true } = {}) {
           selectedBookingId: "booking-corolla",
         }
       : null,
-    activeBookings: [civic, corolla],
-    known: {},
+    activeBookings: [civic, corolla, stonic],
+    known: { deliveryPolicy: "Delivery selected areas mein available hai." },
     pendingAvailabilityRequests: [],
     replyGuardFacts: {
       catalogItems: CATALOG,
-      activeBookings: [civic, corolla],
+      activeBookings: [civic, corolla, stonic],
       bookingExecutionVerified: true,
+      knownPolicies: {
+        deliveryPolicy: "Delivery selected areas mein available hai.",
+      },
     },
     policy: {
       readOnly: true,
@@ -129,6 +170,13 @@ function singleBookingFacts() {
   };
 }
 
+function emptyParams(overrides = {}) {
+  return {
+    ...emptyPostConfirmActionParameters(),
+    ...overrides,
+  };
+}
+
 function decisionJson(overrides = {}) {
   return JSON.stringify({
     situation: "protected_action",
@@ -142,6 +190,7 @@ function decisionJson(overrides = {}) {
     mutationIntent: "cancel_booking",
     mutationExecutionRequested: true,
     mutationExecutionStatus: "not_executed",
+    actionParameters: emptyParams(),
     bookingSelectionMode: "focused",
     selectedBookingIndex: null,
     candidateGroundings: [],
@@ -183,6 +232,7 @@ function infoDecisionJson(reply, overrides = {}) {
     mutationIntent: "none",
     mutationExecutionRequested: false,
     mutationExecutionStatus: "not_executed",
+    actionParameters: emptyParams(),
     bookingSelectionMode: "none",
     selectedBookingIndex: null,
     candidateGroundings: [],
@@ -224,253 +274,178 @@ function composeJson(reply) {
 }
 
 function completion(content) {
-  return {
-    choices: [{ message: { content } }],
-  };
+  return { choices: [{ message: { content } }] };
 }
 
-test("focused extend/cancel select trusted booking; all mutation intents share architecture", async () => {
-  __resetPostConfirmBookingMutationIdempotencyForTests();
+test("supported mutation intents today are none; all intents return unsupported without data change", () => {
   assert.equal(POST_CONFIRM_SUPPORTED_BOOKING_MUTATION_INTENTS.length, 0);
-
+  const facts = multiFacts({ withFocus: true });
   for (const mutationIntent of POST_CONFIRM_BOOKING_MUTATION_INTENTS) {
-    let decideCalls = 0;
-    let composeCalls = 0;
-    let executorCalls = 0;
-    const result = await handleCustomerBusinessPaInbound({
-      db: {},
+    const result = executePostConfirmBookingMutation({
       businessId: BUSINESS_ID,
-      customerPhone: CUSTOMER_PHONE,
-      messageText: `${mutationIntent} kar do`,
-      messageId: `msg-${mutationIntent}`,
-      __resolveActiveCustomerBookingFactsFn: async () => ({
-        ok: true,
-        reason: "MATCHED",
-        facts: multiFacts({ withFocus: true }),
-      }),
-      __executePostConfirmBookingMutationFn: (args) => {
-        executorCalls += 1;
-        return executePostConfirmBookingMutation(args);
+      messageId: `no-exec-${mutationIntent}`,
+      decision: {
+        action: "request_booking_mutation",
+        mutationIntent,
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
+        selectedBookingId: "booking-corolla",
+        actionParameters: emptyParams(
+          mutationIntent === "extend_booking" ? { extensionDays: 2 } : {}
+        ),
       },
-      __executeAvailabilityCustomerConfirmBookingFn: async () => {
-        throw new Error("confirm must not run");
-      },
-      __executeAvailabilityCustomerDeclineFn: async () => {
-        throw new Error("decline must not run");
-      },
-      __chatCompletionsCreateForTests: async (args) => {
-        const prompt = String(args?.messages?.[1]?.content ?? "");
-        if (prompt.includes("FROZEN_DECISION_JSON")) {
-          composeCalls += 1;
-          assert.match(prompt, new RegExp(`"mutationIntent":"${mutationIntent}"`));
-          assert.match(prompt, /"status":"unsupported"/);
-          // Composer must not be able to reinterpret frozen fields via schema —
-          // only customerReply is consumed.
-          return completion(
-            composeJson(
-              `${mutationIntent} abhi yahan auto complete nahi ho sakti, thori der baad follow up hoga.`
-            )
-          );
-        }
-        decideCalls += 1;
-        return completion(
-          decisionJson({
-            mutationIntent,
-            bookingSelectionMode: "focused",
-          })
-        );
-      },
+      facts,
+      selectedBooking: facts.bookingCandidates[1],
     });
-
-    assert.equal(decideCalls, 1, mutationIntent);
-    assert.equal(composeCalls, 1, mutationIntent);
-    assert.equal(executorCalls, 1, mutationIntent);
-    assert.equal(result.semanticDecisionCount, 1, mutationIntent);
-    assert.equal(result.composeCalls, 1, mutationIntent);
-    assert.equal(result.bookingId, "booking-corolla", mutationIntent);
-    assert.equal(result.bookingSelectionMode, "focused", mutationIntent);
-    assert.equal(result.selectedBookingIndex, 2, mutationIntent);
-    assert.equal(result.mutationExecutionStatus, "unsupported", mutationIntent);
-    assert.equal(result.mutationExecution?.changedData, false, mutationIntent);
-    assert.equal(result.mutationExecution?.unsupported, true, mutationIntent);
+    assert.equal(result.status, "unsupported", mutationIntent);
+    assert.equal(result.changedData, false, mutationIntent);
+    assert.equal(result.unsupported, true, mutationIntent);
+    assert.equal(result.idempotencyAuthority, "cloud_inbound_ledger");
   }
 });
 
-test("exactly one semantic decision; compose cannot reinterpret frozen decision", async () => {
-  __resetPostConfirmBookingMutationIdempotencyForTests();
-  let frozenSeen = null;
+test("exact: 2 din aur extend kar do → focused unsupported, no data change", async () => {
+  let decideCalls = 0;
+  let composeCalls = 0;
+  let executorCalls = 0;
+  const safeReply = "Extend abhi complete nahi hua.";
   const result = await handleCustomerBusinessPaInbound({
     db: {},
     businessId: BUSINESS_ID,
     customerPhone: CUSTOMER_PHONE,
-    messageText: "extend kar do",
-    messageId: "msg-freeze",
+    messageText: "2 din aur extend kar do",
+    messageId: "msg-extend-2d",
     __resolveActiveCustomerBookingFactsFn: async () => ({
       ok: true,
       reason: "MATCHED",
       facts: multiFacts({ withFocus: true }),
     }),
-    __composePostConfirmMutationCustomerReplyFn: async (args) => {
-      frozenSeen = args.frozenDecision;
-      // Attempt to smuggle a reinterpreted decision through compose output fields
-      // that the composer must ignore.
-      return {
-        ok: true,
-        reply: "Extend abhi auto nahi ho sakti.",
-        source: "openai",
-        frozenDecision: {
-          ...args.frozenDecision,
-          mutationIntent: "cancel_booking",
-          action: "reply",
-        },
-      };
+    __executePostConfirmBookingMutationFn: (args) => {
+      executorCalls += 1;
+      assert.equal(args.decision.mutationIntent, "extend_booking");
+      assert.equal(args.decision.actionParameters.extensionDays, 2);
+      return executePostConfirmBookingMutation(args);
     },
-    __chatCompletionsCreateForTests: async () =>
-      completion(
+    __chatCompletionsCreateForTests: async (args) => {
+      const prompt = String(args?.messages?.[1]?.content ?? "");
+      if (prompt.includes("FROZEN_DECISION_JSON")) {
+        composeCalls += 1;
+        assert.match(prompt, /"mutationIntent":"extend_booking"/);
+        assert.match(prompt, /"extensionDays":2/);
+        assert.match(prompt, /"status":"unsupported"/);
+        return completion(composeJson(safeReply));
+      }
+      decideCalls += 1;
+      return completion(
         decisionJson({
           mutationIntent: "extend_booking",
           bookingSelectionMode: "focused",
+          actionParameters: emptyParams({ extensionDays: 2 }),
         })
-      ),
+      );
+    },
   });
-
+  assert.equal(decideCalls, 1);
+  assert.equal(composeCalls, 1);
+  assert.equal(executorCalls, 1);
   assert.equal(result.semanticDecisionCount, 1);
-  assert.equal(result.composeCalls, 1);
-  assert.equal(frozenSeen?.mutationIntent, "extend_booking");
-  assert.equal(frozenSeen?.action, "request_booking_mutation");
-  assert.equal(result.mutationIntent, "extend_booking");
-  assert.equal(result.decisionAction, "request_booking_mutation");
-  assert.equal(result.reply, "Extend abhi auto nahi ho sakti.");
+  assert.equal(result.bookingSelectionMode, "focused");
+  assert.equal(result.bookingId, "booking-corolla");
+  assert.equal(result.mutationExecutionStatus, "unsupported");
+  assert.equal(result.mutationExecution?.changedData, false);
+  assert.equal(result.reply, safeReply);
 });
 
-test("stale, ambiguous, or missing selection does not execute", async () => {
-  __resetPostConfirmBookingMutationIdempotencyForTests();
-  const facts = multiFacts({ withFocus: true });
-
-  assert.equal(
-    resolvePostConfirmBookingSelection(
-      {
-        action: "request_booking_mutation",
-        bookingSelectionMode: "none",
-        mutationIntent: "cancel_booking",
-      },
-      facts
-    ).ok,
-    false
-  );
-  assert.equal(
-    resolvePostConfirmBookingSelection(
-      {
-        action: "request_booking_mutation",
-        bookingSelectionMode: "clarification_required",
-        mutationIntent: "extend_booking",
-      },
-      facts
-    ).ok,
-    false
-  );
-  assert.equal(
-    resolvePostConfirmBookingSelection(
-      {
-        action: "request_booking_mutation",
-        bookingSelectionMode: "candidate",
-        selectedBookingIndex: 99,
-        mutationIntent: "cancel_booking",
-      },
-      facts
-    ).ok,
-    false
-  );
-  assert.equal(
-    resolvePostConfirmBookingSelection(
-      {
-        action: "request_booking_mutation",
-        bookingSelectionMode: "focused",
-        mutationIntent: "cancel_booking",
-      },
-      multiFacts({ withFocus: false })
-    ).ok,
-    false
-  );
-
-  let executorCalls = 0;
+test("exact: Kia Stonic ki booking cancel kar do → candidate, unsupported", async () => {
+  const safeReply = "Stonic cancel abhi complete nahi hua.";
   const result = await handleCustomerBusinessPaInbound({
     db: {},
     businessId: BUSINESS_ID,
     customerPhone: CUSTOMER_PHONE,
-    messageText: "cancel kar do",
-    messageId: "msg-ambiguous",
+    messageText: "Kia Stonic ki booking cancel kar do",
+    messageId: "msg-cancel-stonic",
     __resolveActiveCustomerBookingFactsFn: async () => ({
       ok: true,
       reason: "MATCHED",
-      facts,
+      facts: multiFacts({ withFocus: true }),
     }),
-    __executePostConfirmBookingMutationFn: (args) => {
-      executorCalls += 1;
-      return executePostConfirmBookingMutation(args);
-    },
-    __chatCompletionsCreateForTests: async () =>
-      completion(
+    __chatCompletionsCreateForTests: async (args) => {
+      const prompt = String(args?.messages?.[1]?.content ?? "");
+      if (prompt.includes("FROZEN_DECISION_JSON")) {
+        return completion(composeJson(safeReply));
+      }
+      return completion(
         decisionJson({
-          customerReply: "Kaunsi booking — Civic ya Corolla?",
-          action: "reply",
-          mutationIntent: "none",
-          mutationExecutionRequested: false,
-          bookingSelectionMode: "clarification_required",
-          situation: "new_question",
-          conversationAct: "information_request",
-          customerIntent: "ask_fact",
-          customerIsAskingQuestion: true,
+          mutationIntent: "cancel_booking",
+          bookingSelectionMode: "candidate",
+          selectedBookingIndex: 3,
+          actionParameters: emptyParams(),
         })
-      ),
+      );
+    },
   });
-  assert.equal(executorCalls, 0);
-  assert.equal(result.mutationExecutionStatus, "not_executed");
-  assert.equal(result.composeCalls, 0);
-  assert.equal(result.bookingSelectionMode, "clarification_required");
+  assert.equal(result.semanticDecisionCount, 1);
+  assert.equal(result.composeCalls, 1);
+  assert.equal(result.bookingSelectionMode, "candidate");
+  assert.equal(result.selectedBookingIndex, 3);
+  assert.equal(result.bookingId, "booking-stonic");
+  assert.equal(result.mutationExecutionStatus, "unsupported");
+  assert.equal(result.mutationExecution?.changedData, false);
+  assert.equal(result.reply, safeReply);
 });
 
-test("unsupported mutations do not change data; duplicate inbound cannot execute twice", async () => {
-  __resetPostConfirmBookingMutationIdempotencyForTests();
-  const facts = multiFacts({ withFocus: true });
-  const decision = {
-    action: "request_booking_mutation",
-    mutationIntent: "cancel_booking",
-    bookingSelectionMode: "focused",
-    selectedBookingIndex: 2,
-    selectedBookingId: "booking-corolla",
-  };
-  const selected = facts.bookingCandidates[1];
-  const first = executePostConfirmBookingMutation({
+test("exact: Delivery add kar do → update_delivery unsupported, no data change", async () => {
+  const safeReply = "Delivery add abhi complete nahi hua.";
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
     businessId: BUSINESS_ID,
-    messageId: "dup-1",
-    decision,
-    facts,
-    selectedBooking: selected,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "Delivery add kar do",
+    messageId: "msg-delivery-add",
+    __resolveActiveCustomerBookingFactsFn: async () => ({
+      ok: true,
+      reason: "MATCHED",
+      facts: multiFacts({ withFocus: true }),
+    }),
+    __chatCompletionsCreateForTests: async (args) => {
+      const prompt = String(args?.messages?.[1]?.content ?? "");
+      if (prompt.includes("FROZEN_DECISION_JSON")) {
+        return completion(composeJson(safeReply));
+      }
+      return completion(
+        decisionJson({
+          mutationIntent: "update_delivery",
+          bookingSelectionMode: "focused",
+          actionParameters: emptyParams({
+            deliveryRequested: true,
+            deliveryAddress: null,
+            deliveryTime: null,
+          }),
+        })
+      );
+    },
   });
-  const second = executePostConfirmBookingMutation({
-    businessId: BUSINESS_ID,
-    messageId: "dup-1",
-    decision,
-    facts,
-    selectedBooking: selected,
-  });
-  assert.equal(first.status, "unsupported");
-  assert.equal(first.changedData, false);
-  assert.equal(second.duplicateSuppressed, true);
-  assert.equal(second.changedData, false);
-  assert.equal(second.status, "unsupported");
+  assert.equal(result.semanticDecisionCount, 1);
+  assert.equal(result.mutationIntent, "update_delivery");
+  assert.equal(result.bookingSelectionMode, "focused");
+  assert.equal(result.bookingId, "booking-corolla");
+  assert.equal(result.mutationExecutionStatus, "unsupported");
+  assert.equal(result.mutationExecution?.changedData, false);
+  assert.equal(
+    result.mutationExecution?.actionParameters?.deliveryRequested,
+    true
+  );
+  assert.equal(result.reply, safeReply);
 });
 
-test("information questions stay read-only and never call mutation executor", async () => {
-  __resetPostConfirmBookingMutationIdempotencyForTests();
+test("exact: Delivery ho sakti hai? → read-only, no mutation executor", async () => {
   let executorCalls = 0;
   const result = await handleCustomerBusinessPaInbound({
     db: {},
     businessId: BUSINESS_ID,
     customerPhone: CUSTOMER_PHONE,
     messageText: "Delivery ho sakti hai?",
-    messageId: "msg-info",
+    messageId: "msg-delivery-info",
     __resolveActiveCustomerBookingFactsFn: async () => ({
       ok: true,
       reason: "MATCHED",
@@ -508,7 +483,168 @@ test("information questions stay read-only and never call mutation executor", as
   assert.match(result.reply, /delivery/i);
 });
 
-test("compose rejects success claims when execution did not succeed", async () => {
+test("focused only with trusted current booking; none never auto-focuses; candidate for other booking", () => {
+  const facts = multiFacts({ withFocus: true });
+  const focused = resolvePostConfirmBookingSelection(
+    {
+      action: "request_booking_mutation",
+      bookingSelectionMode: "focused",
+      mutationIntent: "extend_booking",
+    },
+    facts
+  );
+  assert.equal(focused.ok, true);
+  assert.equal(focused.mode, "focused");
+  assert.equal(focused.booking?.id, "booking-corolla");
+
+  const noneMode = resolvePostConfirmBookingSelection(
+    {
+      action: "request_booking_mutation",
+      bookingSelectionMode: "none",
+      mutationIntent: "cancel_booking",
+    },
+    facts
+  );
+  assert.equal(noneMode.ok, false);
+
+  const candidate = resolvePostConfirmBookingSelection(
+    {
+      action: "request_booking_mutation",
+      bookingSelectionMode: "candidate",
+      selectedBookingIndex: 3,
+      mutationIntent: "cancel_booking",
+    },
+    facts
+  );
+  assert.equal(candidate.ok, true);
+  assert.equal(candidate.mode, "candidate");
+  assert.equal(candidate.booking?.id, "booking-stonic");
+
+  const focusedWithoutTrust = resolvePostConfirmBookingSelection(
+    {
+      action: "request_booking_mutation",
+      bookingSelectionMode: "focused",
+      mutationIntent: "cancel_booking",
+    },
+    multiFacts({ withFocus: false })
+  );
+  assert.equal(focusedWithoutTrust.ok, false);
+});
+
+test("composer cannot alter action, booking, mutationIntent, or actionParameters", async () => {
+  let frozenSeen = null;
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "2 din aur extend kar do",
+    messageId: "msg-freeze-params",
+    __resolveActiveCustomerBookingFactsFn: async () => ({
+      ok: true,
+      reason: "MATCHED",
+      facts: multiFacts({ withFocus: true }),
+    }),
+    __composePostConfirmMutationCustomerReplyFn: async (args) => {
+      frozenSeen = args.frozenDecision;
+      return {
+        ok: true,
+        reply: "Extend abhi complete nahi hua.",
+        source: "openai",
+        frozenDecision: {
+          ...args.frozenDecision,
+          mutationIntent: "cancel_booking",
+          action: "reply",
+          actionParameters: emptyParams({ extensionDays: 99 }),
+          selectedBookingId: "booking-civic",
+        },
+      };
+    },
+    __chatCompletionsCreateForTests: async () =>
+      completion(
+        decisionJson({
+          mutationIntent: "extend_booking",
+          bookingSelectionMode: "focused",
+          actionParameters: emptyParams({ extensionDays: 2 }),
+        })
+      ),
+  });
+  assert.equal(frozenSeen?.mutationIntent, "extend_booking");
+  assert.equal(frozenSeen?.action, "request_booking_mutation");
+  assert.equal(frozenSeen?.actionParameters?.extensionDays, 2);
+  assert.equal(result.mutationIntent, "extend_booking");
+  assert.equal(result.decisionAction, "request_booking_mutation");
+  assert.equal(result.bookingId, "booking-corolla");
+});
+
+test("durable Cloud inbound ledger is the idempotency authority; executor has no process-local Map", async () => {
+  assert.equal(
+    typeof (
+      await import("../src/services/postConfirmBookingMutationExecutor.js")
+    ).__resetPostConfirmBookingMutationIdempotencyForTests,
+    "undefined"
+  );
+
+  await withFreshLedger(async () => {
+    const messageId = `ledger-dup-${Date.now()}`;
+    const first = claimCloudInboundTurn({
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageId,
+      recoveryContext: {
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        messageText: "cancel kar do",
+        messageId,
+      },
+    });
+    assert.equal(first.claimed, true);
+    assert.equal(first.action, "process");
+    const duplicateWhileProcessing = claimCloudInboundTurn({
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageId,
+      recoveryContext: {
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        messageText: "cancel kar do",
+        messageId,
+      },
+    });
+    assert.equal(duplicateWhileProcessing.claimed, false);
+    assert.equal(duplicateWhileProcessing.action, "processing");
+
+    const facts = multiFacts({ withFocus: true });
+    const decision = {
+      action: "request_booking_mutation",
+      mutationIntent: "cancel_booking",
+      bookingSelectionMode: "focused",
+      selectedBookingIndex: 2,
+      selectedBookingId: "booking-corolla",
+      actionParameters: emptyParams(),
+    };
+    const a = executePostConfirmBookingMutation({
+      businessId: BUSINESS_ID,
+      messageId,
+      decision,
+      facts,
+      selectedBooking: facts.bookingCandidates[1],
+    });
+    const b = executePostConfirmBookingMutation({
+      businessId: BUSINESS_ID,
+      messageId,
+      decision,
+      facts,
+      selectedBooking: facts.bookingCandidates[1],
+    });
+    assert.equal(a.duplicateSuppressed, undefined);
+    assert.equal(b.duplicateSuppressed, undefined);
+    assert.equal(a.status, "unsupported");
+    assert.equal(b.status, "unsupported");
+    assert.equal(a.idempotencyAuthority, "cloud_inbound_ledger");
+  });
+});
+
+test("compose rejects success claims and follow-up/timing promises when not succeeded", async () => {
   let attempts = 0;
   const composed = await composePostConfirmMutationCustomerReply({
     facts: multiFacts({ withFocus: true }),
@@ -516,6 +652,7 @@ test("compose rejects success claims when execution did not succeed", async () =
     frozenDecision: {
       action: "request_booking_mutation",
       mutationIntent: "cancel_booking",
+      actionParameters: emptyParams(),
       bookingSelectionMode: "focused",
       selectedBookingIndex: 2,
       selectedBookingId: "booking-corolla",
@@ -536,28 +673,76 @@ test("compose rejects success claims when execution did not succeed", async () =
       if (attempts === 1) {
         return completion(composeJson("Booking has been cancelled."));
       }
-      return completion(
-        composeJson("Cancel abhi auto complete nahi ho sakti — follow-up chahiye.")
-      );
+      return completion(composeJson("Cancel abhi complete nahi hua."));
     },
   });
   assert.equal(composed.ok, true);
   assert.equal(attempts, 2);
-  assert.match(composed.reply, /nahi/);
+  assert.equal(composed.reply, "Cancel abhi complete nahi hua.");
   assert.equal(composed.frozenDecision.mutationIntent, "cancel_booking");
+  assert.deepEqual(
+    composed.frozenDecision.actionParameters,
+    emptyParams()
+  );
+
+  let followupAttempts = 0;
+  const followupRejected = await composePostConfirmMutationCustomerReply({
+    facts: multiFacts({ withFocus: true }),
+    userMessage: "cancel kar do",
+    frozenDecision: {
+      action: "request_booking_mutation",
+      mutationIntent: "cancel_booking",
+      actionParameters: emptyParams(),
+      bookingSelectionMode: "focused",
+      selectedBookingIndex: 2,
+      selectedBookingId: "booking-corolla",
+      conversationAct: "action_request",
+      customerIntent: "ask_action",
+      situation: "protected_action",
+    },
+    mutationExecution: {
+      status: "unsupported",
+      intent: "cancel_booking",
+      reason: "MUTATION_EXECUTOR_UNSUPPORTED",
+      bookingId: "booking-corolla",
+      changedData: false,
+      unsupported: true,
+    },
+    __chatCompletionsCreateForTests: async () => {
+      followupAttempts += 1;
+      if (followupAttempts === 1) {
+        return completion(composeJson("Owner follow-up jaldi hoga."));
+      }
+      return completion(composeJson("Cancel abhi complete nahi hua."));
+    },
+  });
+  assert.equal(followupRejected.ok, true);
+  assert.equal(followupAttempts, 2);
+  assert.equal(followupRejected.reply, "Cancel abhi complete nahi hua.");
 });
 
-test("candidate selection still used for explicitly named other booking", async () => {
-  const selection = resolvePostConfirmBookingSelection(
+test("actionParameters normalize nullable typed fields without raw-text parsing", () => {
+  const normalized = normalizePostConfirmActionParameters(
     {
-      action: "request_booking_mutation",
-      bookingSelectionMode: "candidate",
-      selectedBookingIndex: 1,
-      mutationIntent: "update_delivery",
+      extensionDays: "2",
+      startDate: "2026-08-01",
+      endDate: null,
+      durationDays: 5,
+      itemId: "stonic-white",
+      pickupDetails: "10 AM gate 2",
+      deliveryRequested: true,
+      deliveryAddress: null,
+      deliveryTime: null,
+      unknownKey: "drop-me",
     },
-    multiFacts({ withFocus: true })
+    "extend_booking"
   );
-  assert.equal(selection.ok, true);
-  assert.equal(selection.mode, "candidate");
-  assert.equal(selection.booking?.id, "booking-civic");
+  assert.equal(normalized.extensionDays, 2);
+  assert.equal(normalized.startDate, "2026-08-01");
+  assert.equal(normalized.itemId, "stonic-white");
+  assert.equal(normalized.unknownKey, undefined);
+  assert.deepEqual(
+    normalizePostConfirmActionParameters({ extensionDays: 2 }, "none"),
+    emptyParams()
+  );
 });

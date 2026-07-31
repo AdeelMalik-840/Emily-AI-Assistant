@@ -2,10 +2,17 @@
  * Deterministic post-confirm booking mutation validation + execution gate.
  *
  * Architecture:
- *   Brain decision (intent + booking selection + mutationIntent)
- *   → validate selected booking
+ *   Brain decision (intent + booking selection + mutationIntent + actionParameters)
+ *   → validate selected booking + actionParameters
  *   → execute only through existing safe executors
  *   → return verified mutationExecution result
+ *
+ * Supported mutation intents today: NONE.
+ * Every declared mutation returns structured `unsupported` and never writes Firestore.
+ *
+ * Idempotency authority: durable Cloud inbound ledger (`claimCloudInboundTurn` /
+ * inbound-turn ledger keyed by messageId). This module intentionally has no
+ * process-local execution cache — restart/multi-instance safety comes from the ledger.
  *
  * No customer-phrase regex. No Firestore writes for unsupported intents.
  */
@@ -26,7 +33,10 @@ export const POST_CONFIRM_BOOKING_MUTATION_INTENTS = Object.freeze([
   "update_delivery",
 ]);
 
-/** Intents with a wired safe executor today. Empty until executors are added. */
+/**
+ * Intents with a wired safe executor today.
+ * Architecture foundation only — no real mutation is supported yet.
+ */
 export const POST_CONFIRM_SUPPORTED_BOOKING_MUTATION_INTENTS = Object.freeze([]);
 
 function clean(value, max = 160) {
@@ -40,18 +50,104 @@ function cleanMutationIntent(value) {
 }
 
 /**
- * @param {unknown} messageId
- * @param {string} businessId
+ * Validate structured actionParameters from the Brain decision.
+ * Does not parse customer text. Unknown keys rejected. Wrong types → invalid.
+ * @param {unknown} raw
+ * @returns {{ ok: true, actionParameters: Record<string, unknown> } | { ok: false, reason: string }}
  */
-function idempotencyKey(businessId, messageId) {
-  const mid = clean(messageId, 200);
-  const bid = clean(businessId, 120);
-  if (!mid || !bid) return null;
-  return `${bid}::cloud_dm::post_confirm_mutation::${mid}`;
-}
+export function validatePostConfirmActionParameters(raw) {
+  if (raw == null) {
+    return {
+      ok: true,
+      actionParameters: {
+        extensionDays: null,
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        itemId: null,
+        pickupDetails: null,
+        deliveryRequested: null,
+        deliveryAddress: null,
+        deliveryTime: null,
+      },
+    };
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, reason: "INVALID_ACTION_PARAMETERS" };
+  }
+  const allowed = new Set([
+    "extensionDays",
+    "startDate",
+    "endDate",
+    "durationDays",
+    "itemId",
+    "pickupDetails",
+    "deliveryRequested",
+    "deliveryAddress",
+    "deliveryTime",
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) {
+      return { ok: false, reason: "INVALID_ACTION_PARAMETERS" };
+    }
+  }
 
-/** @type {Map<string, Record<string, unknown>>} */
-const executedByInboundKey = new Map();
+  const numberOrNull = (value) => {
+    if (value == null || value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const stringOrNull = (value, max) => {
+    if (value == null) return null;
+    if (typeof value !== "string") return undefined;
+    const text = value.trim();
+    return text ? text.slice(0, max) : null;
+  };
+  const booleanOrNull = (value) => {
+    if (value == null) return null;
+    if (typeof value === "boolean") return value;
+    return undefined;
+  };
+
+  const extensionDays = numberOrNull(raw.extensionDays);
+  const durationDays = numberOrNull(raw.durationDays);
+  const startDate = stringOrNull(raw.startDate, 40);
+  const endDate = stringOrNull(raw.endDate, 40);
+  const itemId = stringOrNull(raw.itemId, 120);
+  const pickupDetails = stringOrNull(raw.pickupDetails, 240);
+  const deliveryAddress = stringOrNull(raw.deliveryAddress, 240);
+  const deliveryTime = stringOrNull(raw.deliveryTime, 80);
+  const deliveryRequested = booleanOrNull(raw.deliveryRequested);
+
+  if (
+    extensionDays === undefined ||
+    durationDays === undefined ||
+    startDate === undefined ||
+    endDate === undefined ||
+    itemId === undefined ||
+    pickupDetails === undefined ||
+    deliveryAddress === undefined ||
+    deliveryTime === undefined ||
+    deliveryRequested === undefined
+  ) {
+    return { ok: false, reason: "INVALID_ACTION_PARAMETERS" };
+  }
+
+  return {
+    ok: true,
+    actionParameters: {
+      extensionDays,
+      startDate,
+      endDate,
+      durationDays,
+      itemId,
+      pickupDetails,
+      deliveryRequested,
+      deliveryAddress,
+      deliveryTime,
+    },
+  };
+}
 
 /**
  * @param {{
@@ -63,23 +159,18 @@ const executedByInboundKey = new Map();
  * }} params
  */
 export function executePostConfirmBookingMutation({
-  businessId,
-  messageId = null,
+  businessId: _businessId,
+  messageId: _messageId = null,
   decision,
   facts,
   selectedBooking,
 }) {
-  const key = idempotencyKey(businessId, messageId);
-  if (key && executedByInboundKey.has(key)) {
-    return {
-      ...executedByInboundKey.get(key),
-      duplicateSuppressed: true,
-    };
-  }
-
   const action = clean(decision?.action, 60);
   const mutationIntent = cleanMutationIntent(decision?.mutationIntent);
   const mode = clean(decision?.bookingSelectionMode, 40) || "none";
+  const paramsGuard = validatePostConfirmActionParameters(
+    decision?.actionParameters
+  );
 
   if (action !== "request_booking_mutation" || mutationIntent === "none") {
     return {
@@ -90,6 +181,25 @@ export function executePostConfirmBookingMutation({
       bookingId: null,
       changedData: false,
       unsupported: false,
+      actionParameters: paramsGuard.ok
+        ? paramsGuard.actionParameters
+        : null,
+      idempotencyAuthority: "cloud_inbound_ledger",
+    };
+  }
+
+  if (!paramsGuard.ok) {
+    return {
+      ok: false,
+      status: "failed",
+      intent: mutationIntent,
+      reason: paramsGuard.reason,
+      bookingId: null,
+      changedData: false,
+      unsupported: false,
+      bookingSelectionMode: mode,
+      actionParameters: null,
+      idempotencyAuthority: "cloud_inbound_ledger",
     };
   }
 
@@ -103,6 +213,8 @@ export function executePostConfirmBookingMutation({
       changedData: false,
       unsupported: false,
       bookingSelectionMode: mode,
+      actionParameters: paramsGuard.actionParameters,
+      idempotencyAuthority: "cloud_inbound_ledger",
     };
   }
 
@@ -117,6 +229,8 @@ export function executePostConfirmBookingMutation({
       changedData: false,
       unsupported: false,
       bookingSelectionMode: mode,
+      actionParameters: paramsGuard.actionParameters,
+      idempotencyAuthority: "cloud_inbound_ledger",
     };
   }
 
@@ -134,12 +248,14 @@ export function executePostConfirmBookingMutation({
         changedData: false,
         unsupported: false,
         bookingSelectionMode: mode,
+        actionParameters: paramsGuard.actionParameters,
+        idempotencyAuthority: "cloud_inbound_ledger",
       };
     }
   }
 
   if (!POST_CONFIRM_SUPPORTED_BOOKING_MUTATION_INTENTS.includes(mutationIntent)) {
-    const unsupportedResult = {
+    return {
       ok: false,
       status: "unsupported",
       intent: mutationIntent,
@@ -159,14 +275,14 @@ export function executePostConfirmBookingMutation({
         Number(decision.selectedBookingIndex) >= 1
           ? Number(decision.selectedBookingIndex)
           : null,
+      actionParameters: paramsGuard.actionParameters,
+      idempotencyAuthority: "cloud_inbound_ledger",
     };
-    if (key) executedByInboundKey.set(key, unsupportedResult);
-    return unsupportedResult;
   }
 
   // Placeholder for future safe executor wiring — must never fall through to
   // direct Firestore mutation from this module.
-  const failed = {
+  return {
     ok: false,
     status: "failed",
     intent: mutationIntent,
@@ -175,14 +291,7 @@ export function executePostConfirmBookingMutation({
     changedData: false,
     unsupported: false,
     bookingSelectionMode: mode,
+    actionParameters: paramsGuard.actionParameters,
+    idempotencyAuthority: "cloud_inbound_ledger",
   };
-  if (key) executedByInboundKey.set(key, failed);
-  return failed;
-}
-
-/**
- * Test helper — clears inbound mutation idempotency cache.
- */
-export function __resetPostConfirmBookingMutationIdempotencyForTests() {
-  executedByInboundKey.clear();
 }

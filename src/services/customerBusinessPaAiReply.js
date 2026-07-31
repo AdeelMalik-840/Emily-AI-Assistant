@@ -390,9 +390,25 @@ export async function composePostConfirmMutationCustomerReply({
     .trim()
     .slice(0, 800);
 
+  const frozenActionParameters =
+    decision.actionParameters && typeof decision.actionParameters === "object"
+      ? decision.actionParameters
+      : {
+          extensionDays: null,
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          itemId: null,
+          pickupDetails: null,
+          deliveryRequested: null,
+          deliveryAddress: null,
+          deliveryTime: null,
+        };
+
   const frozen = {
     action: decision.action ?? null,
     mutationIntent: decision.mutationIntent ?? "none",
+    actionParameters: frozenActionParameters,
     bookingSelectionMode: decision.bookingSelectionMode ?? "none",
     selectedBookingIndex: decision.selectedBookingIndex ?? null,
     selectedBookingId: decision.selectedBookingId ?? null,
@@ -462,16 +478,15 @@ OUTPUT STRICT JSON only:
 {"customerReply":"<short WhatsApp reply>","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 FROZEN_DECISION_JSON is authoritative and immutable. You may ONLY write customerReply.
-You MUST NOT change action, mutationIntent, bookingSelectionMode, selectedBookingIndex, selectedBookingId, conversationAct, customerIntent, or situation.
+You MUST NOT change action, mutationIntent, actionParameters, bookingSelectionMode, selectedBookingIndex, selectedBookingId, conversationAct, customerIntent, or situation.
 
 VERIFIED_MUTATION_EXECUTION_JSON is the only source of truth for whether a mutation happened:
 - status "succeeded": you may say the change completed (only what verified fields support).
-- status "unsupported": explain naturally that this change cannot be completed automatically here / needs follow-up — do NOT invent that it succeeded or that data changed.
-- status "failed" / "not_executed": do NOT claim success.
+- status "unsupported" / "failed" / "not_executed": say the change was NOT completed. Do NOT claim success. Do NOT promise owner follow-up, manual action, timing, or automatic completion. Do NOT invent that data changed.
 
 STRICT SAFETY:
 - Never invent booking mutations, amounts, dates, or policies.
-- Never mention Brain, Firestore, executors, or internal process.
+- Never mention executor, unsupported, system, Firestore, Brain, or other internal process terms.
 - Keep reply short for WhatsApp.`;
 
   const userBase =
@@ -564,6 +579,40 @@ STRICT SAFETY:
 
       if (!customerReply) {
         lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+          frozenDecision: frozen,
+        };
+      }
+
+      // Ignore any smuggled decision fields in compose JSON — only customerReply is used.
+      if (
+        verifiedExecution.status !== "succeeded" &&
+        /\b(executor|unsupported|firestore|brain|\bsystem\b)\b/i.test(
+          customerReply
+        )
+      ) {
+        lastReason = "internal_process_terms_in_customer_reply";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+          frozenDecision: frozen,
+        };
+      }
+      if (
+        verifiedExecution.status !== "succeeded" &&
+        /\b(owner\s+follow[- ]?up|follow[- ]?up|manual\s+action|baad\s+mein|jaldi|auto(matic)?\s+(complete|ho)|system\s+complete)\b/i.test(
+          customerReply
+        )
+      ) {
+        lastReason = "unverified_mutation_followup_or_timing_promise";
         if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
         return {
           ok: false,

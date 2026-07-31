@@ -138,6 +138,17 @@ function decisionJson(reply, overrides = {}) {
     mutationIntent: "none",
     mutationExecutionRequested: false,
     mutationExecutionStatus: "not_executed",
+    actionParameters: {
+      extensionDays: null,
+      startDate: null,
+      endDate: null,
+      durationDays: null,
+      itemId: null,
+      pickupDetails: null,
+      deliveryRequested: null,
+      deliveryAddress: null,
+      deliveryTime: null,
+    },
     bookingSelectionMode: "none",
     selectedBookingIndex: null,
     candidateGroundings: [],
@@ -1020,7 +1031,7 @@ test("no trusted focus asks OpenAI clarification and generic mutation cannot sel
         bookingSelectionMode: "focused",
       }),
       composeJson(
-        "Corolla cancel abhi yahan auto complete nahi ho sakti — follow-up chahiye."
+        "Corolla cancel abhi complete nahi hua."
       ),
     ],
     counters,
@@ -1036,7 +1047,7 @@ test("no trusted focus asks OpenAI clarification and generic mutation cannot sel
   assert.equal(mutation.mutationExecution?.changedData, false);
   assert.equal(
     mutation.reply,
-    "Corolla cancel abhi yahan auto complete nahi ho sakti — follow-up chahiye."
+    "Corolla cancel abhi complete nahi hua."
   );
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
   assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
@@ -1057,7 +1068,7 @@ test("explicit multi-booking mutation maps to the exact candidate but remains un
         bookingSelectionMode: "candidate",
         selectedBookingIndex: 1,
       }),
-      composeJson("Civic cancellation abhi auto complete nahi hui."),
+      composeJson("Civic cancellation abhi complete nahi hui."),
     ],
   });
   assert.equal(result.bookingId, "booking-civic");

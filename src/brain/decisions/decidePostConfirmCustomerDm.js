@@ -140,6 +140,94 @@ function cleanMutationIntent(value) {
   return POST_CONFIRM_MUTATION_INTENTS.includes(intent) ? intent : "none";
 }
 
+export const POST_CONFIRM_ACTION_PARAMETER_KEYS = Object.freeze([
+  "extensionDays",
+  "startDate",
+  "endDate",
+  "durationDays",
+  "itemId",
+  "pickupDetails",
+  "deliveryRequested",
+  "deliveryAddress",
+  "deliveryTime",
+]);
+
+export function emptyPostConfirmActionParameters() {
+  return {
+    extensionDays: null,
+    startDate: null,
+    endDate: null,
+    durationDays: null,
+    itemId: null,
+    pickupDetails: null,
+    deliveryRequested: null,
+    deliveryAddress: null,
+    deliveryTime: null,
+  };
+}
+
+/**
+ * Normalize Brain-declared mutation actionParameters.
+ * Nullable typed fields only — never parse customer text.
+ * @param {unknown} raw
+ * @param {string} [mutationIntent]
+ */
+export function normalizePostConfirmActionParameters(
+  raw,
+  mutationIntent = "none"
+) {
+  const empty = emptyPostConfirmActionParameters();
+  if (cleanMutationIntent(mutationIntent) === "none") {
+    return empty;
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return empty;
+  }
+  const numberOrNull = (value) => {
+    if (value == null || value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
+  const stringOrNull = (value, max) => {
+    if (value == null) return null;
+    const text = String(value).trim();
+    return text ? text.slice(0, max) : null;
+  };
+  const booleanOrNull = (value) => {
+    if (value == null) return null;
+    if (typeof value === "boolean") return value;
+    return null;
+  };
+  return {
+    extensionDays: numberOrNull(raw.extensionDays),
+    startDate: stringOrNull(raw.startDate, 40),
+    endDate: stringOrNull(raw.endDate, 40),
+    durationDays: numberOrNull(raw.durationDays),
+    itemId: stringOrNull(raw.itemId, 120),
+    pickupDetails: stringOrNull(raw.pickupDetails, 240),
+    deliveryRequested: booleanOrNull(raw.deliveryRequested),
+    deliveryAddress: stringOrNull(raw.deliveryAddress, 240),
+    deliveryTime: stringOrNull(raw.deliveryTime, 80),
+  };
+}
+
+export const POST_CONFIRM_ACTION_PARAMETERS_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    extensionDays: { type: ["number", "null"] },
+    startDate: { type: ["string", "null"] },
+    endDate: { type: ["string", "null"] },
+    durationDays: { type: ["number", "null"] },
+    itemId: { type: ["string", "null"] },
+    pickupDetails: { type: ["string", "null"] },
+    deliveryRequested: { type: ["boolean", "null"] },
+    deliveryAddress: { type: ["string", "null"] },
+    deliveryTime: { type: ["string", "null"] },
+  },
+  required: [...POST_CONFIRM_ACTION_PARAMETER_KEYS],
+});
+
 function cleanMutationExecutionStatus(value) {
   const status = clean(value, 40).toLowerCase();
   return POST_CONFIRM_MUTATION_EXECUTION_STATUSES.includes(status)
@@ -1422,6 +1510,7 @@ function defaultDecision(overrides = {}) {
     mutationIntent: "none",
     mutationExecutionRequested: false,
     mutationExecutionStatus: "not_executed",
+    actionParameters: emptyPostConfirmActionParameters(),
     bookingSelectionMode: "none",
     selectedBookingIndex: null,
     candidateGroundings: [],
@@ -1500,6 +1589,10 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     null;
   let situation = cleanSituation(parsed.situation);
   const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
+  const actionParameters = normalizePostConfirmActionParameters(
+    parsed.actionParameters,
+    action === "request_booking_mutation" ? mutationIntent : "none"
+  );
   const bookingSelectionMode = cleanBookingSelectionMode(
     parsed.bookingSelectionMode
   );
@@ -1626,6 +1719,10 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       mutationExecutionStatus: cleanMutationExecutionStatus(
         parsed.mutationExecutionStatus
       ),
+      actionParameters:
+        action === "request_booking_mutation"
+          ? actionParameters
+          : emptyPostConfirmActionParameters(),
       bookingSelectionMode,
       selectedBookingIndex,
       candidateGroundings: normalizeCandidateGroundings(
@@ -1788,6 +1885,7 @@ export async function executePostConfirmPaLaneDecision({
           type: "string",
           enum: [...POST_CONFIRM_MUTATION_EXECUTION_STATUSES],
         },
+        actionParameters: POST_CONFIRM_ACTION_PARAMETERS_SCHEMA,
         bookingSelectionMode: {
           type: "string",
           enum: [...POST_CONFIRM_BOOKING_SELECTION_MODES],
@@ -1910,6 +2008,7 @@ export async function executePostConfirmPaLaneDecision({
         "mutationIntent",
         "mutationExecutionRequested",
         "mutationExecutionStatus",
+        "actionParameters",
         "bookingSelectionMode",
         "selectedBookingIndex",
         "candidateGroundings",
@@ -1925,7 +2024,7 @@ export async function executePostConfirmPaLaneDecision({
 LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
 Return STRICT JSON (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
@@ -1957,10 +2056,12 @@ STEP 4 — action:
 - none: rare; prefer silence when empty
 - reply: send customerReply
 - escalate_missing_info: only situation=new_question per escalate rules
-- request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, pickup, or delivery. Set the matching mutationIntent. Set customerReply to "" (final wording is composed after deterministic execution). Do not claim execution succeeded.
+- request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, pickup, or delivery. Set the matching mutationIntent. Fill actionParameters with structured nullable details (never leave mutation meaning only in raw customer text). Set customerReply to "" (final wording is composed after deterministic execution). Do not claim execution succeeded.
+  Examples: extend_booking → extensionDays; cancel_booking → all null; change_dates → startDate/endDate; change_duration → durationDays; change_item → itemId; update_pickup → pickupDetails; update_delivery → deliveryRequested/deliveryAddress/deliveryTime.
 - confirm_pending_availability / decline_pending_availability: use only when the customer clearly intends that action for one listed pendingAvailabilityRequests entry. Set pendingAvailabilitySelectionIndex to that entry's selectionIndex. If intent or selection is unclear, ask a natural clarification with action="reply".
 - mutationExecutionRequested=true only with request_booking_mutation.
 - mutationExecutionStatus must reflect VERIFIED_BUSINESS_PA_FACTS_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
+- For non-mutation actions, actionParameters must be all null.
 - bookingSelectionMode controls booking scope:
   focused = use bookingFocus.selectedBookingIndex for a read-only informational question;
   candidate = customer explicitly identified one bookingCandidates row, and selectedBookingIndex must be that row;
@@ -2176,8 +2277,13 @@ STRICT SAFETY:
         finalized.mutationIntent = cleanMutationIntent(
           finalized.mutationIntent
         );
+        finalized.actionParameters = normalizePostConfirmActionParameters(
+          finalized.actionParameters,
+          finalized.mutationIntent
+        );
       } else {
         finalized.mutationIntent = "none";
+        finalized.actionParameters = emptyPostConfirmActionParameters();
       }
       const bookingSelection = resolvePostConfirmBookingSelection(
         finalized,
@@ -2213,6 +2319,10 @@ STRICT SAFETY:
         finalized.shouldReply = true;
         finalized.mutationExecutionRequested = true;
         finalized.mutationExecutionStatus = "not_executed";
+        finalized.actionParameters = normalizePostConfirmActionParameters(
+          finalized.actionParameters,
+          finalized.mutationIntent
+        );
         return {
           ok: true,
           decision: stripInternalReplySemantics(finalized),
