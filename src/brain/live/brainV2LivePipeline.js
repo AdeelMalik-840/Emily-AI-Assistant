@@ -18,6 +18,7 @@ import { executeOutboundReply } from "../../services/executors/outboundReplyExec
 import { decideCustomerTurn } from "../decisions/decideCustomerTurn.js";
 import { GROUP_POST_EXECUTE_LANE } from "../decisions/groupPostExecuteLane.js";
 import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
+import { buildContinuationContext } from "../continuation/buildContinuationContext.js";
 import {
   ONBOARDING_CLARIFICATION_REPLY,
   isOnboardingStyleClarificationReply,
@@ -121,6 +122,50 @@ export async function runBrainV2LivePipeline(params) {
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
+    const continuation = buildContinuationContext({
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound === true || chatType === "group",
+      participantKey: params.participantKey,
+      customerNumber: params.participantPhoneForDm ?? null,
+      groupChatKey: params.playwrightChatKey ?? params.chatId ?? null,
+      memorySnapshot: params.memorySnapshot,
+      availabilityRequest: params.preResolvedWaitingConfirmRequest ?? null,
+      waitingConfirmCandidates: params.waitingConfirmCandidates ?? null,
+    });
+
+    // Unsafe continuation: fail closed — no generic routing, no mutation.
+    if (continuation.active && !continuation.safeToOwn) {
+      console.log("[continuation_context_fail_closed]", {
+        traceId,
+        businessId,
+        type: continuation.type,
+        rejectReason: continuation.rejectReason,
+        stale: continuation.stale,
+      });
+      return buildSilentPipelineResult({
+        traceId,
+        reason: continuation.rejectReason || "CONTINUATION_UNSAFE",
+      });
+    }
+
+    // Safe continuation: do not let itemless clarify / generic entity steal the turn.
+    if (
+      continuation.safeToOwn &&
+      continuation.bypassGenericRouting &&
+      turnContextInput.shouldClarifyItem
+    ) {
+      turnContextInput.shouldClarifyItem = false;
+      turnContextInput.clarificationReply = null;
+      if (continuation.itemId && !turnContextInput.authoritativeItem?.id) {
+        turnContextInput.authoritativeItem = {
+          id: continuation.itemId,
+          label: continuation.itemLabel,
+          source: "continuation_trusted",
+        };
+      }
+    }
+
     if (turnContextInput.shouldClarifyItem && turnContextInput.clarificationReply) {
       await resolveBusinessTurnContext({
         traceId,
@@ -188,8 +233,12 @@ export async function runBrainV2LivePipeline(params) {
       conversationHistory: params.conversationHistory,
     });
 
+    brainTurnContext.continuation = continuation;
+
     if (turnContextInput.authoritativeItem?.id) {
       brainTurnContext.lastResolvedItemId = String(turnContextInput.authoritativeItem.id).trim();
+    } else if (continuation.safeToOwn && continuation.itemId) {
+      brainTurnContext.lastResolvedItemId = String(continuation.itemId).trim();
     }
 
     const resolvedBusinessTurnContext = await resolveBusinessTurnContext({

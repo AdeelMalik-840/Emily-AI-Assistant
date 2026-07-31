@@ -224,6 +224,10 @@ export function normalizeTurnContext(raw = {}) {
     responseDisposition:
       r.responseDisposition != null ? String(r.responseDisposition) : null,
     actionsAllowed: r.actionsAllowed === false ? false : null,
+    continuation:
+      r.continuation && typeof r.continuation === "object"
+        ? /** @type {Record<string, unknown>} */ (r.continuation)
+        : null,
   };
 }
 
