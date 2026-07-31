@@ -1,0 +1,89 @@
+name: PR74 main baseline verification
+
+on:
+  push:
+    branches:
+      - verify/pr74-6592c019
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr74-main-baseline-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      NODE_ENV: test
+      OPENAI_API_KEY: test-key
+    steps:
+      - name: Checkout exact main baseline
+        uses: actions/checkout@v4
+        with:
+          ref: 8b620883f9422e8c57cbb804532b4dfb7cfad206
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create isolated Firebase test credential
+        run: |
+          openssl genrsa -out /tmp/pr74-main-test-private-key.pem 2048
+          node <<'NODE'
+          const fs = require('fs');
+          const key = fs.readFileSync('/tmp/pr74-main-test-private-key.pem', 'utf8');
+          const credential = {
+            type: 'service_account',
+            project_id: 'pr74-main-verification',
+            private_key_id: 'pr74-main-verification-key',
+            private_key: key,
+            client_email: 'pr74-main-verification@pr74-main-verification.iam.gserviceaccount.com',
+            client_id: '100000000000000000002',
+            auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+            token_uri: 'https://oauth2.googleapis.com/token',
+            auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+            client_x509_cert_url: 'https://www.googleapis.com/robot/v1/metadata/x509/pr74-main-verification%40pr74-main-verification.iam.gserviceaccount.com'
+          };
+          fs.appendFileSync(process.env.GITHUB_ENV, `FIREBASE_KEY<<PR74EOF\n${JSON.stringify(credential)}\nPR74EOF\n`);
+          NODE
+
+      - name: Run full main baseline suite
+        shell: bash
+        run: |
+          set +e
+          out=/tmp/pr74-main-baseline
+          rm -rf "$out"
+          mkdir -p "$out"
+          npm test > "$out/full-suite.log" 2>&1
+          code=$?
+          grep '^not ok ' "$out/full-suite.log" > "$out/not-ok.txt" || true
+          {
+            echo "TESTED_SHA=$(git rev-parse HEAD)"
+            echo "EXIT_CODE=$code"
+            echo "NOT_OK_COUNT=$(wc -l < "$out/not-ok.txt" | tr -d ' ')"
+            cat "$out/not-ok.txt"
+          } > "$out/summary.txt"
+          echo "$code" > "$out/exit-code.txt"
+          cat "$out/summary.txt"
+          exit 0
+
+      - name: Upload main baseline report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr74-main-baseline-report
+          path: /tmp/pr74-main-baseline
+          if-no-files-found: error
+          retention-days: 7
