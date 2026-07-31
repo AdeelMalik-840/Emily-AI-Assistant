@@ -19,6 +19,7 @@ import {
 import { buildCustomerCommunicationPolicy } from "../brain/policies/customerCommunicationPolicy.js";
 import {
   buildPaMissingInfoFollowupContract,
+  buildPostConfirmPaReplyContract,
   normalizeReplySemantics,
 } from "../brain/contracts/customerReplyContract.js";
 import {
@@ -349,6 +350,327 @@ STRICT SAFETY:
       reply: "",
       source: "technical_fallback",
       reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
+    };
+  }
+}
+
+/**
+ * Constrained post-confirm mutation reply composer.
+ * Not a second semantic Brain: frozen decision fields cannot change.
+ * Writes customerReply only from verified mutationExecution + original decision.
+ *
+ * @param {{
+ *   facts?: Record<string, unknown> | null,
+ *   userMessage?: string | null,
+ *   frozenDecision: Record<string, unknown>,
+ *   mutationExecution: Record<string, unknown>,
+ *   styleKey?: string,
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ */
+export async function composePostConfirmMutationCustomerReply({
+  facts = null,
+  userMessage = null,
+  frozenDecision,
+  mutationExecution,
+  styleKey = "casual_local",
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const decision =
+    frozenDecision && typeof frozenDecision === "object" ? frozenDecision : {};
+  const execution =
+    mutationExecution && typeof mutationExecution === "object"
+      ? mutationExecution
+      : {};
+  const factsObj = facts && typeof facts === "object" ? facts : {};
+  const customerMessage = String(userMessage ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+
+  const frozenActionParameters =
+    decision.actionParameters && typeof decision.actionParameters === "object"
+      ? decision.actionParameters
+      : {
+          extensionDays: null,
+          startDate: null,
+          endDate: null,
+          durationDays: null,
+          itemId: null,
+          pickupDetails: null,
+          deliveryRequested: null,
+          deliveryAddress: null,
+          deliveryTime: null,
+        };
+
+  const frozen = {
+    action: decision.action ?? null,
+    mutationIntent: decision.mutationIntent ?? "none",
+    actionParameters: frozenActionParameters,
+    bookingSelectionMode: decision.bookingSelectionMode ?? "none",
+    selectedBookingIndex: decision.selectedBookingIndex ?? null,
+    selectedBookingId: decision.selectedBookingId ?? null,
+    conversationAct: decision.conversationAct ?? null,
+    customerIntent: decision.customerIntent ?? null,
+    situation: decision.situation ?? null,
+  };
+
+  const verifiedExecution = {
+    status: cleanType(execution.status) || "not_executed",
+    intent: cleanType(execution.intent) || frozen.mutationIntent || "none",
+    reason: String(execution.reason ?? "").trim().slice(0, 160) || null,
+    bookingId: String(execution.bookingId ?? "").trim().slice(0, 120) || null,
+    itemLabel: String(execution.itemLabel ?? "").trim().slice(0, 200) || null,
+    changedData: execution.changedData === true,
+    unsupported: execution.unsupported === true,
+  };
+
+  const factsJson = compactPostConfirmFactsForPrompt({
+    ...factsObj,
+    mutationExecution: {
+      requested: true,
+      status: verifiedExecution.status,
+      intent: verifiedExecution.intent,
+    },
+  });
+
+  const replyContract = buildPostConfirmPaReplyContract({
+    ...factsObj,
+    mutationExecution: {
+      requested: true,
+      status: verifiedExecution.status,
+      intent: verifiedExecution.intent,
+    },
+    customerMessageText: customerMessage,
+    styleKey,
+  });
+
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "dm",
+    styleKey,
+    businessCommunicationProfile:
+      factsObj?.business && typeof factsObj.business === "object"
+        ? /** @type {Record<string, unknown>} */ (factsObj.business)
+        : factsObj?.tone != null
+          ? { tone: factsObj.tone }
+          : null,
+  });
+
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "post_confirm_mutation_reply_compose",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        customerReply: { type: "string" },
+        replySemantics: REPLY_SEMANTICS_SCHEMA,
+      },
+      required: ["customerReply", "replySemantics"],
+    }
+  );
+
+  const system = `${shared}
+
+LANE OBJECTIVE (post_confirm_pa mutation reply composer — NOT a decision Brain):
+OUTPUT STRICT JSON only:
+{"customerReply":"<short WhatsApp reply>","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+
+FROZEN_DECISION_JSON is authoritative and immutable. You may ONLY write customerReply.
+You MUST NOT change action, mutationIntent, actionParameters, bookingSelectionMode, selectedBookingIndex, selectedBookingId, conversationAct, customerIntent, or situation.
+
+VERIFIED_MUTATION_EXECUTION_JSON is the only source of truth for whether a mutation happened:
+- status "succeeded": you may say the change completed (only what verified fields support).
+- status "unsupported" / "failed" / "not_executed": say the change was NOT completed. Do NOT claim success. Do NOT promise owner follow-up, manual action, timing, or automatic completion. Do NOT invent that data changed.
+
+STRICT SAFETY:
+- Never invent booking mutations, amounts, dates, or policies.
+- Never mention executor, unsupported, system, Firestore, Brain, or other internal process terms.
+- Keep reply short for WhatsApp.`;
+
+  const userBase =
+    `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\n` +
+    `FROZEN_DECISION_JSON:\n${JSON.stringify(frozen)}\n\n` +
+    `VERIFIED_MUTATION_EXECUTION_JSON:\n${JSON.stringify(verifiedExecution)}\n\n` +
+    `CURRENT_CUSTOMER_MESSAGE:\n${customerMessage || "(none)"}\n\n` +
+    `CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
+      allowedClaims: replyContract.allowedClaims,
+      forbiddenClaims: replyContract.forbiddenClaims,
+      requiredMeaning: replyContract.requiredMeaning,
+    })}`;
+
+  const completionFn =
+    typeof __chatCompletionsCreateForTests === "function"
+      ? __chatCompletionsCreateForTests
+      : (() => {
+          const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+          if (!apiKey) return null;
+          const client = new OpenAI({ apiKey });
+          return (args) => client.chat.completions.create(args);
+        })();
+
+  if (!completionFn) {
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+      frozenDecision: frozen,
+    };
+  }
+
+  try {
+    let lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
+      const userContent =
+        attempt === 1
+          ? `${userBase}\n\nRemember: JSON only; compose wording only; never change frozen decision; never claim success unless verified status is succeeded.`
+          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
+      const createPromise = Promise.resolve(
+        completionFn({
+          model: resolveOpenAiChatModel(),
+          temperature: 0.35,
+          max_tokens: 220,
+          response_format: responseFormat,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userContent },
+          ],
+        })
+      );
+      const timed =
+        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+          ? Promise.race([
+              createPromise,
+              new Promise((_, reject) => {
+                setTimeout(
+                  () =>
+                    reject(
+                      new Error("POST_CONFIRM_MUTATION_COMPOSE_OPENAI_TIMEOUT")
+                    ),
+                  Math.floor(Number(timeoutMs))
+                );
+              }),
+            ])
+          : createPromise;
+
+      const resp = await timed;
+      const raw = resp?.choices?.[0]?.message?.content ?? "";
+      let text = String(raw ?? "").trim();
+      const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fence) text = fence[1].trim();
+      const start = text.indexOf("{");
+      const end = text.lastIndexOf("}");
+      if (start >= 0 && end > start) text = text.slice(start, end + 1);
+
+      let customerReply = "";
+      let semantics = null;
+      try {
+        const parsed = JSON.parse(text);
+        // Ignore any attempt to smuggle decision-field changes.
+        customerReply = String(parsed?.customerReply ?? parsed?.reply ?? "")
+          .replace(/^\s*["']|["']\s*$/g, "")
+          .trim();
+        semantics = normalizeReplySemantics(parsed?.replySemantics);
+      } catch {
+        customerReply = "";
+      }
+
+      if (!customerReply) {
+        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+          frozenDecision: frozen,
+        };
+      }
+
+      // Ignore any smuggled decision fields in compose JSON — only customerReply is used.
+      if (
+        verifiedExecution.status !== "succeeded" &&
+        /\b(executor|unsupported|firestore|brain|\bsystem\b)\b/i.test(
+          customerReply
+        )
+      ) {
+        lastReason = "internal_process_terms_in_customer_reply";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+          frozenDecision: frozen,
+        };
+      }
+      if (
+        verifiedExecution.status !== "succeeded" &&
+        /\b(owner\s+follow[- ]?up|follow[- ]?up|manual\s+action|baad\s+mein|jaldi|auto(matic)?\s+(complete|ho)|system\s+complete)\b/i.test(
+          customerReply
+        )
+      ) {
+        lastReason = "unverified_mutation_followup_or_timing_promise";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+          frozenDecision: frozen,
+        };
+      }
+
+      const guard = validateCustomerReplyAgainstContract(
+        customerReply,
+        {
+          ...replyContract,
+          verifiedCustomerFacts: {
+            ...(replyContract.verifiedCustomerFacts || {}),
+            mutationIntent: frozen.mutationIntent,
+            mutationExecutionRequested: true,
+            mutationExecutionStatus: verifiedExecution.status,
+          },
+          replyRequired: true,
+        },
+        semantics
+      );
+      if (!guard.ok) {
+        lastReason = guard.reason || "customer_reply_guard_failed";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return {
+          ok: false,
+          reply: "",
+          source: "technical_fallback",
+          reason: lastReason,
+          frozenDecision: frozen,
+        };
+      }
+
+      return {
+        ok: true,
+        reply: customerReply.slice(0, 500),
+        source: "openai",
+        frozenDecision: frozen,
+        mutationExecution: verifiedExecution,
+      };
+    }
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: lastReason,
+      frozenDecision: frozen,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
+      frozenDecision: frozen,
     };
   }
 }

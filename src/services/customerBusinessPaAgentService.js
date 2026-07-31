@@ -1,7 +1,10 @@
 /**
  * Emily Business PA — post-confirm context owner + safe executor.
- * Brain facts → deterministic action block → Brain decision → execute only.
- * Never creates/updates/cancels bookings. No canned topic reply engine.
+ * Architecture (post_confirm_pa DM):
+ *   Brain semantic decision → deterministic validate/execute → constrained reply compose.
+ * Booking mutations run only through postConfirmBookingMutationExecutor (safe executors
+ * only; unsupported intents never write Firestore). Pending AVR confirm/decline keep
+ * their existing executor + second Brain reply path.
  */
 
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
@@ -10,6 +13,8 @@ import {
   executeAvailabilityCustomerConfirmBooking,
   executeAvailabilityCustomerDecline,
 } from "./availabilityCustomerConfirmService.js";
+import { executePostConfirmBookingMutation } from "./postConfirmBookingMutationExecutor.js";
+import { composePostConfirmMutationCustomerReply } from "./customerBusinessPaAiReply.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -52,6 +57,8 @@ function logPostConfirmTerminalDiagnostic(decided) {
  *   __decideCustomerTurnFn?: typeof decideCustomerTurn,
  *   __executeAvailabilityCustomerConfirmBookingFn?: typeof executeAvailabilityCustomerConfirmBooking,
  *   __executeAvailabilityCustomerDeclineFn?: typeof executeAvailabilityCustomerDecline,
+ *   __executePostConfirmBookingMutationFn?: typeof executePostConfirmBookingMutation,
+ *   __composePostConfirmMutationCustomerReplyFn?: typeof composePostConfirmMutationCustomerReply,
  *   __chatCompletionsCreateForTests?: Function,
  * }} params
  */
@@ -70,6 +77,9 @@ export async function handleCustomerBusinessPaInbound({
     executeAvailabilityCustomerConfirmBooking,
   __executeAvailabilityCustomerDeclineFn =
     executeAvailabilityCustomerDecline,
+  __executePostConfirmBookingMutationFn = executePostConfirmBookingMutation,
+  __composePostConfirmMutationCustomerReplyFn =
+    composePostConfirmMutationCustomerReply,
   __chatCompletionsCreateForTests = null,
 }) {
   const uid = clean(businessId);
@@ -99,8 +109,8 @@ export async function handleCustomerBusinessPaInbound({
 
   const facts = resolved.facts;
 
-  // Brain shared entrypoint — facts in, OpenAI decision/reply out. Informational
-  // post-booking turns have no missing-info or owner-notification executor.
+  // Brain shared entrypoint — one semantic decision for this customer turn.
+  // Informational post-booking turns have no missing-info or owner-notification executor.
   const decided = await __decideCustomerTurnFn({
     lane: "post_confirm_pa",
     channel: "whatsapp",
@@ -158,6 +168,10 @@ export async function handleCustomerBusinessPaInbound({
 
   let decision = decided.decision;
   let pendingAvailabilityExecution = null;
+  let mutationExecution = null;
+  let semanticDecisionCount = 1;
+  let composeCalls = 0;
+
   if (
     decision.action === "confirm_pending_availability" ||
     decision.action === "decline_pending_availability"
@@ -274,6 +288,7 @@ export async function handleCustomerBusinessPaInbound({
       missingInfoLoopFullyEnabled: false,
       __chatCompletionsCreateForTests,
     });
+    semanticDecisionCount += 1;
     if (finalDecision?.ok !== true || finalDecision?.source !== "openai") {
       const retryable = finalDecision?.retryable === true;
       const terminalDiagnostic = retryable
@@ -305,9 +320,96 @@ export async function handleCustomerBusinessPaInbound({
         contentSafetyAttempts:
           terminalDiagnostic?.contentSafetyAttempts ??
           nonNegativeInteger(finalDecision?.contentSafetyAttempts),
+        semanticDecisionCount,
+        composeCalls,
       };
     }
     decision = finalDecision.decision;
+  } else if (decision.action === "request_booking_mutation") {
+    // Decide → validate/execute → compose. Informational turns never reach here.
+    const frozenDecision = { ...decision };
+    const selectedBookingId = clean(decision.selectedBookingId) || null;
+    const selectedBooking =
+      selectedBookingId && Array.isArray(facts.bookingCandidates)
+        ? facts.bookingCandidates.find(
+            (row) => clean(row?.id) === selectedBookingId
+          ) ?? null
+        : selectedBookingId &&
+            clean(facts.booking?.id) === selectedBookingId
+          ? facts.booking
+          : null;
+
+    mutationExecution = __executePostConfirmBookingMutationFn({
+      businessId: uid,
+      messageId,
+      decision: frozenDecision,
+      facts,
+      selectedBooking,
+    });
+
+    const composed = await __composePostConfirmMutationCustomerReplyFn({
+      facts: {
+        ...facts,
+        mutationExecution: {
+          requested: true,
+          status: mutationExecution?.status ?? "not_executed",
+          intent:
+            mutationExecution?.intent ??
+            frozenDecision.mutationIntent ??
+            "none",
+        },
+      },
+      userMessage: text,
+      frozenDecision,
+      mutationExecution,
+      styleKey: "casual_local",
+      __chatCompletionsCreateForTests,
+    });
+    composeCalls += 1;
+
+    if (composed?.ok !== true || !cleanCustomerReply(composed?.reply)) {
+      return {
+        handled: true,
+        action: "business_pa_terminal_model_failure",
+        reply: "",
+        sentReply: false,
+        bookingId: selectedBookingId || clean(facts.booking?.id) || null,
+        availabilityRequestId:
+          clean(selectedBooking?.availabilityRequestId) ||
+          clean(facts.booking?.availabilityRequestId) ||
+          null,
+        reason: "OPENAI_POST_CONFIRM_MUTATION_COMPOSE_FAILED",
+        retryable: false,
+        terminalFailure: true,
+        openaiUsed: false,
+        openaiSource: composed?.source ?? "technical_fallback",
+        finalReplySource: "openai_post_confirm_pa_mutation_compose",
+        failureReason:
+          clean(composed?.reason, 160) ||
+          "OPENAI_POST_CONFIRM_MUTATION_COMPOSE_FAILED",
+        mutationIntent: frozenDecision.mutationIntent ?? "none",
+        mutationExecutionRequested: true,
+        mutationExecutionStatus:
+          mutationExecution?.status ?? "not_executed",
+        mutationExecution,
+        bookingSelectionMode:
+          clean(frozenDecision.bookingSelectionMode, 40) || "none",
+        selectedBookingIndex: frozenDecision.selectedBookingIndex ?? null,
+        silenceRecoveryAttempts:
+          Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+        semanticDecisionCount,
+        composeCalls,
+      };
+    }
+
+    decision = {
+      ...frozenDecision,
+      customerReply: cleanCustomerReply(composed.reply),
+      shouldReply: true,
+      action: "request_booking_mutation",
+      mutationExecutionRequested: true,
+      mutationExecutionStatus: mutationExecution?.status ?? "not_executed",
+    };
   }
 
   const shouldSend =
@@ -369,14 +471,21 @@ export async function handleCustomerBusinessPaInbound({
     reason,
     openaiUsed,
     openaiSource: decided?.source ?? "technical_fallback",
-    finalReplySource: "openai_post_confirm_pa",
+    finalReplySource:
+      mutationExecution != null
+        ? "openai_post_confirm_pa_mutation_compose"
+        : "openai_post_confirm_pa",
     conversationAct: decision.conversationAct,
     customerIntent: decision.customerIntent ?? "unclear",
     mutationIntent: decision.mutationIntent ?? "none",
     mutationExecutionRequested:
-      decision.mutationExecutionRequested === true,
+      decision.mutationExecutionRequested === true ||
+      mutationExecution != null,
     mutationExecutionStatus:
-      decision.mutationExecutionStatus ?? "not_executed",
+      mutationExecution?.status ??
+      decision.mutationExecutionStatus ??
+      "not_executed",
+    mutationExecution,
     bookingSelectionMode,
     selectedBookingIndex: decision.selectedBookingIndex ?? null,
     pendingAvailabilityExecution,
@@ -390,6 +499,8 @@ export async function handleCustomerBusinessPaInbound({
     silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
     retryable: false,
     terminalFailure: false,
+    semanticDecisionCount,
+    composeCalls,
   };
 }
 
