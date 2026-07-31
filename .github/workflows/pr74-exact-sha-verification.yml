@@ -63,47 +63,88 @@ jobs:
         shell: bash
         run: |
           set +e
+          out=/tmp/pr74-verification
+          rm -rf "$out"
+          mkdir -p "$out/logs"
+          : > "$out/summary.txt"
+          : > "$out/failure-details.txt"
           failed=0
 
           run_check() {
-            name="$1"
-            shift
-            echo "::group::$name"
-            "$@"
+            key="$1"
+            name="$2"
+            shift 2
+            log="$out/logs/${key}.log"
+            echo "RUNNING: $name"
+            "$@" >"$log" 2>&1
             code=$?
-            echo "::endgroup::"
             if [ "$code" -ne 0 ]; then
-              echo "FAILED: $name (exit $code)"
+              printf 'FAILED\t%s\texit=%s\n' "$name" "$code" | tee -a "$out/summary.txt"
+              {
+                echo "===== FAILED: $name (exit $code) ====="
+                tail -n 200 "$log"
+                echo
+              } >> "$out/failure-details.txt"
               failed=1
             else
-              echo "PASSED: $name"
+              printf 'PASSED\t%s\n' "$name" | tee -a "$out/summary.txt"
             fi
           }
 
-          run_check "Exact SHA" bash -lc 'test "$(git rev-parse HEAD)" = "6592c019d170edaa7238194b5399b515aa8bc81c"'
-          run_check "Clarification identity scope" node --test tests/post-confirm-clarification-identity-scope.test.mjs
-          run_check "Post-confirm continuity" node --test tests/dm-confirmed-booking-openai-continuity.test.mjs
-          run_check "Canonical booking facts" node --test tests/canonical-customer-booking-facts.test.mjs
-          run_check "Shared guard supported facts" node --test tests/customer-reply-guard-supported-facts.test.mjs
-          run_check "Post-confirm canonical integration" node --test tests/post-confirm-canonical-booking-facts-integration.test.mjs
-          run_check "Pending availability canonical guard" node --test tests/pending-availability-canonical-guard.test.mjs
-          run_check "Price mismatch diagnostic" node --test tests/verified-price-mismatch-diagnostic.test.mjs
-          run_check "Required-empty recovery" node --test tests/post-confirm-required-empty-recovery.test.mjs
-          run_check "Terminal diagnostic" node --test tests/post-confirm-terminal-diagnostic.test.mjs
-          run_check "Customer Business PA agent" node --test tests/customer-business-pa-agent.test.mjs
-          run_check "Waiting-confirm DM lane" node --test tests/waiting-confirm-dm-brain-lane-step-4.test.mjs
-          run_check "Cloud ownership race" node --test tests/cloud-post-confirm-ownership-race.test.mjs
-          run_check "Conversation idempotency" node --test tests/conversation-store-idempotency.test.mjs
+          run_check "01-exact-sha" "Exact SHA" bash -lc 'test "$(git rev-parse HEAD)" = "6592c019d170edaa7238194b5399b515aa8bc81c"'
+          run_check "02-clarification" "Clarification identity scope" node --test tests/post-confirm-clarification-identity-scope.test.mjs
+          run_check "03-continuity" "Post-confirm continuity" node --test tests/dm-confirmed-booking-openai-continuity.test.mjs
+          run_check "04-canonical-facts" "Canonical booking facts" node --test tests/canonical-customer-booking-facts.test.mjs
+          run_check "05-guard-facts" "Shared guard supported facts" node --test tests/customer-reply-guard-supported-facts.test.mjs
+          run_check "06-post-confirm-integration" "Post-confirm canonical integration" node --test tests/post-confirm-canonical-booking-facts-integration.test.mjs
+          run_check "07-pending-availability" "Pending availability canonical guard" node --test tests/pending-availability-canonical-guard.test.mjs
+          run_check "08-price-diagnostic" "Price mismatch diagnostic" node --test tests/verified-price-mismatch-diagnostic.test.mjs
+          run_check "09-empty-recovery" "Required-empty recovery" node --test tests/post-confirm-required-empty-recovery.test.mjs
+          run_check "10-terminal-diagnostic" "Terminal diagnostic" node --test tests/post-confirm-terminal-diagnostic.test.mjs
+          run_check "11-pa-agent" "Customer Business PA agent" node --test tests/customer-business-pa-agent.test.mjs
+          run_check "12-waiting-confirm" "Waiting-confirm DM lane" node --test tests/waiting-confirm-dm-brain-lane-step-4.test.mjs
+          run_check "13-ownership-race" "Cloud ownership race" node --test tests/cloud-post-confirm-ownership-race.test.mjs
+          run_check "14-idempotency" "Conversation idempotency" node --test tests/conversation-store-idempotency.test.mjs
 
-          run_check "Syntax: booking facts" node --check src/brain/facts/resolveActiveCustomerBookingFacts.js
-          run_check "Syntax: reply guard" node --check src/brain/guards/customerReplyGuard.js
-          run_check "Syntax: reply contract" node --check src/brain/contracts/customerReplyContract.js
-          run_check "Syntax: customer turn" node --check src/brain/decisions/decideCustomerTurn.js
-          run_check "Syntax: waiting-confirm lane" node --check src/brain/decisions/waitingConfirmDmLane.js
+          run_check "15-syntax-booking-facts" "Syntax: booking facts" node --check src/brain/facts/resolveActiveCustomerBookingFacts.js
+          run_check "16-syntax-reply-guard" "Syntax: reply guard" node --check src/brain/guards/customerReplyGuard.js
+          run_check "17-syntax-reply-contract" "Syntax: reply contract" node --check src/brain/contracts/customerReplyContract.js
+          run_check "18-syntax-customer-turn" "Syntax: customer turn" node --check src/brain/decisions/decideCustomerTurn.js
+          run_check "19-syntax-waiting-confirm" "Syntax: waiting-confirm lane" node --check src/brain/decisions/waitingConfirmDmLane.js
 
-          run_check "Diff check" git diff --check 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
-          run_check "Clean worktree" bash -lc 'test -z "$(git status --porcelain)"'
-          run_check "Full repository test suite" npm test
+          run_check "20-diff-check" "Diff check" git diff --check 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
+          run_check "21-clean-worktree" "Clean worktree" bash -lc 'test -z "$(git status --porcelain)"'
+          run_check "22-full-suite" "Full repository test suite" npm test
 
-          git diff --stat 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
-          exit "$failed"
+          {
+            echo
+            echo "===== DIFF STAT ====="
+            git diff --stat 8b620883f9422e8c57cbb804532b4dfb7cfad206...HEAD
+            echo
+            echo "TESTED_SHA=$(git rev-parse HEAD)"
+          } >> "$out/summary.txt"
+
+          if [ "$failed" -eq 0 ]; then
+            echo PASS > "$out/final-status.txt"
+          else
+            echo FAIL > "$out/final-status.txt"
+          fi
+
+          cat "$out/summary.txt"
+          if [ -s "$out/failure-details.txt" ]; then
+            echo "Failure details captured in artifact."
+          fi
+          exit 0
+
+      - name: Upload complete verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr74-exact-sha-verification-report
+          path: /tmp/pr74-verification
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce verification result
+        if: always()
+        run: test "$(cat /tmp/pr74-verification/final-status.txt)" = "PASS"
