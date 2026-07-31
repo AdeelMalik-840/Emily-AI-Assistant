@@ -258,6 +258,20 @@ function baseModelFields(overrides = {}) {
   };
 }
 
+const COMPOSED_CONFIRM_SUCCESS_REPLY = "Booking confirm ho gayi.";
+const COMPOSED_DECLINE_REPLY = "Theek hai, ye offer skip kar dete hain.";
+const COMPOSED_CHANGE_REPLY =
+  "Change ke liye availability dobara check karni hogi.";
+
+function composeSemantics(claims = []) {
+  return {
+    claims,
+    languageStyle: "roman_urdu",
+    containsTimingPromise: false,
+    exposesInternalProcess: false,
+  };
+}
+
 /** OpenAI transport double only — production parser/lane/service must run. */
 function openaiCreateFromPayload(payload, counter = null) {
   return async () => {
@@ -268,15 +282,76 @@ function openaiCreateFromPayload(payload, counter = null) {
   };
 }
 
+/**
+ * Decide then post-exec compose: inspects prompt so one injector covers both calls.
+ */
+function openaiCreateDecideThenCompose(
+  decidePayload,
+  composeReply,
+  counter = null,
+  composeClaims = ["reservation_created"]
+) {
+  return async (args) => {
+    if (counter) counter.calls += 1;
+    const prompt = String(args?.messages?.[1]?.content ?? "");
+    const schemaName = String(
+      args?.response_format?.json_schema?.name ?? ""
+    );
+    if (
+      prompt.includes("FROZEN_DECISION_JSON") ||
+      schemaName.includes("execution_reply_compose")
+    ) {
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply: composeReply,
+                replySemantics: composeSemantics(composeClaims),
+              }),
+            },
+          },
+        ],
+      };
+    }
+    return {
+      choices: [{ message: { content: JSON.stringify(decidePayload) } }],
+    };
+  };
+}
+
 async function handleBrainInbound(fake, messageText, opts = {}) {
   const sendCalls = opts.sendCalls || [];
   const openaiCounter = opts.openaiCounter || { calls: 0 };
+  const decidePayload = opts.openaiPayload || baseModelFields();
+  const action = String(decidePayload.action ?? "");
+  const needsCompose =
+    action === "confirm_booking" ||
+    action === "decline_request" ||
+    action === "change_request";
+  const defaultComposeReply =
+    action === "decline_request"
+      ? COMPOSED_DECLINE_REPLY
+      : action === "change_request"
+        ? COMPOSED_CHANGE_REPLY
+        : COMPOSED_CONFIRM_SUCCESS_REPLY;
+  const defaultComposeClaims =
+    action === "confirm_booking"
+      ? ["reservation_created"]
+      : ["customer_confirmation_acknowledged"];
   const createFn =
     opts.openaiCreate ||
-    openaiCreateFromPayload(
-      opts.openaiPayload || baseModelFields(),
-      openaiCounter
-    );
+    (needsCompose
+      ? openaiCreateDecideThenCompose(
+          {
+            ...decidePayload,
+            customerReply: "",
+          },
+          opts.composeReply || defaultComposeReply,
+          openaiCounter,
+          opts.composeClaims || defaultComposeClaims
+        )
+      : openaiCreateFromPayload(decidePayload, openaiCounter));
   const result = await handleAvailabilityCustomerCloudInbound({
     db: fake.db,
     businessId: BUSINESS_ID,
@@ -334,6 +409,7 @@ test("PR1: waiting_confirm always uses decideCustomerTurn (classifier not final)
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
   const sendCalls = [];
   let decideCalls = 0;
+  let composeCalls = 0;
   const result = await handleAvailabilityCustomerCloudInbound({
     db: fake.db,
     businessId: BUSINESS_ID,
@@ -355,7 +431,7 @@ test("PR1: waiting_confirm always uses decideCustomerTurn (classifier not final)
           ...baseModelFields({
             action: "confirm_booking",
             customerIsConfirmingBooking: true,
-            customerReply: "Confirm mil gaya, request aage barhati hun.",
+            customerReply: "",
             confidence: 0.95,
             requiredExecutor: WAITING_CONFIRM_DM_CONFIRM_EXECUTOR,
           }),
@@ -364,11 +440,23 @@ test("PR1: waiting_confirm always uses decideCustomerTurn (classifier not final)
         lane: WAITING_CONFIRM_DM_LANE,
       };
     },
+    __composeWaitingConfirmExecutionReplyForTests: async () => {
+      composeCalls += 1;
+      return {
+        ok: true,
+        reply: COMPOSED_CONFIRM_SUCCESS_REPLY,
+        source: "test_compose",
+      };
+    },
   });
   assert.equal(decideCalls, 1);
+  assert.equal(composeCalls, 1);
   assert.equal(result.waitingConfirmDmBrain, true);
+  assert.equal(result.composedAfterExecution, true);
   assert.equal(result.action, "confirmed_booking");
   assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
+  assert.equal(String(sendCalls[0][1]), COMPOSED_CONFIRM_SUCCESS_REPLY);
+  assert.doesNotMatch(String(sendCalls[0][1]), /aage barhati/i);
 });
 
 test("PR1: price Q&A via decideCustomerTurn (not classifier path)", async () => {
@@ -428,10 +516,9 @@ test("TurnContext packer includes history, last Emily, AVR, price", () => {
   assert.ok(ctx.allowedExecutors.includes("confirm_booking_executor"));
 });
 
-test("authentic: confirm books once and sends only Brain customerReply", async () => {
+test("authentic: confirm books once and sends composed post-exec reply", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const brainReply = "Confirm mil gaya, request aage barhati hun.";
   const openaiCounter = { calls: 0 };
   const { result, sendCalls } = await handleBrainInbound(
     fake,
@@ -443,7 +530,7 @@ test("authentic: confirm books once and sends only Brain customerReply", async (
         customerIntent: "confirm",
         customerIsConfirmingBooking: true,
         shouldReply: true,
-        customerReply: brainReply,
+        customerReply: "",
         action: "confirm_booking",
         confidence: 0.95,
         reason: "natural_confirm",
@@ -456,23 +543,22 @@ test("authentic: confirm books once and sends only Brain customerReply", async (
       }),
     }
   );
-  assert.equal(openaiCounter.calls, 1);
+  assert.equal(openaiCounter.calls, 2);
   assert.equal(result.action, "confirmed_booking");
   assert.equal(result.waitingConfirmDmBrain, true);
+  assert.equal(result.composedAfterExecution, true);
   assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
   assert.equal(sendCalls.length, 1);
-  assert.equal(String(sendCalls[0][1]), brainReply);
-  assert.notEqual(String(sendCalls[0][1]), EXECUTOR_SUCCESS_REPLY);
-  assert.notEqual(result.result?.reply, brainReply);
+  assert.equal(String(sendCalls[0][1]), COMPOSED_CONFIRM_SUCCESS_REPLY);
+  assert.doesNotMatch(String(sendCalls[0][1]), /aage barhati/i);
   assert.equal(result.result?.reply, EXECUTOR_SUCCESS_REPLY);
   assert.equal(result.pamissCreated, false);
   assert.equal(result.ownerNotified, false);
 });
 
-test("authentic: decline mutates once and sends Brain reply", async () => {
+test("authentic: decline mutates once and sends composed post-exec reply", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const brainReply = "Theek hai, ye offer skip kar dete hain.";
   const openaiCounter = { calls: 0 };
   const { result, sendCalls } = await handleBrainInbound(fake, "nahi chahiye", {
     messageId: "auth-decline-1",
@@ -481,20 +567,21 @@ test("authentic: decline mutates once and sends Brain reply", async () => {
       customerIntent: "decline",
       customerIsDeclining: true,
       shouldReply: true,
-      customerReply: brainReply,
+      customerReply: "",
       action: "decline_request",
       reason: "clear_decline",
     }),
   });
-  assert.equal(openaiCounter.calls, 1);
+  assert.equal(openaiCounter.calls, 2);
   assert.equal(result.action, "declined");
+  assert.equal(result.composedAfterExecution, true);
   assert.equal(
     fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,
     "declined"
   );
   assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
   assert.equal(sendCalls.length, 1);
-  assert.equal(String(sendCalls[0][1]), brainReply);
+  assert.equal(String(sendCalls[0][1]), COMPOSED_DECLINE_REPLY);
 });
 
 test("authentic: price/scoped question replies without mutation", async () => {
@@ -534,31 +621,33 @@ test("authentic: price/scoped question replies without mutation", async () => {
   assert.doesNotMatch(String(sendCalls[0][1]), /Booking confirm ho gayi/);
 });
 
-test("authentic: change request sends Brain reply without mutation", async () => {
+test("authentic: change request sends composed reply without mutation", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
   const before = { ...fake.getRequestDoc(REQUEST_ID) };
-  const brainReply =
-    "Is car ke liye alag se availability confirm karni hogi.";
+  const openaiCounter = { calls: 0 };
   const { result, sendCalls } = await handleBrainInbound(fake, "dusri car", {
     messageId: "auth-change-1",
+    openaiCounter,
     openaiPayload: baseModelFields({
       customerIntent: "change",
       customerWantsChange: true,
       shouldReply: true,
-      customerReply: brainReply,
+      customerReply: "",
       action: "change_request",
       reason: "change_car",
     }),
   });
+  assert.equal(openaiCounter.calls, 2);
   assert.equal(result.action, "change_request");
+  assert.equal(result.composedAfterExecution, true);
   const after = fake.getRequestDoc(REQUEST_ID);
   assert.equal(after.customerConfirmationStatus, before.customerConfirmationStatus);
   assert.equal(after.status, before.status);
   assert.equal(after.itemId, before.itemId);
   assert.equal(after.linkedBookingId, undefined);
   assert.equal(sendCalls.length, 1);
-  assert.equal(String(sendCalls[0][1]), brainReply);
+  assert.equal(String(sendCalls[0][1]), COMPOSED_CHANGE_REPLY);
 });
 
 test("authentic: unclear clarify sends Brain wording only", async () => {
@@ -671,13 +760,12 @@ test("authentic: empty clarify reply uses lane technical fallback only", async (
 test("authentic: same inbound message ID — one Brain, one booking, one outbound", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
-  const brainReply = "Confirm mil gaya, request aage barhati hun.";
   const openaiCounter = { calls: 0 };
   const openaiPayload = baseModelFields({
     customerIntent: "confirm",
     customerIsConfirmingBooking: true,
     shouldReply: true,
-    customerReply: brainReply,
+    customerReply: "",
     action: "confirm_booking",
     confidence: 0.95,
     reason: "natural_confirm",
@@ -696,8 +784,9 @@ test("authentic: same inbound message ID — one Brain, one booking, one outboun
     openaiPayload,
   });
   assert.equal(first.result.action, "confirmed_booking");
-  assert.equal(openaiCounter.calls, 1);
+  assert.equal(openaiCounter.calls, 2);
   assert.equal(sendCalls.length, 1);
+  assert.equal(String(sendCalls[0][1]), COMPOSED_CONFIRM_SUCCESS_REPLY);
   const bookingId = fake.getRequestDoc(REQUEST_ID).linkedBookingId;
   assert.ok(bookingId);
 
@@ -708,7 +797,7 @@ test("authentic: same inbound message ID — one Brain, one booking, one outboun
     openaiPayload,
   });
   assert.equal(second.result.duplicate, true);
-  assert.equal(openaiCounter.calls, 1);
+  assert.equal(openaiCounter.calls, 2);
   assert.equal(sendCalls.length, 1);
   assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, bookingId);
 });
@@ -758,7 +847,7 @@ test("decideCustomerTurn waiting_confirm_dm uses injected OpenAI double", async 
       action: "confirm_booking",
       customerIsConfirmingBooking: true,
       shouldReply: true,
-      customerReply: "Confirm mil gaya, request aage barhati hun.",
+      customerReply: "",
       confidence: 0.9,
       reason: "natural_confirm",
       replySemantics: {
@@ -773,6 +862,7 @@ test("decideCustomerTurn waiting_confirm_dm uses injected OpenAI double", async 
   assert.equal(out.lane, WAITING_CONFIRM_DM_LANE);
   assert.equal(out.ok, true);
   assert.equal(out.decision.action, "confirm_booking");
+  assert.equal(out.decision.customerReply, "");
   assert.equal(out.decision.requiredExecutor, "confirm_booking_executor");
 });
 

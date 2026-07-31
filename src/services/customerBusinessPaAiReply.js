@@ -8,7 +8,6 @@
  * - Phase 2 owner-answer → customer follow-up wording only
  */
 
-import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../config/aiRuntime.js";
 import { decideCustomerTurn } from "../brain/decisions/decideCustomerTurn.js";
 import {
@@ -31,7 +30,9 @@ import {
   MAX_CUSTOMER_REPLY_ATTEMPTS,
   REPLY_SEMANTICS_SCHEMA,
 } from "../brain/openai/strictJsonSchema.js";
+import { composeGuardedCustomerReply } from "../brain/openai/composeGuardedCustomerReply.js";
 import { isAllowedPaMissingInfoType } from "./paMissingInfoRequestService.js";
+import { resolveOpenAiChatCompletionsCreate } from "./openaiChatCompletionsCreate.js";
 
 export const CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK =
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK;
@@ -236,12 +237,7 @@ STRICT SAFETY:
   const completionFn =
     typeof __chatCompletionsCreateForTests === "function"
       ? __chatCompletionsCreateForTests
-      : (() => {
-          const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
-          if (!apiKey) return null;
-          const client = new OpenAI({ apiKey });
-          return (args) => client.chat.completions.create(args);
-        })();
+      : resolveOpenAiChatCompletionsCreate();
 
   if (!completionFn) {
     return {
@@ -458,19 +454,6 @@ export async function composePostConfirmMutationCustomerReply({
           : null,
   });
 
-  const responseFormat = buildStrictJsonSchemaResponseFormat(
-    "post_confirm_mutation_reply_compose",
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        customerReply: { type: "string" },
-        replySemantics: REPLY_SEMANTICS_SCHEMA,
-      },
-      required: ["customerReply", "replySemantics"],
-    }
-  );
-
   const system = `${shared}
 
 LANE OBJECTIVE (post_confirm_pa mutation reply composer — NOT a decision Brain):
@@ -500,177 +483,50 @@ STRICT SAFETY:
       requiredMeaning: replyContract.requiredMeaning,
     })}`;
 
-  const completionFn =
-    typeof __chatCompletionsCreateForTests === "function"
-      ? __chatCompletionsCreateForTests
-      : (() => {
-          const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
-          if (!apiKey) return null;
-          const client = new OpenAI({ apiKey });
-          return (args) => client.chat.completions.create(args);
-        })();
-
-  if (!completionFn) {
-    return {
-      ok: false,
-      reply: "",
-      source: "technical_fallback",
-      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
-      frozenDecision: frozen,
-    };
-  }
-
-  try {
-    let lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
-    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
-      const userContent =
-        attempt === 1
-          ? `${userBase}\n\nRemember: JSON only; compose wording only; never change frozen decision; never claim success unless verified status is succeeded.`
-          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
-      const createPromise = Promise.resolve(
-        completionFn({
-          model: resolveOpenAiChatModel(),
-          temperature: 0.35,
-          max_tokens: 220,
-          response_format: responseFormat,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: userContent },
-          ],
-        })
-      );
-      const timed =
-        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-          ? Promise.race([
-              createPromise,
-              new Promise((_, reject) => {
-                setTimeout(
-                  () =>
-                    reject(
-                      new Error("POST_CONFIRM_MUTATION_COMPOSE_OPENAI_TIMEOUT")
-                    ),
-                  Math.floor(Number(timeoutMs))
-                );
-              }),
-            ])
-          : createPromise;
-
-      const resp = await timed;
-      const raw = resp?.choices?.[0]?.message?.content ?? "";
-      let text = String(raw ?? "").trim();
-      const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-      if (fence) text = fence[1].trim();
-      const start = text.indexOf("{");
-      const end = text.lastIndexOf("}");
-      if (start >= 0 && end > start) text = text.slice(start, end + 1);
-
-      let customerReply = "";
-      let semantics = null;
-      try {
-        const parsed = JSON.parse(text);
-        // Ignore any attempt to smuggle decision-field changes.
-        customerReply = String(parsed?.customerReply ?? parsed?.reply ?? "")
-          .replace(/^\s*["']|["']\s*$/g, "")
-          .trim();
-        semantics = normalizeReplySemantics(parsed?.replySemantics);
-      } catch {
-        customerReply = "";
-      }
-
-      if (!customerReply) {
-        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return {
-          ok: false,
-          reply: "",
-          source: "technical_fallback",
-          reason: lastReason,
-          frozenDecision: frozen,
-        };
-      }
-
-      // Ignore any smuggled decision fields in compose JSON — only customerReply is used.
+  const composed = await composeGuardedCustomerReply({
+    system,
+    userBase,
+    firstAttemptReminder:
+      "Remember: JSON only; compose wording only; never change frozen decision; never claim success unless verified status is succeeded.",
+    responseFormatName: "post_confirm_mutation_reply_compose",
+    replyContract,
+    enrichGuardContract: (contract) => ({
+      ...contract,
+      verifiedCustomerFacts: {
+        ...(contract.verifiedCustomerFacts || {}),
+        mutationIntent: frozen.mutationIntent,
+        mutationExecutionRequested: true,
+        mutationExecutionStatus: verifiedExecution.status,
+      },
+      replyRequired: true,
+    }),
+    extraReject: (customerReply) => {
+      if (verifiedExecution.status === "succeeded") return null;
       if (
-        verifiedExecution.status !== "succeeded" &&
         /\b(executor|unsupported|firestore|brain|\bsystem\b)\b/i.test(
           customerReply
         )
       ) {
-        lastReason = "internal_process_terms_in_customer_reply";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return {
-          ok: false,
-          reply: "",
-          source: "technical_fallback",
-          reason: lastReason,
-          frozenDecision: frozen,
-        };
+        return "internal_process_terms_in_customer_reply";
       }
       if (
-        verifiedExecution.status !== "succeeded" &&
         /\b(owner\s+follow[- ]?up|follow[- ]?up|manual\s+action|baad\s+mein|jaldi|auto(matic)?\s+(complete|ho)|system\s+complete)\b/i.test(
           customerReply
         )
       ) {
-        lastReason = "unverified_mutation_followup_or_timing_promise";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return {
-          ok: false,
-          reply: "",
-          source: "technical_fallback",
-          reason: lastReason,
-          frozenDecision: frozen,
-        };
+        return "unverified_mutation_followup_or_timing_promise";
       }
+      return null;
+    },
+    fallbackReply: "",
+    timeoutMs,
+    timeoutErrorMessage: "POST_CONFIRM_MUTATION_COMPOSE_OPENAI_TIMEOUT",
+    __chatCompletionsCreateForTests,
+  });
 
-      const guard = validateCustomerReplyAgainstContract(
-        customerReply,
-        {
-          ...replyContract,
-          verifiedCustomerFacts: {
-            ...(replyContract.verifiedCustomerFacts || {}),
-            mutationIntent: frozen.mutationIntent,
-            mutationExecutionRequested: true,
-            mutationExecutionStatus: verifiedExecution.status,
-          },
-          replyRequired: true,
-        },
-        semantics
-      );
-      if (!guard.ok) {
-        lastReason = guard.reason || "customer_reply_guard_failed";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return {
-          ok: false,
-          reply: "",
-          source: "technical_fallback",
-          reason: lastReason,
-          frozenDecision: frozen,
-        };
-      }
-
-      return {
-        ok: true,
-        reply: customerReply.slice(0, 500),
-        source: "openai",
-        frozenDecision: frozen,
-        mutationExecution: verifiedExecution,
-      };
-    }
-    return {
-      ok: false,
-      reply: "",
-      source: "technical_fallback",
-      reason: lastReason,
-      frozenDecision: frozen,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      reply: "",
-      source: "technical_fallback",
-      reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
-      frozenDecision: frozen,
-    };
-  }
+  return {
+    ...composed,
+    frozenDecision: frozen,
+    ...(composed.ok ? { mutationExecution: verifiedExecution } : {}),
+  };
 }

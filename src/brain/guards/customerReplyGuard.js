@@ -36,6 +36,13 @@ const BOOKING_SUCCESS_CLAIM_RE =
   /\b(booking (has been |is )?created|booking (has been |is )?confirm(ed)?|successfully booked|booked successfully|reservation (has been |is )?created|reservation (has been |is )?confirm(ed)?|reservation completed|appointment (has been |is )?confirm(ed)?|order (has been |is )?created|confirm ho gaya|book ho gaya|booking ho gayi|booking confirm(ed)?|book confirm(ed)?|your booking is confirm(ed)?)\b/i;
 
 /**
+ * New-booking confirmation must not sound like an extension / in-place change.
+ * Guard-only; never intent routing.
+ */
+const NEW_BOOKING_EXTENSION_LANGUAGE_RE =
+  /\b(aage\s+barh|aage\s+badh|barhati|badhati|barha\s+rahi|badha\s+rahi|extend(ing|ed)?|extension|process\s+karti|process\s+kar\s+rahi)\b/i;
+
+/**
  * Completion wording for a booking *change* (mutation), not status facts.
  * Guard-only; never intent routing; never rewrites customer wording.
  */
@@ -863,6 +870,30 @@ export function validateCustomerReplyAgainstContract(
         String(contract?.requiredMeaning ?? "").includes("pre_execution")));
 
   if (successClaimForbidden && BOOKING_SUCCESS_CLAIM_RE.test(text)) {
+    return { ok: false, reason: "pre_execution_booking_success_claim" };
+  }
+
+  // New booking confirmation wording must not imply extension/change-in-place.
+  // Scoped to post-exec reservation-created contracts only (not every verified booking DM).
+  if (
+    String(contract?.requiredMeaning ?? "").trim() ===
+      "post_execution_reservation_created" &&
+    NEW_BOOKING_EXTENSION_LANGUAGE_RE.test(text)
+  ) {
+    return {
+      ok: false,
+      reason: "new_booking_confirmation_extension_language",
+    };
+  }
+  if (
+    String(contract?.verifiedCustomerFacts?.waitingConfirmExecutionStatus ?? "")
+      .trim()
+      .toLowerCase() !== "succeeded" &&
+    String(contract?.requiredMeaning ?? "").includes(
+      "post_execution_waiting_confirm"
+    ) &&
+    BOOKING_SUCCESS_CLAIM_RE.test(text)
+  ) {
     return { ok: false, reason: "pre_execution_booking_success_claim" };
   }
   if (

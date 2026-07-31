@@ -9,7 +9,6 @@ import { resolveAvailabilityApprovedPriceQuote } from "../../services/availabili
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 import {
   CUSTOMER_CLAIMS,
-  buildWaitingConfirmPreExecutionConfirmContract,
   buildWaitingConfirmVerifiedQuotationContract,
   normalizeReplySemantics,
   stripInternalReplySemantics,
@@ -268,6 +267,16 @@ export function packWaitingConfirmDmTurnContext({
  */
 function ensureSendableWaitingConfirmReply(decision) {
   const next = decision && typeof decision === "object" ? { ...decision } : {};
+  const action = clean(next.action, 40);
+  if (
+    action === "confirm_booking" ||
+    action === "decline_request" ||
+    action === "change_request"
+  ) {
+    next.customerReply = "";
+    next.shouldReply = true;
+    return next;
+  }
   if (next.shouldReply === true && !clean(next.customerReply)) {
     next.customerReply = TECHNICAL_FALLBACK;
   }
@@ -342,8 +351,10 @@ export function parseWaitingConfirmDmDecision(raw) {
             action
           );
 
-  if (action === "confirm_booking" || action === "decline_request") {
-    shouldReply = Boolean(customerReply);
+  if (action === "confirm_booking" || action === "decline_request" || action === "change_request") {
+    // Final customer wording is composed after deterministic execute.
+    customerReply = "";
+    shouldReply = true;
   } else if (action === "silence" || action === "none" || shouldReply === false) {
     action = "silence";
     shouldReply = false;
@@ -374,8 +385,14 @@ export function parseWaitingConfirmDmDecision(raw) {
     shouldReply = true;
   }
 
-  // Final contract: every sendable decision must carry non-empty customer wording.
-  if (shouldReply === true && !clean(customerReply)) {
+  // Action decisions keep empty customerReply for post-execution compose.
+  if (
+    shouldReply === true &&
+    !clean(customerReply) &&
+    action !== "confirm_booking" &&
+    action !== "decline_request" &&
+    action !== "change_request"
+  ) {
     customerReply = TECHNICAL_FALLBACK;
   }
 
@@ -539,8 +556,8 @@ action: confirm_booking|decline_request|change_request|reply|silence|clarify|non
 Natural confirm after Emily's book-confirm prompt (e.g. "Haan book kar do", "Yes, please book it.") → action=confirm_booking (not clarify/reply). After Q&A ambiguous ack ≠ confirm. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social no/thanks after Q&A → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up.
 If your reply intentionally asks the customer to confirm booking again, set asksForBookingConfirmation=true (structured). Do not set it for ordinary Q&A answers.
 When stating a verified total from facts.quotedPrice, include the exact total digits (e.g. 15000) in customerReply and claim quotation_verified.
-When action=confirm_booking: the booking executor has NOT run yet. customerReply may only acknowledge confirmation received / that you will proceed with the request. Do NOT claim booking created, booking confirmed, reservation completed, appointment confirmed, or order created. Prefer claims customer_confirmation_acknowledged or reservation_requested — do not require quotation_verified on confirm turns. If you mention price, include the exact total digits. Still must not claim the booking already exists.
-When action=confirm_booking and customerReply is non-empty: write a short natural acknowledgement in the customer's language (e.g. Roman Urdu: confirm mil gaya, request aage barhati hun / English: got it, I'll proceed with your booking request). Do not paste the customer's message back as the reply.`;
+When action=confirm_booking|decline_request|change_request: set customerReply to "" (final wording is composed AFTER deterministic validate/execute). Decide meaning/action only. Do NOT claim booking created, confirmed, declined-complete wording as final outbound, or use extension language ("aage barhati", extend, process karti). Do not paste the customer's message back.
+When action=reply|clarify: customerReply is the final customer-facing answer from trusted facts (read-only; no booking executor).`;
 
   let userPayload =
     `VERIFIED_FACTS_JSON:\n${factsJson}\n\nLAST_EMILY_MESSAGE:\n${lastEmily || "(none)"}\n\nCUSTOMER_MESSAGE:\n${userLine || "(empty)"}`;
@@ -646,7 +663,23 @@ When action=confirm_booking and customerReply is non-empty: write a short natura
         };
       }
 
-      // Guard customer wording only when a reply would be sent.
+      // Action decisions: empty customerReply; wording composed after execute.
+      if (
+        decision.action === "confirm_booking" ||
+        decision.action === "decline_request" ||
+        decision.action === "change_request"
+      ) {
+        decision.customerReply = "";
+        decision.shouldReply = true;
+        return {
+          ok: true,
+          decision: stripInternalReplySemantics(decision),
+          source: "openai",
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      // Guard customer wording only for read-only reply/clarify paths.
       const replyText = String(decision.customerReply ?? "").trim();
       if (replyText) {
         const normalizedReply = replyText.replace(/\s+/g, " ").trim().toLowerCase();
@@ -654,68 +687,50 @@ When action=confirm_booking and customerReply is non-empty: write a short natura
           .replace(/\s+/g, " ")
           .trim()
           .toLowerCase();
-        if (
-          normalizedCustomer &&
-          normalizedReply === normalizedCustomer &&
-          decision.action === "confirm_booking"
-        ) {
+        if (normalizedCustomer && normalizedReply === normalizedCustomer) {
           if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) {
             lastReason = "customer_reply_echo";
             continue;
           }
-          // Final attempt: keep confirm_booking; drop echoed wording (pre-exec reply optional).
           decision.customerReply = "";
           decision.shouldReply = false;
         } else {
-        const claims = Array.isArray(decision.replySemantics?.claims)
-          ? decision.replySemantics.claims
-          : [];
-        const askNeedsQuote =
-          decision.action !== "confirm_booking" &&
-          (decision.customerIsAskingQuestion === true ||
-            claims.includes("quotation_verified"));
-        const hasQuote =
-          factsObj?.quotedPrice?.total != null &&
-          Number.isFinite(Number(factsObj.quotedPrice.total));
-        const usePreExecConfirm =
-          decision.action === "confirm_booking" ||
-          claims.includes(CUSTOMER_CLAIMS.CUSTOMER_CONFIRMATION_ACKNOWLEDGED) ||
-          claims.includes(CUSTOMER_CLAIMS.RESERVATION_REQUESTED);
-        const activeContract = usePreExecConfirm
-            ? buildWaitingConfirmPreExecutionConfirmContract({
-                ...factsObj,
-                customerMessageText: userLine,
-                recentDialogue: historyLine || null,
-                styleKey,
-                bookingExecutionVerified: false,
-              })
-            : {
-                ...replyContract,
-                requiredMeaning:
-                  askNeedsQuote && hasQuote
-                    ? "state_verified_quotation"
-                    : replyContract.requiredMeaning,
-              };
-        const guard = validateCustomerReplyAgainstContract(
-          replyText,
-          {
-            ...activeContract,
-            replyRequired:
-              decision.action === "reply" || decision.shouldReply === true,
-          },
-          decision.replySemantics
-        );
-        if (!guard.ok) {
-          lastReason = guard.reason || "customer_reply_guard_failed";
-          if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-          return {
-            ok: false,
-            decision: defaultDecision({ reason: lastReason }),
-            source: "content_safety_fail_closed",
-            reason: lastReason,
-            contentSafetyAttempts: attempt,
+          const claims = Array.isArray(decision.replySemantics?.claims)
+            ? decision.replySemantics.claims
+            : [];
+          const askNeedsQuote =
+            decision.customerIsAskingQuestion === true ||
+            claims.includes("quotation_verified");
+          const hasQuote =
+            factsObj?.quotedPrice?.total != null &&
+            Number.isFinite(Number(factsObj.quotedPrice.total));
+          const activeContract = {
+            ...replyContract,
+            requiredMeaning:
+              askNeedsQuote && hasQuote
+                ? "state_verified_quotation"
+                : replyContract.requiredMeaning,
           };
-        }
+          const guard = validateCustomerReplyAgainstContract(
+            replyText,
+            {
+              ...activeContract,
+              replyRequired:
+                decision.action === "reply" || decision.shouldReply === true,
+            },
+            decision.replySemantics
+          );
+          if (!guard.ok) {
+            lastReason = guard.reason || "customer_reply_guard_failed";
+            if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+            return {
+              ok: false,
+              decision: defaultDecision({ reason: lastReason }),
+              source: "content_safety_fail_closed",
+              reason: lastReason,
+              contentSafetyAttempts: attempt,
+            };
+          }
         }
       }
 

@@ -33,6 +33,7 @@ import {
 } from "../src/services/availabilityRequestService.js";
 import {
   decideWaitingConfirmFromLegacyClassifierForTests,
+  composeWaitingConfirmExecutionReplyForTests,
   handlePlaywrightInboundWithTestBrain,
 } from "./helpers/waitingConfirmBrainTestDouble.mjs";
 
@@ -338,6 +339,7 @@ test("G: booking still goes through executeCreateBooking after Brain confirm", a
       ...params,
       availabilityConfirmExecute: false,
       __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+      __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
     });
 
   const result = await bridge({
@@ -471,6 +473,7 @@ test("Cloud path still disambiguates multiple waiting requests by phone", async 
     sendWhatsAppMessageFn: async () => null,
     availabilityConfirmExecute: false,
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   });
 
   assert.equal(result.handled, true);
@@ -611,6 +614,7 @@ test("bridge A: after customer notification, true fresh customer color row is se
         ...params,
         availabilityConfirmExecute: false,
         __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+        __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
       });
     },
     sendPlaywrightActiveChatTextFn: async () => true,
@@ -1247,6 +1251,7 @@ test("single-row E: older unclear rows plus latest confirm passes latest confirm
         ...params,
         availabilityConfirmExecute: false,
         __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+        __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
       });
     },
     sendPlaywrightActiveChatTextFn: async () => true,
