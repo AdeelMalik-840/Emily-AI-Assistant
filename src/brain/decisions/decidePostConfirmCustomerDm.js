@@ -2106,6 +2106,13 @@ STRICT SAFETY:
       }
 
       const finalized = applyPostConfirmAntiEchoAndSilence(decision, userLine);
+      // Anti-echo can rewrite empty request_booking_mutation + shouldReply=false
+      // into action=silence while mutationIntent/execution flags still show mutation.
+      // Capture before normalization so required-reply extra recovery cannot fire.
+      const mutationDeclaredBeforeNormalize =
+        finalized.action === "request_booking_mutation" ||
+        cleanMutationIntent(finalized.mutationIntent) !== "none" ||
+        finalized.mutationExecutionRequested === true;
       finalized.mutationExecutionRequested =
         finalized.action === "request_booking_mutation";
       finalized.mutationExecutionStatus = cleanMutationExecutionStatus(
@@ -2177,7 +2184,12 @@ STRICT SAFETY:
         if (pendingAvailabilityAction || pendingAvailabilitySelectionDeclared) {
           return false;
         }
-        if (finalized.action === "request_booking_mutation") return false;
+        if (
+          finalized.action === "request_booking_mutation" ||
+          mutationDeclaredBeforeNormalize
+        ) {
+          return false;
+        }
         if (!isPostConfirmReadOnlyInformationalDecision(finalized)) return false;
         if (
           !isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(

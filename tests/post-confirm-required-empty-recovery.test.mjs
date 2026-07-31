@@ -357,6 +357,40 @@ test("trusted focus does not turn an ambiguous mutation into focused execution",
   assert.ok(prompts.every((p) => !/CORRECTIVE REGENERATION/.test(p)));
 });
 
+test("empty mutation rewritten to silence does not unlock trusted-focus required-reply extra attempt", async () => {
+  const emptyMutation = decision({
+    situation: "protected_action",
+    conversationAct: "action_request",
+    customerIntent: "ask_action",
+    customerIsAskingQuestion: false,
+    requestedInfoType: null,
+    shouldReply: false,
+    customerReply: "",
+    action: "request_booking_mutation",
+    mutationIntent: "cancel_booking",
+    mutationExecutionRequested: true,
+    bookingSelectionMode: "none",
+    selectedBookingIndex: null,
+    groundedFacts: groundedFacts(),
+  });
+  const { result, calls } = await runWithResponses(
+    [emptyMutation, emptyMutation, decision()],
+    { userMessage: "Cancel kar do" }
+  );
+
+  assert.ok(calls.length <= 2, "empty mutation must not unlock a third attempt");
+  assert.notEqual(result.decision?.action, "reply");
+  assert.notEqual(
+    String(result.decision?.customerReply || ""),
+    "Kia Stonic 4 din ke liye book hai."
+  );
+  const prompts = calls.map((c) => String(c?.messages?.[1]?.content || ""));
+  assert.ok(
+    prompts.every((p) => !/required reply after silence/.test(p)),
+    "must not use trusted-focus required-reply extra correction for empty mutations"
+  );
+});
+
 test("duration-extension mutation does not use trusted-focus required-reply extra attempt", async () => {
   const mutation = decision({
     situation: "protected_action",
