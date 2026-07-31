@@ -496,6 +496,125 @@ function buildPostConfirmTrustedFocusRequiredReplyCorrection(
   ].join("\n");
 }
 
+/**
+ * Constrained recovery after EMPTY_OR_INVALID_OPENAI_REPLY on trusted focus.
+ * Informational reply or one clarification only — never silence or mutations.
+ * @param {Record<string, unknown> | null | undefined} facts
+ * @param {string} userMessage
+ * @param {string} lastEmily
+ * @param {string} classification
+ */
+function buildPostConfirmEmptyInvalidInformationalRecoveryCorrection(
+  facts,
+  userMessage,
+  lastEmily,
+  classification
+) {
+  const identity = resolveTrustedFocusedBookingIdentity(facts);
+  const compactIdentity = identity
+    ? {
+        bookingId: identity.bookingId,
+        availabilityRequestId: identity.availabilityRequestId,
+        itemId: identity.itemId,
+        itemLabel: identity.itemLabel,
+        durationDays: identity.durationDays,
+        totalAmount: identity.totalAmount,
+        dailyRate: identity.dailyRate,
+        bookingStatus: identity.bookingStatus,
+        scope: identity.scope,
+        selectedBookingIndex: identity.selectedBookingIndex,
+      }
+    : null;
+  const known =
+    facts?.known && typeof facts.known === "object" ? facts.known : {};
+  const knownPolicyKeys = [
+    "deliveryPolicy",
+    "driverPolicy",
+    "advancePolicy",
+    "paymentPolicy",
+    "documentsPolicy",
+  ].filter((key) => clean(known[key], 20));
+  return [
+    "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — empty/invalid output recovery).",
+    "Prior model output was empty, malformed, or missing a required customerReply.",
+    `Usability classification (privacy-safe): ${clean(classification, 60) || "schema_or_parse_failure"}`,
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    `Immediately preceding assistant message: ${clean(lastEmily, 500) || "(none)"}`,
+    `Trusted focused booking identity: ${JSON.stringify(compactIdentity)}`,
+    `Verified known policy keys present: ${JSON.stringify(knownPolicyKeys)}`,
+    "Rules:",
+    "- Must set action=reply, shouldReply=true, and a non-empty natural customerReply.",
+    "- Answer ONLY from VERIFIED_BUSINESS_PA_FACTS_JSON / CURRENT_BOOKING_IN_SCOPE.",
+    "- If the asked detail is present in verified facts/policies, answer from that fact only.",
+    "- If the asked detail is absent, ask one useful natural clarification OR say the detail is not confirmed.",
+    "- Never invent delivery, fees, timing, amounts, dates, or policies.",
+    "- Do NOT use action=silence. Do NOT use request_booking_mutation / escalate_missing_info.",
+    "- mutationIntent must be none; actionParameters all null. Strict JSON only.",
+  ].join("\n");
+}
+
+/**
+ * Privacy-safe classification of unusable OpenAI decide output.
+ * Does not log raw content — callers may log length/hash separately.
+ * @param {unknown} raw
+ * @returns {"empty_content"|"malformed_json"|"empty_required_reply"|"schema_or_parse_failure"}
+ */
+export function classifyPostConfirmOpenAiUsabilityFailure(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "empty_content";
+
+  let jsonText = text;
+  const fence = jsonText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) jsonText = fence[1].trim();
+  const start = jsonText.indexOf("{");
+  const end = jsonText.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    jsonText = jsonText.slice(start, end + 1);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    if (!text.startsWith("{") && !text.startsWith("```")) {
+      // Plain non-JSON text may still be accepted by the parser as a reply body.
+      return "schema_or_parse_failure";
+    }
+    return "malformed_json";
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "schema_or_parse_failure";
+  }
+
+  const customerReply = String(parsed.customerReply ?? parsed.reply ?? "")
+    .replace(/^\s*["']|["']\s*$/g, "")
+    .trim();
+  const action = cleanAction(parsed.action);
+  const shouldReply =
+    parsed.shouldReply === false
+      ? false
+      : parsed.shouldReply === true
+        ? true
+        : action !== "silence" && action !== "none";
+  const isSilence = action === "silence" || shouldReply === false;
+  const isMutation =
+    action === "request_booking_mutation" &&
+    cleanMutationIntent(parsed.mutationIntent) !== "none";
+  if (!customerReply && !isSilence && !isMutation) {
+    return "empty_required_reply";
+  }
+  return "schema_or_parse_failure";
+}
+
+function logPostConfirmOpenAiUsabilityFailure(raw, classification) {
+  const text = String(raw ?? "");
+  console.error("[post_confirm_openai_usability_failure]", {
+    classification: clean(classification, 60) || "schema_or_parse_failure",
+    contentLength: text.length,
+    looksLikeJsonObject: /^\s*[{`]/.test(text),
+  });
+}
+
 function isTransientPostConfirmOpenAiFailureReason(reason) {
   const r = clean(reason, 160);
   return (
@@ -2153,19 +2272,34 @@ STRICT SAFETY:
     let lastSuspiciousDecision = null;
     let silenceRecoveryAttempts = 0;
     let trustedFocusRequiredReplyExtraUsed = false;
+    let emptyInvalidInformationalRecoveryUsed = false;
+    /** @type {string | null} */
+    let lastUsabilityClassification = null;
+    const trustedFocusNonEmptyQuestion =
+      hasTrustedPostConfirmBookingFocus(facts) &&
+      Boolean(cleanCustomerReply(userLine));
     for (let attempt = 1; ; attempt++) {
       const attemptLimit =
         MAX_CUSTOMER_REPLY_ATTEMPTS +
-        (trustedFocusRequiredReplyExtraUsed ? 1 : 0);
+        (trustedFocusRequiredReplyExtraUsed ? 1 : 0) +
+        (emptyInvalidInformationalRecoveryUsed ? 1 : 0);
       if (attempt > attemptLimit) {
+        const exhaustedReason =
+          lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY"
+            ? "EMPTY_OR_INVALID_OPENAI_REPLY"
+            : lastReason;
         return {
           ok: false,
           decision: stripInternalReplySemantics(defaultDecision()),
           source: "technical_fallback",
-          reason: lastReason,
-          retryable: false,
+          reason: exhaustedReason,
+          // Trusted-focus questions must not become intentional silent success.
+          retryable: trustedFocusNonEmptyQuestion
+            ? true
+            : isTransientPostConfirmOpenAiFailureReason(exhaustedReason),
           silenceRecoveryAttempts,
           contentSafetyAttempts: attemptLimit,
+          usabilityClassification: lastUsabilityClassification,
         };
       }
       const userContent =
@@ -2184,6 +2318,13 @@ STRICT SAFETY:
                   userLine,
                   lastEmily
                 )}`
+              : lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY"
+                ? `${userPayload}\n\n${buildPostConfirmEmptyInvalidInformationalRecoveryCorrection(
+                    facts,
+                    userLine,
+                    lastEmily,
+                    lastUsabilityClassification || "schema_or_parse_failure"
+                  )}`
             : lastReason === "verified_item_mismatch"
               ? `${userPayload}\n\n${buildPostConfirmVerifiedItemMismatchCorrection(
                   facts,
@@ -2228,22 +2369,53 @@ STRICT SAFETY:
       const isMutationSemanticDecision =
         decision?.action === "request_booking_mutation" &&
         cleanMutationIntent(decision?.mutationIntent) !== "none";
+      const inEmptyInvalidInformationalRecovery =
+        emptyInvalidInformationalRecoveryUsed &&
+        lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY";
       // Mutations may return empty customerReply — wording is composed after execute.
+      // Empty/invalid informational recovery rejects silence and mutations.
       if (
         !decision ||
-        (!hasSendableReply && !isSilence && !isMutationSemanticDecision)
+        (!hasSendableReply && !isSilence && !isMutationSemanticDecision) ||
+        (inEmptyInvalidInformationalRecovery &&
+          (!hasSendableReply || isSilence || isMutationSemanticDecision))
       ) {
+        lastUsabilityClassification =
+          classifyPostConfirmOpenAiUsabilityFailure(raw);
+        logPostConfirmOpenAiUsabilityFailure(
+          raw,
+          lastUsabilityClassification
+        );
         lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
         if (attempt < attemptLimit) continue;
+        if (
+          trustedFocusNonEmptyQuestion &&
+          !emptyInvalidInformationalRecoveryUsed
+        ) {
+          emptyInvalidInformationalRecoveryUsed = true;
+          lastReason = "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY";
+          continue;
+        }
         return {
           ok: false,
           decision: stripInternalReplySemantics(defaultDecision()),
           source: "technical_fallback",
-          reason: lastReason,
-          retryable: false,
+          reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+          retryable: trustedFocusNonEmptyQuestion ? true : false,
           silenceRecoveryAttempts,
           contentSafetyAttempts: attempt,
+          usabilityClassification: lastUsabilityClassification,
         };
+      }
+
+      // Empty/invalid recovery is informational-only: strip mutation semantics.
+      if (emptyInvalidInformationalRecoveryUsed) {
+        decision.action = "reply";
+        decision.shouldReply = true;
+        decision.mutationIntent = "none";
+        decision.mutationExecutionRequested = false;
+        decision.mutationExecutionStatus = "not_executed";
+        decision.actionParameters = emptyPostConfirmActionParameters();
       }
 
       // Hard: never escalate when loop not fully enabled.
