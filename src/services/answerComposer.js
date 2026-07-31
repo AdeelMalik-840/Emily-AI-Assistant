@@ -213,7 +213,14 @@ export function detectAskedField(message) {
   if (hasPricing && hasDuration) {
     return "price_with_duration";
   }
-  if (/\b(month|monthly|mahina|maheena|mahine)\b/.test(text)) return "price_monthly";
+  // Monthly *rate* asks only — bare "1 month k lye" / "1 mahina" are duration answers,
+  // not price_monthly (that misroute triggered itemless-price "which car?" clarifications).
+  if (
+    /\b(monthly|per\s*month|\/\s*month)\b/.test(text) ||
+    (/\b(month|mahina|maheena|mahine)\b/.test(text) && hasPricing)
+  ) {
+    return "price_monthly";
+  }
   if (/\b(day|daily|per\s*day|\/day|din)\b/.test(text) && /\b(price|rate|cost|charges?|rent|kitna|kitni|kitne)\b/.test(text)) {
     return "price_daily";
   }

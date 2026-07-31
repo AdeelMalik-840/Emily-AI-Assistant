@@ -154,7 +154,11 @@ import {
   resolveTurnContext,
   isItemlessPriceDurationFollowup as isItemlessPriceDurationFollowupShape,
   ITEMLESS_PRICE_CLARIFICATION_REPLY,
+  hasOpenAvailabilityDurationPendingMemory,
 } from "./turnContextAuthority.js";
+import {
+  isAvailabilityDurationPendingAction,
+} from "../brain/availability/availabilityPendingActions.js";
 import {
   buildSameSessionBookingContinuationReply,
   isAwaitingBookingContactCapture,
@@ -4341,7 +4345,7 @@ function isBrowseOptionsIntent(message) {
  */
 function isBareDurationMessage(message) {
   const raw = String(message ?? "").trim();
-  return /^(\d+)(?:\s*(?:day|days|din|dino|hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey)(?:\s+\S+){0,3})?$/i.test(raw);
+  return /^(\d+)(?:\s*(?:day|days|din|dino|hour|hours|hr|hrs|ghanta|ghantay|ghanty|ghante|ghantey|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gante|gantey|week|weeks|hafta|haftay|month|months|mahina|mahinay|year|years|yr|yrs|saal)(?:\s+\S+){0,3})?$/i.test(raw);
 }
 
 /**
@@ -4673,13 +4677,55 @@ function hasSafePreviousCatalogItemForPriceFollowup(p) {
     };
   }
   if (memory?.pendingAction) {
-    return {
-      ok: false,
-      reason: "PENDING_ACTION_ACTIVE",
-      itemId: normalizeId(memory?.lastItem?.id) || null,
-      item: null,
-      proofSource: null,
-    };
+    // Availability-duration pending carries the trusted item (e.g. Civic ask-duration).
+    // Do not treat it as a generic blocker that forces "which car?" price clarification.
+    if (isAvailabilityDurationPendingAction(memory.pendingAction)) {
+      const pendingItemId =
+        normalizeId(memory.pendingAction?.itemId) ||
+        normalizeId(memory?.emilyPending?.itemId) ||
+        normalizeId(memory?.lastItem?.id) ||
+        normalizeId(memory?.lastResolvedItemId);
+      if (pendingItemId) {
+        const item =
+          memory?.lastItem &&
+          typeof memory.lastItem === "object" &&
+          normalizeId(memory.lastItem.id) === pendingItemId
+            ? memory.lastItem
+            : { id: pendingItemId };
+        return {
+          ok: true,
+          reason: "AVAILABILITY_DURATION_PENDING_ITEM",
+          itemId: pendingItemId,
+          item,
+          proofSource: "AVAILABILITY_DURATION_PENDING",
+        };
+      }
+    } else if (hasOpenAvailabilityDurationPendingMemory(memory)) {
+      const pendingItemId =
+        normalizeId(memory?.emilyPending?.itemId) ||
+        normalizeId(memory?.lastItem?.id) ||
+        normalizeId(memory?.lastResolvedItemId);
+      if (pendingItemId) {
+        return {
+          ok: true,
+          reason: "AVAILABILITY_DURATION_PENDING_ITEM",
+          itemId: pendingItemId,
+          item:
+            memory?.lastItem && typeof memory.lastItem === "object"
+              ? memory.lastItem
+              : { id: pendingItemId },
+          proofSource: "AVAILABILITY_DURATION_PENDING",
+        };
+      }
+    } else {
+      return {
+        ok: false,
+        reason: "PENDING_ACTION_ACTIVE",
+        itemId: normalizeId(memory?.lastItem?.id) || null,
+        item: null,
+        proofSource: null,
+      };
+    }
   }
   const structured = resolveLastVerifiedCatalogAnswerForPriceFollowup({
     memory,

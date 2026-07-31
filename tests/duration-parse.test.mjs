@@ -40,6 +40,39 @@ test("parseUserDuration: months", () => {
     unit: "months",
     normalizedDays: 30,
   });
+  assert.deepEqual(parseUserDuration("1 month k lye"), {
+    value: 1,
+    unit: "months",
+    normalizedDays: 30,
+  });
+  assert.deepEqual(parseUserDuration("1 mahina"), {
+    value: 1,
+    unit: "months",
+    normalizedDays: 30,
+  });
+});
+
+test("parseUserDuration: years / saal", () => {
+  assert.deepEqual(parseUserDuration("1 year"), {
+    value: 1,
+    unit: "years",
+    normalizedDays: 365,
+  });
+  assert.deepEqual(parseUserDuration("1 year k lye"), {
+    value: 1,
+    unit: "years",
+    normalizedDays: 365,
+  });
+  assert.deepEqual(parseUserDuration("1 saal"), {
+    value: 1,
+    unit: "years",
+    normalizedDays: 365,
+  });
+  assert.deepEqual(parseUserDuration("2 years"), {
+    value: 2,
+    unit: "years",
+    normalizedDays: 730,
+  });
 });
 
 test("parseUserDuration: Roman Urdu continuation phrase", () => {

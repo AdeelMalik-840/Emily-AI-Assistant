@@ -5,13 +5,14 @@
 
 export const DAYS_PER_WEEK = 7;
 export const DAYS_PER_MONTH = 30;
+export const DAYS_PER_YEAR = 365;
 
 /** Bare digits only (whole message) — max days accepted without an explicit unit. */
 export const MAX_BARE_DURATION_DAYS = 90;
 
 /** Longer tokens before shorter prefixes (e.g. dino before din). */
 const DURATION_UNIT_PATTERN =
-  "hours?|hrs?|ghanta|ghantay|ghanty|ghantey?|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gantey?|days?|dino|duna|din|deen|weeks?|wk|hafta|haftay|months?|mahina|mahinay";
+  "hours?|hrs?|ghanta|ghantay|ghanty|ghantey?|ghnty|ghntay|ghnte|gnty|gntay|gnte|gantay|gantey?|days?|dino|duna|din|deen|weeks?|wk|hafta|haftay|months?|mahina|mahinay|years?|yrs?|saal";
 
 const DURATION_WITH_UNIT_RE = new RegExp(
   `(\\d+)\\s*(${DURATION_UNIT_PATTERN})\\b`,
@@ -20,7 +21,7 @@ const DURATION_WITH_UNIT_RE = new RegExp(
 
 /**
  * @param {string} unitLower
- * @returns {"hours"|"days"|"weeks"|"months"|null}
+ * @returns {"hours"|"days"|"weeks"|"months"|"years"|null}
  */
 function resolveCanonicalUnit(unitLower) {
   const u = String(unitLower ?? "").toLowerCase().trim();
@@ -28,22 +29,24 @@ function resolveCanonicalUnit(unitLower) {
   if (/^(day|days|din|dino|duna|deen)$/.test(u)) return "days";
   if (/^(week|weeks|wk|hafta|haftay)$/.test(u)) return "weeks";
   if (/^(month|months|mahina|mahinay)$/.test(u)) return "months";
+  if (/^(year|years|yr|yrs|saal)$/.test(u)) return "years";
   return null;
 }
 
 /**
- * @param {"hours"|"days"|"weeks"|"months"} canonical
+ * @param {"hours"|"days"|"weeks"|"months"|"years"} canonical
  */
 function displayUnit(canonical) {
   if (canonical === "hours") return "hours";
   if (canonical === "days") return "days";
   if (canonical === "weeks") return "weeks";
+  if (canonical === "years") return "years";
   return "months";
 }
 
 /**
  * @param {number} value
- * @param {"hours"|"days"|"weeks"|"months"} canonical
+ * @param {"hours"|"days"|"weeks"|"months"|"years"} canonical
  */
 function computeNormalizedDays(value, canonical) {
   const v = Math.max(1, Math.floor(Number(value)));
@@ -51,6 +54,7 @@ function computeNormalizedDays(value, canonical) {
   if (canonical === "hours") return Math.max(1, Math.ceil(v / 24));
   if (canonical === "days") return v;
   if (canonical === "weeks") return v * DAYS_PER_WEEK;
+  if (canonical === "years") return v * DAYS_PER_YEAR;
   return v * DAYS_PER_MONTH;
 }
 
@@ -154,6 +158,9 @@ export function getNormalizedDaysFromDurationPreference(pref) {
     }
     if (/^(month|months|mahina|mahinay)$/.test(u)) {
       return Math.max(1, Math.floor(pref.value * DAYS_PER_MONTH));
+    }
+    if (/^(year|years|yr|yrs|saal)$/.test(u)) {
+      return Math.max(1, Math.floor(pref.value * DAYS_PER_YEAR));
     }
   }
   return null;
