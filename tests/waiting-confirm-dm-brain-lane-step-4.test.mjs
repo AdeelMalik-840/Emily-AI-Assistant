@@ -329,29 +329,49 @@ test("WAITING_CONFIRM_DM_ALLOWED_ACTIONS matches lane contract", () => {
   assert.equal(WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has("launch_missiles"), false);
 });
 
-test("flag OFF: kar do still books through existing gate", async () => {
+test("PR1: waiting_confirm always uses decideCustomerTurn (classifier not final)", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
   const sendCalls = [];
+  let decideCalls = 0;
   const result = await handleAvailabilityCustomerCloudInbound({
     db: fake.db,
     businessId: BUSINESS_ID,
     customerPhone: CUSTOMER_PHONE,
     messageText: "kar do",
-    messageId: "off-confirm-1",
+    messageId: "pr1-confirm-1",
     sendWhatsAppMessageFn: async (...args) => {
       sendCalls.push(args);
       return { ok: true };
     },
     availabilityConfirmExecute: true,
-    __waitingConfirmDmBrainEnabled: false,
+    __decideCustomerTurnForTests: async (turnContext) => {
+      decideCalls += 1;
+      assert.equal(turnContext?.continuation?.type, "waiting_confirm");
+      assert.equal(turnContext?.continuation?.safeToOwn, true);
+      return {
+        ok: true,
+        decision: {
+          ...baseModelFields({
+            action: "confirm_booking",
+            customerIsConfirmingBooking: true,
+            customerReply: "Confirm mil gaya, request aage barhati hun.",
+            confidence: 0.95,
+            requiredExecutor: WAITING_CONFIRM_DM_CONFIRM_EXECUTOR,
+          }),
+        },
+        source: "test",
+        lane: WAITING_CONFIRM_DM_LANE,
+      };
+    },
   });
+  assert.equal(decideCalls, 1);
+  assert.equal(result.waitingConfirmDmBrain, true);
   assert.equal(result.action, "confirmed_booking");
   assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
-  assert.equal(result.waitingConfirmDmBrain, undefined);
 });
 
-test("flag OFF: price Q&A unchanged", async () => {
+test("PR1: price Q&A via decideCustomerTurn (not classifier path)", async () => {
   const fake = createFakeDb();
   fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
   const sendCalls = [];
@@ -360,15 +380,25 @@ test("flag OFF: price Q&A unchanged", async () => {
     businessId: BUSINESS_ID,
     customerPhone: CUSTOMER_PHONE,
     messageText: "rent kitna ho ga?",
-    messageId: "off-price-1",
+    messageId: "pr1-price-1",
     sendWhatsAppMessageFn: async (...args) => {
       sendCalls.push(args);
       return { ok: true };
     },
     availabilityConfirmExecute: true,
-    __waitingConfirmDmBrainEnabled: false,
+    __decideCustomerTurnForTests: async () => ({
+      ok: true,
+      decision: baseModelFields({
+        action: "reply",
+        customerIsAskingQuestion: true,
+        customerReply: "2 din ka rent 16,000 PKR hoga.",
+        customerIntent: "ask_price",
+      }),
+      source: "test",
+      lane: WAITING_CONFIRM_DM_LANE,
+    }),
   });
-  assert.equal(result.action, "price");
+  assert.equal(result.action, "reply");
   assert.match(String(sendCalls[0][1]), /16,000 PKR/);
   assert.equal(
     fake.getRequestDoc(REQUEST_ID).customerConfirmationStatus,

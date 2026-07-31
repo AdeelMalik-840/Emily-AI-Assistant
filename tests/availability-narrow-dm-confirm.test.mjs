@@ -174,6 +174,9 @@ function baseWaitingRequest(overrides = {}) {
 }
 
 async function handleInbound(fake, messageText, sendCalls) {
+  const { decideWaitingConfirmFromLegacyClassifierForTests } = await import(
+    "./helpers/waitingConfirmBrainTestDouble.mjs"
+  );
   return handleAvailabilityCustomerCloudInbound({
     db: fake.db,
     businessId: BUSINESS_ID,
@@ -185,6 +188,7 @@ async function handleInbound(fake, messageText, sendCalls) {
       return { ok: true };
     },
     availabilityConfirmExecute: true,
+    __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
   });
 }
 
@@ -452,6 +456,9 @@ test("3B booking D: confirm_booking uses owner_approved_waiting_customer_details
       return { ok: true };
     },
     availabilityConfirmExecute: true,
+    __decideCustomerTurnForTests: (
+      await import("./helpers/waitingConfirmBrainTestDouble.mjs")
+    ).decideWaitingConfirmFromLegacyClassifierForTests,
   });
   assert.equal(result.action, "confirmed_booking");
   const stored = fake.getRequestDoc(REQUEST_ID);

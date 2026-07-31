@@ -19,6 +19,7 @@ import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
   readEmilyPendingFromMemory,
 } from "../availability/emilyPendingContext.js";
+import { readBookingContactState } from "../continuation/buildContinuationContext.js";
 
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
@@ -118,17 +119,7 @@ function isBookingRequestContinuation(understanding, message = "") {
  * @returns {boolean}
  */
 function isAwaitingBookingContact(turnContext) {
-  const memory =
-    turnContext?.memorySnapshot && typeof turnContext.memorySnapshot === "object"
-      ? /** @type {Record<string, unknown>} */ (turnContext.memorySnapshot)
-      : null;
-  const stage = String(memory?.stage ?? "").trim();
-  const pending =
-    memory?.pendingAction && typeof memory.pendingAction === "object"
-      ? /** @type {Record<string, unknown>} */ (memory.pendingAction)
-      : null;
-  const pendingType = String(pending?.type ?? "").trim();
-  return stage === "AWAITING_BOOKING_CONTACT" || pendingType === "ASK_CONTACT";
+  return Boolean(readBookingContactState(turnContext?.memorySnapshot ?? null));
 }
 
 /**
@@ -164,6 +155,45 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
       ? /** @type {Record<string, unknown>} */ (resolvedBusinessTurnContext.decision)
       : null;
   const decisionWorkflowType = String(decision?.workflowType ?? "").trim();
+
+  // PR1: trusted continuation / pending ownership before generic resolved decisions.
+  // Contact and availability-duration must not be stolen by unlisted/browse/clarify.
+  if (isAwaitingBookingContact(turnContext)) {
+    const phone = extractContactPhoneFromText(inboundText);
+    if (phone) {
+      return {
+        workflowType: "contact_collection",
+        reason: "contact_phone_detected",
+        priority: 90,
+      };
+    }
+    return {
+      workflowType: "contact_request",
+      reason: "awaiting_booking_contact",
+      priority: 88,
+    };
+  }
+
+  if (hasOpenAvailabilityDurationPending(turnContext)) {
+    if (isPricingWithDurationInterrupt(understanding)) {
+      return {
+        workflowType: "pricing_with_duration",
+        reason: "explicit_rent_question_interrupts_availability_duration_pending",
+        interruptsPendingWorkflow: true,
+        priority: 100,
+      };
+    }
+    return {
+      workflowType: "availability_inquiry",
+      reason:
+        understanding.durationDays != null
+          ? "availability_duration_pending_continuation"
+          : "availability_duration_pending_follow_up",
+      interruptsPendingWorkflow: false,
+      priority: 88,
+    };
+  }
+
   if (decisionWorkflowType && decisionWorkflowType !== "unknown_clarification") {
     // Pending availability duration beats a booking decision from weak/signal shortcuts.
     const bookingBlockedByAvailabilityDuration =
@@ -183,22 +213,6 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
       workflowType: "greeting",
       reason: "deterministic_greeting",
       priority: 95,
-    };
-  }
-
-  if (isAwaitingBookingContact(turnContext)) {
-    const phone = extractContactPhoneFromText(inboundText);
-    if (phone) {
-      return {
-        workflowType: "contact_collection",
-        reason: "contact_phone_detected",
-        priority: 90,
-      };
-    }
-    return {
-      workflowType: "contact_request",
-      reason: "awaiting_booking_contact",
-      priority: 88,
     };
   }
 
@@ -226,25 +240,7 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
   }
 
   // Availability asked "kitne din?" — duration / follow-up stays on availability, never auto-book.
-  if (hasOpenAvailabilityDurationPending(turnContext)) {
-    if (isPricingWithDurationInterrupt(understanding)) {
-      return {
-        workflowType: "pricing_with_duration",
-        reason: "explicit_rent_question_interrupts_availability_duration_pending",
-        interruptsPendingWorkflow: true,
-        priority: 100,
-      };
-    }
-    return {
-      workflowType: "availability_inquiry",
-      reason:
-        understanding.durationDays != null
-          ? "availability_duration_pending_continuation"
-          : "availability_duration_pending_follow_up",
-      interruptsPendingWorkflow: false,
-      priority: 88,
-    };
-  }
+  // (Handled earlier before decisionWorkflowType so unlisted/browse cannot steal.)
 
   if (hasOpenCollectDurationPending(turnContext)) {
     if (isPricingWithDurationInterrupt(understanding)) {

@@ -31,6 +31,18 @@ import {
   findWaitingConfirmAvailabilityRequestsByPhone,
   releaseAvailabilityRequestPlaywrightInboundPoll,
 } from "../src/services/availabilityRequestService.js";
+import {
+  decideWaitingConfirmFromLegacyClassifierForTests,
+  handlePlaywrightInboundWithTestBrain,
+} from "./helpers/waitingConfirmBrainTestDouble.mjs";
+
+/** Bridge helper: Brain entry + test double unless caller supplies handleInboundFn. */
+function bridge(params) {
+  return bridgeAvailabilityCustomerDmTurn({
+    ...params,
+    handleInboundFn: params.handleInboundFn || handlePlaywrightInboundWithTestBrain,
+  });
+}
 
 const BUSINESS_ID = "owner-bridge-1";
 const REQUEST_ID = "avr_bridge_001";
@@ -188,7 +200,7 @@ test("B/C: bridge injects Playwright sendReplyFn and sends through sendPlaywrigh
     return true;
   };
 
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -223,7 +235,7 @@ test("B/C: bridge injects Playwright sendReplyFn and sends through sendPlaywrigh
 test("D: Playwright bridge path does not use sendWhatsAppMessage", async () => {
   const fake = createFakeDb({ [REQUEST_ID]: baseRequest() });
   let cloudCalls = 0;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -260,7 +272,7 @@ test("E: missing customerPhone does not block Playwright DM continuation", async
       customerDmTarget: null,
     }),
   });
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest({
@@ -300,7 +312,7 @@ test("F: missing customerDmChatTitle and customerDmPlaywrightChatKey fails close
       customerDmPlaywrightChatKey: null,
     }),
   });
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest({
@@ -325,9 +337,10 @@ test("G: booking still goes through executeCreateBooking after Brain confirm", a
     handleAvailabilityCustomerPlaywrightInbound({
       ...params,
       availabilityConfirmExecute: false,
+      __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
     });
 
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
@@ -416,7 +429,7 @@ test("M: poll lock is released on bridge failure", async () => {
     status: "idle",
   });
 
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -457,6 +470,7 @@ test("Cloud path still disambiguates multiple waiting requests by phone", async 
     messageText: "ok",
     sendWhatsAppMessageFn: async () => null,
     availabilityConfirmExecute: false,
+    __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
   });
 
   assert.equal(result.handled, true);
@@ -583,7 +597,7 @@ function corollaColorRow(overrides = {}) {
 
 test("bridge A: after customer notification, true fresh customer color row is selected and processed", async () => {
   let seenText = null;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -596,6 +610,7 @@ test("bridge A: after customer notification, true fresh customer color row is se
       return handleAvailabilityCustomerPlaywrightInbound({
         ...params,
         availabilityConfirmExecute: false,
+        __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
       });
     },
     sendPlaywrightActiveChatTextFn: async () => true,
@@ -612,7 +627,7 @@ test("bridge B: color question reply contains Metallic Grey / color detail", asy
     classifyAvailabilityCustomerQuestionTopic("Color kon sa hai gari ka?"),
     "color"
   );
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -631,7 +646,7 @@ test("bridge B: color question reply contains Metallic Grey / color detail", asy
 
 test("bridge scoped B: total rent kitna hai? includes 10,000 PKR", async () => {
   const playwrightSends = [];
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -650,7 +665,7 @@ test("bridge scoped B: total rent kitna hai? includes 10,000 PKR", async () => {
 
 test("bridge scoped C: per day kitna hai? includes 5,000 PKR", async () => {
   const playwrightSends = [];
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -670,7 +685,7 @@ test("bridge scoped C: per day kitna hai? includes 5,000 PKR", async () => {
 test("bridge scoped D: known-detail questions do not create booking", async () => {
   const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
   for (const text of ["Color konsa hai?", "total rent kitna hai?", "per day kitna hai?"]) {
-    const result = await bridgeAvailabilityCustomerDmTurn({
+    const result = await bridge({
       db: fake.db,
       businessId: BUSINESS_ID,
       request: corollaRequest(),
@@ -692,7 +707,7 @@ test("bridge scoped E: Book kar do still books once", async () => {
   const fake = createFakeDb({
     [REQUEST_ID]: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
   });
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
@@ -710,7 +725,7 @@ test("bridge scoped E: Book kar do still books once", async () => {
 });
 
 test("bridge D: after customer notification, outbound Emily rows only → NO_FRESH_INBOUND", async () => {
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -754,7 +769,7 @@ test("bridge E: repeated bridge ticks do not process outbound/stale rows", async
       dataId: "true_repeat_out",
     },
   ];
-  const first = await bridgeAvailabilityCustomerDmTurn({
+  const first = await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -764,7 +779,7 @@ test("bridge E: repeated bridge ticks do not process outbound/stale rows", async
     sendPlaywrightActiveChatTextFn: async () => true,
   });
   assert.equal(first.bridgeReason, "NO_FRESH_INBOUND");
-  const second = await bridgeAvailabilityCustomerDmTurn({
+  const second = await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -779,7 +794,7 @@ test("bridge E: repeated bridge ticks do not process outbound/stale rows", async
 
 test("bridge F: poll lock is released after NO_FRESH_INBOUND", async () => {
   const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -805,7 +820,7 @@ test("bridge G: true fresh Book kar do still confirms booking once", async () =>
   const fake = createFakeDb({
     [REQUEST_ID]: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
   });
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: corollaRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
@@ -938,7 +953,7 @@ test('E: "Han book kar do" is confirm_booking through Playwright path', async ()
   });
   const playwrightSends = [];
 
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
@@ -984,7 +999,7 @@ test("H: wrong DM header fails closed and does not read messages", async () => {
   assert.equal(headerMismatch.activeHeader, "Leads");
 
   let readCalled = false;
-  const bridgeResult = await bridgeAvailabilityCustomerDmTurn({
+  const bridgeResult = await bridge({
     db: createFakeDb({ [REQUEST_ID]: baseRequest() }).db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1043,7 +1058,7 @@ test("J: whatsappInboundBuffer.js remains untouched by Playwright bridge", () =>
 test("single-row A: multiple fresh accepted rows call handleInboundFn exactly once", async () => {
   const fake = createFakeDb({ [REQUEST_ID]: baseRequest() });
   let handlerCalls = 0;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1086,7 +1101,7 @@ test("single-row A: multiple fresh accepted rows call handleInboundFn exactly on
 test("single-row B: multiple fresh accepted rows call sendReplyFn at most once", async () => {
   const fake = createFakeDb({ [REQUEST_ID]: baseRequest() });
   let sendCalls = 0;
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1122,7 +1137,7 @@ test("single-row B: multiple fresh accepted rows call sendReplyFn at most once",
 
 test("single-row C: latest atMs row is selected for handler", async () => {
   let seenText = null;
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: createFakeDb({ [REQUEST_ID]: baseRequest() }).db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1196,7 +1211,7 @@ test("pickSingle returns DUPLICATE_LATEST without falling back to older row", ()
 
 test("single-row E: older unclear rows plus latest confirm passes latest confirm only", async () => {
   let seenText = null;
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: createFakeDb({ [REQUEST_ID]: baseRequest() }).db,
     businessId: BUSINESS_ID,
     request: baseRequest({ lastCustomerDmPromptType: "booking_confirmation_prompt" }),
@@ -1231,6 +1246,7 @@ test("single-row E: older unclear rows plus latest confirm passes latest confirm
       return handleAvailabilityCustomerPlaywrightInbound({
         ...params,
         availabilityConfirmExecute: false,
+        __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
       });
     },
     sendPlaywrightActiveChatTextFn: async () => true,
@@ -1240,7 +1256,7 @@ test("single-row E: older unclear rows plus latest confirm passes latest confirm
 
 test("single-row F: older confirm plus newer unclear passes newer row only", async () => {
   let seenText = null;
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: createFakeDb({ [REQUEST_ID]: baseRequest() }).db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1275,7 +1291,7 @@ test("single-row G: duplicate latest row does not call handler or send", async (
   const duplicateId = "false_duplicate_selected";
   let handlerCalls = 0;
   let sendCalls = 0;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({
       [REQUEST_ID]: baseRequest({
         lastCustomerInboundDmDataId: duplicateId,
@@ -1322,7 +1338,7 @@ test("single-row G: duplicate latest row does not call handler or send", async (
 });
 
 test("single-row H: single fresh row still bridges normally", async () => {
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({ [REQUEST_ID]: baseRequest() }).db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1347,7 +1363,7 @@ test("single-row H: single fresh row still bridges normally", async () => {
 
 test("single-row I: no fresh accepted row does not call handler", async () => {
   let handlerCalls = 0;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({ [REQUEST_ID]: baseRequest() }).db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1375,7 +1391,7 @@ test("single-row I: no fresh accepted row does not call handler", async () => {
 
 test("single-row J: already confirmed request is not eligible for bridge", async () => {
   let handlerCalls = 0;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({
       [REQUEST_ID]: baseRequest({ customerConfirmationStatus: "confirmed" }),
     }).db,
@@ -1431,7 +1447,7 @@ async function runBridgeWithFreshRow({
       readMessagesFn ||
       (async () => [freshInboundRow("rent kitna hai?", 3_000, "false_send_rel")]),
     sendPlaywrightActiveChatTextFn,
-    handleInboundFn,
+    handleInboundFn: handleInboundFn || handlePlaywrightInboundWithTestBrain,
     sendReplyFn,
   });
 }
@@ -1654,7 +1670,7 @@ test("send-reliability H: sendPlaywrightActiveChatTextFn called at most once per
 
 test("send-reliability I: one-row selection still holds with multiple accepted rows", async () => {
   let handlerCalls = 0;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({ [REQUEST_ID]: baseRequest() }).db,
     businessId: BUSINESS_ID,
     request: baseRequest(),
@@ -1677,7 +1693,7 @@ test("send-reliability I: one-row selection still holds with multiple accepted r
 test("send-reliability J: duplicate latest row still does not fall back", async () => {
   const duplicateId = "false_dup_send_rel";
   let handlerCalls = 0;
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({
       [REQUEST_ID]: baseRequest({
         lastCustomerInboundDmDataId: duplicateId,
@@ -1707,7 +1723,7 @@ test("send-reliability J: duplicate latest row still does not fall back", async 
 
 test("3B bridge B1: total rent question sends one reply only", async () => {
   const playwrightSends = [];
-  const result = await bridgeAvailabilityCustomerDmTurn({
+  const result = await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -1728,7 +1744,7 @@ test("3B bridge B1: total rent question sends one reply only", async () => {
 test("3B bridge B2: next poll tick with same logical row but new data-id is NO_FRESH_INBOUND", async () => {
   const atMs = NOTIFY_AT_MS + 10_000;
   const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
-  const first = await bridgeAvailabilityCustomerDmTurn({
+  const first = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -1742,7 +1758,7 @@ test("3B bridge B2: next poll tick with same logical row but new data-id is NO_F
   });
   assert.equal(first.accepted, 1);
   const stored = fake.readRequest(REQUEST_ID);
-  const second = await bridgeAvailabilityCustomerDmTurn({
+  const second = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: { ...corollaRequest(), ...stored },
@@ -1765,7 +1781,7 @@ test("3B bridge B2: next poll tick with same logical row but new data-id is NO_F
 
 test("3B bridge B3: color question includes Metallic Grey once", async () => {
   const playwrightSends = [];
-  await bridgeAvailabilityCustomerDmTurn({
+  await bridge({
     db: createFakeDb({ [REQUEST_ID]: corollaRequest() }).db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -1785,7 +1801,7 @@ test("3B bridge B3: color question includes Metallic Grey once", async () => {
 test("3B bridge D: logistics question is ledgered and duplicate logical row is skipped", async () => {
   const atMs = NOTIFY_AT_MS + 12_000;
   const fake = createFakeDb({ [REQUEST_ID]: corollaRequest() });
-  const first = await bridgeAvailabilityCustomerDmTurn({
+  const first = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: corollaRequest(),
@@ -1803,7 +1819,7 @@ test("3B bridge D: logistics question is ledgered and duplicate logical row is s
   assert.match(String(stored.processedCustomerInboundDmMessageKeys[0]), /^logical:/);
   assert.equal(stored.linkedBookingId ?? null, null);
 
-  const second = await bridgeAvailabilityCustomerDmTurn({
+  const second = await bridge({
     db: fake.db,
     businessId: BUSINESS_ID,
     request: { ...corollaRequest(), ...stored },
