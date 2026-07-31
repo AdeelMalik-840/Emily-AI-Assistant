@@ -2482,24 +2482,17 @@ export async function executeWhatsAppAiPipeline(p) {
           isGroupInbound,
           messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
         });
+        // Model-contract / technical failure must never become intentional silent.
+        // Use durable retryable failure path (same as retryable === true).
         if (businessPaResult.terminalFailure === true) {
-          reply = "";
-          sendVia = "NONE";
-          messageMeta = {
-            handledWithoutOutbound: true,
-            customerBusinessPaHandled: true,
-            postConfirmTerminalFailure: true,
-            failureReason: businessPaResult.failureReason ?? null,
-            bookingId: businessPaResult.bookingId ?? null,
-            availabilityRequestId: businessPaResult.availabilityRequestId ?? null,
-            finalReplySource: "openai_post_confirm_pa",
-            outboundTrace: {
-              kind: "silent_noop",
-              finalReplySource: "openai_post_confirm_pa",
-              reason: "POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
-            },
-          };
-        } else {
+          throw new Error(
+            String(
+              businessPaResult.failureReason ??
+                businessPaResult.reason ??
+                "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL"
+            )
+          );
+        }
         reply = String(businessPaResult.reply ?? "").trim();
         const hasBusinessPaReply = reply.length > 0;
         sendVia = hasBusinessPaReply ? "CLOUD_API" : "NONE";
@@ -2517,7 +2510,6 @@ export async function executeWhatsAppAiPipeline(p) {
             finalReplySource: "openai_post_confirm_pa",
           },
         };
-        }
       }
     }
   }

@@ -532,13 +532,64 @@ test("pending-availability confirm/decline do not use trusted-focus required-rep
   );
 });
 
-test("invalid or malformed OpenAI output remains a separate terminal path", async () => {
-  const { result, calls } = await runWithResponses(["", ""]);
+test("invalid or malformed OpenAI output gets one informational recovery then retryable failure", async () => {
+  const { result, calls } = await runWithResponses(["", "", ""]);
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.equal(result.ok, false);
   assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
-  assert.equal(result.retryable, false);
+  assert.equal(result.retryable, true);
   assert.equal(result.silenceRecoveryAttempts, 0);
-  assert.equal(result.contentSafetyAttempts, 2);
+  assert.equal(result.contentSafetyAttempts, 3);
+  assert.equal(result.usabilityClassification, "empty_content");
+  const recoveryPrompt = String(calls[2]?.messages?.[1]?.content || "");
+  assert.match(recoveryPrompt, /empty\/invalid output recovery/i);
+  assert.match(recoveryPrompt, /Do NOT use action=silence/i);
+});
+
+test("empty/invalid then informational recovery produces grounded reply", async () => {
+  const { result, calls } = await runWithResponses([
+    "",
+    "{not-json",
+    decision({
+      customerReply: "Delivery selected areas mein available hai.",
+      groundedFacts: groundedFacts({
+        itemId: STONIC_ITEM_ID,
+        durationDays: 4,
+        bookingStatus: "approved",
+        policyClaims: [
+          { key: "deliveryPolicy", value: "Delivery selected areas mein available hai." },
+        ],
+      }),
+      replySemantics: {
+        claims: [],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
+    }),
+  ], {
+    userMessage: "Delivery ho skti hai?",
+    facts: {
+      ...focusedFacts(),
+      known: {
+        deliveryPolicy: "Delivery selected areas mein available hai.",
+      },
+      replyGuardFacts: {
+        ...focusedFacts().replyGuardFacts,
+        knownPolicies: {
+          deliveryPolicy: "Delivery selected areas mein available hai.",
+        },
+      },
+    },
+  });
+
+  assert.equal(calls.length, 3);
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai");
+  assert.equal(result.decision.action, "reply");
+  assert.equal(result.decision.shouldReply, true);
+  assert.match(String(result.decision.customerReply), /Delivery selected areas/i);
+  assert.equal(result.decision.mutationIntent, "none");
+  assert.equal(result.retryable, undefined);
 });

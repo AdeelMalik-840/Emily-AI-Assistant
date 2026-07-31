@@ -38,6 +38,8 @@ function logPostConfirmTerminalDiagnostic(decided) {
       decided?.silenceRecoveryAttempts
     ),
     contentSafetyAttempts: nonNegativeInteger(decided?.contentSafetyAttempts),
+    usabilityClassification:
+      clean(decided?.usabilityClassification, 60) || null,
   };
   console.error("[post_confirm_model_terminal_diagnostic]", diagnostic);
   return diagnostic;

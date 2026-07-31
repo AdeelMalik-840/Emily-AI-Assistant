@@ -62,6 +62,7 @@ test("terminal model failure logs safe attempt metadata only", async () => {
     failureReason: "verified_price_mismatch",
     silenceRecoveryAttempts: 1,
     contentSafetyAttempts: 2,
+    usabilityClassification: null,
   });
 
   const serialized = JSON.stringify(entries[0][1]);
