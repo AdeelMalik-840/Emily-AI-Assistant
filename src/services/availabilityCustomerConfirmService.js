@@ -1020,6 +1020,37 @@ function waitingConfirmBrainMeta(extra = {}) {
   return { waitingConfirmDmBrain: true, pamissCreated: false, ownerNotified: false, ...extra };
 }
 
+/**
+ * Shared verified-execution snapshot for waiting-confirm post-exec compose.
+ */
+function buildWaitingConfirmExecutionSnapshot({
+  kind,
+  requestId,
+  trustedFacts,
+  quote = null,
+  attempted,
+  succeeded,
+  reason = null,
+  bookingId = null,
+  statusBefore = null,
+  statusAfter = null,
+}) {
+  return {
+    attempted,
+    succeeded,
+    status: succeeded ? "succeeded" : attempted ? "failed" : "not_executed",
+    reason,
+    bookingId,
+    kind,
+    requestId,
+    ...trustedFacts,
+    totalAmount: quote?.total ?? null,
+    currency: quote?.currency ?? "PKR",
+    customerConfirmationStatusBefore: statusBefore,
+    customerConfirmationStatusAfter: statusAfter,
+  };
+}
+
 function resolveBrainFailReason(turnResult) {
   return (
     clean(turnResult?.reason) ||
@@ -1245,19 +1276,17 @@ async function runWaitingConfirmDmBrainTurn({
     });
     if (!confirmGuard.ok) {
       return composeAndFinish({
-        executionResult: {
-          attempted: false,
-          succeeded: false,
-          status: "not_executed",
-          reason: "CONFIRM_GUARD_FAILED",
+        executionResult: buildWaitingConfirmExecutionSnapshot({
           kind: "confirm_booking",
           requestId,
-          ...trustedFacts,
-          totalAmount: quote?.total ?? null,
-          currency: quote?.currency ?? "PKR",
-          customerConfirmationStatusBefore: "waiting_confirm",
-          customerConfirmationStatusAfter: "waiting_confirm",
-        },
+          trustedFacts,
+          quote,
+          attempted: false,
+          succeeded: false,
+          reason: "CONFIRM_GUARD_FAILED",
+          statusBefore: "waiting_confirm",
+          statusAfter: "waiting_confirm",
+        }),
         payload: {
           action: "clarify",
           confirmGuardFailed: true,
@@ -1277,23 +1306,19 @@ async function runWaitingConfirmDmBrainTurn({
       availabilityConfirmExecute,
       brainAuthorizedConfirm: true,
     });
-    const executionResult = {
-      attempted: true,
-      succeeded: result.ok === true,
-      status: result.ok === true ? "succeeded" : "failed",
-      reason: result.ok === true ? null : result.reason ?? "CONFIRM_FAILED",
-      bookingId: result.ok === true ? result.bookingId ?? null : null,
-      kind: "confirm_booking",
-      requestId,
-      ...trustedFacts,
-      totalAmount: quote?.total ?? null,
-      currency: quote?.currency ?? "PKR",
-      customerConfirmationStatusBefore: statusBefore,
-      customerConfirmationStatusAfter:
-        result.ok === true ? "confirmed" : statusBefore,
-    };
     return composeAndFinish({
-      executionResult,
+      executionResult: buildWaitingConfirmExecutionSnapshot({
+        kind: "confirm_booking",
+        requestId,
+        trustedFacts,
+        quote,
+        attempted: true,
+        succeeded: result.ok === true,
+        reason: result.ok === true ? null : result.reason ?? "CONFIRM_FAILED",
+        bookingId: result.ok === true ? result.bookingId ?? null : null,
+        statusBefore,
+        statusAfter: result.ok === true ? "confirmed" : statusBefore,
+      }),
       confirmResult: result,
       payload: {
         action: result.ok ? "confirmed_booking" : "confirm_failed",
@@ -1316,23 +1341,20 @@ async function runWaitingConfirmDmBrainTurn({
       messageText: text,
     });
     return composeAndFinish({
-      executionResult: {
+      executionResult: buildWaitingConfirmExecutionSnapshot({
+        kind: "decline_request",
+        requestId,
+        trustedFacts,
+        quote,
         attempted: true,
         succeeded: declineResult.ok === true,
-        status: declineResult.ok === true ? "succeeded" : "failed",
         reason:
           declineResult.ok === true
             ? null
             : declineResult.reason ?? "DECLINE_FAILED",
-        kind: "decline_request",
-        requestId,
-        ...trustedFacts,
-        totalAmount: quote?.total ?? null,
-        currency: quote?.currency ?? "PKR",
-        customerConfirmationStatusBefore: statusBefore,
-        customerConfirmationStatusAfter:
-          declineResult.ok === true ? "declined" : statusBefore,
-      },
+        statusBefore,
+        statusAfter: declineResult.ok === true ? "declined" : statusBefore,
+      }),
       payload: {
         action: declineResult.ok === true ? "declined" : "decline_failed",
         result: declineResult,
@@ -1342,19 +1364,17 @@ async function runWaitingConfirmDmBrainTurn({
 
   if (action === "change_request") {
     return composeAndFinish({
-      executionResult: {
-        attempted: false,
-        succeeded: false,
-        status: "not_executed",
-        reason: "CHANGE_REQUEST_NO_BOOKING_MUTATION",
+      executionResult: buildWaitingConfirmExecutionSnapshot({
         kind: "change_request",
         requestId,
-        ...trustedFacts,
-        totalAmount: quote?.total ?? null,
-        currency: quote?.currency ?? "PKR",
-        customerConfirmationStatusBefore: "waiting_confirm",
-        customerConfirmationStatusAfter: "waiting_confirm",
-      },
+        trustedFacts,
+        quote,
+        attempted: false,
+        succeeded: false,
+        reason: "CHANGE_REQUEST_NO_BOOKING_MUTATION",
+        statusBefore: "waiting_confirm",
+        statusAfter: "waiting_confirm",
+      }),
       payload: { action: resultAction },
     });
   }

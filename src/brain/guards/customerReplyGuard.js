@@ -874,10 +874,10 @@ export function validateCustomerReplyAgainstContract(
   }
 
   // New booking confirmation wording must not imply extension/change-in-place.
+  // Scoped to post-exec reservation-created contracts only (not every verified booking DM).
   if (
-    (bookingExecutionVerified === true ||
-      String(contract?.requiredMeaning ?? "") ===
-        "post_execution_reservation_created") &&
+    String(contract?.requiredMeaning ?? "").trim() ===
+      "post_execution_reservation_created" &&
     NEW_BOOKING_EXTENSION_LANGUAGE_RE.test(text)
   ) {
     return {

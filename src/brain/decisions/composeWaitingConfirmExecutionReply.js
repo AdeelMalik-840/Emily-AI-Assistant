@@ -2,27 +2,16 @@
  * Waiting-confirm post-execution reply composer.
  *
  * Not a decision Brain: frozen semantic decision + verified execution only.
- * Mirrors composePostConfirmMutationCustomerReply (wording-only, guarded).
+ * Generic OpenAI/guard loop lives in composeGuardedCustomerReply.
  */
 
-import OpenAI from "openai";
-import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 import {
   CUSTOMER_CLAIMS,
   buildPostExecutionBookingSuccessContract,
   buildWaitingConfirmPostExecutionFailureContract,
-  normalizeReplySemantics,
 } from "../contracts/customerReplyContract.js";
-import {
-  buildCustomerReplyGuardCorrection,
-  validateCustomerReplyAgainstContract,
-} from "../guards/customerReplyGuard.js";
-import {
-  buildStrictJsonSchemaResponseFormat,
-  MAX_CUSTOMER_REPLY_ATTEMPTS,
-  REPLY_SEMANTICS_SCHEMA,
-} from "../openai/strictJsonSchema.js";
+import { composeGuardedCustomerReply } from "../openai/composeGuardedCustomerReply.js";
 import { WAITING_CONFIRM_DM_TECHNICAL_FALLBACK } from "./waitingConfirmDmLane.js";
 
 function clean(value, max = 200) {
@@ -130,25 +119,10 @@ export async function composeWaitingConfirmExecutionReply({
           waitingConfirmAction: frozen.action,
         });
 
-  const shared = buildCustomerCommunicationPolicy({
+  const system = `${buildCustomerCommunicationPolicy({
     channel: "dm",
     styleKey,
-  });
-
-  const responseFormat = buildStrictJsonSchemaResponseFormat(
-    "waiting_confirm_execution_reply_compose",
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        customerReply: { type: "string" },
-        replySemantics: REPLY_SEMANTICS_SCHEMA,
-      },
-      required: ["customerReply", "replySemantics"],
-    }
-  );
-
-  const system = `${shared}
+  })}
 
 LANE OBJECTIVE (waiting_confirm_dm execution reply composer — NOT a decision Brain):
 OUTPUT STRICT JSON only:
@@ -187,147 +161,45 @@ STRICT SAFETY:
       requiredMeaning: replyContract.requiredMeaning,
     })}`;
 
-  const completionFn =
-    typeof __chatCompletionsCreateForTests === "function"
-      ? __chatCompletionsCreateForTests
-      : (() => {
-          const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
-          if (!apiKey) return null;
-          const client = new OpenAI({ apiKey });
-          return (args) => client.chat.completions.create(args);
-        })();
+  const composed = await composeGuardedCustomerReply({
+    system,
+    userBase,
+    firstAttemptReminder:
+      "Remember: JSON only; wording only; never change frozen decision; claim booking confirmed only when verified status is succeeded.",
+    responseFormatName: "waiting_confirm_execution_reply_compose",
+    replyContract,
+    enrichGuardContract: (contract) => ({
+      ...contract,
+      verifiedCustomerFacts: {
+        ...(contract.verifiedCustomerFacts || {}),
+        bookingExecutionVerified: verified.succeeded === true,
+        waitingConfirmExecutionStatus: verified.status,
+        waitingConfirmAction: frozen.action,
+      },
+      replyRequired: true,
+    }),
+    resolveSemantics: (semantics) =>
+      semantics || {
+        claims: verified.succeeded
+          ? [CUSTOMER_CLAIMS.RESERVATION_CREATED]
+          : [CUSTOMER_CLAIMS.CUSTOMER_CONFIRMATION_ACKNOWLEDGED],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
+    extraReject: (customerReply) =>
+      /\b(avr|executor|firestore|brain|\bsystem\b)\b/i.test(customerReply)
+        ? "internal_process_terms_in_customer_reply"
+        : null,
+    fallbackReply: WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
+    timeoutMs,
+    timeoutErrorMessage: "WAITING_CONFIRM_COMPOSE_OPENAI_TIMEOUT",
+    __chatCompletionsCreateForTests,
+  });
 
-  if (!completionFn) {
-    return {
-      ok: false,
-      reply: WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
-      source: "technical_fallback",
-      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
-      frozenDecision: frozen,
-      executionResult: verified,
-    };
-  }
-
-  try {
-    let lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
-    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
-      const userContent =
-        attempt === 1
-          ? `${userBase}\n\nRemember: JSON only; wording only; never change frozen decision; claim booking confirmed only when verified status is succeeded.`
-          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
-
-      const createPromise = Promise.resolve(
-        completionFn({
-          model: resolveOpenAiChatModel(),
-          temperature: 0.35,
-          max_tokens: 220,
-          response_format: responseFormat,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: userContent },
-          ],
-        })
-      );
-      const timed =
-        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-          ? Promise.race([
-              createPromise,
-              new Promise((_, reject) => {
-                setTimeout(
-                  () =>
-                    reject(
-                      new Error("WAITING_CONFIRM_COMPOSE_OPENAI_TIMEOUT")
-                    ),
-                  Math.floor(Number(timeoutMs))
-                );
-              }),
-            ])
-          : createPromise;
-
-      const resp = await timed;
-      let text = String(resp?.choices?.[0]?.message?.content ?? "").trim();
-      const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-      if (fence) text = fence[1].trim();
-      const start = text.indexOf("{");
-      const end = text.lastIndexOf("}");
-      if (start >= 0 && end > start) text = text.slice(start, end + 1);
-
-      let customerReply = "";
-      let semantics = null;
-      try {
-        const parsed = JSON.parse(text);
-        customerReply = String(parsed?.customerReply ?? parsed?.reply ?? "")
-          .replace(/^\s*["']|["']\s*$/g, "")
-          .trim();
-        semantics = normalizeReplySemantics(parsed?.replySemantics);
-      } catch {
-        customerReply = "";
-      }
-
-      if (!customerReply) {
-        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        break;
-      }
-
-      if (/\b(avr|executor|firestore|brain|\bsystem\b)\b/i.test(customerReply)) {
-        lastReason = "internal_process_terms_in_customer_reply";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        break;
-      }
-
-      const guard = validateCustomerReplyAgainstContract(
-        customerReply,
-        {
-          ...replyContract,
-          verifiedCustomerFacts: {
-            ...(replyContract.verifiedCustomerFacts || {}),
-            bookingExecutionVerified: verified.succeeded === true,
-            waitingConfirmExecutionStatus: verified.status,
-            waitingConfirmAction: frozen.action,
-          },
-          replyRequired: true,
-        },
-        semantics || {
-          claims: verified.succeeded
-            ? [CUSTOMER_CLAIMS.RESERVATION_CREATED]
-            : [CUSTOMER_CLAIMS.CUSTOMER_CONFIRMATION_ACKNOWLEDGED],
-          languageStyle: "roman_urdu",
-          containsTimingPromise: false,
-          exposesInternalProcess: false,
-        }
-      );
-      if (!guard.ok) {
-        lastReason = guard.reason || "customer_reply_guard_failed";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        break;
-      }
-
-      return {
-        ok: true,
-        reply: customerReply.slice(0, 500),
-        source: "openai",
-        frozenDecision: frozen,
-        executionResult: verified,
-      };
-    }
-
-    return {
-      ok: false,
-      reply: WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
-      source: "technical_fallback",
-      reason: lastReason,
-      frozenDecision: frozen,
-      executionResult: verified,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      reply: WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
-      source: "technical_fallback",
-      reason: clean(err?.message, 120) || "COMPOSE_FAILED",
-      frozenDecision: frozen,
-      executionResult: verified,
-    };
-  }
+  return {
+    ...composed,
+    frozenDecision: frozen,
+    executionResult: verified,
+  };
 }

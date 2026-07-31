@@ -44,3 +44,16 @@ export const REPLY_SEMANTICS_SCHEMA = Object.freeze({
 });
 
 export const MAX_CUSTOMER_REPLY_ATTEMPTS = 2;
+
+/** Shared wording-only compose schema: customerReply + replySemantics. */
+export function buildCustomerReplyOnlyResponseFormat(name) {
+  return buildStrictJsonSchemaResponseFormat(name, {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      customerReply: { type: "string" },
+      replySemantics: REPLY_SEMANTICS_SCHEMA,
+    },
+    required: ["customerReply", "replySemantics"],
+  });
+}
