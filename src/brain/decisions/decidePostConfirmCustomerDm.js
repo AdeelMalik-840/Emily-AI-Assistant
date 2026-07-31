@@ -921,6 +921,34 @@ function isPostConfirmReadOnlyInformationalDecision(decision) {
 }
 
 /**
+ * Narrow factual-question evidence for the gated third required-reply recovery.
+ * Broader read-only helper also accepts ask_action / bare action=reply; those must
+ * not unlock “answer from booking facts” after silence.
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+function isPostConfirmTrustedFocusFactQuestionDecision(decision) {
+  const action = cleanAction(decision?.action);
+  if (
+    action === "request_booking_mutation" ||
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability"
+  ) {
+    return false;
+  }
+  if (
+    decision?.conversationAct === "action_request" ||
+    decision?.customerIntent === "ask_action"
+  ) {
+    return false;
+  }
+  return (
+    decision?.conversationAct === "information_request" ||
+    decision?.customerIntent === "ask_fact" ||
+    decision?.customerIsAskingQuestion === true
+  );
+}
+
+/**
  * Trusted MATCHED_TRUSTED_FOCUS evidence already on facts.
  * @param {Record<string, unknown> | null | undefined} facts
  */
@@ -2190,7 +2218,9 @@ STRICT SAFETY:
         ) {
           return false;
         }
-        if (!isPostConfirmReadOnlyInformationalDecision(finalized)) return false;
+        if (!isPostConfirmTrustedFocusFactQuestionDecision(finalized)) {
+          return false;
+        }
         if (
           !isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(
             finalized,

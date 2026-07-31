@@ -391,6 +391,43 @@ test("empty mutation rewritten to silence does not unlock trusted-focus required
   );
 });
 
+test("non-mutation ask_action silence does not unlock trusted-focus required-reply extra attempt", async () => {
+  const actionSilence = decision({
+    situation: "protected_action",
+    conversationAct: "action_request",
+    customerIntent: "ask_action",
+    customerIsAskingQuestion: false,
+    requestedInfoType: null,
+    shouldReply: false,
+    customerReply: "",
+    action: "silence",
+    mutationIntent: "none",
+    mutationExecutionRequested: false,
+    bookingSelectionMode: "none",
+    selectedBookingIndex: null,
+    groundedFacts: groundedFacts(),
+  });
+  const { result, calls } = await runWithResponses(
+    [
+      acknowledgementSilenceDecision(),
+      actionSilence,
+      decision(),
+    ],
+    { userMessage: "Driver ke sath change karna hai" }
+  );
+
+  assert.ok(calls.length <= 2, "ask_action silence must not unlock a third attempt");
+  const prompts = calls.map((c) => String(c?.messages?.[1]?.content || ""));
+  assert.ok(
+    prompts.every((p) => !/required reply after silence/.test(p)),
+    "must not answer action requests from booking-fact recovery"
+  );
+  assert.notEqual(
+    String(result.decision?.customerReply || ""),
+    "Kia Stonic 4 din ke liye book hai."
+  );
+});
+
 test("duration-extension mutation does not use trusted-focus required-reply extra attempt", async () => {
   const mutation = decision({
     situation: "protected_action",
