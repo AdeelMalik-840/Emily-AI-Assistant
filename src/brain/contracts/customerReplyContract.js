@@ -342,6 +342,26 @@ export function buildPostExecutionBookingSuccessContract(facts = {}) {
   });
 }
 
+function clarificationIdentityCandidates(facts) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  const rows = Array.isArray(f.bookingCandidates)
+    ? f.bookingCandidates
+    : Array.isArray(f.activeBookings)
+      ? f.activeBookings
+      : [];
+  return rows
+    .slice(0, 12)
+    .map((row) => ({
+      itemId: row?.itemId ?? null,
+      itemLabel: row?.itemLabel ?? row?.itemName ?? null,
+      bookingReference:
+        row?.customerSafeReference ?? row?.bookingReference ?? null,
+    }))
+    .filter(
+      (row) => row.itemId || row.itemLabel || row.bookingReference
+    );
+}
+
 /** Post-confirm PA: facts-only Q&A / social; no invented money or process. */
 export function buildPostConfirmPaReplyContract(facts = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
@@ -374,8 +394,21 @@ export function buildPostConfirmPaReplyContract(facts = {}) {
             : [],
           catalogItems: Array.isArray(f.catalogItems) ? f.catalogItems : [],
         };
+  const clarificationCandidates =
+    baseGuardFacts.bookingSelectionRequired === true
+      ? clarificationIdentityCandidates(f)
+      : [];
   const guardFacts = {
     ...baseGuardFacts,
+    activeBookings:
+      clarificationCandidates.length > 0
+        ? clarificationCandidates
+        : Array.isArray(baseGuardFacts.activeBookings)
+          ? baseGuardFacts.activeBookings
+          : [],
+    bookingSelectionRequired:
+      baseGuardFacts.bookingSelectionRequired === true &&
+      clarificationCandidates.length === 0,
     pendingAvailabilityRequests: Array.isArray(
       f.pendingAvailabilityRequests
     )
