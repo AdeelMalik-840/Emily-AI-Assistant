@@ -1206,24 +1206,36 @@ export function availabilityRequestMatchesCloudCustomerPhone(request, customerPh
 }
 
 /**
+ * Channel-agnostic waiting_confirm lifecycle: approved, customer notified, waiting,
+ * not yet booked, and not past confirmExpiresAt. Transport-specific gates layer on top.
+ *
+ * @param {Record<string, unknown>} request
+ * @param {number} [nowMs]
+ */
+export function isWaitingConfirmLifecycleActive(request, nowMs = Date.now()) {
+  if (clean(request?.status) !== "approved") return false;
+  if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
+  if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
+  if (clean(request?.linkedBookingId)) return false;
+  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
+  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Eligible AVR for Cloud waiting_confirm ownership (excludes Playwright channels).
  * @param {Record<string, unknown>} request
  * @param {number} [nowMs]
  */
 export function isCloudWaitingConfirmAvailabilityRequestEligible(request, nowMs = Date.now()) {
-  if (clean(request?.status) !== "approved") return false;
-  if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
-  if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
+  if (!isWaitingConfirmLifecycleActive(request, nowMs)) return false;
   const channel = clean(request?.customerConfirmationChannel);
   const transport = clean(request?.customerDmTransport);
   if (channel !== "waiting_confirm_cloud" && transport !== "cloud_api") return false;
-  if (clean(request?.linkedBookingId)) return false;
   const processing = clean(request?.customerConfirmProcessingStatus);
   if (processing === "processing" || processing === "done") return false;
-  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
-  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
-    return false;
-  }
   return true;
 }
 
@@ -1821,16 +1833,9 @@ export function buildAvailabilityCustomerInboundDmMessageKey(message = {}) {
  * @param {number} [nowMs]
  */
 export function isPlaywrightAvailabilityConfirmRequestEligible(request, nowMs = Date.now()) {
-  if (clean(request?.status) !== "approved") return false;
-  if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
-  if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
-  if (clean(request?.linkedBookingId)) return false;
+  if (!isWaitingConfirmLifecycleActive(request, nowMs)) return false;
   if (!resolveLastCustomerNotifyAtMs(request)) return false;
   if (!clean(request?.customerDmChatTitle) && !clean(request?.customerDmPlaywrightChatKey)) {
-    return false;
-  }
-  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
-  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
     return false;
   }
   return true;

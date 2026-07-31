@@ -953,225 +953,36 @@ export async function handleAvailabilityCustomerPlaywrightInbound({
       ? __decideCustomerTurnForTests
       : decideCustomerTurn;
 
-  return handleWaitingConfirmDmBrainPlaywrightTurn({
+  const customerPhone =
+    clean(fresh?.customerPhone) ||
+    clean(fresh?.customerDmTarget) ||
+    clean(fresh?.customerPhoneNormalized) ||
+    null;
+
+  return runWaitingConfirmDmBrainTurn({
     connection,
     businessId: uid,
+    customerPhone,
     text,
     inboundMessageId: clean(messageId) || null,
     conversationHistory,
     request: fresh,
     requestId,
-    sendReplyFn,
-    sendReplyOpts,
+    channel: "whatsapp_web",
     availabilityConfirmExecute,
     decideCustomerTurnFn: decideFn,
     catalogRowOverride: __catalogRowForTests,
     chatCompletionsCreateForTests: __chatCompletionsCreateForTests,
-  });
-}
-
-/** Playwright DM: Brain meaning → existing confirm/decline/reply executors. */
-async function handleWaitingConfirmDmBrainPlaywrightTurn({
-  connection,
-  businessId,
-  text,
-  inboundMessageId,
-  conversationHistory,
-  request,
-  requestId,
-  sendReplyFn,
-  sendReplyOpts,
-  availabilityConfirmExecute,
-  decideCustomerTurnFn,
-  catalogRowOverride,
-  chatCompletionsCreateForTests = null,
-}) {
-  const catalogRow =
-    catalogRowOverride !== undefined
-      ? catalogRowOverride
-      : await loadCatalogRowForRequest(businessId, request);
-  const customerPhone =
-    clean(request?.customerPhone) ||
-    clean(request?.customerDmTarget) ||
-    clean(request?.customerPhoneNormalized) ||
-    null;
-  const turnContext = packWaitingConfirmDmTurnContext({
-    businessId,
-    customerPhone,
-    messageText: text,
-    messageId: inboundMessageId,
-    conversationHistory,
-    request,
-    catalogRow,
-  });
-  turnContext.channel = "whatsapp_web";
-  turnContext.chatType = "dm";
-  turnContext.continuation = buildContinuationContext({
-    channel: "whatsapp_web",
-    chatType: "dm",
-    isGroupInbound: false,
-    customerNumber: customerPhone,
-    availabilityRequest: request,
-  });
-  if (typeof chatCompletionsCreateForTests === "function") {
-    turnContext.__chatCompletionsCreateForTests = chatCompletionsCreateForTests;
-  }
-
-  const turnResult = await decideCustomerTurnFn(turnContext);
-  if (!isUsableWaitingConfirmBrainTurn(turnResult)) {
-    return waitingConfirmBrainMeta({
-      handled: true,
-      action: "silence",
-      reply: null,
-      decision: turnResult?.decision || null,
-      requestId,
-      turnContext,
-      brainFailed: true,
-      reason:
-        clean(turnResult?.reason) ||
-        (turnResult?.ok === false ? "BRAIN_TURN_NOT_OK" : "BRAIN_DECISION_MISSING"),
-    });
-  }
-
-  const decision = turnResult.decision;
-  const action = clean(decision.action, 40);
-  const resultAction = resolveWaitingConfirmResultAction(decision);
-
-  const finish = async (payload, replyText = null, promptType = null) => {
-    let reply = replyText;
-    if (reply != null) {
-      const recordedPromptType =
-        promptType ||
-        resolveWaitingConfirmDmOutboundPromptType(
-          decision,
-          AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-        );
-      reply = await sendPlaywrightCustomerDmReply({
+    sendReply: async ({ reply, promptType }) =>
+      sendPlaywrightCustomerDmReply({
         reply,
         sendReplyFn,
         sendReplyOpts,
         connection,
-        businessId,
+        businessId: uid,
         requestId,
-        promptType: recordedPromptType,
-      });
-    }
-    return waitingConfirmBrainMeta({
-      handled: true,
-      decision,
-      requestId,
-      reply,
-      turnContext,
-      ...payload,
-      action: payload.action != null ? payload.action : resultAction,
-    });
-  };
-
-  if (action === "confirm_booking") {
-    const confirmGuard = evaluateWaitingConfirmDmBrainConfirmGuard({
-      decision,
-      turnContext,
-    });
-    if (!confirmGuard.ok) {
-      return finish(
-        {
-          action: "clarify",
-          confirmGuardFailed: true,
-          confirmGuardReasons: confirmGuard.reasons,
-        },
-        resolveBrainEnabledOutboundReply(decision),
-        resolveWaitingConfirmDmOutboundPromptType(
-          decision,
-          AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-        )
-      );
-    }
-
-    const result = await executeAvailabilityCustomerConfirmBooking({
-      db: connection,
-      businessId,
-      request,
-      messageText: text,
-      messageId: inboundMessageId,
-      availabilityConfirmExecute,
-      brainAuthorizedConfirm: true,
-    });
-    const reply = resolveBrainEnabledOutboundReply(decision);
-    if (reply == null) {
-      return waitingConfirmBrainMeta({
-        handled: true,
-        action: result.ok ? "confirmed_booking" : "confirm_failed",
-        reply: null,
-        result,
-        decision,
-        requestId,
-        actionType: "confirm_booking",
-        failureReason: result.ok === true ? null : result.reason ?? null,
-        failureStage: result.ok === true ? null : result.failureStage ?? null,
-        turnContext,
-      });
-    }
-    const sent = await sendPlaywrightCustomerDmReply({
-      reply,
-      sendReplyFn,
-      sendReplyOpts,
-      connection,
-      businessId,
-      requestId,
-      promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
-    });
-    return waitingConfirmBrainMeta({
-      handled: true,
-      action: result.ok ? "confirmed_booking" : "confirm_failed",
-      reply: sent,
-      result,
-      decision,
-      requestId,
-      actionType: "confirm_booking",
-      failureReason: result.ok === true ? null : result.reason ?? null,
-      failureStage: result.ok === true ? null : result.failureStage ?? null,
-      turnContext,
-    });
-  }
-
-  if (action === "decline_request") {
-    await updateAvailabilityRequestCustomerConfirmationState({
-      db: connection,
-      businessId,
-      requestId,
-      customerConfirmationStatus: "declined",
-      extra: {
-        customerConfirmationAt: new Date(),
-        customerConfirmationMessageId: inboundMessageId || null,
-        customerConfirmationTextPreview: text.slice(0, 160),
-      },
-    });
-    return finish(
-      { action: "declined" },
-      resolveBrainEnabledOutboundReply(decision),
-      AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-    );
-  }
-
-  if (action === "silence" || action === "none") {
-    return finish({ action: "silence" });
-  }
-
-  if (action === "change_request" || action === "clarify" || action === "reply") {
-    return finish(
-      { action: resultAction },
-      resolveBrainEnabledOutboundReply(decision),
-      resolveWaitingConfirmDmOutboundPromptType(
-        decision,
-        AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
-      )
-    );
-  }
-
-  return finish({
-    action: "silence",
-    brainFailed: true,
-    reason: "BRAIN_ACTION_INVALID",
+        promptType,
+      }),
   });
 }
 
@@ -1201,22 +1012,62 @@ function waitingConfirmBrainMeta(extra = {}) {
   return { waitingConfirmDmBrain: true, pamissCreated: false, ownerNotified: false, ...extra };
 }
 
-/** Flag-ON: Brain meaning → existing confirm/decline/reply executors. No pamiss/owner notify. */
-async function handleWaitingConfirmDmBrainCloudTurn({
+function resolveBrainFailReason(turnResult) {
+  return (
+    clean(turnResult?.reason) ||
+    (turnResult?.ok === false
+      ? "BRAIN_TURN_NOT_OK"
+      : !WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has(
+            clean(turnResult?.decision?.action, 40)
+          )
+        ? "BRAIN_ACTION_INVALID"
+        : "BRAIN_DECISION_MISSING")
+  );
+}
+
+/**
+ * Shared waiting_confirm Brain path. Cloud / Playwright differ only via transport hooks.
+ *
+ * @param {{
+ *   connection: unknown,
+ *   businessId: string,
+ *   customerPhone: string | null,
+ *   text: string,
+ *   inboundMessageId: string | null,
+ *   conversationHistory: string | null,
+ *   request: Record<string, unknown>,
+ *   requestId: string,
+ *   channel: "whatsapp_cloud" | "whatsapp_web",
+ *   availabilityConfirmExecute: boolean,
+ *   decideCustomerTurnFn: Function,
+ *   catalogRowOverride?: Record<string, unknown> | null,
+ *   chatCompletionsCreateForTests?: Function | null,
+ *   sendCredentials?: Record<string, unknown> | null,
+ *   sendReply: (p: {
+ *     reply: string,
+ *     promptType: string,
+ *     confirmResult?: Record<string, unknown> | null,
+ *   }) => Promise<unknown>,
+ *   afterHandled?: () => Promise<void>,
+ * }} params
+ */
+async function runWaitingConfirmDmBrainTurn({
   connection,
   businessId,
-  phone,
+  customerPhone,
   text,
   inboundMessageId,
   conversationHistory,
   request,
   requestId,
-  sendCredentials,
-  sendWhatsAppMessageFn,
+  channel,
   availabilityConfirmExecute,
   decideCustomerTurnFn,
   catalogRowOverride,
   chatCompletionsCreateForTests = null,
+  sendCredentials = null,
+  sendReply,
+  afterHandled = null,
 }) {
   const catalogRow =
     catalogRowOverride !== undefined
@@ -1224,33 +1075,29 @@ async function handleWaitingConfirmDmBrainCloudTurn({
       : await loadCatalogRowForRequest(businessId, request);
   const turnContext = packWaitingConfirmDmTurnContext({
     businessId,
-    customerPhone: phone,
+    customerPhone,
     messageText: text,
     messageId: inboundMessageId,
     conversationHistory,
     request,
     catalogRow,
   });
+  turnContext.channel = channel;
+  turnContext.chatType = "dm";
   turnContext.continuation = buildContinuationContext({
-    channel: "whatsapp_cloud",
+    channel,
     chatType: "dm",
     isGroupInbound: false,
-    customerNumber: phone,
+    customerNumber: customerPhone,
     availabilityRequest: request,
   });
   if (typeof chatCompletionsCreateForTests === "function") {
     turnContext.__chatCompletionsCreateForTests = chatCompletionsCreateForTests;
   }
+
   const turnResult = await decideCustomerTurnFn(turnContext);
   if (!isUsableWaitingConfirmBrainTurn(turnResult)) {
-    // Fail closed: no booking / decline / fabricated semantic reply.
-    await recordCloudInboundIdempotency({
-      connection,
-      businessId,
-      requestId,
-      messageId: inboundMessageId,
-      messageText: text,
-    });
+    if (typeof afterHandled === "function") await afterHandled();
     return waitingConfirmBrainMeta({
       handled: true,
       action: "silence",
@@ -1259,15 +1106,7 @@ async function handleWaitingConfirmDmBrainCloudTurn({
       requestId,
       turnContext,
       brainFailed: true,
-      reason:
-        clean(turnResult?.reason) ||
-        (turnResult?.ok === false
-          ? "BRAIN_TURN_NOT_OK"
-          : !WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has(
-                clean(turnResult?.decision?.action, 40)
-              )
-            ? "BRAIN_ACTION_INVALID"
-            : "BRAIN_DECISION_MISSING"),
+      reason: resolveBrainFailReason(turnResult),
     });
   }
 
@@ -1284,25 +1123,9 @@ async function handleWaitingConfirmDmBrainCloudTurn({
           decision,
           AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO
         );
-      reply = await sendCustomerDmReply({
-        phone,
-        reply,
-        sendWhatsAppMessageFn,
-        sendCredentials,
-        connection,
-        businessId,
-        requestId,
-        promptType: recordedPromptType,
-        sourceMessageId: inboundMessageId || null,
-      });
+      reply = await sendReply({ reply, promptType: recordedPromptType });
     }
-    await recordCloudInboundIdempotency({
-      connection,
-      businessId,
-      requestId,
-      messageId: inboundMessageId,
-      messageText: text,
-    });
+    if (typeof afterHandled === "function") await afterHandled();
     return waitingConfirmBrainMeta({
       handled: true,
       decision,
@@ -1320,8 +1143,6 @@ async function handleWaitingConfirmDmBrainCloudTurn({
       turnContext,
     });
     if (!confirmGuard.ok) {
-      // Soft fail: no booking / decline / AVR mutate / pamiss / owner notify.
-      // Outbound wording stays Brain-owned (or silence / technical only).
       return finish(
         {
           action: "clarify",
@@ -1346,16 +1167,9 @@ async function handleWaitingConfirmDmBrainCloudTurn({
       availabilityConfirmExecute,
       brainAuthorizedConfirm: true,
     });
-    // Brain owns customer wording — never send executor-built reply text.
     const reply = resolveBrainEnabledOutboundReply(decision);
     if (reply == null) {
-      await recordCloudInboundIdempotency({
-        connection,
-        businessId,
-        requestId,
-        messageId: inboundMessageId,
-        messageText: text,
-      });
+      if (typeof afterHandled === "function") await afterHandled();
       return waitingConfirmBrainMeta({
         handled: true,
         action: result.ok ? "confirmed_booking" : "confirm_failed",
@@ -1366,22 +1180,21 @@ async function handleWaitingConfirmDmBrainCloudTurn({
         actionType: "confirm_booking",
         failureReason: result.ok === true ? null : result.reason ?? null,
         failureStage: result.ok === true ? null : result.failureStage ?? null,
+        turnContext,
       });
     }
-    const sendOutcome = await sendCustomerDmReply({
-      phone,
+
+    const sendOutcome = await sendReply({
       reply,
-      sendWhatsAppMessageFn,
-      sendCredentials,
-      connection,
-      businessId,
-      requestId,
       promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
-      sourceMessageId: inboundMessageId || null,
-      recordOutboundOnSuccess: result.ok === true,
-      includeDeliveryStatus: true,
+      confirmResult: result,
     });
-    if (sendOutcome?.providerAccepted !== true) {
+    if (
+      sendOutcome &&
+      typeof sendOutcome === "object" &&
+      "providerAccepted" in sendOutcome &&
+      sendOutcome.providerAccepted !== true
+    ) {
       return waitingConfirmBrainMeta({
         handled: false,
         retryable: true,
@@ -1394,23 +1207,21 @@ async function handleWaitingConfirmDmBrainCloudTurn({
         actionType: "confirm_booking",
       });
     }
-    await recordCloudInboundIdempotency({
-      connection,
-      businessId,
-      requestId,
-      messageId: inboundMessageId,
-      messageText: text,
-    });
+    if (typeof afterHandled === "function") await afterHandled();
     return waitingConfirmBrainMeta({
       handled: true,
       action: result.ok ? "confirmed_booking" : "confirm_failed",
-      reply,
+      reply:
+        sendOutcome && typeof sendOutcome === "object" && "reply" in sendOutcome
+          ? sendOutcome.reply
+          : sendOutcome ?? reply,
       result,
       decision,
       requestId,
       actionType: "confirm_booking",
       failureReason: result.ok === true ? null : result.reason ?? null,
       failureStage: result.ok === true ? null : result.failureStage ?? null,
+      turnContext,
     });
   }
 
@@ -1448,7 +1259,6 @@ async function handleWaitingConfirmDmBrainCloudTurn({
     );
   }
 
-  // Defensive: allowed-set check above should already have failed closed.
   return finish({
     action: "silence",
     brainFailed: true,
@@ -1653,21 +1463,43 @@ export async function handleAvailabilityCustomerCloudInbound({
     typeof __decideCustomerTurnForTests === "function"
       ? __decideCustomerTurnForTests
       : decideCustomerTurn;
-  return handleWaitingConfirmDmBrainCloudTurn({
+  return runWaitingConfirmDmBrainTurn({
     connection,
     businessId: uid,
-    phone,
+    customerPhone: phone,
     text,
     inboundMessageId,
     conversationHistory,
     request,
     requestId,
-    sendCredentials,
-    sendWhatsAppMessageFn,
+    channel: "whatsapp_cloud",
     availabilityConfirmExecute,
     decideCustomerTurnFn: decideFn,
     catalogRowOverride: __catalogRowForTests,
     chatCompletionsCreateForTests: __chatCompletionsCreateForTests,
+    sendCredentials,
+    afterHandled: async () =>
+      recordCloudInboundIdempotency({
+        connection,
+        businessId: uid,
+        requestId,
+        messageId: inboundMessageId,
+        messageText: text,
+      }),
+    sendReply: async ({ reply, promptType, confirmResult = null }) =>
+      sendCustomerDmReply({
+        phone,
+        reply,
+        sendWhatsAppMessageFn,
+        sendCredentials,
+        connection,
+        businessId: uid,
+        requestId,
+        promptType,
+        sourceMessageId: inboundMessageId || null,
+        recordOutboundOnSuccess: confirmResult ? confirmResult.ok === true : true,
+        includeDeliveryStatus: Boolean(confirmResult),
+      }),
   });
 }
 
