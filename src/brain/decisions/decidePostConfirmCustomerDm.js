@@ -353,6 +353,61 @@ function buildPostConfirmSuspiciousSilenceCorrection(
   ].join("\n");
 }
 
+/**
+ * Final same-lane recovery after silence correction still left a required reply empty.
+ * Pins already-verified trusted focus identity only — never invents customer wording.
+ * @param {Record<string, unknown> | null | undefined} facts
+ * @param {Record<string, unknown>} priorDecision
+ * @param {string} userMessage
+ * @param {string} lastEmily
+ */
+function buildPostConfirmTrustedFocusRequiredReplyCorrection(
+  facts,
+  priorDecision,
+  userMessage,
+  lastEmily
+) {
+  const identity = resolveTrustedFocusedBookingIdentity(facts);
+  const compactIdentity = identity
+    ? {
+        bookingId: identity.bookingId,
+        availabilityRequestId: identity.availabilityRequestId,
+        itemId: identity.itemId,
+        itemLabel: identity.itemLabel,
+        durationDays: identity.durationDays,
+        totalAmount: identity.totalAmount,
+        dailyRate: identity.dailyRate,
+        bookingStatus: identity.bookingStatus,
+        scope: identity.scope,
+        selectedBookingIndex: identity.selectedBookingIndex,
+      }
+    : null;
+  const compactPrior = {
+    situation: priorDecision?.situation ?? null,
+    conversationAct: priorDecision?.conversationAct ?? null,
+    customerIntent: priorDecision?.customerIntent ?? null,
+    shouldReply: priorDecision?.shouldReply === true,
+    action: priorDecision?.action ?? null,
+    bookingSelectionMode: priorDecision?.bookingSelectionMode ?? null,
+    selectedBookingIndex: priorDecision?.selectedBookingIndex ?? null,
+    customerReply: priorDecision?.customerReply ?? "",
+  };
+  return [
+    "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — required reply after silence).",
+    "A prior silence/acknowledgement correction still produced no sendable customerReply,",
+    "but this turn requires a customer reply for the trusted focused booking.",
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    `Immediately preceding assistant message: ${clean(lastEmily, 500) || "(none)"}`,
+    `Trusted focused booking identity (answer ONLY this booking): ${JSON.stringify(compactIdentity)}`,
+    `Previous decision (still invalid): ${JSON.stringify(compactPrior)}`,
+    "Rules:",
+    "- Must set action=reply, shouldReply=true, and a non-empty natural customerReply.",
+    "- Answer only from VERIFIED_FACTS_JSON / CURRENT_BOOKING_IN_SCOPE for the trusted focused booking.",
+    "- Use bookingSelectionMode=focused (or none — the system may apply trusted focus).",
+    "- Do not silence. Do not invent amounts, dates, policies, or mutations. Strict JSON only.",
+  ].join("\n");
+}
+
 function isTransientPostConfirmOpenAiFailureReason(reason) {
   const r = clean(reason, 160);
   return (
@@ -862,6 +917,34 @@ function isPostConfirmReadOnlyInformationalDecision(decision) {
     decision?.customerIntent === "ask_action" ||
     decision?.customerIsAskingQuestion === true ||
     action === "reply"
+  );
+}
+
+/**
+ * Narrow factual-question evidence for the gated third required-reply recovery.
+ * Broader read-only helper also accepts ask_action / bare action=reply; those must
+ * not unlock “answer from booking facts” after silence.
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+function isPostConfirmTrustedFocusFactQuestionDecision(decision) {
+  const action = cleanAction(decision?.action);
+  if (
+    action === "request_booking_mutation" ||
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability"
+  ) {
+    return false;
+  }
+  if (
+    decision?.conversationAct === "action_request" ||
+    decision?.customerIntent === "ask_action"
+  ) {
+    return false;
+  }
+  return (
+    decision?.conversationAct === "information_request" ||
+    decision?.customerIntent === "ask_fact" ||
+    decision?.customerIsAskingQuestion === true
   );
 }
 
@@ -1949,7 +2032,22 @@ STRICT SAFETY:
     /** @type {Record<string, unknown> | null} */
     let lastSuspiciousDecision = null;
     let silenceRecoveryAttempts = 0;
-    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
+    let trustedFocusRequiredReplyExtraUsed = false;
+    for (let attempt = 1; ; attempt++) {
+      const attemptLimit =
+        MAX_CUSTOMER_REPLY_ATTEMPTS +
+        (trustedFocusRequiredReplyExtraUsed ? 1 : 0);
+      if (attempt > attemptLimit) {
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: lastReason,
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attemptLimit,
+        };
+      }
       const userContent =
         attempt === 1
           ? `${userPayload}\n\nRemember: JSON only; never mirror the customer; silence ok for farewells; social 'no' is decline_more_help not clarification; never escalate acknowledgements; only verified facts.`
@@ -1959,6 +2057,13 @@ STRICT SAFETY:
                 userLine,
                 lastEmily
               )}`
+            : lastReason === "TRUSTED_FOCUS_REQUIRED_REPLY_AFTER_SILENCE"
+              ? `${userPayload}\n\n${buildPostConfirmTrustedFocusRequiredReplyCorrection(
+                  facts,
+                  lastSuspiciousDecision || {},
+                  userLine,
+                  lastEmily
+                )}`
             : lastReason === "verified_item_mismatch"
               ? `${userPayload}\n\n${buildPostConfirmVerifiedItemMismatchCorrection(
                   facts,
@@ -2002,7 +2107,7 @@ STRICT SAFETY:
         decision?.action === "silence" || decision?.shouldReply === false;
       if (!decision || (!hasSendableReply && !isSilence)) {
         lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        if (attempt < attemptLimit) continue;
         return {
           ok: false,
           decision: stripInternalReplySemantics(defaultDecision()),
@@ -2029,6 +2134,13 @@ STRICT SAFETY:
       }
 
       const finalized = applyPostConfirmAntiEchoAndSilence(decision, userLine);
+      // Anti-echo can rewrite empty request_booking_mutation + shouldReply=false
+      // into action=silence while mutationIntent/execution flags still show mutation.
+      // Capture before normalization so required-reply extra recovery cannot fire.
+      const mutationDeclaredBeforeNormalize =
+        finalized.action === "request_booking_mutation" ||
+        cleanMutationIntent(finalized.mutationIntent) !== "none" ||
+        finalized.mutationExecutionRequested === true;
       finalized.mutationExecutionRequested =
         finalized.action === "request_booking_mutation";
       finalized.mutationExecutionStatus = cleanMutationExecutionStatus(
@@ -2048,7 +2160,7 @@ STRICT SAFETY:
       if (!bookingSelection.ok) {
         lastReason =
           bookingSelection.reason || "invalid_or_stale_booking_selection";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        if (attempt < attemptLimit) continue;
         return {
           ok: false,
           decision: stripInternalReplySemantics(defaultDecision()),
@@ -2086,6 +2198,43 @@ STRICT SAFETY:
         bookingSelection.mode === "focused" &&
         bookingSelection.selectedBookingIndex === trustedFocusIndex;
 
+      const pendingAvailabilitySelectionDeclared =
+        Number.isInteger(Number(finalized.pendingAvailabilitySelectionIndex)) &&
+        Number(finalized.pendingAvailabilitySelectionIndex) >= 1;
+      const tryTrustedFocusRequiredReplyExtra = () => {
+        if (trustedFocusRequiredReplyExtraUsed) return false;
+        if (silenceRecoveryAttempts < 1) return false;
+        if (!hasTrustedPostConfirmBookingFocus(facts)) return false;
+        if (!trustedFocusedBooking) return false;
+        if (!replyRequired) return false;
+        // Anti-echo may rewrite pending confirm/decline + empty reply to silence;
+        // still exclude whenever pending selection or action was declared.
+        if (pendingAvailabilityAction || pendingAvailabilitySelectionDeclared) {
+          return false;
+        }
+        if (
+          finalized.action === "request_booking_mutation" ||
+          mutationDeclaredBeforeNormalize
+        ) {
+          return false;
+        }
+        if (!isPostConfirmTrustedFocusFactQuestionDecision(finalized)) {
+          return false;
+        }
+        if (
+          !isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(
+            finalized,
+            userLine
+          )
+        ) {
+          return false;
+        }
+        trustedFocusRequiredReplyExtraUsed = true;
+        lastReason = "TRUSTED_FOCUS_REQUIRED_REPLY_AFTER_SILENCE";
+        lastSuspiciousDecision = finalized;
+        return true;
+      };
+
       // A verified read-only booking question must not terminalize before the
       // existing same-Brain silence correction gets one chance to answer.
       if (
@@ -2109,7 +2258,8 @@ STRICT SAFETY:
         !replyText
       ) {
         lastReason = "customer_reply_required_but_empty";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        if (tryTrustedFocusRequiredReplyExtra()) continue;
+        if (attempt < attemptLimit) continue;
         return {
           ok: false,
           decision: stripInternalReplySemantics(defaultDecision()),
@@ -2122,7 +2272,7 @@ STRICT SAFETY:
       }
       if (isPostConfirmNearEchoViolation(userLine, replyText, finalized)) {
         lastReason = "near_echo_reply";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        if (attempt < attemptLimit) continue;
         return {
           ok: false,
           decision: stripInternalReplySemantics(defaultDecision()),
@@ -2147,7 +2297,7 @@ STRICT SAFETY:
           lastReason =
             allCandidateGuard.reason ||
             "all_candidates_grounding_failed";
-          if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+          if (attempt < attemptLimit) continue;
           return {
             ok: false,
             decision: stripInternalReplySemantics(defaultDecision()),
@@ -2218,7 +2368,13 @@ STRICT SAFETY:
       );
       if (!guard.ok) {
         lastReason = guard.reason || "customer_reply_guard_failed";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        if (
+          lastReason === "customer_reply_required_but_empty" &&
+          tryTrustedFocusRequiredReplyExtra()
+        ) {
+          continue;
+        }
+        if (attempt < attemptLimit) continue;
         return {
           ok: false,
           decision: stripInternalReplySemantics(defaultDecision()),
