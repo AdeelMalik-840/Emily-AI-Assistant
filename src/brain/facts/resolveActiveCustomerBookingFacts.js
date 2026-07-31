@@ -120,57 +120,106 @@ function compactCatalogItems(rows) {
   }));
 }
 
-function compactBookingFacts(booking, availabilityRequest = null) {
+/**
+ * Canonical customer-safe booking facts. Trusted linked availability facts may
+ * fill missing booking fields, but booking fields always win when present.
+ */
+export function compactBookingFacts(booking, availabilityRequest = null) {
   const bookingPriceQuote = compactPriceQuote(booking?.priceQuote);
+  const availabilityPriceQuote = compactPriceQuote(
+    availabilityRequest?.priceQuote
+  );
   const totalAmount =
     toFiniteNumber(booking?.totalAmount) ??
     toFiniteNumber(booking?.total) ??
     bookingPriceQuote?.total ??
-    availabilityRequest?.priceQuote?.total ??
+    availabilityPriceQuote?.total ??
     null;
   const dailyRate =
     toFiniteNumber(booking?.dailyRate) ??
     bookingPriceQuote?.dailyRate ??
-    availabilityRequest?.priceQuote?.dailyRate ??
+    availabilityPriceQuote?.dailyRate ??
     null;
   const durationDays =
     toFiniteNumber(booking?.durationDays) ??
-    availabilityRequest?.requestedDuration ??
+    toFiniteNumber(availabilityRequest?.requestedDuration) ??
+    null;
+  const itemId =
+    clean(booking?.itemId, 160) ||
+    clean(availabilityRequest?.itemId, 160) ||
     null;
   const itemLabel =
     clean(booking?.itemLabel) ||
     clean(booking?.itemName) ||
     clean(availabilityRequest?.itemLabel) ||
+    clean(availabilityRequest?.itemName) ||
     null;
+  const resolvedPriceQuote =
+    totalAmount == null && dailyRate == null
+      ? null
+      : { total: totalAmount, dailyRate };
 
   return {
     id: clean(booking?.id) || null,
     customerSafeReference: customerSafeBookingReference(booking),
     status: clean(booking?.status) || null,
     approvalStage: clean(booking?.approvalStage) || null,
-    itemId: clean(booking?.itemId) || null,
+    itemId,
     itemLabel,
     itemName: clean(booking?.itemName) || itemLabel,
     durationDays:
       durationDays != null ? Math.max(1, Math.floor(durationDays)) : null,
     startDate: toCustomerSafeDate(
-      booking?.startDate ?? booking?.startAt ?? booking?.pickupDate
+      booking?.startDate ??
+        booking?.startAt ??
+        booking?.pickupDate ??
+        availabilityRequest?.startDate ??
+        availabilityRequest?.requestedStartDate
     ),
     endDate: toCustomerSafeDate(
-      booking?.endDate ?? booking?.endAt ?? booking?.returnDate
+      booking?.endDate ??
+        booking?.endAt ??
+        booking?.returnDate ??
+        availabilityRequest?.endDate ??
+        availabilityRequest?.requestedEndDate
     ),
     pickupTime:
-      clean(booking?.pickupTime ?? booking?.pickupAt ?? booking?.collectionTime, 120) ||
+      clean(
+        booking?.pickupTime ??
+          booking?.pickupAt ??
+          booking?.collectionTime ??
+          availabilityRequest?.pickupTime,
+        120
+      ) || null,
+    deliveryTime:
+      clean(booking?.deliveryTime ?? availabilityRequest?.deliveryTime, 120) ||
       null,
-    deliveryTime: clean(booking?.deliveryTime, 120) || null,
     deliveryMethod:
-      clean(booking?.deliveryMethod ?? booking?.fulfillmentMethod, 80) || null,
+      clean(
+        booking?.deliveryMethod ??
+          booking?.fulfillmentMethod ??
+          availabilityRequest?.deliveryMethod,
+        80
+      ) || null,
     deliveryAddress:
-      clean(booking?.deliveryAddress ?? booking?.pickupLocation, 300) || null,
+      clean(
+        booking?.deliveryAddress ??
+          booking?.pickupLocation ??
+          availabilityRequest?.deliveryAddress ??
+          availabilityRequest?.pickupLocation,
+        300
+      ) || null,
     totalAmount,
     dailyRate,
-    priceQuote: bookingPriceQuote,
-    availabilityRequestId: clean(booking?.availabilityRequestId) || null,
+    priceQuote: resolvedPriceQuote,
+    availabilityRequestId:
+      clean(booking?.availabilityRequestId) ||
+      clean(
+        availabilityRequest?.id ??
+          availabilityRequest?.requestId ??
+          availabilityRequest?.availabilityRequestId
+      ) ||
+      null,
     dmTargetPhone: canonicalCustomerPhone(booking?.dmTargetPhone) || null,
   };
 }
@@ -234,8 +283,12 @@ function linkedAvailabilityConfirmationMs(request) {
   );
 }
 
-function compactCustomerSafeBookingCandidate(booking, selectionIndex) {
-  const safe = compactBookingFacts(booking);
+function compactCustomerSafeBookingCandidate(
+  booking,
+  selectionIndex,
+  availabilityRequest = null
+) {
+  const safe = compactBookingFacts(booking, availabilityRequest);
   return {
     id: safe.id,
     selectionIndex,
@@ -501,7 +554,8 @@ export async function resolveActiveCustomerBookingFacts({
   const pendingAvailabilityRequests =
     await loadTrustedPendingAvailabilityRequests(connection, uid, phone);
 
-  const bookingCandidates = candidates.map((booking, index) =>
+  const trustedAvailabilityByBookingId = new Map();
+  let bookingCandidates = candidates.map((booking, index) =>
     compactCustomerSafeBookingCandidate(booking, index + 1)
   );
   let booking = candidates[0];
@@ -542,6 +596,18 @@ export async function resolveActiveCustomerBookingFacts({
       })
     );
     const trusted = linkedRows.filter(Boolean);
+    for (const row of trusted) {
+      const bookingId = clean(row?.booking?.id);
+      if (bookingId) trustedAvailabilityByBookingId.set(bookingId, row.request);
+    }
+    bookingCandidates = candidates.map((candidate, index) =>
+      compactCustomerSafeBookingCandidate(
+        candidate,
+        index + 1,
+        trustedAvailabilityByBookingId.get(clean(candidate?.id)) ?? null
+      )
+    );
+
     const nowMs = Date.now();
     const hasUnreasonableFutureConfirmation = trusted.some(
       (row) =>
@@ -673,19 +739,40 @@ export async function resolveActiveCustomerBookingFacts({
       ) {
         availabilityRequest = {
           id: clean(avr.requestId ?? avr.id) || availabilityRequestId,
+          itemId: clean(avr.itemId, 160) || null,
           itemLabel: clean(avr.itemLabel) || null,
           requestedDuration: toFiniteNumber(avr.requestedDuration),
+          startDate: toCustomerSafeDate(
+            avr.startDate ?? avr.requestedStartDate
+          ),
+          endDate: toCustomerSafeDate(avr.endDate ?? avr.requestedEndDate),
+          pickupTime: clean(avr.pickupTime, 120) || null,
+          deliveryTime: clean(avr.deliveryTime, 120) || null,
+          deliveryMethod: clean(avr.deliveryMethod, 80) || null,
+          deliveryAddress:
+            clean(avr.deliveryAddress ?? avr.pickupLocation, 300) || null,
           status: clean(avr.status) || null,
           customerConfirmationStatus:
             clean(avr.customerConfirmationStatus) || null,
           priceQuote: compactPriceQuote(avr.priceQuote),
         };
+        trustedAvailabilityByBookingId.set(
+          clean(booking?.id),
+          availabilityRequest
+        );
       }
     }
   }
 
+  bookingCandidates = candidates.map((candidate, index) =>
+    compactCustomerSafeBookingCandidate(
+      candidate,
+      index + 1,
+      trustedAvailabilityByBookingId.get(clean(candidate?.id)) ?? null
+    )
+  );
+
   const compactBooking = compactBookingFacts(booking, availabilityRequest);
-  const bookingPriceQuote = compactBooking.priceQuote;
   const totalAmount = compactBooking.totalAmount;
   const dailyRate = compactBooking.dailyRate;
   const durationDays = compactBooking.durationDays;

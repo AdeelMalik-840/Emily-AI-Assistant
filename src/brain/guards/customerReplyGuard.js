@@ -133,6 +133,26 @@ function inferReplyLanguageFromText(replyText, declaredStyle) {
   return "mixed";
 }
 
+function hasExplicitValue(value) {
+  if (value === null || value === undefined) return false;
+  return typeof value !== "string" || value.trim() !== "";
+}
+
+/** Missing and empty values stay missing; explicit numeric zero stays zero. */
+function finiteNumberOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.replace(/,/g, "").trim();
+    if (!trimmed) return null;
+    const number = Number(trimmed);
+    return Number.isFinite(number) ? number : null;
+  }
+  return null;
+}
+
 function normalizeItemId(value) {
   return String(value ?? "").trim().toLowerCase();
 }
@@ -365,8 +385,8 @@ function extractExplicitMoneyAmounts(text) {
   const moneyRe =
     /(?:\b(?:pkr|rs\.?|rupees?)\s*([\d,]+(?:\.\d+)?)\b|\b([\d,]+(?:\.\d+)?)\s*(?:pkr|rs\.?|rupees?)\b)/giu;
   for (const match of String(text ?? "").matchAll(moneyRe)) {
-    const value = Number(String(match[1] ?? match[2] ?? "").replace(/,/g, ""));
-    if (Number.isFinite(value)) amounts.push(value);
+    const value = finiteNumberOrNull(match[1] ?? match[2]);
+    if (value != null) amounts.push(value);
   }
   return amounts;
 }
@@ -429,14 +449,18 @@ function verifiedMoneyValues(facts) {
       row?.dailyRate,
       row?.advanceAmount,
     ])
-    .map(Number)
-    .filter(Number.isFinite);
+    .map(finiteNumberOrNull)
+    .filter((value) => value != null);
 }
 
 function uniqueSortedFiniteNumbers(values) {
-  return [...new Set((values || []).map(Number).filter(Number.isFinite))].sort(
-    (a, b) => a - b
-  );
+  return [
+    ...new Set(
+      (values || [])
+        .map(finiteNumberOrNull)
+        .filter((value) => value != null)
+    ),
+  ].sort((a, b) => a - b);
 }
 
 function logVerifiedPriceMismatchDiagnostic({
@@ -449,9 +473,7 @@ function logVerifiedPriceMismatchDiagnostic({
     failureReason: "verified_price_mismatch",
     mismatchSource,
     mismatchField,
-    actualNumericValue: Number.isFinite(Number(actualNumericValue))
-      ? Number(actualNumericValue)
-      : null,
+    actualNumericValue: finiteNumberOrNull(actualNumericValue),
     allowedVerifiedValues: uniqueSortedFiniteNumbers(allowedVerifiedValues),
   });
 }
@@ -465,66 +487,84 @@ function validateDeclaredGroundedFacts(declared, facts) {
       .map((row) => resolveVerifiedCatalogItemId(row, catalogItems))
       .filter(Boolean)
   );
-  if (
-    d.itemId != null &&
-    verifiedItemIds.size > 0 &&
-    !verifiedItemIds.has(normalizeItemId(d.itemId))
-  ) {
-    return { ok: false, reason: "verified_item_mismatch" };
+  if (hasExplicitValue(d.itemId)) {
+    const declaredItemId = normalizeItemId(d.itemId);
+    if (
+      !declaredItemId ||
+      verifiedItemIds.size === 0 ||
+      !verifiedItemIds.has(declaredItemId)
+    ) {
+      return { ok: false, reason: "verified_item_mismatch" };
+    }
   }
 
   const verifiedDurations = new Set(
     rows
-      .map((row) => Number(row?.durationDays))
-      .filter((value) => Number.isFinite(value) && value >= 1)
+      .map((row) => finiteNumberOrNull(row?.durationDays))
+      .filter((value) => value != null && value >= 1)
       .map((value) => Math.floor(value))
   );
-  if (
-    d.durationDays != null &&
-    verifiedDurations.size > 0 &&
-    !verifiedDurations.has(Math.floor(Number(d.durationDays)))
-  ) {
-    return { ok: false, reason: "verified_duration_mismatch" };
+  if (hasExplicitValue(d.durationDays)) {
+    const declaredDuration = finiteNumberOrNull(d.durationDays);
+    if (
+      declaredDuration == null ||
+      declaredDuration < 1 ||
+      verifiedDurations.size === 0 ||
+      !verifiedDurations.has(Math.floor(declaredDuration))
+    ) {
+      return { ok: false, reason: "verified_duration_mismatch" };
+    }
   }
 
   const verifiedStatuses = new Set(
     rows.map((row) => canonicalBookingStatus(row?.bookingStatus)).filter(Boolean)
   );
-  if (
-    d.bookingStatus != null &&
-    verifiedStatuses.size > 0 &&
-    !verifiedStatuses.has(canonicalBookingStatus(d.bookingStatus))
-  ) {
-    return { ok: false, reason: "verified_booking_status_mismatch" };
+  if (hasExplicitValue(d.bookingStatus)) {
+    const declaredStatus = canonicalBookingStatus(d.bookingStatus);
+    if (
+      !declaredStatus ||
+      verifiedStatuses.size === 0 ||
+      !verifiedStatuses.has(declaredStatus)
+    ) {
+      return { ok: false, reason: "verified_booking_status_mismatch" };
+    }
   }
 
   const verifiedReferences = new Set(
     rows.map((row) => normalizeComparableText(row?.bookingReference)).filter(Boolean)
   );
-  if (
-    d.bookingReference != null &&
-    verifiedReferences.size > 0 &&
-    !verifiedReferences.has(normalizeComparableText(d.bookingReference))
-  ) {
-    return { ok: false, reason: "verified_booking_reference_mismatch" };
+  if (hasExplicitValue(d.bookingReference)) {
+    const declaredReference = normalizeComparableText(d.bookingReference);
+    if (
+      !declaredReference ||
+      verifiedReferences.size === 0 ||
+      !verifiedReferences.has(declaredReference)
+    ) {
+      return { ok: false, reason: "verified_booking_reference_mismatch" };
+    }
   }
 
   for (const key of ["totalAmount", "dailyRate", "advanceAmount"]) {
     const verifiedValues = new Set(
-      rows.map((row) => Number(row?.[key])).filter(Number.isFinite)
+      rows
+        .map((row) => finiteNumberOrNull(row?.[key]))
+        .filter((value) => value != null)
     );
-    if (
-      d[key] != null &&
-      verifiedValues.size > 0 &&
-      !verifiedValues.has(Number(d[key]))
-    ) {
-      logVerifiedPriceMismatchDiagnostic({
-        mismatchSource: "grounded_facts",
-        mismatchField: key,
-        actualNumericValue: Number(d[key]),
-        allowedVerifiedValues: [...verifiedValues],
-      });
-      return { ok: false, reason: "verified_price_mismatch" };
+    if (hasExplicitValue(d[key])) {
+      const declaredValue = finiteNumberOrNull(d[key]);
+      if (
+        declaredValue == null ||
+        verifiedValues.size === 0 ||
+        !verifiedValues.has(declaredValue)
+      ) {
+        logVerifiedPriceMismatchDiagnostic({
+          mismatchSource: "grounded_facts",
+          mismatchField: key,
+          actualNumericValue: declaredValue,
+          allowedVerifiedValues: [...verifiedValues],
+        });
+        return { ok: false, reason: "verified_price_mismatch" };
+      }
     }
   }
 
@@ -533,17 +573,20 @@ function validateDeclaredGroundedFacts(declared, facts) {
     const verifiedValues = new Set(
       rows.map((row) => normalize(row?.[key])).filter(Boolean)
     );
-    if (
-      d[key] != null &&
-      verifiedValues.size > 0 &&
-      !verifiedValues.has(normalize(d[key]))
-    ) {
-      return {
-        ok: false,
-        reason: key.includes("Date")
-          ? "verified_booking_date_mismatch"
-          : "verified_booking_time_mismatch",
-      };
+    if (hasExplicitValue(d[key])) {
+      const declaredValue = normalize(d[key]);
+      if (
+        !declaredValue ||
+        verifiedValues.size === 0 ||
+        !verifiedValues.has(declaredValue)
+      ) {
+        return {
+          ok: false,
+          reason: key.includes("Date")
+            ? "verified_booking_date_mismatch"
+            : "verified_booking_time_mismatch",
+        };
+      }
     }
   }
 
@@ -596,7 +639,7 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
       declared.endDate,
       declared.pickupTime,
       declared.deliveryTime,
-    ].some((value) => value != null && String(value).trim() !== "");
+    ].some(hasExplicitValue);
     const explicitBookingFact =
       extractExplicitReplyDurationDays(text).length > 0 ||
       extractExplicitBookingStatuses(text).length > 0 ||
@@ -609,86 +652,96 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
     }
   }
   if (
-    verifiedItemIds.size > 0 &&
-    [...replyItemIds].some((replyItemId) => !verifiedItemIds.has(replyItemId))
+    replyItemIds.size > 0 &&
+    (verifiedItemIds.size === 0 ||
+      [...replyItemIds].some((replyItemId) => !verifiedItemIds.has(replyItemId)))
   ) {
     return { ok: false, reason: "verified_item_mismatch" };
   }
 
   const verifiedDurations = new Set(
     rows
-      .map((row) => Number(row?.durationDays))
-      .filter((value) => Number.isFinite(value) && value >= 1)
+      .map((row) => finiteNumberOrNull(row?.durationDays))
+      .filter((value) => value != null && value >= 1)
       .map((value) => Math.floor(value))
   );
-  if (verifiedDurations.size > 0) {
-    const replyDurations = extractExplicitReplyDurationDays(text);
-    if (
+  const replyDurations = extractExplicitReplyDurationDays(text);
+  if (
+    replyDurations.length > 0 &&
+    (verifiedDurations.size === 0 ||
       replyDurations.some(
         (replyDuration) => !verifiedDurations.has(replyDuration)
-      )
-    ) {
-      return { ok: false, reason: "verified_duration_mismatch" };
-    }
+      ))
+  ) {
+    return { ok: false, reason: "verified_duration_mismatch" };
   }
 
   const verifiedStatuses = new Set(
     rows.map((row) => canonicalBookingStatus(row?.bookingStatus)).filter(Boolean)
   );
-  if (verifiedStatuses.size > 0) {
-    const statuses = extractExplicitBookingStatuses(text);
-    if (statuses.some((status) => !verifiedStatuses.has(status))) {
-      return { ok: false, reason: "verified_booking_status_mismatch" };
-    }
+  const statuses = extractExplicitBookingStatuses(text);
+  if (
+    statuses.length > 0 &&
+    (verifiedStatuses.size === 0 ||
+      statuses.some((status) => !verifiedStatuses.has(status)))
+  ) {
+    return { ok: false, reason: "verified_booking_status_mismatch" };
   }
 
   const verifiedReferences = new Set(
     rows.map((row) => normalizeComparableText(row?.bookingReference)).filter(Boolean)
   );
-  if (verifiedReferences.size > 0) {
-    const references = extractExplicitBookingReferences(text);
-    if (references.some((reference) => !verifiedReferences.has(reference))) {
-      return { ok: false, reason: "verified_booking_reference_mismatch" };
-    }
+  const references = extractExplicitBookingReferences(text);
+  if (
+    references.length > 0 &&
+    (verifiedReferences.size === 0 ||
+      references.some((reference) => !verifiedReferences.has(reference)))
+  ) {
+    return { ok: false, reason: "verified_booking_reference_mismatch" };
   }
 
   const verifiedAmounts = verifiedMoneyValues(facts);
-  if (verifiedAmounts.length > 0) {
-    const amounts = extractExplicitMoneyAmounts(text);
-    const mismatchedAmount = amounts.find(
-      (amount) => !verifiedAmounts.includes(amount)
-    );
-    if (mismatchedAmount != null) {
-      logVerifiedPriceMismatchDiagnostic({
-        mismatchSource: "reply_text",
-        mismatchField: "explicitMoneyAmount",
-        actualNumericValue: mismatchedAmount,
-        allowedVerifiedValues: verifiedAmounts,
-      });
-      return { ok: false, reason: "verified_price_mismatch" };
-    }
+  const amounts = extractExplicitMoneyAmounts(text);
+  const mismatchedAmount = amounts.find(
+    (amount) => !verifiedAmounts.includes(amount)
+  );
+  if (
+    amounts.length > 0 &&
+    (verifiedAmounts.length === 0 || mismatchedAmount != null)
+  ) {
+    logVerifiedPriceMismatchDiagnostic({
+      mismatchSource: "reply_text",
+      mismatchField: "explicitMoneyAmount",
+      actualNumericValue: mismatchedAmount ?? amounts[0],
+      allowedVerifiedValues: verifiedAmounts,
+    });
+    return { ok: false, reason: "verified_price_mismatch" };
   }
 
   const verifiedDates = rows
     .flatMap((row) => [row.startDate, row.endDate])
     .map(normalizeDateClaim)
     .filter(Boolean);
-  if (verifiedDates.length > 0) {
-    const dateClaims = extractExplicitDateClaims(text);
-    if (dateClaims.some((date) => !verifiedDates.includes(date))) {
-      return { ok: false, reason: "verified_booking_date_mismatch" };
-    }
+  const dateClaims = extractExplicitDateClaims(text);
+  if (
+    dateClaims.length > 0 &&
+    (verifiedDates.length === 0 ||
+      dateClaims.some((date) => !verifiedDates.includes(date)))
+  ) {
+    return { ok: false, reason: "verified_booking_date_mismatch" };
   }
 
   const verifiedTimes = rows
     .flatMap((row) => [row.pickupTime, row.deliveryTime])
     .map(normalizeTimeClaim)
     .filter(Boolean);
-  if (verifiedTimes.length > 0) {
-    const timeClaims = extractExplicitTimeClaims(text);
-    if (timeClaims.some((time) => !verifiedTimes.includes(time))) {
-      return { ok: false, reason: "verified_booking_time_mismatch" };
-    }
+  const timeClaims = extractExplicitTimeClaims(text);
+  if (
+    timeClaims.length > 0 &&
+    (verifiedTimes.length === 0 ||
+      timeClaims.some((time) => !verifiedTimes.includes(time)))
+  ) {
+    return { ok: false, reason: "verified_booking_time_mismatch" };
   }
 
   const declaredGrounding = validateDeclaredGroundedFacts(groundedFacts, facts);
@@ -857,9 +910,11 @@ export function validateCustomerReplyAgainstContract(
 
   const requiredMeaning = String(contract?.requiredMeaning ?? "");
   if (requiredMeaning === "state_verified_quotation") {
-    const total = contract?.verifiedCustomerFacts?.quotedPrice?.total;
-    if (total != null && Number.isFinite(Number(total))) {
-      const totalStr = String(Math.floor(Number(total)));
+    const total = finiteNumberOrNull(
+      contract?.verifiedCustomerFacts?.quotedPrice?.total
+    );
+    if (total != null) {
+      const totalStr = String(Math.floor(total));
       const compact = text.replace(/[,\s]/g, "");
       if (!compact.includes(totalStr) && !text.includes(totalStr)) {
         return { ok: false, reason: "verified_quotation_missing_from_reply" };

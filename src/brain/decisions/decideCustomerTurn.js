@@ -64,6 +64,39 @@ function cleanLane(value) {
 }
 
 /**
+ * Compatibility-only normalization for older post-confirm fact shapes.
+ * Canonical resolver output already includes bookingCandidates; when it does,
+ * preserve it exactly. Legacy activeBookings are copied into candidate rows so
+ * clarification can use customer-safe identities without selecting a booking.
+ */
+function normalizePostConfirmBookingCandidates(rawFacts) {
+  const facts =
+    rawFacts && typeof rawFacts === "object"
+      ? /** @type {Record<string, unknown>} */ (rawFacts)
+      : {};
+  if (
+    Array.isArray(facts.bookingCandidates) &&
+    facts.bookingCandidates.length > 0
+  ) {
+    return facts;
+  }
+  if (!Array.isArray(facts.activeBookings) || facts.activeBookings.length === 0) {
+    return facts;
+  }
+  return {
+    ...facts,
+    bookingCandidates: facts.activeBookings.map((row, index) => ({
+      ...(row && typeof row === "object" ? row : {}),
+      selectionIndex:
+        Number.isInteger(Number(row?.selectionIndex)) &&
+        Number(row.selectionIndex) >= 1
+          ? Number(row.selectionIndex)
+          : index + 1,
+    })),
+  };
+}
+
+/**
  * Normalize a shared TurnContext. Missing fields are safe nulls.
  * @param {Record<string, unknown> | null | undefined} raw
  * @returns {TurnContext}
@@ -271,8 +304,11 @@ export async function decideCustomerTurn(turnContextInput = {}) {
   const lane = turnContext.lane;
 
   if (lane === "post_confirm_pa") {
+    const postConfirmFacts = normalizePostConfirmBookingCandidates(
+      turnContext.facts || {}
+    );
     const result = await executePostConfirmPaLaneDecision({
-      facts: turnContext.facts || {},
+      facts: postConfirmFacts,
       userMessage: turnContext.messageText || "",
       conversationHistory: turnContext.recentDialogue,
       styleKey: turnContext.styleKey || "casual_local",
