@@ -204,6 +204,84 @@ function langOptsFromFacts(facts = {}, overrides = {}) {
   };
 }
 
+function firstNonEmptyText(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+function firstFiniteNumber(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    const number = Number(
+      typeof value === "string" ? value.replace(/,/g, "").trim() : value
+    );
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+/**
+ * Canonical read-only guard projection for waiting-confirm facts.
+ * Original nested facts remain present; flat fields are additive and use the
+ * same shape as post-confirm guard facts. Missing values remain null and a real
+ * numeric zero is preserved.
+ */
+export function buildWaitingConfirmGuardFacts(facts = {}) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  const avr =
+    f.availabilityRequest && typeof f.availabilityRequest === "object"
+      ? f.availabilityRequest
+      : {};
+  const quote =
+    f.quotedPrice && typeof f.quotedPrice === "object" ? f.quotedPrice : {};
+  const itemId = firstNonEmptyText(f.itemId, avr.itemId);
+  const itemLabel = firstNonEmptyText(f.itemLabel, avr.itemLabel);
+  const existingCatalog = Array.isArray(f.catalogItems) ? f.catalogItems : [];
+  const catalogItems =
+    existingCatalog.length > 0
+      ? existingCatalog
+      : itemId || itemLabel
+        ? [
+            {
+              id: itemId,
+              name: itemLabel,
+              displayLabel: itemLabel,
+              aliases: [],
+            },
+          ]
+        : [];
+
+  return {
+    ...f,
+    bookingExecutionVerified: f.bookingExecutionVerified === true,
+    itemId,
+    itemLabel,
+    durationDays: firstFiniteNumber(
+      f.durationDays,
+      avr.requestedDuration,
+      quote.durationDays
+    ),
+    totalAmount: firstFiniteNumber(f.totalAmount, quote.total),
+    dailyRate: firstFiniteNumber(f.dailyRate, quote.dailyRate),
+    advanceAmount: firstFiniteNumber(
+      f.advanceAmount,
+      f.knownPolicies?.advanceAmount
+    ),
+    bookingStatus: firstNonEmptyText(f.bookingStatus),
+    bookingReference: firstNonEmptyText(f.bookingReference),
+    startDate: firstNonEmptyText(f.startDate, avr.startDate),
+    endDate: firstNonEmptyText(f.endDate, avr.endDate),
+    pickupTime: firstNonEmptyText(f.pickupTime, avr.pickupTime),
+    deliveryTime: firstNonEmptyText(f.deliveryTime, avr.deliveryTime),
+    catalogItems,
+  };
+}
+
 /** Group post-execute: availability check started, not confirmed. */
 export function buildGroupPostExecutePendingAvailabilityContract(facts = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
@@ -237,15 +315,15 @@ export function buildGroupPostExecutePendingAvailabilityContract(facts = {}) {
 /** Waiting-confirm DM: answer from verified quotation; no booking this turn. */
 export function buildWaitingConfirmVerifiedQuotationContract(facts = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
-  const hasQuote =
-    f?.quotedPrice?.total != null && Number.isFinite(Number(f.quotedPrice.total));
+  const guardFacts = buildWaitingConfirmGuardFacts(f);
+  const hasQuote = guardFacts.totalAmount != null;
   const lang = langOptsFromFacts(f);
   return buildCustomerReplyContract({
     channel: "dm",
     conversationalGoal:
       "Answer the customer from verified facts (including quoted price when present). Do not invent amounts. Do not treat this turn as a booking confirmation unless the customer is clearly confirming. Match the customer's language.",
     replyRequired: true,
-    verifiedCustomerFacts: f,
+    verifiedCustomerFacts: guardFacts,
     requiredMeaning: hasQuote
       ? "facts_with_optional_verified_quotation"
       : "facts_only_no_invented_quote",
@@ -281,15 +359,15 @@ export function buildWaitingConfirmVerifiedQuotationContract(facts = {}) {
  */
 export function buildWaitingConfirmPreExecutionConfirmContract(facts = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
+  const guardFacts = buildWaitingConfirmGuardFacts(f);
   const lang = langOptsFromFacts(f);
-  const hasQuote =
-    f?.quotedPrice?.total != null && Number.isFinite(Number(f.quotedPrice.total));
+  const hasQuote = guardFacts.totalAmount != null;
   return buildCustomerReplyContract({
     channel: "dm",
     conversationalGoal:
       "Acknowledge that the customer confirmed and that Emily will proceed with the booking/reservation request. Do not claim the booking already exists, is confirmed, or completed. Match the customer's language.",
     replyRequired: false,
-    verifiedCustomerFacts: f,
+    verifiedCustomerFacts: guardFacts,
     requiredMeaning: "pre_execution_booking_request_ack",
     allowedClaims: [
       CUSTOMER_CLAIMS.CUSTOMER_CONFIRMATION_ACKNOWLEDGED,
