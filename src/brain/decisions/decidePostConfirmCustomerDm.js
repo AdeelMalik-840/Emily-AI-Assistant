@@ -19,6 +19,7 @@ import {
 } from "../contracts/customerReplyContract.js";
 import {
   buildCustomerReplyGuardCorrection,
+  isVerifiedCustomerClaimMismatchReason,
   validateCustomerReplyAgainstContract,
 } from "../guards/customerReplyGuard.js";
 import {
@@ -808,6 +809,8 @@ export function buildPostConfirmVerifiedItemMismatchCorrection(
     return [
       `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
       "Use ONLY verified customer-safe facts from VERIFIED_BUSINESS_PA_FACTS_JSON.",
+      "If the requested detail is absent, say it is not confirmed or ask one useful clarification — never invent a substitute.",
+      "Keep action=reply with a non-empty customerReply. No silence, no mutation.",
       "Return the same required JSON schema. Return JSON only.",
     ].join("\n");
   }
@@ -823,8 +826,24 @@ export function buildPostConfirmVerifiedItemMismatchCorrection(
     "The final customerReply and groundedFacts.itemId MUST refer only to this focused booking.",
     "Do not use any OUT_OF_SCOPE_CONTEXT_ONLY candidate in customerReply or groundedFacts.",
     "Use bookingSelectionMode=focused with this selectedBookingIndex for read-only factual answers.",
+    "If a requested detail is absent from verified facts, say it is not confirmed or ask one useful clarification — never invent a substitute.",
+    "Keep action=reply with a non-empty customerReply. No silence, no mutation.",
     "Return the same required JSON schema, including honest replySemantics.claims and languageStyle.",
     "Return JSON only.",
+  ].join("\n");
+}
+
+/**
+ * Same-lane correction after a deterministic verified_* claim mismatch.
+ * Reuses the shared guard correction text; pins customer intent for rewrite.
+ * @param {string} reason
+ * @param {string} userMessage
+ */
+function buildPostConfirmVerifiedClaimGuardCorrection(reason, userMessage) {
+  return [
+    buildCustomerReplyGuardCorrection(reason),
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    "Preserve that customer intent. Rewrite customerReply from verified facts only.",
   ].join("\n");
 }
 
@@ -2168,6 +2187,13 @@ CUSTOMER_REPLY CONTRACT (critical):
 - Empty customerReply is ONLY allowed for action="silence" (shouldReply=false) or action="request_booking_mutation" (final wording is composed after deterministic execution).
 - If a verified policy/fact is present, answer from that fact. If absent, ask one useful clarification OR say the detail is not confirmed — still with a non-empty customerReply when action="reply".
 
+VERIFIED FACTUAL GROUNDING (informational replies — general rule):
+- Every factual value stated in customerReply (item, duration, status, reference, amount, date, time, policy, location, or similar) MUST already exist in VERIFIED_BUSINESS_PA_FACTS_JSON.
+- If the requested detail is absent/null in verified facts, produce a natural unknown/unconfirmed reply OR ask one useful clarification. Never invent a replacement value.
+- Do not infer or invent dates, times, amounts, locations, statuses, policies, references, or items.
+- Do not mention a date or clock time merely because the customer asked about an event (for example pickup/delivery). Only state a time/date when that exact value is verified in facts.
+- Social turns need no invented booking facts.
+
 INFORMATIONAL VS MUTATION (delivery/pickup):
 - Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", bookingSelectionMode="focused" when a trusted booking is in scope.
 - Use mutationIntent="update_delivery" / "update_pickup" ONLY when the customer asks to change, set, or add delivery/pickup details on the existing booking. A yes/no availability question is NOT a mutation.
@@ -2252,7 +2278,7 @@ LANE FACT RULES:
   use null/[] exactly as the schema requires.
 
 STRICT SAFETY:
-- Do NOT invent amounts or policies.
+- Do NOT invent amounts, policies, dates, times, locations, statuses, references, or items.
 - Do NOT create/cancel/change bookings.
 - A requested booking mutation is not completed unless verified mutationExecution.status is succeeded.
 - Do NOT mention Brain, Firestore, OpenAI, or internal tokens.
@@ -2354,6 +2380,11 @@ STRICT SAFETY:
                   facts,
                   lastReason
                 )}`
+              : isVerifiedCustomerClaimMismatchReason(lastReason)
+                ? `${userPayload}\n\n${buildPostConfirmVerifiedClaimGuardCorrection(
+                    lastReason,
+                    userLine
+                  )}`
               : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
       const createPromise = Promise.resolve(
         completionFn({

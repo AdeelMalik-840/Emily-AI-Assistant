@@ -592,7 +592,16 @@ export function isPostConfirmModelContractFailureError(lastError) {
     /EMPTY_OR_INVALID_OPENAI_REPLY/i.test(err) ||
     /OPENAI_POST_CONFIRM_FAILED/i.test(err) ||
     /OPENAI_POST_CONFIRM_MODEL_CONTRACT/i.test(err) ||
-    /customer_reply_required_but_empty/i.test(err)
+    /customer_reply_required_but_empty/i.test(err) ||
+    // Exhausted in-decision claim-guard mismatches must not auto-replay storms.
+    /verified_item_mismatch/i.test(err) ||
+    /verified_duration_mismatch/i.test(err) ||
+    /verified_booking_status_mismatch/i.test(err) ||
+    /verified_booking_reference_mismatch/i.test(err) ||
+    /verified_price_mismatch/i.test(err) ||
+    /verified_booking_date_mismatch/i.test(err) ||
+    /verified_booking_time_mismatch/i.test(err) ||
+    /verified_policy_mismatch/i.test(err)
   );
 }
 

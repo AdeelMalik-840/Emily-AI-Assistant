@@ -983,22 +983,50 @@ export function validateCustomerReplyAgainstContract(
 }
 
 /**
+ * Deterministic verified-claim mismatch reasons from claim-level reply validation.
+ * @param {unknown} reason
+ * @returns {boolean}
+ */
+export function isVerifiedCustomerClaimMismatchReason(reason) {
+  return /^(?:verified_item_mismatch|verified_duration_mismatch|verified_booking_status_mismatch|verified_booking_reference_mismatch|verified_price_mismatch|verified_booking_date_mismatch|verified_booking_time_mismatch|verified_policy_mismatch)$/.test(
+    String(reason ?? "").trim()
+  );
+}
+
+/**
  * @param {string} reason
  * @returns {string}
  */
 export function buildCustomerReplyGuardCorrection(reason) {
-  return `CORRECTION: Your previous customer reply failed validation (${reason}).
-Use ONLY verified customer-safe facts.
-If the failure is dm_reply_too_long or group_reply_too_long, return a materially shorter customerReply within the contract limit.
-Match the customer's language in replySemantics.languageStyle and in customerReply wording:
-- english customer → english reply
-- roman_urdu customer → roman_urdu reply
-- mixed customer → mixed is fine
-Do not claim resource availability is confirmed unless allowedClaims includes resource_availability_confirmed.
-Do not claim booking/reservation/appointment/order created or confirmed unless verified post-execution facts allow it.
-Before booking execution succeeds, only acknowledge confirmation received / request will proceed — do not paste the customer's message back.
-When stating a verified quoted total, include the exact digits from the contract/facts in customerReply.
-Do not invent timing, payment, delivery, or internal process details.
-Return the same required JSON schema, including honest replySemantics.claims and languageStyle.
-Return JSON only.`;
+  const failureReason = String(reason ?? "").trim() || "validation_failed";
+  const lines = [
+    `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
+    "Use ONLY verified customer-safe facts.",
+    "If the failure is dm_reply_too_long or group_reply_too_long, return a materially shorter customerReply within the contract limit.",
+    "Match the customer's language in replySemantics.languageStyle and in customerReply wording:",
+    "- english customer → english reply",
+    "- roman_urdu customer → roman_urdu reply",
+    "- mixed customer → mixed is fine",
+    "Do not claim resource availability is confirmed unless allowedClaims includes resource_availability_confirmed.",
+    "Do not claim booking/reservation/appointment/order created or confirmed unless verified post-execution facts allow it.",
+    "Before booking execution succeeds, only acknowledge confirmation received / request will proceed — do not paste the customer's message back.",
+    "When stating a verified quoted total, include the exact digits from the contract/facts in customerReply.",
+    "Do not invent timing, payment, delivery, or internal process details.",
+  ];
+  if (isVerifiedCustomerClaimMismatchReason(failureReason)) {
+    lines.push(
+      "VERIFIED CLAIM MISMATCH (critical — rewrite, do not invent):",
+      "- Preserve the original understood customer intent.",
+      "- Rewrite customerReply using ONLY values present in verified facts/contract.",
+      "- Remove every unsupported item, duration, status, reference, price, date, time, or policy claim.",
+      "- If the requested detail is absent from verified facts, naturally say it is not confirmed yet OR ask one useful clarification.",
+      "- Never invent a substitute date, time, amount, location, status, policy, reference, or item.",
+      "- Keep action=reply with a non-empty customerReply. No silence, no mutation, no escalate, no workflow change."
+    );
+  }
+  lines.push(
+    "Return the same required JSON schema, including honest replySemantics.claims and languageStyle.",
+    "Return JSON only."
+  );
+  return lines.join("\n");
 }
