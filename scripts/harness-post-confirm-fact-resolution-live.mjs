@@ -199,7 +199,14 @@ const CASES = [
   { msg: "pickup kis time hai?", state: "absent_core", expectInfo: "pickup_time", expectStatus: "not_found", mustPass: true },
   { msg: "kal pickup kitne baje hogi?", state: "present_core", expectInfo: "pickup_time", expectStatus: "found", mustPass: true },
   { msg: "delivery ho skti hai?", state: "policy_present", expectInfo: "delivery_policy", expectStatus: "found", mustPass: true },
-  { msg: "delivery kahan tak hogi?", state: "absent_core", expectInfo: ["delivery_location", "delivery_policy"], expectStatus: "not_found" },
+  // Ambiguous: area ask may resolve as delivery location/policy miss, OR ask which area.
+  {
+    msg: "delivery kahan tak hogi?",
+    state: "absent_core",
+    expectInfo: ["delivery_location", "delivery_policy", "unclear"],
+    expectStatus: ["not_found", "unsupported"],
+    ambiguousDeliveryClarify: true,
+  },
   { msg: "delivery ka time kya hai?", state: "present_core", expectInfo: "delivery_time", expectStatus: "found" },
   { msg: "gari ghar deliver ho jaye gi?", state: "absent_core", expectInfo: ["delivery_policy", "delivery_location", "unclear"], expectStatus: ["not_found", "unsupported"], mustPass: true },
   { msg: "delivery charges hain?", state: "absent_core", expectInfo: ["delivery_policy", "unclear", "other_verified_fact"], expectStatus: ["not_found", "unsupported"] },
@@ -624,6 +631,31 @@ async function runCaseBody(c, index) {
     if (claims.times.length > 0) {
       pass = false;
       failReasons.push(`invented_time:${claims.times.join(",")}`);
+    }
+  }
+  // Case-local: clarification for ambiguous delivery-area ask must not assert
+  // delivery area / time / charge / availability facts.
+  if (
+    c.ambiguousDeliveryClarify === true &&
+    capability === "clarification_needed"
+  ) {
+    if (!finalReply) {
+      pass = false;
+      failReasons.push("clarify_empty");
+    }
+    if (claims.times.length > 0 || claims.money.length > 0) {
+      pass = false;
+      failReasons.push(
+        `clarify_asserted_delivery_fact:${[...claims.times, ...claims.money].join(",")}`
+      );
+    }
+    if (
+      /\b(lahore|dha|gulberg|model\s*town|johar|city[- ]wide|free\s+delivery|delivery\s+available|charges?\s+\d)\b/i.test(
+        finalReply
+      )
+    ) {
+      pass = false;
+      failReasons.push("clarify_asserted_delivery_area_or_offer");
     }
   }
   if (!guard.ok && finalReply) {
