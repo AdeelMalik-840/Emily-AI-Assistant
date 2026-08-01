@@ -27,6 +27,19 @@ import {
   MAX_CUSTOMER_REPLY_ATTEMPTS,
   REPLY_SEMANTICS_SCHEMA,
 } from "../openai/strictJsonSchema.js";
+import {
+  cleanPostConfirmCapability,
+  capabilityRequiresEvidenceResolution,
+  normalizeEvidenceNeeds,
+  POST_CONFIRM_CAPABILITIES,
+  POST_CONFIRM_EVIDENCE_CONCEPTS,
+  POST_CONFIRM_EVIDENCE_ATTRIBUTES,
+  POST_CONFIRM_EVIDENCE_ENTITIES,
+  // legacy compat during migration
+  cleanRequestedInformation,
+  mapLegacyRequestedInformationToTurnPlan,
+  REQUESTED_INFORMATION_TO_MISSING_INFO_TYPE,
+} from "../facts/resolvePostConfirmRequestedFact.js";
 
 export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "information_request",
@@ -37,6 +50,7 @@ export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "correction",
   "unknown",
 ]);
+
 
 export const POST_CONFIRM_ACTIONS = Object.freeze([
   "none",
@@ -406,6 +420,8 @@ export function isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(
 ) {
   if (!cleanCustomerReply(userMessage)) return false;
   const d = decision && typeof decision === "object" ? decision : {};
+  // Factual deferred wording is intentional — not silence drift.
+  if (isDeferredPostConfirmInformationalDecision(d)) return false;
   const action = cleanAction(d.action);
   const reply = cleanCustomerReply(d.customerReply);
   if (action === "silence" || d.shouldReply === false || !reply) {
@@ -443,7 +459,8 @@ function buildPostConfirmSuspiciousSilenceCorrection(
     `Previous decision (invalid/suspicious): ${JSON.stringify(compact)}`,
     "Rules:",
     "- Silence is valid ONLY for a purely social acknowledgement with no question, request, concern, or requested information.",
-    "- When the customer asks anything about the booking, answer naturally from VERIFIED_FACTS_JSON with action=reply, shouldReply=true, and a non-empty customerReply.",
+    "- When the customer asks anything factual about the booking/business: set capability + evidenceNeeds Turn Plan with customerReply=\"\". Do NOT answer facts here.",
+    "- Genuine social small-talk only: capability=social with a non-empty customerReply that states NO booking facts, prices, policies, dates, times, locations, or references.",
     "- For read-only informational questions with a trusted bookingFocus, use bookingSelectionMode=focused (or leave none — the system may apply trusted focus).",
     "- Never invent amounts, dates, policies, or booking mutations. Strict JSON only.",
   ].join("\n");
@@ -470,10 +487,6 @@ function buildPostConfirmTrustedFocusRequiredReplyCorrection(
         availabilityRequestId: identity.availabilityRequestId,
         itemId: identity.itemId,
         itemLabel: identity.itemLabel,
-        durationDays: identity.durationDays,
-        totalAmount: identity.totalAmount,
-        dailyRate: identity.dailyRate,
-        bookingStatus: identity.bookingStatus,
         scope: identity.scope,
         selectedBookingIndex: identity.selectedBookingIndex,
       }
@@ -494,11 +507,12 @@ function buildPostConfirmTrustedFocusRequiredReplyCorrection(
     "but this turn requires a customer reply for the trusted focused booking.",
     `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
     `Immediately preceding assistant message: ${clean(lastEmily, 500) || "(none)"}`,
-    `Trusted focused booking identity (answer ONLY this booking): ${JSON.stringify(compactIdentity)}`,
+    `Trusted focused booking identity (selection only — no answerable fact values): ${JSON.stringify(compactIdentity)}`,
     `Previous decision (still invalid): ${JSON.stringify(compactPrior)}`,
     "Rules:",
-    "- Must set action=reply, shouldReply=true, and a non-empty natural customerReply.",
-    "- Answer only from VERIFIED_FACTS_JSON / CURRENT_BOOKING_IN_SCOPE for the trusted focused booking.",
+    "- Must set action=reply, shouldReply=true.",
+    "- Factual/booking/business asks: capability + evidenceNeeds Turn Plan, customerReply=\"\". Wording happens after trusted resolve.",
+    "- Genuine social only: capability=social with non-empty customerReply and NO factual business/booking claims.",
     "- Use bookingSelectionMode=focused (or none — the system may apply trusted focus).",
     "- Do not silence. Do not invent amounts, dates, policies, or mutations. Strict JSON only.",
   ].join("\n");
@@ -525,36 +539,21 @@ function buildPostConfirmEmptyInvalidInformationalRecoveryCorrection(
         availabilityRequestId: identity.availabilityRequestId,
         itemId: identity.itemId,
         itemLabel: identity.itemLabel,
-        durationDays: identity.durationDays,
-        totalAmount: identity.totalAmount,
-        dailyRate: identity.dailyRate,
-        bookingStatus: identity.bookingStatus,
         scope: identity.scope,
         selectedBookingIndex: identity.selectedBookingIndex,
       }
     : null;
-  const known =
-    facts?.known && typeof facts.known === "object" ? facts.known : {};
-  const knownPolicyKeys = [
-    "deliveryPolicy",
-    "driverPolicy",
-    "advancePolicy",
-    "paymentPolicy",
-    "documentsPolicy",
-  ].filter((key) => clean(known[key], 20));
   return [
     "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — empty/invalid output recovery).",
     "Prior model output was empty, malformed, or missing a required customerReply.",
     `Usability classification (privacy-safe): ${clean(classification, 60) || "schema_or_parse_failure"}`,
     `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
     `Immediately preceding assistant message: ${clean(lastEmily, 500) || "(none)"}`,
-    `Trusted focused booking identity: ${JSON.stringify(compactIdentity)}`,
-    `Verified known policy keys present: ${JSON.stringify(knownPolicyKeys)}`,
+    `Trusted focused booking identity (selection only — no answerable fact values): ${JSON.stringify(compactIdentity)}`,
     "Rules:",
-    "- Must set action=reply, shouldReply=true, and a non-empty natural customerReply.",
-    "- Answer ONLY from VERIFIED_BUSINESS_PA_FACTS_JSON / CURRENT_BOOKING_IN_SCOPE.",
-    "- If the asked detail is present in verified facts/policies, answer from that fact only.",
-    "- If the asked detail is absent, ask one useful natural clarification OR say the detail is not confirmed.",
+    "- Must set action=reply, shouldReply=true.",
+    "- Factual/booking/business/policy/availability asks: capability + evidenceNeeds Turn Plan with customerReply=\"\". Do NOT answer facts in this decide step.",
+    "- Genuine social small-talk only: capability=social, non-empty customerReply with NO booking facts, prices, policies, dates, times, locations, or references.",
     "- Never invent delivery, fees, timing, amounts, dates, or policies.",
     "- A yes/no availability question about delivery/pickup is informational (mutationIntent=none), not update_delivery/update_pickup.",
     "- Do NOT use action=silence. Do NOT use request_booking_mutation / escalate_missing_info.",
@@ -609,7 +608,13 @@ export function classifyPostConfirmOpenAiUsabilityFailure(raw) {
   const isMutation =
     action === "request_booking_mutation" &&
     cleanMutationIntent(parsed.mutationIntent) !== "none";
-  if (!customerReply && !isSilence && !isMutation) {
+  const capability = cleanPostConfirmCapability(parsed.capability);
+  const hasLegacyInfo = Boolean(
+    cleanRequestedInformation(parsed.requestedInformation)
+  );
+  const deferredTurnPlan =
+    capabilityRequiresEvidenceResolution(capability) || hasLegacyInfo;
+  if (!customerReply && !isSilence && !isMutation && !deferredTurnPlan) {
     return "empty_required_reply";
   }
   return "schema_or_parse_failure";
@@ -679,6 +684,7 @@ function compactCustomerSafeBooking(booking) {
     startDate: booking.startDate ?? null,
     endDate: booking.endDate ?? null,
     pickupTime: booking.pickupTime ?? null,
+    pickupLocation: booking.pickupLocation ?? null,
     deliveryTime: booking.deliveryTime ?? null,
     deliveryMethod: booking.deliveryMethod ?? null,
     deliveryAddress: booking.deliveryAddress ?? null,
@@ -808,9 +814,9 @@ export function buildPostConfirmVerifiedItemMismatchCorrection(
   if (!identity) {
     return [
       `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
-      "Use ONLY verified customer-safe facts from VERIFIED_BUSINESS_PA_FACTS_JSON.",
-      "If the requested detail is absent, say it is not confirmed or ask one useful clarification — never invent a substitute.",
-      "Keep action=reply with a non-empty customerReply. No silence, no mutation.",
+      "Do not invent booking or business fact values in decide. For factual asks use capability + evidenceNeeds with customerReply=\"\".",
+      "Genuine social replies must not include prices, policies, dates, times, locations, or references.",
+      "Keep action=reply. No silence, no mutation.",
       "Return the same required JSON schema. Return JSON only.",
     ].join("\n");
   }
@@ -821,13 +827,12 @@ export function buildPostConfirmVerifiedItemMismatchCorrection(
     `bookingId: ${identity.bookingId ?? "(none)"}`,
     `itemId: ${identity.itemId ?? "(none)"}`,
     `itemLabel: ${identity.itemLabel ?? "(none)"}`,
-    `durationDays: ${identity.durationDays ?? "(none)"}`,
-    `bookingStatus: ${identity.bookingStatus ?? "(none)"}`,
     "The final customerReply and groundedFacts.itemId MUST refer only to this focused booking.",
     "Do not use any OUT_OF_SCOPE_CONTEXT_ONLY candidate in customerReply or groundedFacts.",
+    "For factual asks: prefer capability + evidenceNeeds with customerReply=\"\" (wording after resolve). Do not invent fact values.",
     "Use bookingSelectionMode=focused with this selectedBookingIndex for read-only factual answers.",
     "If a requested detail is absent from verified facts, say it is not confirmed or ask one useful clarification — never invent a substitute.",
-    "Keep action=reply with a non-empty customerReply. No silence, no mutation.",
+    "Keep action=reply. No silence, no mutation.",
     "Return the same required JSON schema, including honest replySemantics.claims and languageStyle.",
     "Return JSON only.",
   ].join("\n");
@@ -1157,11 +1162,428 @@ function isPostConfirmReadOnlyInformationalDecision(decision) {
 }
 
 /**
+ * Valid factual-deferred semantic state: Brain emitted a Turn Plan that requires
+ * evidence resolution; customerReply is empty until resolve + compose.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+export function isDeferredPostConfirmInformationalDecision(decision) {
+  if (!decision || typeof decision !== "object") return false;
+  if (cleanAction(decision.action) !== "reply") return false;
+  if (decision.shouldReply === false) return false;
+  if (cleanMutationIntent(decision.mutationIntent) !== "none") return false;
+  if (decision.mutationExecutionRequested === true) return false;
+  if (
+    decision.action === "request_booking_mutation" ||
+    decision.action === "confirm_pending_availability" ||
+    decision.action === "decline_pending_availability"
+  ) {
+    return false;
+  }
+  const capability = cleanPostConfirmCapability(decision.capability);
+  if (!capabilityRequiresEvidenceResolution(capability)) {
+    // Legacy deferred: requestedInformation set without capability yet.
+    const legacy = cleanRequestedInformation(decision.requestedInformation);
+    return Boolean(legacy);
+  }
+  if (capability === "clarification_needed") return true;
+  if (capability === "availability_request") return true;
+  const needs = normalizeEvidenceNeeds(decision.evidenceNeeds);
+  return needs.length > 0;
+}
+
+/**
+ * Brain-declared factual informational turn (structured fields only).
+ * Does not inspect customer text. capability=social does NOT exempt a turn that
+ * already declares factual semantics — those must still emit a Turn Plan.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+export function isPostConfirmFactualInformationalSemanticDecision(decision) {
+  if (!decision || typeof decision !== "object") return false;
+  const action = cleanAction(decision.action);
+  if (
+    action === "request_booking_mutation" ||
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability"
+  ) {
+    return false;
+  }
+  if (cleanMutationIntent(decision.mutationIntent) !== "none") return false;
+  if (decision.mutationExecutionRequested === true) return false;
+
+  const capability = cleanPostConfirmCapability(decision.capability);
+  if (capability === "mutation_requested") {
+    return false;
+  }
+
+  const act = cleanAct(decision.conversationAct);
+  const factualMarkers =
+    act === "information_request" ||
+    decision.customerIntent === "ask_fact" ||
+    decision.customerIsAskingQuestion === true ||
+    capabilityRequiresEvidenceResolution(capability);
+
+  // capability=social with factual markers is invalid — needs Turn Plan correction.
+  if (capability === "social" && !factualMarkers) {
+    return false;
+  }
+
+  // Intentional social silence is allowed only without factual markers.
+  // Silence / shouldReply=false on a factual ask is a contract violation.
+  if (action === "silence" || decision.shouldReply === false) {
+    return factualMarkers;
+  }
+  if (action !== "reply" && action !== "escalate_missing_info") return false;
+
+  if (
+    act === "acknowledgement" ||
+    act === "thanks" ||
+    act === "chit_chat"
+  ) {
+    return factualMarkers;
+  }
+
+  return factualMarkers;
+}
+
+/**
+ * Detect factual business/booking claims in a *proposed model reply*.
+ * Does not inspect customer text (not a customer-language classifier).
+ * @param {unknown} reply
+ * @returns {boolean}
+ */
+export function socialReplyContainsFactualBusinessClaims(reply) {
+  const text = String(reply ?? "").trim();
+  if (!text) return false;
+  // Money / large numeric amounts typical of rent/deposit
+  if (/\b\d{3,}(?:\.\d+)?\b/.test(text)) return true;
+  // Clock times
+  if (
+    /\b(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*(?:am|pm))?\b/i.test(text) ||
+    /\b\d{1,2}\s*(?:am|pm)\b/i.test(text)
+  ) {
+    return true;
+  }
+  // ISO / numeric dates
+  if (
+    /\b\d{4}-\d{1,2}-\d{1,2}\b/.test(text) ||
+    /\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/.test(text)
+  ) {
+    return true;
+  }
+  // Duration claims
+  if (/\b\d{1,3}\s*(?:din|day|days)\b/i.test(text)) return true;
+  // Booking reference-like tokens
+  if (
+    /\bbooking\s+reference\b/i.test(text) ||
+    /\breference\s*:/i.test(text) ||
+    /\b[A-Z]{2,}[-_][A-Z0-9]{2,}\b/.test(text)
+  ) {
+    return true;
+  }
+  // Status / confirmation claims about the booking
+  if (
+    /\b(?:booking\s+)?(?:confirm(?:ed|ation)?|approved|status)\b/i.test(text) &&
+    /\b(?:hai|hain|ho\s*gayi|ho\s*gya|is|are)\b/i.test(text)
+  ) {
+    return true;
+  }
+  // Policy / availability / location / pricing language with assertive content
+  if (
+    /\b(?:pickup|delivery|advance|deposit|insurance|fuel|cancellation|policy|outstation|available|rent|total|daily\s*rate|driver\s+policy|documents?)\b/i.test(
+      text
+    ) &&
+    /\b(?:hai|hain|hoga|hogi|milega|available|included|lahore|dha|phase|gate|address|location|pk(r)?|rupees?)\b/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Presence/absence only — never values. Helps Turn Plan selection without
+ * exposing answerable facts to social direct wording.
+ * @param {unknown} value
+ * @returns {"present"|"absent"}
+ */
+function evidencePresence(value) {
+  if (value == null) return "absent";
+  if (typeof value === "string" && !String(value).trim()) return "absent";
+  if (Array.isArray(value) && value.length === 0) return "absent";
+  return "present";
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} facts
+ */
+function buildPostConfirmEvidenceAvailability(facts) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  const booking =
+    f.booking && typeof f.booking === "object" ? f.booking : {};
+  const known = f.known && typeof f.known === "object" ? f.known : {};
+  const business =
+    f.business && typeof f.business === "object" ? f.business : {};
+  const closed = Array.isArray(f.latestClosedMissingInfoAnswers)
+    ? f.latestClosedMissingInfoAnswers
+    : [];
+
+  const pickupLocationFields = [
+    booking.pickupLocation,
+    booking.pickupDetails,
+    booking.pickupAddress,
+  ];
+  const pickupLocationPresent = pickupLocationFields.some(
+    (v) => evidencePresence(v) === "present"
+  );
+  const pickupLocationDistinct = new Set(
+    pickupLocationFields
+      .map((v) => String(v ?? "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const pickupLocation =
+    pickupLocationDistinct.size > 1
+      ? "conflicting"
+      : pickupLocationPresent
+        ? "present"
+        : "absent";
+
+  const knownOrBiz = (key) => known[key] ?? business[key] ?? null;
+
+  return {
+    active_booking: {
+      pickup_location: pickupLocation,
+      pickup_time: evidencePresence(booking.pickupTime),
+      delivery_location: evidencePresence(
+        booking.deliveryAddress ?? booking.deliveryLocation
+      ),
+      delivery_time: evidencePresence(booking.deliveryTime),
+      duration_days: evidencePresence(booking.durationDays),
+      start_date: evidencePresence(booking.startDate),
+      end_date: evidencePresence(booking.endDate),
+      total_amount: evidencePresence(booking.totalAmount),
+      daily_rate: evidencePresence(booking.dailyRate),
+      status: evidencePresence(booking.status),
+      reference: evidencePresence(
+        booking.customerSafeReference ?? booking.bookingReference
+      ),
+      item_identity: evidencePresence(booking.itemId ?? booking.itemLabel),
+    },
+    business_profile: {
+      delivery_policy: evidencePresence(knownOrBiz("deliveryPolicy")),
+      payment_policy: evidencePresence(knownOrBiz("paymentPolicy")),
+      advance_amount: evidencePresence(knownOrBiz("advanceAmount")),
+      advance_policy: evidencePresence(knownOrBiz("advancePolicy")),
+      driver_policy: evidencePresence(knownOrBiz("driverPolicy")),
+      documents_policy: evidencePresence(knownOrBiz("documentsPolicy")),
+    },
+    saved_owner_answer: {
+      closedAnswerCount: closed.length,
+      // Types only — never ownerAnswer text.
+      closedAnswerTypes: closed
+        .map((row) => clean(row?.missingInfoType, 80))
+        .filter(Boolean)
+        .slice(0, 12),
+    },
+  };
+}
+
+/**
+ * Decide-lane context: identity/tone + evidence presence only — never answerable
+ * fact values. Social direct wording must not see prices, policies, owner answers,
+ * catalog, times, dates, locations, or amounts.
+ *
+ * @param {Record<string, unknown> | null | undefined} facts
+ */
+export function buildPostConfirmDecideFactsForPrompt(facts) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  const business =
+    f.business && typeof f.business === "object" ? f.business : {};
+  const policy = f.policy && typeof f.policy === "object" ? f.policy : {};
+  const trustedFocusIdentity = resolveTrustedFocusedBookingIdentity(f);
+  const trustedFocusIndex = trustedFocusIdentity?.selectedBookingIndex ?? null;
+  const name = clean(business.name ?? business.businessName, 120) || null;
+  const tone = clean(business.tone, 200) || null;
+
+  const bookingCandidates = bookingCandidatesForFacts(f)
+    .map((row, index) => {
+      const selectionIndex =
+        positiveIntegerOrNull(row?.selectionIndex) ?? index + 1;
+      const itemLabel = clean(row?.itemLabel || row?.itemName, 200) || null;
+      const itemId = clean(row?.itemId, 160) || null;
+      if (trustedFocusIdentity) {
+        if (selectionIndex === trustedFocusIndex) {
+          return {
+            selectionIndex,
+            itemId,
+            itemLabel,
+            scope: "CURRENT_BOOKING_IN_SCOPE",
+          };
+        }
+        return {
+          selectionIndex,
+          itemLabel,
+          scope: "OUT_OF_SCOPE_CONTEXT_ONLY",
+        };
+      }
+      return { selectionIndex, itemId, itemLabel };
+    })
+    .filter(Boolean)
+    .slice(0, 12);
+
+  const bookingFocus = trustedFocusIdentity
+    ? {
+        source: trustedFocusIdentity.source,
+        confidence: trustedFocusIdentity.confidence,
+        selectedBookingIndex: trustedFocusIdentity.selectedBookingIndex,
+        bookingId: trustedFocusIdentity.bookingId,
+        availabilityRequestId: trustedFocusIdentity.availabilityRequestId,
+        itemId: trustedFocusIdentity.itemId,
+        itemLabel: trustedFocusIdentity.itemLabel,
+        scope: "CURRENT_BOOKING_IN_SCOPE",
+      }
+    : null;
+
+  const pendingAvailabilityRequests = Array.isArray(
+    f.pendingAvailabilityRequests
+  )
+    ? f.pendingAvailabilityRequests.slice(0, 12).map((row) => ({
+        selectionIndex:
+          Number.isFinite(Number(row?.selectionIndex))
+            ? Number(row.selectionIndex)
+            : null,
+        itemLabel: clean(row?.itemLabel, 200) || null,
+        // No priceQuote, dates, or status details — selection identity only.
+      }))
+    : [];
+
+  const mutationExecution =
+    f.mutationExecution && typeof f.mutationExecution === "object"
+      ? {
+          requested: f.mutationExecution.requested === true,
+          status:
+            String(f.mutationExecution.status ?? "not_executed").trim() ||
+            "not_executed",
+        }
+      : null;
+
+  return {
+    decideContextOnly: true,
+    noAnswerableFacts: true,
+    business: {
+      name,
+      ...(tone ? { tone } : {}),
+    },
+    bookingFocus,
+    bookingCandidates,
+    activeBookings: bookingCandidates
+      .filter((row) => row?.scope === "CURRENT_BOOKING_IN_SCOPE")
+      .map((row) => ({
+        itemId: row.itemId ?? null,
+        itemLabel: row.itemLabel ?? null,
+      }))
+      .slice(0, 1),
+    pendingAvailabilityRequests,
+    mutationExecution,
+    // present|absent|conflicting only — never values the model could quote.
+    evidenceAvailability: buildPostConfirmEvidenceAvailability(f),
+    // Explicit denial of answerable stores.
+    known: null,
+    knownPolicies: null,
+    latestClosedMissingInfoAnswers: null,
+    openMissingInfoRequests: null,
+    catalogItems: null,
+    availabilityRequest: null,
+    booking: null,
+    replyGuardFacts: null,
+    policy: {
+      readOnly: policy.readOnly !== false,
+      doNotInventAmounts: policy.doNotInventAmounts !== false,
+      doNotInventPolicies: policy.doNotInventPolicies !== false,
+      doNotMutateBooking: policy.doNotMutateBooking !== false,
+    },
+  };
+}
+
+/**
+ * Same-Brain correction: factual ask missing compact Turn Plan evidence.
+ * @param {Record<string, unknown> | null | undefined} priorDecision
+ * @param {string} userMessage
+ */
+function buildPostConfirmFactualRequestedInformationCorrection(
+  priorDecision,
+  userMessage
+) {
+  return [
+    "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — not a second classifier).",
+    "This turn is a factual informational ask, but the Turn Plan is missing a valid capability + evidenceNeeds.",
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    `Previous decision (invalid): ${JSON.stringify({
+      situation: priorDecision?.situation ?? null,
+      conversationAct: priorDecision?.conversationAct ?? null,
+      customerIntent: priorDecision?.customerIntent ?? null,
+      action: priorDecision?.action ?? null,
+      capability: priorDecision?.capability ?? null,
+      evidenceNeeds: priorDecision?.evidenceNeeds ?? null,
+      customerReply: priorDecision?.customerReply ?? "",
+    })}`,
+    "Rules:",
+    "- This ask is factual/informational. Do NOT use capability=social. Do NOT leave capability null.",
+    "- Do NOT write a direct customerReply answer. customerReply MUST be empty.",
+    "- Keep action=reply, shouldReply=true, mutationIntent=none. Do NOT use action=silence.",
+    "- Set capability to one of: " + POST_CONFIRM_CAPABILITIES.join(", "),
+    "- For answer_from_* capabilities, set non-empty evidenceNeeds: [{entity, concept, attributes}].",
+    `- Entities: ${POST_CONFIRM_EVIDENCE_ENTITIES.join(", ")}`,
+    `- Concepts: ${POST_CONFIRM_EVIDENCE_CONCEPTS.join(", ")}`,
+    `- Attributes: ${POST_CONFIRM_EVIDENCE_ATTRIBUTES.join(", ")}`,
+    "- If the exact trusted field is unclear (deposit refundability, insurance inclusion, cancellation terms, mileage, overnight driver, accident terms, etc.), set capability=clarification_needed with evidenceNeeds=[].",
+    "- Freeform policy with a possible saved owner answer → answer_from_saved_owner_answer + [{entity:\"saved_owner_answer\",concept:\"other\",attributes:[\"answer\"]}].",
+    "- Advance/deposit amount or advance rules → answer_from_business_profile + advance amount/policy attributes.",
+    "- Documents / payment / driver / delivery policy → answer_from_business_profile + matching concept attributes:[\"policy\"].",
+    "- Active booking fields (pickup/delivery/time/price/status/reference/identity/dates/duration) → answer_from_active_booking with matching evidenceNeeds.",
+    "- New inventory availability asks → capability=availability_request (never answer from active booking).",
+    "- Return the same required JSON schema only.",
+  ].join("\n");
+}
+
+/**
  * Narrow factual-question evidence for the gated third required-reply recovery.
  * Broader read-only helper also accepts ask_action / bare action=reply; those must
  * not unlock “answer from booking facts” after silence.
  * @param {Record<string, unknown> | null | undefined} decision
  */
+
+/**
+ * Same-Brain correction: capability=social but proposed reply asserts facts.
+ * Inspects model reply only — not customer text.
+ * @param {Record<string, unknown> | null | undefined} priorDecision
+ * @param {string} userMessage
+ */
+function buildPostConfirmSocialFactualClaimCorrection(priorDecision, userMessage) {
+  return [
+    "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — not a second classifier).",
+    "capability=social was set, but customerReply contains factual business/booking claims.",
+    "Direct social wording must not state booking facts, prices, policies, dates, times, locations, references, or availability.",
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    `Previous decision (invalid): ${JSON.stringify({
+      situation: priorDecision?.situation ?? null,
+      conversationAct: priorDecision?.conversationAct ?? null,
+      customerIntent: priorDecision?.customerIntent ?? null,
+      action: priorDecision?.action ?? null,
+      capability: priorDecision?.capability ?? null,
+      evidenceNeeds: priorDecision?.evidenceNeeds ?? null,
+      customerReply: priorDecision?.customerReply ?? "",
+    })}`,
+    "Rules:",
+    "- If this turn is factual/informational: set a valid capability + evidenceNeeds Turn Plan and customerReply=\"\".",
+    "- If this turn is genuinely social small-talk: capability=social, evidenceNeeds=[], non-empty customerReply with NO factual business/booking claims.",
+    "- Keep action=reply, shouldReply=true, mutationIntent=none (unless a real mutation/availability action applies).",
+    "- Do NOT invent facts. Return the same required JSON schema only.",
+  ].join("\n");
+}
+
 function isPostConfirmTrustedFocusFactQuestionDecision(decision) {
   const action = cleanAction(decision?.action);
   if (
@@ -1651,6 +2073,10 @@ function defaultDecision(overrides = {}) {
     customerIntent: "unclear",
     customerIsAskingQuestion: false,
     requestedInfoType: null,
+    requestedInformation: null,
+    capability: null,
+    evidenceNeeds: [],
+    informationalReplyDeferred: false,
     customerReply: "",
     action: "silence",
     shouldReply: false,
@@ -1713,14 +2139,37 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       : parsed.shouldReply === true
         ? true
         : action !== "silence" && action !== "none";
+  const mutationIntentEarly = cleanMutationIntent(parsed.mutationIntent);
+  let requestedInformation = cleanRequestedInformation(
+    parsed.requestedInformation
+  );
+  let capability = cleanPostConfirmCapability(parsed.capability);
+  let evidenceNeeds = normalizeEvidenceNeeds(parsed.evidenceNeeds);
+
+  // Legacy requestedInformation → compact Turn Plan when capability absent.
+  if (!capability && requestedInformation) {
+    const mapped = mapLegacyRequestedInformationToTurnPlan(requestedInformation);
+    capability = mapped.capability;
+    evidenceNeeds = mapped.evidenceNeeds;
+  }
+
+  const deferredInformationalCandidate =
+    action === "reply" &&
+    shouldReply !== false &&
+    mutationIntentEarly === "none" &&
+    parsed.mutationExecutionRequested !== true &&
+    (capabilityRequiresEvidenceResolution(capability) ||
+      Boolean(requestedInformation));
 
   // Silence / no-reply may have empty customerReply.
   // request_booking_mutation may also be empty: final wording is composed after
   // deterministic validate/execute (semantic decision only in this Brain call).
+  // Factual Turn Plans defer wording until evidence resolve + compose.
   if (
     (action === "silence" ||
       shouldReply === false ||
-      action === "request_booking_mutation") &&
+      action === "request_booking_mutation" ||
+      deferredInformationalCandidate) &&
     !customerReply
   ) {
     customerReply = "";
@@ -1736,7 +2185,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     cleanType(parsed.missingInfoType) ||
     null;
   let situation = cleanSituation(parsed.situation);
-  const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
+  const mutationIntent = mutationIntentEarly;
   const actionParameters = normalizePostConfirmActionParameters(
     parsed.actionParameters,
     action === "request_booking_mutation" ? mutationIntent : "none"
@@ -1759,19 +2208,80 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   }
 
   if (conversationAct !== "information_request") {
-    customerIsAskingQuestion = false;
-    requestedInfoType = null;
-    if (action === "escalate_missing_info") {
-      action = "reply";
+    // Preserve a factual Turn Plan even when conversationAct drifted
+    // (unknown/ack/chit_chat). Do not wipe evidenceNeeds to social/null.
+    // Exception: action_request / ask_action must not become a booking-fact
+    // lookup (e.g. "owner se confirm") — that yields wrong found evidence or
+    // empty compose. Clarify instead (no owner workflow in this lane).
+    if (capabilityRequiresEvidenceResolution(capability)) {
+      const actionLikeAsk =
+        conversationAct === "action_request" ||
+        customerIntent === "ask_action";
+      if (
+        actionLikeAsk &&
+        capability !== "availability_request" &&
+        capability !== "mutation_requested" &&
+        action !== "request_booking_mutation"
+      ) {
+        capability = "clarification_needed";
+        evidenceNeeds = [];
+        requestedInformation = null;
+      }
+      conversationAct = "information_request";
+      customerIsAskingQuestion = true;
+      if (customerIntent === "unclear" || !customerIntent) {
+        customerIntent = "ask_fact";
+      }
+    } else {
+      customerIsAskingQuestion = false;
+      requestedInfoType = null;
+      requestedInformation = null;
+      if (
+        capability !== "social" &&
+        capability !== "mutation_requested" &&
+        capability !== "availability_request"
+      ) {
+        if (
+          conversationAct === "acknowledgement" ||
+          conversationAct === "thanks" ||
+          conversationAct === "chit_chat"
+        ) {
+          capability = "social";
+          evidenceNeeds = [];
+        } else if (conversationAct !== "action_request") {
+          capability = capability === "social" ? "social" : null;
+          evidenceNeeds = [];
+        }
+      }
+      if (action === "escalate_missing_info") {
+        action = "reply";
+      }
     }
   }
 
   if (requestedInfoType && !isAllowedPaMissingInfoType(requestedInfoType)) {
     requestedInfoType = null;
   }
+  // Prefer Brain-declared requestedInformation; derive escalate type when mapped.
+  if (requestedInformation) {
+    const mapped =
+      REQUESTED_INFORMATION_TO_MISSING_INFO_TYPE[requestedInformation] ?? null;
+    if (mapped && isAllowedPaMissingInfoType(mapped) && !requestedInfoType) {
+      requestedInfoType = mapped;
+    }
+  }
   if (conversationAct === "information_request" && !customerIsAskingQuestion) {
     requestedInfoType = null;
+    requestedInformation = null;
     if (action === "escalate_missing_info") action = "reply";
+  }
+
+  if (capability === "social") {
+    evidenceNeeds = [];
+  }
+  if (action === "request_booking_mutation") {
+    capability = "mutation_requested";
+    evidenceNeeds = [];
   }
 
   // Act-driven situation hardening.
@@ -1836,6 +2346,9 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     customerIntent = "ask_action";
     customerIsAskingQuestion = false;
     requestedInfoType = null;
+    requestedInformation = null;
+    capability = "mutation_requested";
+    evidenceNeeds = [];
   }
   if (
     action === "confirm_pending_availability" ||
@@ -1846,7 +2359,33 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     customerIntent = "ask_action";
     customerIsAskingQuestion = false;
     requestedInfoType = null;
+    requestedInformation = null;
+    capability = null;
+    evidenceNeeds = [];
   }
+
+  // Semantic contract: a factual Turn Plan defers wording — never silence.
+  // Models often emit capability+evidenceNeeds with action=silence after decide
+  // prompts omit answerable facts; that must become deferred resolve, not mute.
+  const factualTurnPlanPresent =
+    mutationIntent === "none" &&
+    action !== "request_booking_mutation" &&
+    action !== "confirm_pending_availability" &&
+    action !== "decline_pending_availability" &&
+    (capabilityRequiresEvidenceResolution(capability) ||
+      Boolean(requestedInformation));
+  if (factualTurnPlanPresent) {
+    action = "reply";
+    shouldReply = true;
+    customerReply = "";
+  }
+
+  const informationalReplyDeferred =
+    action === "reply" &&
+    shouldReply !== false &&
+    mutationIntent === "none" &&
+    (capabilityRequiresEvidenceResolution(capability) ||
+      Boolean(requestedInformation));
 
   return applyPostConfirmAntiEchoAndSilence(
     {
@@ -1855,7 +2394,12 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       customerIsAskingQuestion,
       requestedInfoType:
         conversationAct === "information_request" ? requestedInfoType : null,
-      customerReply,
+      requestedInformation:
+        conversationAct === "information_request" ? requestedInformation : null,
+      capability,
+      evidenceNeeds,
+      informationalReplyDeferred,
+      customerReply: informationalReplyDeferred ? "" : customerReply,
       action,
       shouldReply,
       situation,
@@ -1958,7 +2502,7 @@ export async function executePostConfirmPaLaneDecision({
         .trim()
         .slice(0, 500)
     : "";
-  const factsJson = compactPostConfirmFactsForPrompt(facts);
+  const factsJson = buildPostConfirmDecideFactsForPrompt(facts);
   const loopOn = missingInfoLoopFullyEnabled === true;
 
   const hasActiveBooking = Boolean(
@@ -2021,11 +2565,54 @@ export async function executePostConfirmPaLaneDecision({
         },
         customerIsAskingQuestion: { type: "boolean" },
         requestedInfoType: { type: ["string", "null"] },
+        requestedInformation: {
+          type: ["string", "null"],
+          description:
+            "Legacy optional label. Prefer capability + evidenceNeeds Turn Plan.",
+        },
+        capability: {
+          anyOf: [
+            { type: "string", enum: [...POST_CONFIRM_CAPABILITIES] },
+            { type: "null" },
+          ],
+          description:
+            "Compact Turn Plan capability. Allowed: " +
+            POST_CONFIRM_CAPABILITIES.join(", "),
+        },
+        evidenceNeeds: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              entity: {
+                type: "string",
+                enum: [...POST_CONFIRM_EVIDENCE_ENTITIES],
+              },
+              concept: {
+                type: "string",
+                enum: [...POST_CONFIRM_EVIDENCE_CONCEPTS],
+                description:
+                  "Semantic slot. pickup and delivery are DISTINCT: pickup+time is pickup time only; delivery+time is delivery time only. Never swap pickup↔delivery. business_profile delivery+policy is delivery policy, not a booking delivery time.",
+              },
+              attributes: {
+                type: "array",
+                items: {
+                  type: "string",
+                  enum: [...POST_CONFIRM_EVIDENCE_ATTRIBUTES],
+                },
+                description:
+                  "For times: pair attribute time with concept pickup OR delivery (not both, never the opposite concept).",
+              },
+            },
+            required: ["entity", "concept", "attributes"],
+          },
+        },
         shouldReply: { type: "boolean" },
         customerReply: {
           type: "string",
           description:
-            "Sendable WhatsApp text. MUST be non-empty when action=reply and shouldReply=true. Empty string ONLY for action=silence or request_booking_mutation (wording composed after execute).",
+            "Sendable WhatsApp text. MUST be non-empty when action=reply for social turns. Empty string for action=silence, request_booking_mutation, OR factual answer_from_*/clarification/availability Turn Plans (wording after evidence resolution).",
         },
         action: { type: "string", enum: [...POST_CONFIRM_ACTIONS] },
         mutationIntent: {
@@ -2154,6 +2741,9 @@ export async function executePostConfirmPaLaneDecision({
         "customerIntent",
         "customerIsAskingQuestion",
         "requestedInfoType",
+        "requestedInformation",
+        "capability",
+        "evidenceNeeds",
         "shouldReply",
         "customerReply",
         "action",
@@ -2176,23 +2766,25 @@ export async function executePostConfirmPaLaneDecision({
 LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
 Return STRICT JSON (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"requestedInformation":null,"capability":"social","evidenceNeeds":[],"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
 - If you would only repeat them, use action="silence" and shouldReply=false with empty customerReply.
 
 CUSTOMER_REPLY CONTRACT (critical):
-- When action="reply" and shouldReply=true: customerReply MUST be a non-empty natural sendable message. Never return customerReply="" for a reply action.
-- Empty customerReply is ONLY allowed for action="silence" (shouldReply=false) or action="request_booking_mutation" (final wording is composed after deterministic execution).
-- If a verified policy/fact is present, answer from that fact. If absent, ask one useful clarification OR say the detail is not confirmed — still with a non-empty customerReply when action="reply".
+- Social / chit-chat / farewell / ack turns: capability="social", evidenceNeeds=[], and when action="reply" customerReply MUST be a non-empty natural sendable message with NO booking facts, prices, policies, dates, times, locations, references, or availability claims.
+- Empty customerReply is allowed for: action="silence" (genuine social only); action="request_booking_mutation"; OR factual Turn Plans (answer_from_*/clarification_needed/availability_request) with action="reply", shouldReply=true — wording after evidence resolution.
+- NEVER use action=silence / shouldReply=false when capability is answer_from_*, clarification_needed, or availability_request. Factual Turn Plans must use action=reply + empty customerReply.
+- For factual asks: capability + evidenceNeeds are REQUIRED. Do NOT invent facts into customerReply — defer wording.
+- Never accept a direct factual customerReply as social.
 
-VERIFIED FACTUAL GROUNDING (informational replies — general rule):
-- Every factual value stated in customerReply (item, duration, status, reference, amount, date, time, policy, location, or similar) MUST already exist in VERIFIED_BUSINESS_PA_FACTS_JSON.
-- If the requested detail is absent/null in verified facts, produce a natural unknown/unconfirmed reply OR ask one useful clarification. Never invent a replacement value.
-- Do not infer or invent dates, times, amounts, locations, statuses, policies, references, or items.
-- Do not mention a date or clock time merely because the customer asked about an event (for example pickup/delivery). Only state a time/date when that exact value is verified in facts.
-- Social turns need no invented booking facts.
+TURN PLAN (informational — semantic only in this call):
+- Factual booking/business asks → capability=answer_from_active_booking | answer_from_business_profile | answer_from_saved_owner_answer with evidenceNeeds like {"entity":"active_booking","concept":"pickup","attributes":["location"]}. Leave customerReply="".
+- Vague ask → capability=clarification_needed, evidenceNeeds=[], customerReply="".
+- New inventory availability (not about the confirmed booking) → capability=availability_request; never answer from active booking facts.
+- Social → capability=social.
+- Never invent dates, times, amounts, locations, statuses, policies, references, or items in this call.
 
 INFORMATIONAL VS MUTATION (delivery/pickup):
 - Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", bookingSelectionMode="focused" when a trusted booking is in scope.
@@ -2217,7 +2809,32 @@ STEP 1 — conversationAct:
 
 STEP 2 — customerIsAskingQuestion=true only for real information asks (including "ok driver milega?").
 
-STEP 3 — requestedInfoType only for information_request asks; else null. Allowed: ${PA_MISSING_INFO_TYPES.join(", ")}
+STEP 3 — Turn Plan capability + evidenceNeeds (MANDATORY for factual asks):
+Capabilities: ${POST_CONFIRM_CAPABILITIES.join(", ")}
+evidenceNeeds item: {entity, concept, attributes[]}
+- Entities: ${POST_CONFIRM_EVIDENCE_ENTITIES.join(", ")}
+- Concepts: ${POST_CONFIRM_EVIDENCE_CONCEPTS.join(", ")}
+- Attributes: ${POST_CONFIRM_EVIDENCE_ATTRIBUTES.join(", ")}
+Examples:
+- pickup where / "kahan ana" → answer_from_active_booking + [{entity:"active_booking",concept:"pickup",attributes:["location"]}] (even when evidenceAvailability.pickup_location=absent)
+- pickup time / "kitne baje pickup" → answer_from_active_booking + pickup/time (NEVER delivery/time)
+- delivery TIME on the confirmed booking ("delivery ka time", "deliver kab") → answer_from_active_booking + [{entity:"active_booking",concept:"delivery",attributes:["time"]}] — NEVER business_profile delivery/policy; NEVER pickup/time
+- delivery LOCATION/address on the booking → answer_from_active_booking + delivery/location
+- "kitny din" / duration → concept:"duration", attributes:["days"]
+- "total rent" / "daily rent" / price → concept:"price", attributes:["total","daily"]
+- "booking confirm hai?" / status → concept:"status", attributes:["value"] (NOT capability=social)
+- booking reference → concept:"reference", attributes:["value"]
+- which car / identity → concept:"identity", attributes:["label"]
+- dates / "kab se start" → concept:"dates", attributes:["start","end"] (NOT clarification_needed when dates are the clear ask)
+- documents / payment / driver / delivery policy ("delivery ho skti hai?", "kis area delivery") → answer_from_business_profile + [{entity:"business_profile",concept:"delivery"|"documents"|"payment"|"driver",attributes:["policy"]}] — NOT availability_request
+- advance amount/policy → answer_from_business_profile + advance attributes
+- fuel/late return/cancellation/insurance → clarification_needed (evidenceNeeds=[]) OR answer_from_saved_owner_answer + other/answer when a saved owner answer exists
+- "owner se confirm" / ask Emily to check with owner without a concrete fact → clarification_needed (not answer_from_active_booking)
+- "koi gari available?" (new vehicle/inventory search) → availability_request (do NOT use active booking evidence; do NOT use availability_request for delivery-policy asks)
+- social hello / acha / thanks → capability=social, evidenceNeeds=[], non-empty customerReply with NO booking/business factual claims
+- "mujhe details chahiye" / vague only → clarification_needed. If the customer named a concrete concept (pickup/delivery/documents/dates/price/status), do NOT use clarification_needed — use answer_from_* even when evidenceAvailability is absent (resolver returns not_found).
+- Keep attributes ONLY from the compact attribute list (policy, location, time, days, value, label, total, daily, start, end, amount, answer). Never invent attribute names like deliveryPolicy.
+- requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
 
 STEP 4 — action:
 - silence: no WhatsApp send (shouldReply=false, customerReply="")
@@ -2229,7 +2846,7 @@ STEP 4 — action:
   Do NOT use update_delivery/update_pickup for a plain availability/possibility question — that is action="reply".
 - confirm_pending_availability / decline_pending_availability: use only when the customer clearly intends that action for one listed pendingAvailabilityRequests entry. Set pendingAvailabilitySelectionIndex to that entry's selectionIndex. If intent or selection is unclear, ask a natural clarification with action="reply".
 - mutationExecutionRequested=true only with request_booking_mutation.
-- mutationExecutionStatus must reflect VERIFIED_BUSINESS_PA_FACTS_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
+- mutationExecutionStatus must reflect POST_CONFIRM_DECIDE_CONTEXT_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
 - For non-mutation actions, actionParameters must be all null.
 - bookingSelectionMode controls booking scope:
   focused = use bookingFocus.selectedBookingIndex for a read-only informational question;
@@ -2249,7 +2866,7 @@ STEP 4 — action:
 
 SITUATION RULES:
 - Ack after Emily already answered (customerFollowupText / known) → acknowledgement_after_answer; reply brief or silence; never escalate.
-- Same answered question again → repeat_question_answered; answer from known / latestClosedMissingInfoAnswers.
+- Same answered question again → repeat_question_answered; emit Turn Plan (capability + evidenceNeeds) with customerReply="" — wording after trusted resolve. Do not invent from memory.
 - Open pending same type → pending_owner_answer; do not create another request.
 - New missing detail → new_question; may escalate if loop enabled.
 - Prefer workflow fields over incomplete RECENT_CONVERSATION.
@@ -2257,25 +2874,25 @@ SITUATION RULES:
 ${escalateGuidance}
 
 LANE FACT RULES:
-- Money from facts includes PKR.
+- POST_CONFIRM_DECIDE_CONTEXT_JSON has NO answerable prices, policies, owner answers, dates, times, locations, or amounts.
+- evidenceAvailability is present|absent|conflicting only. When a field is present, prefer the matching answer_from_* Turn Plan (never invent the value). When absent/conflicting, still emit a Turn Plan — resolver returns not_found/conflicting.
+- Factual asks MUST use capability + evidenceNeeds with action=reply, shouldReply=true, customerReply="". Direct customerReply is for genuine social small-talk only (no factual claims). Never silence a factual Turn Plan.
 - No Hindi "swagat", no CRM dump, no welcome speech for active bookings.
-- Use ONLY VERIFIED_BUSINESS_PA_FACTS_JSON + RECENT_CONVERSATION.
+- Use ONLY POST_CONFIRM_DECIDE_CONTEXT_JSON + RECENT_CONVERSATION for decide semantics (not for stating verified fact values).
 - ${
     hasActiveBooking
-      ? "Active booking is BACKGROUND. Do not onboard as a new visitor."
+      ? "Active booking identity is BACKGROUND for selection. Do not onboard as a new visitor. Do not state booking field values here."
       : "No active booking object."
   }
 - ${
     hasTrustedBookingFocus
-      ? "Multiple active bookings are present with a trusted latest-confirmed focus. bookingFocus and any CURRENT_BOOKING_IN_SCOPE row are the only booking to answer for generic/read-only questions. Use bookingFocus.itemId and bookingFocus.itemLabel in groundedFacts when stating that booking. Entries marked OUT_OF_SCOPE_CONTEXT_ONLY are context for clarification/mutation only — never put them in customerReply or groundedFacts.itemId unless the customer explicitly identified that booking (bookingSelectionMode=candidate with its selectionIndex). For generic read-only questions use bookingSelectionMode=focused."
+      ? "Multiple active bookings are present with a trusted latest-confirmed focus. bookingFocus and any CURRENT_BOOKING_IN_SCOPE row are the only booking identity for generic/read-only questions. Use bookingFocus.itemId and bookingFocus.itemLabel in groundedFacts when identifying that booking. Entries marked OUT_OF_SCOPE_CONTEXT_ONLY are context for clarification/mutation only — never put them in customerReply or groundedFacts.itemId unless the customer explicitly identified that booking (bookingSelectionMode=candidate with its selectionIndex). For generic read-only questions use bookingSelectionMode=focused and defer factual wording."
       : hasAmbiguousBookings
         ? "Multiple active bookings are present without trusted focus. Generic booking questions require bookingSelectionMode=clarification_required and a natural clarification. Do not guess or mutate one."
         : "There is no multi-booking ambiguity."
   }
 - replySemantics.claims must only list claims supported by verified facts / allowedClaims.
-- groundedFacts is internal validation metadata. Populate every verified booking,
-  price, date, time, reference, or policy value used in customerReply; otherwise
-  use null/[] exactly as the schema requires.
+- groundedFacts is internal validation metadata. For deferred factual Turn Plans leave groundedFacts null/empty. For social replies do not populate booking fact fields.
 
 STRICT SAFETY:
 - Do NOT invent amounts, policies, dates, times, locations, statuses, references, or items.
@@ -2284,7 +2901,7 @@ STRICT SAFETY:
 - Do NOT mention Brain, Firestore, OpenAI, or internal tokens.
 - Never escalate social/closing/acknowledgement turns.`;
 
-  let userPayload = `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\nCUSTOMER_MESSAGE:\n${userLine || "(empty)"}`;
+  let userPayload = `POST_CONFIRM_DECIDE_CONTEXT_JSON:\n${JSON.stringify(factsJson)}\n\nCUSTOMER_MESSAGE:\n${userLine || "(empty)"}`;
   if (historyLine) {
     userPayload += `\n\nRECENT_CONVERSATION:\n${historyLine}`;
   }
@@ -2323,6 +2940,8 @@ STRICT SAFETY:
     let silenceRecoveryAttempts = 0;
     let trustedFocusRequiredReplyExtraUsed = false;
     let emptyInvalidInformationalRecoveryUsed = false;
+    let factualRequestedInfoCorrectionUsed = false;
+    let socialFactualClaimCorrectionUsed = false;
     /** @type {string | null} */
     let lastUsabilityClassification = null;
     const trustedFocusNonEmptyQuestion =
@@ -2332,7 +2951,9 @@ STRICT SAFETY:
       const attemptLimit =
         MAX_CUSTOMER_REPLY_ATTEMPTS +
         (trustedFocusRequiredReplyExtraUsed ? 1 : 0) +
-        (emptyInvalidInformationalRecoveryUsed ? 1 : 0);
+        (emptyInvalidInformationalRecoveryUsed ? 1 : 0) +
+        (factualRequestedInfoCorrectionUsed ? 1 : 0) +
+        (socialFactualClaimCorrectionUsed ? 1 : 0);
       if (attempt > attemptLimit) {
         const exhaustedReason =
           lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY"
@@ -2374,6 +2995,17 @@ STRICT SAFETY:
                     userLine,
                     lastEmily,
                     lastUsabilityClassification || "schema_or_parse_failure"
+                  )}`
+              : lastReason === "FACTUAL_TURN_PLAN_REQUIRED" ||
+                  lastReason === "FACTUAL_REQUESTED_INFORMATION_REQUIRED"
+                ? `${userPayload}\n\n${buildPostConfirmFactualRequestedInformationCorrection(
+                    lastSuspiciousDecision || {},
+                    userLine
+                  )}`
+              : lastReason === "SOCIAL_REPLY_CONTAINS_FACTUAL_CLAIMS"
+                ? `${userPayload}\n\n${buildPostConfirmSocialFactualClaimCorrection(
+                    lastSuspiciousDecision || {},
+                    userLine
                   )}`
             : lastReason === "verified_item_mismatch"
               ? `${userPayload}\n\n${buildPostConfirmVerifiedItemMismatchCorrection(
@@ -2424,14 +3056,25 @@ STRICT SAFETY:
       const isMutationSemanticDecision =
         decision?.action === "request_booking_mutation" &&
         cleanMutationIntent(decision?.mutationIntent) !== "none";
+      const isDeferredInformationalDecision =
+        isDeferredPostConfirmInformationalDecision(decision);
+      const isFactualSemanticDecision =
+        isPostConfirmFactualInformationalSemanticDecision(decision);
       const inEmptyInvalidInformationalRecovery =
         emptyInvalidInformationalRecoveryUsed &&
         lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY";
-      // Mutations may return empty customerReply — wording is composed after execute.
+      // Mutations / deferred factual asks may return empty customerReply —
+      // wording is composed after execute / fact resolution.
+      // Factual semantic turns with empty reply proceed to Turn Plan correction
+      // (not EMPTY_OR_INVALID) when evidenceNeeds were wiped/invalid.
       // Empty/invalid informational recovery rejects silence and mutations.
       if (
         !decision ||
-        (!hasSendableReply && !isSilence && !isMutationSemanticDecision) ||
+        (!hasSendableReply &&
+          !isSilence &&
+          !isMutationSemanticDecision &&
+          !isDeferredInformationalDecision &&
+          !isFactualSemanticDecision) ||
         (inEmptyInvalidInformationalRecovery &&
           (!hasSendableReply || isSilence || isMutationSemanticDecision))
       ) {
@@ -2557,6 +3200,86 @@ STRICT SAFETY:
           silenceRecoveryAttempts,
           contentSafetyAttempts: attempt,
         };
+      }
+
+      // Factual informational decisions stop here when requestedInformation is set:
+      // wording is composed after deterministic fact resolution. Clear any model
+      // customerReply so invented claims cannot skip the resolver.
+      if (isDeferredPostConfirmInformationalDecision(finalized)) {
+        finalized.customerReply = "";
+        finalized.shouldReply = true;
+        finalized.informationalReplyDeferred = true;
+        finalized.capability = cleanPostConfirmCapability(finalized.capability);
+        finalized.evidenceNeeds = normalizeEvidenceNeeds(
+          finalized.evidenceNeeds
+        );
+        finalized.requestedInformation = cleanRequestedInformation(
+          finalized.requestedInformation
+        );
+        finalized.mutationIntent = "none";
+        finalized.mutationExecutionRequested = false;
+        finalized.actionParameters = emptyPostConfirmActionParameters();
+        return {
+          ok: true,
+          decision: stripInternalReplySemantics(finalized),
+          source: "openai",
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      // Factual informational without a valid evidence Turn Plan is invalid —
+      // one same-Brain correction, then durable technical failure.
+      // Never accept a direct ungrounded factual customerReply.
+      if (isPostConfirmFactualInformationalSemanticDecision(finalized)) {
+        if (!factualRequestedInfoCorrectionUsed) {
+          factualRequestedInfoCorrectionUsed = true;
+          lastReason = "FACTUAL_TURN_PLAN_REQUIRED";
+          lastSuspiciousDecision = finalized;
+          continue;
+        }
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: "FACTUAL_TURN_PLAN_REQUIRED",
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      // Direct Brain wording is social-only (or silence). Social replies must not
+      // assert booking/business facts — reject and correct (model reply only).
+      {
+        const capNow = cleanPostConfirmCapability(finalized.capability);
+        const replyNow = cleanCustomerReply(finalized?.customerReply);
+        const pendingAvailabilityActionNow =
+          finalized.action === "confirm_pending_availability" ||
+          finalized.action === "decline_pending_availability";
+        if (
+          !pendingAvailabilityActionNow &&
+          finalized.action === "reply" &&
+          capNow === "social" &&
+          replyNow &&
+          socialReplyContainsFactualBusinessClaims(replyNow)
+        ) {
+          if (!socialFactualClaimCorrectionUsed) {
+            socialFactualClaimCorrectionUsed = true;
+            lastReason = "SOCIAL_REPLY_CONTAINS_FACTUAL_CLAIMS";
+            lastSuspiciousDecision = finalized;
+            continue;
+          }
+          return {
+            ok: false,
+            decision: stripInternalReplySemantics(defaultDecision()),
+            source: "technical_fallback",
+            reason: "SOCIAL_REPLY_CONTAINS_FACTUAL_CLAIMS",
+            retryable: false,
+            silenceRecoveryAttempts,
+            contentSafetyAttempts: attempt,
+          };
+        }
       }
 
       const replyText = cleanCustomerReply(finalized?.customerReply);

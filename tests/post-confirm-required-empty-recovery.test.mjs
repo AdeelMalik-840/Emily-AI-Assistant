@@ -110,6 +110,15 @@ function decision(overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: "booking_duration",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "duration",
+        attributes: ["days"],
+      },
+    ],
     shouldReply: true,
     customerReply: "Kia Stonic 4 din ke liye book hai.",
     action: "reply",
@@ -146,6 +155,22 @@ function silenceInformationDecision() {
   });
 }
 
+/** Silence on a factual ask without a Turn Plan (contract violation). */
+function silenceFactualWithoutTurnPlan() {
+  return decision({
+    capability: null,
+    evidenceNeeds: [],
+    requestedInformation: null,
+    requestedInfoType: null,
+    shouldReply: false,
+    customerReply: "",
+    action: "silence",
+    bookingSelectionMode: "none",
+    selectedBookingIndex: null,
+    groundedFacts: groundedFacts(),
+  });
+}
+
 function acknowledgementSilenceDecision() {
   return decision({
     situation: "acknowledgement_after_answer",
@@ -153,6 +178,8 @@ function acknowledgementSilenceDecision() {
     customerIntent: "ack",
     customerIsAskingQuestion: false,
     requestedInfoType: null,
+    capability: "social",
+    evidenceNeeds: [],
     shouldReply: false,
     customerReply: "",
     action: "silence",
@@ -169,6 +196,8 @@ function socialSilenceDecision(overrides = {}) {
     customerIntent: "thanks",
     customerIsAskingQuestion: false,
     requestedInfoType: null,
+    capability: "social",
+    evidenceNeeds: [],
     shouldReply: false,
     customerReply: "",
     action: "silence",
@@ -198,11 +227,46 @@ async function runWithResponses(responses, options = {}) {
   return { result, calls };
 }
 
-test("trusted focused information silence gets one same-Brain correction and natural answer", async () => {
+test("silence with factual Turn Plan normalizes to deferred without recovery", async () => {
+  const { result, calls } = await runWithResponses([silenceInformationDecision()]);
+
+  assert.equal(calls.length, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai");
+  assert.equal(result.silenceRecoveryAttempts, 0);
+  assert.equal(result.contentSafetyAttempts, 1);
+  assert.equal(result.decision.action, "reply");
+  assert.equal(result.decision.shouldReply, true);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.bookingSelectionMode, "focused");
+  assert.equal(result.decision.selectedBookingIndex, 1);
+  assert.equal(result.decision.selectedBookingId, "test-booking-stonic");
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+});
+
+test("silence without Turn Plan corrects to deferred factual plan", async () => {
   const { result, calls } = await runWithResponses([
-    silenceInformationDecision(),
-    decision(),
+    silenceFactualWithoutTurnPlan(),
+    decision({ customerReply: "" }),
   ]);
+
+  assert.equal(calls.length, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+  const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
+  assert.match(correctionPrompt, /CORRECTIVE REGENERATION/);
+  assert.match(correctionPrompt, /Turn Plan|capability|evidenceNeeds/i);
+  assert.doesNotMatch(correctionPrompt, /return\s+"Kia Stonic 4 din/i);
+});
+
+test("live ack silence then Turn Plan defers without third recovery", async () => {
+  const { result, calls } = await runWithResponses(
+    [acknowledgementSilenceDecision(), silenceInformationDecision()],
+    { userMessage: "Kitny din k lye book ki h?" }
+  );
 
   assert.equal(calls.length, 2);
   assert.equal(result.ok, true);
@@ -211,77 +275,38 @@ test("trusted focused information silence gets one same-Brain correction and nat
   assert.equal(result.contentSafetyAttempts, 2);
   assert.equal(result.decision.action, "reply");
   assert.equal(result.decision.shouldReply, true);
-  assert.equal(result.decision.customerReply, "Kia Stonic 4 din ke liye book hai.");
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
   assert.equal(result.decision.bookingSelectionMode, "focused");
   assert.equal(result.decision.selectedBookingIndex, 1);
   assert.equal(result.decision.selectedBookingId, "test-booking-stonic");
-
-  const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  assert.match(correctionPrompt, /CORRECTIVE REGENERATION/);
-  assert.match(correctionPrompt, /CURRENT_BOOKING_IN_SCOPE/);
-  assert.match(correctionPrompt, /test-stonic-item/);
-  assert.doesNotMatch(correctionPrompt, /return\s+"Kia Stonic 4 din/i);
-});
-
-test("live ack silence then empty required reply recovers with gated third same-Brain attempt", async () => {
-  const { result, calls } = await runWithResponses(
-    [
-      acknowledgementSilenceDecision(),
-      silenceInformationDecision(),
-      decision(),
-    ],
-    { userMessage: "Kitny din k lye book ki h?" }
-  );
-
-  assert.equal(calls.length, 3);
-  assert.equal(result.ok, true);
-  assert.equal(result.source, "openai");
-  assert.equal(result.silenceRecoveryAttempts, 1);
-  assert.equal(result.contentSafetyAttempts, 3);
-  assert.equal(result.decision.action, "reply");
-  assert.equal(result.decision.shouldReply, true);
-  assert.ok(String(result.decision.customerReply || "").trim());
-  assert.equal(result.decision.bookingSelectionMode, "focused");
-  assert.equal(result.decision.selectedBookingIndex, 1);
-  assert.equal(result.decision.selectedBookingId, "test-booking-stonic");
-  // groundedFacts are stripped before return; duration must appear in the natural reply.
-  assert.match(String(result.decision.customerReply || ""), /\b4\b/);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
   assert.equal(result.decision.mutationIntent, "none");
   assert.equal(result.decision.mutationExecutionRequested, false);
   assert.notEqual(result.source, "technical_fallback");
-  assert.doesNotMatch(
-    String(result.decision.customerReply || ""),
-    /Abhi ye detail confirm nahi hai/
-  );
 
   const secondPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  const thirdPrompt = String(calls[2]?.messages?.[1]?.content || "");
   assert.match(secondPrompt, /CORRECTIVE REGENERATION/);
   assert.match(secondPrompt, /acknowledgement\/silence/);
-  assert.match(thirdPrompt, /required reply after silence/);
-  assert.match(thirdPrompt, /CURRENT_BOOKING_IN_SCOPE|Trusted focused booking identity/);
-  assert.match(thirdPrompt, /test-stonic-item|"durationDays":4/);
-  assert.doesNotMatch(thirdPrompt, /return\s+"Kia Stonic 4 din/i);
-  assert.doesNotMatch(thirdPrompt, /hardcode|canned/i);
+  assert.doesNotMatch(secondPrompt, /return\s+"Kia Stonic 4 din/i);
+  assert.doesNotMatch(secondPrompt, /hardcode|canned/i);
 });
 
-test("three required focused silences terminalize after gated extra recovery", async () => {
+test("repeated factual silence without Turn Plan fails closed (no mute success)", async () => {
   const { result, calls } = await runWithResponses([
-    silenceInformationDecision(),
-    silenceInformationDecision(),
-    silenceInformationDecision(),
+    silenceFactualWithoutTurnPlan(),
+    silenceFactualWithoutTurnPlan(),
+    silenceFactualWithoutTurnPlan(),
   ]);
 
-  assert.equal(calls.length, 3);
+  assert.ok(calls.length >= 2);
   assert.equal(result.ok, false);
   assert.equal(result.source, "technical_fallback");
-  assert.equal(result.reason, "customer_reply_required_but_empty");
+  assert.equal(result.reason, "FACTUAL_TURN_PLAN_REQUIRED");
   assert.equal(result.retryable, false);
-  assert.equal(result.silenceRecoveryAttempts, 1);
-  assert.equal(result.contentSafetyAttempts, 3);
   assert.equal(result.decision.customerReply, "");
-  const thirdPrompt = String(calls[2]?.messages?.[1]?.content || "");
-  assert.match(thirdPrompt, /required reply after silence/);
+  const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
+  assert.match(correctionPrompt, /Turn Plan|capability|evidenceNeeds/i);
 });
 
 test("social silence remains a valid no-outbound result", async () => {
@@ -547,11 +572,20 @@ test("invalid or malformed OpenAI output gets one informational recovery then re
   assert.match(recoveryPrompt, /Do NOT use action=silence/i);
 });
 
-test("empty/invalid then informational recovery produces grounded reply", async () => {
+test("empty/invalid then deferred factual recovery stays retryable", async () => {
   const { result, calls } = await runWithResponses([
     "",
     "{not-json",
     decision({
+      requestedInformation: "delivery_policy",
+      capability: "answer_from_business_profile",
+      evidenceNeeds: [
+        {
+          entity: "business_profile",
+          concept: "delivery",
+          attributes: ["policy"],
+        },
+      ],
       customerReply: "Delivery selected areas mein available hai.",
       groundedFacts: groundedFacts({
         itemId: STONIC_ITEM_ID,
@@ -585,11 +619,9 @@ test("empty/invalid then informational recovery produces grounded reply", async 
   });
 
   assert.equal(calls.length, 3);
-  assert.equal(result.ok, true);
-  assert.equal(result.source, "openai");
-  assert.equal(result.decision.action, "reply");
-  assert.equal(result.decision.shouldReply, true);
-  assert.match(String(result.decision.customerReply), /Delivery selected areas/i);
-  assert.equal(result.decision.mutationIntent, "none");
-  assert.equal(result.retryable, undefined);
+  assert.equal(result.ok, false);
+  assert.equal(result.source, "technical_fallback");
+  assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
+  assert.equal(result.retryable, true);
+  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
 });

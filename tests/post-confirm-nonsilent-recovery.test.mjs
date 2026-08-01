@@ -105,6 +105,15 @@ function decision(overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: "booking_duration",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "duration",
+        attributes: ["days"],
+      },
+    ],
     shouldReply: true,
     customerReply: "Kia Stonic 4 din ke liye book hai.",
     action: "reply",
@@ -147,6 +156,8 @@ function socialSilenceDecision() {
     conversationAct: "thanks",
     customerIntent: "thanks",
     customerIsAskingQuestion: false,
+    capability: "social",
+    evidenceNeeds: [],
     shouldReply: false,
     customerReply: "",
     action: "silence",
@@ -175,9 +186,18 @@ async function runDecide(responses, options = {}) {
   return { result, calls };
 }
 
-test("1. trusted factual question + valid AI answer sends reply, no mutation", async () => {
+test("1. trusted factual question returns deferred Turn Plan, no mutation", async () => {
   const { result, calls } = await runDecide([
     decision({
+      requestedInformation: "delivery_policy",
+      capability: "answer_from_business_profile",
+      evidenceNeeds: [
+        {
+          entity: "business_profile",
+          concept: "delivery",
+          attributes: ["policy"],
+        },
+      ],
       customerReply: "Delivery selected areas mein available hai.",
       groundedFacts: groundedFacts({
         itemId: STONIC_ITEM_ID,
@@ -199,16 +219,27 @@ test("1. trusted factual question + valid AI answer sends reply, no mutation", a
   assert.equal(calls.length, 1);
   assert.equal(result.ok, true);
   assert.equal(result.decision.action, "reply");
-  assert.match(String(result.decision.customerReply), /Delivery selected areas/i);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_business_profile");
   assert.equal(result.decision.mutationIntent, "none");
 });
 
-test("2. first attempts malformed, recovery succeeds with grounded reply", async () => {
+test("2. first attempts malformed, deferred Turn Plan in recovery stays retryable", async () => {
   const { result, calls } = await runDecide(
     [
       "",
       "{bad",
       decision({
+        requestedInformation: "delivery_policy",
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: "delivery",
+            attributes: ["policy"],
+          },
+        ],
         customerReply: "Delivery selected areas mein available hai.",
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -230,16 +261,17 @@ test("2. first attempts malformed, recovery succeeds with grounded reply", async
     }
   );
   assert.equal(calls.length, 3);
-  assert.equal(result.ok, true);
-  assert.equal(result.decision.action, "reply");
-  assert.match(String(result.decision.customerReply), /Delivery/i);
-  assert.equal(result.decision.mutationIntent, "none");
+  assert.equal(result.ok, false);
+  assert.equal(result.source, "technical_fallback");
+  assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
+  assert.equal(result.retryable, true);
+  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
   const recoveryPrompt = String(calls[2]?.messages?.[1]?.content || "");
   assert.match(recoveryPrompt, /empty\/invalid output recovery/i);
   assert.match(recoveryPrompt, /Do NOT use request_booking_mutation/);
 });
 
-test("3. delivery fact missing → AI clarification, no invented delivery claim", async () => {
+test("3. delivery fact missing Turn Plan in recovery stays retryable", async () => {
   const clarification =
     "Delivery detail abhi confirm nahi hai. Kis area ke liye pooch rahe hain?";
   const { result } = await runDecide(
@@ -247,6 +279,15 @@ test("3. delivery fact missing → AI clarification, no invented delivery claim"
       "",
       "",
       decision({
+        requestedInformation: "delivery_policy",
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: "delivery",
+            attributes: ["policy"],
+          },
+        ],
         customerReply: clarification,
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -257,13 +298,11 @@ test("3. delivery fact missing → AI clarification, no invented delivery claim"
     ],
     { facts: focusedFacts({}) }
   );
-  assert.equal(result.ok, true);
-  assert.equal(result.decision.action, "reply");
-  assert.equal(result.decision.customerReply, clarification);
-  assert.doesNotMatch(
-    String(result.decision.customerReply),
-    /available hai|ho sakti|possible/i
-  );
+  assert.equal(result.ok, false);
+  assert.equal(result.source, "technical_fallback");
+  assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
+  assert.equal(result.retryable, true);
+  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
 });
 
 test("4. all attempts fail → retryable, not intentionalSilent/silent_noop", async () => {

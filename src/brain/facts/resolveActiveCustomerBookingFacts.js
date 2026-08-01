@@ -201,12 +201,18 @@ export function compactBookingFacts(booking, availabilityRequest = null) {
           availabilityRequest?.deliveryMethod,
         80
       ) || null,
+    // Discrete pickup location only — never infer from deliveryAddress/time.
+    pickupLocation:
+      clean(
+        booking?.pickupLocation ??
+          booking?.pickupDetails ??
+          availabilityRequest?.pickupLocation ??
+          availabilityRequest?.pickupDetails,
+        300
+      ) || null,
     deliveryAddress:
       clean(
-        booking?.deliveryAddress ??
-          booking?.pickupLocation ??
-          availabilityRequest?.deliveryAddress ??
-          availabilityRequest?.pickupLocation,
+        booking?.deliveryAddress ?? availabilityRequest?.deliveryAddress,
         300
       ) || null,
     totalAmount,
@@ -330,7 +336,7 @@ function stripInternalBookingCandidate(candidate) {
   };
 }
 
-function bookingReplyGuardFacts(booking, catalogItems, known = {}) {
+export function bookingReplyGuardFacts(booking, catalogItems, known = {}) {
   return {
     bookingExecutionVerified: true,
     itemId: booking?.itemId ?? null,
@@ -345,6 +351,7 @@ function bookingReplyGuardFacts(booking, catalogItems, known = {}) {
     endDate: booking?.endDate ?? null,
     pickupTime: booking?.pickupTime ?? null,
     deliveryTime: booking?.deliveryTime ?? null,
+    pickupLocation: booking?.pickupLocation ?? null,
     deliveryMethod: booking?.deliveryMethod ?? null,
     deliveryAddress: booking?.deliveryAddress ?? null,
     knownPolicies: {
@@ -749,8 +756,8 @@ export async function resolveActiveCustomerBookingFacts({
           pickupTime: clean(avr.pickupTime, 120) || null,
           deliveryTime: clean(avr.deliveryTime, 120) || null,
           deliveryMethod: clean(avr.deliveryMethod, 80) || null,
-          deliveryAddress:
-            clean(avr.deliveryAddress ?? avr.pickupLocation, 300) || null,
+          pickupLocation: clean(avr.pickupLocation, 300) || null,
+          deliveryAddress: clean(avr.deliveryAddress, 300) || null,
           status: clean(avr.status) || null,
           customerConfirmationStatus:
             clean(avr.customerConfirmationStatus) || null,

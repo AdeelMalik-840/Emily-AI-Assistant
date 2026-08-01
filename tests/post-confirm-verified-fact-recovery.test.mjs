@@ -116,6 +116,7 @@ function decision(overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: null,
     shouldReply: true,
     customerReply: "Kia Stonic 4 din ke liye book hai.",
     action: "reply",
@@ -184,12 +185,14 @@ test("source: verified factual grounding + verified_* correction + pause list", 
     join(ROOT, "src/services/whatsappInboundBuffer.js"),
     "utf8"
   );
-  assert.match(decideSrc, /VERIFIED FACTUAL GROUNDING/);
+  assert.match(decideSrc, /buildPostConfirmVerifiedClaimGuardCorrection/);
   assert.match(
     decideSrc,
-    /Every factual value stated in customerReply[\s\S]*MUST already exist/
+    /capability \+ evidenceNeeds|Turn Plan capability/
   );
-  assert.match(decideSrc, /buildPostConfirmVerifiedClaimGuardCorrection/);
+  assert.match(decideSrc, /resolvePostConfirmRequestedFact\.js/);
+  assert.match(decideSrc, /isDeferredPostConfirmInformationalDecision/);
+  assert.match(decideSrc, /FACTUAL_TURN_PLAN_REQUIRED/);
   assert.match(guardSrc, /isVerifiedCustomerClaimMismatchReason/);
   assert.match(guardSrc, /VERIFIED CLAIM MISMATCH/);
   assert.match(bufferSrc, /verified_booking_time_mismatch/);
@@ -221,7 +224,23 @@ test("verified claim mismatch reasons helper covers required set", () => {
   assert.match(correction, /No silence, no mutation/i);
 });
 
-test("A. missing pickup location: invented 10am corrected to unconfirmed, no clock", async () => {
+function bookingEvidence(concept, attributes, extra = {}) {
+  return {
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept,
+        attributes,
+      },
+    ],
+    requestedInformation: null,
+    customerReply: "",
+    ...extra,
+  };
+}
+
+test("A. missing pickup location: invent without Turn Plan corrected to deferred plan", async () => {
   const { result, calls } = await runDecide(
     [
       decision({
@@ -232,31 +251,30 @@ test("A. missing pickup location: invented 10am corrected to unconfirmed, no clo
           pickupTime: "10am",
         }),
       }),
-      decision({
-        customerReply: "Pickup location abhi confirm nahi hai.",
-        groundedFacts: groundedFacts({
-          itemId: STONIC_ITEM_ID,
-          durationDays: 4,
-        }),
-      }),
+      decision(
+        bookingEvidence("pickup", ["location"], {
+          groundedFacts: groundedFacts({
+            itemId: STONIC_ITEM_ID,
+            durationDays: 4,
+          }),
+        })
+      ),
     ],
     { userMessage: "pickup k lye kahan ana ho ga?" }
   );
   assert.equal(result.ok, true);
   assert.equal(calls.length, 2);
-  assert.equal(
-    result.decision.customerReply,
-    "Pickup location abhi confirm nahi hai."
-  );
-  assert.doesNotMatch(result.decision.customerReply, /\b\d{1,2}\s*(am|pm)\b/i);
-  assert.equal(result.decision.mutationIntent, "none");
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+  assert.equal(result.decision.evidenceNeeds?.[0]?.concept, "pickup");
   const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  assert.match(correctionPrompt, /verified_booking_time_mismatch/);
-  assert.match(correctionPrompt, /pickup k lye kahan ana ho ga/i);
-  assert.match(correctionPrompt, /never invent a substitute/i);
+  assert.match(correctionPrompt, /FACTUAL_TURN_PLAN_REQUIRED|capability|evidenceNeeds/i);
+  assert.match(correctionPrompt, /customerReply MUST be empty/i);
+  assert.match(correctionPrompt, /Do NOT use capability=social/i);
 });
 
-test("B. missing advance/deposit fact: invented amount corrected to unconfirmed", async () => {
+test("B. missing advance/deposit fact: invent without Turn Plan corrected to deferred plan", async () => {
   const { result, calls } = await runDecide(
     [
       decision({
@@ -269,7 +287,15 @@ test("B. missing advance/deposit fact: invented amount corrected to unconfirmed"
         }),
       }),
       decision({
-        customerReply: "Advance/deposit abhi confirm nahi hai.",
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: "advance",
+            attributes: ["amount", "policy"],
+          },
+        ],
+        customerReply: "",
         requestedInfoType: "advance",
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -284,27 +310,27 @@ test("B. missing advance/deposit fact: invented amount corrected to unconfirmed"
   );
   assert.equal(result.ok, true);
   assert.equal(calls.length, 2);
-  assert.equal(
-    result.decision.customerReply,
-    "Advance/deposit abhi confirm nahi hai."
-  );
-  assert.doesNotMatch(result.decision.customerReply, /\b15000\b/);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_business_profile");
   const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  assert.match(correctionPrompt, /verified_price_mismatch/);
-  assert.match(correctionPrompt, /never invent a substitute/i);
+  assert.match(correctionPrompt, /capability|evidenceNeeds/i);
+  assert.match(correctionPrompt, /customerReply MUST be empty/i);
+  assert.match(correctionPrompt, /Do NOT use capability=social/i);
 });
 
-test("C. verified pickupTime=10am and reply says 10am passes", async () => {
+test("C. verified pickupTime ask defers via Turn Plan (wording after resolve)", async () => {
   const { result, calls } = await runDecide(
     [
-      decision({
-        customerReply: "Pickup 10am hai.",
-        groundedFacts: groundedFacts({
-          itemId: STONIC_ITEM_ID,
-          durationDays: 4,
-          pickupTime: "10am",
-        }),
-      }),
+      decision(
+        bookingEvidence("pickup", ["time"], {
+          groundedFacts: groundedFacts({
+            itemId: STONIC_ITEM_ID,
+            durationDays: 4,
+            pickupTime: "10am",
+          }),
+        })
+      ),
     ],
     {
       facts: focusedFacts({}, { pickupTime: "10am" }),
@@ -313,10 +339,12 @@ test("C. verified pickupTime=10am and reply says 10am passes", async () => {
   );
   assert.equal(result.ok, true);
   assert.equal(calls.length, 1);
-  assert.equal(result.decision.customerReply, "Pickup 10am hai.");
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
 });
 
-test("D. wrong visible time still rejected after correction exhaustion", async () => {
+test("D. factual ask without Turn Plan fails closed after correction exhaustion", async () => {
   const { result, calls } = await runDecide(
     [
       decision({
@@ -337,12 +365,12 @@ test("D. wrong visible time still rejected after correction exhaustion", async (
     { userMessage: "Pickup time?" }
   );
   assert.equal(result.ok, false);
-  assert.equal(result.reason, "verified_booking_time_mismatch");
+  assert.equal(result.reason, "FACTUAL_TURN_PLAN_REQUIRED");
   assert.equal(result.retryable, false);
   assert.equal(calls.length, 2);
 });
 
-test("E. wrong price/duration use same general correction pattern", async () => {
+test("E. price/duration invents without Turn Plan correct then defer", async () => {
   const price = await runDecide(
     [
       decision({
@@ -353,26 +381,25 @@ test("E. wrong price/duration use same general correction pattern", async () => 
           totalAmount: 22000,
         }),
       }),
-      decision({
-        customerReply: "Total 22000 PKR hai.",
-        groundedFacts: groundedFacts({
-          itemId: STONIC_ITEM_ID,
-          durationDays: 4,
-          totalAmount: 22000,
-        }),
-      }),
+      decision(
+        bookingEvidence("price", ["total", "daily"], {
+          groundedFacts: groundedFacts({
+            itemId: STONIC_ITEM_ID,
+            durationDays: 4,
+            totalAmount: 22000,
+          }),
+        })
+      ),
     ],
     { userMessage: "Total kitna hai?" }
   );
   assert.equal(price.result.ok, true);
   assert.equal(price.calls.length, 2);
+  assert.equal(price.result.decision.customerReply, "");
+  assert.equal(price.result.decision.informationalReplyDeferred, true);
   assert.match(
     String(price.calls[1]?.messages?.[1]?.content || ""),
-    /verified_price_mismatch/
-  );
-  assert.match(
-    String(price.calls[1]?.messages?.[1]?.content || ""),
-    /never invent a substitute/i
+    /capability|evidenceNeeds/i
   );
 
   const duration = await runDecide(
@@ -384,22 +411,21 @@ test("E. wrong price/duration use same general correction pattern", async () => 
           durationDays: 4,
         }),
       }),
-      decision({
-        customerReply: "Kia Stonic 4 din ke liye book hai.",
-        groundedFacts: groundedFacts({
-          itemId: STONIC_ITEM_ID,
-          durationDays: 4,
-        }),
-      }),
+      decision(
+        bookingEvidence("duration", ["days"], {
+          groundedFacts: groundedFacts({
+            itemId: STONIC_ITEM_ID,
+            durationDays: 4,
+          }),
+        })
+      ),
     ],
     { userMessage: "Kitny din k lye booking hui hai?" }
   );
   assert.equal(duration.result.ok, true);
   assert.equal(duration.calls.length, 2);
-  assert.match(
-    String(duration.calls[1]?.messages?.[1]?.content || ""),
-    /verified_duration_mismatch/
-  );
+  assert.equal(duration.result.decision.customerReply, "");
+  assert.equal(duration.result.decision.informationalReplyDeferred, true);
 });
 
 test("F. social hello? normal reply without invented facts", async () => {
@@ -410,6 +436,8 @@ test("F. social hello? normal reply without invented facts", async () => {
         conversationAct: "chit_chat",
         customerIntent: "unclear",
         customerIsAskingQuestion: false,
+        capability: "social",
+        evidenceNeeds: [],
         customerReply: "Ji, boliye",
         action: "reply",
         groundedFacts: groundedFacts({ pickupTime: "10am" }),

@@ -264,6 +264,89 @@ function mockOpenAiReply(text) {
   });
 }
 
+/** Decide Turn Plan then informational compose for factual asks. */
+function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
+  let call = 0;
+  const {
+    capability = "answer_from_active_booking",
+    evidenceNeeds = [
+      { entity: "active_booking", concept: "price", attributes: ["total"] },
+    ],
+  } = turnPlan;
+  return async (args) => {
+    call += 1;
+    const schema = String(args?.response_format?.json_schema?.name || "");
+    const isCompose =
+      schema.includes("compose") ||
+      String(args?.messages?.[1]?.content || "").includes("FACT_RESOLUTION_JSON");
+    if (isCompose || call > 1) {
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply: reply,
+                replySemantics: {
+                  claims: [],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    }
+    return {
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              situation: "new_question",
+              conversationAct: "information_request",
+              customerIntent: "ask_fact",
+              customerIsAskingQuestion: true,
+              requestedInfoType: null,
+              capability,
+              evidenceNeeds,
+              shouldReply: true,
+              customerReply: "",
+              action: "reply",
+              mutationIntent: "none",
+              mutationExecutionRequested: false,
+              mutationExecutionStatus: "not_executed",
+              bookingSelectionMode: "focused",
+              selectedBookingIndex: null,
+              candidateGroundings: [],
+              groundedFacts: {
+                itemId: null,
+                durationDays: null,
+                bookingStatus: null,
+                bookingReference: null,
+                totalAmount: null,
+                dailyRate: null,
+                advanceAmount: null,
+                startDate: null,
+                endDate: null,
+                pickupTime: null,
+                deliveryTime: null,
+                policyClaims: [],
+              },
+              replySemantics: {
+                claims: [],
+                languageStyle: "roman_urdu",
+                containsTimingPromise: false,
+                exposesInternalProcess: false,
+              },
+            }),
+          },
+        },
+      ],
+    };
+  };
+}
+
 function mockOpenAiSocialReply(text) {
   return async () => ({
     choices: [
@@ -275,6 +358,8 @@ function mockOpenAiSocialReply(text) {
             customerIntent: "ack",
             customerIsAskingQuestion: false,
             requestedInfoType: null,
+            capability: "social",
+            evidenceNeeds: [],
             shouldReply: true,
             customerReply: text,
             action: "reply",
@@ -1015,10 +1100,48 @@ test("Advance / Driver / Rent questions call OpenAI with Brain facts", async () 
     priceQuote: { total: 16000 },
   });
 
+  const turnPlans = {
+    "Advance kitna?": {
+      capability: "answer_from_business_profile",
+      evidenceNeeds: [
+        {
+          entity: "business_profile",
+          concept: "advance",
+          attributes: ["amount", "policy"],
+        },
+      ],
+    },
+    "Driver milega?": {
+      capability: "answer_from_business_profile",
+      evidenceNeeds: [
+        {
+          entity: "business_profile",
+          concept: "driver",
+          attributes: ["policy"],
+        },
+      ],
+    },
+    "Rent kitna bana?": {
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        {
+          entity: "active_booking",
+          concept: "price",
+          attributes: ["total"],
+        },
+      ],
+    },
+  };
+
   async function runMsg(message) {
     let openaiCalls = 0;
-    let userContent = "";
+    let decideContent = "";
+    let composeContent = "";
     const mockReply = `natural:${message}`;
+    const mock = mockOpenAiFactualDecideThenCompose(
+      mockReply,
+      turnPlans[message]
+    );
     const result = await withFlag(true, async () =>
       handleCustomerBusinessPaInbound({
         db: fake.db,
@@ -1037,30 +1160,36 @@ test("Advance / Driver / Rent questions call OpenAI with Brain facts", async () 
           }),
         __chatCompletionsCreateForTests: async (args) => {
           openaiCalls += 1;
-          userContent = String(args?.messages?.[1]?.content ?? "");
-          return mockOpenAiReply(mockReply)(args);
+          const content = String(args?.messages?.[1]?.content ?? "");
+          if (openaiCalls === 1) decideContent = content;
+          else composeContent = content;
+          return mock(args);
         },
       })
     );
-    return { result, openaiCalls, userContent, mockReply };
+    return { result, openaiCalls, decideContent, composeContent, mockReply };
   }
 
   const advance = await runMsg("Advance kitna?");
   assert.equal(advance.result.handled, true);
-  assert.equal(advance.openaiCalls, 1);
+  assert.equal(advance.openaiCalls, 2);
   assert.equal(advance.result.reply, advance.mockReply);
-  assert.match(advance.userContent, /VERIFIED_BUSINESS_PA_FACTS_JSON/);
-  assert.match(advance.userContent, /Emily Cars/);
-  assert.match(advance.userContent, /bk_pa_001|Honda Civic/);
+  assert.match(advance.decideContent, /POST_CONFIRM_DECIDE_CONTEXT_JSON/);
+  assert.match(advance.decideContent, /Emily Cars/);
+  assert.match(advance.decideContent, /Honda Civic/);
+  assert.equal(
+    advance.result.finalReplySource,
+    "openai_post_confirm_pa_informational_compose"
+  );
 
   const driver = await runMsg("Driver milega?");
-  assert.equal(driver.openaiCalls, 1);
+  assert.equal(driver.openaiCalls, 2);
   assert.equal(driver.result.reply, driver.mockReply);
 
   const rent = await runMsg("Rent kitna bana?");
-  assert.equal(rent.openaiCalls, 1);
+  assert.equal(rent.openaiCalls, 2);
   assert.equal(rent.result.reply, rent.mockReply);
-  assert.match(rent.userContent, /16000|totalAmount/);
+  assert.match(rent.composeContent, /16000|FACT_RESOLUTION_JSON/);
   assert.doesNotMatch(rent.result.reply, /Advance mai btata hun/i);
 });
 
@@ -1164,13 +1293,28 @@ test("OpenAI helper compact facts include booking total + linked AVR", async () 
   assert.match(compact, /Honda Civic/);
   assert.doesNotMatch(compact, /avr_pa_001|bk_pa_001|owner-business-pa-1/);
 
+  // generateCustomerBusinessPaReplyFromFacts is decide-only; factual wording is
+  // deferred to resolve+compose. Turn Plan → empty customerReply.
   const ai = await generateCustomerBusinessPaReplyFromFacts({
     facts: JSON.parse(compact),
     userMessage: "Rent kitna?",
-    __chatCompletionsCreateForTests: mockOpenAiReply("16000 total tha."),
+    __chatCompletionsCreateForTests: mockOpenAiFactualDecideThenCompose(
+      "16000 total tha.",
+      {
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "price",
+            attributes: ["total"],
+          },
+        ],
+      }
+    ),
   });
   assert.equal(ai.ok, true);
-  assert.equal(ai.reply, "16000 total tha.");
+  assert.equal(ai.reply, "");
+  assert.equal(ai.action, "reply");
 });
 
 test("buffer: PA reply skips general Brain and uses normal Cloud outbound", async () => {

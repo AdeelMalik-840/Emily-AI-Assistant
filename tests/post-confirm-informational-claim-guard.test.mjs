@@ -175,6 +175,15 @@ function decision(overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: "booking_duration",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "duration",
+        attributes: ["days"],
+      },
+    ],
     shouldReply: true,
     customerReply: "Kia Stonic 4 din ke liye book hai.",
     action: "reply",
@@ -258,6 +267,15 @@ test("1. pickup location Q: irrelevant groundedFacts.pickupTime does not reject"
   const { result, calls } = await runDecide(
     [
       decision({
+        requestedInformation: "pickup_location",
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "pickup",
+            attributes: ["location"],
+          },
+        ],
         customerReply: reply,
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -270,7 +288,9 @@ test("1. pickup location Q: irrelevant groundedFacts.pickupTime does not reject"
     { userMessage: "pickup k lye kahan ana ho ga" }
   );
   assert.equal(result.ok, true);
-  assert.equal(result.decision.customerReply, reply);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
   assert.equal(result.decision.mutationIntent, "none");
   assert.notEqual(result.reason, "verified_booking_time_mismatch");
   assert.ok(calls.length >= 1);
@@ -285,6 +305,8 @@ test("2. social hello?: irrelevant pickupTime does not cause time mismatch", asy
         conversationAct: "chit_chat",
         customerIntent: "unclear",
         customerIsAskingQuestion: false,
+        capability: "social",
+        evidenceNeeds: [],
         customerReply: reply,
         action: "reply",
         groundedFacts: groundedFacts({
@@ -305,6 +327,15 @@ test("3. Delivery ho skti hai? policy reply; mutationIntent none; no hidden-fiel
   const { result } = await runDecide(
     [
       decision({
+        requestedInformation: "delivery_policy",
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: "delivery",
+            attributes: ["policy"],
+          },
+        ],
         customerReply: reply,
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -329,15 +360,26 @@ test("3. Delivery ho skti hai? policy reply; mutationIntent none; no hidden-fiel
   );
   assert.equal(result.ok, true);
   assert.equal(result.decision.action, "reply");
-  assert.equal(result.decision.customerReply, reply);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_business_profile");
   assert.equal(result.decision.mutationIntent, "none");
   assert.notEqual(result.reason, "verified_booking_time_mismatch");
 });
 
-test("4a. duration question: wrong duration in reply still rejected", async () => {
+test("4a. duration question defers even if model stuffed visible duration text", async () => {
   const { result, calls } = await runDecide(
     [
       decision({
+        requestedInformation: "booking_duration",
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "duration",
+            attributes: ["days"],
+          },
+        ],
         customerReply: "Kia Stonic 7 din ke liye book hai.",
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -357,11 +399,13 @@ test("4a. duration question: wrong duration in reply still rejected", async () =
     { userMessage: "Kitny din k lye booking hui hai?" }
   );
   assert.equal(result.ok, true);
-  assert.equal(result.decision.customerReply, "Kia Stonic 4 din ke liye book hai.");
-  assert.ok(calls.length >= 2);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+  assert.equal(calls.length, 1);
 });
 
-test("4b. duration question: correct duration passes even with junk groundedFacts times", async () => {
+test("4b. duration question defers even with junk groundedFacts times", async () => {
   const reply = "Kia Stonic 4 din ke liye book hai.";
   const { result } = await runDecide(
     [
@@ -379,13 +423,23 @@ test("4b. duration question: correct duration passes even with junk groundedFact
     { userMessage: "Kitny din k lye booking hui hai?" }
   );
   assert.equal(result.ok, true);
-  assert.equal(result.decision.customerReply, reply);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
 });
 
-test("5. explicit unverified time claim in reply text still rejected", async () => {
+test("5. explicit unverified time text defers instead of decide-path rejection", async () => {
   const { result, calls } = await runDecide(
     [
       decision({
+        requestedInformation: "pickup_time",
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "pickup",
+            attributes: ["time"],
+          },
+        ],
         customerReply: "Pickup 10am hai.",
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -406,17 +460,25 @@ test("5. explicit unverified time claim in reply text still rejected", async () 
     { userMessage: "Pickup time kya hai?" }
   );
   assert.equal(result.ok, true);
-  assert.equal(
-    result.decision.customerReply,
-    "Pickup time abhi confirm nahi hai."
-  );
-  assert.ok(calls.length >= 2);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+  assert.equal(calls.length, 1);
 });
 
-test("6. explicit wrong price in reply text still rejected", async () => {
+test("6. explicit wrong price text defers instead of decide-path rejection", async () => {
   const { result, calls } = await runDecide(
     [
       decision({
+        requestedInformation: "booking_price",
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "price",
+            attributes: ["totalAmount"],
+          },
+        ],
         customerReply: "Total 99999 PKR hai.",
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -436,8 +498,10 @@ test("6. explicit wrong price in reply text still rejected", async () => {
     { userMessage: "Total kitna hai?" }
   );
   assert.equal(result.ok, true);
-  assert.equal(result.decision.customerReply, "Total 22000 PKR hai.");
-  assert.ok(calls.length >= 2);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+  assert.equal(calls.length, 1);
 });
 
 test("7. mutation path still freezes decision and skips informational reply guard", async () => {
@@ -488,6 +552,8 @@ test("7. mutation path still freezes decision and skips informational reply guar
               conversationAct: "action_request",
               customerIntent: "ask_action",
               customerIsAskingQuestion: false,
+              capability: "mutation_requested",
+              evidenceNeeds: [],
               shouldReply: true,
               customerReply: "",
               action: "request_booking_mutation",
@@ -525,7 +591,7 @@ test("7. mutation path still freezes decision and skips informational reply guar
   assert.match(String(result.reply), /Delivery change/i);
 });
 
-test("8a. all_candidates: wrong segment duration still rejected; selection safety holds", async () => {
+test("8a. all_candidates: visible duration text still defers with selection safety", async () => {
   const wrong =
     "Honda Civic 2026 4 din ke liye hai. Toyota Corolla Metallic Grey 5 din ke liye hai.";
   const corrected =
@@ -558,6 +624,15 @@ test("8a. all_candidates: wrong segment duration still rejected; selection safet
   const { result, calls } = await runDecide(
     [
       decision({
+        requestedInformation: "booking_duration",
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "duration",
+            attributes: ["days"],
+          },
+        ],
         customerReply: wrong,
         bookingSelectionMode: "all_candidates",
         selectedBookingIndex: null,
@@ -578,12 +653,13 @@ test("8a. all_candidates: wrong segment duration still rejected; selection safet
     }
   );
   assert.equal(result.ok, true);
-  assert.equal(result.decision.customerReply, corrected);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
   assert.equal(result.decision.bookingSelectionMode, "all_candidates");
-  assert.ok(calls.length >= 2);
+  assert.equal(calls.length, 1);
 });
 
-test("8b. all_candidates: hidden junk candidate groundedFacts do not kill safe segments", async () => {
+test("8b. all_candidates: hidden junk groundedFacts still preserve deferred Turn Plan", async () => {
   const reply =
     "Honda Civic 2026 5 din ke liye hai. Toyota Corolla Metallic Grey 4 din ke liye hai.";
   const { result } = await runDecide(
@@ -629,7 +705,8 @@ test("8b. all_candidates: hidden junk candidate groundedFacts do not kill safe s
     }
   );
   assert.equal(result.ok, true);
-  assert.equal(result.decision.customerReply, reply);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
   assert.equal(result.decision.bookingSelectionMode, "all_candidates");
 });
 

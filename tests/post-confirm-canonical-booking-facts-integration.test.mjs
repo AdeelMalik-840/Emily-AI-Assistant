@@ -35,6 +35,15 @@ function modelDecision(overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: "booking_price",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "price",
+        attributes: ["total", "daily"],
+      },
+    ],
     shouldReply: true,
     customerReply:
       "Kia Stonic 4 din ke liye book hai. Total 22000 PKR hai aur pickup 10am hai.",
@@ -146,6 +155,7 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
   };
 
   const calls = [];
+  // Silence + factual Turn Plan must normalize to deferred resolve (no recovery round-trip).
   const responses = [
     modelDecision({
       shouldReply: false,
@@ -155,7 +165,6 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
       selectedBookingIndex: null,
       groundedFacts: grounded(),
     }),
-    modelDecision(),
   ];
   let responseIndex = 0;
 
@@ -172,24 +181,28 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
     },
   });
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1);
   assert.equal(result.ok, true);
   assert.equal(result.source, "openai");
-  assert.equal(result.silenceRecoveryAttempts, 1);
-  assert.equal(result.contentSafetyAttempts, 2);
+  assert.equal(result.silenceRecoveryAttempts, 0);
+  assert.equal(result.contentSafetyAttempts, 1);
   assert.equal(result.decision.selectedBookingId, "booking-stonic");
-  assert.equal(result.decision.customerReply.includes("22000 PKR"), true);
-  assert.equal(result.decision.customerReply.includes("4 din"), true);
-  assert.equal(result.decision.customerReply.includes("10am"), true);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
 
   const firstPrompt = String(calls[0]?.messages?.[1]?.content || "");
-  const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  for (const prompt of [firstPrompt, correctionPrompt]) {
-    assert.match(prompt, /CURRENT_BOOKING_IN_SCOPE/);
-    assert.match(prompt, /item-stonic/);
-    assert.match(prompt, /22000/);
-    assert.match(prompt, /5500/);
-    assert.match(prompt, /2026-08-01/);
-    assert.match(prompt, /10am/);
-  }
+  assert.match(firstPrompt, /POST_CONFIRM_DECIDE_CONTEXT_JSON|CURRENT_BOOKING_IN_SCOPE/);
+  assert.match(firstPrompt, /item-stonic/);
+  assert.match(firstPrompt, /Kia Stonic/);
+  // Decide context must not expose answerable fact values (resolve+compose owns those).
+  const contextBlock = firstPrompt.split("CUSTOMER_MESSAGE:")[0] || "";
+  assert.doesNotMatch(contextBlock, /\b22000\b/);
+  assert.doesNotMatch(contextBlock, /\b5500\b/);
+  assert.doesNotMatch(contextBlock, /2026-08-01/);
+  assert.doesNotMatch(contextBlock, /\b10am\b/i);
+  // Final guard still receives full trusted booking facts via replyGuardFacts.
+  assert.equal(facts.replyGuardFacts.totalAmount, 22000);
+  assert.equal(facts.replyGuardFacts.dailyRate, 5500);
+  assert.equal(facts.replyGuardFacts.pickupTime, "10am");
 });
