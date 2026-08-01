@@ -1039,6 +1039,9 @@ test("non-exhausted queued lookup retry consumes token and preserves original ow
 });
 
 test("non-exhausted post_confirm_pa retry preserves lifecycle and sends once", async () => {
+  const prevAutoRetry = process.env.CLOUD_POST_CONFIRM_AUTO_RETRY;
+  process.env.CLOUD_POST_CONFIRM_AUTO_RETRY = "1";
+  try {
   const fake = createFakeDb();
   const providerMessageId = `wamid.openai-retry-${randomUUID()}`;
   const identity = buildCloudInboundLifecycleIdentity({
@@ -1140,6 +1143,13 @@ test("non-exhausted post_confirm_pa retry preserves lifecycle and sends once", a
   assert.equal(confirmCalls, 0);
   assert.equal(generalCalls, 0);
   assert.equal(sends, 1);
+  } finally {
+    if (prevAutoRetry === undefined) {
+      delete process.env.CLOUD_POST_CONFIRM_AUTO_RETRY;
+    } else {
+      process.env.CLOUD_POST_CONFIRM_AUTO_RETRY = prevAutoRetry;
+    }
+  }
 });
 
 test("startup recovery runs retryCount 5 final attempt with the original identity", async () => {

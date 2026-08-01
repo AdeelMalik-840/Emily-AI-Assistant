@@ -101,6 +101,13 @@ export const POST_CONFIRM_CUSTOMER_INTENTS = Object.freeze([
 export const POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK =
   "Abhi ye detail confirm nahi hai.";
 
+/**
+ * Decision JSON is large (enums + groundedFacts + replySemantics).
+ * Harness proved max_tokens=300 truncates (finish_reason=length);
+ * 600 completed the same live-like schema successfully.
+ */
+export const POST_CONFIRM_DECISION_MAX_TOKENS = 600;
+
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
@@ -548,6 +555,7 @@ function buildPostConfirmEmptyInvalidInformationalRecoveryCorrection(
     "- If the asked detail is present in verified facts/policies, answer from that fact only.",
     "- If the asked detail is absent, ask one useful natural clarification OR say the detail is not confirmed.",
     "- Never invent delivery, fees, timing, amounts, dates, or policies.",
+    "- A yes/no availability question about delivery/pickup is informational (mutationIntent=none), not update_delivery/update_pickup.",
     "- Do NOT use action=silence. Do NOT use request_booking_mutation / escalate_missing_info.",
     "- mutationIntent must be none; actionParameters all null. Strict JSON only.",
   ].join("\n");
@@ -1993,7 +2001,11 @@ export async function executePostConfirmPaLaneDecision({
         customerIsAskingQuestion: { type: "boolean" },
         requestedInfoType: { type: ["string", "null"] },
         shouldReply: { type: "boolean" },
-        customerReply: { type: "string" },
+        customerReply: {
+          type: "string",
+          description:
+            "Sendable WhatsApp text. MUST be non-empty when action=reply and shouldReply=true. Empty string ONLY for action=silence or request_booking_mutation (wording composed after execute).",
+        },
         action: { type: "string", enum: [...POST_CONFIRM_ACTIONS] },
         mutationIntent: {
           type: "string",
@@ -2149,6 +2161,15 @@ NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
 - If you would only repeat them, use action="silence" and shouldReply=false with empty customerReply.
 
+CUSTOMER_REPLY CONTRACT (critical):
+- When action="reply" and shouldReply=true: customerReply MUST be a non-empty natural sendable message. Never return customerReply="" for a reply action.
+- Empty customerReply is ONLY allowed for action="silence" (shouldReply=false) or action="request_booking_mutation" (final wording is composed after deterministic execution).
+- If a verified policy/fact is present, answer from that fact. If absent, ask one useful clarification OR say the detail is not confirmed — still with a non-empty customerReply when action="reply".
+
+INFORMATIONAL VS MUTATION (delivery/pickup):
+- Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", bookingSelectionMode="focused" when a trusted booking is in scope.
+- Use mutationIntent="update_delivery" / "update_pickup" ONLY when the customer asks to change, set, or add delivery/pickup details on the existing booking. A yes/no availability question is NOT a mutation.
+
 SOCIAL / END-OF-CHAT (critical):
 - Farewells ("have a good day", "allah hafiz", "bye") → situation=conversation_closing, customerIntent=farewell. Prefer action=silence OR a short natural close that is NOT a copy. Never copy their farewell.
 - "you too" after a closing → usually silence (shouldReply=false). Tiny close only if needed — never copy "you too".
@@ -2173,10 +2194,11 @@ STEP 3 — requestedInfoType only for information_request asks; else null. Allow
 STEP 4 — action:
 - silence: no WhatsApp send (shouldReply=false, customerReply="")
 - none: rare; prefer silence when empty
-- reply: send customerReply
+- reply: send a non-empty customerReply (never customerReply="" with action=reply)
 - escalate_missing_info: only situation=new_question per escalate rules
-- request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, pickup, or delivery. Set the matching mutationIntent. Fill actionParameters with structured nullable details (never leave mutation meaning only in raw customer text). Set customerReply to "" (final wording is composed after deterministic execution). Do not claim execution succeeded.
-  Examples: extend_booking → extensionDays; cancel_booking → all null; change_dates → startDate/endDate; change_duration → durationDays; change_item → itemId; update_pickup → pickupDetails; update_delivery → deliveryRequested/deliveryAddress/deliveryTime.
+- request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, or change/set pickup or delivery on the booking. Set the matching mutationIntent. Fill actionParameters with structured nullable details (never leave mutation meaning only in raw customer text). Set customerReply to "" (final wording is composed after deterministic execution). Do not claim execution succeeded.
+  Examples: extend_booking → extensionDays; cancel_booking → all null; change_dates → startDate/endDate; change_duration → durationDays; change_item → itemId; update_pickup → pickupDetails when changing pickup; update_delivery → deliveryRequested/deliveryAddress/deliveryTime when changing/setting delivery.
+  Do NOT use update_delivery/update_pickup for a plain availability/possibility question — that is action="reply".
 - confirm_pending_availability / decline_pending_availability: use only when the customer clearly intends that action for one listed pendingAvailabilityRequests entry. Set pendingAvailabilitySelectionIndex to that entry's selectionIndex. If intent or selection is unclear, ask a natural clarification with action="reply".
 - mutationExecutionRequested=true only with request_booking_mutation.
 - mutationExecutionStatus must reflect VERIFIED_BUSINESS_PA_FACTS_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
@@ -2335,7 +2357,7 @@ STRICT SAFETY:
         completionFn({
           model: resolveOpenAiChatModel(),
           temperature: 0.35,
-          max_tokens: 300,
+          max_tokens: POST_CONFIRM_DECISION_MAX_TOKENS,
           response_format: responseFormat,
           messages: [
             { role: "system", content: system },
