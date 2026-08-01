@@ -12,6 +12,11 @@ import {
   isDeferredPostConfirmInformationalDecision,
   parsePostConfirmCustomerDmDecision,
 } from "../src/brain/decisions/decidePostConfirmCustomerDm.js";
+import {
+  buildPostConfirmInformationalComposeContextForPrompt,
+  buildInformationalComposeFactResolutionForPrompt,
+  composePostConfirmInformationalCustomerReply,
+} from "../src/services/customerBusinessPaAiReply.js";
 
 function booking(overrides = {}) {
   return {
@@ -509,4 +514,282 @@ test("ordinary empty reply without requestedInformation still fails closed", () 
     })
   );
   assert.equal(decision, null);
+});
+
+test("compose context strips side-channel owner answers and policies", () => {
+  const ctx = buildPostConfirmInformationalComposeContextForPrompt({
+    facts: {
+      business: {
+        name: "Prod Rentals",
+        tone: "friendly",
+        deliveryPolicy: "Lahore only",
+        advancePolicy: "50%",
+      },
+      known: {
+        deliveryPolicy: "Lahore only",
+        driverPolicy: "Driver on request",
+      },
+      booking: booking({
+        pickupLocation: "DHA",
+        pickupTime: "10:00 AM",
+        totalAmount: 22000,
+      }),
+      latestClosedMissingInfoAnswers: [
+        {
+          requestId: "mir-1",
+          missingInfoType: "other",
+          ownerAnswer: "Fuel is customer responsibility",
+        },
+      ],
+      catalogItems: [{ id: "x", name: "Corolla" }],
+      activeBookings: [booking()],
+      pendingAvailabilityRequests: [{ itemLabel: "Civic" }],
+    },
+    selectedBooking: booking({ pickupLocation: "DHA", totalAmount: 22000 }),
+  });
+  assert.equal(ctx.conversationContextOnly, true);
+  assert.equal(ctx.business.name, "Prod Rentals");
+  assert.equal(ctx.business.tone, "friendly");
+  assert.equal(ctx.focusedBookingIdentity?.itemLabel, "Suzuki Stonic");
+  assert.equal(ctx.known, null);
+  assert.equal(ctx.knownPolicies, null);
+  assert.equal(ctx.latestClosedMissingInfoAnswers, null);
+  assert.equal(ctx.booking, null);
+  assert.equal(ctx.catalogItems, null);
+  assert.equal(ctx.activeBookings, null);
+  assert.equal(ctx.pendingAvailabilityRequests, null);
+  const blob = JSON.stringify(ctx);
+  assert.doesNotMatch(blob, /Fuel is customer/i);
+  assert.doesNotMatch(blob, /Lahore only/i);
+  assert.doesNotMatch(blob, /Driver on request/i);
+  assert.doesNotMatch(blob, /10:00/i);
+  assert.doesNotMatch(blob, /22000/);
+  assert.doesNotMatch(blob, /Corolla|Civic/i);
+});
+
+test("compose Result prompt strips values unless aggregate found", () => {
+  const missing = buildInformationalComposeFactResolutionForPrompt({
+    status: "missing",
+    factAvailable: false,
+    verifiedValue: { start: "2026-08-05" },
+    items: [
+      {
+        entity: "active_booking",
+        concept: "dates",
+        attribute: "start",
+        status: "found",
+        verifiedValue: "2026-08-05",
+        source: "booking.startDate",
+      },
+      {
+        entity: "active_booking",
+        concept: "dates",
+        attribute: "end",
+        status: "missing",
+        verifiedValue: null,
+        source: null,
+      },
+    ],
+  });
+  assert.equal(missing.status, "not_found");
+  assert.equal(missing.verifiedValue, null);
+  assert.ok(missing.items.every((i) => i.verifiedValue == null));
+
+  const conflicting = buildInformationalComposeFactResolutionForPrompt({
+    status: "conflicting",
+    items: [
+      {
+        entity: "active_booking",
+        concept: "pickup",
+        attribute: "location",
+        status: "conflicting",
+        verifiedValue: null,
+        source: null,
+      },
+    ],
+  });
+  assert.equal(conflicting.status, "conflicting");
+  assert.equal(conflicting.verifiedValue, null);
+
+  const found = buildInformationalComposeFactResolutionForPrompt({
+    status: "found",
+    factAvailable: true,
+    verifiedValue: "Fuel is customer responsibility",
+    items: [
+      {
+        entity: "saved_owner_answer",
+        concept: "other",
+        attribute: "answer",
+        status: "found",
+        verifiedValue: "Fuel is customer responsibility",
+        source: "latestClosedMissingInfoAnswers.ownerAnswer",
+      },
+    ],
+  });
+  assert.equal(found.status, "found");
+  assert.equal(found.verifiedValue, "Fuel is customer responsibility");
+  assert.equal(found.items[0].verifiedValue, "Fuel is customer responsibility");
+});
+
+test("unsupported fuel compose prompt cannot see closed owner answer", async () => {
+  const b = booking({ pickupLocation: null, pickupTime: null });
+  const facts = {
+    business: { name: "Prod", deliveryPolicy: "Lahore only" },
+    known: { deliveryPolicy: "Lahore only" },
+    booking: b,
+    latestClosedMissingInfoAnswers: [
+      {
+        requestId: "mir-1",
+        missingInfoType: "other",
+        ownerAnswer: "Fuel is customer responsibility",
+      },
+    ],
+  };
+  const prompts = [];
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts,
+    userMessage: "fuel policy kya hai?",
+    frozenDecision: {
+      action: "reply",
+      shouldReply: true,
+      mutationIntent: "none",
+      capability: "answer_from_business_profile",
+      evidenceNeeds: [
+        {
+          entity: "business_profile",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
+      informationalReplyDeferred: true,
+    },
+    factResolution: {
+      capability: "answer_from_business_profile",
+      status: "unsupported",
+      factAvailable: false,
+      verifiedValue: null,
+      source: null,
+      items: [
+        {
+          entity: "business_profile",
+          concept: "other",
+          attribute: "answer",
+          status: "unsupported",
+          verifiedValue: null,
+          source: null,
+        },
+      ],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async (args) => {
+      prompts.push(args);
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply:
+                  "Fuel policy abhi confirm nahi hui. Kya aur detail chahiye?",
+                replySemantics: {
+                  claims: [],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+  assert.equal(composed.ok, true);
+  assert.doesNotMatch(composed.reply, /zimmedari|responsibility|bear/i);
+  const userContent = String(prompts[0]?.messages?.[1]?.content || "");
+  assert.match(userContent, /CONVERSATION_CONTEXT_JSON/);
+  assert.doesNotMatch(userContent, /VERIFIED_BUSINESS_PA_FACTS_JSON/);
+  assert.doesNotMatch(userContent, /Fuel is customer responsibility/i);
+  assert.doesNotMatch(userContent, /Lahore only/i);
+  assert.match(userContent, /"status":"unsupported"/);
+});
+
+test("found saved owner answer remains answerable only via Result", async () => {
+  const b = booking();
+  const facts = {
+    business: { name: "Prod" },
+    booking: b,
+    latestClosedMissingInfoAnswers: [
+      {
+        requestId: "mir-1",
+        missingInfoType: "other",
+        ownerAnswer: "Fuel is customer responsibility",
+      },
+    ],
+  };
+  const prompts = [];
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts,
+    userMessage: "fuel policy kya hai?",
+    frozenDecision: {
+      action: "reply",
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
+      informationalReplyDeferred: true,
+    },
+    factResolution: {
+      capability: "answer_from_saved_owner_answer",
+      status: "found",
+      factAvailable: true,
+      verifiedValue: "Fuel is customer responsibility",
+      source: "latestClosedMissingInfoAnswers.ownerAnswer",
+      items: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attribute: "answer",
+          status: "found",
+          verifiedValue: "Fuel is customer responsibility",
+          source: "latestClosedMissingInfoAnswers.ownerAnswer",
+        },
+      ],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async (args) => {
+      prompts.push(args);
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply: "Fuel ka kharcha aapki zimmedari hai.",
+                replySemantics: {
+                  claims: [],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+  assert.equal(composed.ok, true);
+  const userContent = String(prompts[0]?.messages?.[1]?.content || "");
+  assert.doesNotMatch(
+    userContent.split("FACT_RESOLUTION_JSON")[0],
+    /Fuel is customer responsibility/i
+  );
+  assert.match(userContent, /FACT_RESOLUTION_JSON/);
+  assert.match(
+    userContent.split("FACT_RESOLUTION_JSON")[1],
+    /Fuel is customer responsibility/
+  );
 });

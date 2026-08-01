@@ -270,7 +270,8 @@ test("A. missing pickup location: invent without Turn Plan corrected to deferred
   assert.equal(result.decision.evidenceNeeds?.[0]?.concept, "pickup");
   const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
   assert.match(correctionPrompt, /FACTUAL_TURN_PLAN_REQUIRED|capability|evidenceNeeds/i);
-  assert.match(correctionPrompt, /Do NOT answer the factual question yet/i);
+  assert.match(correctionPrompt, /customerReply MUST be empty/i);
+  assert.match(correctionPrompt, /Do NOT use capability=social/i);
 });
 
 test("B. missing advance/deposit fact: invent without Turn Plan corrected to deferred plan", async () => {
@@ -314,7 +315,8 @@ test("B. missing advance/deposit fact: invent without Turn Plan corrected to def
   assert.equal(result.decision.capability, "answer_from_business_profile");
   const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
   assert.match(correctionPrompt, /capability|evidenceNeeds/i);
-  assert.match(correctionPrompt, /Do NOT answer the factual question yet/i);
+  assert.match(correctionPrompt, /customerReply MUST be empty/i);
+  assert.match(correctionPrompt, /Do NOT use capability=social/i);
 });
 
 test("C. verified pickupTime ask defers via Turn Plan (wording after resolve)", async () => {

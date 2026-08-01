@@ -349,7 +349,8 @@ test("factual ask without requestedInformation triggers correction then failure"
   assert.ok(calls.length >= 2);
   const correction = String(calls[1]?.messages?.[1]?.content || "");
   assert.match(correction, /capability|evidenceNeeds/i);
-  assert.match(correction, /Do NOT answer the factual question yet/i);
+  assert.match(correction, /customerReply MUST be empty/i);
+  assert.match(correction, /Do NOT use capability=social/i);
 });
 
 test("factual ask with requestedInformation defers — no direct customerReply", async () => {

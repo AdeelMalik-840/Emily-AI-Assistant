@@ -35,6 +35,119 @@ import { bookingReplyGuardFacts } from "../brain/facts/resolveActiveCustomerBook
 import { isAllowedPaMissingInfoType } from "./paMissingInfoRequestService.js";
 import { resolveOpenAiChatCompletionsCreate } from "./openaiChatCompletionsCreate.js";
 
+/**
+ * Model-facing conversation context for post-confirm informational compose.
+ * Structurally excludes answerable side-channel facts (policies, closed owner
+ * answers, booking field values, catalog, candidate arrays). Guard validation
+ * facts are assembled separately and must not be confused with this prompt.
+ *
+ * @param {{
+ *   facts?: Record<string, unknown> | null,
+ *   selectedBooking?: Record<string, unknown> | null,
+ * }} [p]
+ */
+export function buildPostConfirmInformationalComposeContextForPrompt({
+  facts = null,
+  selectedBooking = null,
+} = {}) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  const business =
+    f.business && typeof f.business === "object" ? f.business : {};
+  const booking =
+    selectedBooking && typeof selectedBooking === "object"
+      ? selectedBooking
+      : f.booking && typeof f.booking === "object"
+        ? f.booking
+        : null;
+  const name = String(business.name ?? business.businessName ?? "")
+    .trim()
+    .slice(0, 120);
+  const tone = String(business.tone ?? "").trim().slice(0, 200);
+  return {
+    conversationContextOnly: true,
+    business: {
+      name: name || null,
+      ...(tone ? { tone } : {}),
+    },
+    focusedBookingIdentity: booking
+      ? {
+          id: booking.id ?? null,
+          selectionIndex: booking.selectionIndex ?? null,
+          itemLabel: booking.itemLabel ?? booking.itemName ?? null,
+        }
+      : null,
+    // Explicit structural denial — never pass these answerable stores to the model.
+    known: null,
+    knownPolicies: null,
+    latestClosedMissingInfoAnswers: null,
+    openMissingInfoRequests: null,
+    booking: null,
+    bookingCandidates: null,
+    activeBookings: null,
+    catalogItems: null,
+    pendingAvailabilityRequests: null,
+    availabilityRequest: null,
+    replyGuardFacts: null,
+  };
+}
+
+/**
+ * Shape FACT_RESOLUTION_JSON for the model: Result is the only factual authority.
+ * - found: only found items retain verified values
+ * - missing / conflicting / unsupported / not_found: all item values stripped
+ *   (including partial found slots) so the model cannot substitute
+ *
+ * @param {Record<string, unknown>} resolution
+ */
+export function buildInformationalComposeFactResolutionForPrompt(resolution) {
+  const raw = resolution && typeof resolution === "object" ? resolution : {};
+  const rawStatus = String(raw.status ?? "unsupported");
+  let status;
+  if (rawStatus === "found") status = "found";
+  else if (rawStatus === "conflicting") status = "conflicting";
+  else if (
+    rawStatus === "missing" ||
+    rawStatus === "not_found"
+  ) {
+    status = "not_found";
+  } else {
+    status = "unsupported";
+  }
+
+  const itemsIn = Array.isArray(raw.items) ? raw.items : [];
+  const items =
+    status === "found"
+      ? itemsIn
+          .filter((i) => i && i.status === "found")
+          .map((i) => ({
+            entity: i.entity ?? null,
+            concept: i.concept ?? null,
+            attribute: i.attribute ?? null,
+            status: "found",
+            verifiedValue: i.verifiedValue ?? null,
+            source: i.source ?? null,
+          }))
+      : itemsIn.map((i) => ({
+          entity: i?.entity ?? null,
+          concept: i?.concept ?? null,
+          attribute: i?.attribute ?? null,
+          status: i?.status ?? status,
+          verifiedValue: null,
+          source: null,
+        }));
+
+  return {
+    capability: raw.capability ?? null,
+    requestedInformation: raw.requestedInformation ?? null,
+    status,
+    factAvailable: status === "found",
+    verifiedValue: status === "found" ? raw.verifiedValue ?? null : null,
+    source: status === "found" ? raw.source ?? null : null,
+    items,
+    missingInfoType: raw.missingInfoType ?? null,
+  };
+}
+
 /** Apply a found evidence item onto reply-guard seed facts. */
 function applyFoundEvidenceItemToGuardFacts(guardFacts, item) {
   const concept = String(item?.concept || "");
@@ -616,10 +729,10 @@ export async function composePostConfirmInformationalCustomerReply({
       resolution.requestedInformation ?? decision.requestedInformation ?? null,
     status: (() => {
       const s = String(resolution.status ?? "unsupported");
-      if (s === "missing" || s === "conflicting" || s === "not_found") {
-        return "not_found";
-      }
-      return s === "found" ? "found" : "unsupported";
+      if (s === "found") return "found";
+      if (s === "conflicting") return "conflicting";
+      if (s === "missing" || s === "not_found") return "not_found";
+      return "unsupported";
     })(),
     factAvailable: resolution.factAvailable === true || resolution.status === "found",
     verifiedValue:
@@ -631,7 +744,12 @@ export async function composePostConfirmInformationalCustomerReply({
         ? resolution.source ?? null
         : null,
     items: Array.isArray(resolution.items) ? resolution.items : [],
+    missingInfoType: resolution.missingInfoType ?? null,
   };
+
+  // Model prompt Result: sole factual authority (values stripped unless found).
+  const promptFactResolution =
+    buildInformationalComposeFactResolutionForPrompt(verifiedResolution);
 
   const frozen = {
     action: decision.action ?? "reply",
@@ -779,7 +897,13 @@ export async function composePostConfirmInformationalCustomerReply({
     replyGuardFacts: seededGuardFacts,
   };
 
-  const factsJson = compactPostConfirmFactsForPrompt(contractFacts);
+  // Guard + reply contract keep full trusted validation facts.
+  // Model prompt gets conversation context only — no side-channel answers.
+  const promptContext = buildPostConfirmInformationalComposeContextForPrompt({
+    facts: factsObj,
+    selectedBooking: booking,
+  });
+  const factsJson = JSON.stringify(promptContext);
   const replyContract = buildPostConfirmPaReplyContract({
     ...contractFacts,
     customerMessageText: customerMessage,
@@ -791,7 +915,9 @@ export async function composePostConfirmInformationalCustomerReply({
     styleKey,
     businessCommunicationProfile:
       factsObj?.business && typeof factsObj.business === "object"
-        ? /** @type {Record<string, unknown>} */ (factsObj.business)
+        ? {
+            tone: /** @type {Record<string, unknown>} */ (factsObj.business).tone,
+          }
         : factsObj?.tone != null
           ? { tone: factsObj.tone }
           : null,
@@ -807,11 +933,12 @@ FROZEN_DECISION_JSON is authoritative and immutable. You may ONLY write customer
 You MUST NOT change action, mutationIntent, bookingSelectionMode, selectedBookingIndex, selectedBookingId, conversationAct, customerIntent, situation, capability, or evidenceNeeds.
 You MUST NOT reinterpret the customer message into a different intent, workflow, mutation, or booking.
 
-FACT_RESOLUTION_JSON is the only authority for whether the requested fact exists:
-- status "found": answer using verifiedValue only (and matching verified booking facts). Do not add other unverified facts. customerReply MUST be non-empty.
-- status "not_found": say the detail is not confirmed yet, OR ask one useful clarification. Do NOT invent a substitute value. customerReply MUST be non-empty.
-- Only mention fields that appear as status="found" in FACT_RESOLUTION_JSON.items (or the single verifiedValue). Do not volunteer extra booking dates/prices/locations that were not requested in the Turn Plan.
-- status "unsupported": ask one useful clarification about what detail they need. Do NOT invent facts. customerReply MUST be non-empty.
+FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
+- status "found": answer using verifiedValue / found items only. Do not add other facts. customerReply MUST be non-empty.
+- status "not_found": say the detail is not confirmed yet, OR ask one useful clarification. Do NOT invent a substitute. customerReply MUST be non-empty.
+- status "conflicting": trusted sources disagree — say the detail is unclear/not confirmed. Do NOT pick either candidate value. customerReply MUST be non-empty.
+- status "unsupported": say this detail is not available from verified booking/business facts, OR ask one useful clarification. Do NOT invent policies or answers. customerReply MUST be non-empty.
+- CONVERSATION_CONTEXT_JSON is tone/identity only. It contains NO answerable booking/policy/owner-answer facts. Never treat it as an answer source.
 - When stating a found booking reference/code, put the exact verifiedValue immediately after a colon with no filler words in between (example shape: "booking reference: STONIC-PROD"). Do not write patterns like "reference hai: …".
 
 STRICT SAFETY:
@@ -820,9 +947,9 @@ STRICT SAFETY:
 - Keep reply short for WhatsApp.`;
 
   const userBase =
-    `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\n` +
+    `CONVERSATION_CONTEXT_JSON:\n${factsJson}\n\n` +
     `FROZEN_DECISION_JSON:\n${JSON.stringify(frozen)}\n\n` +
-    `FACT_RESOLUTION_JSON:\n${JSON.stringify(verifiedResolution)}\n\n` +
+    `FACT_RESOLUTION_JSON:\n${JSON.stringify(promptFactResolution)}\n\n` +
     `CURRENT_CUSTOMER_MESSAGE (tone/context only — do not reinterpret intent):\n${customerMessage || "(none)"}\n\n` +
     `CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
       allowedClaims: replyContract.allowedClaims,
@@ -834,7 +961,7 @@ STRICT SAFETY:
     system,
     userBase,
     firstAttemptReminder:
-      "Remember: JSON only; wording only from FACT_RESOLUTION_JSON + verified facts; customerReply must be non-empty; never invent missing values; never change frozen decision.",
+      "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; CONVERSATION_CONTEXT_JSON is not an answer source; customerReply must be non-empty; never invent missing values; never change frozen decision.",
     responseFormatName: "post_confirm_informational_reply_compose",
     replyContract,
     enrichGuardContract: (contract) => ({
