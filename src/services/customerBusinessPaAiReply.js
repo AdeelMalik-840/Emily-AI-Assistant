@@ -96,6 +96,38 @@ export function buildPostConfirmInformationalComposeContextForPrompt({
 }
 
 /**
+ * Derive whether informational compose may ask the customer for input.
+ * Reuses existing frozen Plan / Result marks only — no new schema fields,
+ * no customer-text routing.
+ *
+ * @param {{
+ *   frozenDecision?: Record<string, unknown> | null,
+ *   factResolution?: Record<string, unknown> | null,
+ * }} [p]
+ */
+export function isPostConfirmInformationalCustomerInputRequired({
+  frozenDecision = null,
+  factResolution = null,
+} = {}) {
+  const decision =
+    frozenDecision && typeof frozenDecision === "object" ? frozenDecision : {};
+  const resolution =
+    factResolution && typeof factResolution === "object" ? factResolution : {};
+  const capability = String(
+    decision.capability ?? resolution.capability ?? ""
+  ).trim();
+  const bookingSelectionMode = String(
+    decision.bookingSelectionMode ?? ""
+  ).trim();
+  const selectionStatus = String(resolution.selectionStatus ?? "").trim();
+  return (
+    capability === "clarification_needed" ||
+    bookingSelectionMode === "clarification_required" ||
+    selectionStatus === "explicit_unresolved"
+  );
+}
+
+/**
  * Shape FACT_RESOLUTION_JSON for the model: Result is the only factual authority.
  * - found: only found items retain verified values
  * - missing / conflicting / unsupported / not_found: all item values stripped
@@ -749,11 +781,24 @@ export async function composePostConfirmInformationalCustomerReply({
         : null,
     items: Array.isArray(resolution.items) ? resolution.items : [],
     missingInfoType: resolution.missingInfoType ?? null,
+    selectionStatus: resolution.selectionStatus ?? null,
   };
 
+  const customerInputRequired = isPostConfirmInformationalCustomerInputRequired({
+    frozenDecision: decision,
+    factResolution: {
+      ...resolution,
+      capability: verifiedResolution.capability,
+      selectionStatus: verifiedResolution.selectionStatus,
+    },
+  });
+
   // Model prompt Result: sole factual authority (values stripped unless found).
-  const promptFactResolution =
-    buildInformationalComposeFactResolutionForPrompt(verifiedResolution);
+  const promptFactResolution = {
+    ...buildInformationalComposeFactResolutionForPrompt(verifiedResolution),
+    customerInputRequired,
+    selectionStatus: verifiedResolution.selectionStatus,
+  };
 
   const frozen = {
     action: decision.action ?? "reply",
@@ -770,6 +815,8 @@ export async function composePostConfirmInformationalCustomerReply({
       : [],
     requestedInformation: verifiedResolution.requestedInformation,
     informationalReplyDeferred: true,
+    // Compose-local derivation from existing Plan/Result marks (not a Brain schema field).
+    customerInputRequired,
   };
 
   const known =
@@ -940,9 +987,8 @@ You MUST NOT reinterpret the customer message into a different intent, workflow,
 
 FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
 - status "found": answer using verifiedValue / found items only. Do not add other facts. customerReply MUST be non-empty.
-- status "not_found": say the detail is not confirmed yet, OR ask one useful clarification. Do NOT invent a substitute. customerReply MUST be non-empty.
-- status "conflicting": trusted sources disagree — say the detail is unclear/not confirmed. Do NOT pick either candidate value. customerReply MUST be non-empty.
-- status "unsupported": say this detail is not available from verified booking/business facts, OR ask one useful clarification. Do NOT invent policies or answers. customerReply MUST be non-empty.
+- customerInputRequired=true: you MAY ask one useful clarification for customer preference/input that the Turn Plan/Result already marked as required. Do NOT invent facts. customerReply MUST be non-empty.
+- customerInputRequired=false AND status is "not_found", "unsupported", or "conflicting": state naturally that the business/booking detail is not confirmed, unavailable, or unclear. Do NOT ask the customer to supply that business-owned fact. Do NOT invent a substitute. Do NOT claim owner contact. Do NOT promise a later answer. customerReply MUST be non-empty.
 - CONVERSATION_CONTEXT_JSON is tone/identity only. It contains NO answerable booking/policy/owner-answer facts. Never treat it as an answer source.
 - When stating a found booking reference/code, put the exact verifiedValue immediately after a colon with no filler words in between (example shape: "booking reference: STONIC-PROD"). Do not write patterns like "reference hai: …".
 
@@ -965,8 +1011,9 @@ STRICT SAFETY:
   const composed = await composeGuardedCustomerReply({
     system,
     userBase,
-    firstAttemptReminder:
-      "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; CONVERSATION_CONTEXT_JSON is not an answer source; customerReply must be non-empty; never invent missing values; never change frozen decision.",
+    firstAttemptReminder: customerInputRequired
+      ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; customerReply must be non-empty; never change frozen decision."
+      : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; customerReply must be non-empty; never change frozen decision.",
     responseFormatName: "post_confirm_informational_reply_compose",
     replyContract,
     enrichGuardContract: (contract) => ({
@@ -1006,8 +1053,10 @@ STRICT SAFETY:
   });
 
   // Found/not_found/unsupported must never silently become an empty sendable reply.
-  // Prefer a truthful deterministic clarification over empty outbound.
+  // Prefer a truthful deterministic recovery over empty outbound.
   if (!String(composed?.reply ?? "").trim()) {
+    const openaiReason =
+      String(composed?.reason ?? "").trim() || "EMPTY_OR_INVALID_OPENAI_REPLY";
     const status = verifiedResolution.status;
     let deterministic = "";
     if (status === "found" && verifiedResolution.verifiedValue != null) {
@@ -1015,24 +1064,30 @@ STRICT SAFETY:
       if (v) deterministic = v;
     }
     if (!deterministic) {
-      deterministic =
-        status === "conflicting"
-          ? "Yeh detail abhi clear nahi hai. Kya aap thoda aur specify kar sakte hain?"
-          : "Yeh detail abhi confirm nahi hui. Kya aap thoda aur clear bata sakte hain?";
+      if (customerInputRequired) {
+        deterministic =
+          status === "conflicting"
+            ? "Yeh detail abhi clear nahi hai. Kya aap thoda aur specify kar sakte hain?"
+            : "Yeh detail abhi confirm nahi hui. Kya aap thoda aur clear bata sakte hain?";
+      } else if (status === "conflicting") {
+        deterministic = "Yeh detail abhi clear nahi hai.";
+      } else {
+        deterministic = "Yeh detail abhi confirm nahi hui.";
+      }
     }
-    const contractFacts = {
+    const contractFactsDet = {
       ...factsObj,
       booking,
       activeBookings: [],
       replyGuardFacts: seededGuardFacts,
     };
-    const replyContract = buildPostConfirmPaReplyContract({
-      ...contractFacts,
+    const replyContractDet = buildPostConfirmPaReplyContract({
+      ...contractFactsDet,
       customerMessageText: customerMessage,
       styleKey,
     });
     const guard = validateCustomerReplyAgainstContract(deterministic, {
-      ...replyContract,
+      ...replyContractDet,
       replyRequired: true,
     });
     if (guard.ok) {
@@ -1043,15 +1098,32 @@ STRICT SAFETY:
         reason: null,
         frozenDecision: frozen,
         factResolution: verifiedResolution,
+        composeFailure: {
+          openaiReason,
+          deterministicReason: null,
+          finalClass: null,
+        },
       };
     }
+    const deterministicReason =
+      String(guard?.reason ?? "").trim() || "deterministic_guard_failed";
+    const finalClass = "INFORMATIONAL_COMPOSE_EMPTY_REPLY";
+    // Keep pause-eligible OpenAI reasons visible in the outward reason string.
+    const outwardReason = /EMPTY_OR_INVALID_OPENAI_REPLY/i.test(openaiReason)
+      ? `${finalClass}:${openaiReason}`
+      : finalClass;
     return {
       ok: false,
       reply: "",
       source: "technical_fallback",
-      reason: "INFORMATIONAL_COMPOSE_EMPTY_REPLY",
+      reason: outwardReason,
       frozenDecision: frozen,
       factResolution: verifiedResolution,
+      composeFailure: {
+        openaiReason,
+        deterministicReason,
+        finalClass,
+      },
     };
   }
 
@@ -1059,5 +1131,6 @@ STRICT SAFETY:
     ...composed,
     frozenDecision: frozen,
     factResolution: verifiedResolution,
+    composeFailure: null,
   };
 }
