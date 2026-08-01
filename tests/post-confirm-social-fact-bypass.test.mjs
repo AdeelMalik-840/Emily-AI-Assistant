@@ -386,6 +386,53 @@ test("silence on ask_fact without Turn Plan is factual contract violation", () =
   );
 });
 
+test("action_request with answer_from_* normalizes to clarification_needed", () => {
+  const parsed = parsePostConfirmCustomerDmDecision(
+    decisionJson({
+      conversationAct: "action_request",
+      customerIntent: "ask_action",
+      customerIsAskingQuestion: false,
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        {
+          entity: "active_booking",
+          concept: "status",
+          attributes: ["value"],
+        },
+      ],
+      customerReply: "",
+      shouldReply: true,
+      action: "reply",
+    })
+  );
+  assert.ok(parsed);
+  assert.equal(parsed.capability, "clarification_needed");
+  assert.deepEqual(parsed.evidenceNeeds, []);
+  assert.equal(isDeferredPostConfirmInformationalDecision(parsed), true);
+});
+
+test("pickup time Turn Plan stays pickup (not delivery)", () => {
+  const parsed = parsePostConfirmCustomerDmDecision(
+    decisionJson({
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        {
+          entity: "active_booking",
+          concept: "pickup",
+          attributes: ["time"],
+        },
+      ],
+      customerReply: "",
+      conversationAct: "information_request",
+      customerIntent: "ask_fact",
+      customerIsAskingQuestion: true,
+    })
+  );
+  assert.equal(parsed.evidenceNeeds[0].concept, "pickup");
+  assert.ok(parsed.evidenceNeeds[0].attributes.includes("time"));
+  assert.notEqual(parsed.evidenceNeeds[0].concept, "delivery");
+});
+
 test("genuine social hello accepted and decide prompt has no fact dump", async () => {
   const calls = [];
   const result = await executePostConfirmPaLaneDecision({

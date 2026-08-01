@@ -2210,7 +2210,23 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   if (conversationAct !== "information_request") {
     // Preserve a factual Turn Plan even when conversationAct drifted
     // (unknown/ack/chit_chat). Do not wipe evidenceNeeds to social/null.
+    // Exception: action_request / ask_action must not become a booking-fact
+    // lookup (e.g. "owner se confirm") — that yields wrong found evidence or
+    // empty compose. Clarify instead (no owner workflow in this lane).
     if (capabilityRequiresEvidenceResolution(capability)) {
+      const actionLikeAsk =
+        conversationAct === "action_request" ||
+        customerIntent === "ask_action";
+      if (
+        actionLikeAsk &&
+        capability !== "availability_request" &&
+        capability !== "mutation_requested" &&
+        action !== "request_booking_mutation"
+      ) {
+        capability = "clarification_needed";
+        evidenceNeeds = [];
+        requestedInformation = null;
+      }
       conversationAct = "information_request";
       customerIsAskingQuestion = true;
       if (customerIntent === "unclear" || !customerIntent) {
@@ -2576,6 +2592,8 @@ export async function executePostConfirmPaLaneDecision({
               concept: {
                 type: "string",
                 enum: [...POST_CONFIRM_EVIDENCE_CONCEPTS],
+                description:
+                  "Semantic slot. pickup and delivery are DISTINCT: pickup+time is pickup time only; delivery+time is delivery time only. Never swap pickup↔delivery. business_profile delivery+policy is delivery policy, not a booking delivery time.",
               },
               attributes: {
                 type: "array",
@@ -2583,6 +2601,8 @@ export async function executePostConfirmPaLaneDecision({
                   type: "string",
                   enum: [...POST_CONFIRM_EVIDENCE_ATTRIBUTES],
                 },
+                description:
+                  "For times: pair attribute time with concept pickup OR delivery (not both, never the opposite concept).",
               },
             },
             required: ["entity", "concept", "attributes"],

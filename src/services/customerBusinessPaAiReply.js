@@ -1001,11 +1001,45 @@ STRICT SAFETY:
   });
 
   // Found/not_found/unsupported must never silently become an empty sendable reply.
-  // Empty + ok:false is a classified technical compose failure for the caller.
-  if (
-    composed?.ok === true &&
-    !String(composed?.reply ?? "").trim()
-  ) {
+  // Prefer a truthful deterministic clarification over empty outbound.
+  if (!String(composed?.reply ?? "").trim()) {
+    const status = verifiedResolution.status;
+    let deterministic = "";
+    if (status === "found" && verifiedResolution.verifiedValue != null) {
+      const v = String(verifiedResolution.verifiedValue).trim();
+      if (v) deterministic = v;
+    }
+    if (!deterministic) {
+      deterministic =
+        status === "conflicting"
+          ? "Yeh detail abhi clear nahi hai. Kya aap thoda aur specify kar sakte hain?"
+          : "Yeh detail abhi confirm nahi hui. Kya aap thoda aur clear bata sakte hain?";
+    }
+    const contractFacts = {
+      ...factsObj,
+      booking,
+      activeBookings: [],
+      replyGuardFacts: seededGuardFacts,
+    };
+    const replyContract = buildPostConfirmPaReplyContract({
+      ...contractFacts,
+      customerMessageText: customerMessage,
+      styleKey,
+    });
+    const guard = validateCustomerReplyAgainstContract(deterministic, {
+      ...replyContract,
+      replyRequired: true,
+    });
+    if (guard.ok) {
+      return {
+        ok: true,
+        reply: deterministic,
+        source: "deterministic_informational_fallback",
+        reason: null,
+        frozenDecision: frozen,
+        factResolution: verifiedResolution,
+      };
+    }
     return {
       ok: false,
       reply: "",
