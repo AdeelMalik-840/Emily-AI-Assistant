@@ -496,6 +496,13 @@ export async function handleCustomerBusinessPaInbound({
     composeCalls += 1;
 
     if (composed?.ok !== true || !cleanCustomerReply(composed?.reply)) {
+      const composeFailure =
+        composed?.composeFailure && typeof composed.composeFailure === "object"
+          ? composed.composeFailure
+          : null;
+      const failureReason =
+        clean(composed?.reason, 160) ||
+        "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED";
       return {
         handled: true,
         action: "business_pa_terminal_model_failure",
@@ -512,9 +519,8 @@ export async function handleCustomerBusinessPaInbound({
         openaiUsed: false,
         openaiSource: composed?.source ?? "technical_fallback",
         finalReplySource: "openai_post_confirm_pa_informational_compose",
-        failureReason:
-          clean(composed?.reason, 160) ||
-          "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED",
+        failureReason,
+        composeFailure,
         requestedInformation: frozenDecision.requestedInformation ?? null,
         factResolution,
         bookingSelectionMode:

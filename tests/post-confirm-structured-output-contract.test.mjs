@@ -407,6 +407,18 @@ test("temporary auto-retry pause gate for model-contract failures", () => {
       true
     );
     assert.equal(
+      shouldPauseCloudPostConfirmModelContractAutoRetry(
+        "INFORMATIONAL_COMPOSE_EMPTY_REPLY"
+      ),
+      true
+    );
+    assert.equal(
+      shouldPauseCloudPostConfirmModelContractAutoRetry(
+        "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED"
+      ),
+      true
+    );
+    assert.equal(
       shouldPauseCloudPostConfirmModelContractAutoRetry("network_timeout"),
       false
     );

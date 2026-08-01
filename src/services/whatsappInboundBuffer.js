@@ -592,6 +592,8 @@ export function isPostConfirmModelContractFailureError(lastError) {
     /EMPTY_OR_INVALID_OPENAI_REPLY/i.test(err) ||
     /OPENAI_POST_CONFIRM_FAILED/i.test(err) ||
     /OPENAI_POST_CONFIRM_MODEL_CONTRACT/i.test(err) ||
+    /OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE/i.test(err) ||
+    /INFORMATIONAL_COMPOSE_EMPTY_REPLY/i.test(err) ||
     /customer_reply_required_but_empty/i.test(err) ||
     // Exhausted in-decision claim-guard mismatches must not auto-replay storms.
     /verified_item_mismatch/i.test(err) ||
@@ -2549,6 +2551,9 @@ export async function executeWhatsAppAiPipeline(p) {
         reply = String(businessPaResult.reply ?? "").trim();
         const hasBusinessPaReply = reply.length > 0;
         sendVia = hasBusinessPaReply ? "CLOUD_API" : "NONE";
+        const paFinalReplySource =
+          String(businessPaResult.finalReplySource ?? "").trim() ||
+          "openai_post_confirm_pa";
         messageMeta = {
           ...(hasBusinessPaReply ? {} : { handledWithoutOutbound: true }),
           customerBusinessPaHandled: true,
@@ -2557,10 +2562,10 @@ export async function executeWhatsAppAiPipeline(p) {
           missingInfoEscalated: businessPaResult.missingInfoEscalated === true,
           missingInfoRequestId: businessPaResult.missingInfoRequestId ?? null,
           missingInfoType: businessPaResult.missingInfoType ?? null,
-          finalReplySource: "openai_post_confirm_pa",
+          finalReplySource: paFinalReplySource,
           outboundTrace: {
             kind: "business_pa_outbound",
-            finalReplySource: "openai_post_confirm_pa",
+            finalReplySource: paFinalReplySource,
           },
         };
       }
