@@ -572,14 +572,58 @@ const recentInboundByOwnerAndText = new Map();
 const pendingPlaywrightPipelineBySession = new Map();
 const pendingCloudRetryTimersByGuarantee = new Map();
 
+/**
+ * Temporary development gate for post-confirm model-contract auto-replay storms.
+ * Durable failure marking remains; timers/recovery auto-replay are paused unless
+ * CLOUD_POST_CONFIRM_AUTO_RETRY=1|true|on.
+ * Re-enable after the structured-output contract fix is validated in production.
+ */
+export function isCloudPostConfirmAutoRetryEnabled() {
+  const raw = String(process.env.CLOUD_POST_CONFIRM_AUTO_RETRY ?? "0")
+    .trim()
+    .toLowerCase();
+  return raw === "1" || raw === "true" || raw === "on";
+}
+
+/** @param {unknown} lastError */
+export function isPostConfirmModelContractFailureError(lastError) {
+  const err = String(lastError ?? "");
+  return (
+    /EMPTY_OR_INVALID_OPENAI_REPLY/i.test(err) ||
+    /OPENAI_POST_CONFIRM_FAILED/i.test(err) ||
+    /OPENAI_POST_CONFIRM_MODEL_CONTRACT/i.test(err) ||
+    /customer_reply_required_but_empty/i.test(err)
+  );
+}
+
+/**
+ * @param {unknown} lastError
+ * @returns {boolean} true when this failure should not auto-replay right now
+ */
+export function shouldPauseCloudPostConfirmModelContractAutoRetry(lastError) {
+  return (
+    !isCloudPostConfirmAutoRetryEnabled() &&
+    isPostConfirmModelContractFailureError(lastError)
+  );
+}
+
 function scheduleCloudPostConfirmRetry(
   p,
   identity,
   retryCount,
-  claimOwner = null
+  claimOwner = null,
+  lastError = null
 ) {
   const guaranteeKey = String(identity?.guaranteeKey ?? "").trim();
   if (!guaranteeKey || retryCount > 5) return;
+  if (shouldPauseCloudPostConfirmModelContractAutoRetry(lastError)) {
+    console.warn("[cloud_post_confirm_auto_retry_paused]", {
+      guaranteeKey,
+      retryCount,
+      lastError: String(lastError ?? "").slice(0, 120) || null,
+    });
+    return;
+  }
   if (pendingCloudRetryTimersByGuarantee.has(guaranteeKey)) return;
   const delayMs = Math.min(30_000, 500 * 2 ** Math.max(0, retryCount - 1));
   const timer = setTimeout(() => {
@@ -3478,16 +3522,21 @@ export async function executeWhatsAppAiPipeline(p) {
   } catch (err) {
     console.error("❌ Processing error:", err);
     if (cloudLifecycleClaimed && cloudLifecycleIdentity?.guaranteeKey) {
+      const lastError = String(err?.message ?? err ?? "processing_error");
+      const pauseContractAutoRetry =
+        shouldPauseCloudPostConfirmModelContractAutoRetry(lastError);
       const failed = markCloudInboundTurnRetryableFailure({
         identity: cloudLifecycleIdentity,
-        lastError: String(err?.message ?? err ?? "processing_error"),
+        lastError,
         retryDelayMs: 1000,
+        ...(pauseContractAutoRetry ? { autoRetryAllowed: false } : {}),
       });
       scheduleCloudPostConfirmRetry(
         p,
         cloudLifecycleIdentity,
         Number(failed?.retryCount ?? 1),
-        cloudLifecycleClaimOwner
+        cloudLifecycleClaimOwner,
+        lastError
       );
     }
     if (guaranteeKey) {

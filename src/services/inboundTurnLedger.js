@@ -1608,6 +1608,7 @@ export function markCloudInboundTurnRetryableFailure({
   lastError,
   retryDelayMs = 1000,
   maxRetryCount = 5,
+  autoRetryAllowed,
 } = {}) {
   const chatKey = String(identity?.chatKey ?? "").trim();
   const stableId = String(identity?.stableId ?? "").trim();
@@ -1641,6 +1642,7 @@ export function markCloudInboundTurnRetryableFailure({
       retryCount,
       nextRetryAt: Date.now() + Math.max(250, Number(retryDelayMs) || 1000),
       lastError: String(lastError ?? "cloud_processing_failed").slice(0, 160),
+      ...(autoRetryAllowed === false ? { autoRetryAllowed: false } : {}),
       cloudOwnershipQueue: existing.cloudOwnershipQueue
         ? {
             ...existing.cloudOwnershipQueue,
