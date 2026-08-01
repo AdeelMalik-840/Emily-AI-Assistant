@@ -349,6 +349,18 @@ test("temporary auto-retry pause gate for model-contract failures", () => {
       true
     );
     assert.equal(
+      shouldPauseCloudPostConfirmModelContractAutoRetry(
+        "verified_booking_time_mismatch"
+      ),
+      true
+    );
+    assert.equal(
+      shouldPauseCloudPostConfirmModelContractAutoRetry(
+        "verified_price_mismatch"
+      ),
+      true
+    );
+    assert.equal(
       shouldPauseCloudPostConfirmModelContractAutoRetry("network_timeout"),
       false
     );
@@ -358,6 +370,12 @@ test("temporary auto-retry pause gate for model-contract failures", () => {
     assert.equal(
       shouldPauseCloudPostConfirmModelContractAutoRetry(
         "EMPTY_OR_INVALID_OPENAI_REPLY"
+      ),
+      false
+    );
+    assert.equal(
+      shouldPauseCloudPostConfirmModelContractAutoRetry(
+        "verified_booking_time_mismatch"
       ),
       false
     );
