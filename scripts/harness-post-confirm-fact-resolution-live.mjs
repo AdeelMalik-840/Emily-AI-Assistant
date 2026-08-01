@@ -334,6 +334,8 @@ async function runCaseBody(c, index) {
     facts,
     styleKey: "casual_local",
     missingInfoLoopFullyEnabled: false,
+    // Decide may use same-Brain corrections; keep under case timeout.
+    timeoutMs: Math.min(45000, Math.max(20000, CASE_TIMEOUT_MS - 15000)),
   });
   openaiCalls += Number(decided?.contentSafetyAttempts ?? 1) || 1;
   if (Number(decided?.silenceRecoveryAttempts ?? 0) > 0) retries += 1;

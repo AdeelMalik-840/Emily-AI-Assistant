@@ -155,6 +155,22 @@ function silenceInformationDecision() {
   });
 }
 
+/** Silence on a factual ask without a Turn Plan (contract violation). */
+function silenceFactualWithoutTurnPlan() {
+  return decision({
+    capability: null,
+    evidenceNeeds: [],
+    requestedInformation: null,
+    requestedInfoType: null,
+    shouldReply: false,
+    customerReply: "",
+    action: "silence",
+    bookingSelectionMode: "none",
+    selectedBookingIndex: null,
+    groundedFacts: groundedFacts(),
+  });
+}
+
 function acknowledgementSilenceDecision() {
   return decision({
     situation: "acknowledgement_after_answer",
@@ -211,11 +227,46 @@ async function runWithResponses(responses, options = {}) {
   return { result, calls };
 }
 
-test("trusted focused information silence recovers to deferred Turn Plan", async () => {
+test("silence with factual Turn Plan normalizes to deferred without recovery", async () => {
+  const { result, calls } = await runWithResponses([silenceInformationDecision()]);
+
+  assert.equal(calls.length, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai");
+  assert.equal(result.silenceRecoveryAttempts, 0);
+  assert.equal(result.contentSafetyAttempts, 1);
+  assert.equal(result.decision.action, "reply");
+  assert.equal(result.decision.shouldReply, true);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.bookingSelectionMode, "focused");
+  assert.equal(result.decision.selectedBookingIndex, 1);
+  assert.equal(result.decision.selectedBookingId, "test-booking-stonic");
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+});
+
+test("silence without Turn Plan corrects to deferred factual plan", async () => {
   const { result, calls } = await runWithResponses([
-    silenceInformationDecision(),
-    decision(),
+    silenceFactualWithoutTurnPlan(),
+    decision({ customerReply: "" }),
   ]);
+
+  assert.equal(calls.length, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
+  const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
+  assert.match(correctionPrompt, /CORRECTIVE REGENERATION/);
+  assert.match(correctionPrompt, /Turn Plan|capability|evidenceNeeds/i);
+  assert.doesNotMatch(correctionPrompt, /return\s+"Kia Stonic 4 din/i);
+});
+
+test("live ack silence then Turn Plan defers without third recovery", async () => {
+  const { result, calls } = await runWithResponses(
+    [acknowledgementSilenceDecision(), silenceInformationDecision()],
+    { userMessage: "Kitny din k lye book ki h?" }
+  );
 
   assert.equal(calls.length, 2);
   assert.equal(result.ok, true);
@@ -230,69 +281,32 @@ test("trusted focused information silence recovers to deferred Turn Plan", async
   assert.equal(result.decision.selectedBookingIndex, 1);
   assert.equal(result.decision.selectedBookingId, "test-booking-stonic");
   assert.equal(result.decision.capability, "answer_from_active_booking");
-
-  const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  assert.match(correctionPrompt, /CORRECTIVE REGENERATION/);
-  assert.match(correctionPrompt, /CURRENT_BOOKING_IN_SCOPE/);
-  assert.match(correctionPrompt, /test-stonic-item/);
-  assert.doesNotMatch(correctionPrompt, /return\s+"Kia Stonic 4 din/i);
-});
-
-test("live ack silence then empty required reply recovers to deferred Turn Plan", async () => {
-  const { result, calls } = await runWithResponses(
-    [
-      acknowledgementSilenceDecision(),
-      silenceInformationDecision(),
-      decision(),
-    ],
-    { userMessage: "Kitny din k lye book ki h?" }
-  );
-
-  assert.equal(calls.length, 3);
-  assert.equal(result.ok, true);
-  assert.equal(result.source, "openai");
-  assert.equal(result.silenceRecoveryAttempts, 1);
-  assert.equal(result.contentSafetyAttempts, 3);
-  assert.equal(result.decision.action, "reply");
-  assert.equal(result.decision.shouldReply, true);
-  assert.equal(result.decision.customerReply, "");
-  assert.equal(result.decision.informationalReplyDeferred, true);
-  assert.equal(result.decision.bookingSelectionMode, "focused");
-  assert.equal(result.decision.selectedBookingIndex, 1);
-  assert.equal(result.decision.selectedBookingId, "test-booking-stonic");
-  assert.equal(result.decision.capability, "answer_from_active_booking");
   assert.equal(result.decision.mutationIntent, "none");
   assert.equal(result.decision.mutationExecutionRequested, false);
   assert.notEqual(result.source, "technical_fallback");
 
   const secondPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  const thirdPrompt = String(calls[2]?.messages?.[1]?.content || "");
   assert.match(secondPrompt, /CORRECTIVE REGENERATION/);
   assert.match(secondPrompt, /acknowledgement\/silence/);
-  assert.match(thirdPrompt, /required reply after silence/);
-  assert.match(thirdPrompt, /CURRENT_BOOKING_IN_SCOPE|Trusted focused booking identity/);
-  assert.match(thirdPrompt, /test-stonic-item|"durationDays":4/);
-  assert.doesNotMatch(thirdPrompt, /return\s+"Kia Stonic 4 din/i);
-  assert.doesNotMatch(thirdPrompt, /hardcode|canned/i);
+  assert.doesNotMatch(secondPrompt, /return\s+"Kia Stonic 4 din/i);
+  assert.doesNotMatch(secondPrompt, /hardcode|canned/i);
 });
 
-test("three required focused silences terminalize after gated extra recovery", async () => {
+test("repeated factual silence without Turn Plan fails closed (no mute success)", async () => {
   const { result, calls } = await runWithResponses([
-    silenceInformationDecision(),
-    silenceInformationDecision(),
-    silenceInformationDecision(),
+    silenceFactualWithoutTurnPlan(),
+    silenceFactualWithoutTurnPlan(),
+    silenceFactualWithoutTurnPlan(),
   ]);
 
-  assert.equal(calls.length, 3);
+  assert.ok(calls.length >= 2);
   assert.equal(result.ok, false);
   assert.equal(result.source, "technical_fallback");
-  assert.equal(result.reason, "customer_reply_required_but_empty");
+  assert.equal(result.reason, "FACTUAL_TURN_PLAN_REQUIRED");
   assert.equal(result.retryable, false);
-  assert.equal(result.silenceRecoveryAttempts, 1);
-  assert.equal(result.contentSafetyAttempts, 3);
   assert.equal(result.decision.customerReply, "");
-  const thirdPrompt = String(calls[2]?.messages?.[1]?.content || "");
-  assert.match(thirdPrompt, /required reply after silence/);
+  const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
+  assert.match(correctionPrompt, /Turn Plan|capability|evidenceNeeds/i);
 });
 
 test("social silence remains a valid no-outbound result", async () => {
