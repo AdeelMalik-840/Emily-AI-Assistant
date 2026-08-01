@@ -1067,11 +1067,13 @@ function validateAllCandidateReplyGrounding({
       recentDialogue: historyLine || null,
       styleKey,
     });
+    // Claim-level only: segment text vs this candidate's trusted facts.
+    // Model-declared row.groundedFacts is not a fatal acceptance channel
+    // (schema retained for now; follow-up schema-shrink cleanup).
     const guarded = validateCustomerReplyAgainstContract(
       segment,
       { ...contract, replyRequired: true },
-      null,
-      row?.groundedFacts
+      null
     );
     if (!guarded.ok) return guarded;
   }
@@ -2691,6 +2693,10 @@ STRICT SAFETY:
         recentDialogue: historyLine || null,
         styleKey,
       });
+      // Informational acceptance: validate customer-facing claims only.
+      // Do not pass model groundedFacts as a 4th fatal channel — hidden
+      // pickupTime/deliveryTime/etc. must not reject an otherwise safe reply.
+      // groundedFacts remains in the structured schema temporarily (cleanup PR).
       const guard = validateCustomerReplyAgainstContract(
         replyText,
         {
@@ -2713,8 +2719,7 @@ STRICT SAFETY:
             finalized.action === "reply" ||
             finalized.shouldReply === true,
         },
-        finalized.replySemantics || decision.replySemantics,
-        finalized.groundedFacts || decision.groundedFacts
+        finalized.replySemantics || decision.replySemantics
       );
       if (!guard.ok) {
         lastReason = guard.reason || "customer_reply_guard_failed";
