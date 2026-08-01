@@ -3,8 +3,8 @@
  * Architecture (post_confirm_pa DM):
  *   Brain semantic decision → deterministic validate/execute → constrained reply compose.
  * Booking mutations run only through postConfirmBookingMutationExecutor (safe executors
- * only; unsupported intents never write Firestore). Pending AVR confirm/decline keep
- * their existing executor + second Brain reply path.
+ * only; unsupported intents never write Firestore). Pending AVR confirm/decline:
+ *   execute once → post-exec Brain Turn Plan → same resolve→compose path when deferred.
  */
 
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
@@ -184,6 +184,9 @@ export async function handleCustomerBusinessPaInbound({
   let mutationExecution = null;
   let semanticDecisionCount = 1;
   let composeCalls = 0;
+  // Post-exec pending lane may replace facts with verified execution Result.
+  let laneFacts = facts;
+  let mutationAlreadyComposed = false;
 
   if (
     decision.action === "confirm_pending_availability" ||
@@ -337,7 +340,11 @@ export async function handleCustomerBusinessPaInbound({
         composeCalls,
       };
     }
+    // Verified execution Result is the only post-exec factual authority for compose.
+    laneFacts = finalFacts;
     decision = finalDecision.decision;
+    // Fall through: deferred Turn Plans continue into the shared resolve→compose
+    // path below (do not nest compose only under else-if after confirm/decline).
   } else if (decision.action === "request_booking_mutation") {
     // Decide → validate/execute → compose. Informational turns never reach here.
     const frozenDecision = { ...decision };
@@ -423,22 +430,27 @@ export async function handleCustomerBusinessPaInbound({
       mutationExecutionRequested: true,
       mutationExecutionStatus: mutationExecution?.status ?? "not_executed",
     };
-  } else if (
-    decision.informationalReplyDeferred === true ||
-    isDeferredPostConfirmInformationalDecision(decision)
+    mutationAlreadyComposed = true;
+  }
+
+  if (
+    !mutationAlreadyComposed &&
+    (decision.informationalReplyDeferred === true ||
+      isDeferredPostConfirmInformationalDecision(decision))
   ) {
     // Decide → resolve trusted fact → compose. Owner missing-info stays unwired.
+    // Also used after pending AVR execute when the post-exec Turn Plan defers.
     const frozenDecision = { ...decision };
     const selectedBookingId = clean(decision.selectedBookingId) || null;
     const selectedBooking =
-      selectedBookingId && Array.isArray(facts.bookingCandidates)
-        ? facts.bookingCandidates.find(
+      selectedBookingId && Array.isArray(laneFacts.bookingCandidates)
+        ? laneFacts.bookingCandidates.find(
             (row) => clean(row?.id) === selectedBookingId
           ) ?? null
-        : selectedBookingId && clean(facts.booking?.id) === selectedBookingId
-          ? facts.booking
-          : facts.booking && typeof facts.booking === "object"
-            ? facts.booking
+        : selectedBookingId && clean(laneFacts.booking?.id) === selectedBookingId
+          ? laneFacts.booking
+          : laneFacts.booking && typeof laneFacts.booking === "object"
+            ? laneFacts.booking
             : null;
 
     const factResolution = __resolvePostConfirmRequestedFactFn({
@@ -446,12 +458,12 @@ export async function handleCustomerBusinessPaInbound({
       evidenceNeeds: frozenDecision.evidenceNeeds,
       // legacy compat for injected test doubles
       requestedInformation: frozenDecision.requestedInformation,
-      facts,
+      facts: laneFacts,
       selectedBooking,
     });
 
     const composed = await __composePostConfirmInformationalCustomerReplyFn({
-      facts,
+      facts: laneFacts,
       userMessage: text,
       frozenDecision,
       factResolution,
@@ -467,10 +479,10 @@ export async function handleCustomerBusinessPaInbound({
         action: "business_pa_terminal_model_failure",
         reply: "",
         sentReply: false,
-        bookingId: selectedBookingId || clean(facts.booking?.id) || null,
+        bookingId: selectedBookingId || clean(laneFacts.booking?.id) || null,
         availabilityRequestId:
           clean(selectedBooking?.availabilityRequestId) ||
-          clean(facts.booking?.availabilityRequestId) ||
+          clean(laneFacts.booking?.availabilityRequestId) ||
           null,
         reason: "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED",
         retryable: false,
@@ -486,6 +498,7 @@ export async function handleCustomerBusinessPaInbound({
         bookingSelectionMode:
           clean(frozenDecision.bookingSelectionMode, 40) || "none",
         selectedBookingIndex: frozenDecision.selectedBookingIndex ?? null,
+        pendingAvailabilityExecution,
         silenceRecoveryAttempts:
           Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
         semanticDecisionCount,
@@ -522,8 +535,8 @@ export async function handleCustomerBusinessPaInbound({
   const bookingSelectionMode =
     clean(decision.bookingSelectionMode, 40) || "none";
   const selectedBooking =
-    selectedBookingId && Array.isArray(facts.bookingCandidates)
-      ? facts.bookingCandidates.find(
+    selectedBookingId && Array.isArray(laneFacts.bookingCandidates)
+      ? laneFacts.bookingCandidates.find(
           (row) => clean(row?.id) === selectedBookingId
         ) ?? null
       : null;
@@ -533,12 +546,12 @@ export async function handleCustomerBusinessPaInbound({
   const bookingId =
     hasNoExactBookingSelection
       ? null
-      : selectedBookingId || clean(facts.booking?.id) || null;
+      : selectedBookingId || clean(laneFacts.booking?.id) || null;
   const availabilityRequestId =
     hasNoExactBookingSelection
       ? null
       : clean(selectedBooking?.availabilityRequestId) ||
-        clean(facts.booking?.availabilityRequestId) ||
+        clean(laneFacts.booking?.availabilityRequestId) ||
         null;
 
   console.log("[customer_business_pa_result]", {

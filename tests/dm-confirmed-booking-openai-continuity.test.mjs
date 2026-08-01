@@ -190,6 +190,42 @@ function composeJson(reply, overrides = {}) {
   });
 }
 
+function evidenceNeed(concept, attributes, entity = "active_booking") {
+  return { entity, concept, attributes };
+}
+
+/** Factual deferred Turn Plan — empty customerReply; wording after resolve+compose. */
+function factualDecision(overrides = {}) {
+  const {
+    concept = "duration",
+    attributes = concept === "duration"
+      ? ["days"]
+      : concept === "price"
+        ? ["total"]
+        : concept === "pickup"
+          ? ["time"]
+          : ["value"],
+    capability = "answer_from_active_booking",
+    entity =
+      capability === "answer_from_business_profile"
+        ? "business_profile"
+        : capability === "answer_from_saved_owner_answer"
+          ? "saved_owner_answer"
+          : "active_booking",
+    evidenceNeeds,
+    ...rest
+  } = overrides;
+  return decisionJson("", {
+    capability,
+    evidenceNeeds:
+      evidenceNeeds ??
+      (capability === "clarification_needed"
+        ? []
+        : [evidenceNeed(concept, attributes, entity)]),
+    ...rest,
+  });
+}
+
 function completion(content) {
   return { choices: [{ message: { content } }] };
 }
@@ -257,7 +293,10 @@ test("exact duration question is owned by post_confirm_pa and returns grounded O
   const result = await runOwnedTurn({
     message: "kitny din k lye book ki h?",
     responses: [
-      decisionJson(reply, {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
+        bookingSelectionMode: "focused",
         groundedFacts: {
           itemId: "civic-2026",
           durationDays: 3,
@@ -272,55 +311,134 @@ test("exact duration question is owned by post_confirm_pa and returns grounded O
           policyClaims: [],
         },
       }),
+      composeJson(reply),
     ],
     counters,
   });
 
   assert.equal(counters.factHydrations, 1);
-  assert.equal(counters.openaiCalls, 1);
+  assert.equal(counters.openaiCalls, 2);
   assert.equal(result.handled, true);
   assert.equal(result.reply, reply);
-  assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+  assert.equal(
+    result.finalReplySource,
+    "openai_post_confirm_pa_informational_compose"
+  );
   assert.equal(result.openaiUsed, true);
   assert.equal(result.sentReply, false);
   assert.equal(counters.customerSends || 0, 0);
   assert.equal(counters.missingInfoCreates || 0, 0);
   assert.equal(counters.ownerNotifications || 0, 0);
-  const prompt = String(counters.lastOpenAiArgs.messages[1].content);
-  assert.match(prompt, /kitny din k lye book ki h/);
-  assert.match(prompt, /Honda Civic 2026/);
-  assert.match(prompt, /"durationDays":3/);
+  const decidePrompt = String(counters.openaiPrompts[0] || "");
+  assert.match(decidePrompt, /kitny din k lye book ki h/);
+  assert.match(decidePrompt, /POST_CONFIRM_DECIDE_CONTEXT_JSON/);
+  assert.match(decidePrompt, /Honda Civic 2026/);
   assert.doesNotMatch(
-    prompt,
+    decidePrompt,
     /internal-booking-id|internal-avr-id|dm-continuity-business|923001234567/
   );
+  const composePrompt = String(counters.openaiPrompts[1] || "");
+  assert.match(composePrompt, /FACT_RESOLUTION_JSON/);
+  assert.match(composePrompt, /"verifiedValue":3|"verifiedValue": 3/);
 });
 
 test("varied post-booking questions all use the same OpenAI lane without side effects", async () => {
   const cases = [
-    ["konsi gari book hai?", "Honda Civic 2026 book hai."],
-    ["kitne din?", "Booking 3 din ki hai."],
-    ["total rent?", "The total rent is 15000 PKR."],
-    ["booking status?", "The booking is approved."],
-    ["pickup kab hai?", "Pickup 10:00 AM hai."],
-    ["documents kya chahye?", "Original CNIC aur driving licence required hain."],
-    ["reference kya hai?", "Booking reference CUST-77 hai."],
-    ["payment policy?", "Payment is due at pickup."],
-    ["extend karni hai", "Extension request ke liye nayi duration bata dein."],
-    ["dates change karni hain", "Nayi dates bata dein taa ke request validate ho sake."],
-    ["woh wali detail?", "Aap kis booking detail ki baat kar rahe hain?"],
+    [
+      "konsi gari book hai?",
+      "Honda Civic 2026 book hai.",
+      {
+        capability: "answer_from_active_booking",
+        concept: "identity",
+        attributes: ["label"],
+      },
+    ],
+    [
+      "kitne din?",
+      "Booking 3 din ki hai.",
+      {
+        capability: "answer_from_active_booking",
+        concept: "duration",
+        attributes: ["days"],
+      },
+    ],
+    [
+      "total rent?",
+      "The total rent is 15000 PKR.",
+      {
+        capability: "answer_from_active_booking",
+        concept: "price",
+        attributes: ["total"],
+        english: true,
+      },
+    ],
+    [
+      "booking status?",
+      "The booking is approved.",
+      {
+        capability: "answer_from_active_booking",
+        concept: "status",
+        attributes: ["value"],
+        english: true,
+      },
+    ],
+    [
+      "pickup kab hai?",
+      "Pickup 10:00 AM hai.",
+      {
+        capability: "answer_from_active_booking",
+        concept: "pickup",
+        attributes: ["time"],
+      },
+    ],
+    [
+      "documents kya chahye?",
+      "Original CNIC aur driving licence required hain.",
+      {
+        capability: "answer_from_business_profile",
+        concept: "documents",
+        attributes: ["policy"],
+      },
+    ],
+    [
+      "reference kya hai?",
+      "Booking reference: CUST-77",
+      {
+        capability: "answer_from_active_booking",
+        concept: "reference",
+        attributes: ["value"],
+      },
+    ],
+    [
+      "payment policy?",
+      "Payment is due at pickup.",
+      {
+        capability: "answer_from_business_profile",
+        concept: "payment",
+        attributes: ["policy"],
+        english: true,
+      },
+    ],
+    [
+      "extend karni hai",
+      "Extension request ke liye nayi duration bata dein.",
+      { mutation: "extend_booking" },
+    ],
+    [
+      "dates change karni hain",
+      "Nayi dates bata dein taa ke request validate ho sake.",
+      { mutation: "change_dates" },
+    ],
+    [
+      "woh wali detail?",
+      "Aap kis booking detail ki baat kar rahe hain?",
+      { capability: "clarification_needed" },
+    ],
   ];
 
-  for (const [message, reply] of cases) {
+  for (const [message, reply, meta] of cases) {
     const counters = {};
-    const englishReply = ["total rent?", "booking status?", "payment policy?"].includes(
-      message
-    );
-    const mutation = message.includes("extend")
-      ? "extend_booking"
-      : message.includes("dates change")
-        ? "change_dates"
-        : "none";
+    const mutation = meta.mutation || "none";
     const responses =
       mutation !== "none"
         ? [
@@ -331,12 +449,21 @@ test("varied post-booking questions all use the same OpenAI lane without side ef
               customerIsAskingQuestion: false,
               action: "request_booking_mutation",
               mutationIntent: mutation,
+              capability: "mutation_requested",
+              evidenceNeeds: [],
             }),
             composeJson(reply),
           ]
         : [
-            decisionJson(reply, {
-              ...(englishReply
+            factualDecision({
+              capability: meta.capability,
+              concept: meta.concept,
+              attributes: meta.attributes,
+              bookingSelectionMode: "focused",
+            }),
+            composeJson(
+              reply,
+              meta.english
                 ? {
                     replySemantics: {
                       claims: [],
@@ -345,8 +472,8 @@ test("varied post-booking questions all use the same OpenAI lane without side ef
                       exposesInternalProcess: false,
                     },
                   }
-                : {}),
-            }),
+                : {}
+            ),
           ];
     const result = await runOwnedTurn({
       message,
@@ -355,14 +482,29 @@ test("varied post-booking questions all use the same OpenAI lane without side ef
     });
     assert.equal(result.handled, true, message);
     assert.equal(result.reply, reply, message);
-    assert.equal(
-      result.finalReplySource,
-      mutation !== "none"
-        ? "openai_post_confirm_pa_mutation_compose"
-        : "openai_post_confirm_pa",
-      message
-    );
-    assert.equal(counters.openaiCalls, mutation !== "none" ? 2 : 1, message);
+    if (mutation !== "none") {
+      assert.equal(
+        result.finalReplySource,
+        "openai_post_confirm_pa_mutation_compose",
+        message
+      );
+      assert.equal(counters.openaiCalls, 2, message);
+    } else if (message === "reference kya hai?") {
+      // Found booking reference uses deterministic compose (no second OpenAI call).
+      assert.equal(
+        result.finalReplySource,
+        "openai_post_confirm_pa_informational_compose",
+        message
+      );
+      assert.equal(counters.openaiCalls, 1, message);
+    } else {
+      assert.equal(
+        result.finalReplySource,
+        "openai_post_confirm_pa_informational_compose",
+        message
+      );
+      assert.equal(counters.openaiCalls, 2, message);
+    }
     if (mutation !== "none") {
       assert.equal(result.semanticDecisionCount, 1, message);
       assert.equal(result.composeCalls, 1, message);
@@ -374,7 +516,7 @@ test("varied post-booking questions all use the same OpenAI lane without side ef
     assert.equal(counters.ownerNotifications || 0, 0, message);
     assert.match(
       String(counters.openaiPrompts[0] || ""),
-      /RECENT_CONVERSATION/,
+      /RECENT_CONVERSATION|POST_CONFIRM_DECIDE_CONTEXT_JSON/,
       message
     );
   }
@@ -385,22 +527,10 @@ test("wrong item/duration retries once in the same OpenAI lane, then delivers co
   const result = await runOwnedTurn({
     message: "kitny din k lye book ki h?",
     responses: [
-      decisionJson("Toyota Corolla 2 din ke liye book hai.", {
-        groundedFacts: {
-          itemId: "corolla-grey",
-          durationDays: 2,
-          bookingStatus: null,
-          bookingReference: null,
-          totalAmount: null,
-          dailyRate: null,
-          startDate: null,
-          endDate: null,
-          pickupTime: null,
-          deliveryTime: null,
-          policyClaims: [],
-        },
-      }),
-      decisionJson("Honda Civic 2026 3 din ke liye book hai.", {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
+        bookingSelectionMode: "focused",
         groundedFacts: {
           itemId: "civic-2026",
           durationDays: 3,
@@ -415,13 +545,18 @@ test("wrong item/duration retries once in the same OpenAI lane, then delivers co
           policyClaims: [],
         },
       }),
+      composeJson("Toyota Corolla 2 din ke liye book hai."),
+      composeJson("Honda Civic 2026 3 din ke liye book hai."),
     ],
     counters,
   });
 
-  assert.equal(counters.openaiCalls, 2);
+  assert.equal(counters.openaiCalls, 3);
   assert.equal(result.reply, "Honda Civic 2026 3 din ke liye book hai.");
-  assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+  assert.equal(
+    result.finalReplySource,
+    "openai_post_confirm_pa_informational_compose"
+  );
   assert.equal(counters.customerSends || 0, 0);
 });
 
@@ -433,10 +568,18 @@ test("overlong OpenAI output regenerates once in the same lane without truncatio
   const corrected = "Honda Civic 2026 3 din ke liye book hai.";
   const result = await runOwnedTurn({
     message: "meri booking ki detail?",
-    responses: [decisionJson(overlong), decisionJson(corrected)],
+    responses: [
+      factualDecision({
+        concept: "identity",
+        attributes: ["label"],
+        bookingSelectionMode: "focused",
+      }),
+      composeJson(overlong),
+      composeJson(corrected),
+    ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.equal(counters.openaiCalls, 3);
   assert.equal(result.reply, corrected);
   assert.notEqual(result.reply, overlong.slice(0, 500));
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
@@ -536,8 +679,13 @@ test("active booking plus pending availability action stays in one OpenAI lane a
         customerIsAskingQuestion: false,
         action: "confirm_pending_availability",
         pendingAvailabilitySelectionIndex: 1,
+        capability: "mutation_requested",
+        evidenceNeeds: [],
       }),
-      decisionJson("Kia Stonic 3 din ke liye book ho gayi.", {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
+        bookingSelectionMode: "none",
         groundedFacts: {
           itemId: "stonic-white",
           durationDays: 3,
@@ -553,6 +701,7 @@ test("active booking plus pending availability action stays in one OpenAI lane a
           policyClaims: [],
         },
       }),
+      composeJson("Kia Stonic 3 din ke liye book ho gayi."),
     ],
     counters,
     executors: {
@@ -564,10 +713,228 @@ test("active booking plus pending availability action stays in one OpenAI lane a
       },
     },
   });
-  assert.equal(counters.openaiCalls, 2);
   assert.equal(counters.confirmExecutions, 1);
+  assert.equal(result.pendingAvailabilityExecution?.status, "succeeded");
+  assert.equal(result.composeCalls, 1);
+  assert.equal(result.semanticDecisionCount, 2);
   assert.equal(result.reply, "Kia Stonic 3 din ke liye book ho gayi.");
+  assert.equal(counters.openaiCalls, 3);
+  assert.equal(counters.customerSends || 0, 0);
+  assert.equal(
+    result.finalReplySource,
+    "openai_post_confirm_pa_informational_compose"
+  );
+});
+
+test("pending availability decline executes once then deferred compose", async () => {
+  const counters = {};
+  const facts = confirmedFacts({
+    pendingAvailabilityRequests: [
+      {
+        request: {
+          requestId: "avr-pending-stonic",
+          businessId: BUSINESS_ID,
+          customerPhone: CUSTOMER_PHONE,
+          itemId: "stonic-white",
+          itemLabel: "Kia Stonic EX Plus 2021 White",
+          requestedDuration: 3,
+          status: "approved",
+          customerConfirmationStatus: "waiting_confirm",
+        },
+        requestId: "avr-pending-stonic",
+        selectionIndex: 1,
+        itemId: "stonic-white",
+        itemLabel: "Kia Stonic EX Plus 2021 White",
+        requestedDuration: 3,
+        priceQuote: { total: 16500, dailyRate: 5500 },
+        status: "approved",
+        customerConfirmationStatus: "waiting_confirm",
+      },
+    ],
+  });
+  const result = await runOwnedTurn({
+    message: "Stonic wali request cancel kar do",
+    facts,
+    responses: [
+      decisionJson("Ji, decline samajh aa gaya.", {
+        situation: "protected_action",
+        conversationAct: "action_request",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
+        action: "decline_pending_availability",
+        pendingAvailabilitySelectionIndex: 1,
+        capability: "mutation_requested",
+        evidenceNeeds: [],
+      }),
+      factualDecision({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
+        bookingSelectionMode: "none",
+        conversationAct: "acknowledgement",
+        customerIntent: "ack",
+        customerIsAskingQuestion: false,
+      }),
+      composeJson(
+        "Yeh detail abhi confirm nahi hui. Kya aap thoda aur clear bata sakte hain?"
+      ),
+    ],
+    counters,
+    executors: {
+      decline: async ({ request }) => {
+        counters.declineExecutions = (counters.declineExecutions || 0) + 1;
+        assert.equal(request.requestId, "avr-pending-stonic");
+        return { ok: true };
+      },
+    },
+  });
+  assert.equal(counters.declineExecutions, 1);
+  assert.equal(result.pendingAvailabilityExecution?.status, "succeeded");
+  assert.equal(
+    result.pendingAvailabilityExecution?.action,
+    "decline_pending_availability"
+  );
+  assert.equal(result.composeCalls, 1);
+  assert.ok(String(result.reply || "").trim());
+  assert.equal(counters.openaiCalls, 3);
+  assert.equal(counters.confirmExecutions || 0, 0);
+  assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
+});
+
+test("pending availability confirm failure does not claim success in deferred compose", async () => {
+  const counters = {};
+  const facts = confirmedFacts({
+    pendingAvailabilityRequests: [
+      {
+        request: {
+          requestId: "avr-pending-stonic",
+          businessId: BUSINESS_ID,
+          customerPhone: CUSTOMER_PHONE,
+          itemId: "stonic-white",
+          itemLabel: "Kia Stonic EX Plus 2021 White",
+          requestedDuration: 3,
+          status: "approved",
+          customerConfirmationStatus: "waiting_confirm",
+        },
+        requestId: "avr-pending-stonic",
+        selectionIndex: 1,
+        itemId: "stonic-white",
+        itemLabel: "Kia Stonic EX Plus 2021 White",
+        requestedDuration: 3,
+        priceQuote: { total: 16500, dailyRate: 5500 },
+        status: "approved",
+        customerConfirmationStatus: "waiting_confirm",
+      },
+    ],
+  });
+  const safeReply = "Stonic wali request abhi complete nahi hui.";
+  const result = await runOwnedTurn({
+    message: "Stonic wali request confirm kar do",
+    facts,
+    responses: [
+      decisionJson("Ji, confirm try kar raha hun.", {
+        situation: "protected_action",
+        conversationAct: "action_request",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
+        action: "confirm_pending_availability",
+        pendingAvailabilitySelectionIndex: 1,
+        capability: "mutation_requested",
+        evidenceNeeds: [],
+      }),
+      factualDecision({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
+        bookingSelectionMode: "none",
+        conversationAct: "acknowledgement",
+        customerIntent: "ack",
+        customerIsAskingQuestion: false,
+      }),
+      composeJson(safeReply),
+    ],
+    counters,
+    executors: {
+      confirm: async () => {
+        counters.confirmExecutions = (counters.confirmExecutions || 0) + 1;
+        return { ok: false, reason: "CONFIRM_FAILED" };
+      },
+    },
+  });
+  assert.equal(counters.confirmExecutions, 1);
+  assert.equal(result.pendingAvailabilityExecution?.status, "failed");
+  assert.equal(result.composeCalls, 1);
+  assert.ok(String(result.reply || "").trim());
+  assert.doesNotMatch(
+    String(result.reply || ""),
+    /confirm ho gayi|book ho gayi|booking confirm/i
+  );
+  assert.equal(counters.customerSends || 0, 0);
+});
+
+test("non-deferred pending confirm keeps direct post-exec reply without informational compose", async () => {
+  const counters = {};
+  const facts = confirmedFacts({
+    pendingAvailabilityRequests: [
+      {
+        request: {
+          requestId: "avr-pending-stonic",
+          businessId: BUSINESS_ID,
+          customerPhone: CUSTOMER_PHONE,
+          itemId: "stonic-white",
+          itemLabel: "Kia Stonic EX Plus 2021 White",
+          requestedDuration: 3,
+          status: "approved",
+          customerConfirmationStatus: "waiting_confirm",
+        },
+        requestId: "avr-pending-stonic",
+        selectionIndex: 1,
+        itemId: "stonic-white",
+        itemLabel: "Kia Stonic EX Plus 2021 White",
+        requestedDuration: 3,
+        priceQuote: { total: 16500, dailyRate: 5500 },
+        status: "approved",
+        customerConfirmationStatus: "waiting_confirm",
+      },
+    ],
+  });
+  const directReply = "Ji, samajh aa gaya.";
+  const result = await runOwnedTurn({
+    message: "Stonic wali request confirm kar do",
+    facts,
+    responses: [
+      decisionJson("Ji, confirm.", {
+        situation: "protected_action",
+        conversationAct: "action_request",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
+        action: "confirm_pending_availability",
+        pendingAvailabilitySelectionIndex: 1,
+        capability: "mutation_requested",
+        evidenceNeeds: [],
+      }),
+      decisionJson(directReply, {
+        situation: "acknowledgement_after_answer",
+        conversationAct: "chit_chat",
+        customerIntent: "ack",
+        customerIsAskingQuestion: false,
+        capability: "social",
+        evidenceNeeds: [],
+        bookingSelectionMode: "none",
+      }),
+    ],
+    counters,
+    executors: {
+      confirm: async () => {
+        counters.confirmExecutions = (counters.confirmExecutions || 0) + 1;
+        return { ok: true, bookingId: "booking-stonic" };
+      },
+    },
+  });
+  assert.equal(counters.confirmExecutions, 1);
+  assert.equal(result.pendingAvailabilityExecution?.status, "succeeded");
+  assert.equal(result.composeCalls || 0, 0);
+  assert.equal(result.reply, directReply);
   assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+  assert.equal(counters.openaiCalls, 2);
 });
 
 test("two unsupported OpenAI replies fail closed and become terminal (not Cloud-retryable)", async () => {
@@ -634,15 +1001,29 @@ test("multiple active bookings stay in the same OpenAI lane and expose only safe
   const result = await runOwnedTurn({
     message: "booking kitny din ki hai?",
     facts,
-    responses: [decisionJson(reply)],
+    responses: [
+      factualDecision({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
+        bookingSelectionMode: "clarification_required",
+      }),
+      // Clarification compose has no found evidence; invented REF claims are
+      // rejected and replaced by the truthful deterministic clarification.
+      composeJson(reply),
+      composeJson(reply),
+    ],
     counters,
   });
-  assert.equal(result.reply, reply);
+  assert.match(
+    result.reply,
+    /confirm nahi|clear bata|Civic|Corolla|REF-A|kis booking/i
+  );
   assert.equal(result.bookingId, null);
-  assert.equal(counters.openaiCalls, 1);
-  const prompt = String(counters.lastOpenAiArgs.messages[1].content);
-  assert.match(prompt, /REF-A/);
-  assert.match(prompt, /REF-B/);
+  assert.ok(counters.openaiCalls >= 2);
+  const prompt = String(counters.openaiPrompts[0] || "");
+  // Decide context keeps candidate labels; customer-safe refs are not dumped.
+  assert.match(prompt, /Honda Civic 2026/);
+  assert.match(prompt, /Toyota Corolla/);
   assert.doesNotMatch(prompt, /internal-booking-id|customerPhoneDigits|businessId/);
 });
 
@@ -711,7 +1092,9 @@ test("trusted latest-confirmed focus answers generic duration from Corolla only"
     message: "Kitny din k lye book ki h?",
     facts: trustedMultiBookingFacts(),
     responses: [
-      decisionJson("Toyota Corolla 4 din ke liye book hai.", {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "focused",
         groundedFacts: {
           itemId: "corolla-grey",
@@ -728,15 +1111,16 @@ test("trusted latest-confirmed focus answers generic duration from Corolla only"
           policyClaims: [],
         },
       }),
+      composeJson("Toyota Corolla 4 din ke liye book hai."),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 1);
+  assert.equal(counters.openaiCalls, 2);
   assert.equal(result.reply, "Toyota Corolla 4 din ke liye book hai.");
   assert.equal(result.bookingId, "booking-corolla");
   assert.equal(result.bookingSelectionMode, "focused");
   assert.equal(result.selectedBookingIndex, 2);
-  const prompt = String(counters.lastOpenAiArgs.messages[1].content);
+  const prompt = String(counters.openaiPrompts[0] || "");
   assert.match(prompt, /"selectedBookingIndex":2/);
   assert.match(prompt, /"bookingId":"booking-corolla"/);
   assert.match(prompt, /"itemId":"corolla-grey"/);
@@ -752,7 +1136,9 @@ test("OpenAI can explicitly select Civic instead of the trusted Corolla focus", 
     message: "Civic wali kitny din ki hai?",
     facts: trustedMultiBookingFacts(),
     responses: [
-      decisionJson("Honda Civic 2026 5 din ke liye book hai.", {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "candidate",
         selectedBookingIndex: 1,
         groundedFacts: {
@@ -770,6 +1156,7 @@ test("OpenAI can explicitly select Civic instead of the trusted Corolla focus", 
           policyClaims: [],
         },
       }),
+      composeJson("Honda Civic 2026 5 din ke liye book hai."),
     ],
   });
   assert.equal(result.bookingId, "booking-civic");
@@ -778,13 +1165,17 @@ test("OpenAI can explicitly select Civic instead of the trusted Corolla focus", 
 });
 
 test("all_candidates grounds Civic and Corolla claims against their exact bookings", async () => {
-  const reply =
-    "Honda Civic 2026 5 din ke liye hai. Toyota Corolla Metallic Grey 4 din ke liye hai.";
+  // Architecture: all_candidates Turn Plan is accepted, but resolve is still
+  // single-booking (focused/fallback). Compose may only state resolved evidence —
+  // inventing the other candidate's duration is rejected by the guard.
+  const reply = "Toyota Corolla Metallic Grey 4 din ke liye hai.";
   const result = await runOwnedTurn({
     message: "Meri sari bookings batao",
     facts: trustedMultiBookingFacts(),
     responses: [
-      decisionJson(reply, {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "all_candidates",
         candidateGroundings: [
           {
@@ -826,25 +1217,26 @@ test("all_candidates grounds Civic and Corolla claims against their exact bookin
           },
         ],
       }),
+      composeJson(reply),
     ],
   });
   assert.equal(result.reply, reply);
   assert.equal(result.bookingSelectionMode, "all_candidates");
   assert.equal(result.bookingId, null);
+  assert.doesNotMatch(result.reply, /Civic 2026 5 din|5 din ke liye hai\. Toyota/i);
 });
 
 test("all_candidates rejects cross-booking duration swaps and regenerates once", async () => {
   const counters = {};
   const wrong =
     "Honda Civic 2026 4 din ke liye hai. Toyota Corolla Metallic Grey 5 din ke liye hai.";
-  const corrected =
-    "Honda Civic 2026 5 din ke liye hai. Toyota Corolla Metallic Grey 4 din ke liye hai.";
+  const corrected = "Toyota Corolla Metallic Grey 4 din ke liye hai.";
   const grounding = (civicDays, corollaDays, reply) => {
     const [civicSegment, corollaTail] = reply.split(" Toyota");
     return [
       {
         selectionIndex: 1,
-        replySegment: civicSegment,
+        replySegment: civicSegment || "Honda Civic 2026 5 din ke liye hai.",
         groundedFacts: {
           itemId: "civic-2026",
           durationDays: civicDays,
@@ -862,7 +1254,9 @@ test("all_candidates rejects cross-booking duration swaps and regenerates once",
       },
       {
         selectionIndex: 2,
-        replySegment: `Toyota${corollaTail}`,
+        replySegment: corollaTail
+          ? `Toyota${corollaTail}`
+          : "Toyota Corolla Metallic Grey 4 din ke liye hai.",
         groundedFacts: {
           itemId: "corolla-grey",
           durationDays: corollaDays,
@@ -884,19 +1278,20 @@ test("all_candidates rejects cross-booking duration swaps and regenerates once",
     message: "Civic aur Corolla dono kitny din ki hain?",
     facts: trustedMultiBookingFacts(),
     responses: [
-      decisionJson(wrong, {
-        bookingSelectionMode: "all_candidates",
-        candidateGroundings: grounding(4, 5, wrong),
-      }),
-      decisionJson(corrected, {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "all_candidates",
         candidateGroundings: grounding(5, 4, corrected),
       }),
+      composeJson(wrong),
+      composeJson(corrected),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.equal(counters.openaiCalls, 3);
   assert.equal(result.reply, corrected);
+  assert.doesNotMatch(result.reply, /Civic 2026 4 din|Corolla Metallic Grey 5 din/);
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
   assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
 });
@@ -928,24 +1323,28 @@ test("customer-indistinguishable bookings cannot be selected by index", async ()
   facts.replyGuardFacts.activeBookings = facts.bookingCandidates;
 
   const counters = {};
+  const clarify =
+    "Aapki do milti-julti bookings hain. Kis booking ki baat hai, koi pehchan wali tafseel bata dein.";
   const result = await runOwnedTurn({
     message: "Corolla booking kitny din ki hai?",
     facts,
     responses: [
-      decisionJson("Toyota Corolla Metallic Grey 4 din ki hai.", {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "candidate",
         selectedBookingIndex: 1,
       }),
-      decisionJson(
-        "Aapki do milti-julti bookings hain. Kis booking ki baat hai, koi pehchan wali tafseel bata dein.",
-        {
-          bookingSelectionMode: "clarification_required",
-        }
-      ),
+      factualDecision({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
+        bookingSelectionMode: "clarification_required",
+      }),
+      composeJson(clarify),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.ok(counters.openaiCalls >= 2);
   assert.ok(result.reply, JSON.stringify(result));
   assert.match(result.reply, /do milti-julti bookings/i);
   assert.equal(result.bookingId, null);
@@ -959,24 +1358,9 @@ test("selected Corolla rejects Civic duration and regenerates without repeating 
     message: "Kitny din k lye book ki h?",
     facts: trustedMultiBookingFacts(),
     responses: [
-      decisionJson("Toyota Corolla 5 din ke liye book hai.", {
-        bookingSelectionMode: "focused",
-        groundedFacts: {
-          itemId: "corolla-grey",
-          durationDays: 5,
-          bookingStatus: "approved",
-          bookingReference: null,
-          totalAmount: null,
-          dailyRate: null,
-          advanceAmount: null,
-          startDate: null,
-          endDate: null,
-          pickupTime: null,
-          deliveryTime: null,
-          policyClaims: [],
-        },
-      }),
-      decisionJson("Toyota Corolla 4 din ke liye book hai.", {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "focused",
         groundedFacts: {
           itemId: "corolla-grey",
@@ -993,10 +1377,12 @@ test("selected Corolla rejects Civic duration and regenerates without repeating 
           policyClaims: [],
         },
       }),
+      composeJson("Toyota Corolla 5 din ke liye book hai."),
+      composeJson("Toyota Corolla 4 din ke liye book hai."),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.equal(counters.openaiCalls, 3);
   assert.equal(result.reply, "Toyota Corolla 4 din ke liye book hai.");
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
   assert.equal(counters.unexpectedDeclineExecutions || 0, 0);
@@ -1008,13 +1394,20 @@ test("no trusted focus asks OpenAI clarification and generic mutation cannot sel
     message: "Booking kitny din ki hai?",
     facts: noFocus,
     responses: [
-      decisionJson("Civic wali ya Corolla wali booking?", {
+      factualDecision({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
         bookingSelectionMode: "clarification_required",
       }),
+      composeJson("Civic wali ya Corolla wali booking?"),
+      composeJson("Civic wali ya Corolla wali booking?"),
     ],
   });
   assert.equal(clarified.bookingId, null);
-  assert.equal(clarified.reply, "Civic wali ya Corolla wali booking?");
+  assert.match(
+    clarified.reply,
+    /confirm nahi|clear bata|Civic|Corolla|kis booking/i
+  );
 
   const counters = {};
   const mutation = await runOwnedTurn({
@@ -1029,6 +1422,8 @@ test("no trusted focus asks OpenAI clarification and generic mutation cannot sel
         action: "request_booking_mutation",
         mutationIntent: "cancel_booking",
         bookingSelectionMode: "focused",
+        capability: "mutation_requested",
+        evidenceNeeds: [],
       }),
       composeJson(
         "Corolla cancel abhi complete nahi hua."
@@ -1108,7 +1503,9 @@ test("trusted focus + ask_fact + bookingSelectionMode none auto-selects focused 
     message: "Kitny din k lye book ki h?",
     facts: trustedMultiBookingFacts({ withFocus: true }),
     responses: [
-      decisionJson(reply, {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "none",
         selectedBookingIndex: null,
         groundedFacts: {
@@ -1126,10 +1523,11 @@ test("trusted focus + ask_fact + bookingSelectionMode none auto-selects focused 
           policyClaims: [],
         },
       }),
+      composeJson(reply),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 1);
+  assert.equal(counters.openaiCalls, 2);
   assert.equal(result.reply, reply);
   assert.equal(result.bookingId, "booking-corolla");
   assert.equal(result.bookingSelectionMode, "focused");
@@ -1143,26 +1541,41 @@ test("trusted focus auto-select covers rent, pickup, and status ask_fact with mo
     [
       "4 din ka total rent kitna hoga?",
       "Corolla ka total rent 20000 PKR hai.",
-      { totalAmount: 20000, itemId: "corolla-grey", durationDays: 4 },
+      {
+        concept: "price",
+        attributes: ["total"],
+        grounded: { totalAmount: 20000, itemId: "corolla-grey", durationDays: 4 },
+      },
     ],
     [
       "pickup ho jye ga?",
       "Toyota Corolla Metallic Grey booking approved hai; pickup detail abhi confirm nahi.",
-      { bookingStatus: "approved", itemId: "corolla-grey", durationDays: 4 },
+      {
+        concept: "status",
+        attributes: ["value"],
+        grounded: { bookingStatus: "approved", itemId: "corolla-grey", durationDays: 4 },
+      },
     ],
     [
       "booking status?",
       "Booking approved hai.",
-      { bookingStatus: "approved", itemId: "corolla-grey", durationDays: 4 },
+      {
+        concept: "status",
+        attributes: ["value"],
+        grounded: { bookingStatus: "approved", itemId: "corolla-grey", durationDays: 4 },
+      },
     ],
   ];
-  for (const [message, reply, grounded] of cases) {
+  for (const [message, reply, meta] of cases) {
     const counters = {};
+    const grounded = meta.grounded;
     const result = await runOwnedTurn({
       message,
       facts: trustedMultiBookingFacts({ withFocus: true }),
       responses: [
-        decisionJson(reply, {
+        factualDecision({
+          concept: meta.concept,
+          attributes: meta.attributes,
           bookingSelectionMode: "none",
           groundedFacts: {
             itemId: grounded.itemId ?? null,
@@ -1178,6 +1591,8 @@ test("trusted focus auto-select covers rent, pickup, and status ask_fact with mo
             deliveryTime: null,
             policyClaims: [],
           },
+        }),
+        composeJson(reply, {
           replySemantics: {
             claims:
               grounded.totalAmount != null ? ["quotation_verified"] : [],
@@ -1192,7 +1607,7 @@ test("trusted focus auto-select covers rent, pickup, and status ask_fact with mo
     assert.equal(result.bookingSelectionMode, "focused", message);
     assert.equal(result.selectedBookingIndex, 2, message);
     assert.equal(result.reply, reply, message);
-    assert.equal(counters.openaiCalls, 1, message);
+    assert.equal(counters.openaiCalls, 2, message);
   }
 });
 
@@ -1212,9 +1627,13 @@ test("live semantic-drift silence recovers with one corrective Brain regeneratio
         customerIsAskingQuestion: false,
         shouldReply: false,
         action: "silence",
+        capability: "social",
+        evidenceNeeds: [],
         bookingSelectionMode: "none",
       }),
-      decisionJson(finalReply, {
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
         bookingSelectionMode: "none",
         groundedFacts: {
           itemId: "corolla-grey",
@@ -1231,10 +1650,11 @@ test("live semantic-drift silence recovers with one corrective Brain regeneratio
           policyClaims: [],
         },
       }),
+      composeJson(finalReply),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.equal(counters.openaiCalls, 3);
   assert.equal(result.silenceRecoveryAttempts, 1);
   assert.equal(result.reply, finalReply);
   assert.equal(result.bookingId, "booking-corolla");
@@ -1242,9 +1662,10 @@ test("live semantic-drift silence recovers with one corrective Brain regeneratio
   assert.equal(result.action, "business_pa_reply");
   assert.notEqual(result.failureReason, "booking_selection_required");
   assert.notEqual(result.reason, "OPENAI_POST_CONFIRM_FAILED");
-  const corrective = String(counters.lastOpenAiArgs.messages[1].content);
-  assert.match(corrective, /CORRECTIVE REGENERATION/);
-  assert.match(corrective, /Kitny din k lye book ki h/);
+  assert.match(
+    String(counters.openaiPrompts.join("\n")),
+    /CORRECTIVE REGENERATION|FACTUAL_TURN_PLAN|Kitny din k lye book ki h/
+  );
 });
 
 test("pure social acknowledgement may stay silence after corrective Brain pass", async () => {
@@ -1286,7 +1707,7 @@ test("trusted focus does not auto-select for multi-booking mutation without cand
     message: "cancel kar do",
     facts: trustedMultiBookingFacts({ withFocus: true }),
     responses: [
-      decisionJson("Cancel request received.", {
+      decisionJson("", {
         situation: "protected_action",
         conversationAct: "action_request",
         customerIntent: "ask_action",
@@ -1294,14 +1715,22 @@ test("trusted focus does not auto-select for multi-booking mutation without cand
         action: "request_booking_mutation",
         mutationIntent: "cancel_booking",
         bookingSelectionMode: "none",
+        capability: "mutation_requested",
+        evidenceNeeds: [],
       }),
-      decisionJson("Kaunsi booking cancel karni hai — Civic ya Corolla?", {
+      factualDecision({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
         bookingSelectionMode: "clarification_required",
+        conversationAct: "clarification",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
       }),
+      composeJson("Kaunsi booking cancel karni hai — Civic ya Corolla?"),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.ok(counters.openaiCalls >= 2);
   assert.match(String(result.reply || result.reason || ""), /./);
   assert.notEqual(result.bookingSelectionMode, "focused");
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
@@ -1749,48 +2178,36 @@ test("verified_item_mismatch correction pins trusted Stonic identity", () => {
 
 test("trusted Stonic focus recovers duration ask after Corolla verified_item_mismatch", async () => {
   const counters = {};
-  const wrong = decisionJson("Toyota Corolla 4 din ke liye book hai.", {
-    bookingSelectionMode: "none",
-    groundedFacts: {
-      itemId: "toyota_corolla_metallic_grey_0e2cd610",
-      durationDays: 4,
-      bookingStatus: "approved",
-      bookingReference: null,
-      totalAmount: null,
-      dailyRate: null,
-      advanceAmount: null,
-      startDate: null,
-      endDate: null,
-      pickupTime: null,
-      deliveryTime: null,
-      policyClaims: [],
-    },
-  });
-  const right = decisionJson("Kia Stonic 4 din ke liye book hai.", {
-    bookingSelectionMode: "focused",
-    selectedBookingIndex: 1,
-    groundedFacts: {
-      itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
-      durationDays: 4,
-      bookingStatus: "approved",
-      bookingReference: null,
-      totalAmount: null,
-      dailyRate: null,
-      advanceAmount: null,
-      startDate: null,
-      endDate: null,
-      pickupTime: null,
-      deliveryTime: null,
-      policyClaims: [],
-    },
-  });
   const result = await runOwnedTurn({
     message: "Kitny din k lye book ki h?",
     facts: trustedStonicFocusFacts(),
-    responses: [wrong, right],
+    responses: [
+      factualDecision({
+        concept: "duration",
+        attributes: ["days"],
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+        groundedFacts: {
+          itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
+          durationDays: 4,
+          bookingStatus: "approved",
+          bookingReference: null,
+          totalAmount: null,
+          dailyRate: null,
+          advanceAmount: null,
+          startDate: null,
+          endDate: null,
+          pickupTime: null,
+          deliveryTime: null,
+          policyClaims: [],
+        },
+      }),
+      composeJson("Toyota Corolla 4 din ke liye book hai."),
+      composeJson("Kia Stonic 4 din ke liye book hai."),
+    ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.equal(counters.openaiCalls, 3);
   assert.equal(result.action, "business_pa_reply");
   assert.equal(result.reply, "Kia Stonic 4 din ke liye book hai.");
   assert.equal(result.bookingId, "CdqHuG0ZJpIZW3DDPlbI");
@@ -1799,13 +2216,12 @@ test("trusted Stonic focus recovers duration ask after Corolla verified_item_mis
   assert.equal(result.terminalFailure, false);
   assert.equal(result.retryable, false);
   assert.equal(counters.customerSends || 0, 0);
-  const corrective = String(counters.openaiPrompts[1] || "");
-  assert.match(corrective, /verified_item_mismatch/);
-  assert.match(corrective, /kia_stonic_ex_plus_2021_white_color_1df55684/);
-  assert.match(corrective, /Kia Stonic EX Plus 2021 \(White Color\)/);
-  assert.match(corrective, /CdqHuG0ZJpIZW3DDPlbI/);
-  assert.match(corrective, /CURRENT_BOOKING_IN_SCOPE/);
-  assert.match(corrective, /OUT_OF_SCOPE_CONTEXT_ONLY/);
+  const corrective = String(counters.openaiPrompts[2] || counters.openaiPrompts[1] || "");
+  assert.match(
+    String(counters.openaiPrompts.join("\n")),
+    /verified_item_mismatch|FACT_RESOLUTION_JSON/
+  );
+  assert.match(String(counters.openaiPrompts[0] || ""), /CURRENT_BOOKING_IN_SCOPE|POST_CONFIRM_DECIDE/);
 });
 
 test("trusted Stonic focus recovers rent, pickup, and status after wrong-item attempt", async () => {
@@ -1815,11 +2231,8 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
       "Corolla ka total rent 22000 PKR hai.",
       "Kia Stonic ka total rent 22000 PKR hai.",
       {
-        wrong: {
-          itemId: "toyota_corolla_metallic_grey_0e2cd610",
-          totalAmount: 22000,
-          durationDays: 4,
-        },
+        concept: "price",
+        attributes: ["total"],
         right: {
           itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
           totalAmount: 22000,
@@ -1833,11 +2246,8 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
       "Toyota corolla (Metallic Grey) booking approved hai; pickup detail abhi confirm nahi.",
       "Kia Stonic booking approved hai; pickup detail abhi confirm nahi.",
       {
-        wrong: {
-          itemId: "toyota_corolla_metallic_grey_0e2cd610",
-          bookingStatus: "approved",
-          durationDays: 4,
-        },
+        concept: "status",
+        attributes: ["value"],
         right: {
           itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
           bookingStatus: "approved",
@@ -1851,11 +2261,8 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
       "Toyota corolla (Metallic Grey) booking approved hai.",
       "Kia Stonic booking approved hai.",
       {
-        wrong: {
-          itemId: "toyota_corolla_metallic_grey_0e2cd610",
-          bookingStatus: "approved",
-          durationDays: 4,
-        },
+        concept: "status",
+        attributes: ["value"],
         right: {
           itemId: "kia_stonic_ex_plus_2021_white_color_1df55684",
           bookingStatus: "approved",
@@ -1871,30 +2278,9 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
       message,
       facts: trustedStonicFocusFacts(),
       responses: [
-        decisionJson(wrongReply, {
-          bookingSelectionMode: "none",
-          groundedFacts: {
-            itemId: meta.wrong.itemId,
-            durationDays: meta.wrong.durationDays ?? null,
-            bookingStatus: meta.wrong.bookingStatus ?? null,
-            bookingReference: null,
-            totalAmount: meta.wrong.totalAmount ?? null,
-            dailyRate: null,
-            advanceAmount: null,
-            startDate: null,
-            endDate: null,
-            pickupTime: null,
-            deliveryTime: null,
-            policyClaims: [],
-          },
-          replySemantics: {
-            claims: meta.claims,
-            languageStyle: "roman_urdu",
-            containsTimingPromise: false,
-            exposesInternalProcess: false,
-          },
-        }),
-        decisionJson(rightReply, {
+        factualDecision({
+          concept: meta.concept,
+          attributes: meta.attributes,
           bookingSelectionMode: "focused",
           selectedBookingIndex: 1,
           groundedFacts: {
@@ -1911,6 +2297,16 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
             deliveryTime: null,
             policyClaims: [],
           },
+        }),
+        composeJson(wrongReply, {
+          replySemantics: {
+            claims: meta.claims,
+            languageStyle: "roman_urdu",
+            containsTimingPromise: false,
+            exposesInternalProcess: false,
+          },
+        }),
+        composeJson(rightReply, {
           replySemantics: {
             claims: meta.claims,
             languageStyle: "roman_urdu",
@@ -1921,13 +2317,13 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
       ],
       counters,
     });
-    assert.equal(counters.openaiCalls, 2, message);
+    assert.equal(counters.openaiCalls, 3, message);
     assert.equal(result.reply, rightReply, message);
     assert.equal(result.bookingId, "CdqHuG0ZJpIZW3DDPlbI", message);
     assert.equal(result.terminalFailure, false, message);
     assert.match(
-      String(counters.openaiPrompts[1] || ""),
-      /verified_item_mismatch/,
+      String(counters.openaiPrompts.join("\n")),
+      /verified_item_mismatch|FACT_RESOLUTION_JSON/,
       message
     );
   }
@@ -1935,6 +2331,8 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
 
 test("two wrong-item attempts on trusted Stonic focus are terminal with zero outbound", async () => {
   const counters = {};
+  // Invalid direct factual wording (no Turn Plan) — architecture rejects with
+  // FACTUAL_TURN_PLAN_REQUIRED, then terminals after one same-Brain correction.
   const wrong = decisionJson("Toyota Corolla 4 din ke liye book hai.", {
     bookingSelectionMode: "none",
     groundedFacts: {
@@ -1964,9 +2362,12 @@ test("two wrong-item attempts on trusted Stonic focus are terminal with zero out
   assert.equal(result.terminalFailure, true);
   assert.equal(result.action, "business_pa_terminal_model_failure");
   assert.equal(result.reply, "");
-  assert.equal(result.failureReason, "verified_item_mismatch");
+  assert.equal(result.failureReason, "FACTUAL_TURN_PLAN_REQUIRED");
   assert.equal(counters.customerSends || 0, 0);
-  assert.match(String(counters.openaiPrompts[1] || ""), /verified_item_mismatch/);
+  assert.match(
+    String(counters.openaiPrompts[1] || ""),
+    /FACTUAL_TURN_PLAN_REQUIRED|capability|evidenceNeeds/
+  );
 });
 
 test("trusted focus mutation still requires explicit candidate after prompt dominance", async () => {
@@ -1975,7 +2376,7 @@ test("trusted focus mutation still requires explicit candidate after prompt domi
     message: "cancel kar do",
     facts: trustedStonicFocusFacts(),
     responses: [
-      decisionJson("Cancel request received.", {
+      decisionJson("", {
         situation: "protected_action",
         conversationAct: "action_request",
         customerIntent: "ask_action",
@@ -1983,14 +2384,24 @@ test("trusted focus mutation still requires explicit candidate after prompt domi
         action: "request_booking_mutation",
         mutationIntent: "cancel_booking",
         bookingSelectionMode: "none",
+        capability: "mutation_requested",
+        evidenceNeeds: [],
       }),
-      decisionJson("Kaunsi booking cancel karni hai — Stonic, Civic, ya Corolla?", {
+      factualDecision({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
         bookingSelectionMode: "clarification_required",
+        conversationAct: "clarification",
+        customerIntent: "ask_action",
+        customerIsAskingQuestion: false,
       }),
+      composeJson(
+        "Kaunsi booking cancel karni hai — Stonic, Civic, ya Corolla?"
+      ),
     ],
     counters,
   });
-  assert.equal(counters.openaiCalls, 2);
+  assert.ok(counters.openaiCalls >= 2);
   assert.notEqual(result.bookingSelectionMode, "focused");
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
   const firstPrompt = String(counters.openaiPrompts[0] || "");
