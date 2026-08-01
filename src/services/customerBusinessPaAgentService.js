@@ -8,13 +8,18 @@
  */
 
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
+import { resolvePostConfirmRequestedFact } from "../brain/facts/resolvePostConfirmRequestedFact.js";
 import { decideCustomerTurn } from "../brain/decisions/decideCustomerTurn.js";
+import { isDeferredPostConfirmInformationalDecision } from "../brain/decisions/decidePostConfirmCustomerDm.js";
 import {
   executeAvailabilityCustomerConfirmBooking,
   executeAvailabilityCustomerDecline,
 } from "./availabilityCustomerConfirmService.js";
 import { executePostConfirmBookingMutation } from "./postConfirmBookingMutationExecutor.js";
-import { composePostConfirmMutationCustomerReply } from "./customerBusinessPaAiReply.js";
+import {
+  composePostConfirmInformationalCustomerReply,
+  composePostConfirmMutationCustomerReply,
+} from "./customerBusinessPaAiReply.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -61,6 +66,8 @@ function logPostConfirmTerminalDiagnostic(decided) {
  *   __executeAvailabilityCustomerDeclineFn?: typeof executeAvailabilityCustomerDecline,
  *   __executePostConfirmBookingMutationFn?: typeof executePostConfirmBookingMutation,
  *   __composePostConfirmMutationCustomerReplyFn?: typeof composePostConfirmMutationCustomerReply,
+ *   __resolvePostConfirmRequestedFactFn?: typeof resolvePostConfirmRequestedFact,
+ *   __composePostConfirmInformationalCustomerReplyFn?: typeof composePostConfirmInformationalCustomerReply,
  *   __chatCompletionsCreateForTests?: Function,
  * }} params
  */
@@ -82,6 +89,10 @@ export async function handleCustomerBusinessPaInbound({
   __executePostConfirmBookingMutationFn = executePostConfirmBookingMutation,
   __composePostConfirmMutationCustomerReplyFn =
     composePostConfirmMutationCustomerReply,
+  // Shim accepts capability+evidenceNeeds (B) and legacy requestedInformation.
+  __resolvePostConfirmRequestedFactFn = resolvePostConfirmRequestedFact,
+  __composePostConfirmInformationalCustomerReplyFn =
+    composePostConfirmInformationalCustomerReply,
   __chatCompletionsCreateForTests = null,
 }) {
   const uid = clean(businessId);
@@ -412,6 +423,89 @@ export async function handleCustomerBusinessPaInbound({
       mutationExecutionRequested: true,
       mutationExecutionStatus: mutationExecution?.status ?? "not_executed",
     };
+  } else if (
+    decision.informationalReplyDeferred === true ||
+    isDeferredPostConfirmInformationalDecision(decision)
+  ) {
+    // Decide → resolve trusted fact → compose. Owner missing-info stays unwired.
+    const frozenDecision = { ...decision };
+    const selectedBookingId = clean(decision.selectedBookingId) || null;
+    const selectedBooking =
+      selectedBookingId && Array.isArray(facts.bookingCandidates)
+        ? facts.bookingCandidates.find(
+            (row) => clean(row?.id) === selectedBookingId
+          ) ?? null
+        : selectedBookingId && clean(facts.booking?.id) === selectedBookingId
+          ? facts.booking
+          : facts.booking && typeof facts.booking === "object"
+            ? facts.booking
+            : null;
+
+    const factResolution = __resolvePostConfirmRequestedFactFn({
+      capability: frozenDecision.capability,
+      evidenceNeeds: frozenDecision.evidenceNeeds,
+      // legacy compat for injected test doubles
+      requestedInformation: frozenDecision.requestedInformation,
+      facts,
+      selectedBooking,
+    });
+
+    const composed = await __composePostConfirmInformationalCustomerReplyFn({
+      facts,
+      userMessage: text,
+      frozenDecision,
+      factResolution,
+      selectedBooking,
+      styleKey: "casual_local",
+      __chatCompletionsCreateForTests,
+    });
+    composeCalls += 1;
+
+    if (composed?.ok !== true || !cleanCustomerReply(composed?.reply)) {
+      return {
+        handled: true,
+        action: "business_pa_terminal_model_failure",
+        reply: "",
+        sentReply: false,
+        bookingId: selectedBookingId || clean(facts.booking?.id) || null,
+        availabilityRequestId:
+          clean(selectedBooking?.availabilityRequestId) ||
+          clean(facts.booking?.availabilityRequestId) ||
+          null,
+        reason: "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED",
+        retryable: false,
+        terminalFailure: true,
+        openaiUsed: false,
+        openaiSource: composed?.source ?? "technical_fallback",
+        finalReplySource: "openai_post_confirm_pa_informational_compose",
+        failureReason:
+          clean(composed?.reason, 160) ||
+          "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED",
+        requestedInformation: frozenDecision.requestedInformation ?? null,
+        factResolution,
+        bookingSelectionMode:
+          clean(frozenDecision.bookingSelectionMode, 40) || "none",
+        selectedBookingIndex: frozenDecision.selectedBookingIndex ?? null,
+        silenceRecoveryAttempts:
+          Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+        semanticDecisionCount,
+        composeCalls,
+        missingInfoEscalated: false,
+        missingInfoRequestId: null,
+        missingInfoType: null,
+        ownerNotifyStatus: null,
+      };
+    }
+
+    decision = {
+      ...frozenDecision,
+      customerReply: cleanCustomerReply(composed.reply),
+      shouldReply: true,
+      action: "reply",
+      mutationIntent: "none",
+      informationalReplyDeferred: true,
+      factResolution,
+    };
   }
 
   const shouldSend =
@@ -457,6 +551,9 @@ export async function handleCustomerBusinessPaInbound({
     decisionAction: decision.action,
     shouldReply: decision.shouldReply !== false,
     preparedReply: shouldSend,
+    requestedInformation: decision.requestedInformation ?? null,
+    factResolutionStatus: decision.factResolution?.status ?? null,
+    capability: decision.capability ?? null,
     missingInfoEscalated: false,
     missingInfoRequestId: null,
     missingInfoType: null,
@@ -476,9 +573,15 @@ export async function handleCustomerBusinessPaInbound({
     finalReplySource:
       mutationExecution != null
         ? "openai_post_confirm_pa_mutation_compose"
-        : "openai_post_confirm_pa",
+        : decision.informationalReplyDeferred === true
+          ? "openai_post_confirm_pa_informational_compose"
+          : "openai_post_confirm_pa",
     conversationAct: decision.conversationAct,
     customerIntent: decision.customerIntent ?? "unclear",
+    requestedInformation: decision.requestedInformation ?? null,
+    capability: decision.capability ?? null,
+    evidenceNeeds: decision.evidenceNeeds ?? [],
+    factResolution: decision.factResolution ?? null,
     mutationIntent: decision.mutationIntent ?? "none",
     mutationExecutionRequested:
       decision.mutationExecutionRequested === true ||

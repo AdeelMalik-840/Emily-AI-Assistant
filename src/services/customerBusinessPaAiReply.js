@@ -31,8 +31,46 @@ import {
   REPLY_SEMANTICS_SCHEMA,
 } from "../brain/openai/strictJsonSchema.js";
 import { composeGuardedCustomerReply } from "../brain/openai/composeGuardedCustomerReply.js";
+import { bookingReplyGuardFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
 import { isAllowedPaMissingInfoType } from "./paMissingInfoRequestService.js";
 import { resolveOpenAiChatCompletionsCreate } from "./openaiChatCompletionsCreate.js";
+
+/** Apply a found evidence item onto reply-guard seed facts. */
+function applyFoundEvidenceItemToGuardFacts(guardFacts, item) {
+  const concept = String(item?.concept || "");
+  const attribute = String(item?.attribute || "");
+  const value = item?.verifiedValue;
+  const key = `${concept}.${attribute}`;
+  const scalar = {
+    "pickup.time": "pickupTime",
+    "delivery.time": "deliveryTime",
+    "reference.value": "bookingReference",
+    "status.value": "bookingStatus",
+    "identity.label": "itemLabel",
+    "duration.days": "durationDays",
+    "dates.start": "startDate",
+    "dates.end": "endDate",
+    "price.total": "totalAmount",
+    "price.daily": "dailyRate",
+    "pickup.location": "pickupLocation",
+    "delivery.location": "deliveryAddress",
+    "advance.amount": "advanceAmount",
+  };
+  if (scalar[key]) {
+    guardFacts[scalar[key]] = value;
+    return;
+  }
+  const policy = {
+    "advance.policy": "advancePolicy",
+    "driver.policy": "driverPolicy",
+    "payment.policy": "paymentPolicy",
+    "documents.policy": "documentsPolicy",
+    "delivery.policy": "deliveryPolicy",
+  };
+  if (policy[key]) {
+    guardFacts.knownPolicies[policy[key]] = value;
+  }
+}
 
 export const CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK =
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK;
@@ -528,5 +566,332 @@ STRICT SAFETY:
     ...composed,
     frozenDecision: frozen,
     ...(composed.ok ? { mutationExecution: verifiedExecution } : {}),
+  };
+}
+
+/**
+ * Post-confirm informational wording after deterministic fact resolution.
+ * NOT a decision Brain — frozen semantic decision + FACT_RESOLUTION_JSON only.
+ *
+ * @param {{
+ *   facts?: Record<string, unknown> | null,
+ *   userMessage?: string | null,
+ *   frozenDecision: Record<string, unknown>,
+ *   factResolution: Record<string, unknown>,
+ *   selectedBooking?: Record<string, unknown> | null,
+ *   styleKey?: string,
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ */
+export async function composePostConfirmInformationalCustomerReply({
+  facts = null,
+  userMessage = null,
+  frozenDecision,
+  factResolution,
+  selectedBooking = null,
+  styleKey = "casual_local",
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const decision =
+    frozenDecision && typeof frozenDecision === "object" ? frozenDecision : {};
+  const resolution =
+    factResolution && typeof factResolution === "object" ? factResolution : {};
+  const factsObj = facts && typeof facts === "object" ? facts : {};
+  const booking =
+    selectedBooking && typeof selectedBooking === "object"
+      ? selectedBooking
+      : factsObj.booking && typeof factsObj.booking === "object"
+        ? factsObj.booking
+        : null;
+  const customerMessage = String(userMessage ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+
+  const verifiedResolution = {
+    capability: resolution.capability ?? decision.capability ?? null,
+    requestedInformation:
+      resolution.requestedInformation ?? decision.requestedInformation ?? null,
+    status: (() => {
+      const s = String(resolution.status ?? "unsupported");
+      if (s === "missing" || s === "conflicting" || s === "not_found") {
+        return "not_found";
+      }
+      return s === "found" ? "found" : "unsupported";
+    })(),
+    factAvailable: resolution.factAvailable === true || resolution.status === "found",
+    verifiedValue:
+      resolution.status === "found" || resolution.factAvailable === true
+        ? resolution.verifiedValue ?? null
+        : null,
+    source:
+      resolution.status === "found" || resolution.factAvailable === true
+        ? resolution.source ?? null
+        : null,
+    items: Array.isArray(resolution.items) ? resolution.items : [],
+  };
+
+  const frozen = {
+    action: decision.action ?? "reply",
+    mutationIntent: "none",
+    bookingSelectionMode: decision.bookingSelectionMode ?? "none",
+    selectedBookingIndex: decision.selectedBookingIndex ?? null,
+    selectedBookingId: decision.selectedBookingId ?? null,
+    conversationAct: decision.conversationAct ?? null,
+    customerIntent: decision.customerIntent ?? null,
+    situation: decision.situation ?? null,
+    capability: verifiedResolution.capability,
+    evidenceNeeds: Array.isArray(decision.evidenceNeeds)
+      ? decision.evidenceNeeds
+      : [],
+    requestedInformation: verifiedResolution.requestedInformation,
+    informationalReplyDeferred: true,
+  };
+
+  const known =
+    factsObj.known && typeof factsObj.known === "object" ? factsObj.known : {};
+  const business =
+    factsObj.business && typeof factsObj.business === "object"
+      ? factsObj.business
+      : {};
+  const catalogItems = Array.isArray(factsObj.replyGuardFacts?.catalogItems)
+    ? factsObj.replyGuardFacts.catalogItems
+    : Array.isArray(factsObj.catalogItems)
+      ? factsObj.catalogItems
+      : [];
+  const knownForGuard = {
+    advanceAmount: known.advanceAmount ?? business.advanceAmount ?? null,
+    advancePolicy: known.advancePolicy ?? business.advancePolicy ?? null,
+    driverPolicy: known.driverPolicy ?? business.driverPolicy ?? null,
+    paymentPolicy: known.paymentPolicy ?? business.paymentPolicy ?? null,
+    documentsPolicy: known.documentsPolicy ?? business.documentsPolicy ?? null,
+    deliveryPolicy: known.deliveryPolicy ?? business.deliveryPolicy ?? null,
+  };
+
+  // Always seed guard facts from the selected booking. Incomplete replyGuardFacts
+  // (missing pickupTime/reference/etc.) must never wipe verified fields — that
+  // caused found-time/reference compose to fail the claim guard then fall back
+  // to an empty reply.
+  const seededGuardFacts = {
+    ...bookingReplyGuardFacts(booking, catalogItems, knownForGuard),
+    bookingExecutionVerified: Boolean(booking),
+  };
+
+  if (verifiedResolution.status === "found" && verifiedResolution.verifiedValue != null) {
+    const items = Array.isArray(verifiedResolution.items)
+      ? verifiedResolution.items.filter((i) => i?.status === "found")
+      : [];
+    for (const item of items) {
+      applyFoundEvidenceItemToGuardFacts(seededGuardFacts, item);
+    }
+    // Fallback for legacy single verifiedValue without items.
+    if (items.length === 0) {
+      const key = String(verifiedResolution.requestedInformation || "");
+      const value = verifiedResolution.verifiedValue;
+      if (key === "pickup_time" && typeof value === "string") {
+        seededGuardFacts.pickupTime = value;
+      } else if (key === "delivery_time" && typeof value === "string") {
+        seededGuardFacts.deliveryTime = value;
+      } else if (key === "booking_reference" && typeof value === "string") {
+        seededGuardFacts.bookingReference = value;
+      } else if (key === "booking_status" && typeof value === "string") {
+        seededGuardFacts.bookingStatus = value;
+      }
+    }
+  }
+
+  const hasVerifiedClock =
+    verifiedResolution.status === "found" &&
+    ((Array.isArray(verifiedResolution.items) &&
+      verifiedResolution.items.some(
+        (i) =>
+          i?.status === "found" &&
+          i?.concept &&
+          ["pickup", "delivery"].includes(String(i.concept)) &&
+          String(i.attribute) === "time"
+      )) ||
+      verifiedResolution.requestedInformation === "pickup_time" ||
+      verifiedResolution.requestedInformation === "delivery_time") &&
+    Boolean(
+      String(
+        seededGuardFacts.pickupTime ??
+          seededGuardFacts.deliveryTime ??
+          verifiedResolution.verifiedValue ??
+          ""
+      ).trim()
+    );
+
+  // Single found booking reference: format directly from verified Result.
+  // Avoids natural Roman-Urdu phrasings that trip the existing reference
+  // extractor false-positive ("erence") without changing the guard.
+  const foundItemsOnly = Array.isArray(verifiedResolution.items)
+    ? verifiedResolution.items.filter((i) => i?.status === "found")
+    : [];
+  const onlyFoundReference =
+    verifiedResolution.status === "found" &&
+    foundItemsOnly.length === 1 &&
+    String(foundItemsOnly[0]?.concept) === "reference" &&
+    String(foundItemsOnly[0]?.attribute) === "value" &&
+    Boolean(String(foundItemsOnly[0]?.verifiedValue ?? "").trim());
+  if (onlyFoundReference) {
+    const refValue = String(foundItemsOnly[0].verifiedValue).trim();
+    const deterministicReply = `Booking reference: ${refValue}`;
+    const contractFacts = {
+      ...factsObj,
+      booking,
+      activeBookings: [],
+      replyGuardFacts: seededGuardFacts,
+    };
+    const replyContract = buildPostConfirmPaReplyContract({
+      ...contractFacts,
+      customerMessageText: customerMessage,
+      styleKey,
+    });
+    const guard = validateCustomerReplyAgainstContract(deterministicReply, {
+      ...replyContract,
+      verifiedCustomerFacts: {
+        ...(replyContract.verifiedCustomerFacts || {}),
+        ...seededGuardFacts,
+        mutationIntent: "none",
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+      },
+      replyRequired: true,
+    });
+    if (guard.ok === true) {
+      return {
+        ok: true,
+        reply: deterministicReply,
+        source: "deterministic_fact_resolution",
+        reason: null,
+        frozenDecision: frozen,
+        factResolution: verifiedResolution,
+      };
+    }
+  }
+
+  const contractFacts = {
+    ...factsObj,
+    booking,
+    activeBookings: [],
+    replyGuardFacts: seededGuardFacts,
+  };
+
+  const factsJson = compactPostConfirmFactsForPrompt(contractFacts);
+  const replyContract = buildPostConfirmPaReplyContract({
+    ...contractFacts,
+    customerMessageText: customerMessage,
+    styleKey,
+  });
+
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "dm",
+    styleKey,
+    businessCommunicationProfile:
+      factsObj?.business && typeof factsObj.business === "object"
+        ? /** @type {Record<string, unknown>} */ (factsObj.business)
+        : factsObj?.tone != null
+          ? { tone: factsObj.tone }
+          : null,
+  });
+
+  const system = `${shared}
+
+LANE OBJECTIVE (post_confirm_pa informational reply composer — NOT a decision Brain):
+OUTPUT STRICT JSON only:
+{"customerReply":"<short WhatsApp reply>","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+
+FROZEN_DECISION_JSON is authoritative and immutable. You may ONLY write customerReply.
+You MUST NOT change action, mutationIntent, bookingSelectionMode, selectedBookingIndex, selectedBookingId, conversationAct, customerIntent, situation, capability, or evidenceNeeds.
+You MUST NOT reinterpret the customer message into a different intent, workflow, mutation, or booking.
+
+FACT_RESOLUTION_JSON is the only authority for whether the requested fact exists:
+- status "found": answer using verifiedValue only (and matching verified booking facts). Do not add other unverified facts. customerReply MUST be non-empty.
+- status "not_found": say the detail is not confirmed yet, OR ask one useful clarification. Do NOT invent a substitute value. customerReply MUST be non-empty.
+- Only mention fields that appear as status="found" in FACT_RESOLUTION_JSON.items (or the single verifiedValue). Do not volunteer extra booking dates/prices/locations that were not requested in the Turn Plan.
+- status "unsupported": ask one useful clarification about what detail they need. Do NOT invent facts. customerReply MUST be non-empty.
+- When stating a found booking reference/code, put the exact verifiedValue immediately after a colon with no filler words in between (example shape: "booking reference: STONIC-PROD"). Do not write patterns like "reference hai: …".
+
+STRICT SAFETY:
+- Never invent dates, times, amounts, locations, items, statuses, references, or policies.
+- Never mention resolver, Brain, Firestore, system, or other internal process terms.
+- Keep reply short for WhatsApp.`;
+
+  const userBase =
+    `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\n` +
+    `FROZEN_DECISION_JSON:\n${JSON.stringify(frozen)}\n\n` +
+    `FACT_RESOLUTION_JSON:\n${JSON.stringify(verifiedResolution)}\n\n` +
+    `CURRENT_CUSTOMER_MESSAGE (tone/context only — do not reinterpret intent):\n${customerMessage || "(none)"}\n\n` +
+    `CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
+      allowedClaims: replyContract.allowedClaims,
+      forbiddenClaims: replyContract.forbiddenClaims,
+      requiredMeaning: replyContract.requiredMeaning,
+    })}`;
+
+  const composed = await composeGuardedCustomerReply({
+    system,
+    userBase,
+    firstAttemptReminder:
+      "Remember: JSON only; wording only from FACT_RESOLUTION_JSON + verified facts; customerReply must be non-empty; never invent missing values; never change frozen decision.",
+    responseFormatName: "post_confirm_informational_reply_compose",
+    replyContract,
+    enrichGuardContract: (contract) => ({
+      ...contract,
+      verifiedCustomerFacts: {
+        ...(contract.verifiedCustomerFacts || {}),
+        ...seededGuardFacts,
+        mutationIntent: "none",
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+      },
+      verifiedTiming: {
+        hasVerifiedTime: hasVerifiedClock,
+        timeText: hasVerifiedClock
+          ? String(verifiedResolution.verifiedValue)
+          : null,
+      },
+      forbiddenClaims: hasVerifiedClock
+        ? (contract.forbiddenClaims || []).filter(
+            (claim) => claim !== "specific_timing_verified"
+          )
+        : contract.forbiddenClaims,
+      allowedClaims: hasVerifiedClock
+        ? [
+            ...new Set([
+              ...(contract.allowedClaims || []),
+              "specific_timing_verified",
+            ]),
+          ]
+        : contract.allowedClaims,
+      replyRequired: true,
+    }),
+    fallbackReply: "",
+    timeoutMs,
+    timeoutErrorMessage: "POST_CONFIRM_INFORMATIONAL_COMPOSE_OPENAI_TIMEOUT",
+    __chatCompletionsCreateForTests,
+  });
+
+  // Found/not_found/unsupported must never silently become an empty sendable reply.
+  // Empty + ok:false is a classified technical compose failure for the caller.
+  if (
+    composed?.ok === true &&
+    !String(composed?.reply ?? "").trim()
+  ) {
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: "INFORMATIONAL_COMPOSE_EMPTY_REPLY",
+      frozenDecision: frozen,
+      factResolution: verifiedResolution,
+    };
+  }
+
+  return {
+    ...composed,
+    frozenDecision: frozen,
+    factResolution: verifiedResolution,
   };
 }

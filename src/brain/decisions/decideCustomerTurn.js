@@ -245,6 +245,9 @@ export function enrichSharedCustomerTurnDecision(decision) {
           customerIntent: "unclear",
           customerIsAskingQuestion: false,
           requestedInfoType: null,
+          requestedInformation: null,
+          capability: null,
+          evidenceNeeds: [],
           customerReply: POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
           action: "reply",
           shouldReply: true,
@@ -265,6 +268,8 @@ export function enrichSharedCustomerTurnDecision(decision) {
       requiredExecutor = "pa_missing_info_escalate";
     } else if (action === "fallthrough_action") {
       requiredExecutor = "brain_fallthrough";
+    } else if (d.informationalReplyDeferred === true) {
+      requiredExecutor = "post_confirm_evidence_resolve_compose";
     } else {
       requiredExecutor = "whatsapp_cloud_dm";
     }
@@ -280,6 +285,10 @@ export function enrichSharedCustomerTurnDecision(decision) {
     conversationAct: d.conversationAct ?? "unknown",
     customerIsAskingQuestion: d.customerIsAskingQuestion === true,
     requestedInfoType: d.requestedInfoType ?? null,
+    requestedInformation: d.requestedInformation ?? null,
+    capability: d.capability ?? null,
+    evidenceNeeds: Array.isArray(d.evidenceNeeds) ? d.evidenceNeeds : [],
+    informationalReplyDeferred: d.informationalReplyDeferred === true,
     shouldReply: d.shouldReply !== false,
     customerReply: d.customerReply ?? "",
     action,

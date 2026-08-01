@@ -107,6 +107,15 @@ function decision(overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: "booking_duration",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "duration",
+        attributes: ["days"],
+      },
+    ],
     shouldReply: true,
     customerReply: "Kia Stonic 4 din ke liye book hai.",
     action: "reply",
@@ -191,6 +200,15 @@ test("2. informational delivery question → reply, non-empty, mutationIntent=no
   const { result, calls } = await runDecide(
     [
       decision({
+        requestedInformation: "delivery_policy",
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: "delivery",
+            attributes: ["policy"],
+          },
+        ],
         customerReply: "Delivery selected areas mein available hai.",
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -222,7 +240,9 @@ test("2. informational delivery question → reply, non-empty, mutationIntent=no
   assert.equal(calls[0].max_tokens, 600);
   assert.equal(result.ok, true);
   assert.equal(result.decision.action, "reply");
-  assert.ok(String(result.decision.customerReply).trim().length > 0);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_business_profile");
   assert.equal(result.decision.mutationIntent, "none");
 });
 
@@ -232,6 +252,15 @@ test("3. missing delivery fact → non-empty clarification, no invented claim", 
   const { result } = await runDecide(
     [
       decision({
+        requestedInformation: "delivery_policy",
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: "delivery",
+            attributes: ["policy"],
+          },
+        ],
         customerReply: clarification,
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -244,12 +273,10 @@ test("3. missing delivery fact → non-empty clarification, no invented claim", 
   );
   assert.equal(result.ok, true);
   assert.equal(result.decision.action, "reply");
-  assert.equal(result.decision.customerReply, clarification);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_business_profile");
   assert.equal(result.decision.mutationIntent, "none");
-  assert.doesNotMatch(
-    String(result.decision.customerReply),
-    /available hai|ho sakti|possible/i
-  );
 });
 
 test("4. real delivery-change request still classifies as update_delivery", async () => {
@@ -260,6 +287,8 @@ test("4. real delivery-change request still classifies as update_delivery", asyn
         conversationAct: "action_request",
         customerIntent: "ask_action",
         customerIsAskingQuestion: false,
+        capability: "mutation_requested",
+        evidenceNeeds: [],
         shouldReply: true,
         customerReply: "",
         action: "request_booking_mutation",
@@ -292,7 +321,14 @@ test("4. real delivery-change request still classifies as update_delivery", asyn
 });
 
 test("5. empty customerReply for action=reply rejected by parser validation", () => {
-  const raw = decision({ customerReply: "", shouldReply: true, action: "reply" });
+  const raw = decision({
+    requestedInformation: null,
+    capability: null,
+    evidenceNeeds: [],
+    customerReply: "",
+    shouldReply: true,
+    action: "reply",
+  });
   assert.equal(classifyPostConfirmOpenAiUsabilityFailure(raw), "empty_required_reply");
   assert.equal(
     parsePostConfirmCustomerDmDecision(raw, {
@@ -302,7 +338,7 @@ test("5. empty customerReply for action=reply rejected by parser validation", ()
   );
 });
 
-test("6. truncation simulation → malformed_json; PR81 recovery still runs", async () => {
+test("6. truncation simulation → deferred factual recovery stays retryable", async () => {
   const truncated =
     '{"situation":"new_question","conversationAct":"information_request","customerIntent":"ask_fact","shouldReply":true,"customerReply":"Delivery selected areas","action":"reply","mutationIntent":"none","groundedFacts":{"itemId":"x","durationDays":4';
   assert.equal(classifyPostConfirmOpenAiUsabilityFailure(truncated), "malformed_json");
@@ -312,6 +348,15 @@ test("6. truncation simulation → malformed_json; PR81 recovery still runs", as
       truncated,
       truncated,
       decision({
+        requestedInformation: "delivery_policy",
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: "delivery",
+            attributes: ["policy"],
+          },
+        ],
         customerReply: "Delivery detail abhi confirm nahi hai.",
         groundedFacts: groundedFacts({
           itemId: STONIC_ITEM_ID,
@@ -323,10 +368,11 @@ test("6. truncation simulation → malformed_json; PR81 recovery still runs", as
     { facts: focusedFacts({}), userMessage: "Delivery ho skti hai?" }
   );
   assert.equal(calls.length, 3);
-  assert.equal(result.ok, true);
-  assert.equal(result.decision.action, "reply");
-  assert.ok(String(result.decision.customerReply).trim().length > 0);
-  assert.equal(result.decision.mutationIntent, "none");
+  assert.equal(result.ok, false);
+  assert.equal(result.source, "technical_fallback");
+  assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
+  assert.equal(result.retryable, true);
+  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
   const recoveryPrompt = String(calls[2]?.messages?.[1]?.content || "");
   assert.match(recoveryPrompt, /empty\/invalid output recovery/i);
 });

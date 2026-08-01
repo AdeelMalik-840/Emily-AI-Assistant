@@ -35,6 +35,15 @@ function modelDecision(overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: "booking_price",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "price",
+        attributes: ["total", "daily"],
+      },
+    ],
     shouldReply: true,
     customerReply:
       "Kia Stonic 4 din ke liye book hai. Total 22000 PKR hai aur pickup 10am hai.",
@@ -178,9 +187,9 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
   assert.equal(result.silenceRecoveryAttempts, 1);
   assert.equal(result.contentSafetyAttempts, 2);
   assert.equal(result.decision.selectedBookingId, "booking-stonic");
-  assert.equal(result.decision.customerReply.includes("22000 PKR"), true);
-  assert.equal(result.decision.customerReply.includes("4 din"), true);
-  assert.equal(result.decision.customerReply.includes("10am"), true);
+  assert.equal(result.decision.customerReply, "");
+  assert.equal(result.decision.informationalReplyDeferred, true);
+  assert.equal(result.decision.capability, "answer_from_active_booking");
 
   const firstPrompt = String(calls[0]?.messages?.[1]?.content || "");
   const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");

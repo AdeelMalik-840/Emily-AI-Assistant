@@ -27,6 +27,19 @@ import {
   MAX_CUSTOMER_REPLY_ATTEMPTS,
   REPLY_SEMANTICS_SCHEMA,
 } from "../openai/strictJsonSchema.js";
+import {
+  cleanPostConfirmCapability,
+  capabilityRequiresEvidenceResolution,
+  normalizeEvidenceNeeds,
+  POST_CONFIRM_CAPABILITIES,
+  POST_CONFIRM_EVIDENCE_CONCEPTS,
+  POST_CONFIRM_EVIDENCE_ATTRIBUTES,
+  POST_CONFIRM_EVIDENCE_ENTITIES,
+  // legacy compat during migration
+  cleanRequestedInformation,
+  mapLegacyRequestedInformationToTurnPlan,
+  REQUESTED_INFORMATION_TO_MISSING_INFO_TYPE,
+} from "../facts/resolvePostConfirmRequestedFact.js";
 
 export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "information_request",
@@ -37,6 +50,7 @@ export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "correction",
   "unknown",
 ]);
+
 
 export const POST_CONFIRM_ACTIONS = Object.freeze([
   "none",
@@ -406,6 +420,8 @@ export function isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(
 ) {
   if (!cleanCustomerReply(userMessage)) return false;
   const d = decision && typeof decision === "object" ? decision : {};
+  // Factual deferred wording is intentional — not silence drift.
+  if (isDeferredPostConfirmInformationalDecision(d)) return false;
   const action = cleanAction(d.action);
   const reply = cleanCustomerReply(d.customerReply);
   if (action === "silence" || d.shouldReply === false || !reply) {
@@ -609,7 +625,13 @@ export function classifyPostConfirmOpenAiUsabilityFailure(raw) {
   const isMutation =
     action === "request_booking_mutation" &&
     cleanMutationIntent(parsed.mutationIntent) !== "none";
-  if (!customerReply && !isSilence && !isMutation) {
+  const capability = cleanPostConfirmCapability(parsed.capability);
+  const hasLegacyInfo = Boolean(
+    cleanRequestedInformation(parsed.requestedInformation)
+  );
+  const deferredTurnPlan =
+    capabilityRequiresEvidenceResolution(capability) || hasLegacyInfo;
+  if (!customerReply && !isSilence && !isMutation && !deferredTurnPlan) {
     return "empty_required_reply";
   }
   return "schema_or_parse_failure";
@@ -679,6 +701,7 @@ function compactCustomerSafeBooking(booking) {
     startDate: booking.startDate ?? null,
     endDate: booking.endDate ?? null,
     pickupTime: booking.pickupTime ?? null,
+    pickupLocation: booking.pickupLocation ?? null,
     deliveryTime: booking.deliveryTime ?? null,
     deliveryMethod: booking.deliveryMethod ?? null,
     deliveryAddress: booking.deliveryAddress ?? null,
@@ -1154,6 +1177,121 @@ function isPostConfirmReadOnlyInformationalDecision(decision) {
     decision?.customerIsAskingQuestion === true ||
     action === "reply"
   );
+}
+
+/**
+ * Valid factual-deferred semantic state: Brain emitted a Turn Plan that requires
+ * evidence resolution; customerReply is empty until resolve + compose.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+export function isDeferredPostConfirmInformationalDecision(decision) {
+  if (!decision || typeof decision !== "object") return false;
+  if (cleanAction(decision.action) !== "reply") return false;
+  if (decision.shouldReply === false) return false;
+  if (cleanMutationIntent(decision.mutationIntent) !== "none") return false;
+  if (decision.mutationExecutionRequested === true) return false;
+  if (
+    decision.action === "request_booking_mutation" ||
+    decision.action === "confirm_pending_availability" ||
+    decision.action === "decline_pending_availability"
+  ) {
+    return false;
+  }
+  const capability = cleanPostConfirmCapability(decision.capability);
+  if (!capabilityRequiresEvidenceResolution(capability)) {
+    // Legacy deferred: requestedInformation set without capability yet.
+    const legacy = cleanRequestedInformation(decision.requestedInformation);
+    return Boolean(legacy);
+  }
+  if (capability === "clarification_needed") return true;
+  if (capability === "availability_request") return true;
+  const needs = normalizeEvidenceNeeds(decision.evidenceNeeds);
+  return needs.length > 0;
+}
+
+/**
+ * Brain-declared factual informational turn (structured fields only).
+ * Does not inspect customer text. Requires capability+evidence Turn Plan.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+export function isPostConfirmFactualInformationalSemanticDecision(decision) {
+  if (!decision || typeof decision !== "object") return false;
+  const action = cleanAction(decision.action);
+  if (
+    action === "request_booking_mutation" ||
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability" ||
+    action === "silence"
+  ) {
+    return false;
+  }
+  if (cleanMutationIntent(decision.mutationIntent) !== "none") return false;
+  if (decision.mutationExecutionRequested === true) return false;
+  if (decision.shouldReply === false) return false;
+  if (action !== "reply" && action !== "escalate_missing_info") return false;
+
+  const capability = cleanPostConfirmCapability(decision.capability);
+  if (capability === "social" || capability === "mutation_requested") {
+    return false;
+  }
+
+  const act = cleanAct(decision.conversationAct);
+  if (
+    act === "acknowledgement" ||
+    act === "thanks" ||
+    act === "chit_chat"
+  ) {
+    return (
+      decision.customerIntent === "ask_fact" ||
+      decision.customerIsAskingQuestion === true ||
+      capabilityRequiresEvidenceResolution(capability)
+    );
+  }
+
+  return (
+    act === "information_request" ||
+    decision.customerIntent === "ask_fact" ||
+    decision.customerIsAskingQuestion === true ||
+    capabilityRequiresEvidenceResolution(capability)
+  );
+}
+
+/**
+ * Same-Brain correction: factual ask missing compact Turn Plan evidence.
+ * @param {Record<string, unknown> | null | undefined} priorDecision
+ * @param {string} userMessage
+ */
+function buildPostConfirmFactualRequestedInformationCorrection(
+  priorDecision,
+  userMessage
+) {
+  return [
+    "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — not a second classifier).",
+    "This turn is a factual informational ask, but the Turn Plan is missing a valid capability + evidenceNeeds.",
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    `Previous decision (invalid): ${JSON.stringify({
+      situation: priorDecision?.situation ?? null,
+      conversationAct: priorDecision?.conversationAct ?? null,
+      customerIntent: priorDecision?.customerIntent ?? null,
+      action: priorDecision?.action ?? null,
+      capability: priorDecision?.capability ?? null,
+      evidenceNeeds: priorDecision?.evidenceNeeds ?? null,
+      customerReply: priorDecision?.customerReply ?? "",
+    })}`,
+    "Rules:",
+    "- Set capability to one of: " + POST_CONFIRM_CAPABILITIES.join(", "),
+    "- For answer_from_* capabilities, set non-empty evidenceNeeds: [{entity, concept, attributes}].",
+    `- Entities: ${POST_CONFIRM_EVIDENCE_ENTITIES.join(", ")}`,
+    `- Concepts: ${POST_CONFIRM_EVIDENCE_CONCEPTS.join(", ")}`,
+    `- Attributes: ${POST_CONFIRM_EVIDENCE_ATTRIBUTES.join(", ")}`,
+    "- Do NOT answer the factual question yet — leave customerReply empty.",
+    "- Keep action=reply, shouldReply=true, mutationIntent=none.",
+    "- New inventory availability asks → capability=availability_request (never answer from active booking).",
+    "- Social → capability=social with a normal customerReply.",
+    "- Return the same required JSON schema only.",
+  ].join("\n");
 }
 
 /**
@@ -1651,6 +1789,10 @@ function defaultDecision(overrides = {}) {
     customerIntent: "unclear",
     customerIsAskingQuestion: false,
     requestedInfoType: null,
+    requestedInformation: null,
+    capability: null,
+    evidenceNeeds: [],
+    informationalReplyDeferred: false,
     customerReply: "",
     action: "silence",
     shouldReply: false,
@@ -1713,14 +1855,37 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       : parsed.shouldReply === true
         ? true
         : action !== "silence" && action !== "none";
+  const mutationIntentEarly = cleanMutationIntent(parsed.mutationIntent);
+  let requestedInformation = cleanRequestedInformation(
+    parsed.requestedInformation
+  );
+  let capability = cleanPostConfirmCapability(parsed.capability);
+  let evidenceNeeds = normalizeEvidenceNeeds(parsed.evidenceNeeds);
+
+  // Legacy requestedInformation → compact Turn Plan when capability absent.
+  if (!capability && requestedInformation) {
+    const mapped = mapLegacyRequestedInformationToTurnPlan(requestedInformation);
+    capability = mapped.capability;
+    evidenceNeeds = mapped.evidenceNeeds;
+  }
+
+  const deferredInformationalCandidate =
+    action === "reply" &&
+    shouldReply !== false &&
+    mutationIntentEarly === "none" &&
+    parsed.mutationExecutionRequested !== true &&
+    (capabilityRequiresEvidenceResolution(capability) ||
+      Boolean(requestedInformation));
 
   // Silence / no-reply may have empty customerReply.
   // request_booking_mutation may also be empty: final wording is composed after
   // deterministic validate/execute (semantic decision only in this Brain call).
+  // Factual Turn Plans defer wording until evidence resolve + compose.
   if (
     (action === "silence" ||
       shouldReply === false ||
-      action === "request_booking_mutation") &&
+      action === "request_booking_mutation" ||
+      deferredInformationalCandidate) &&
     !customerReply
   ) {
     customerReply = "";
@@ -1736,7 +1901,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     cleanType(parsed.missingInfoType) ||
     null;
   let situation = cleanSituation(parsed.situation);
-  const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
+  const mutationIntent = mutationIntentEarly;
   const actionParameters = normalizePostConfirmActionParameters(
     parsed.actionParameters,
     action === "request_booking_mutation" ? mutationIntent : "none"
@@ -1761,6 +1926,38 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   if (conversationAct !== "information_request") {
     customerIsAskingQuestion = false;
     requestedInfoType = null;
+    requestedInformation = null;
+    if (
+      capability !== "social" &&
+      capability !== "mutation_requested" &&
+      capability !== "availability_request"
+    ) {
+      // Keep social/availability capabilities on non-information_request acts.
+      if (
+        conversationAct === "acknowledgement" ||
+        conversationAct === "thanks" ||
+        conversationAct === "chit_chat"
+      ) {
+        if (!capability) {
+          capability = "social";
+          evidenceNeeds = [];
+        } else if (capabilityRequiresEvidenceResolution(capability)) {
+          // Model sometimes labels factual asks as acknowledgement_* while still
+          // emitting a valid Turn Plan — keep evidenceNeeds; do not demote to social.
+          conversationAct = "information_request";
+          customerIsAskingQuestion = true;
+          if (customerIntent === "unclear" || !customerIntent) {
+            customerIntent = "ask_fact";
+          }
+        } else {
+          capability = "social";
+          evidenceNeeds = [];
+        }
+      } else if (conversationAct !== "action_request") {
+        capability = capability === "social" ? "social" : null;
+        evidenceNeeds = [];
+      }
+    }
     if (action === "escalate_missing_info") {
       action = "reply";
     }
@@ -1769,9 +1966,26 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   if (requestedInfoType && !isAllowedPaMissingInfoType(requestedInfoType)) {
     requestedInfoType = null;
   }
+  // Prefer Brain-declared requestedInformation; derive escalate type when mapped.
+  if (requestedInformation) {
+    const mapped =
+      REQUESTED_INFORMATION_TO_MISSING_INFO_TYPE[requestedInformation] ?? null;
+    if (mapped && isAllowedPaMissingInfoType(mapped) && !requestedInfoType) {
+      requestedInfoType = mapped;
+    }
+  }
   if (conversationAct === "information_request" && !customerIsAskingQuestion) {
     requestedInfoType = null;
+    requestedInformation = null;
     if (action === "escalate_missing_info") action = "reply";
+  }
+
+  if (capability === "social") {
+    evidenceNeeds = [];
+  }
+  if (action === "request_booking_mutation") {
+    capability = "mutation_requested";
+    evidenceNeeds = [];
   }
 
   // Act-driven situation hardening.
@@ -1836,6 +2050,9 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     customerIntent = "ask_action";
     customerIsAskingQuestion = false;
     requestedInfoType = null;
+    requestedInformation = null;
+    capability = "mutation_requested";
+    evidenceNeeds = [];
   }
   if (
     action === "confirm_pending_availability" ||
@@ -1846,7 +2063,17 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     customerIntent = "ask_action";
     customerIsAskingQuestion = false;
     requestedInfoType = null;
+    requestedInformation = null;
+    capability = null;
+    evidenceNeeds = [];
   }
+
+  const informationalReplyDeferred =
+    action === "reply" &&
+    shouldReply !== false &&
+    mutationIntent === "none" &&
+    (capabilityRequiresEvidenceResolution(capability) ||
+      Boolean(requestedInformation));
 
   return applyPostConfirmAntiEchoAndSilence(
     {
@@ -1855,7 +2082,12 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       customerIsAskingQuestion,
       requestedInfoType:
         conversationAct === "information_request" ? requestedInfoType : null,
-      customerReply,
+      requestedInformation:
+        conversationAct === "information_request" ? requestedInformation : null,
+      capability,
+      evidenceNeeds,
+      informationalReplyDeferred,
+      customerReply: informationalReplyDeferred ? "" : customerReply,
       action,
       shouldReply,
       situation,
@@ -2021,11 +2253,50 @@ export async function executePostConfirmPaLaneDecision({
         },
         customerIsAskingQuestion: { type: "boolean" },
         requestedInfoType: { type: ["string", "null"] },
+        requestedInformation: {
+          type: ["string", "null"],
+          description:
+            "Legacy optional label. Prefer capability + evidenceNeeds Turn Plan.",
+        },
+        capability: {
+          anyOf: [
+            { type: "string", enum: [...POST_CONFIRM_CAPABILITIES] },
+            { type: "null" },
+          ],
+          description:
+            "Compact Turn Plan capability. Allowed: " +
+            POST_CONFIRM_CAPABILITIES.join(", "),
+        },
+        evidenceNeeds: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              entity: {
+                type: "string",
+                enum: [...POST_CONFIRM_EVIDENCE_ENTITIES],
+              },
+              concept: {
+                type: "string",
+                enum: [...POST_CONFIRM_EVIDENCE_CONCEPTS],
+              },
+              attributes: {
+                type: "array",
+                items: {
+                  type: "string",
+                  enum: [...POST_CONFIRM_EVIDENCE_ATTRIBUTES],
+                },
+              },
+            },
+            required: ["entity", "concept", "attributes"],
+          },
+        },
         shouldReply: { type: "boolean" },
         customerReply: {
           type: "string",
           description:
-            "Sendable WhatsApp text. MUST be non-empty when action=reply and shouldReply=true. Empty string ONLY for action=silence or request_booking_mutation (wording composed after execute).",
+            "Sendable WhatsApp text. MUST be non-empty when action=reply for social turns. Empty string for action=silence, request_booking_mutation, OR factual answer_from_*/clarification/availability Turn Plans (wording after evidence resolution).",
         },
         action: { type: "string", enum: [...POST_CONFIRM_ACTIONS] },
         mutationIntent: {
@@ -2154,6 +2425,9 @@ export async function executePostConfirmPaLaneDecision({
         "customerIntent",
         "customerIsAskingQuestion",
         "requestedInfoType",
+        "requestedInformation",
+        "capability",
+        "evidenceNeeds",
         "shouldReply",
         "customerReply",
         "action",
@@ -2176,23 +2450,23 @@ export async function executePostConfirmPaLaneDecision({
 LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
 Return STRICT JSON (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"requestedInformation":null,"capability":"social","evidenceNeeds":[],"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
 - If you would only repeat them, use action="silence" and shouldReply=false with empty customerReply.
 
 CUSTOMER_REPLY CONTRACT (critical):
-- When action="reply" and shouldReply=true: customerReply MUST be a non-empty natural sendable message. Never return customerReply="" for a reply action.
-- Empty customerReply is ONLY allowed for action="silence" (shouldReply=false) or action="request_booking_mutation" (final wording is composed after deterministic execution).
-- If a verified policy/fact is present, answer from that fact. If absent, ask one useful clarification OR say the detail is not confirmed — still with a non-empty customerReply when action="reply".
+- Social / chit-chat / farewell / ack turns: capability="social", evidenceNeeds=[], and when action="reply" customerReply MUST be a non-empty natural sendable message.
+- Empty customerReply is allowed for: action="silence"; action="request_booking_mutation"; OR factual Turn Plans (answer_from_*/clarification_needed/availability_request) — wording after evidence resolution.
+- For factual asks: capability + evidenceNeeds are REQUIRED. Do NOT invent facts into customerReply — defer wording.
 
-VERIFIED FACTUAL GROUNDING (informational replies — general rule):
-- Every factual value stated in customerReply (item, duration, status, reference, amount, date, time, policy, location, or similar) MUST already exist in VERIFIED_BUSINESS_PA_FACTS_JSON.
-- If the requested detail is absent/null in verified facts, produce a natural unknown/unconfirmed reply OR ask one useful clarification. Never invent a replacement value.
-- Do not infer or invent dates, times, amounts, locations, statuses, policies, references, or items.
-- Do not mention a date or clock time merely because the customer asked about an event (for example pickup/delivery). Only state a time/date when that exact value is verified in facts.
-- Social turns need no invented booking facts.
+TURN PLAN (informational — semantic only in this call):
+- Factual booking/business asks → capability=answer_from_active_booking | answer_from_business_profile | answer_from_saved_owner_answer with evidenceNeeds like {"entity":"active_booking","concept":"pickup","attributes":["location"]}. Leave customerReply="".
+- Vague ask → capability=clarification_needed, evidenceNeeds=[], customerReply="".
+- New inventory availability (not about the confirmed booking) → capability=availability_request; never answer from active booking facts.
+- Social → capability=social.
+- Never invent dates, times, amounts, locations, statuses, policies, references, or items in this call.
 
 INFORMATIONAL VS MUTATION (delivery/pickup):
 - Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", bookingSelectionMode="focused" when a trusted booking is in scope.
@@ -2217,7 +2491,28 @@ STEP 1 — conversationAct:
 
 STEP 2 — customerIsAskingQuestion=true only for real information asks (including "ok driver milega?").
 
-STEP 3 — requestedInfoType only for information_request asks; else null. Allowed: ${PA_MISSING_INFO_TYPES.join(", ")}
+STEP 3 — Turn Plan capability + evidenceNeeds (MANDATORY for factual asks):
+Capabilities: ${POST_CONFIRM_CAPABILITIES.join(", ")}
+evidenceNeeds item: {entity, concept, attributes[]}
+- Entities: ${POST_CONFIRM_EVIDENCE_ENTITIES.join(", ")}
+- Concepts: ${POST_CONFIRM_EVIDENCE_CONCEPTS.join(", ")}
+- Attributes: ${POST_CONFIRM_EVIDENCE_ATTRIBUTES.join(", ")}
+Examples:
+- pickup where → answer_from_active_booking + [{entity:"active_booking",concept:"pickup",attributes:["location"]}]
+- pickup time → attributes:["time"]
+- "kitny din" / duration → concept:"duration", attributes:["days"]
+- "total rent" / "daily rent" / price → concept:"price", attributes:["total","daily"]
+- "booking confirm hai?" / status → concept:"status", attributes:["value"] (NOT capability=social)
+- booking reference → concept:"reference", attributes:["value"]
+- which car / identity → concept:"identity", attributes:["label"]
+- dates/start → concept:"dates", attributes:["start","end"]
+- driver/advance/payment/documents/delivery policy → answer_from_business_profile + business_profile entity + attributes:["policy"] (or amount for advance)
+- fuel/late return/cancellation/insurance → clarification_needed (evidenceNeeds=[]) OR answer_from_saved_owner_answer + other/answer when a saved owner answer exists
+- "koi gari available?" (new search) → availability_request (do NOT use active booking evidence)
+- social hello / acha / thanks → capability=social, evidenceNeeds=[]
+- "mujhe details chahiye" / vague → clarification_needed, evidenceNeeds=[]
+- Keep attributes ONLY from the compact attribute list (policy, location, time, days, value, label, total, daily, start, end, amount, answer). Never invent attribute names like deliveryPolicy.
+- requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
 
 STEP 4 — action:
 - silence: no WhatsApp send (shouldReply=false, customerReply="")
@@ -2323,6 +2618,7 @@ STRICT SAFETY:
     let silenceRecoveryAttempts = 0;
     let trustedFocusRequiredReplyExtraUsed = false;
     let emptyInvalidInformationalRecoveryUsed = false;
+    let factualRequestedInfoCorrectionUsed = false;
     /** @type {string | null} */
     let lastUsabilityClassification = null;
     const trustedFocusNonEmptyQuestion =
@@ -2332,7 +2628,8 @@ STRICT SAFETY:
       const attemptLimit =
         MAX_CUSTOMER_REPLY_ATTEMPTS +
         (trustedFocusRequiredReplyExtraUsed ? 1 : 0) +
-        (emptyInvalidInformationalRecoveryUsed ? 1 : 0);
+        (emptyInvalidInformationalRecoveryUsed ? 1 : 0) +
+        (factualRequestedInfoCorrectionUsed ? 1 : 0);
       if (attempt > attemptLimit) {
         const exhaustedReason =
           lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY"
@@ -2374,6 +2671,12 @@ STRICT SAFETY:
                     userLine,
                     lastEmily,
                     lastUsabilityClassification || "schema_or_parse_failure"
+                  )}`
+              : lastReason === "FACTUAL_TURN_PLAN_REQUIRED" ||
+                  lastReason === "FACTUAL_REQUESTED_INFORMATION_REQUIRED"
+                ? `${userPayload}\n\n${buildPostConfirmFactualRequestedInformationCorrection(
+                    lastSuspiciousDecision || {},
+                    userLine
                   )}`
             : lastReason === "verified_item_mismatch"
               ? `${userPayload}\n\n${buildPostConfirmVerifiedItemMismatchCorrection(
@@ -2424,14 +2727,25 @@ STRICT SAFETY:
       const isMutationSemanticDecision =
         decision?.action === "request_booking_mutation" &&
         cleanMutationIntent(decision?.mutationIntent) !== "none";
+      const isDeferredInformationalDecision =
+        isDeferredPostConfirmInformationalDecision(decision);
+      const isFactualSemanticDecision =
+        isPostConfirmFactualInformationalSemanticDecision(decision);
       const inEmptyInvalidInformationalRecovery =
         emptyInvalidInformationalRecoveryUsed &&
         lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY";
-      // Mutations may return empty customerReply — wording is composed after execute.
+      // Mutations / deferred factual asks may return empty customerReply —
+      // wording is composed after execute / fact resolution.
+      // Factual semantic turns with empty reply proceed to Turn Plan correction
+      // (not EMPTY_OR_INVALID) when evidenceNeeds were wiped/invalid.
       // Empty/invalid informational recovery rejects silence and mutations.
       if (
         !decision ||
-        (!hasSendableReply && !isSilence && !isMutationSemanticDecision) ||
+        (!hasSendableReply &&
+          !isSilence &&
+          !isMutationSemanticDecision &&
+          !isDeferredInformationalDecision &&
+          !isFactualSemanticDecision) ||
         (inEmptyInvalidInformationalRecovery &&
           (!hasSendableReply || isSilence || isMutationSemanticDecision))
       ) {
@@ -2554,6 +2868,53 @@ STRICT SAFETY:
           ok: true,
           decision: stripInternalReplySemantics(finalized),
           source: "openai",
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      // Factual informational decisions stop here when requestedInformation is set:
+      // wording is composed after deterministic fact resolution. Clear any model
+      // customerReply so invented claims cannot skip the resolver.
+      if (isDeferredPostConfirmInformationalDecision(finalized)) {
+        finalized.customerReply = "";
+        finalized.shouldReply = true;
+        finalized.informationalReplyDeferred = true;
+        finalized.capability = cleanPostConfirmCapability(finalized.capability);
+        finalized.evidenceNeeds = normalizeEvidenceNeeds(
+          finalized.evidenceNeeds
+        );
+        finalized.requestedInformation = cleanRequestedInformation(
+          finalized.requestedInformation
+        );
+        finalized.mutationIntent = "none";
+        finalized.mutationExecutionRequested = false;
+        finalized.actionParameters = emptyPostConfirmActionParameters();
+        return {
+          ok: true,
+          decision: stripInternalReplySemantics(finalized),
+          source: "openai",
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      // Factual informational without a valid evidence Turn Plan is invalid —
+      // one same-Brain correction, then durable technical failure.
+      // Never accept a direct ungrounded factual customerReply.
+      if (isPostConfirmFactualInformationalSemanticDecision(finalized)) {
+        if (!factualRequestedInfoCorrectionUsed) {
+          factualRequestedInfoCorrectionUsed = true;
+          lastReason = "FACTUAL_TURN_PLAN_REQUIRED";
+          lastSuspiciousDecision = finalized;
+          continue;
+        }
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(defaultDecision()),
+          source: "technical_fallback",
+          reason: "FACTUAL_TURN_PLAN_REQUIRED",
+          retryable: false,
           silenceRecoveryAttempts,
           contentSafetyAttempts: attempt,
         };

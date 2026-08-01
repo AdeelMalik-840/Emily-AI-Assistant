@@ -226,6 +226,15 @@ function infoDecisionJson(reply, overrides = {}) {
     customerIntent: "ask_fact",
     customerIsAskingQuestion: true,
     requestedInfoType: null,
+    requestedInformation: "booking_duration",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "duration",
+        attributes: ["days"],
+      },
+    ],
     shouldReply: true,
     customerReply: reply,
     action: "reply",
@@ -440,6 +449,7 @@ test("exact: Delivery add kar do → update_delivery unsupported, no data change
 
 test("exact: Delivery ho sakti hai? → read-only, no mutation executor", async () => {
   let executorCalls = 0;
+  let informationalComposeCalls = 0;
   const result = await handleCustomerBusinessPaInbound({
     db: {},
     businessId: BUSINESS_ID,
@@ -455,9 +465,28 @@ test("exact: Delivery ho sakti hai? → read-only, no mutation executor", async 
       executorCalls += 1;
       return executePostConfirmBookingMutation(args);
     },
+    __composePostConfirmInformationalCustomerReplyFn: async (args) => {
+      informationalComposeCalls += 1;
+      assert.equal(args.frozenDecision.capability, "answer_from_business_profile");
+      assert.equal(args.frozenDecision.customerReply, "");
+      return {
+        ok: true,
+        reply: "Haan, selected areas mein delivery available hai.",
+        source: "openai",
+      };
+    },
     __chatCompletionsCreateForTests: async () =>
       completion(
         infoDecisionJson("Haan, selected areas mein delivery available hai.", {
+          requestedInformation: "delivery_policy",
+          capability: "answer_from_business_profile",
+          evidenceNeeds: [
+            {
+              entity: "business_profile",
+              concept: "delivery",
+              attributes: ["policy"],
+            },
+          ],
           groundedFacts: {
             itemId: "civic-2026",
             durationDays: 3,
@@ -470,13 +499,19 @@ test("exact: Delivery ho sakti hai? → read-only, no mutation executor", async 
             endDate: null,
             pickupTime: null,
             deliveryTime: null,
-            policyClaims: ["deliveryPolicy"],
+            policyClaims: [
+              {
+                key: "deliveryPolicy",
+                value: "Delivery available in selected areas.",
+              },
+            ],
           },
         })
       ),
   });
   assert.equal(executorCalls, 0);
-  assert.equal(result.composeCalls, 0);
+  assert.equal(informationalComposeCalls, 1);
+  assert.equal(result.composeCalls, 1);
   assert.equal(result.semanticDecisionCount, 1);
   assert.equal(result.mutationExecutionStatus, "not_executed");
   assert.equal(result.decisionAction, "reply");
