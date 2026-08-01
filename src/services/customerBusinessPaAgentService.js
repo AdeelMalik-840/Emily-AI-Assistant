@@ -30,6 +30,34 @@ function cleanCustomerReply(value) {
   return String(value ?? "").trim();
 }
 
+/**
+ * Resolve Brain-selected booking from trusted candidate rows.
+ * Explicit selectedBookingId never falls back to a different facts.booking.
+ *
+ * @param {Record<string, unknown> | null | undefined} facts
+ * @param {unknown} selectedBookingIdRaw
+ */
+function resolveLaneSelectedBooking(facts, selectedBookingIdRaw) {
+  const selectedBookingId = clean(selectedBookingIdRaw) || null;
+  const focused =
+    facts?.booking && typeof facts.booking === "object" ? facts.booking : null;
+  if (!selectedBookingId) {
+    return { selectedBookingId: null, selectedBooking: focused };
+  }
+  if (Array.isArray(facts?.bookingCandidates)) {
+    const hit = facts.bookingCandidates.find(
+      (row) => clean(row?.id) === selectedBookingId
+    );
+    if (hit) {
+      return { selectedBookingId, selectedBooking: hit };
+    }
+  }
+  if (focused && clean(focused.id) === selectedBookingId) {
+    return { selectedBookingId, selectedBooking: focused };
+  }
+  return { selectedBookingId, selectedBooking: null };
+}
+
 function nonNegativeInteger(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
@@ -441,17 +469,10 @@ export async function handleCustomerBusinessPaInbound({
     // Decide → resolve trusted fact → compose. Owner missing-info stays unwired.
     // Also used after pending AVR execute when the post-exec Turn Plan defers.
     const frozenDecision = { ...decision };
-    const selectedBookingId = clean(decision.selectedBookingId) || null;
-    const selectedBooking =
-      selectedBookingId && Array.isArray(laneFacts.bookingCandidates)
-        ? laneFacts.bookingCandidates.find(
-            (row) => clean(row?.id) === selectedBookingId
-          ) ?? null
-        : selectedBookingId && clean(laneFacts.booking?.id) === selectedBookingId
-          ? laneFacts.booking
-          : laneFacts.booking && typeof laneFacts.booking === "object"
-            ? laneFacts.booking
-            : null;
+    const { selectedBookingId, selectedBooking } = resolveLaneSelectedBooking(
+      laneFacts,
+      frozenDecision.selectedBookingId
+    );
 
     const factResolution = __resolvePostConfirmRequestedFactFn({
       capability: frozenDecision.capability,
@@ -460,6 +481,7 @@ export async function handleCustomerBusinessPaInbound({
       requestedInformation: frozenDecision.requestedInformation,
       facts: laneFacts,
       selectedBooking,
+      selectedBookingId,
     });
 
     const composed = await __composePostConfirmInformationalCustomerReplyFn({

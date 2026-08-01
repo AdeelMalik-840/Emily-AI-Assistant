@@ -32,6 +32,9 @@ import {
 } from "../brain/openai/strictJsonSchema.js";
 import { composeGuardedCustomerReply } from "../brain/openai/composeGuardedCustomerReply.js";
 import { bookingReplyGuardFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
+import {
+  resolvePostConfirmEvidenceBooking,
+} from "../brain/facts/resolvePostConfirmRequestedFact.js";
 import { isAllowedPaMissingInfoType } from "./paMissingInfoRequestService.js";
 import { resolveOpenAiChatCompletionsCreate } from "./openaiChatCompletionsCreate.js";
 
@@ -49,16 +52,17 @@ import { resolveOpenAiChatCompletionsCreate } from "./openaiChatCompletionsCreat
 export function buildPostConfirmInformationalComposeContextForPrompt({
   facts = null,
   selectedBooking = null,
+  selectedBookingId = null,
 } = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
   const business =
     f.business && typeof f.business === "object" ? f.business : {};
-  const booking =
-    selectedBooking && typeof selectedBooking === "object"
-      ? selectedBooking
-      : f.booking && typeof f.booking === "object"
-        ? f.booking
-        : null;
+  const selection = resolvePostConfirmEvidenceBooking({
+    facts: f,
+    selectedBooking,
+    selectedBookingId,
+  });
+  const booking = selection.ok ? selection.booking : null;
   const name = String(business.name ?? business.businessName ?? "")
     .trim()
     .slice(0, 120);
@@ -712,12 +716,12 @@ export async function composePostConfirmInformationalCustomerReply({
   const resolution =
     factResolution && typeof factResolution === "object" ? factResolution : {};
   const factsObj = facts && typeof facts === "object" ? facts : {};
-  const booking =
-    selectedBooking && typeof selectedBooking === "object"
-      ? selectedBooking
-      : factsObj.booking && typeof factsObj.booking === "object"
-        ? factsObj.booking
-        : null;
+  const selection = resolvePostConfirmEvidenceBooking({
+    facts: factsObj,
+    selectedBooking,
+    selectedBookingId: decision.selectedBookingId,
+  });
+  const booking = selection.ok ? selection.booking : null;
   const customerMessage = String(userMessage ?? "")
     .replace(/\s+/g, " ")
     .trim()
@@ -902,6 +906,7 @@ export async function composePostConfirmInformationalCustomerReply({
   const promptContext = buildPostConfirmInformationalComposeContextForPrompt({
     facts: factsObj,
     selectedBooking: booking,
+    selectedBookingId: decision.selectedBookingId,
   });
   const factsJson = JSON.stringify(promptContext);
   const replyContract = buildPostConfirmPaReplyContract({

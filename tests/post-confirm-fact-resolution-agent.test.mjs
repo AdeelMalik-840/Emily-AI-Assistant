@@ -10,6 +10,9 @@ process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || "test-key";
 const { handleCustomerBusinessPaInbound } = await import(
   "../src/services/customerBusinessPaAgentService.js"
 );
+const { resolvePostConfirmRequestedFact } = await import(
+  "../src/brain/facts/resolvePostConfirmRequestedFact.js"
+);
 
 function baseFacts(bookingOverrides = {}) {
   const booking = {
@@ -374,4 +377,179 @@ test("not_found is not classified as technical decide failure", async () => {
   assert.equal(result.retryable, false);
   assert.equal(result.factResolution?.status, "not_found");
   assert.ok(result.reply);
+});
+
+test("agent: explicit missing selectedBookingId does not answer from facts.booking", async () => {
+  const bookingA = {
+    id: "bk-a",
+    selectionIndex: 1,
+    status: "approved",
+    itemLabel: "Kia Stonic",
+    pickupLocation: "Location A SECRET",
+    durationDays: 2,
+    totalAmount: 12000,
+    customerSafeReference: "REF-A",
+    pickupTime: "10:00 AM",
+  };
+  const bookingB = {
+    id: "bk-b",
+    selectionIndex: 2,
+    status: "approved",
+    itemLabel: "Honda Civic",
+    pickupLocation: "Location B",
+    durationDays: 5,
+    totalAmount: 40000,
+    customerSafeReference: "REF-B",
+  };
+  let resolveArgs = null;
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "biz-1",
+    customerPhone: "923001234567",
+    messageText: "pickup location kya hai?",
+    messageId: "wamid.missing-selection",
+    preResolvedBookingFacts: {
+      ok: true,
+      facts: {
+        ...baseFacts(),
+        booking: bookingA,
+        bookingCandidates: [bookingA],
+        bookingFocus: {
+          selectedBookingIndex: 1,
+          confidence: "trusted",
+          source: "MATCHED_TRUSTED_FOCUS",
+        },
+      },
+    },
+    __decideCustomerTurnFn: async () => ({
+      ok: true,
+      source: "openai",
+      decision: {
+        situation: "new_question",
+        conversationAct: "information_request",
+        customerIntent: "ask_fact",
+        customerIsAskingQuestion: true,
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "pickup",
+            attributes: ["location"],
+          },
+        ],
+        requestedInformation: "pickup_location",
+        informationalReplyDeferred: true,
+        shouldReply: true,
+        customerReply: "",
+        action: "reply",
+        mutationIntent: "none",
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
+        selectedBookingId: "bk-b",
+      },
+    }),
+    __resolvePostConfirmRequestedFactFn: (p) => {
+      resolveArgs = p;
+      return resolvePostConfirmRequestedFact(p);
+    },
+    __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+      assert.equal(p.factResolution?.status, "unsupported");
+      assert.equal(p.selectedBooking, null);
+      assert.doesNotMatch(
+        JSON.stringify(p.factResolution),
+        /Location A SECRET|REF-A|12000|10:00/
+      );
+      return {
+        ok: true,
+        reply: "Yeh booking detail abhi clear nahi hai. Kaunsi booking?",
+        source: "openai",
+      };
+    },
+  });
+
+  assert.equal(resolveArgs?.selectedBookingId, "bk-b");
+  assert.equal(resolveArgs?.selectedBooking, null);
+  assert.equal(result.factResolution?.status, "unsupported");
+  assert.equal(result.factResolution?.selectionStatus, "explicit_unresolved");
+  assert.doesNotMatch(result.reply, /Location A SECRET|REF-A|12000/);
+  assert.equal(result.action, "business_pa_reply");
+  assert.ok(result.reply);
+});
+
+test("agent: selected booking differing from facts.booking wins end-to-end", async () => {
+  const bookingA = {
+    id: "bk-a",
+    selectionIndex: 1,
+    status: "approved",
+    itemLabel: "Stonic",
+    pickupLocation: "Loc A",
+    durationDays: 2,
+  };
+  const bookingB = {
+    id: "bk-b",
+    selectionIndex: 2,
+    status: "approved",
+    itemLabel: "Civic",
+    pickupLocation: "Loc B ONLY",
+    durationDays: 5,
+  };
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "biz-1",
+    customerPhone: "923001234567",
+    messageText: "pickup location kya hai?",
+    messageId: "wamid.selected-wins",
+    preResolvedBookingFacts: {
+      ok: true,
+      facts: {
+        ...baseFacts(),
+        booking: bookingA,
+        bookingCandidates: [bookingA, bookingB],
+      },
+    },
+    __decideCustomerTurnFn: async () => ({
+      ok: true,
+      source: "openai",
+      decision: {
+        situation: "new_question",
+        conversationAct: "information_request",
+        customerIntent: "ask_fact",
+        customerIsAskingQuestion: true,
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "pickup",
+            attributes: ["location"],
+          },
+        ],
+        requestedInformation: "pickup_location",
+        informationalReplyDeferred: true,
+        shouldReply: true,
+        customerReply: "",
+        action: "reply",
+        mutationIntent: "none",
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
+        selectedBookingId: "bk-b",
+      },
+    }),
+    __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+      assert.equal(p.selectedBooking?.id, "bk-b");
+      assert.equal(p.factResolution?.status, "found");
+      assert.equal(p.factResolution?.verifiedValue, "Loc B ONLY");
+      return {
+        ok: true,
+        reply: `Pickup ${p.factResolution.verifiedValue} se hogi.`,
+        source: "openai",
+      };
+    },
+  });
+
+  assert.match(result.reply, /Loc B ONLY/);
+  assert.doesNotMatch(result.reply, /Loc A/);
 });

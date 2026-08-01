@@ -371,6 +371,74 @@ function fromUniqueValues(values, source) {
 }
 
 /**
+ * Resolve which booking object evidence lookup may read.
+ *
+ * A. No explicit selectedBookingId → focused facts.booking fallback allowed.
+ * B. Explicit id + resolved selectedBooking (or focused id match) → that booking only.
+ * C. Explicit id requested but unresolved → fail closed (no facts.booking fallback).
+ *
+ * @param {{
+ *   facts?: Record<string, unknown> | null,
+ *   selectedBooking?: Record<string, unknown> | null,
+ *   selectedBookingId?: unknown,
+ * }} [p]
+ * @returns {{
+ *   ok: boolean,
+ *   booking: Record<string, unknown> | null,
+ *   selectionStatus:
+ *     | "explicit_resolved"
+ *     | "explicit_matches_focused"
+ *     | "explicit_unresolved"
+ *     | "provided"
+ *     | "focused_fallback"
+ *     | "none",
+ * }}
+ */
+export function resolvePostConfirmEvidenceBooking({
+  facts = null,
+  selectedBooking = null,
+  selectedBookingId = null,
+} = {}) {
+  const explicitId = clean(selectedBookingId, 120);
+  const asBooking = (row) =>
+    row && typeof row === "object" ? /** @type {Record<string, unknown>} */ (row) : null;
+
+  if (explicitId) {
+    const selected = asBooking(selectedBooking);
+    if (selected && clean(selected.id, 120) === explicitId) {
+      return {
+        ok: true,
+        booking: selected,
+        selectionStatus: "explicit_resolved",
+      };
+    }
+    const focused = asBooking(facts?.booking);
+    if (focused && clean(focused.id, 120) === explicitId) {
+      return {
+        ok: true,
+        booking: focused,
+        selectionStatus: "explicit_matches_focused",
+      };
+    }
+    return {
+      ok: false,
+      booking: null,
+      selectionStatus: "explicit_unresolved",
+    };
+  }
+
+  const selected = asBooking(selectedBooking);
+  if (selected) {
+    return { ok: true, booking: selected, selectionStatus: "provided" };
+  }
+  const focused = asBooking(facts?.booking);
+  if (focused) {
+    return { ok: true, booking: focused, selectionStatus: "focused_fallback" };
+  }
+  return { ok: true, booking: null, selectionStatus: "none" };
+}
+
+/**
  * Lookup one (entity, concept, attribute) against trusted stores.
  * @returns {{ status: EvidenceItemStatus, verifiedValue: unknown, source: string | null }}
  */
@@ -380,15 +448,8 @@ function lookupEvidenceAttribute({
   attribute,
   capability,
   facts,
-  selectedBooking,
+  booking = null,
 }) {
-  const booking =
-    selectedBooking && typeof selectedBooking === "object"
-      ? selectedBooking
-      : facts?.booking && typeof facts.booking === "object"
-        ? facts.booking
-        : null;
-
   // Availability must never be answered from active-booking evidence.
   if (capability === "availability_request") {
     return UNSUPPORTED_ITEM;
@@ -554,9 +615,10 @@ function aggregateStatus(statuses) {
  *   evidenceNeeds?: unknown,
  *   facts?: Record<string, unknown> | null,
  *   selectedBooking?: Record<string, unknown> | null,
+ *   selectedBookingId?: unknown,
  * }} p
  */
-function emptyEvidenceResult(capability, items = []) {
+function emptyEvidenceResult(capability, items = [], extra = {}) {
   return {
     capability,
     status: "unsupported",
@@ -565,7 +627,21 @@ function emptyEvidenceResult(capability, items = []) {
     source: null,
     items,
     missingInfoType: null,
+    ...extra,
   };
+}
+
+function unsupportedItemsForNeeds(needs) {
+  return needs.flatMap((need) =>
+    need.attributes.map((attribute) => ({
+      entity: need.entity,
+      concept: need.concept,
+      attribute,
+      status: "unsupported",
+      verifiedValue: null,
+      source: null,
+    }))
+  );
 }
 
 export function resolvePostConfirmTurnEvidence({
@@ -573,6 +649,7 @@ export function resolvePostConfirmTurnEvidence({
   evidenceNeeds = null,
   facts = null,
   selectedBooking = null,
+  selectedBookingId = null,
 } = {}) {
   const needs = normalizeEvidenceNeeds(evidenceNeeds);
   const cap = coerceEvidenceCapability(
@@ -593,25 +670,30 @@ export function resolvePostConfirmTurnEvidence({
   }
 
   if (cap === "availability_request") {
-    return emptyEvidenceResult(
-      cap,
-      needs.flatMap((need) =>
-        need.attributes.map((attribute) => ({
-          entity: need.entity,
-          concept: need.concept,
-          attribute,
-          status: "unsupported",
-          verifiedValue: null,
-          source: null,
-        }))
-      )
-    );
+    return emptyEvidenceResult(cap, unsupportedItemsForNeeds(needs));
   }
 
   if (ANSWER_FROM_CAPABILITIES.has(cap) && needs.length === 0) {
     return emptyEvidenceResult(cap);
   }
 
+  const selection = resolvePostConfirmEvidenceBooking({
+    facts,
+    selectedBooking,
+    selectedBookingId,
+  });
+  const needsActiveBooking =
+    cap === "answer_from_active_booking" ||
+    needs.some((n) => n.entity === "active_booking");
+
+  // Explicit Brain selection unresolved → never read another booking's fields.
+  if (!selection.ok && needsActiveBooking) {
+    return emptyEvidenceResult(cap, unsupportedItemsForNeeds(needs), {
+      selectionStatus: selection.selectionStatus,
+    });
+  }
+
+  const booking = selection.booking;
   const items = [];
   for (const need of needs) {
     for (const attribute of need.attributes) {
@@ -621,7 +703,7 @@ export function resolvePostConfirmTurnEvidence({
         attribute,
         capability: cap,
         facts,
-        selectedBooking,
+        booking,
       });
       items.push({
         entity: need.entity,
@@ -687,6 +769,7 @@ export function resolvePostConfirmTurnEvidence({
     source: status === "found" || status === "missing" ? source : null,
     items,
     missingInfoType,
+    selectionStatus: selection.selectionStatus,
   };
 }
 
@@ -704,6 +787,7 @@ export function resolvePostConfirmRequestedFact({
   requestedInformation = null,
   facts = null,
   selectedBooking = null,
+  selectedBookingId = null,
   capability = null,
   evidenceNeeds = null,
 } = {}) {
@@ -713,6 +797,7 @@ export function resolvePostConfirmRequestedFact({
       evidenceNeeds,
       facts,
       selectedBooking,
+      selectedBookingId,
     });
     return {
       ...resolved,
@@ -728,6 +813,7 @@ export function resolvePostConfirmRequestedFact({
     evidenceNeeds: mapped.evidenceNeeds,
     facts,
     selectedBooking,
+    selectedBookingId,
   });
   return {
     requestedInformation: key || null,
@@ -738,6 +824,7 @@ export function resolvePostConfirmRequestedFact({
     missingInfoType: resolved.missingInfoType,
     capability: resolved.capability,
     items: resolved.items,
+    selectionStatus: resolved.selectionStatus,
   };
 }
 

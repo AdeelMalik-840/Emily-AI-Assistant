@@ -6,6 +6,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   resolvePostConfirmRequestedFact,
+  resolvePostConfirmTurnEvidence,
+  resolvePostConfirmEvidenceBooking,
   POST_CONFIRM_REQUESTED_INFORMATION,
 } from "../src/brain/facts/resolvePostConfirmRequestedFact.js";
 import {
@@ -792,4 +794,188 @@ test("found saved owner answer remains answerable only via Result", async () => 
     userContent.split("FACT_RESOLUTION_JSON")[1],
     /Fuel is customer responsibility/
   );
+});
+
+test("explicit selected booking id exists → resolver uses only that booking", () => {
+  const a = booking({
+    id: "bk-a",
+    durationDays: 2,
+    totalAmount: 10000,
+    customerSafeReference: "REF-A",
+    pickupLocation: "Place A",
+  });
+  const b = booking({
+    id: "bk-b",
+    durationDays: 9,
+    totalAmount: 99000,
+    customerSafeReference: "REF-B",
+    pickupLocation: "Place B",
+    itemLabel: "Honda Civic",
+  });
+  const r = resolvePostConfirmTurnEvidence({
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      { entity: "active_booking", concept: "pickup", attributes: ["location"] },
+    ],
+    facts: { booking: a, bookingCandidates: [a, b] },
+    selectedBooking: b,
+    selectedBookingId: "bk-b",
+  });
+  assert.equal(r.status, "found");
+  assert.equal(r.verifiedValue, "Place B");
+  assert.equal(r.selectionStatus, "explicit_resolved");
+});
+
+test("explicit selected id absent from candidates → no facts.booking fallback", () => {
+  const a = booking({
+    id: "bk-a",
+    durationDays: 2,
+    totalAmount: 10000,
+    dailyRate: 5000,
+    startDate: "2026-08-01",
+    endDate: "2026-08-03",
+    pickupTime: "10:00 AM",
+    pickupLocation: "Place A",
+    customerSafeReference: "REF-A",
+    itemLabel: "Kia Stonic",
+    status: "approved",
+  });
+  const concepts = [
+    ["duration", ["days"]],
+    ["price", ["total"]],
+    ["dates", ["start"]],
+    ["pickup", ["time"]],
+    ["pickup", ["location"]],
+    ["status", ["value"]],
+    ["reference", ["value"]],
+    ["identity", ["label"]],
+  ];
+  for (const [concept, attributes] of concepts) {
+    const r = resolvePostConfirmTurnEvidence({
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [{ entity: "active_booking", concept, attributes }],
+      facts: { booking: a, bookingCandidates: [a] },
+      selectedBooking: null,
+      selectedBookingId: "bk-missing-b",
+    });
+    assert.equal(r.status, "unsupported", concept);
+    assert.equal(r.factAvailable, false, concept);
+    assert.equal(r.verifiedValue, null, concept);
+    assert.equal(r.selectionStatus, "explicit_unresolved", concept);
+    const blob = JSON.stringify(r);
+    assert.doesNotMatch(blob, /Place A|REF-A|10000|10:00|Kia Stonic|2026-08-01/);
+  }
+});
+
+test("explicit selected id differs from facts.booking → selected booking wins", () => {
+  const a = booking({
+    id: "bk-a",
+    totalAmount: 11111,
+    customerSafeReference: "REF-A",
+  });
+  const b = booking({
+    id: "bk-b",
+    totalAmount: 22222,
+    customerSafeReference: "REF-B",
+  });
+  const r = resolvePostConfirmRequestedFact({
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      { entity: "active_booking", concept: "price", attributes: ["total"] },
+    ],
+    facts: { booking: a, bookingCandidates: [a, b] },
+    selectedBooking: b,
+    selectedBookingId: "bk-b",
+  });
+  assert.equal(r.status, "found");
+  assert.equal(r.verifiedValue, 22222);
+  assert.notEqual(r.verifiedValue, 11111);
+});
+
+test("no explicit selection → trusted focused facts.booking fallback remains valid", () => {
+  const a = booking({ id: "bk-a", pickupLocation: "Focused Office" });
+  const selection = resolvePostConfirmEvidenceBooking({
+    facts: { booking: a },
+    selectedBooking: null,
+    selectedBookingId: null,
+  });
+  assert.equal(selection.ok, true);
+  assert.equal(selection.selectionStatus, "focused_fallback");
+  assert.equal(selection.booking?.id, "bk-a");
+
+  const r = resolvePostConfirmTurnEvidence({
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      { entity: "active_booking", concept: "pickup", attributes: ["location"] },
+    ],
+    facts: { booking: a },
+    selectedBooking: null,
+    selectedBookingId: null,
+  });
+  assert.equal(r.status, "found");
+  assert.equal(r.verifiedValue, "Focused Office");
+  assert.equal(r.selectionStatus, "focused_fallback");
+});
+
+test("multi-booking: zero cross-booking leakage across core concepts", () => {
+  const a = booking({
+    id: "bk-a",
+    itemLabel: "Stonic A",
+    durationDays: 2,
+    totalAmount: 10000,
+    dailyRate: 5000,
+    startDate: "2026-08-01",
+    endDate: "2026-08-03",
+    pickupLocation: "Loc A",
+    pickupTime: "9 AM",
+    status: "approved",
+    customerSafeReference: "REF-A",
+  });
+  const b = booking({
+    id: "bk-b",
+    itemLabel: "Civic B",
+    durationDays: 7,
+    totalAmount: 77777,
+    dailyRate: 11111,
+    startDate: "2026-09-01",
+    endDate: "2026-09-08",
+    pickupLocation: "Loc B LEAK",
+    pickupTime: "11 PM",
+    status: "pending",
+    customerSafeReference: "REF-B-LEAK",
+  });
+  const checks = [
+    ["duration", ["days"], 2],
+    ["price", ["total"], 10000],
+    ["dates", ["start"], "2026-08-01"],
+    ["pickup", ["location"], "Loc A"],
+    ["pickup", ["time"], "9 AM"],
+    ["status", ["value"], "approved"],
+    ["reference", ["value"], "REF-A"],
+    ["identity", ["label"], "Stonic A"],
+  ];
+  for (const [concept, attributes, expected] of checks) {
+    const r = resolvePostConfirmTurnEvidence({
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [{ entity: "active_booking", concept, attributes }],
+      facts: { booking: a, bookingCandidates: [a, b] },
+      selectedBooking: a,
+      selectedBookingId: "bk-a",
+    });
+    assert.equal(r.status, "found", concept);
+    assert.equal(r.verifiedValue, expected, concept);
+    const blob = JSON.stringify(r);
+    assert.doesNotMatch(blob, /Loc B LEAK|REF-B-LEAK|Civic B|77777|11 PM|2026-09-01/);
+  }
+});
+
+test("compose context: unresolved explicit selection does not expose focused booking identity", () => {
+  const a = booking({ id: "bk-a", itemLabel: "Should Not Leak" });
+  const ctx = buildPostConfirmInformationalComposeContextForPrompt({
+    facts: { business: { name: "Biz" }, booking: a },
+    selectedBooking: null,
+    selectedBookingId: "bk-missing",
+  });
+  assert.equal(ctx.focusedBookingIdentity, null);
+  assert.doesNotMatch(JSON.stringify(ctx), /Should Not Leak/);
 });
