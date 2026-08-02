@@ -1087,4 +1087,106 @@ test("decide guidance scopes freeform other to business facts with explicit nega
   // No customer-text phrase routers for fuel/refund/cancellation in resolver.
   assert.doesNotMatch(resolverSrc, /fuel policy|refund policy|cancellation policy/i);
   assert.doesNotMatch(resolverSrc, /messageText|userMessage|customerMessage/);
+  assert.match(
+    decideSrc,
+    /Never map an unknown "\* policy" into documents or payment merely because the word "policy" appears/
+  );
+  assert.match(
+    decideSrc,
+    /documents means REQUIRED PAPERS \/ document checklist/
+  );
+  // No runtime phrase → documents/other remappers in decide (prompt guidance only).
+  assert.doesNotMatch(
+    decideSrc,
+    /if\s*\(\s*\/(?:refund|fuel|cancellation)/i
+  );
+  assert.doesNotMatch(decideSrc, /messageText\.match\([^)]*policy/i);
+  assert.doesNotMatch(
+    decideSrc,
+    /classifyCustomerBusinessPaActionIntent|phraseMap|keywordMap/
+  );
+});
+
+test("structured vs freeform missingInfoType matrix (resolver, no customer text)", () => {
+  const facts = {
+    booking: booking(),
+    known: {},
+    business: {},
+    openMissingInfoRequests: [],
+    latestClosedMissingInfoAnswers: [],
+  };
+  const selected = booking();
+
+  const freeform = resolvePostConfirmRequestedFact({
+    capability: "answer_from_saved_owner_answer",
+    evidenceNeeds: [
+      {
+        entity: "saved_owner_answer",
+        concept: "other",
+        attributes: ["answer"],
+      },
+    ],
+    facts,
+    selectedBooking: selected,
+    selectedBookingId: selected.id,
+  });
+  assert.equal(freeform.status, "not_found");
+  assert.equal(freeform.missingInfoType, "other");
+
+  const matrix = [
+    ["documents", "documents"],
+    ["payment", "payment"],
+    ["delivery", "delivery"],
+    ["driver", "driver"],
+  ];
+  for (const [concept, type] of matrix) {
+    const r = resolvePostConfirmRequestedFact({
+      capability: "answer_from_business_profile",
+      evidenceNeeds: [
+        {
+          entity: "business_profile",
+          concept,
+          attributes: ["policy"],
+        },
+      ],
+      facts,
+      selectedBooking: selected,
+      selectedBookingId: selected.id,
+    });
+    assert.equal(r.status, "not_found", concept);
+    assert.equal(r.missingInfoType, type, concept);
+  }
+
+  // Compatibility coerce preserves documents; does not rewrite to other.
+  const coercedDocs = resolvePostConfirmRequestedFact({
+    capability: "answer_from_business_profile",
+    evidenceNeeds: [
+      {
+        entity: "active_booking",
+        concept: "documents",
+        attributes: ["policy"],
+      },
+    ],
+    facts,
+    selectedBooking: selected,
+    selectedBookingId: selected.id,
+  });
+  assert.equal(coercedDocs.missingInfoType, "documents");
+
+  // business_profile + other/answer → saved_owner_answer + other (compat only).
+  const coercedOther = resolvePostConfirmRequestedFact({
+    capability: "answer_from_business_profile",
+    evidenceNeeds: [
+      {
+        entity: "business_profile",
+        concept: "other",
+        attributes: ["answer"],
+      },
+    ],
+    facts,
+    selectedBooking: selected,
+    selectedBookingId: selected.id,
+  });
+  assert.equal(coercedOther.capability, "answer_from_saved_owner_answer");
+  assert.equal(coercedOther.missingInfoType, "other");
 });

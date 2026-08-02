@@ -13,7 +13,7 @@ import {
 import { findConservativeFuzzyCatalogMention } from "../../services/currentTurnAuthority.js";
 
 const TIMING_PROMISE_RE =
-  /\bthodi\s+der\b|\bshortly\b|\bjaldi\b|\b\d+\s*(min|mins|minute|minutes)\b/i;
+  /\bthodi\s+der\b|\bshortly\b|\bsoon\b|\bjald(?:i)?(?:\s*hi)?\b|\ba\s+few\s+minutes?\b|\b\d+\s*(min|mins|minute|minutes)\b/i;
 
 const INTERNAL_PROCESS_RE =
   /\bowner\b|\bowners\b|\bmaalik\b|\bmalek\b|\bstaff\b|\bhuman\b|\bmanager\b|\bapproval\b|\bapprove\b|\bnotify\b|\bnotified\b|\bnotification\b|\bavr\b|\bexecutor\b|\btemplate\b|\blifecycle\b|owner\s+ko|dekhte\s+hain\s+kya\s+hota/i;
