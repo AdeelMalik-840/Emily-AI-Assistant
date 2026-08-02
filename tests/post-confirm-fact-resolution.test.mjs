@@ -979,3 +979,112 @@ test("compose context: unresolved explicit selection does not expose focused boo
   assert.equal(ctx.focusedBookingIdentity, null);
   assert.doesNotMatch(JSON.stringify(ctx), /Should Not Leak/);
 });
+
+test("freeform saved_owner_answer other missing → not_found + missingInfoType other", () => {
+  const r = resolvePostConfirmRequestedFact({
+    capability: "answer_from_saved_owner_answer",
+    evidenceNeeds: [
+      {
+        entity: "saved_owner_answer",
+        concept: "other",
+        attributes: ["answer"],
+      },
+    ],
+    facts: {
+      booking: booking(),
+      latestClosedMissingInfoAnswers: [],
+    },
+    selectedBooking: booking(),
+    selectedBookingId: "bk-1",
+  });
+  assert.equal(r.status, "not_found");
+  assert.equal(r.missingInfoType, "other");
+  assert.equal(r.capability, "answer_from_saved_owner_answer");
+  assert.equal(r.factAvailable, false);
+});
+
+test("freeform business_profile other coerces to saved_owner_answer path", () => {
+  const r = resolvePostConfirmRequestedFact({
+    capability: "answer_from_business_profile",
+    evidenceNeeds: [
+      {
+        entity: "business_profile",
+        concept: "other",
+        attributes: ["answer"],
+      },
+    ],
+    facts: {
+      booking: booking(),
+      latestClosedMissingInfoAnswers: [],
+    },
+    selectedBooking: booking(),
+    selectedBookingId: "bk-1",
+  });
+  assert.equal(r.status, "not_found");
+  assert.equal(r.missingInfoType, "other");
+  assert.equal(r.capability, "answer_from_saved_owner_answer");
+  assert.equal(r.items?.[0]?.entity, "saved_owner_answer");
+});
+
+test("freeform other found from saved owner answer → no missing escalate type needed", () => {
+  const r = resolvePostConfirmRequestedFact({
+    capability: "answer_from_saved_owner_answer",
+    evidenceNeeds: [
+      {
+        entity: "saved_owner_answer",
+        concept: "other",
+        attributes: ["answer"],
+      },
+    ],
+    facts: {
+      booking: booking(),
+      latestClosedMissingInfoAnswers: [
+        {
+          requestId: "mir-1",
+          missingInfoType: "other",
+          ownerAnswer: "Fuel is customer responsibility",
+        },
+      ],
+    },
+    selectedBooking: booking(),
+    selectedBookingId: "bk-1",
+  });
+  assert.equal(r.status, "found");
+  assert.equal(r.verifiedValue, "Fuel is customer responsibility");
+  assert.equal(r.missingInfoType, null);
+});
+
+test("decide guidance scopes freeform other to business facts with explicit negatives", async () => {
+  const fs = await import("node:fs");
+  const decideSrc = fs.readFileSync(
+    new URL("../src/brain/decisions/decidePostConfirmCustomerDm.js", import.meta.url),
+    "utf8"
+  );
+  assert.match(
+    decideSrc,
+    /Freeform THIS-business facts only: answer_from_saved_owner_answer/
+  );
+  assert.match(decideSrc, /NEVER use saved_owner_answer \+ other\/answer for/);
+  assert.match(decideSrc, /general knowledge/);
+  assert.match(decideSrc, /current time or date/);
+  assert.match(decideSrc, /Never force capability=answer_from_saved_owner_answer or concept=other merely because the message is a question/);
+  assert.doesNotMatch(
+    decideSrc,
+    /fuel\/late return\/cancellation\/insurance → clarification_needed/
+  );
+  assert.match(
+    decideSrc,
+    /Do NOT use capability=social for a clear business\/booking fact ask/
+  );
+  assert.doesNotMatch(
+    decideSrc,
+    /This ask is factual\/informational\. Do NOT use capability=social/
+  );
+  const resolverSrc = fs.readFileSync(
+    new URL("../src/brain/facts/resolvePostConfirmRequestedFact.js", import.meta.url),
+    "utf8"
+  );
+  // No customer-text phrase routers for fuel/refund/cancellation in resolver.
+  assert.doesNotMatch(resolverSrc, /fuel policy|refund policy|cancellation policy/i);
+  assert.doesNotMatch(resolverSrc, /messageText|userMessage|customerMessage/);
+});
