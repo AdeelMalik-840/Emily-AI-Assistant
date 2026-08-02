@@ -290,25 +290,8 @@ test("4. OpenAI empty twice: deterministic recovery + provenance retained", asyn
   assert.equal(composed.composeFailure?.deterministicReason, null);
 });
 
-test("5. deterministic recovery guard failure: pause-classified reason + provenance", async () => {
+test("5. English customer + empty OpenAI still gets one non-empty guarded reply", async () => {
   const b = booking();
-  const { validateCustomerReplyAgainstContract } = await import(
-    "../src/brain/guards/customerReplyGuard.js"
-  );
-  // Force deterministic text to fail by using a hostile contract via monkeypatch
-  // of buildPostConfirmPaReplyContract is heavy; instead inject empty found value
-  // path then stub validate by composing with a replyContract that replyRequired
-  // cannot satisfy — use invent that fails then empty OpenAI and make
-  // deterministic fail by setting bookingExecutionVerified false + success claim
-  // in deterministic... our deterministic doesn't claim success.
-  // Simulate by calling compose and patching module is hard. Directly assert
-  // pause classification + provenance shape from a controlled return path via
-  // empty OpenAI + validate override through dynamic import of the compose
-  // internals: use __chatCompletionsCreateForTests empty and spy by temporarily
-  // wrapping validate — not exported.
-  // Practical approach: call compose with empty OpenAI; if deterministic succeeds
-  // (expected), separately assert pause helpers and provenance shape on a
-  // synthetic failure object matching the contract.
   const prev = process.env.CLOUD_POST_CONFIRM_AUTO_RETRY;
   try {
     delete process.env.CLOUD_POST_CONFIRM_AUTO_RETRY;
@@ -318,40 +301,42 @@ test("5. deterministic recovery guard failure: pause-classified reason + provena
       true
     );
     assert.equal(
-      isPostConfirmModelContractFailureError(
-        "INFORMATIONAL_COMPOSE_EMPTY_REPLY:EMPTY_OR_INVALID_OPENAI_REPLY"
-      ),
-      true
-    );
-    assert.equal(
-      isPostConfirmModelContractFailureError(
-        "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED"
-      ),
-      true
-    );
-    assert.equal(
       shouldPauseCloudPostConfirmModelContractAutoRetry(
         "INFORMATIONAL_COMPOSE_EMPTY_REPLY:EMPTY_OR_INVALID_OPENAI_REPLY"
       ),
       true
-    );
-    assert.equal(
-      shouldPauseCloudPostConfirmModelContractAutoRetry("socket hang up"),
-      false
-    );
-    assert.equal(
-      shouldPauseCloudPostConfirmModelContractAutoRetry("network_timeout"),
-      false
     );
   } finally {
     if (prev === undefined) delete process.env.CLOUD_POST_CONFIRM_AUTO_RETRY;
     else process.env.CLOUD_POST_CONFIRM_AUTO_RETRY = prev;
   }
 
-  // Provenance retention when both OpenAI empty and deterministic would fail:
-  // use found status with whitespace + empty OpenAI → deterministic falls to
-  // unconfirmed text; still passes. Force failure by validating the outward
-  // reason builder path via agent terminal injection.
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts: factsFor(b),
+    userMessage: "Where is the pickup location?",
+    frozenDecision: frozenAnswerFrom(),
+    factResolution: {
+      status: "not_found",
+      capability: "answer_from_active_booking",
+      factAvailable: false,
+      verifiedValue: null,
+      items: [],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async () => ({
+      choices: [{ message: { content: "" } }],
+    }),
+  });
+  assert.equal(composed.ok, true);
+  assert.ok(String(composed.reply || "").trim());
+  assert.equal(composed.source, "deterministic_informational_fallback");
+  assert.match(composed.reply, /not confirmed|unclear/i);
+  assert.doesNotMatch(composed.reply, /Yeh detail/i);
+  assert.equal(composed.composeFailure?.finalClass, null);
+});
+
+test("5b. agent still surfaces injected compose empty as terminal (defensive)", async () => {
+  const b = booking();
   const agent = await handleCustomerBusinessPaInbound({
     db: {},
     businessId: "biz-1",
@@ -386,21 +371,11 @@ test("5. deterministic recovery guard failure: pause-classified reason + provena
     }),
   });
   assert.equal(agent.terminalFailure, true);
-  assert.match(String(agent.failureReason), /EMPTY_OR_INVALID_OPENAI_REPLY/);
   assert.match(String(agent.failureReason), /INFORMATIONAL_COMPOSE_EMPTY_REPLY/);
-  assert.equal(
-    agent.composeFailure?.openaiReason,
-    "EMPTY_OR_INVALID_OPENAI_REPLY"
-  );
-  assert.equal(
-    agent.composeFailure?.deterministicReason,
-    "deterministic_guard_failed"
-  );
   assert.equal(
     agent.finalReplySource,
     "openai_post_confirm_pa_informational_compose"
   );
-  void validateCustomerReplyAgainstContract;
 });
 
 test("6-7. Cloud pause gate: informational compose terminals pause; network does not", () => {
@@ -493,4 +468,223 @@ test("9. transient network errors remain retryable (not paused)", () => {
     if (prev === undefined) delete process.env.CLOUD_POST_CONFIRM_AUTO_RETRY;
     else process.env.CLOUD_POST_CONFIRM_AUTO_RETRY = prev;
   }
+});
+
+test("10. empty OpenAI: found/missing/conflicting/unsupported each get one non-empty reply", async () => {
+  const b = booking({ pickupLocation: "Gate 2" });
+  const emptyAi = async () => ({ choices: [{ message: { content: "" } }] });
+  const cases = [
+    {
+      name: "found",
+      userMessage: "pickup kahan se hogi?",
+      frozen: frozenAnswerFrom(),
+      factResolution: {
+        status: "found",
+        capability: "answer_from_active_booking",
+        factAvailable: true,
+        verifiedValue: "Gate 2",
+        items: [
+          {
+            entity: "active_booking",
+            concept: "pickup",
+            attribute: "location",
+            status: "found",
+            verifiedValue: "Gate 2",
+          },
+        ],
+      },
+      expect: /Gate 2/,
+    },
+    {
+      name: "missing",
+      userMessage: "pickup kahan se hogi?",
+      frozen: frozenAnswerFrom(),
+      factResolution: {
+        status: "not_found",
+        capability: "answer_from_active_booking",
+        factAvailable: false,
+        verifiedValue: null,
+        items: [],
+      },
+      expect: /confirm nahi|not confirmed/i,
+    },
+    {
+      name: "conflicting",
+      userMessage: "pickup kahan se hogi?",
+      frozen: frozenAnswerFrom(),
+      factResolution: {
+        status: "conflicting",
+        capability: "answer_from_active_booking",
+        factAvailable: false,
+        verifiedValue: null,
+        items: [
+          {
+            entity: "active_booking",
+            concept: "pickup",
+            attribute: "location",
+            status: "conflicting",
+            verifiedValue: null,
+          },
+        ],
+      },
+      expect: /clear nahi|unclear/i,
+    },
+    {
+      name: "unsupported",
+      userMessage: "mujhe details chahiye",
+      frozen: frozenAnswerFrom({
+        capability: "clarification_needed",
+        evidenceNeeds: [],
+        bookingSelectionMode: "none",
+        selectedBookingId: null,
+      }),
+      factResolution: {
+        status: "unsupported",
+        capability: "clarification_needed",
+        factAvailable: false,
+        verifiedValue: null,
+        items: [],
+      },
+      expect: /\?|confirm nahi|not confirmed|clear/i,
+    },
+  ];
+
+  for (const row of cases) {
+    const composed = await composePostConfirmInformationalCustomerReply({
+      facts: factsFor(b),
+      userMessage: row.userMessage,
+      frozenDecision: row.frozen,
+      factResolution: row.factResolution,
+      selectedBooking: b,
+      __chatCompletionsCreateForTests: emptyAi,
+    });
+    assert.equal(composed.ok, true, row.name);
+    assert.ok(String(composed.reply || "").trim(), row.name);
+    assert.match(composed.reply, row.expect, row.name);
+    assert.equal(composed.source, "deterministic_informational_fallback", row.name);
+    assert.notEqual(composed.composeFailure?.finalClass, "INFORMATIONAL_COMPOSE_EMPTY_REPLY");
+  }
+});
+
+test("11. conversationHistory is passed for continuity but not as factual authority", async () => {
+  const b = booking();
+  const prompts = [];
+  const history =
+    "Assistant: Dates bata dein.\nUser: kal raat 10 baje\nAssistant: Pickup DHA Phase 5 se hogi.";
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts: factsFor(b),
+    userMessage: "pickup kahan se hogi?",
+    conversationHistory: history,
+    frozenDecision: frozenAnswerFrom(),
+    factResolution: {
+      status: "not_found",
+      capability: "answer_from_active_booking",
+      factAvailable: false,
+      verifiedValue: null,
+      items: [],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async (args) => {
+      prompts.push(args);
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply: "Pickup location abhi confirm nahi hui.",
+                replySemantics: {
+                  claims: [],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+  assert.equal(composed.ok, true);
+  assert.doesNotMatch(composed.reply, /DHA Phase 5/i);
+  const system = String(prompts[0]?.messages?.[0]?.content || "");
+  const user = String(prompts[0]?.messages?.[1]?.content || "");
+  assert.match(system, /RECENT_DIALOGUE is continuity\/tone only/i);
+  assert.match(system, /NEVER a factual answer source/i);
+  assert.match(user, /RECENT_DIALOGUE \(continuity\/tone only/);
+  assert.match(user, /kal raat 10 baje/);
+  assert.match(user, /FACT_RESOLUTION_JSON/);
+  // History must not leak into FACT_RESOLUTION_JSON verified values.
+  const factBlock = user.slice(
+    user.indexOf("FACT_RESOLUTION_JSON:"),
+    user.indexOf("RECENT_DIALOGUE")
+  );
+  assert.doesNotMatch(factBlock, /DHA Phase 5|kal raat 10 baje/i);
+});
+
+test("12. agent forwards conversationHistory into informational compose", async () => {
+  const b = booking({ pickupLocation: "Gate 2" });
+  let sawHistory = null;
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "biz-1",
+    customerPhone: "923001234567",
+    messageText: "pickup location kya hai?",
+    messageId: "wamid.hist",
+    conversationHistory: "Assistant: Dates bata dein.\nUser: kal raat 10 baje",
+    preResolvedBookingFacts: { ok: true, facts: factsFor(b) },
+    __decideCustomerTurnFn: async () => ({
+      ok: true,
+      source: "openai",
+      decision: {
+        ...frozenAnswerFrom(),
+        shouldReply: true,
+        customerReply: "",
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+        actionParameters: {},
+        candidateGroundings: [],
+        customerIsAskingQuestion: true,
+      },
+    }),
+    __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+      sawHistory = p.conversationHistory;
+      assert.equal(p.factResolution?.status, "found");
+      return { ok: true, reply: "Pickup Gate 2 se hogi.", source: "openai" };
+    },
+  });
+  assert.match(String(sawHistory || ""), /kal raat 10 baje/);
+  assert.equal(result.action, "business_pa_reply");
+  assert.match(result.reply, /Gate 2/);
+});
+
+test("13. found object verifiedValue flattens instead of [object Object]", async () => {
+  const b = booking();
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts: factsFor(b),
+    userMessage: "pickup kahan?",
+    frozenDecision: frozenAnswerFrom(),
+    factResolution: {
+      status: "found",
+      capability: "answer_from_active_booking",
+      factAvailable: true,
+      verifiedValue: { location: "Gate 2" },
+      items: [
+        {
+          entity: "active_booking",
+          concept: "pickup",
+          attribute: "location",
+          status: "found",
+          verifiedValue: "Gate 2",
+        },
+      ],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async () => ({
+      choices: [{ message: { content: "" } }],
+    }),
+  });
+  assert.equal(composed.ok, true);
+  assert.doesNotMatch(composed.reply, /\[object Object\]/i);
+  assert.match(composed.reply, /Gate 2/);
 });

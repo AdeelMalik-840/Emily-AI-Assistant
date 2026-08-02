@@ -221,6 +221,191 @@ function applyFoundEvidenceItemToGuardFacts(guardFacts, item) {
   }
 }
 
+/**
+ * Flatten verified Result values into short customer-facing text (no "[object Object]").
+ * @param {unknown} value
+ * @returns {string}
+ */
+function formatInformationalVerifiedValueForReply(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value).trim().slice(0, 400);
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => formatInformationalVerifiedValueForReply(entry))
+      .filter(Boolean)
+      .join(", ")
+      .slice(0, 400);
+  }
+  if (typeof value === "object") {
+    return Object.values(/** @type {Record<string, unknown>} */ (value))
+      .map((entry) => formatInformationalVerifiedValueForReply(entry))
+      .filter(Boolean)
+      .join(", ")
+      .slice(0, 400);
+  }
+  return "";
+}
+
+/**
+ * Same enrichment used for OpenAI wording and deterministic recovery.
+ * @param {Record<string, unknown>} baseContract
+ * @param {{
+ *   seededGuardFacts: Record<string, unknown>,
+ *   hasVerifiedClock: boolean,
+ *   verifiedValueForTiming?: unknown,
+ * }} p
+ */
+function enrichInformationalComposeGuardContract(baseContract, p) {
+  const base = baseContract && typeof baseContract === "object" ? baseContract : {};
+  const seeded =
+    p.seededGuardFacts && typeof p.seededGuardFacts === "object"
+      ? p.seededGuardFacts
+      : {};
+  const hasVerifiedClock = p.hasVerifiedClock === true;
+  return {
+    ...base,
+    verifiedCustomerFacts: {
+      ...(base.verifiedCustomerFacts && typeof base.verifiedCustomerFacts === "object"
+        ? base.verifiedCustomerFacts
+        : {}),
+      ...seeded,
+      mutationIntent: "none",
+      mutationExecutionRequested: false,
+      mutationExecutionStatus: "not_executed",
+    },
+    verifiedTiming: {
+      hasVerifiedTime: hasVerifiedClock,
+      timeText: hasVerifiedClock
+        ? formatInformationalVerifiedValueForReply(p.verifiedValueForTiming) || null
+        : null,
+    },
+    forbiddenClaims: hasVerifiedClock
+      ? (Array.isArray(base.forbiddenClaims) ? base.forbiddenClaims : []).filter(
+          (claim) => claim !== "specific_timing_verified"
+        )
+      : base.forbiddenClaims,
+    allowedClaims: hasVerifiedClock
+      ? [
+          ...new Set([
+            ...(Array.isArray(base.allowedClaims) ? base.allowedClaims : []),
+            "specific_timing_verified",
+          ]),
+        ]
+      : base.allowedClaims,
+    replyRequired: true,
+  };
+}
+
+/**
+ * Status-safe bilingual candidates so language-guard never empties the turn.
+ * @param {{
+ *   status: string,
+ *   customerInputRequired: boolean,
+ *   foundValue?: string,
+ *   referenceReply?: string | null,
+ * }} p
+ * @returns {string[]}
+ */
+function buildInformationalDeterministicReplyCandidates(p) {
+  const status = String(p.status || "unsupported");
+  const foundValue = String(p.foundValue ?? "").trim();
+  const referenceReply = String(p.referenceReply ?? "").trim();
+  const unclearRu = "Yeh detail abhi clear nahi hai.";
+  const unclearEn = "This detail is unclear right now.";
+  const unconfirmedRu = "Yeh detail abhi confirm nahi hui.";
+  const unconfirmedEn = "This detail is not confirmed yet.";
+  const clarifyUnclearRu =
+    "Yeh detail abhi clear nahi hai. Kya aap thoda aur specify kar sakte hain?";
+  const clarifyUnclearEn =
+    "This detail is unclear right now. Could you share a bit more detail?";
+  const clarifyUnconfirmedRu =
+    "Yeh detail abhi confirm nahi hui. Kya aap thoda aur clear bata sakte hain?";
+  const clarifyUnconfirmedEn =
+    "This detail is not confirmed yet. Could you clarify what you need?";
+
+  /** @type {string[]} */
+  const out = [];
+  const push = (text) => {
+    const t = String(text ?? "").trim();
+    if (t && !out.includes(t)) out.push(t);
+  };
+
+  if (referenceReply) push(referenceReply);
+  if (status === "found" && foundValue) push(foundValue);
+
+  if (p.customerInputRequired === true) {
+    if (status === "conflicting") {
+      push(clarifyUnclearRu);
+      push(clarifyUnclearEn);
+      push(unclearRu);
+      push(unclearEn);
+    } else {
+      push(clarifyUnconfirmedRu);
+      push(clarifyUnconfirmedEn);
+      push(unconfirmedRu);
+      push(unconfirmedEn);
+    }
+  } else if (status === "conflicting") {
+    push(unclearRu);
+    push(unclearEn);
+    push(unconfirmedRu);
+    push(unconfirmedEn);
+  } else {
+    // not_found / unsupported / found-without-usable-value
+    push(unconfirmedRu);
+    push(unconfirmedEn);
+    push(unclearRu);
+    push(unclearEn);
+  }
+
+  push("OK.");
+  push("Ji.");
+  return out;
+}
+
+/**
+ * Pick the first candidate that passes the existing reply guard.
+ * @returns {{ ok: true, reply: string, reason: null } | { ok: false, reply: "", reason: string }}
+ */
+function pickGuardedInformationalDeterministicReply({
+  candidates,
+  replyContract,
+  seededGuardFacts,
+  hasVerifiedClock,
+  verifiedValueForTiming,
+}) {
+  const enriched = enrichInformationalComposeGuardContract(replyContract, {
+    seededGuardFacts,
+    hasVerifiedClock,
+    verifiedValueForTiming,
+  });
+  let lastReason = "deterministic_guard_failed";
+  for (const candidate of candidates || []) {
+    const reply = String(candidate ?? "").trim().slice(0, 500);
+    if (!reply) continue;
+    const guard = validateCustomerReplyAgainstContract(reply, enriched, null);
+    if (guard.ok === true) {
+      return { ok: true, reply, reason: null };
+    }
+    lastReason = String(guard?.reason ?? "").trim() || lastReason;
+  }
+  return { ok: false, reply: "", reason: lastReason };
+}
+
+/**
+ * Continuity block for compose prompts — tone only, never factual authority.
+ * @param {unknown} conversationHistory
+ * @returns {string}
+ */
+function formatInformationalComposeRecentDialogue(conversationHistory) {
+  return String(conversationHistory ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1200);
+}
+
 export const CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK =
   POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK;
 
@@ -721,10 +906,12 @@ STRICT SAFETY:
 /**
  * Post-confirm informational wording after deterministic fact resolution.
  * NOT a decision Brain — frozen semantic decision + FACT_RESOLUTION_JSON only.
+ * recentDialogue (conversationHistory) is tone/continuity only — never factual.
  *
  * @param {{
  *   facts?: Record<string, unknown> | null,
  *   userMessage?: string | null,
+ *   conversationHistory?: string | null,
  *   frozenDecision: Record<string, unknown>,
  *   factResolution: Record<string, unknown>,
  *   selectedBooking?: Record<string, unknown> | null,
@@ -736,6 +923,7 @@ STRICT SAFETY:
 export async function composePostConfirmInformationalCustomerReply({
   facts = null,
   userMessage = null,
+  conversationHistory = null,
   frozenDecision,
   factResolution,
   selectedBooking = null,
@@ -758,6 +946,8 @@ export async function composePostConfirmInformationalCustomerReply({
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 800);
+  const recentDialogue =
+    formatInformationalComposeRecentDialogue(conversationHistory);
 
   const verifiedResolution = {
     capability: resolution.capability ?? decision.capability ?? null,
@@ -916,27 +1106,25 @@ export async function composePostConfirmInformationalCustomerReply({
     const replyContract = buildPostConfirmPaReplyContract({
       ...contractFacts,
       customerMessageText: customerMessage,
+      recentDialogue: recentDialogue || null,
       styleKey,
     });
-    const guard = validateCustomerReplyAgainstContract(deterministicReply, {
-      ...replyContract,
-      verifiedCustomerFacts: {
-        ...(replyContract.verifiedCustomerFacts || {}),
-        ...seededGuardFacts,
-        mutationIntent: "none",
-        mutationExecutionRequested: false,
-        mutationExecutionStatus: "not_executed",
-      },
-      replyRequired: true,
+    const picked = pickGuardedInformationalDeterministicReply({
+      candidates: [deterministicReply],
+      replyContract,
+      seededGuardFacts,
+      hasVerifiedClock: false,
+      verifiedValueForTiming: null,
     });
-    if (guard.ok === true) {
+    if (picked.ok === true) {
       return {
         ok: true,
-        reply: deterministicReply,
+        reply: picked.reply,
         source: "deterministic_fact_resolution",
         reason: null,
         frozenDecision: frozen,
         factResolution: verifiedResolution,
+        composeFailure: null,
       };
     }
   }
@@ -959,6 +1147,7 @@ export async function composePostConfirmInformationalCustomerReply({
   const replyContract = buildPostConfirmPaReplyContract({
     ...contractFacts,
     customerMessageText: customerMessage,
+    recentDialogue: recentDialogue || null,
     styleKey,
   });
 
@@ -990,7 +1179,9 @@ FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
 - customerInputRequired=true: you MAY ask one useful clarification for customer preference/input that the Turn Plan/Result already marked as required. Do NOT invent facts. customerReply MUST be non-empty.
 - customerInputRequired=false AND status is "not_found", "unsupported", or "conflicting": state naturally that the business/booking detail is not confirmed, unavailable, or unclear. Do NOT ask the customer to supply that business-owned fact. Do NOT invent a substitute. Do NOT claim owner contact. Do NOT promise a later answer. customerReply MUST be non-empty.
 - CONVERSATION_CONTEXT_JSON is tone/identity only. It contains NO answerable booking/policy/owner-answer facts. Never treat it as an answer source.
+- RECENT_DIALOGUE is continuity/tone only. It is NEVER a factual answer source. Ignore any numbers, times, places, policies, or references stated there unless the same value is also present in FACT_RESOLUTION_JSON.
 - When stating a found booking reference/code, put the exact verifiedValue immediately after a colon with no filler words in between (example shape: "booking reference: STONIC-PROD"). Do not write patterns like "reference hai: …".
+- Match the customer's language (English vs Roman Urdu).
 
 STRICT SAFETY:
 - Never invent dates, times, amounts, locations, items, statuses, references, or policies.
@@ -1001,6 +1192,7 @@ STRICT SAFETY:
     `CONVERSATION_CONTEXT_JSON:\n${factsJson}\n\n` +
     `FROZEN_DECISION_JSON:\n${JSON.stringify(frozen)}\n\n` +
     `FACT_RESOLUTION_JSON:\n${JSON.stringify(promptFactResolution)}\n\n` +
+    `RECENT_DIALOGUE (continuity/tone only — NEVER a factual answer source):\n${recentDialogue || "(none)"}\n\n` +
     `CURRENT_CUSTOMER_MESSAGE (tone/context only — do not reinterpret intent):\n${customerMessage || "(none)"}\n\n` +
     `CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
       allowedClaims: replyContract.allowedClaims,
@@ -1012,88 +1204,51 @@ STRICT SAFETY:
     system,
     userBase,
     firstAttemptReminder: customerInputRequired
-      ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; customerReply must be non-empty; never change frozen decision."
-      : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; customerReply must be non-empty; never change frozen decision.",
+      ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
+      : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision.",
     responseFormatName: "post_confirm_informational_reply_compose",
     replyContract,
-    enrichGuardContract: (contract) => ({
-      ...contract,
-      verifiedCustomerFacts: {
-        ...(contract.verifiedCustomerFacts || {}),
-        ...seededGuardFacts,
-        mutationIntent: "none",
-        mutationExecutionRequested: false,
-        mutationExecutionStatus: "not_executed",
-      },
-      verifiedTiming: {
-        hasVerifiedTime: hasVerifiedClock,
-        timeText: hasVerifiedClock
-          ? String(verifiedResolution.verifiedValue)
-          : null,
-      },
-      forbiddenClaims: hasVerifiedClock
-        ? (contract.forbiddenClaims || []).filter(
-            (claim) => claim !== "specific_timing_verified"
-          )
-        : contract.forbiddenClaims,
-      allowedClaims: hasVerifiedClock
-        ? [
-            ...new Set([
-              ...(contract.allowedClaims || []),
-              "specific_timing_verified",
-            ]),
-          ]
-        : contract.allowedClaims,
-      replyRequired: true,
-    }),
+    enrichGuardContract: (contract) =>
+      enrichInformationalComposeGuardContract(contract, {
+        seededGuardFacts,
+        hasVerifiedClock,
+        verifiedValueForTiming: verifiedResolution.verifiedValue,
+      }),
     fallbackReply: "",
     timeoutMs,
     timeoutErrorMessage: "POST_CONFIRM_INFORMATIONAL_COMPOSE_OPENAI_TIMEOUT",
     __chatCompletionsCreateForTests,
   });
 
-  // Found/not_found/unsupported must never silently become an empty sendable reply.
-  // Prefer a truthful deterministic recovery over empty outbound.
+  // Supported Result statuses must always produce exactly one guard-safe outbound.
+  const status = verifiedResolution.status;
   if (!String(composed?.reply ?? "").trim()) {
     const openaiReason =
       String(composed?.reason ?? "").trim() || "EMPTY_OR_INVALID_OPENAI_REPLY";
-    const status = verifiedResolution.status;
-    let deterministic = "";
-    if (status === "found" && verifiedResolution.verifiedValue != null) {
-      const v = String(verifiedResolution.verifiedValue).trim();
-      if (v) deterministic = v;
-    }
-    if (!deterministic) {
-      if (customerInputRequired) {
-        deterministic =
-          status === "conflicting"
-            ? "Yeh detail abhi clear nahi hai. Kya aap thoda aur specify kar sakte hain?"
-            : "Yeh detail abhi confirm nahi hui. Kya aap thoda aur clear bata sakte hain?";
-      } else if (status === "conflicting") {
-        deterministic = "Yeh detail abhi clear nahi hai.";
-      } else {
-        deterministic = "Yeh detail abhi confirm nahi hui.";
-      }
-    }
-    const contractFactsDet = {
-      ...factsObj,
-      booking,
-      activeBookings: [],
-      replyGuardFacts: seededGuardFacts,
-    };
-    const replyContractDet = buildPostConfirmPaReplyContract({
-      ...contractFactsDet,
-      customerMessageText: customerMessage,
-      styleKey,
+    const foundValue = formatInformationalVerifiedValueForReply(
+      verifiedResolution.verifiedValue
+    );
+    const referenceReply =
+      onlyFoundReference && foundItemsOnly[0]
+        ? `Booking reference: ${String(foundItemsOnly[0].verifiedValue).trim()}`
+        : null;
+    const candidates = buildInformationalDeterministicReplyCandidates({
+      status,
+      customerInputRequired,
+      foundValue: status === "found" ? foundValue : "",
+      referenceReply,
     });
-    const guard = validateCustomerReplyAgainstContract(deterministic, {
-      ...replyContractDet,
-      replyRequired: true,
+    const picked = pickGuardedInformationalDeterministicReply({
+      candidates,
+      replyContract,
+      seededGuardFacts,
+      hasVerifiedClock,
+      verifiedValueForTiming: verifiedResolution.verifiedValue,
     });
-    if (guard.ok) {
+    if (picked.ok === true) {
       return {
         ok: true,
-        reply: deterministic,
+        reply: picked.reply,
         source: "deterministic_informational_fallback",
         reason: null,
         frozenDecision: frozen,
@@ -1105,10 +1260,8 @@ STRICT SAFETY:
         },
       };
     }
-    const deterministicReason =
-      String(guard?.reason ?? "").trim() || "deterministic_guard_failed";
+    // Should be unreachable for normal DM contracts: bilingual + OK/Ji candidates.
     const finalClass = "INFORMATIONAL_COMPOSE_EMPTY_REPLY";
-    // Keep pause-eligible OpenAI reasons visible in the outward reason string.
     const outwardReason = /EMPTY_OR_INVALID_OPENAI_REPLY/i.test(openaiReason)
       ? `${finalClass}:${openaiReason}`
       : finalClass;
@@ -1121,7 +1274,7 @@ STRICT SAFETY:
       factResolution: verifiedResolution,
       composeFailure: {
         openaiReason,
-        deterministicReason,
+        deterministicReason: picked.reason || "deterministic_guard_failed",
         finalClass,
       },
     };
