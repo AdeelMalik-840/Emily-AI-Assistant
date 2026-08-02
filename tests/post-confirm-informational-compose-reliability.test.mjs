@@ -688,3 +688,165 @@ test("13. found object verifiedValue flattens instead of [object Object]", async
   assert.doesNotMatch(composed.reply, /\[object Object\]/i);
   assert.match(composed.reply, /Gate 2/);
 });
+
+test("14. ownerCheckStarted compose contract: AI wording, no timing/owner/token", async () => {
+  const b = booking();
+  const prompts = [];
+  let attempts = 0;
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts: factsFor(b),
+    userMessage: "Refund policy kya hai?",
+    frozenDecision: frozenAnswerFrom({
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
+    }),
+    factResolution: {
+      status: "not_found",
+      capability: "answer_from_saved_owner_answer",
+      factAvailable: false,
+      verifiedValue: null,
+      missingInfoType: "other",
+      ownerCheckStarted: true,
+      ownerCheckPending: false,
+      items: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attribute: "answer",
+          status: "missing",
+          verifiedValue: null,
+        },
+      ],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async (args) => {
+      prompts.push(args);
+      attempts += 1;
+      if (attempts === 1) {
+        // Proven live defects: apology + timing promise must be rejected by guard.
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  customerReply:
+                    "Mujhe afsos hai, lekin refund policy ki maloomat abhi confirm nahi hui. Iski detail confirm karne ka koshish kar raha hun, jald hi bata dunga.",
+                  replySemantics: {
+                    claims: [],
+                    languageStyle: "roman_urdu",
+                    containsTimingPromise: false,
+                    exposesInternalProcess: false,
+                  },
+                }),
+              },
+            },
+          ],
+        };
+      }
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply:
+                  "Refund policy ki detail abhi confirm nahi hai. Main check karke aapko bata deta hun.",
+                replySemantics: {
+                  claims: [],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+
+  assert.equal(composed.ok, true);
+  assert.ok(String(composed.reply || "").trim());
+  assert.equal(composed.source, "openai");
+  assert.ok(attempts >= 2, "timing-promise reply must be rejected and retried");
+  assert.doesNotMatch(composed.reply, /jald\s*hi|jaldi|soon|shortly|afsos|owner|staff|admin|pamiss_/i);
+  assert.doesNotMatch(composed.reply, /\?/);
+
+  const system = String(prompts[0]?.messages?.[0]?.content || "");
+  assert.match(system, /ownerCheckStarted=true OR ownerCheckPending=true/i);
+  assert.match(system, /Do NOT apologize by default/i);
+  assert.match(system, /jald hi/i);
+  assert.match(system, /Do NOT promise timing/i);
+  assert.match(system, /Do NOT ask the customer to supply the missing business fact/i);
+  assert.match(system, /style example only/i);
+});
+
+test("15. ownerCheckStarted false: no checking/pending promise in compose contract", async () => {
+  const b = booking();
+  const prompts = [];
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts: factsFor(b),
+    userMessage: "Fuel policy kya hai?",
+    frozenDecision: frozenAnswerFrom({
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
+    }),
+    factResolution: {
+      status: "not_found",
+      capability: "answer_from_saved_owner_answer",
+      factAvailable: false,
+      verifiedValue: null,
+      missingInfoType: "other",
+      ownerCheckStarted: false,
+      ownerCheckPending: false,
+      items: [],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async (args) => {
+      prompts.push(args);
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply: "Yeh detail abhi confirm nahi hui.",
+                replySemantics: {
+                  claims: [],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+  assert.equal(composed.ok, true);
+  assert.ok(composed.reply);
+  assert.doesNotMatch(
+    composed.reply,
+    /check karke|confirm karke|bata deta|bata dunga|jald|soon|shortly/i
+  );
+  const system = String(prompts[0]?.messages?.[0]?.content || "");
+  const user = String(prompts[0]?.messages?.[1]?.content || "");
+  assert.match(system, /Do NOT promise a later answer/i);
+  assert.match(user, /"ownerCheckStarted":false/);
+  assert.match(user, /"ownerCheckPending":false/);
+  assert.match(
+    user,
+    /customerInputRequired=false — for not_found\/unsupported\/conflicting say unconfirmed/
+  );
+});

@@ -74,24 +74,92 @@ export async function resolvePaMissingInfoOwnerTarget({
 }
 
 /**
- * Deterministic owner-facing message (not customer-facing).
+ * Readable phone for owner scan when digits are unambiguous enough.
+ * @param {unknown} value
+ */
+function formatCustomerPhoneForOwnerDisplay(value) {
+  const raw = clean(value, 32);
+  const digits = phoneDigitsOnly(raw);
+  if (!digits) return raw || "unknown";
+  // Common TR / PK mobile shapes: CC + 10 national digits.
+  if (/^90\d{10}$/.test(digits)) {
+    const n = digits.slice(2);
+    return `+90 ${n.slice(0, 3)} ${n.slice(3, 6)} ${n.slice(6)}`;
+  }
+  if (/^92\d{10}$/.test(digits)) {
+    const n = digits.slice(2);
+    return `+92 ${n.slice(0, 3)} ${n.slice(3, 6)} ${n.slice(6)}`;
+  }
+  if (raw.startsWith("+") && digits.length >= 10) {
+    return `+${digits}`;
+  }
+  if (digits.length >= 10) return `+${digits}`;
+  return raw;
+}
+
+/**
+ * Prefer a human item/vehicle label; "Name (variant)" → "Name — variant".
+ * @param {unknown} value
+ */
+function formatItemLabelForOwnerDisplay(value) {
+  const label = clean(value, 120);
+  if (!label) return "";
+  const m = label.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+  if (m) return `${m[1].trim()} — ${m[2].trim()}`;
+  return label;
+}
+
+/**
+ * Customer-safe booking reference only — never raw Firestore booking IDs.
  * @param {Record<string, unknown>} request
- * @param {{ itemLabel?: string | null }} [extra]
+ * @param {{ itemLabel?: string | null, customerSafeReference?: string | null }} [extra]
+ */
+function resolveCustomerSafeBookingReference(request, extra = {}) {
+  return (
+    clean(extra.customerSafeReference, 80) ||
+    clean(request?.customerSafeReference, 80) ||
+    clean(request?.bookingReference, 80) ||
+    ""
+  );
+}
+
+/**
+ * Deterministic owner-facing operational message (not customer conversation).
+ * Token must stay visible for parsePaMissingInfoOwnerAnswerMessage.
+ * Internal missingInfoType and raw booking Firestore IDs stay in the request
+ * record only — not in visible text.
+ * @param {Record<string, unknown>} request
+ * @param {{ itemLabel?: string | null, customerSafeReference?: string | null }} [extra]
  */
 export function buildPaMissingInfoOwnerNotificationMessage(request, extra = {}) {
   const requestId = clean(request?.requestId, 80) || "unknown";
-  const bookingId = clean(request?.bookingId, 80) || "unknown";
-  const customerPhone = clean(request?.customerPhone, 32) || "unknown";
-  const missingInfoType = clean(request?.missingInfoType, 40) || "other";
+  const customerPhone = formatCustomerPhoneForOwnerDisplay(request?.customerPhone);
   const question = clean(request?.customerQuestion, 280) || "(no question)";
-  const itemLabel = clean(extra.itemLabel || request?.itemLabel, 120);
-  const itemBit = itemLabel ? ` Item: ${itemLabel}.` : "";
-  return (
-    `Emily PA missing info (${missingInfoType}). ` +
-    `Customer ${customerPhone}. Booking ${bookingId}.${itemBit} ` +
-    `Q: ${question} ` +
-    `Reply with answer for token ${requestId}.`
+  const itemLabel = formatItemLabelForOwnerDisplay(
+    extra.itemLabel || request?.itemLabel
   );
+  const safeRef = resolveCustomerSafeBookingReference(request, extra);
+
+  const lines = ["❓ Customer question", ""];
+  if (itemLabel) {
+    lines.push("Item:", itemLabel, "");
+  }
+  if (safeRef) {
+    lines.push("Booking ref:", safeRef, "");
+  }
+  lines.push(
+    "Customer:",
+    customerPhone,
+    "",
+    "Question:",
+    `“${question}”`,
+    "",
+    "Reply to this message with the answer. Emily will send it to the customer.",
+    "",
+    "Reference:",
+    requestId
+  );
+  return lines.join("\n");
 }
 
 /**

@@ -281,6 +281,36 @@ test("parse pamiss token and answer", () => {
   assert.equal(b.ownerAnswer, "5000 PKR");
 });
 
+test("multiline owner notification still parses token + answer", async () => {
+  const { buildPaMissingInfoOwnerNotificationMessage } = await import(
+    "../src/services/paMissingInfoOwnerNotifyService.js"
+  );
+  const notify = buildPaMissingInfoOwnerNotificationMessage({
+    requestId: REQUEST_ID,
+    bookingId: BOOKING_ID,
+    customerPhone: OWNER_PHONE,
+    missingInfoType: "other",
+    customerQuestion: "Refund policy kya hai?",
+    itemLabel: "Toyota corolla (Metallic Grey)",
+  });
+  assert.match(notify, /Reference:\n/);
+  assert.ok(notify.includes(REQUEST_ID));
+  assert.doesNotMatch(notify, new RegExp(BOOKING_ID));
+  assert.doesNotMatch(notify, /\bother\b|\bdocuments\b/i);
+
+  const parsed = parsePaMissingInfoOwnerAnswerMessage(
+    `Fuel customer ke zimme.\n${REQUEST_ID}`
+  );
+  assert.equal(parsed.requestId, REQUEST_ID);
+  assert.match(parsed.ownerAnswer, /Fuel customer/i);
+
+  const fromQuotedNotify = parsePaMissingInfoOwnerAnswerMessage(
+    `${notify}\n\nFull refund within 24h.`
+  );
+  assert.equal(fromQuotedNotify.requestId, REQUEST_ID);
+  assert.match(fromQuotedNotify.ownerAnswer, /Full refund within 24h/i);
+});
+
 test("owner reply with valid pamiss_* token stores answer and sends customer follow-up", async () => {
   const fake = createFakeDb();
   seedContext(fake);

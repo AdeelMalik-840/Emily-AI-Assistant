@@ -2457,3 +2457,171 @@ test("freeform other: saved owner answer found → no escalate", async () => {
     assert.equal(result.sentReply, false);
   });
 });
+
+test("structured documents/payment/delivery/driver still escalate with matching type", async () => {
+  const cases = [
+    {
+      concept: "documents",
+      type: "documents",
+      message: "Kaun se documents chahiye?",
+    },
+    {
+      concept: "payment",
+      type: "payment",
+      message: "Payment kis method se hoti hai?",
+    },
+    {
+      concept: "delivery",
+      type: "delivery",
+      message: "Delivery policy kya hai city ke andar?",
+    },
+    {
+      concept: "driver",
+      type: "driver",
+      message: "Driver included hai kya policy mein?",
+    },
+  ];
+
+  for (const row of cases) {
+    const fake = createFakeDb();
+    const resolveFacts = seedActiveContext(fake);
+    const sends = captureSend();
+    const decision = {
+      ok: true,
+      source: "openai",
+      decision: {
+        situation: "new_question",
+        conversationAct: "information_request",
+        customerIntent: "ask_fact",
+        customerIsAskingQuestion: true,
+        requestedInfoType: null,
+        requestedInformation: null,
+        capability: "answer_from_business_profile",
+        evidenceNeeds: [
+          {
+            entity: "business_profile",
+            concept: row.concept,
+            attributes: ["policy"],
+          },
+        ],
+        shouldReply: true,
+        customerReply: "",
+        action: "reply",
+        mutationIntent: "none",
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+        actionParameters: {},
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+        selectedBookingId: BOOKING_ID,
+        informationalReplyDeferred: true,
+      },
+    };
+
+    await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+      const result = await handleCustomerBusinessPaInbound({
+        db: fake.db,
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        messageText: row.message,
+        __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+        __resolveActiveCustomerBookingFactsFn: resolveFacts,
+        __decideCustomerTurnFn: async () => decision,
+        __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+          assert.equal(p.factResolution?.missingInfoType, row.type);
+          assert.equal(p.factResolution?.ownerCheckStarted, true);
+          return {
+            ok: true,
+            reply: "Main yeh detail confirm karke batata hun.",
+            source: "openai",
+          };
+        },
+      });
+
+      assert.equal(result.missingInfoEscalated, true, row.concept);
+      assert.equal(result.missingInfoType, row.type, row.concept);
+      assert.equal(sends.ownerSends.length, 1, row.concept);
+      const ownerText = String(sends.ownerSends[0].text || "");
+      assert.match(ownerText, /❓ Customer question/);
+      assert.match(ownerText, /Reference:\n?pamiss_/i);
+      // Internal type must not be labeled in the operational header (question text may still mention the word).
+      assert.doesNotMatch(ownerText, /Emily PA missing info\s*\(/i);
+      assert.doesNotMatch(ownerText, /missingInfoType/i);
+      assert.doesNotMatch(ownerText, new RegExp(BOOKING_ID, "i"));
+    });
+  }
+});
+
+test("owner notification is multiline readable and keeps token for parser", async () => {
+  const { buildPaMissingInfoOwnerNotificationMessage } = await import(
+    "../src/services/paMissingInfoOwnerNotifyService.js"
+  );
+  const { parsePaMissingInfoOwnerAnswerMessage } = await import(
+    "../src/services/paMissingInfoOwnerAnswerService.js"
+  );
+
+  const requestId = "pamiss_3b6bb008d31e42a7806b";
+  const bookingId = "NYwhJnkhY9alSuuj9Wz1";
+  const msg = buildPaMissingInfoOwnerNotificationMessage(
+    {
+      requestId,
+      bookingId,
+      customerPhone: "905443829990",
+      missingInfoType: "documents",
+      customerQuestion: "Refund policy kya hai?",
+      itemLabel: "Toyota corolla (Metallic Grey)",
+    },
+    { itemLabel: "Toyota corolla (Metallic Grey)" }
+  );
+
+  assert.match(msg, /\n/);
+  assert.match(msg, /❓ Customer question/);
+  assert.match(msg, /Item:\nToyota corolla — Metallic Grey/);
+  assert.match(msg, /Customer:\n\+90 544 382 9990/);
+  assert.match(msg, /Question:\n“Refund policy kya hai\?”/);
+  assert.match(msg, /Reply to this message with the answer/);
+  assert.match(msg, /Reference:\n/);
+  assert.ok(msg.includes(requestId));
+  assert.doesNotMatch(msg, /\bdocuments\b/i);
+  assert.doesNotMatch(msg, /\bother\b/i);
+  assert.doesNotMatch(msg, new RegExp(bookingId));
+  assert.doesNotMatch(msg, /Emily PA missing info/i);
+
+  // Owner can reply quoting the notification; token still parses.
+  const parsed = parsePaMissingInfoOwnerAnswerMessage(
+    `${msg}\n\nFull refund within 24 hours.`
+  );
+  assert.equal(parsed.requestId, requestId);
+  assert.match(parsed.ownerAnswer, /Full refund within 24 hours/i);
+
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  const sends = captureSend();
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Refund policy kya hai?",
+      __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
+      __composePostConfirmInformationalCustomerReplyFn: async () => ({
+        ok: true,
+        reply: "Main yeh detail confirm karke batata hun.",
+        source: "openai",
+      }),
+    });
+
+    assert.equal(result.missingInfoEscalated, true);
+    assert.equal(sends.ownerSends.length, 1);
+    // Idempotent skip on second notify for same open request path covered elsewhere;
+    // one owner notification maximum after success for this turn.
+    assert.equal(result.ownerNotifyStatus, "sent");
+    const ownerText = String(sends.ownerSends[0].text || "");
+    assert.match(ownerText, /❓ Customer question/);
+    assert.match(ownerText, /pamiss_/);
+    assert.doesNotMatch(ownerText, new RegExp(BOOKING_ID));
+  });
+});
