@@ -13,8 +13,14 @@ const { resolveActiveCustomerBookingFacts } = await import(
 const {
   handleCustomerBusinessPaInbound,
 } = await import("../src/services/customerBusinessPaAgentService.js");
-const { canEscalatePostConfirmMissingInfo, PA_MISSING_INFO_GATE_OUTCOME } =
-  await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+const {
+  canEscalatePostConfirmMissingInfo,
+  PA_MISSING_INFO_GATE_OUTCOME,
+  isPostConfirmFactualInformationalSemanticDecision,
+} = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+const { resolvePostConfirmRequestedFact } = await import(
+  "../src/brain/facts/resolvePostConfirmRequestedFact.js"
+);
 
 /** Local test helper only — production no longer keyword-routes post-booking intent. */
 function classifyCustomerBusinessPaActionIntent(messageText) {
@@ -389,6 +395,42 @@ function deferredPolicyTurnPlan({
       requestedInformation: null,
       capability,
       evidenceNeeds: [{ entity: "business_profile", concept, attributes }],
+      shouldReply: true,
+      customerReply: "",
+      action: "reply",
+      mutationIntent: "none",
+      mutationExecutionRequested: false,
+      mutationExecutionStatus: "not_executed",
+      actionParameters: {},
+      bookingSelectionMode: "focused",
+      selectedBookingIndex: 1,
+      selectedBookingId: BOOKING_ID,
+      candidateGroundings: [],
+      informationalReplyDeferred: true,
+    },
+  };
+}
+
+/** Deferred freeform business-fact Turn Plan (saved_owner_answer / other). */
+function deferredFreeformOtherTurnPlan() {
+  return {
+    ok: true,
+    source: "openai",
+    decision: {
+      situation: "new_question",
+      conversationAct: "information_request",
+      customerIntent: "ask_fact",
+      customerIsAskingQuestion: true,
+      requestedInfoType: null,
+      requestedInformation: null,
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
       shouldReply: true,
       customerReply: "",
       action: "reply",
@@ -2145,5 +2187,273 @@ test("PA reply is prepared for buffer delivery without local memory write", asyn
     assert.equal(result.sentReply, false);
     // Conversation memory append is owned by the Cloud buffer send path.
     assert.equal(memory.length, 0);
+  });
+});
+
+test("freeform missing business facts share other escalate path (no phrase routing)", async () => {
+  const messages = [
+    "What is your refund policy?",
+    "Fuel policy kya hai?",
+    "What is your cancellation policy?",
+    "Does Corolla have cruise control?",
+    "Can I return this car at 11 PM?",
+    "Do you provide child seats?",
+    "What are the extra mileage charges?",
+    "What is the accident policy?",
+  ];
+
+  for (const messageText of messages) {
+    const fake = createFakeDb();
+    const resolveFacts = seedActiveContext(fake);
+    const sends = captureSend();
+
+    await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+      const result = await handleCustomerBusinessPaInbound({
+        db: fake.db,
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        messageText,
+        messageId: `wamid.freeform-${Buffer.from(messageText).toString("hex").slice(0, 12)}`,
+        sendCredentials: {},
+        __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+        __resolveActiveCustomerBookingFactsFn: resolveFacts,
+        // Same Turn Plan for every freeform message — proves no phrase branching.
+        __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
+        __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+          assert.equal(p.factResolution?.status, "not_found");
+          assert.equal(p.factResolution?.missingInfoType, "other");
+          assert.equal(p.factResolution?.ownerCheckStarted, true);
+          assert.equal(p.frozenDecision?.mutationIntent, "none");
+          assert.equal(
+            p.frozenDecision?.capability,
+            "answer_from_saved_owner_answer"
+          );
+          assert.deepEqual(p.frozenDecision?.evidenceNeeds, [
+            {
+              entity: "saved_owner_answer",
+              concept: "other",
+              attributes: ["answer"],
+            },
+          ]);
+          return {
+            ok: true,
+            reply: "Main yeh detail confirm karke batata hun.",
+            source: "openai",
+          };
+        },
+      });
+
+      assert.equal(result.handled, true, messageText);
+      assert.equal(result.missingInfoEscalated, true, messageText);
+      assert.equal(result.missingInfoType, "other", messageText);
+      assert.equal(result.ownerNotifyStatus, "sent", messageText);
+      assert.equal(sends.ownerSends.length, 1, messageText);
+      assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1, messageText);
+      assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
+      assert.equal(result.sentReply, false, messageText);
+      assert.match(result.reply, /confirm karke batata/i);
+    });
+  }
+});
+
+test("non-business social asks never use other escalate path", async () => {
+  const messages = [
+    "What time is it?",
+    "What is your name?",
+    "Where do you live?",
+    "How are you?",
+    "Tell me a joke.",
+    "Who is the president?",
+    "What is the weather?",
+    "What is 2+2?",
+    "What happened in the news today?",
+    "How old are you?",
+  ];
+
+  for (const messageText of messages) {
+    const fake = createFakeDb();
+    const resolveFacts = seedActiveContext(fake);
+    const sends = captureSend();
+    let createCalled = false;
+
+    const socialDecision = {
+      ok: true,
+      source: "openai",
+      decision: {
+        situation: "unclear",
+        conversationAct: "chit_chat",
+        customerIntent: "unclear",
+        customerIsAskingQuestion: true,
+        requestedInfoType: null,
+        requestedInformation: null,
+        capability: "social",
+        evidenceNeeds: [],
+        shouldReply: true,
+        customerReply: "Main business booking help ke liye yahan hun.",
+        action: "reply",
+        mutationIntent: "none",
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+        actionParameters: {},
+        bookingSelectionMode: "none",
+        selectedBookingIndex: null,
+        selectedBookingId: null,
+        informationalReplyDeferred: false,
+      },
+    };
+
+    // Question-shaped social must not force FACTUAL_TURN_PLAN_REQUIRED recovery.
+    assert.equal(
+      isPostConfirmFactualInformationalSemanticDecision(socialDecision.decision),
+      false,
+      messageText
+    );
+
+    const resolution = resolvePostConfirmRequestedFact({
+      capability: socialDecision.decision.capability,
+      evidenceNeeds: socialDecision.decision.evidenceNeeds,
+      facts: {
+        booking: { id: BOOKING_ID },
+        known: {},
+        business: {},
+        openMissingInfoRequests: [],
+        latestClosedMissingInfoAnswers: [],
+      },
+      selectedBooking: { id: BOOKING_ID },
+      selectedBookingId: BOOKING_ID,
+    });
+    assert.notEqual(resolution.missingInfoType, "other", messageText);
+    assert.notEqual(
+      resolution.capability,
+      "answer_from_saved_owner_answer",
+      messageText
+    );
+
+    const gate = canEscalatePostConfirmMissingInfo({
+      decision: {
+        ...socialDecision.decision,
+        situation: "new_question",
+        conversationAct: "information_request",
+        customerIsAskingQuestion: true,
+      },
+      facts: {
+        booking: { id: BOOKING_ID },
+        known: {},
+        business: {},
+        openMissingInfoRequests: [],
+      },
+      factResolution: resolution,
+      missingInfoEnabled: true,
+      ownerAnswerEnabled: true,
+      isFactMissingFn: isPaMissingInfoFactMissing,
+    });
+    assert.notEqual(
+      gate.outcome,
+      PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY,
+      messageText
+    );
+
+    await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+      const result = await handleCustomerBusinessPaInbound({
+        db: fake.db,
+        businessId: BUSINESS_ID,
+        customerPhone: CUSTOMER_PHONE,
+        messageText,
+        __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+        __resolveActiveCustomerBookingFactsFn: resolveFacts,
+        __createOrGetOpenPaMissingInfoRequestFn: async () => {
+          createCalled = true;
+          return { ok: false };
+        },
+        __decideCustomerTurnFn: async () => socialDecision,
+      });
+
+      assert.equal(result.handled, true, messageText);
+      assert.equal(result.capability, "social", messageText);
+      assert.notEqual(result.missingInfoType, "other", messageText);
+      assert.equal(result.missingInfoEscalated, false, messageText);
+      assert.equal(createCalled, false, messageText);
+      assert.equal(sends.ownerSends.length, 0, messageText);
+      assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0, messageText);
+    });
+  }
+});
+
+test("freeform other: flags OFF does not escalate", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  const sends = captureSend();
+
+  await withFlags({ pa: true, missingInfo: false, ownerAnswer: false }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Insurance policy kya hai?",
+      __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
+      __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+        assert.equal(p.factResolution?.missingInfoType, "other");
+        assert.notEqual(p.factResolution?.ownerCheckStarted, true);
+        return {
+          ok: true,
+          reply: "Yeh detail abhi confirm nahi hui.",
+          source: "openai",
+        };
+      },
+    });
+
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(sends.ownerSends.length, 0);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
+    assert.equal(result.sentReply, false);
+  });
+});
+
+test("freeform other: saved owner answer found → no escalate", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  const sends = captureSend();
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Fuel policy kya hai?",
+      __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+      __resolveActiveCustomerBookingFactsFn: async (p) => {
+        const resolved = await resolveFacts(p);
+        if (resolved?.ok && resolved.facts) {
+          resolved.facts.latestClosedMissingInfoAnswers = [
+            {
+              requestId: "pamiss_closed_fuel",
+              missingInfoType: "other",
+              ownerAnswer: "Fuel customer zimmedari hai.",
+              customerFollowupText: "Fuel customer zimmedari hai.",
+              customerFollowupStatus: "sent",
+            },
+          ];
+        }
+        return resolved;
+      },
+      __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
+      __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+        assert.equal(p.factResolution?.status, "found");
+        assert.notEqual(p.factResolution?.ownerCheckStarted, true);
+        return {
+          ok: true,
+          reply: "Fuel customer zimmedari hai.",
+          source: "openai",
+        };
+      },
+    });
+
+    assert.equal(result.missingInfoEscalated, false);
+    assert.equal(sends.ownerSends.length, 0);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
+    assert.match(result.reply, /Fuel customer/i);
+    assert.equal(result.sentReply, false);
   });
 });

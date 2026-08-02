@@ -1212,22 +1212,32 @@ export function isPostConfirmFactualInformationalSemanticDecision(decision) {
   if (cleanMutationIntent(decision.mutationIntent) !== "none") return false;
   if (decision.mutationExecutionRequested === true) return false;
 
+  const act = cleanAct(decision.conversationAct);
   const capability = cleanPostConfirmCapability(decision.capability);
   if (capability === "mutation_requested") {
     return false;
   }
 
-  const act = cleanAct(decision.conversationAct);
+  // capability=social: do not force a factual Turn Plan merely because the
+  // message is question-shaped (customerIsAskingQuestion=true). Only treat as
+  // factual-invalid when social is mixed with information_request / ask_fact /
+  // non-empty evidenceNeeds (those need same-Brain correction).
+  if (capability === "social") {
+    const socialDeclaringFactSemantics =
+      act === "information_request" ||
+      decision.customerIntent === "ask_fact" ||
+      (Array.isArray(decision.evidenceNeeds) &&
+        normalizeEvidenceNeeds(decision.evidenceNeeds).length > 0);
+    if (!socialDeclaringFactSemantics) {
+      return false;
+    }
+  }
+
   const factualMarkers =
     act === "information_request" ||
     decision.customerIntent === "ask_fact" ||
     decision.customerIsAskingQuestion === true ||
     capabilityRequiresEvidenceResolution(capability);
-
-  // capability=social with factual markers is invalid — needs Turn Plan correction.
-  if (capability === "social" && !factualMarkers) {
-    return false;
-  }
 
   // Intentional social silence is allowed only without factual markers.
   // Silence / shouldReply=false on a factual ask is a contract violation.
@@ -1530,16 +1540,19 @@ function buildPostConfirmFactualRequestedInformationCorrection(
       customerReply: priorDecision?.customerReply ?? "",
     })}`,
     "Rules:",
-    "- This ask is factual/informational. Do NOT use capability=social. Do NOT leave capability null.",
-    "- Do NOT write a direct customerReply answer. customerReply MUST be empty.",
-    "- Keep action=reply, shouldReply=true, mutationIntent=none. Do NOT use action=silence.",
+    "- First classify: is this a business/item/service/booking fact about THIS business or the customer's booking, or is it social/general/non-business?",
+    "- Clearly social, conversational, or general/non-business (even if phrased as a question; even if customerIsAskingQuestion was true) → capability=social with non-empty customerReply and NO business claims, OR capability=clarification_needed with evidenceNeeds=[] when unrelated/unclear. customerReply may be non-empty for social.",
+    "- Never use answer_from_saved_owner_answer + other/answer for general knowledge, current time/date, weather, jokes, maths, politics, news, trivia, Emily personal identity, greetings, thanks, farewells, or any ask with no business/item/service/booking connection.",
+    "- Never force capability=answer_from_saved_owner_answer or concept=other merely because the message is a question.",
+    "- Clearly business/item/service/booking factual ask → do NOT leave capability null; prefer a valid answer_from_* / clarification_needed / availability_request Turn Plan; customerReply MUST be empty for deferred factual plans. Do NOT use capability=social for a clear business/booking fact ask.",
+    "- Keep action=reply (or silence only for genuine social endings), mutationIntent=none unless a real mutation applies.",
     "- Set capability to one of: " + POST_CONFIRM_CAPABILITIES.join(", "),
     "- For answer_from_* capabilities, set non-empty evidenceNeeds: [{entity, concept, attributes}].",
     `- Entities: ${POST_CONFIRM_EVIDENCE_ENTITIES.join(", ")}`,
     `- Concepts: ${POST_CONFIRM_EVIDENCE_CONCEPTS.join(", ")}`,
     `- Attributes: ${POST_CONFIRM_EVIDENCE_ATTRIBUTES.join(", ")}`,
-    "- If the exact trusted field is unclear (deposit refundability, insurance inclusion, cancellation terms, mileage, overnight driver, accident terms, etc.), set capability=clarification_needed with evidenceNeeds=[].",
-    "- Freeform policy with a possible saved owner answer → answer_from_saved_owner_answer + [{entity:\"saved_owner_answer\",concept:\"other\",attributes:[\"answer\"]}].",
+    "- Freeform THIS-business policy/rule/service/item/booking facts not covered by structured advance/driver/delivery/documents/payment fields → answer_from_saved_owner_answer + [{entity:\"saved_owner_answer\",concept:\"other\",attributes:[\"answer\"]}]. Examples: fuel/refund/cancellation/insurance/late-return/mileage/accident/outstation/child-seat/item features. Do NOT invent a business_profile concept.",
+    "- Vague/underspecified or unrelated asks with no identifiable business or booking fact → clarification_needed with evidenceNeeds=[].",
     "- Advance/deposit amount or advance rules → answer_from_business_profile + advance amount/policy attributes.",
     "- Documents / payment / driver / delivery policy → answer_from_business_profile + matching concept attributes:[\"policy\"].",
     "- Active booking fields (pickup/delivery/time/price/status/reference/identity/dates/duration) → answer_from_active_booking with matching evidenceNeeds.",
@@ -1577,8 +1590,9 @@ function buildPostConfirmSocialFactualClaimCorrection(priorDecision, userMessage
       customerReply: priorDecision?.customerReply ?? "",
     })}`,
     "Rules:",
-    "- If this turn is factual/informational: set a valid capability + evidenceNeeds Turn Plan and customerReply=\"\".",
-    "- If this turn is genuinely social small-talk: capability=social, evidenceNeeds=[], non-empty customerReply with NO factual business/booking claims.",
+    "- If this turn is a genuine business/item/service/booking factual ask: set a valid capability + evidenceNeeds Turn Plan and customerReply=\"\".",
+    "- If this turn is social, general knowledge, current time/weather/jokes/maths/politics/news/trivia, Emily personal identity, or casual conversation: capability=social, evidenceNeeds=[], non-empty customerReply with NO factual business/booking claims — OR clarification_needed when unrelated/unclear. Never use answer_from_saved_owner_answer + other for these.",
+    "- Never force saved_owner_answer + other merely because the message is phrased as a question.",
     "- Keep action=reply, shouldReply=true, mutationIntent=none (unless a real mutation/availability action applies).",
     "- Do NOT invent facts. Return the same required JSON schema only.",
   ].join("\n");
@@ -2923,6 +2937,7 @@ TURN PLAN (informational — semantic only in this call):
 - New inventory availability (not about the confirmed booking) → capability=availability_request; never answer from active booking facts.
 - Social → capability=social.
 - Never invent dates, times, amounts, locations, statuses, policies, references, or items in this call.
+- Never route general knowledge, current time/weather/jokes/maths/politics/news/trivia, or Emily personal/social chat to answer_from_saved_owner_answer + other.
 
 INFORMATIONAL VS MUTATION (delivery/pickup):
 - Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", bookingSelectionMode="focused" when a trusted booking is in scope.
@@ -2966,7 +2981,8 @@ Examples:
 - dates / "kab se start" → concept:"dates", attributes:["start","end"] (NOT clarification_needed when dates are the clear ask)
 - documents / payment / driver / delivery policy ("delivery ho skti hai?", "kis area delivery") → answer_from_business_profile + [{entity:"business_profile",concept:"delivery"|"documents"|"payment"|"driver",attributes:["policy"]}] — NOT availability_request
 - advance amount/policy → answer_from_business_profile + advance attributes
-- fuel/late return/cancellation/insurance → clarification_needed (evidenceNeeds=[]) OR answer_from_saved_owner_answer + other/answer when a saved owner answer exists
+- Freeform THIS-business facts only: answer_from_saved_owner_answer + [{entity:"saved_owner_answer",concept:"other",attributes:["answer"]}] with action=reply, customerReply="" — ONLY when the ask is about THIS business, its policies/operating rules, its services, its items/products/vehicles, or the customer's active booking, and it is not covered by structured advance/driver/delivery/documents/payment profile fields. Examples: fuel/refund/cancellation/insurance/late-return/mileage/accident/outstation/child-seat availability/item features/booking-specific operational facts. Resolver: found when a saved owner answer exists; otherwise not_found + missingInfoType=other for the existing missing-info gate. Never invent fuel/refund/cancellation concepts or business_profile fields for these.
+- NEVER use saved_owner_answer + other/answer for: general knowledge; current time or date; weather; jokes; maths/calculations; politics or world facts; news; trivia; Emily's name/location/age/home/feelings/personal identity; greetings, thanks, acknowledgements, farewells, or casual conversation; or any unrelated question with no business, item, service, or booking connection. Those stay capability=social (conversational) or clarification_needed (unclear/unrelated). They must never produce missingInfoType=other or owner escalation. Never choose other merely because the message is phrased as a question.
 - "owner se confirm" / ask Emily to check with owner without a concrete fact → clarification_needed (not answer_from_active_booking)
 - "koi gari available?" (new vehicle/inventory search) → availability_request (do NOT use active booking evidence; do NOT use availability_request for delivery-policy asks)
 - social hello / acha / thanks → capability=social, evidenceNeeds=[], non-empty customerReply with NO booking/business factual claims

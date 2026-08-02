@@ -256,6 +256,15 @@ export function normalizeEvidenceNeed(raw) {
       return null;
     }
   }
+  // Freeform other/answer lives on saved_owner_answer — never business_profile.
+  // Compatibility only: does not inspect customer text.
+  if (
+    concept === "other" &&
+    attributes.includes("answer") &&
+    entityOut === "business_profile"
+  ) {
+    entityOut = "saved_owner_answer";
+  }
   return { entity: entityOut, concept, attributes };
 }
 
@@ -281,6 +290,16 @@ export function coerceEvidenceCapability(capability, needs) {
     !entities.has("active_booking")
   ) {
     return "answer_from_business_profile";
+  }
+  // After other/answer entity coerce, align capability with saved_owner_answer store.
+  if (
+    (cap === "answer_from_business_profile" ||
+      cap === "answer_from_active_booking") &&
+    entities.has("saved_owner_answer") &&
+    !entities.has("business_profile") &&
+    !entities.has("active_booking")
+  ) {
+    return "answer_from_saved_owner_answer";
   }
   return cap;
 }
