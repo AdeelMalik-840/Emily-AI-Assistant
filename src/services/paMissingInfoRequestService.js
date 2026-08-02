@@ -17,6 +17,8 @@ export const PA_MISSING_INFO_TYPES = Object.freeze([
 export const PA_MISSING_INFO_OPEN_STATUSES = Object.freeze([
   "open",
   "owner_notified",
+  // Notify-failed rows stay reusable for REUSE_AND_NOTIFY (no duplicate create).
+  "failed",
 ]);
 
 /** Statuses that may still accept an owner answer. */

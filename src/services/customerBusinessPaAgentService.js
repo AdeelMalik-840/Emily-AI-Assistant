@@ -5,12 +5,22 @@
  * Booking mutations run only through postConfirmBookingMutationExecutor (safe executors
  * only; unsupported intents never write Firestore). Pending AVR confirm/decline:
  *   execute once → post-exec Brain Turn Plan → same resolve→compose path when deferred.
+ * Missing-info owner-check: after resolve, single gate canEscalatePostConfirmMissingInfo,
+ * then create/notify once; compose checking only when notify succeeds/idempotent.
  */
 
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
 import { resolvePostConfirmRequestedFact } from "../brain/facts/resolvePostConfirmRequestedFact.js";
 import { decideCustomerTurn } from "../brain/decisions/decideCustomerTurn.js";
-import { isDeferredPostConfirmInformationalDecision } from "../brain/decisions/decidePostConfirmCustomerDm.js";
+import {
+  canEscalatePostConfirmMissingInfo,
+  isDeferredPostConfirmInformationalDecision,
+  PA_MISSING_INFO_GATE_OUTCOME,
+} from "../brain/decisions/decidePostConfirmCustomerDm.js";
+import {
+  isEmilyBusinessPaMissingInfoEnabled,
+  isEmilyBusinessPaMissingInfoOwnerAnswerEnabled,
+} from "../brain/config/liveFeatureFlags.js";
 import {
   executeAvailabilityCustomerConfirmBooking,
   executeAvailabilityCustomerDecline,
@@ -20,6 +30,12 @@ import {
   composePostConfirmInformationalCustomerReply,
   composePostConfirmMutationCustomerReply,
 } from "./customerBusinessPaAiReply.js";
+import {
+  createOrGetOpenPaMissingInfoRequest,
+  isPaMissingInfoFactMissing,
+} from "./paMissingInfoRequestService.js";
+import { sendPaMissingInfoOwnerNotification } from "./paMissingInfoOwnerNotifyService.js";
+import { sendWhatsAppMessage } from "./whatsappCloud.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -28,6 +44,222 @@ function clean(value, max = 500) {
 
 function cleanCustomerReply(value) {
   return String(value ?? "").trim();
+}
+
+/**
+ * One missing-info owner-check executor.
+ * Executes the gate outcome only — does not re-decide eligibility/lifecycle.
+ * Checking/pending wording authorized only from verified notify success or ALREADY_PENDING.
+ *
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ *   messageText: string,
+ *   messageId?: string | null,
+ *   facts: Record<string, unknown>,
+ *   decision: Record<string, unknown>,
+ *   factResolution: Record<string, unknown>,
+ *   gate: {
+ *     outcome: string,
+ *     reason?: string,
+ *     missingInfoType?: string | null,
+ *     openRequest?: Record<string, unknown> | null,
+ *   },
+ *   selectedBooking?: Record<string, unknown> | null,
+ *   sendCredentials?: unknown,
+ *   __createOrGetOpenPaMissingInfoRequestFn?: typeof createOrGetOpenPaMissingInfoRequest,
+ *   __sendPaMissingInfoOwnerNotificationFn?: typeof sendPaMissingInfoOwnerNotification,
+ *   __sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
+ * }} p
+ */
+export async function executePostConfirmPaMissingInfoOwnerCheck({
+  db: connection,
+  businessId,
+  customerPhone,
+  messageText,
+  messageId = null,
+  facts,
+  decision,
+  factResolution,
+  gate,
+  selectedBooking = null,
+  sendCredentials = null,
+  __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
+  __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
+  __sendWhatsAppMessageFn = sendWhatsAppMessage,
+} = {}) {
+  const uid = clean(businessId, 120);
+  const phone = String(customerPhone ?? "").trim();
+  const outcome = clean(gate?.outcome, 40);
+  const type =
+    clean(gate?.missingInfoType, 40) ||
+    clean(factResolution?.missingInfoType, 40) ||
+    clean(decision?.requestedInfoType, 40);
+  const bookingId =
+    clean(selectedBooking?.id, 120) || clean(facts?.booking?.id, 120) || null;
+  const availabilityRequestId =
+    clean(selectedBooking?.availabilityRequestId, 120) ||
+    clean(facts?.booking?.availabilityRequestId, 120) ||
+    null;
+
+  const empty = {
+    gateOutcome: outcome || PA_MISSING_INFO_GATE_OUTCOME.NOT_ALLOWED,
+    ownerCheckAuthorized: false,
+    ownerCheckPending: false,
+    missingInfoEscalated: false,
+    missingInfoRequestId: null,
+    missingInfoType: type || null,
+    ownerNotifyStatus: null,
+  };
+
+  if (
+    outcome === PA_MISSING_INFO_GATE_OUTCOME.NOT_ALLOWED ||
+    !outcome ||
+    !connection ||
+    !uid ||
+    !phone ||
+    !bookingId ||
+    !type
+  ) {
+    return {
+      ...empty,
+      reason: clean(gate?.reason, 80) || "NOT_ALLOWED",
+    };
+  }
+
+  // Verified pending: open request already notified — no create, no re-notify.
+  if (outcome === PA_MISSING_INFO_GATE_OUTCOME.ALREADY_PENDING) {
+    const open = gate?.openRequest && typeof gate.openRequest === "object"
+      ? gate.openRequest
+      : null;
+    const requestId =
+      clean(open?.requestId || open?.id, 120) || null;
+    const ownerNotifyStatus =
+      clean(open?.ownerNotifyStatus, 40) ||
+      (clean(open?.status, 40) === "owner_notified" ? "sent" : null) ||
+      "sent";
+    return {
+      gateOutcome: outcome,
+      ownerCheckAuthorized: false,
+      ownerCheckPending: true,
+      missingInfoEscalated: false,
+      missingInfoRequestId: requestId,
+      missingInfoType: type,
+      ownerNotifyStatus,
+      reason: "ALREADY_PENDING",
+    };
+  }
+
+  if (
+    outcome !== PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY &&
+    outcome !== PA_MISSING_INFO_GATE_OUTCOME.REUSE_AND_NOTIFY
+  ) {
+    return { ...empty, reason: "UNKNOWN_GATE_OUTCOME" };
+  }
+
+  let created;
+  try {
+    // createOrGet: CREATE path inserts; REUSE path returns the same open row.
+    created = await __createOrGetOpenPaMissingInfoRequestFn({
+      db: connection,
+      businessId: uid,
+      customerPhone: phone,
+      bookingId,
+      availabilityRequestId,
+      missingInfoType: type,
+      customerQuestion: clean(messageText, 800),
+      customerMessageId: clean(messageId, 160) || null,
+    });
+  } catch (err) {
+    console.warn("[pa_missing_info_escalate_create_failed]", {
+      businessId: uid,
+      bookingId,
+      missingInfoType: type,
+      gateOutcome: outcome,
+      error: err?.message || String(err),
+    });
+    return { ...empty, reason: "CREATE_FAILED" };
+  }
+
+  if (!created?.ok || !created.request) {
+    return {
+      ...empty,
+      reason: clean(created?.reason, 80) || "CREATE_FAILED",
+    };
+  }
+
+  const requestId =
+    clean(created.request.requestId || created.request.id, 120) || null;
+  const priorNotify =
+    clean(created.request.ownerNotifyStatus, 40) || "not_started";
+
+  let notify;
+  try {
+    notify = await __sendPaMissingInfoOwnerNotificationFn({
+      db: connection,
+      businessId: uid,
+      request: created.request,
+      itemLabel: clean(
+        selectedBooking?.itemLabel ||
+          facts?.booking?.itemLabel ||
+          facts?.known?.itemLabel,
+        200
+      ),
+      sendCredentials,
+      sendWhatsAppMessageFn: __sendWhatsAppMessageFn,
+    });
+  } catch (err) {
+    console.warn("[pa_missing_info_escalate_notify_failed]", {
+      businessId: uid,
+      bookingId,
+      requestId,
+      missingInfoType: type,
+      gateOutcome: outcome,
+      error: err?.message || String(err),
+    });
+    return {
+      ...empty,
+      missingInfoRequestId: requestId,
+      missingInfoType: type,
+      ownerNotifyStatus: "failed",
+      reason: "NOTIFY_FAILED",
+    };
+  }
+
+  const ownerNotifyStatus =
+    clean(notify?.ownerNotifyStatus, 40) || priorNotify || null;
+  const authorized =
+    notify?.ok === true &&
+    (notify?.sent === true ||
+      notify?.skipped === true ||
+      ownerNotifyStatus === "sent" ||
+      ownerNotifyStatus === "queued" ||
+      ownerNotifyStatus === "sending");
+
+  if (!authorized) {
+    return {
+      gateOutcome: outcome,
+      ownerCheckAuthorized: false,
+      ownerCheckPending: false,
+      missingInfoEscalated: false,
+      missingInfoRequestId: requestId,
+      missingInfoType: type,
+      ownerNotifyStatus,
+      reason: clean(notify?.reason, 80) || "NOTIFY_FAILED",
+    };
+  }
+
+  return {
+    gateOutcome: outcome,
+    ownerCheckAuthorized: true,
+    ownerCheckPending: false,
+    missingInfoEscalated: true,
+    missingInfoRequestId: requestId,
+    missingInfoType: type,
+    ownerNotifyStatus,
+    reason: clean(notify?.reason, 80) || "OWNER_CHECK_STARTED",
+  };
 }
 
 /**
@@ -87,6 +319,7 @@ function logPostConfirmTerminalDiagnostic(decided) {
  *   messageId?: string | null,
  *   inboundReceivedAtMs?: number | null,
  *   conversationHistory?: string | null,
+ *   sendCredentials?: unknown,
  *   preResolvedBookingFacts?: Record<string, unknown> | null,
  *   __resolveActiveCustomerBookingFactsFn?: typeof resolveActiveCustomerBookingFacts,
  *   __decideCustomerTurnFn?: typeof decideCustomerTurn,
@@ -96,6 +329,10 @@ function logPostConfirmTerminalDiagnostic(decided) {
  *   __composePostConfirmMutationCustomerReplyFn?: typeof composePostConfirmMutationCustomerReply,
  *   __resolvePostConfirmRequestedFactFn?: typeof resolvePostConfirmRequestedFact,
  *   __composePostConfirmInformationalCustomerReplyFn?: typeof composePostConfirmInformationalCustomerReply,
+ *   __executePostConfirmPaMissingInfoOwnerCheckFn?: typeof executePostConfirmPaMissingInfoOwnerCheck,
+ *   __createOrGetOpenPaMissingInfoRequestFn?: typeof createOrGetOpenPaMissingInfoRequest,
+ *   __sendPaMissingInfoOwnerNotificationFn?: typeof sendPaMissingInfoOwnerNotification,
+ *   __sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
  *   __chatCompletionsCreateForTests?: Function,
  * }} params
  */
@@ -107,6 +344,7 @@ export async function handleCustomerBusinessPaInbound({
   messageId = null,
   inboundReceivedAtMs = null,
   conversationHistory = null,
+  sendCredentials = null,
   preResolvedBookingFacts = null,
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
   __decideCustomerTurnFn = decideCustomerTurn,
@@ -121,6 +359,11 @@ export async function handleCustomerBusinessPaInbound({
   __resolvePostConfirmRequestedFactFn = resolvePostConfirmRequestedFact,
   __composePostConfirmInformationalCustomerReplyFn =
     composePostConfirmInformationalCustomerReply,
+  __executePostConfirmPaMissingInfoOwnerCheckFn =
+    executePostConfirmPaMissingInfoOwnerCheck,
+  __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
+  __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
+  __sendWhatsAppMessageFn = sendWhatsAppMessage,
   __chatCompletionsCreateForTests = null,
 }) {
   const uid = clean(businessId);
@@ -466,7 +709,7 @@ export async function handleCustomerBusinessPaInbound({
     (decision.informationalReplyDeferred === true ||
       isDeferredPostConfirmInformationalDecision(decision))
   ) {
-    // Decide → resolve trusted fact → compose. Owner missing-info stays unwired.
+    // Decide → resolve trusted fact → optional missing-info owner-check → compose.
     // Also used after pending AVR execute when the post-exec Turn Plan defers.
     const frozenDecision = { ...decision };
     const { selectedBookingId, selectedBooking } = resolveLaneSelectedBooking(
@@ -474,7 +717,7 @@ export async function handleCustomerBusinessPaInbound({
       frozenDecision.selectedBookingId
     );
 
-    const factResolution = __resolvePostConfirmRequestedFactFn({
+    let factResolution = __resolvePostConfirmRequestedFactFn({
       capability: frozenDecision.capability,
       evidenceNeeds: frozenDecision.evidenceNeeds,
       // legacy compat for injected test doubles
@@ -483,6 +726,62 @@ export async function handleCustomerBusinessPaInbound({
       selectedBooking,
       selectedBookingId,
     });
+
+    let missingInfoEscalated = false;
+    let missingInfoRequestId = null;
+    let missingInfoType = null;
+    let ownerNotifyStatus = null;
+
+    const missingInfoEnabled = isEmilyBusinessPaMissingInfoEnabled();
+    const ownerAnswerEnabled = isEmilyBusinessPaMissingInfoOwnerAnswerEnabled();
+    // Single gate: agent only executes the returned outcome.
+    const escalateGate = canEscalatePostConfirmMissingInfo({
+      decision: frozenDecision,
+      facts: laneFacts,
+      factResolution,
+      missingInfoEnabled,
+      ownerAnswerEnabled,
+      isFactMissingFn: isPaMissingInfoFactMissing,
+    });
+    if (
+      escalateGate?.outcome &&
+      escalateGate.outcome !== PA_MISSING_INFO_GATE_OUTCOME.NOT_ALLOWED
+    ) {
+      const escalateResult = await __executePostConfirmPaMissingInfoOwnerCheckFn({
+        db: connection,
+        businessId: uid,
+        customerPhone: phone,
+        messageText: text,
+        messageId,
+        facts: laneFacts,
+        decision: frozenDecision,
+        factResolution,
+        gate: escalateGate,
+        selectedBooking,
+        sendCredentials,
+        __createOrGetOpenPaMissingInfoRequestFn,
+        __sendPaMissingInfoOwnerNotificationFn,
+        __sendWhatsAppMessageFn,
+      });
+      missingInfoEscalated = escalateResult?.missingInfoEscalated === true;
+      missingInfoRequestId =
+        clean(escalateResult?.missingInfoRequestId, 120) || null;
+      missingInfoType = clean(escalateResult?.missingInfoType, 40) || null;
+      ownerNotifyStatus =
+        clean(escalateResult?.ownerNotifyStatus, 40) || null;
+      // Checking wording only from verified notify success or verified already-pending.
+      const ownerCheckStarted = escalateResult?.ownerCheckAuthorized === true;
+      const ownerCheckPending = escalateResult?.ownerCheckPending === true;
+      if (ownerCheckStarted || ownerCheckPending) {
+        factResolution = {
+          ...factResolution,
+          ownerCheckStarted,
+          ownerCheckPending,
+          missingInfoType:
+            missingInfoType || factResolution?.missingInfoType || null,
+        };
+      }
+    }
 
     const composed = await __composePostConfirmInformationalCustomerReplyFn({
       facts: laneFacts,
@@ -532,10 +831,10 @@ export async function handleCustomerBusinessPaInbound({
           Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
         semanticDecisionCount,
         composeCalls,
-        missingInfoEscalated: false,
-        missingInfoRequestId: null,
-        missingInfoType: null,
-        ownerNotifyStatus: null,
+        missingInfoEscalated,
+        missingInfoRequestId,
+        missingInfoType,
+        ownerNotifyStatus,
       };
     }
 
@@ -547,6 +846,10 @@ export async function handleCustomerBusinessPaInbound({
       mutationIntent: "none",
       informationalReplyDeferred: true,
       factResolution,
+      missingInfoEscalated,
+      missingInfoRequestId,
+      missingInfoType,
+      ownerNotifyStatus,
     };
   }
 
@@ -596,10 +899,10 @@ export async function handleCustomerBusinessPaInbound({
     requestedInformation: decision.requestedInformation ?? null,
     factResolutionStatus: decision.factResolution?.status ?? null,
     capability: decision.capability ?? null,
-    missingInfoEscalated: false,
-    missingInfoRequestId: null,
-    missingInfoType: null,
-    ownerNotifyStatus: null,
+    missingInfoEscalated: decision.missingInfoEscalated === true,
+    missingInfoRequestId: decision.missingInfoRequestId ?? null,
+    missingInfoType: decision.missingInfoType ?? null,
+    ownerNotifyStatus: decision.ownerNotifyStatus ?? null,
   });
 
   return {
@@ -639,10 +942,10 @@ export async function handleCustomerBusinessPaInbound({
     situation: decision.situation ?? "unclear",
     decisionAction: decision.action,
     shouldReply: decision.shouldReply !== false,
-    missingInfoEscalated: false,
-    missingInfoRequestId: null,
-    missingInfoType: null,
-    ownerNotifyStatus: null,
+    missingInfoEscalated: decision.missingInfoEscalated === true,
+    missingInfoRequestId: decision.missingInfoRequestId ?? null,
+    missingInfoType: decision.missingInfoType ?? null,
+    ownerNotifyStatus: decision.ownerNotifyStatus ?? null,
     silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
     retryable: false,
     terminalFailure: false,

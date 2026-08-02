@@ -222,7 +222,8 @@ export async function sendPaMissingInfoOwnerNotification({
       businessId: uid,
       requestId,
       patch: {
-        status: "failed",
+        // Keep request open so the gate can REUSE_AND_NOTIFY on a later ask.
+        // Do not terminal-fail the row on a transient WhatsApp send error.
         ownerNotifyStatus: "failed",
         ownerNotifyAt: new Date(),
         ownerNotifyError: error,

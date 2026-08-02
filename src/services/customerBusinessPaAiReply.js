@@ -181,6 +181,9 @@ export function buildInformationalComposeFactResolutionForPrompt(resolution) {
     source: status === "found" ? raw.source ?? null : null,
     items,
     missingInfoType: raw.missingInfoType ?? null,
+    // Verified escalate Result only — never invent from dialogue.
+    ownerCheckStarted: raw.ownerCheckStarted === true,
+    ownerCheckPending: raw.ownerCheckPending === true,
   };
 }
 
@@ -305,6 +308,8 @@ function enrichInformationalComposeGuardContract(baseContract, p) {
  *   customerInputRequired: boolean,
  *   foundValue?: string,
  *   referenceReply?: string | null,
+ *   ownerCheckStarted?: boolean,
+ *   ownerCheckPending?: boolean,
  * }} p
  * @returns {string[]}
  */
@@ -312,6 +317,8 @@ function buildInformationalDeterministicReplyCandidates(p) {
   const status = String(p.status || "unsupported");
   const foundValue = String(p.foundValue ?? "").trim();
   const referenceReply = String(p.referenceReply ?? "").trim();
+  const checkingAuthorized =
+    p.ownerCheckStarted === true || p.ownerCheckPending === true;
   const unclearRu = "Yeh detail abhi clear nahi hai.";
   const unclearEn = "This detail is unclear right now.";
   const unconfirmedRu = "Yeh detail abhi confirm nahi hui.";
@@ -324,6 +331,8 @@ function buildInformationalDeterministicReplyCandidates(p) {
     "Yeh detail abhi confirm nahi hui. Kya aap thoda aur clear bata sakte hain?";
   const clarifyUnconfirmedEn =
     "This detail is not confirmed yet. Could you clarify what you need?";
+  const checkingRu = "Main yeh detail confirm karke batata hun.";
+  const checkingEn = "I'll confirm this detail and update you.";
 
   /** @type {string[]} */
   const out = [];
@@ -331,6 +340,19 @@ function buildInformationalDeterministicReplyCandidates(p) {
     const t = String(text ?? "").trim();
     if (t && !out.includes(t)) out.push(t);
   };
+
+  if (checkingAuthorized) {
+    // Verified owner-check started or already pending — natural checking wording only.
+    push(checkingRu);
+    push(checkingEn);
+    push("Confirm karke batata hun.");
+    push("I am confirming this detail now.");
+    push(unconfirmedRu);
+    push(unconfirmedEn);
+    push("OK.");
+    push("Ji.");
+    return out;
+  }
 
   if (referenceReply) push(referenceReply);
   if (status === "found" && foundValue) push(foundValue);
@@ -972,6 +994,8 @@ export async function composePostConfirmInformationalCustomerReply({
     items: Array.isArray(resolution.items) ? resolution.items : [],
     missingInfoType: resolution.missingInfoType ?? null,
     selectionStatus: resolution.selectionStatus ?? null,
+    ownerCheckStarted: resolution.ownerCheckStarted === true,
+    ownerCheckPending: resolution.ownerCheckPending === true,
   };
 
   const customerInputRequired = isPostConfirmInformationalCustomerInputRequired({
@@ -988,6 +1012,8 @@ export async function composePostConfirmInformationalCustomerReply({
     ...buildInformationalComposeFactResolutionForPrompt(verifiedResolution),
     customerInputRequired,
     selectionStatus: verifiedResolution.selectionStatus,
+    ownerCheckStarted: verifiedResolution.ownerCheckStarted === true,
+    ownerCheckPending: verifiedResolution.ownerCheckPending === true,
   };
 
   const frozen = {
@@ -1176,8 +1202,9 @@ You MUST NOT reinterpret the customer message into a different intent, workflow,
 
 FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
 - status "found": answer using verifiedValue / found items only. Do not add other facts. customerReply MUST be non-empty.
+- ownerCheckStarted=true OR ownerCheckPending=true: a verified owner-check was started or is already pending for this missing detail. Say briefly that you will confirm this detail (natural wording). Do NOT invent the missing value. Do NOT name owner/staff/system. Do NOT promise a specific time. customerReply MUST be non-empty.
 - customerInputRequired=true: you MAY ask one useful clarification for customer preference/input that the Turn Plan/Result already marked as required. Do NOT invent facts. customerReply MUST be non-empty.
-- customerInputRequired=false AND status is "not_found", "unsupported", or "conflicting": state naturally that the business/booking detail is not confirmed, unavailable, or unclear. Do NOT ask the customer to supply that business-owned fact. Do NOT invent a substitute. Do NOT claim owner contact. Do NOT promise a later answer. customerReply MUST be non-empty.
+- customerInputRequired=false AND ownerCheckStarted=false AND ownerCheckPending=false AND status is "not_found", "unsupported", or "conflicting": state naturally that the business/booking detail is not confirmed, unavailable, or unclear. Do NOT ask the customer to supply that business-owned fact. Do NOT invent a substitute. Do NOT claim owner contact. Do NOT promise a later answer. customerReply MUST be non-empty.
 - CONVERSATION_CONTEXT_JSON is tone/identity only. It contains NO answerable booking/policy/owner-answer facts. Never treat it as an answer source.
 - RECENT_DIALOGUE is continuity/tone only. It is NEVER a factual answer source. Ignore any numbers, times, places, policies, or references stated there unless the same value is also present in FACT_RESOLUTION_JSON.
 - When stating a found booking reference/code, put the exact verifiedValue immediately after a colon with no filler words in between (example shape: "booking reference: STONIC-PROD"). Do not write patterns like "reference hai: …".
@@ -1185,7 +1212,7 @@ FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
 
 STRICT SAFETY:
 - Never invent dates, times, amounts, locations, items, statuses, references, or policies.
-- Never mention resolver, Brain, Firestore, system, or other internal process terms.
+- Never mention resolver, Brain, Firestore, system, owner, staff, or other internal process terms.
 - Keep reply short for WhatsApp.`;
 
   const userBase =
@@ -1203,9 +1230,13 @@ STRICT SAFETY:
   const composed = await composeGuardedCustomerReply({
     system,
     userBase,
-    firstAttemptReminder: customerInputRequired
-      ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
-      : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision.",
+    firstAttemptReminder:
+      verifiedResolution.ownerCheckStarted === true ||
+      verifiedResolution.ownerCheckPending === true
+        ? "Remember: JSON only; ownerCheckStarted/ownerCheckPending verified — say you will confirm this detail without inventing the value or naming owner/staff; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
+        : customerInputRequired
+          ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
+          : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision.",
     responseFormatName: "post_confirm_informational_reply_compose",
     replyContract,
     enrichGuardContract: (contract) =>
@@ -1237,6 +1268,8 @@ STRICT SAFETY:
       customerInputRequired,
       foundValue: status === "found" ? foundValue : "",
       referenceReply,
+      ownerCheckStarted: verifiedResolution.ownerCheckStarted === true,
+      ownerCheckPending: verifiedResolution.ownerCheckPending === true,
     });
     const picked = pickGuardedInformationalDeterministicReply({
       candidates,

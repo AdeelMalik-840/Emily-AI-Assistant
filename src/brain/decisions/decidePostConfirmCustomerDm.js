@@ -2055,16 +2055,51 @@ export function compactPostConfirmFactsForPrompt(facts) {
 }
 
 /**
+ * Deterministic missing-info owner-check gate outcomes.
+ * Single escalation authority — agent executes the outcome; does not re-decide.
+ */
+export const PA_MISSING_INFO_GATE_OUTCOME = Object.freeze({
+  CREATE_AND_NOTIFY: "CREATE_AND_NOTIFY",
+  REUSE_AND_NOTIFY: "REUSE_AND_NOTIFY",
+  ALREADY_PENDING: "ALREADY_PENDING",
+  NOT_ALLOWED: "NOT_ALLOWED",
+});
+
+/**
  * @param {Record<string, unknown> | null | undefined} facts
  * @param {string} missingInfoType
  */
 export function hasOpenPaMissingInfoForType(facts, missingInfoType) {
+  return findOpenPaMissingInfoRowForType(facts, missingInfoType) != null;
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} facts
+ * @param {string} missingInfoType
+ * @returns {Record<string, unknown> | null}
+ */
+export function findOpenPaMissingInfoRowForType(facts, missingInfoType) {
   const type = clean(missingInfoType, 40);
-  if (!type || !isAllowedPaMissingInfoType(type)) return false;
+  if (!type || !isAllowedPaMissingInfoType(type)) return null;
   const rows = Array.isArray(facts?.openMissingInfoRequests)
     ? facts.openMissingInfoRequests
     : [];
-  return rows.some((row) => clean(row?.missingInfoType, 40) === type);
+  const hit = rows.find((row) => clean(row?.missingInfoType, 40) === type);
+  return hit && typeof hit === "object" ? hit : null;
+}
+
+/**
+ * Verified: owner notification already succeeded or is in-flight for an open request.
+ * @param {Record<string, unknown> | null | undefined} row
+ */
+export function isPaMissingInfoOwnerNotifyAlreadyPending(row) {
+  if (!row || typeof row !== "object") return false;
+  const notify = clean(row.ownerNotifyStatus, 40).toLowerCase();
+  const status = clean(row.status, 40).toLowerCase();
+  if (["queued", "sending", "sent"].includes(notify)) return true;
+  if (notify === "owner_notified") return true;
+  if (status === "owner_notified") return true;
+  return false;
 }
 
 function defaultDecision(overrides = {}) {
@@ -2429,37 +2464,140 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
 }
 
 /**
- * Deterministic executor gate for missing-info escalation (Brain decision + facts + flags).
+ * Deterministic executor gate for missing-info owner-check.
+ * Single eligibility authority — returns one outcome:
+ *   CREATE_AND_NOTIFY | REUSE_AND_NOTIFY | ALREADY_PENDING | NOT_ALLOWED
+ *
+ * Primary: Turn Plan + verified Result (missing|not_found + missingInfoType).
+ * Compat: legacy Brain escalate_missing_info + requestedInfoType.
+ *
+ * Open-request notification lifecycle lives here (not in the agent):
+ * - no open → CREATE_AND_NOTIFY
+ * - open + notify not successfully sent → REUSE_AND_NOTIFY (retry)
+ * - open + notify queued/sending/sent/owner_notified → ALREADY_PENDING
+ *
  * @param {{
  *   decision: Record<string, unknown> | null | undefined,
  *   facts: Record<string, unknown> | null | undefined,
+ *   factResolution?: Record<string, unknown> | null,
  *   missingInfoEnabled?: boolean,
  *   ownerAnswerEnabled?: boolean,
  *   isFactMissingFn?: (facts: unknown, type: string) => boolean,
  * }} p
+ * @returns {{
+ *   outcome: string,
+ *   reason: string,
+ *   missingInfoType: string | null,
+ *   openRequest: Record<string, unknown> | null,
+ * }}
  */
 export function canEscalatePostConfirmMissingInfo({
   decision,
   facts,
+  factResolution = null,
   missingInfoEnabled = false,
   ownerAnswerEnabled = false,
   isFactMissingFn = null,
 } = {}) {
-  if (!missingInfoEnabled || !ownerAnswerEnabled) return false;
-  if (!decision || typeof decision !== "object") return false;
-  if (decision.action !== "escalate_missing_info") return false;
-  if (decision.situation !== "new_question") return false;
-  if (decision.conversationAct !== "information_request") return false;
-  if (decision.customerIsAskingQuestion !== true) return false;
-  const type = clean(decision.requestedInfoType, 40);
-  if (!isAllowedPaMissingInfoType(type)) return false;
-  const bookingId = clean(facts?.booking?.id, 120);
-  if (!bookingId) return false;
-  if (hasOpenPaMissingInfoForType(facts, type)) return false;
-  if (typeof isFactMissingFn === "function") {
-    return isFactMissingFn(facts, type) === true;
+  const deny = (reason, type = null) => ({
+    outcome: PA_MISSING_INFO_GATE_OUTCOME.NOT_ALLOWED,
+    reason,
+    missingInfoType: type,
+    openRequest: null,
+  });
+
+  if (!missingInfoEnabled || !ownerAnswerEnabled) {
+    return deny("FLAGS_OFF");
   }
-  return false;
+  if (!decision || typeof decision !== "object") {
+    return deny("NO_DECISION");
+  }
+
+  // Never escalate beside mutation / protected execution.
+  if (cleanMutationIntent(decision.mutationIntent) !== "none") {
+    return deny("MUTATION_INTENT");
+  }
+  if (decision.mutationExecutionRequested === true) {
+    return deny("MUTATION_EXECUTION");
+  }
+  const action = cleanAction(decision.action);
+  if (action === "request_booking_mutation") {
+    return deny("MUTATION_ACTION");
+  }
+
+  if (decision.situation !== "new_question") return deny("SITUATION");
+  if (decision.conversationAct !== "information_request") {
+    return deny("CONVERSATION_ACT");
+  }
+  if (decision.customerIsAskingQuestion !== true) {
+    return deny("NOT_ASKING");
+  }
+
+  const bookingId = clean(facts?.booking?.id, 120);
+  if (!bookingId) return deny("NO_BOOKING");
+
+  const resolution =
+    factResolution && typeof factResolution === "object" ? factResolution : null;
+  const resolutionStatus = String(resolution?.status ?? "")
+    .trim()
+    .toLowerCase();
+
+  /** @type {string} */
+  let type = "";
+  if (
+    resolution &&
+    (resolutionStatus === "missing" || resolutionStatus === "not_found")
+  ) {
+    // Primary: trusted missing Result from resolvePostConfirmRequestedFact.
+    if (action !== "reply" && action !== "escalate_missing_info") {
+      return deny("ACTION");
+    }
+    type = clean(resolution.missingInfoType, 40);
+    if (!type) return deny("NO_MISSING_INFO_TYPE");
+  } else if (action === "escalate_missing_info") {
+    // Compat: legacy Brain escalate without a missing Result.
+    type = clean(decision.requestedInfoType, 40);
+    if (!type) return deny("NO_REQUESTED_INFO_TYPE");
+  } else {
+    return deny("RESULT_NOT_MISSING");
+  }
+
+  if (!isAllowedPaMissingInfoType(type)) {
+    return deny("UNSUPPORTED_TYPE", type);
+  }
+  if (typeof isFactMissingFn === "function") {
+    if (isFactMissingFn(facts, type) !== true) {
+      return deny("FACT_NOT_MISSING", type);
+    }
+  } else {
+    return deny("NO_FACT_MISSING_FN", type);
+  }
+
+  const openRequest = findOpenPaMissingInfoRowForType(facts, type);
+  if (!openRequest) {
+    return {
+      outcome: PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY,
+      reason: "NO_OPEN_REQUEST",
+      missingInfoType: type,
+      openRequest: null,
+    };
+  }
+
+  if (isPaMissingInfoOwnerNotifyAlreadyPending(openRequest)) {
+    return {
+      outcome: PA_MISSING_INFO_GATE_OUTCOME.ALREADY_PENDING,
+      reason: "OWNER_NOTIFY_ALREADY_PENDING",
+      missingInfoType: type,
+      openRequest,
+    };
+  }
+
+  return {
+    outcome: PA_MISSING_INFO_GATE_OUTCOME.REUSE_AND_NOTIFY,
+    reason: "OPEN_REQUEST_NOTIFY_RETRY",
+    missingInfoType: type,
+    openRequest,
+  };
 }
 
 /**
