@@ -487,6 +487,7 @@ export async function handleCustomerBusinessPaInbound({
     const composed = await __composePostConfirmInformationalCustomerReplyFn({
       facts: laneFacts,
       userMessage: text,
+      conversationHistory,
       frozenDecision,
       factResolution,
       selectedBooking,
