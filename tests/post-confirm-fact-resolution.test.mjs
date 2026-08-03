@@ -221,7 +221,7 @@ test("policy categories absent/present", () => {
   );
 });
 
-test("other_verified_fact uses closed answers only", () => {
+test("other_verified_fact never reuses closed owner answers (emergency miss)", () => {
   assert.equal(
     resolvePostConfirmRequestedFact({
       requestedInformation: "other_verified_fact",
@@ -230,18 +230,23 @@ test("other_verified_fact uses closed answers only", () => {
     }).status,
     "not_found"
   );
-  assert.equal(
-    resolvePostConfirmRequestedFact({
-      requestedInformation: "other_verified_fact",
-      facts: {
-        latestClosedMissingInfoAnswers: [
-          { ownerAnswer: "Fuel is customer responsibility" },
-        ],
-      },
-      selectedBooking: booking(),
-    }).verifiedValue,
-    "Fuel is customer responsibility"
-  );
+  const withClosed = resolvePostConfirmRequestedFact({
+    requestedInformation: "other_verified_fact",
+    facts: {
+      latestClosedMissingInfoAnswers: [
+        { ownerAnswer: "Fuel is customer responsibility" },
+        {
+          missingInfoType: "other",
+          ownerAnswer: "???",
+        },
+      ],
+    },
+    selectedBooking: booking(),
+  });
+  assert.equal(withClosed.status, "not_found");
+  assert.equal(withClosed.factAvailable, false);
+  assert.equal(withClosed.verifiedValue, null);
+  assert.equal(withClosed.missingInfoType, "other");
 });
 
 test("unclear / unknown → unsupported", () => {
@@ -1037,7 +1042,7 @@ test("freeform business_profile other coerces to saved_owner_answer path", () =>
   assert.equal(r.items?.[0]?.entity, "saved_owner_answer");
 });
 
-test("freeform other found from saved owner answer → no missing escalate type needed", () => {
+test("freeform other always missing even with closed owner answers (emergency)", () => {
   const r = resolvePostConfirmRequestedFact({
     capability: "answer_from_saved_owner_answer",
     evidenceNeeds: [
@@ -1055,14 +1060,52 @@ test("freeform other found from saved owner answer → no missing escalate type 
           missingInfoType: "other",
           ownerAnswer: "Fuel is customer responsibility",
         },
+        {
+          requestId: "mir-2",
+          missingInfoType: "other",
+          ownerAnswer: "???",
+        },
       ],
     },
     selectedBooking: booking(),
     selectedBookingId: "bk-1",
   });
-  assert.equal(r.status, "found");
-  assert.equal(r.verifiedValue, "Fuel is customer responsibility");
-  assert.equal(r.missingInfoType, null);
+  assert.equal(r.status, "not_found");
+  assert.equal(r.verifiedValue, null);
+  assert.equal(r.factAvailable, false);
+  assert.equal(r.missingInfoType, "other");
+  assert.equal(r.capability, "answer_from_saved_owner_answer");
+});
+
+test("emergency freeform miss: refund and fuel both missing/other (owner notify reachable)", () => {
+  const closed = [
+    {
+      requestId: "mir-old",
+      missingInfoType: "other",
+      ownerAnswer: "Old freeform answer",
+    },
+  ];
+  for (const label of ["refund", "fuel"]) {
+    const r = resolvePostConfirmRequestedFact({
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
+      facts: {
+        booking: booking(),
+        latestClosedMissingInfoAnswers: closed,
+      },
+      selectedBooking: booking(),
+      selectedBookingId: "bk-1",
+    });
+    assert.equal(r.status, "not_found", label);
+    assert.equal(r.missingInfoType, "other", label);
+    assert.equal(r.factAvailable, false, label);
+  }
 });
 
 test("decide guidance scopes freeform other to business facts with explicit negatives", async () => {

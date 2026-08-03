@@ -136,11 +136,31 @@ export function isPaMissingInfoFactMissing(facts, missingInfoType) {
 }
 
 /**
+ * Phase 1 freeform (`other`): open-row match only by inbound message identity
+ * or exact customer question text — never by type alone.
+ * @param {Record<string, unknown>} data
+ * @param {{ customerQuestion?: string, customerMessageId?: string | null }} scope
+ */
+function openOtherRequestMatchesScope(data, scope = {}) {
+  const messageId = clean(scope.customerMessageId, 160);
+  const question = clean(scope.customerQuestion, 800);
+  if (messageId && clean(data?.customerMessageId, 160) === messageId) {
+    return true;
+  }
+  if (question && clean(data?.customerQuestion, 800) === question) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * @param {{
  *   db: unknown,
  *   businessId: string,
  *   bookingId: string,
  *   missingInfoType: string,
+ *   customerQuestion?: string | null,
+ *   customerMessageId?: string | null,
  * }} p
  */
 export async function findOpenPaMissingInfoRequest({
@@ -148,6 +168,8 @@ export async function findOpenPaMissingInfoRequest({
   businessId,
   bookingId,
   missingInfoType,
+  customerQuestion = null,
+  customerMessageId = null,
 }) {
   const col = collectionRef(connection, businessId);
   const bid = clean(bookingId, 120);
@@ -157,17 +179,31 @@ export async function findOpenPaMissingInfoRequest({
   const snap = await col
     .where("bookingId", "==", bid)
     .where("missingInfoType", "==", type)
-    .limit(20)
+    .limit(40)
     .get()
     .catch(() => null);
 
   const now = Date.now();
+  const question = clean(customerQuestion, 800);
+  const messageId = clean(customerMessageId, 160);
   for (const doc of snap?.docs ?? []) {
     const data = doc.data() || {};
     const status = clean(data.status, 40);
     if (!PA_MISSING_INFO_OPEN_STATUSES.includes(status)) continue;
     if (isExpiredRequest(data, now)) continue;
-    return { id: doc.id, ...(data || {}) };
+    // Structured types: one open row per booking + type.
+    if (type !== "other") {
+      return { id: doc.id, ...(data || {}) };
+    }
+    // Freeform other: require exact question or same inbound message id.
+    if (
+      openOtherRequestMatchesScope(data, {
+        customerQuestion: question,
+        customerMessageId: messageId,
+      })
+    ) {
+      return { id: doc.id, ...(data || {}) };
+    }
   }
   return null;
 }
@@ -210,11 +246,17 @@ export async function createOrGetOpenPaMissingInfoRequest(p) {
     };
   }
 
+  const customerMessageId = clean(p.customerMessageId, 160) || null;
   const existing = await findOpenPaMissingInfoRequest({
     db: p.db,
     businessId: uid,
     bookingId,
     missingInfoType,
+    // Freeform other scopes dedupe to exact question / same inbound message.
+    customerQuestion:
+      missingInfoType === "other" ? customerQuestion : null,
+    customerMessageId:
+      missingInfoType === "other" ? customerMessageId : null,
   });
   if (existing) {
     return {
@@ -239,7 +281,7 @@ export async function createOrGetOpenPaMissingInfoRequest(p) {
     availabilityRequestId: clean(p.availabilityRequestId, 120) || null,
     missingInfoType,
     customerQuestion,
-    customerMessageId: clean(p.customerMessageId, 160) || null,
+    customerMessageId,
     status: "open",
     ownerNotifyStatus: "not_started",
     ownerNotifyAt: null,
@@ -396,6 +438,7 @@ export async function listOpenPaMissingInfoRequestsForBooking({
       requestId: clean(data.requestId || doc.id, 120) || doc.id,
       missingInfoType: type,
       customerQuestion: clean(data.customerQuestion, 400) || null,
+      customerMessageId: clean(data.customerMessageId, 160) || null,
       status,
       createdAt: toIsoOrNull(data.createdAt) || null,
       ownerNotifyStatus: clean(data.ownerNotifyStatus, 40) || null,

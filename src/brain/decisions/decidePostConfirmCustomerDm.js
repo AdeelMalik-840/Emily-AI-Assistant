@@ -774,6 +774,7 @@ function compactOpenMissingInfo(rows) {
   return rows.slice(0, 12).map((row) => ({
     missingInfoType: row?.missingInfoType ?? null,
     customerQuestion: row?.customerQuestion ?? null,
+    customerMessageId: row?.customerMessageId ?? null,
     status: row?.status ?? null,
   }));
 }
@@ -2243,23 +2244,44 @@ export const PA_MISSING_INFO_GATE_OUTCOME = Object.freeze({
 /**
  * @param {Record<string, unknown> | null | undefined} facts
  * @param {string} missingInfoType
+ * @param {{ customerQuestion?: string | null, customerMessageId?: string | null }} [scope]
  */
-export function hasOpenPaMissingInfoForType(facts, missingInfoType) {
-  return findOpenPaMissingInfoRowForType(facts, missingInfoType) != null;
+export function hasOpenPaMissingInfoForType(facts, missingInfoType, scope = {}) {
+  return findOpenPaMissingInfoRowForType(facts, missingInfoType, scope) != null;
 }
 
 /**
  * @param {Record<string, unknown> | null | undefined} facts
  * @param {string} missingInfoType
+ * @param {{ customerQuestion?: string | null, customerMessageId?: string | null }} [scope]
  * @returns {Record<string, unknown> | null}
  */
-export function findOpenPaMissingInfoRowForType(facts, missingInfoType) {
+export function findOpenPaMissingInfoRowForType(
+  facts,
+  missingInfoType,
+  scope = {}
+) {
   const type = clean(missingInfoType, 40);
   if (!type || !isAllowedPaMissingInfoType(type)) return null;
   const rows = Array.isArray(facts?.openMissingInfoRequests)
     ? facts.openMissingInfoRequests
     : [];
-  const hit = rows.find((row) => clean(row?.missingInfoType, 40) === type);
+  const question = clean(scope?.customerQuestion, 800);
+  const messageId = clean(scope?.customerMessageId, 160);
+  const hit = rows.find((row) => {
+    if (clean(row?.missingInfoType, 40) !== type) return false;
+    // Freeform other: only the same exact question / inbound message is "open".
+    if (type === "other") {
+      if (messageId && clean(row?.customerMessageId, 160) === messageId) {
+        return true;
+      }
+      if (question && clean(row?.customerQuestion, 800) === question) {
+        return true;
+      }
+      return false;
+    }
+    return true;
+  });
   return hit && typeof hit === "object" ? hit : null;
 }
 
@@ -2698,6 +2720,8 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
  *   decision: Record<string, unknown> | null | undefined,
  *   facts: Record<string, unknown> | null | undefined,
  *   factResolution?: Record<string, unknown> | null,
+ *   customerQuestion?: string | null,
+ *   customerMessageId?: string | null,
  *   missingInfoEnabled?: boolean,
  *   ownerAnswerEnabled?: boolean,
  *   isFactMissingFn?: (facts: unknown, type: string) => boolean,
@@ -2713,6 +2737,8 @@ export function canEscalatePostConfirmMissingInfo({
   decision,
   facts,
   factResolution = null,
+  customerQuestion = null,
+  customerMessageId = null,
   missingInfoEnabled = false,
   ownerAnswerEnabled = false,
   isFactMissingFn = null,
@@ -2791,7 +2817,10 @@ export function canEscalatePostConfirmMissingInfo({
     return deny("NO_FACT_MISSING_FN", type);
   }
 
-  const openRequest = findOpenPaMissingInfoRowForType(facts, type);
+  const openRequest = findOpenPaMissingInfoRowForType(facts, type, {
+    customerQuestion,
+    customerMessageId,
+  });
   if (!openRequest) {
     return {
       outcome: PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY,

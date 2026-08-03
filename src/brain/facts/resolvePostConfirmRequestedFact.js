@@ -590,13 +590,9 @@ function lookupEvidenceAttribute({
       return UNSUPPORTED_ITEM;
     }
     if (concept === "other" && attribute === "answer") {
-      const rows = Array.isArray(facts?.latestClosedMissingInfoAnswers)
-        ? facts.latestClosedMissingInfoAnswers
-        : [];
-      return fromUniqueValues(
-        uniquePresentValues(rows.map((row) => row?.ownerAnswer)),
-        "latestClosedMissingInfoAnswers.ownerAnswer"
-      );
+      // Emergency production safety: do not reuse historical closed owner
+      // answers for freeform other. Always miss so gate can CREATE_AND_NOTIFY.
+      return MISSING_ITEM;
     }
     return UNSUPPORTED_ITEM;
   }
