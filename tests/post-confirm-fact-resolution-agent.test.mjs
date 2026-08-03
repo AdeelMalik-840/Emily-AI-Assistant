@@ -14,6 +14,77 @@ const { resolvePostConfirmRequestedFact } = await import(
   "../src/brain/facts/resolvePostConfirmRequestedFact.js"
 );
 
+/** Nested↔flat parity for the post-confirm agent return contract. */
+function assertPostConfirmReturnContractParity(
+  result,
+  { decisionAction, expectEmptyExecution = false } = {}
+) {
+  assert.ok(result?.outbound && typeof result.outbound === "object");
+  assert.ok(result?.decision && typeof result.decision === "object");
+  assert.ok(result?.evidence && typeof result.evidence === "object");
+  assert.ok(result?.execution && typeof result.execution === "object");
+  assert.ok(result?.replyEnvelope && typeof result.replyEnvelope === "object");
+
+  assert.equal(result.outbound.reply, result.reply ?? "");
+  assert.equal(result.outbound.action, result.action ?? null);
+  assert.equal(result.outbound.handled, result.handled === true);
+  assert.equal(result.outbound.terminalFailure, result.terminalFailure === true);
+  assert.equal(result.outbound.retryable, result.retryable === true);
+  assert.equal(
+    result.outbound.finalReplySource,
+    result.finalReplySource ?? null
+  );
+  assert.equal(result.outbound.bookingId, result.bookingId ?? null);
+  assert.equal(
+    result.outbound.availabilityRequestId,
+    result.availabilityRequestId ?? null
+  );
+
+  assert.equal(
+    result.replyEnvelope.text,
+    typeof result.reply === "string" ? result.reply : ""
+  );
+  assert.equal(result.replyEnvelope.source, result.finalReplySource ?? null);
+
+  if (result.factResolution && typeof result.factResolution === "object") {
+    assert.equal(result.evidence.status, result.factResolution.status ?? null);
+    assert.deepEqual(
+      result.evidence.items,
+      Array.isArray(result.factResolution.items)
+        ? result.factResolution.items
+        : []
+    );
+    assert.equal(
+      result.evidence.verifiedValue,
+      result.factResolution.verifiedValue ?? null
+    );
+    assert.equal(
+      result.evidence.missingInfoType,
+      result.factResolution.missingInfoType ?? result.missingInfoType ?? null
+    );
+    assert.equal(
+      result.evidence.selectionStatus,
+      result.factResolution.selectionStatus ?? null
+    );
+  }
+
+  assert.equal(
+    result.execution.pendingAvr,
+    result.pendingAvailabilityExecution ?? null
+  );
+  assert.equal(result.execution.mutation, result.mutationExecution ?? null);
+  assert.equal("kind" in result.execution, false);
+  assert.equal("result" in result.execution, false);
+  if (expectEmptyExecution) {
+    assert.equal(result.execution.pendingAvr, null);
+    assert.equal(result.execution.mutation, null);
+    assert.equal(result.execution.missingInfo, null);
+  }
+  if (decisionAction !== undefined) {
+    assert.equal(result.decision.action, decisionAction);
+  }
+}
+
 function baseFacts(bookingOverrides = {}) {
   const booking = {
     id: "NYwhJnkhY9alSuuj9Wz1",
@@ -138,6 +209,13 @@ test("pickup location absent: resolve not_found → compose reply → no termina
   assert.equal(result.missingInfoEscalated, false);
   assert.equal(result.composeCalls, 1);
   assert.equal(result.mutationExecution, null);
+  assert.equal(result.sentReply, false);
+  assertPostConfirmReturnContractParity(result, {
+    expectEmptyExecution: true,
+    decisionAction: "reply",
+  });
+  assert.equal(result.decision.customerIntent, "ask_fact");
+  assert.equal(result.evidence.status, "not_found");
 });
 
 test("pickup location present: found value reaches compose", async () => {
@@ -196,6 +274,11 @@ test("pickup location present: found value reaches compose", async () => {
   assert.equal(result.action, "business_pa_reply");
   assert.match(result.reply, /Johar Town office/);
   assert.equal(result.factResolution?.status, "found");
+  assertPostConfirmReturnContractParity(result, {
+    expectEmptyExecution: true,
+    decisionAction: "reply",
+  });
+  assert.equal(result.evidence.verifiedValue, "Johar Town office");
 });
 
 test("social hello does not enter fact resolution compose", async () => {
@@ -240,6 +323,12 @@ test("social hello does not enter fact resolution compose", async () => {
   assert.equal(result.reply, "Ji, bataiye?");
   assert.equal(result.finalReplySource, "openai_post_confirm_pa");
   assert.equal(result.composeCalls, 0);
+  assert.equal(result.sentReply, false);
+  assertPostConfirmReturnContractParity(result, {
+    expectEmptyExecution: true,
+    decisionAction: "reply",
+  });
+  assert.equal(result.decision.capability, "social");
 });
 
 test("multiple bookings: selected booking only — no cross leakage", async () => {
@@ -476,6 +565,12 @@ test("agent: explicit missing selectedBookingId does not answer from facts.booki
   assert.doesNotMatch(result.reply, /Location A SECRET|REF-A|12000/);
   assert.equal(result.action, "business_pa_reply");
   assert.ok(result.reply);
+  assertPostConfirmReturnContractParity(result, {
+    expectEmptyExecution: true,
+    decisionAction: "reply",
+  });
+  assert.equal(result.evidence.status, "unsupported");
+  assert.equal(result.evidence.selectionStatus, "explicit_unresolved");
 });
 
 test("agent: selected booking differing from facts.booking wins end-to-end", async () => {
@@ -552,4 +647,166 @@ test("agent: selected booking differing from facts.booking wins end-to-end", asy
 
   assert.match(result.reply, /Loc B ONLY/);
   assert.doesNotMatch(result.reply, /Loc A/);
+  assertPostConfirmReturnContractParity(result, { expectEmptyExecution: true });
+});
+
+test("return contract: silence, terminal, and early defaults preserve flat aliases", async () => {
+  const missing = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "",
+    customerPhone: "",
+    messageText: "",
+  });
+  assert.equal(missing.handled, false);
+  assert.equal(missing.reason, "MISSING_CONTEXT");
+  assertPostConfirmReturnContractParity(missing, { expectEmptyExecution: true });
+  assert.equal(missing.decision.situation, null);
+  assert.equal(missing.evidence.status, null);
+  assert.equal(missing.execution.pendingAvr, null);
+  assert.equal(missing.execution.mutation, null);
+  assert.equal(missing.execution.missingInfo, null);
+  assert.equal(missing.replyEnvelope.text, "");
+  assert.equal(missing.outbound.handled, false);
+
+  const silence = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "biz-1",
+    customerPhone: "923001234567",
+    messageText: "ok",
+    messageId: "wamid.silence",
+    preResolvedBookingFacts: { ok: true, facts: baseFacts() },
+    __decideCustomerTurnFn: async () => ({
+      ok: true,
+      source: "openai",
+      decision: {
+        situation: "acknowledgement_after_answer",
+        conversationAct: "acknowledgement",
+        customerIntent: "unclear",
+        capability: "social",
+        evidenceNeeds: [],
+        informationalReplyDeferred: false,
+        shouldReply: false,
+        customerReply: "",
+        action: "silence",
+        mutationIntent: "none",
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+        selectedBookingId: "NYwhJnkhY9alSuuj9Wz1",
+      },
+    }),
+  });
+  assert.equal(silence.action, "business_pa_silence");
+  assert.equal(silence.reply, "");
+  assert.equal(silence.sentReply, false);
+  assertPostConfirmReturnContractParity(silence, {
+    expectEmptyExecution: true,
+    decisionAction: "silence",
+  });
+
+  const terminal = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "biz-1",
+    customerPhone: "923001234567",
+    messageText: "hello",
+    messageId: "wamid.terminal",
+    preResolvedBookingFacts: { ok: true, facts: baseFacts() },
+    __decideCustomerTurnFn: async () => ({
+      ok: false,
+      source: "technical_fallback",
+      reason: "MODEL_CONTRACT_FAILED",
+      retryable: false,
+      silenceRecoveryAttempts: 0,
+      contentSafetyAttempts: 1,
+    }),
+  });
+  assert.equal(terminal.action, "business_pa_terminal_model_failure");
+  assert.equal(terminal.terminalFailure, true);
+  assert.equal(terminal.retryable, false);
+  assert.equal(terminal.sentReply, false);
+  assertPostConfirmReturnContractParity(terminal, { expectEmptyExecution: true });
+  assert.equal(terminal.decision.situation, null);
+  assert.equal(terminal.execution.pendingAvr, null);
+  assert.equal(terminal.execution.mutation, null);
+  assert.equal(terminal.execution.missingInfo, null);
+
+  const retryable = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "biz-1",
+    customerPhone: "923001234567",
+    messageText: "hello",
+    messageId: "wamid.retryable",
+    preResolvedBookingFacts: { ok: true, facts: baseFacts() },
+    __decideCustomerTurnFn: async () => ({
+      ok: false,
+      source: "technical_fallback",
+      reason: "OPENAI_TRANSIENT",
+      retryable: true,
+    }),
+  });
+  assert.equal(retryable.action, "business_pa_retryable_failure");
+  assert.equal(retryable.retryable, true);
+  assert.equal(retryable.terminalFailure, false);
+  assertPostConfirmReturnContractParity(retryable, { expectEmptyExecution: true });
+});
+
+test("return contract: conflicting factResolution mirrors evidence slice", async () => {
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: "biz-1",
+    customerPhone: "923001234567",
+    messageText: "pickup kahan?",
+    messageId: "wamid.conflicting",
+    preResolvedBookingFacts: { ok: true, facts: baseFacts() },
+    __decideCustomerTurnFn: async () => ({
+      ok: true,
+      source: "openai",
+      decision: {
+        situation: "new_question",
+        conversationAct: "information_request",
+        customerIntent: "ask_fact",
+        capability: "answer_from_active_booking",
+        evidenceNeeds: [
+          {
+            entity: "active_booking",
+            concept: "pickup",
+            attributes: ["location"],
+          },
+        ],
+        requestedInformation: "pickup_location",
+        informationalReplyDeferred: true,
+        shouldReply: true,
+        customerReply: "",
+        action: "reply",
+        mutationIntent: "none",
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+        selectedBookingId: "NYwhJnkhY9alSuuj9Wz1",
+      },
+    }),
+    __resolvePostConfirmRequestedFactFn: () => ({
+      requestedInformation: "pickup_location",
+      status: "conflicting",
+      factAvailable: false,
+      verifiedValue: null,
+      items: [{ source: "a" }, { source: "b" }],
+      missingInfoType: null,
+    }),
+    __composePostConfirmInformationalCustomerReplyFn: async (p) => {
+      assert.equal(p.factResolution?.status, "conflicting");
+      return {
+        ok: true,
+        reply: "Pickup detail abhi clear nahi hai.",
+        source: "openai",
+      };
+    },
+  });
+
+  assert.equal(result.factResolution?.status, "conflicting");
+  assertPostConfirmReturnContractParity(result, {
+    expectEmptyExecution: true,
+    decisionAction: "reply",
+  });
+  assert.equal(result.evidence.status, "conflicting");
+  assert.equal(result.evidence.items.length, 2);
+  assert.equal(result.sentReply, false);
 });

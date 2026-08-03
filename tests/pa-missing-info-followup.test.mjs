@@ -22,6 +22,52 @@ const { resolvePostConfirmRequestedFact } = await import(
   "../src/brain/facts/resolvePostConfirmRequestedFact.js"
 );
 
+/** Nested↔flat parity for the post-confirm agent return contract. */
+function assertPostConfirmReturnContractParity(result) {
+  assert.ok(result?.outbound && typeof result.outbound === "object");
+  assert.ok(result?.decision && typeof result.decision === "object");
+  assert.ok(result?.evidence && typeof result.evidence === "object");
+  assert.ok(result?.execution && typeof result.execution === "object");
+  assert.ok(result?.replyEnvelope && typeof result.replyEnvelope === "object");
+  assert.equal(result.outbound.reply, result.reply ?? "");
+  assert.equal(result.outbound.action, result.action ?? null);
+  assert.equal(result.outbound.handled, result.handled === true);
+  assert.equal(result.outbound.terminalFailure, result.terminalFailure === true);
+  assert.equal(result.outbound.retryable, result.retryable === true);
+  assert.equal(
+    result.outbound.finalReplySource,
+    result.finalReplySource ?? null
+  );
+  assert.equal(result.outbound.bookingId, result.bookingId ?? null);
+  assert.equal(
+    result.outbound.availabilityRequestId,
+    result.availabilityRequestId ?? null
+  );
+  assert.equal(
+    result.replyEnvelope.text,
+    typeof result.reply === "string" ? result.reply : ""
+  );
+  assert.equal(result.replyEnvelope.source, result.finalReplySource ?? null);
+  if (result.factResolution && typeof result.factResolution === "object") {
+    assert.equal(result.evidence.status, result.factResolution.status ?? null);
+    assert.equal(
+      result.evidence.verifiedValue,
+      result.factResolution.verifiedValue ?? null
+    );
+    assert.equal(
+      result.evidence.missingInfoType,
+      result.factResolution.missingInfoType ?? result.missingInfoType ?? null
+    );
+  }
+  assert.equal(
+    result.execution.pendingAvr,
+    result.pendingAvailabilityExecution ?? null
+  );
+  assert.equal(result.execution.mutation, result.mutationExecution ?? null);
+  assert.equal("kind" in result.execution, false);
+  assert.equal("result" in result.execution, false);
+}
+
 /** Local test helper only — production no longer keyword-routes post-booking intent. */
 function classifyCustomerBusinessPaActionIntent(messageText) {
   const text = String(messageText ?? "").trim();
@@ -646,6 +692,13 @@ test("missing advance with flags ON creates request, notifies owner, checking re
     assert.match(String(sends.ownerSends[0].text), /pamiss_/i);
     assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
     assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
+    assert.equal(result.sentReply, false);
+    assertPostConfirmReturnContractParity(result);
+    assert.equal(result.execution.pendingAvr, null);
+    assert.equal(result.execution.mutation, null);
+    assert.ok(result.execution.missingInfo);
+    assert.equal(result.execution.missingInfo.missingInfoEscalated, true);
+    assert.equal(result.evidence.missingInfoType, "advance");
   });
 });
 
@@ -710,6 +763,14 @@ test("duplicate missing advance does not create second request or re-notify", as
     assert.equal(sends.ownerSends.length, 1);
     assert.equal(first.sentReply, false);
     assert.equal(second.sentReply, false);
+    assertPostConfirmReturnContractParity(first);
+    assertPostConfirmReturnContractParity(second);
+    assert.equal(first.execution.pendingAvr, null);
+    assert.equal(first.execution.mutation, null);
+    assert.ok(first.execution.missingInfo);
+    assert.equal(second.execution.pendingAvr, null);
+    assert.equal(second.execution.mutation, null);
+    assert.ok(second.execution.missingInfo);
   });
 });
 
@@ -806,6 +867,11 @@ test("notify failure does not authorize checking promise", async () => {
     assert.ok(result.missingInfoRequestId);
     assert.match(result.reply, /confirm nahi/i);
     assert.doesNotMatch(result.reply, /confirm karke batata|I'll confirm/i);
+    assertPostConfirmReturnContractParity(result);
+    assert.equal(result.execution.pendingAvr, null);
+    assert.equal(result.execution.mutation, null);
+    assert.ok(result.execution.missingInfo);
+    assert.equal(result.execution.missingInfo.ownerNotifyStatus, "failed");
   });
 });
 
