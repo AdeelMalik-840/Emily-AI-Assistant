@@ -81,6 +81,7 @@ function decisionJson(overrides = {}) {
     customerIsAskingQuestion: true,
     requestedInfoType: null,
     requestedInformation: null,
+    factKind: null,
     shouldReply: true,
     customerReply: "Invented answer with 10am.",
     action: "reply",
@@ -348,9 +349,62 @@ test("factual ask without requestedInformation triggers correction then failure"
   assert.equal(result.reason, "FACTUAL_TURN_PLAN_REQUIRED");
   assert.ok(calls.length >= 2);
   const correction = String(calls[1]?.messages?.[1]?.content || "");
-  assert.match(correction, /capability|evidenceNeeds/i);
+  assert.match(correction, /capability|evidenceNeeds|factKind/i);
   assert.match(correction, /customerReply MUST be empty/i);
-  assert.match(correction, /Do NOT use capability=social/i);
+  assert.match(correction, /factKind/i);
+  assert.match(correction, /booking_fact|freeform_business/i);
+});
+
+test("factual ask + factKind=null + hostile documents plan: correction then fail closed (no escalate)", async () => {
+  const b = booking();
+  const facts = factsWithIncompleteGuard(b);
+  const calls = [];
+  const hostileDocumentsPlan = decisionJson({
+    factKind: null,
+    capability: "answer_from_business_profile",
+    evidenceNeeds: [
+      {
+        entity: "business_profile",
+        concept: "documents",
+        attributes: ["policy"],
+      },
+    ],
+    customerReply: "",
+    shouldReply: true,
+    action: "reply",
+  });
+  const result = await executePostConfirmPaLaneDecision({
+    facts,
+    userMessage: "Refund policy kya hai?",
+    timeoutMs: 2000,
+    missingInfoLoopFullyEnabled: false,
+    __chatCompletionsCreateForTests: async (args) => {
+      calls.push(args);
+      return {
+        choices: [
+          { message: { content: hostileDocumentsPlan }, finish_reason: "stop" },
+        ],
+      };
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "FACTUAL_TURN_PLAN_REQUIRED");
+  assert.ok(calls.length >= 2, "same-Brain correction must run once");
+  const firstParsed = parsePostConfirmCustomerDmDecision(hostileDocumentsPlan);
+  assert.equal(firstParsed.factKindMissingOnFactualAsk, true);
+  assert.equal(firstParsed.capability, null);
+  assert.deepEqual(firstParsed.evidenceNeeds, []);
+  assert.equal(firstParsed.informationalReplyDeferred, false);
+  assert.notEqual(result.decision?.capability, "answer_from_business_profile");
+  assert.equal(
+    Array.isArray(result.decision?.evidenceNeeds)
+      ? result.decision.evidenceNeeds.length
+      : 0,
+    0
+  );
+  const correction = String(calls[1]?.messages?.[1]?.content || "");
+  assert.match(correction, /factKind/i);
+  assert.match(correction, /FACTUAL|missing or invalid|cannot build a Turn Plan/i);
 });
 
 test("factual ask with requestedInformation defers — no direct customerReply", async () => {
@@ -366,6 +420,15 @@ test("factual ask with requestedInformation defers — no direct customerReply",
         {
           message: {
             content: decisionJson({
+              factKind: "booking_fact",
+              capability: "answer_from_active_booking",
+              evidenceNeeds: [
+                {
+                  entity: "active_booking",
+                  concept: "pickup",
+                  attributes: ["location"],
+                },
+              ],
               requestedInformation: "pickup_location",
               customerReply: "",
             }),

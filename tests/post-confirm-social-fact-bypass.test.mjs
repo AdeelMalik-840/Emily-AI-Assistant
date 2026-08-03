@@ -92,6 +92,7 @@ function decisionJson(overrides = {}) {
     customerIsAskingQuestion: true,
     requestedInfoType: null,
     requestedInformation: null,
+    factKind: null,
     capability: null,
     evidenceNeeds: [],
     shouldReply: true,
@@ -205,6 +206,7 @@ test("genuine social without factual markers is not forced through factual gate"
       conversationAct: "chit_chat",
       customerIntent: "unclear",
       customerIsAskingQuestion: false,
+      factKind: "non_business",
       capability: "social",
       evidenceNeeds: [],
       customerReply: "Hello! Kya madad chahiye?",
@@ -238,6 +240,7 @@ test("social dump of booking facts is corrected then fails if still factual", as
           {
             message: {
               content: decisionJson({
+                factKind: "non_business",
                 situation: "acknowledgement_after_answer",
                 conversationAct: "chit_chat",
                 customerIntent: "unclear",
@@ -291,6 +294,7 @@ test("factual social mislabel with ask_fact forces Turn Plan correction", async 
           {
             message: {
               content: decisionJson({
+                factKind: "booking_fact",
                 capability: "answer_from_active_booking",
                 evidenceNeeds: [
                   {
@@ -320,6 +324,7 @@ test("factual social mislabel with ask_fact forces Turn Plan correction", async 
 test("silence + valid Turn Plan normalizes to deferred resolve (not mute)", () => {
   const parsed = parsePostConfirmCustomerDmDecision(
     decisionJson({
+      factKind: "documents_checklist",
       capability: "answer_from_business_profile",
       evidenceNeeds: [
         {
@@ -347,6 +352,7 @@ test("silence + valid Turn Plan normalizes to deferred resolve (not mute)", () =
 test("unknown act keeps Turn Plan and still defers (no wipe to social)", () => {
   const parsed = parsePostConfirmCustomerDmDecision(
     decisionJson({
+      factKind: "booking_fact",
       capability: "answer_from_active_booking",
       evidenceNeeds: [
         {
@@ -389,6 +395,7 @@ test("silence on ask_fact without Turn Plan is factual contract violation", () =
 test("action_request with answer_from_* normalizes to clarification_needed", () => {
   const parsed = parsePostConfirmCustomerDmDecision(
     decisionJson({
+      factKind: "booking_fact",
       conversationAct: "action_request",
       customerIntent: "ask_action",
       customerIsAskingQuestion: false,
@@ -414,6 +421,7 @@ test("action_request with answer_from_* normalizes to clarification_needed", () 
 test("pickup time Turn Plan stays pickup (not delivery)", () => {
   const parsed = parsePostConfirmCustomerDmDecision(
     decisionJson({
+      factKind: "booking_fact",
       capability: "answer_from_active_booking",
       evidenceNeeds: [
         {
@@ -450,6 +458,7 @@ test("genuine social hello accepted and decide prompt has no fact dump", async (
           {
             message: {
               content: decisionJson({
+                factKind: "non_business",
                 situation: "acknowledgement_after_answer",
                 conversationAct: "chit_chat",
                 customerIntent: "unclear",
