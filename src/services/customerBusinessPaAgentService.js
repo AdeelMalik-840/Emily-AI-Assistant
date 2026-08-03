@@ -922,6 +922,8 @@ export async function handleCustomerBusinessPaInbound({
       decision: frozenDecision,
       facts: laneFacts,
       factResolution,
+      customerQuestion: text,
+      customerMessageId: messageId,
       missingInfoEnabled,
       ownerAnswerEnabled,
       isFactMissingFn: isPaMissingInfoFactMissing,

@@ -2477,7 +2477,7 @@ test("freeform other: flags OFF does not escalate", async () => {
   });
 });
 
-test("freeform other: saved owner answer found → no escalate", async () => {
+test("freeform other: closed owner answers ignored → escalate missing/other", async () => {
   const fake = createFakeDb();
   const resolveFacts = seedActiveContext(fake);
   const sends = captureSend();
@@ -2506,21 +2506,161 @@ test("freeform other: saved owner answer found → no escalate", async () => {
       },
       __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
       __composePostConfirmInformationalCustomerReplyFn: async (p) => {
-        assert.equal(p.factResolution?.status, "found");
-        assert.notEqual(p.factResolution?.ownerCheckStarted, true);
+        assert.equal(p.factResolution?.status, "not_found");
+        assert.equal(p.factResolution?.missingInfoType, "other");
+        assert.equal(p.factResolution?.ownerCheckStarted, true);
         return {
           ok: true,
-          reply: "Fuel customer zimmedari hai.",
+          reply: "Owner se confirm kar rahi hoon — thori der mein bataungi.",
           source: "openai",
         };
       },
     });
 
-    assert.equal(result.missingInfoEscalated, false);
-    assert.equal(sends.ownerSends.length, 0);
-    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 0);
-    assert.match(result.reply, /Fuel customer/i);
+    assert.equal(result.missingInfoEscalated, true);
+    assert.equal(sends.ownerSends.length, 1);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID)[0].missingInfoType, "other");
     assert.equal(result.sentReply, false);
+  });
+});
+
+test("Phase1: refund then fuel while refund open creates separate other requests", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  const sends = captureSend();
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const compose = async (p) => {
+      assert.equal(p.factResolution?.status, "not_found");
+      assert.equal(p.factResolution?.missingInfoType, "other");
+      return {
+        ok: true,
+        reply: "Main yeh detail confirm karke batata hun.",
+        source: "openai",
+      };
+    };
+
+    const refund = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Refund policy kya hai?",
+      messageId: "wamid.refund-1",
+      __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+      __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
+      __composePostConfirmInformationalCustomerReplyFn: compose,
+    });
+
+    assert.equal(refund.missingInfoEscalated, true);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+    assert.equal(
+      fake.listMissingInfo(BUSINESS_ID)[0].customerQuestion,
+      "Refund policy kya hai?"
+    );
+
+    const resolveWithOpen = async (p) => {
+      const resolved = await resolveFacts(p);
+      if (resolved?.ok && resolved.facts) {
+        resolved.facts.openMissingInfoRequests = fake
+          .listMissingInfo(BUSINESS_ID)
+          .filter((row) =>
+            ["open", "owner_notified", "failed"].includes(row.status)
+          )
+          .map((row) => ({
+            requestId: row.requestId,
+            missingInfoType: row.missingInfoType,
+            customerQuestion: row.customerQuestion,
+            customerMessageId: row.customerMessageId ?? null,
+            status: row.status,
+            ownerNotifyStatus: row.ownerNotifyStatus,
+          }));
+      }
+      return resolved;
+    };
+
+    const fuel = await handleCustomerBusinessPaInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Fuel policy kya hai?",
+      messageId: "wamid.fuel-1",
+      __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+      __resolveActiveCustomerBookingFactsFn: resolveWithOpen,
+      __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
+      __composePostConfirmInformationalCustomerReplyFn: compose,
+    });
+
+    assert.equal(fuel.missingInfoEscalated, true);
+    const rows = fake.listMissingInfo(BUSINESS_ID);
+    assert.equal(rows.length, 2);
+    const questions = rows.map((r) => r.customerQuestion).sort();
+    assert.deepEqual(questions, [
+      "Fuel policy kya hai?",
+      "Refund policy kya hai?",
+    ]);
+    assert.equal(sends.ownerSends.length, 2);
+    assert.notEqual(refund.missingInfoRequestId, fuel.missingInfoRequestId);
+  });
+});
+
+test("Phase1: identical freeform question text reuses open other request", async () => {
+  const fake = createFakeDb();
+  const resolveFacts = seedActiveContext(fake);
+  const sends = captureSend();
+
+  await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
+    const common = {
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: "Refund policy kya hai?",
+      __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
+      __decideCustomerTurnFn: async () => deferredFreeformOtherTurnPlan(),
+      __composePostConfirmInformationalCustomerReplyFn: async () => ({
+        ok: true,
+        reply: "Main yeh detail confirm karke batata hun.",
+        source: "openai",
+      }),
+    };
+
+    const first = await handleCustomerBusinessPaInbound({
+      ...common,
+      messageId: "wamid.refund-a",
+      __resolveActiveCustomerBookingFactsFn: resolveFacts,
+    });
+
+    const resolveWithOpen = async (p) => {
+      const resolved = await resolveFacts(p);
+      if (resolved?.ok && resolved.facts) {
+        resolved.facts.openMissingInfoRequests = fake
+          .listMissingInfo(BUSINESS_ID)
+          .filter((row) =>
+            ["open", "owner_notified", "failed"].includes(row.status)
+          )
+          .map((row) => ({
+            requestId: row.requestId,
+            missingInfoType: row.missingInfoType,
+            customerQuestion: row.customerQuestion,
+            customerMessageId: row.customerMessageId ?? null,
+            status: row.status,
+            ownerNotifyStatus: row.ownerNotifyStatus,
+          }));
+      }
+      return resolved;
+    };
+
+    const second = await handleCustomerBusinessPaInbound({
+      ...common,
+      messageId: "wamid.refund-b",
+      __resolveActiveCustomerBookingFactsFn: resolveWithOpen,
+    });
+
+    assert.equal(first.missingInfoEscalated, true);
+    assert.equal(second.missingInfoEscalated, false);
+    assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
+    assert.equal(sends.ownerSends.length, 1);
   });
 });
 

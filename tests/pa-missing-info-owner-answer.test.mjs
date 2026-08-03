@@ -323,7 +323,7 @@ test("owner reply with valid pamiss_* token stores answer and sends customer fol
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
-      messageText: `${REQUEST_ID} advance 5000`,
+      messageText: `${REQUEST_ID} Advance half amount before pickup`,
       messageId: "wamid.owner-1",
       sendWhatsAppMessageFn: async (to, text) => {
         customerSends.push({ to, text });
@@ -334,41 +334,41 @@ test("owner reply with valid pamiss_* token stores answer and sends customer fol
       },
       __chatCompletionsCreateForTests: async () => {
         openaiCalls += 1;
-        return {
-          choices: [
-            {
-              message: {
-                content: JSON.stringify({
-                  customerReply: "Advance 5000 PKR dena hoga.",
-                  needsFollowup: false,
-                  missingInfoType: null,
-                }),
-              },
-            },
-          ],
-        };
+        return followupOpenAiResponse(
+          "Advance half amount before pickup dena hoga."
+        );
       },
     });
 
     assert.equal(result.handled, true);
     assert.equal(result.customerFollowupSent, true);
     assert.equal(result.requestId, REQUEST_ID);
+    assert.equal(result.openaiUsed, true);
     assert.equal(openaiCalls, 1);
     assert.equal(customerSends.length, 1);
     assert.equal(phoneDigits(customerSends[0].to), CUSTOMER_PHONE);
-    assert.equal(customerSends[0].text, "Advance 5000 PKR dena hoga.");
+    assert.equal(
+      customerSends[0].text,
+      "Advance half amount before pickup dena hoga."
+    );
     // Memory logging only — one assistant append, no extra WhatsApp send.
     assert.equal(memory.length, 1);
     assert.equal(memory[0].role, "assistant");
-    assert.equal(memory[0].text, "Advance 5000 PKR dena hoga.");
+    assert.equal(
+      memory[0].text,
+      "Advance half amount before pickup dena hoga."
+    );
     assert.equal(memory[0].ownerUserId, BUSINESS_ID);
     assert.equal(phoneDigits(memory[0].customerNumber), CUSTOMER_PHONE);
 
     const row = fake.getMissingInfo(BUSINESS_ID, REQUEST_ID);
     assert.equal(row.status, "closed");
-    assert.equal(row.ownerAnswer, "5000");
+    assert.equal(row.ownerAnswer, "half amount before pickup");
     assert.equal(row.ownerAnswerMessageId, "wamid.owner-1");
-    assert.equal(row.customerFollowupText, "Advance 5000 PKR dena hoga.");
+    assert.equal(
+      row.customerFollowupText,
+      "Advance half amount before pickup dena hoga."
+    );
     assert.equal(row.customerFollowupStatus, "sent");
 
     assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
@@ -387,6 +387,28 @@ function phoneDigits(v) {
   return String(v ?? "").replace(/\D/g, "");
 }
 
+function followupOpenAiResponse(customerReply) {
+  return {
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            customerReply,
+            needsFollowup: false,
+            missingInfoType: null,
+            replySemantics: {
+              claims: [],
+              languageStyle: "roman_urdu",
+              containsTimingPromise: false,
+              exposesInternalProcess: false,
+            },
+          }),
+        },
+      },
+    ],
+  };
+}
+
 test("duplicate same owner message does not send twice", async () => {
   const fake = createFakeDb();
   seedContext(fake);
@@ -395,25 +417,14 @@ test("duplicate same owner message does not send twice", async () => {
     db: fake.db,
     businessId: BUSINESS_ID,
     senderPhone: OWNER_PHONE,
-    messageText: `${REQUEST_ID} 5000`,
+    messageText: `${REQUEST_ID} half amount before pickup`,
     messageId: "wamid.owner-dup",
     sendWhatsAppMessageFn: async () => {
       sendCount += 1;
       return { ok: true, messages: [{ id: "wamid.x" }] };
     },
-    __chatCompletionsCreateForTests: async () => ({
-      choices: [
-        {
-          message: {
-            content: JSON.stringify({
-              customerReply: "Advance 5000 PKR.",
-              needsFollowup: false,
-              missingInfoType: null,
-            }),
-          },
-        },
-      ],
-    }),
+    __chatCompletionsCreateForTests: async () =>
+      followupOpenAiResponse("Advance half amount before pickup dena hoga."),
   };
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
@@ -465,10 +476,46 @@ test("duplicate reply after closed does not send twice", async () => {
   });
 });
 
-test("owner reply without token + exactly one open request matches", async () => {
+test("customer follow-up send failure does not close request or report success", async () => {
   const fake = createFakeDb();
   seedContext(fake);
-  const sends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: `${REQUEST_ID} half amount before pickup`,
+      messageId: "wamid.owner-send-fail",
+      sendWhatsAppMessageFn: async () => {
+        throw new Error("WHATSAPP_API_FAILED");
+      },
+      __chatCompletionsCreateForTests: async () =>
+        followupOpenAiResponse(
+          "Advance half amount before pickup dena hoga."
+        ),
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(result.reason, "CUSTOMER_FOLLOWUP_FAILED");
+    assert.equal(result.action, "owner_answer_followup_failed");
+    assert.equal(result.status, "customer_followup_failed");
+    assert.notEqual(result.status, "closed");
+
+    const row = fake.getMissingInfo(BUSINESS_ID, REQUEST_ID);
+    assert.equal(row.status, "customer_followup_failed");
+    assert.notEqual(row.status, "closed");
+    assert.equal(row.customerFollowupStatus, "failed");
+    assert.equal(row.customerFollowupStatus !== "sent", true);
+    assert.equal(row.closedAt ?? null, null);
+  });
+});
+
+test("owner reply without token is rejected (no SINGLE_OPEN)", async () => {
+  const fake = createFakeDb();
+  seedContext(fake);
+  let sendCount = 0;
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
@@ -477,36 +524,27 @@ test("owner reply without token + exactly one open request matches", async () =>
       senderPhone: OWNER_PHONE,
       messageText: "Advance 50 percent hai",
       messageId: "wamid.owner-no-token",
-      sendWhatsAppMessageFn: async (to, text) => {
-        sends.push({ to, text });
-        return { ok: true, messages: [{ id: "wamid.y" }] };
+      sendWhatsAppMessageFn: async () => {
+        sendCount += 1;
+        return { ok: true };
       },
-      __chatCompletionsCreateForTests: async () => ({
-        choices: [
-          {
-            message: {
-              content: JSON.stringify({
-                customerReply: "Advance 50 percent hai.",
-                needsFollowup: false,
-                missingInfoType: null,
-              }),
-            },
-          },
-        ],
-      }),
     });
     assert.equal(result.handled, true);
-    assert.equal(result.matchReason, "SINGLE_OPEN");
-    assert.equal(result.customerFollowupSent, true);
-    assert.equal(sends.length, 1);
+    assert.equal(result.reason, "TOKEN_REQUIRED");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(sendCount, 0);
     assert.equal(
-      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer,
-      "Advance 50 percent hai"
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "owner_notified"
+    );
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer ?? null,
+      null
     );
   });
 });
 
-test("owner reply without token + multiple open requests does not match", async () => {
+test("owner reply without token + multiple open requests still requires token", async () => {
   const fake = createFakeDb();
   const now = new Date();
   seedContext(fake, {
@@ -538,12 +576,77 @@ test("owner reply without token + multiple open requests does not match", async 
       },
     });
     assert.equal(result.handled, true);
-    assert.equal(result.reason, "AMBIGUOUS_OPEN_REQUESTS");
+    assert.equal(result.reason, "TOKEN_REQUIRED");
     assert.equal(result.customerFollowupSent, false);
     assert.equal(sendCount, 0);
     assert.equal(
       fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
       "owner_notified"
+    );
+  });
+});
+
+test("punctuation-only owner answer ??? rejected; request stays open", async () => {
+  const fake = createFakeDb();
+  seedContext(fake);
+  let sendCount = 0;
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: `${REQUEST_ID} ???`,
+      messageId: "wamid.owner-junk",
+      sendWhatsAppMessageFn: async () => {
+        sendCount += 1;
+        return { ok: true };
+      },
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "UNUSABLE_OWNER_ANSWER");
+    assert.equal(result.action, "owner_answer_rejected");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(sendCount, 0);
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "owner_notified"
+    );
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer ?? null,
+      null
+    );
+  });
+});
+
+test("wrong pamiss token does not modify any open request", async () => {
+  const fake = createFakeDb();
+  seedContext(fake);
+  let sendCount = 0;
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "pamiss_deadbeefdeadbeefde Full refund",
+      messageId: "wamid.owner-wrong-token",
+      sendWhatsAppMessageFn: async () => {
+        sendCount += 1;
+        return { ok: true };
+      },
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "TOKEN_NOT_FOUND");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(sendCount, 0);
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "owner_notified"
+    );
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer ?? null,
+      null
     );
   });
 });
@@ -623,31 +726,24 @@ test("customer follow-up uses OpenAI helper, not canned reply map", async () => 
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
-      messageText: `${REQUEST_ID} 5000`,
+      messageText: `${REQUEST_ID} half amount before pickup`,
       messageId: "wamid.openai",
       sendWhatsAppMessageFn: async () => ({ ok: true, messages: [{ id: "o" }] }),
       __chatCompletionsCreateForTests: async (args) => {
         const blob = JSON.stringify(args);
         sawOwnerAnswerInPrompt = /OWNER_ANSWER_FOR_THIS_REQUEST/.test(blob);
         assert.doesNotMatch(blob, /HOLD_REPLIES/);
-        return {
-          choices: [
-            {
-              message: {
-                content: JSON.stringify({
-                  customerReply: "Advance 5000 PKR confirm hai.",
-                  needsFollowup: false,
-                  missingInfoType: null,
-                }),
-              },
-            },
-          ],
-        };
+        return followupOpenAiResponse(
+          "Advance half amount before pickup confirm hai."
+        );
       },
     });
     assert.equal(result.openaiUsed, true);
     assert.equal(sawOwnerAnswerInPrompt, true);
-    assert.equal(result.customerFollowupText, "Advance 5000 PKR confirm hai.");
+    assert.equal(
+      result.customerFollowupText,
+      "Advance half amount before pickup confirm hai."
+    );
   });
 });
 

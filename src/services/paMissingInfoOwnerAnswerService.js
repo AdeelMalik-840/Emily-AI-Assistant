@@ -14,7 +14,6 @@ import { resolvePaMissingInfoOwnerTarget } from "./paMissingInfoOwnerNotifyServi
 import {
   applyPaMissingInfoOwnerAnswer,
   getPaMissingInfoRequest,
-  listOpenForAnswerPaMissingInfoRequests,
   markPaMissingInfoCustomerFollowupFailed,
   markPaMissingInfoCustomerFollowupSent,
   PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES,
@@ -31,6 +30,17 @@ const PAMISS_TOKEN_RE = /\b(pamiss_[a-f0-9]{12,32})\b/i;
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
+}
+
+/**
+ * Phase 1: reject empty / punctuation-only owner replies (e.g. "???").
+ * Requires at least one letter or digit. Request stays open on reject.
+ * @param {string | null | undefined} value
+ */
+export function isUsablePaMissingInfoOwnerAnswerText(value) {
+  const text = clean(value, 800);
+  if (!text) return false;
+  return /[\p{L}\p{N}]/u.test(text);
 }
 
 function phoneDigitsOnly(value) {
@@ -133,40 +143,31 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
   let request = null;
   let matchReason = null;
 
-  if (parsed.requestId) {
-    request = await getPaMissingInfoRequest({
-      db: connection,
-      businessId: uid,
-      requestId: parsed.requestId,
-    });
-    if (!request) {
-      return {
-        handled: true,
-        reason: "TOKEN_NOT_FOUND",
-        action: "owner_answer_unmatched",
-        requestId: parsed.requestId,
-        customerFollowupSent: false,
-      };
-    }
-    matchReason = "TOKEN";
-  } else {
-    const openRows = await listOpenForAnswerPaMissingInfoRequests({
-      db: connection,
-      businessId: uid,
-    });
-    if (openRows.length !== 1) {
-      return {
-        handled: true,
-        reason:
-          openRows.length === 0 ? "NO_OPEN_REQUEST" : "AMBIGUOUS_OPEN_REQUESTS",
-        action: "owner_answer_unmatched",
-        openCount: openRows.length,
-        customerFollowupSent: false,
-      };
-    }
-    request = openRows[0];
-    matchReason = "SINGLE_OPEN";
+  // Phase 1: require pamiss_* token. No business-wide SINGLE_OPEN matching.
+  if (!parsed.requestId) {
+    return {
+      handled: true,
+      reason: "TOKEN_REQUIRED",
+      action: "owner_answer_unmatched",
+      customerFollowupSent: false,
+    };
   }
+
+  request = await getPaMissingInfoRequest({
+    db: connection,
+    businessId: uid,
+    requestId: parsed.requestId,
+  });
+  if (!request) {
+    return {
+      handled: true,
+      reason: "TOKEN_NOT_FOUND",
+      action: "owner_answer_unmatched",
+      requestId: parsed.requestId,
+      customerFollowupSent: false,
+    };
+  }
+  matchReason = "TOKEN";
 
   const requestId =
     clean(request.requestId || request.id, 120) || parsed.requestId;
@@ -197,16 +198,16 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
     };
   }
 
-  const ownerAnswer =
-    parsed.ownerAnswer ||
-    (matchReason === "SINGLE_OPEN" ? clean(text, 800) : "");
-  if (!ownerAnswer) {
+  const ownerAnswer = parsed.ownerAnswer;
+  if (!ownerAnswer || !isUsablePaMissingInfoOwnerAnswerText(ownerAnswer)) {
     return {
       handled: true,
-      reason: "EMPTY_OWNER_ANSWER",
-      action: "owner_answer_unmatched",
+      reason: "UNUSABLE_OWNER_ANSWER",
+      action: "owner_answer_rejected",
       requestId,
+      matchReason,
       customerFollowupSent: false,
+      status,
     };
   }
 
