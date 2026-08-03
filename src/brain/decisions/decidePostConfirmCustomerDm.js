@@ -37,7 +37,6 @@ import {
   POST_CONFIRM_EVIDENCE_ENTITIES,
   // legacy compat during migration
   cleanRequestedInformation,
-  mapLegacyRequestedInformationToTurnPlan,
   REQUESTED_INFORMATION_TO_MISSING_INFO_TYPE,
 } from "../facts/resolvePostConfirmRequestedFact.js";
 
@@ -112,6 +111,23 @@ export const POST_CONFIRM_CUSTOMER_INTENTS = Object.freeze([
   "unclear",
 ]);
 
+/**
+ * Brain meaning-only kind. Deterministic code maps this to capability + evidenceNeeds.
+ * Brain is not the authority for evidence-store selection on these kinds.
+ */
+export const POST_CONFIRM_FACT_KINDS = Object.freeze([
+  "documents_checklist",
+  "payment_method",
+  "driver_policy",
+  "delivery_policy",
+  "advance",
+  "freeform_business",
+  "booking_fact",
+  "vague",
+  "non_business",
+  "action",
+]);
+
 /** Honesty-safe fallback — does not promise a follow-up check. */
 export const POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK =
   "Abhi ye detail confirm nahi hai.";
@@ -145,6 +161,106 @@ function cleanAction(value) {
 function cleanSituation(value) {
   const situation = clean(value, 60).toLowerCase();
   return POST_CONFIRM_SITUATIONS.includes(situation) ? situation : "unclear";
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function cleanPostConfirmFactKind(value) {
+  const kind = clean(value, 40).toLowerCase();
+  return POST_CONFIRM_FACT_KINDS.includes(kind) ? kind : null;
+}
+
+/**
+ * Deterministic Turn Plan from Brain meaning (factKind).
+ * Returns null when factKind is absent/invalid or action (mutation/AVR).
+ * Callers must NOT retain Brain-authored capability/evidenceNeeds for factual
+ * asks when this returns null — see parsePostConfirmCustomerDmDecision.
+ *
+ * @param {string | null | undefined} factKind
+ * @param {string | null | undefined} brainCapability
+ * @param {unknown} brainEvidenceNeeds
+ * @returns {{ capability: string | null, evidenceNeeds: Array<Record<string, unknown>> } | null}
+ */
+export function mapFactKindToTurnPlan(
+  factKind,
+  brainCapability = null,
+  brainEvidenceNeeds = []
+) {
+  const kind = cleanPostConfirmFactKind(factKind);
+  if (!kind || kind === "action") return null;
+
+  const need = (entity, concept, attributes) => [
+    { entity, concept, attributes: [...attributes] },
+  ];
+
+  switch (kind) {
+    case "documents_checklist":
+      return {
+        capability: "answer_from_business_profile",
+        evidenceNeeds: need("business_profile", "documents", ["policy"]),
+      };
+    case "payment_method":
+      return {
+        capability: "answer_from_business_profile",
+        evidenceNeeds: need("business_profile", "payment", ["policy"]),
+      };
+    case "driver_policy":
+      return {
+        capability: "answer_from_business_profile",
+        evidenceNeeds: need("business_profile", "driver", ["policy"]),
+      };
+    case "delivery_policy":
+      return {
+        capability: "answer_from_business_profile",
+        evidenceNeeds: need("business_profile", "delivery", ["policy"]),
+      };
+    case "advance":
+      return {
+        capability: "answer_from_business_profile",
+        evidenceNeeds: need("business_profile", "advance", ["amount", "policy"]),
+      };
+    case "freeform_business":
+      return {
+        capability: "answer_from_saved_owner_answer",
+        evidenceNeeds: need("saved_owner_answer", "other", ["answer"]),
+      };
+    case "vague":
+      return { capability: "clarification_needed", evidenceNeeds: [] };
+    case "non_business":
+      return { capability: "social", evidenceNeeds: [] };
+    case "booking_fact": {
+      const normalized = normalizeEvidenceNeeds(brainEvidenceNeeds);
+      const bookingNeeds = normalized.filter((n) => n.entity === "active_booking");
+      if (bookingNeeds.length > 0) {
+        return {
+          capability: "answer_from_active_booking",
+          evidenceNeeds: bookingNeeds,
+        };
+      }
+      if (
+        cleanPostConfirmCapability(brainCapability) ===
+          "answer_from_active_booking" &&
+        normalized.length > 0
+      ) {
+        return {
+          capability: "answer_from_active_booking",
+          evidenceNeeds: normalized,
+        };
+      }
+      // Preserve inventory availability asks when Brain still emits that capability.
+      if (cleanPostConfirmCapability(brainCapability) === "availability_request") {
+        return {
+          capability: "availability_request",
+          evidenceNeeds: normalized,
+        };
+      }
+      return { capability: "clarification_needed", evidenceNeeds: [] };
+    }
+    default:
+      return null;
+  }
 }
 
 function cleanIntent(value) {
@@ -1162,13 +1278,66 @@ function isPostConfirmReadOnlyInformationalDecision(decision) {
 }
 
 /**
- * Valid factual-deferred semantic state: Brain emitted a Turn Plan that requires
- * evidence resolution; customerReply is empty until resolve + compose.
+ * Whether structured fields mark a factual informational ask that requires an
+ * authoritative factKind before any capability/evidenceNeeds store plan is trusted.
+ * Does not inspect customer text. Does not treat bare question-shaped social as factual.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ */
+export function isPostConfirmFactualAskRequiringFactKind(decision) {
+  if (!decision || typeof decision !== "object") return false;
+  if (decision.factKindMissingOnFactualAsk === true) return true;
+
+  const action = cleanAction(decision.action);
+  if (
+    action === "request_booking_mutation" ||
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability"
+  ) {
+    return false;
+  }
+  if (cleanMutationIntent(decision.mutationIntent) !== "none") return false;
+  if (decision.mutationExecutionRequested === true) return false;
+
+  const capability = cleanPostConfirmCapability(decision.capability);
+  if (capability === "mutation_requested") return false;
+
+  const act = cleanAct(decision.conversationAct);
+  const evidenceNeeds = normalizeEvidenceNeeds(decision.evidenceNeeds);
+  const legacyInfo = cleanRequestedInformation(decision.requestedInformation);
+  const storePlanPresent =
+    capabilityRequiresEvidenceResolution(capability) ||
+    Boolean(legacyInfo) ||
+    evidenceNeeds.length > 0;
+
+  // Hostile or incomplete store plans without factKind always require authority.
+  if (storePlanPresent) return true;
+
+  if (capability === "social") {
+    return (
+      act === "information_request" || decision.customerIntent === "ask_fact"
+    );
+  }
+
+  return (
+    act === "information_request" ||
+    decision.customerIntent === "ask_fact" ||
+    decision.customerIsAskingQuestion === true
+  );
+}
+
+/**
+ * Valid factual-deferred semantic state: authoritative factKind mapped to a
+ * Turn Plan that requires evidence resolution; customerReply empty until compose.
  *
  * @param {Record<string, unknown> | null | undefined} decision
  */
 export function isDeferredPostConfirmInformationalDecision(decision) {
   if (!decision || typeof decision !== "object") return false;
+  if (decision.factKindMissingOnFactualAsk === true) return false;
+  const factKind = cleanPostConfirmFactKind(decision.factKind);
+  // Deferred store plans require authoritative factKind (not action / absent).
+  if (!factKind || factKind === "action") return false;
   if (cleanAction(decision.action) !== "reply") return false;
   if (decision.shouldReply === false) return false;
   if (cleanMutationIntent(decision.mutationIntent) !== "none") return false;
@@ -1182,9 +1351,7 @@ export function isDeferredPostConfirmInformationalDecision(decision) {
   }
   const capability = cleanPostConfirmCapability(decision.capability);
   if (!capabilityRequiresEvidenceResolution(capability)) {
-    // Legacy deferred: requestedInformation set without capability yet.
-    const legacy = cleanRequestedInformation(decision.requestedInformation);
-    return Boolean(legacy);
+    return false;
   }
   if (capability === "clarification_needed") return true;
   if (capability === "availability_request") return true;
@@ -1201,6 +1368,7 @@ export function isDeferredPostConfirmInformationalDecision(decision) {
  */
 export function isPostConfirmFactualInformationalSemanticDecision(decision) {
   if (!decision || typeof decision !== "object") return false;
+  if (decision.factKindMissingOnFactualAsk === true) return true;
   const action = cleanAction(decision.action);
   if (
     action === "request_booking_mutation" ||
@@ -1237,7 +1405,8 @@ export function isPostConfirmFactualInformationalSemanticDecision(decision) {
     act === "information_request" ||
     decision.customerIntent === "ask_fact" ||
     decision.customerIsAskingQuestion === true ||
-    capabilityRequiresEvidenceResolution(capability);
+    capabilityRequiresEvidenceResolution(capability) ||
+    Boolean(cleanRequestedInformation(decision.requestedInformation));
 
   // Intentional social silence is allowed only without factual markers.
   // Silence / shouldReply=false on a factual ask is a contract violation.
@@ -1528,36 +1697,27 @@ function buildPostConfirmFactualRequestedInformationCorrection(
 ) {
   return [
     "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — not a second classifier).",
-    "This turn is a factual informational ask, but the Turn Plan is missing a valid capability + evidenceNeeds.",
+    "This turn is a factual informational ask, but factKind (customer meaning) is missing or invalid so runtime cannot build a Turn Plan.",
     `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
     `Previous decision (invalid): ${JSON.stringify({
       situation: priorDecision?.situation ?? null,
       conversationAct: priorDecision?.conversationAct ?? null,
       customerIntent: priorDecision?.customerIntent ?? null,
       action: priorDecision?.action ?? null,
+      factKind: priorDecision?.factKind ?? null,
       capability: priorDecision?.capability ?? null,
       evidenceNeeds: priorDecision?.evidenceNeeds ?? null,
       customerReply: priorDecision?.customerReply ?? "",
     })}`,
     "Rules:",
-    "- First classify: is this a business/item/service/booking fact about THIS business or the customer's booking, or is it social/general/non-business?",
-    "- Clearly social, conversational, or general/non-business (even if phrased as a question; even if customerIsAskingQuestion was true) → capability=social with non-empty customerReply and NO business claims, OR capability=clarification_needed with evidenceNeeds=[] when unrelated/unclear. customerReply may be non-empty for social.",
-    "- Never use answer_from_saved_owner_answer + other/answer for general knowledge, current time/date, weather, jokes, maths, politics, news, trivia, Emily personal identity, greetings, thanks, farewells, or any ask with no business/item/service/booking connection.",
-    "- Never force capability=answer_from_saved_owner_answer or concept=other merely because the message is a question.",
-    "- Clearly business/item/service/booking factual ask → do NOT leave capability null; prefer a valid answer_from_* / availability_request Turn Plan; customerReply MUST be empty for deferred factual plans. Do NOT use capability=social or capability=clarification_needed for a clear business/booking fact ask.",
+    "- Set factKind to one of: " + POST_CONFIRM_FACT_KINDS.join(", "),
+    "- Runtime builds capability + evidenceNeeds from factKind. Do not rely on choosing evidence stores yourself.",
+    "- documents_checklist = required papers checklist only. payment_method = how to pay only. driver_policy / delivery_policy / advance = those profile meanings only.",
+    "- Named THIS-business operating rules/policies/item features that are not those five → factKind=freeform_business (including refund/fuel/cancellation/insurance). Never use documents_checklist merely because the word policy appears.",
+    "- Active booking fields → factKind=booking_fact with active_booking evidenceNeeds.",
+    "- Vague → factKind=vague. Non-business/social/general → factKind=non_business with non-empty customerReply when action=reply.",
     "- Keep action=reply (or silence only for genuine social endings), mutationIntent=none unless a real mutation applies.",
-    "- Set capability to one of: " + POST_CONFIRM_CAPABILITIES.join(", "),
-    "- For answer_from_* capabilities, set non-empty evidenceNeeds: [{entity, concept, attributes}].",
-    `- Entities: ${POST_CONFIRM_EVIDENCE_ENTITIES.join(", ")}`,
-    `- Concepts: ${POST_CONFIRM_EVIDENCE_CONCEPTS.join(", ")}`,
-    `- Attributes: ${POST_CONFIRM_EVIDENCE_ATTRIBUTES.join(", ")}`,
-    "- Freeform THIS-business policy/rule/service/item/booking facts not covered by structured advance/driver/delivery/documents/payment fields → answer_from_saved_owner_answer + [{entity:\"saved_owner_answer\",concept:\"other\",attributes:[\"answer\"]}]. Examples: fuel/refund/cancellation/insurance/late-return/mileage/accident/outstation/child-seat/item features. Do NOT invent a business_profile concept. Never map an unknown \"* policy\" into documents or payment merely because the word policy appears.",
-    "- documents = required papers/document checklist only. payment = payment method/how to pay only. delivery/driver = those policies only.",
-    "- Vague/underspecified or unrelated asks with no identifiable business or booking fact → clarification_needed with evidenceNeeds=[].",
-    "- Advance/deposit amount or advance rules → answer_from_business_profile + advance amount/policy attributes.",
-    "- Genuine documents / payment / driver / delivery policy (not refund/fuel/cancellation/insurance freeform) → answer_from_business_profile + matching concept attributes:[\"policy\"].",
-    "- Active booking fields (pickup/delivery/time/price/status/reference/identity/dates/duration) → answer_from_active_booking with matching evidenceNeeds.",
-    "- New inventory availability asks → capability=availability_request (never answer from active booking).",
+    "- customerReply MUST be empty for deferred factual factKinds.",
     "- Return the same required JSON schema only.",
   ].join("\n");
 }
@@ -2124,6 +2284,8 @@ function defaultDecision(overrides = {}) {
     customerIsAskingQuestion: false,
     requestedInfoType: null,
     requestedInformation: null,
+    factKind: null,
+    factKindMissingOnFactualAsk: false,
     capability: null,
     evidenceNeeds: [],
     informationalReplyDeferred: false,
@@ -2195,31 +2357,65 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   );
   let capability = cleanPostConfirmCapability(parsed.capability);
   let evidenceNeeds = normalizeEvidenceNeeds(parsed.evidenceNeeds);
+  const factKind = cleanPostConfirmFactKind(parsed.factKind);
+  let factKindMissingOnFactualAsk = false;
 
-  // Legacy requestedInformation → compact Turn Plan when capability absent.
-  if (!capability && requestedInformation) {
-    const mapped = mapLegacyRequestedInformationToTurnPlan(requestedInformation);
-    capability = mapped.capability;
-    evidenceNeeds = mapped.evidenceNeeds;
+  // Meaning → store: factKind is the only authority for informational store plans.
+  // Brain-generated capability/evidenceNeeds are never trusted when factKind maps.
+  // factKind=action → mutation/AVR paths preserve existing behaviour below.
+  // factKind absent/invalid on a factual ask → strip Brain/legacy stores and
+  // force same-Brain correction (never retain documents/other guesses).
+  const factKindPlan = mapFactKindToTurnPlan(
+    factKind,
+    capability,
+    evidenceNeeds
+  );
+  if (factKindPlan) {
+    capability = factKindPlan.capability;
+    evidenceNeeds = normalizeEvidenceNeeds(factKindPlan.evidenceNeeds);
+  } else if (factKind === "action") {
+    // Mutation/AVR: do not build evidence stores from factKind.
+  } else if (
+    isPostConfirmFactualAskRequiringFactKind({
+      action,
+      mutationIntent: mutationIntentEarly,
+      mutationExecutionRequested: parsed.mutationExecutionRequested,
+      conversationAct: parsed.conversationAct,
+      customerIntent: parsed.customerIntent,
+      customerIsAskingQuestion: parsed.customerIsAskingQuestion,
+      capability,
+      evidenceNeeds,
+      requestedInformation,
+    })
+  ) {
+    factKindMissingOnFactualAsk = true;
+    capability = null;
+    evidenceNeeds = [];
+    requestedInformation = null;
   }
 
   const deferredInformationalCandidate =
+    !factKindMissingOnFactualAsk &&
+    Boolean(factKind) &&
+    factKind !== "action" &&
     action === "reply" &&
     shouldReply !== false &&
     mutationIntentEarly === "none" &&
     parsed.mutationExecutionRequested !== true &&
-    (capabilityRequiresEvidenceResolution(capability) ||
-      Boolean(requestedInformation));
+    capabilityRequiresEvidenceResolution(capability);
 
   // Silence / no-reply may have empty customerReply.
   // request_booking_mutation may also be empty: final wording is composed after
   // deterministic validate/execute (semantic decision only in this Brain call).
   // Factual Turn Plans defer wording until evidence resolve + compose.
+  // Missing factKind on a factual ask also allows empty reply so the decide
+  // loop can run same-Brain correction (not accept a Brain store guess).
   if (
     (action === "silence" ||
       shouldReply === false ||
       action === "request_booking_mutation" ||
-      deferredInformationalCandidate) &&
+      deferredInformationalCandidate ||
+      factKindMissingOnFactualAsk) &&
     !customerReply
   ) {
     customerReply = "";
@@ -2417,13 +2613,18 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   // Semantic contract: a factual Turn Plan defers wording — never silence.
   // Models often emit capability+evidenceNeeds with action=silence after decide
   // prompts omit answerable facts; that must become deferred resolve, not mute.
+  // Requires authoritative factKind — never defer on Brain store guesses alone.
+  const authoritativeFactKind =
+    Boolean(factKind) &&
+    factKind !== "action" &&
+    !factKindMissingOnFactualAsk;
   const factualTurnPlanPresent =
+    authoritativeFactKind &&
     mutationIntent === "none" &&
     action !== "request_booking_mutation" &&
     action !== "confirm_pending_availability" &&
     action !== "decline_pending_availability" &&
-    (capabilityRequiresEvidenceResolution(capability) ||
-      Boolean(requestedInformation));
+    capabilityRequiresEvidenceResolution(capability);
   if (factualTurnPlanPresent) {
     action = "reply";
     shouldReply = true;
@@ -2431,11 +2632,11 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   }
 
   const informationalReplyDeferred =
+    authoritativeFactKind &&
     action === "reply" &&
     shouldReply !== false &&
     mutationIntent === "none" &&
-    (capabilityRequiresEvidenceResolution(capability) ||
-      Boolean(requestedInformation));
+    capabilityRequiresEvidenceResolution(capability);
 
   return applyPostConfirmAntiEchoAndSilence(
     {
@@ -2446,6 +2647,8 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
         conversationAct === "information_request" ? requestedInfoType : null,
       requestedInformation:
         conversationAct === "information_request" ? requestedInformation : null,
+      factKind,
+      factKindMissingOnFactualAsk,
       capability,
       evidenceNeeds,
       informationalReplyDeferred,
@@ -2721,7 +2924,16 @@ export async function executePostConfirmPaLaneDecision({
         requestedInformation: {
           type: ["string", "null"],
           description:
-            "Legacy optional label. Prefer capability + evidenceNeeds Turn Plan.",
+            "Legacy optional label. Prefer factKind; runtime maps factKind to capability + evidenceNeeds.",
+        },
+        factKind: {
+          anyOf: [
+            { type: "string", enum: [...POST_CONFIRM_FACT_KINDS] },
+            { type: "null" },
+          ],
+          description:
+            "Customer meaning only. Runtime builds capability + evidenceNeeds from factKind. Allowed: " +
+            POST_CONFIRM_FACT_KINDS.join(", "),
         },
         capability: {
           anyOf: [
@@ -2729,8 +2941,7 @@ export async function executePostConfirmPaLaneDecision({
             { type: "null" },
           ],
           description:
-            "Compact Turn Plan capability. Allowed: " +
-            POST_CONFIRM_CAPABILITIES.join(", "),
+            "Optional hint only for booking_fact / availability. Runtime overwrites from factKind when factKind is set (except action). Factual asks with missing factKind discard Brain capability/evidenceNeeds.",
         },
         evidenceNeeds: {
           type: "array",
@@ -2755,7 +2966,7 @@ export async function executePostConfirmPaLaneDecision({
                   enum: [...POST_CONFIRM_EVIDENCE_ATTRIBUTES],
                 },
                 description:
-                  "For times: pair attribute time with concept pickup OR delivery (not both, never the opposite concept).",
+                  "For times: pair attribute time with concept pickup OR delivery (not both, never the opposite concept). For booking_fact, emit active_booking evidenceNeeds; runtime preserves them.",
               },
             },
             required: ["entity", "concept", "attributes"],
@@ -2895,6 +3106,7 @@ export async function executePostConfirmPaLaneDecision({
         "customerIsAskingQuestion",
         "requestedInfoType",
         "requestedInformation",
+        "factKind",
         "capability",
         "evidenceNeeds",
         "shouldReply",
@@ -2919,26 +3131,34 @@ export async function executePostConfirmPaLaneDecision({
 LANE OBJECTIVE (post_confirm_pa):
 OUTPUT FORMAT (required):
 Return STRICT JSON (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"requestedInformation":null,"capability":"social","evidenceNeeds":[],"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"requestedInformation":null,"factKind":"non_business","capability":"social","evidenceNeeds":[],"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
 - If you would only repeat them, use action="silence" and shouldReply=false with empty customerReply.
 
 CUSTOMER_REPLY CONTRACT (critical):
-- Social / chit-chat / farewell / ack turns: capability="social", evidenceNeeds=[], and when action="reply" customerReply MUST be a non-empty natural sendable message with NO booking facts, prices, policies, dates, times, locations, references, or availability claims.
-- Empty customerReply is allowed for: action="silence" (genuine social only); action="request_booking_mutation"; OR factual Turn Plans (answer_from_*/clarification_needed/availability_request) with action="reply", shouldReply=true — wording after evidence resolution.
-- NEVER use action=silence / shouldReply=false when capability is answer_from_*, clarification_needed, or availability_request. Factual Turn Plans must use action=reply + empty customerReply.
-- For factual asks: capability + evidenceNeeds are REQUIRED. Do NOT invent facts into customerReply — defer wording.
+- Social / chit-chat / farewell / ack turns: factKind=non_business (or omit store routing), capability hint may be social, evidenceNeeds=[], and when action="reply" customerReply MUST be a non-empty natural sendable message with NO booking facts, prices, policies, dates, times, locations, references, or availability claims.
+- Empty customerReply is allowed for: action="silence" (genuine social only); action="request_booking_mutation"; OR factual factKind plans (runtime builds answer_from_*/clarification/availability) with action="reply", shouldReply=true — wording after evidence resolution.
+- NEVER use action=silence / shouldReply=false when factKind is a factual kind (documents_checklist, payment_method, driver_policy, delivery_policy, advance, freeform_business, booking_fact, vague). Factual plans must use action=reply + empty customerReply.
+- For factual asks: set factKind (meaning only). Do NOT invent facts into customerReply — defer wording.
 - Never accept a direct factual customerReply as social.
 
-TURN PLAN (informational — semantic only in this call):
-- Factual booking/business asks → capability=answer_from_active_booking | answer_from_business_profile | answer_from_saved_owner_answer with evidenceNeeds like {"entity":"active_booking","concept":"pickup","attributes":["location"]}. Leave customerReply="".
-- Vague ask → capability=clarification_needed, evidenceNeeds=[], customerReply="".
-- New inventory availability (not about the confirmed booking) → capability=availability_request; never answer from active booking facts.
-- Social → capability=social.
+MEANING + TURN PLAN (critical):
+- You decide customer MEANING via factKind only. Runtime builds capability + evidenceNeeds from factKind. Do NOT choose evidence stores yourself for structured/freeform/vague/non_business kinds — any capability/evidenceNeeds you emit for those kinds are overwritten.
+- factKind values: ${POST_CONFIRM_FACT_KINDS.join(", ")}
+- documents_checklist = required papers/document checklist only (CNIC, license, contract papers) — NOT refund/fuel/cancellation/insurance/late-return freeform rules
+- payment_method = how to pay / payment method only — NOT refund/cancellation freeform rules
+- driver_policy = driver availability/policy only
+- delivery_policy = delivery availability/area/policy only (business profile) — NOT booking delivery TIME/LOCATION
+- advance = advance/deposit amount or advance rules only
+- freeform_business = named THIS-business/item/service/operating-rule fact that does NOT fit the five structured kinds above (including refund/fuel/cancellation/insurance/late-return/mileage/accident/outstation/child-seat/item features)
+- booking_fact = active booking field ask; ALSO emit evidenceNeeds for active_booking slots (pickup/delivery/time/location/price/status/reference/identity/dates/duration). Runtime preserves those active_booking needs.
+- vague = underspecified with no identifiable fact ("mujhe details chahiye")
+- non_business = social/general/time/weather/jokes/maths/politics/trivia/Emily personal — never owner escalation
+- action = mutation or pending AVR confirm/decline — keep mutationIntent/AVR fields; runtime does not map factKind to evidence stores
+- New inventory availability ("koi gari available?") → factKind=booking_fact with capability hint availability_request (runtime may preserve availability_request from that hint); never answer inventory from active booking fields alone. Never omit factKind on factual asks.
 - Never invent dates, times, amounts, locations, statuses, policies, references, or items in this call.
-- Never route general knowledge, current time/weather/jokes/maths/politics/news/trivia, or Emily personal/social chat to answer_from_saved_owner_answer + other.
 
 INFORMATIONAL VS MUTATION (delivery/pickup):
 - Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", bookingSelectionMode="focused" when a trusted booking is in scope.
@@ -2963,35 +3183,23 @@ STEP 1 — conversationAct:
 
 STEP 2 — customerIsAskingQuestion=true only for real information asks (including "ok driver milega?").
 
-STEP 3 — Turn Plan capability + evidenceNeeds (MANDATORY for factual asks):
-Capabilities: ${POST_CONFIRM_CAPABILITIES.join(", ")}
-evidenceNeeds item: {entity, concept, attributes[]}
-- Entities: ${POST_CONFIRM_EVIDENCE_ENTITIES.join(", ")}
-- Concepts: ${POST_CONFIRM_EVIDENCE_CONCEPTS.join(", ")}
-- Attributes: ${POST_CONFIRM_EVIDENCE_ATTRIBUTES.join(", ")}
-Examples:
-- pickup where / "kahan ana" → answer_from_active_booking + [{entity:"active_booking",concept:"pickup",attributes:["location"]}] (even when evidenceAvailability.pickup_location=absent)
-- pickup time / "kitne baje pickup" → answer_from_active_booking + pickup/time (NEVER delivery/time)
-- delivery TIME on the confirmed booking ("delivery ka time", "deliver kab") → answer_from_active_booking + [{entity:"active_booking",concept:"delivery",attributes:["time"]}] — NEVER business_profile delivery/policy; NEVER pickup/time
-- delivery LOCATION/address on the booking → answer_from_active_booking + delivery/location
-- "kitny din" / duration → concept:"duration", attributes:["days"]
-- "total rent" / "daily rent" / price → concept:"price", attributes:["total","daily"]
-- "booking confirm hai?" / status → concept:"status", attributes:["value"] (NOT capability=social)
-- booking reference → concept:"reference", attributes:["value"]
-- which car / identity → concept:"identity", attributes:["label"]
-- dates / "kab se start" → concept:"dates", attributes:["start","end"] (NOT clarification_needed when dates are the clear ask)
-- documents / payment / driver / delivery policy ("delivery ho skti hai?", "kis area delivery") → answer_from_business_profile + [{entity:"business_profile",concept:"delivery"|"documents"|"payment"|"driver",attributes:["policy"]}] — NOT availability_request
-- documents means REQUIRED PAPERS / document checklist (CNIC, license, contract papers) only — NOT refund/fuel/cancellation/insurance/late-return/mileage/accident/outstation or other freeform operating rules
-- payment means payment method / how to pay only — NOT refund/cancellation/insurance freeform rules
-- advance amount/policy → answer_from_business_profile + advance attributes
-- Freeform THIS-business facts only: answer_from_saved_owner_answer + [{entity:"saved_owner_answer",concept:"other",attributes:["answer"]}] with action=reply, customerReply="" — ONLY when the ask is about THIS business, its policies/operating rules, its services, its items/products/vehicles, or the customer's active booking, and it is not covered by structured advance/driver/delivery/documents/payment profile fields. Examples: fuel/refund/cancellation/insurance/late-return/mileage/accident/outstation/child-seat availability/item features/booking-specific operational facts. Resolver: found when a saved owner answer exists; otherwise not_found + missingInfoType=other for the existing missing-info gate. Never invent fuel/refund/cancellation concepts or business_profile fields for these. Never map an unknown "* policy" into documents or payment merely because the word "policy" appears.
-- NEVER use saved_owner_answer + other/answer for: general knowledge; current time or date; weather; jokes; maths/calculations; politics or world facts; news; trivia; Emily's name/location/age/home/feelings/personal identity; greetings, thanks, acknowledgements, farewells, or casual conversation; or any unrelated question with no business, item, service, or booking connection. Those stay capability=social (conversational) or clarification_needed (unclear/unrelated). They must never produce missingInfoType=other or owner escalation. Never choose other merely because the message is phrased as a question.
-- "owner se confirm" / ask Emily to check with owner without a concrete fact → clarification_needed (not answer_from_active_booking)
-- "koi gari available?" (new vehicle/inventory search) → availability_request (do NOT use active booking evidence; do NOT use availability_request for delivery-policy asks)
-- social hello / acha / thanks → capability=social, evidenceNeeds=[], non-empty customerReply with NO booking/business factual claims
-- "mujhe details chahiye" / vague only → clarification_needed. If the customer named a concrete concept (pickup/delivery/documents/dates/price/status) OR a concrete THIS-business freeform policy/rule/service/item fact, do NOT use clarification_needed — use answer_from_* even when evidenceAvailability is absent (resolver returns not_found).
-- Keep attributes ONLY from the compact attribute list (policy, location, time, days, value, label, total, daily, start, end, amount, answer). Never invent attribute names like deliveryPolicy.
-- requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
+STEP 3 — factKind meaning (MANDATORY for factual asks; runtime builds the store plan):
+factKind values: ${POST_CONFIRM_FACT_KINDS.join(", ")}
+- Set factKind to the customer meaning. Runtime maps factKind → capability + evidenceNeeds. Do not treat capability/evidenceNeeds as the store authority when factKind is set (except booking_fact active_booking needs and action).
+Examples (meaning → factKind; leave customerReply="" for factual kinds):
+- required documents / papers checklist → factKind=documents_checklist
+- card/cash how to pay → factKind=payment_method
+- driver available / driver policy → factKind=driver_policy
+- delivery area / delivery possible (profile) → factKind=delivery_policy — NOT booking delivery time
+- advance / deposit amount or rules → factKind=advance
+- refund / fuel / cancellation / insurance / late-return / mileage / accident / outstation / child-seat / item features → factKind=freeform_business (NOT documents_checklist or payment_method merely because "policy" appears)
+- pickup where / pickup time / delivery TIME on booking / price / status / reference / identity / dates / duration → factKind=booking_fact AND evidenceNeeds with active_booking concepts (pickup/delivery/price/status/reference/identity/dates/duration + attributes). pickup≠delivery.
+- "mujhe details chahiye" / vague only → factKind=vague
+- general knowledge / time / weather / jokes / maths / politics / Emily personal / hello / thanks → factKind=non_business
+- extend/cancel/change pickup or delivery details / pending AVR confirm|decline → factKind=action with matching action/mutationIntent/AVR fields
+- "owner se confirm" without a concrete fact → factKind=vague
+- "koi gari available?" (new inventory) → factKind=booking_fact with availability_request capability hint (not an omitted factKind; never invent booking field answers for inventory)
+- Never invent attribute names. requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
 
 STEP 4 — action:
 - silence: no WhatsApp send (shouldReply=false, customerReply="")

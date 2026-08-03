@@ -100,8 +100,50 @@ function groundedFacts(overrides = {}) {
   };
 }
 
+
+/** Test-only: inject authoritative factKind so production never accepts Brain stores without it. */
+function inferTestOnlyFactKind(d) {
+  if (d?.factKind) return d.factKind;
+  const action = d?.action;
+  if (
+    action === "request_booking_mutation" ||
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability"
+  ) {
+    return "action";
+  }
+  if (d?.mutationIntent && d.mutationIntent !== "none") return "action";
+  const cap = d?.capability;
+  const concept = Array.isArray(d?.evidenceNeeds) ? d.evidenceNeeds[0]?.concept : null;
+  if (cap === "social") return "non_business";
+  if (cap === "mutation_requested") return "action";
+  if (cap === "clarification_needed") return "vague";
+  if (cap === "answer_from_saved_owner_answer") return "freeform_business";
+  if (cap === "answer_from_active_booking" || cap === "availability_request") {
+    return "booking_fact";
+  }
+  if (cap === "answer_from_business_profile") {
+    if (concept === "documents") return "documents_checklist";
+    if (concept === "payment") return "payment_method";
+    if (concept === "driver") return "driver_policy";
+    if (concept === "delivery") return "delivery_policy";
+    if (concept === "advance") return "advance";
+    return "advance";
+  }
+  if (
+    (d?.conversationAct === "chit_chat" ||
+      d?.conversationAct === "acknowledgement" ||
+      d?.conversationAct === "thanks") &&
+    d?.customerIsAskingQuestion !== true &&
+    d?.customerIntent !== "ask_fact"
+  ) {
+    return "non_business";
+  }
+  return null;
+}
+
 function decision(overrides = {}) {
-  return JSON.stringify({
+  const payload = {
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -149,7 +191,11 @@ function decision(overrides = {}) {
       exposesInternalProcess: false,
     },
     ...overrides,
-  });
+  };
+  if (!Object.prototype.hasOwnProperty.call(overrides, "factKind")) {
+    payload.factKind = inferTestOnlyFactKind(payload);
+  }
+  return JSON.stringify(payload);
 }
 
 async function runDecide(responses, options = {}) {
@@ -322,8 +368,11 @@ test("4. real delivery-change request still classifies as update_delivery", asyn
 
 test("5. empty customerReply for action=reply rejected by parser validation", () => {
   const raw = decision({
+    conversationAct: "chit_chat",
+    customerIntent: "unclear",
+    customerIsAskingQuestion: false,
     requestedInformation: null,
-    capability: null,
+    capability: "social",
     evidenceNeeds: [],
     customerReply: "",
     shouldReply: true,
@@ -332,7 +381,7 @@ test("5. empty customerReply for action=reply rejected by parser validation", ()
   assert.equal(classifyPostConfirmOpenAiUsabilityFailure(raw), "empty_required_reply");
   assert.equal(
     parsePostConfirmCustomerDmDecision(raw, {
-      userMessage: "Delivery ho skti hai?",
+      userMessage: "hello",
     }),
     null
   );

@@ -117,6 +117,7 @@ function decision(overrides = {}) {
     customerIsAskingQuestion: true,
     requestedInfoType: null,
     requestedInformation: null,
+    factKind: null,
     shouldReply: true,
     customerReply: "Kia Stonic 4 din ke liye book hai.",
     action: "reply",
@@ -226,6 +227,7 @@ test("verified claim mismatch reasons helper covers required set", () => {
 
 function bookingEvidence(concept, attributes, extra = {}) {
   return {
+    factKind: "booking_fact",
     capability: "answer_from_active_booking",
     evidenceNeeds: [
       {
@@ -269,9 +271,10 @@ test("A. missing pickup location: invent without Turn Plan corrected to deferred
   assert.equal(result.decision.capability, "answer_from_active_booking");
   assert.equal(result.decision.evidenceNeeds?.[0]?.concept, "pickup");
   const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  assert.match(correctionPrompt, /FACTUAL_TURN_PLAN_REQUIRED|capability|evidenceNeeds/i);
+  assert.match(correctionPrompt, /FACTUAL_TURN_PLAN_REQUIRED|capability|evidenceNeeds|factKind/i);
   assert.match(correctionPrompt, /customerReply MUST be empty/i);
-  assert.match(correctionPrompt, /Do NOT use capability=social/i);
+  assert.match(correctionPrompt, /factKind/i);
+  assert.match(correctionPrompt, /booking_fact|Active booking fields/i);
 });
 
 test("B. missing advance/deposit fact: invent without Turn Plan corrected to deferred plan", async () => {
@@ -287,6 +290,7 @@ test("B. missing advance/deposit fact: invent without Turn Plan corrected to def
         }),
       }),
       decision({
+        factKind: "advance",
         capability: "answer_from_business_profile",
         evidenceNeeds: [
           {
@@ -314,9 +318,10 @@ test("B. missing advance/deposit fact: invent without Turn Plan corrected to def
   assert.equal(result.decision.informationalReplyDeferred, true);
   assert.equal(result.decision.capability, "answer_from_business_profile");
   const correctionPrompt = String(calls[1]?.messages?.[1]?.content || "");
-  assert.match(correctionPrompt, /capability|evidenceNeeds/i);
+  assert.match(correctionPrompt, /capability|evidenceNeeds|factKind/i);
   assert.match(correctionPrompt, /customerReply MUST be empty/i);
-  assert.match(correctionPrompt, /Do NOT use capability=social/i);
+  assert.match(correctionPrompt, /factKind/i);
+  assert.match(correctionPrompt, /advance|booking_fact|freeform_business/i);
 });
 
 test("C. verified pickupTime ask defers via Turn Plan (wording after resolve)", async () => {

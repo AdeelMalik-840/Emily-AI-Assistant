@@ -270,6 +270,7 @@ test("deferred informational parse allows empty customerReply", () => {
       customerIsAskingQuestion: true,
       requestedInfoType: null,
       requestedInformation: "pickup_location",
+      factKind: "booking_fact",
       capability: "answer_from_active_booking",
       evidenceNeeds: [
         {
@@ -330,7 +331,7 @@ test("deferred informational parse allows empty customerReply", () => {
   assert.equal(isDeferredPostConfirmInformationalDecision(decision), true);
 });
 
-test("legacy requestedInformation alone still maps to Turn Plan on parse", () => {
+test("legacy requestedInformation alone does not preserve a store plan without factKind", () => {
   const decision = parsePostConfirmCustomerDmDecision(
     JSON.stringify({
       situation: "new_question",
@@ -339,6 +340,9 @@ test("legacy requestedInformation alone still maps to Turn Plan on parse", () =>
       customerIsAskingQuestion: true,
       requestedInfoType: null,
       requestedInformation: "pickup_location",
+      factKind: null,
+      capability: null,
+      evidenceNeeds: [],
       shouldReply: true,
       customerReply: "",
       action: "reply",
@@ -383,15 +387,13 @@ test("legacy requestedInformation alone still maps to Turn Plan on parse", () =>
     })
   );
   assert.ok(decision);
-  assert.equal(decision.capability, "answer_from_active_booking");
-  assert.deepEqual(decision.evidenceNeeds, [
-    {
-      entity: "active_booking",
-      concept: "pickup",
-      attributes: ["location"],
-    },
-  ]);
-  assert.equal(decision.informationalReplyDeferred, true);
+  assert.equal(decision.factKind, null);
+  assert.equal(decision.factKindMissingOnFactualAsk, true);
+  assert.equal(decision.capability, null);
+  assert.deepEqual(decision.evidenceNeeds, []);
+  assert.equal(decision.requestedInformation, null);
+  assert.equal(decision.informationalReplyDeferred, false);
+  assert.equal(isDeferredPostConfirmInformationalDecision(decision), false);
 });
 
 test("acknowledgement act keeps answer_from Turn Plan evidenceNeeds", () => {
@@ -403,6 +405,7 @@ test("acknowledgement act keeps answer_from Turn Plan evidenceNeeds", () => {
       customerIsAskingQuestion: true,
       requestedInfoType: null,
       requestedInformation: null,
+      factKind: "booking_fact",
       capability: "answer_from_active_booking",
       evidenceNeeds: [
         {
@@ -463,7 +466,7 @@ test("acknowledgement act keeps answer_from Turn Plan evidenceNeeds", () => {
   assert.equal(isDeferredPostConfirmInformationalDecision(decision), true);
 });
 
-test("ordinary empty reply without requestedInformation still fails closed", () => {
+test("ordinary empty reply without factKind marks factual ask for correction (no store plan)", () => {
   const decision = parsePostConfirmCustomerDmDecision(
     JSON.stringify({
       situation: "new_question",
@@ -472,6 +475,9 @@ test("ordinary empty reply without requestedInformation still fails closed", () 
       customerIsAskingQuestion: true,
       requestedInfoType: null,
       requestedInformation: null,
+      factKind: null,
+      capability: null,
+      evidenceNeeds: [],
       shouldReply: true,
       customerReply: "",
       action: "reply",
@@ -515,7 +521,12 @@ test("ordinary empty reply without requestedInformation still fails closed", () 
       },
     })
   );
-  assert.equal(decision, null);
+  assert.ok(decision);
+  assert.equal(decision.factKindMissingOnFactualAsk, true);
+  assert.equal(decision.capability, null);
+  assert.deepEqual(decision.evidenceNeeds, []);
+  assert.equal(decision.informationalReplyDeferred, false);
+  assert.equal(isDeferredPostConfirmInformationalDecision(decision), false);
 });
 
 test("compose context strips side-channel owner answers and policies", () => {
@@ -1060,33 +1071,21 @@ test("decide guidance scopes freeform other to business facts with explicit nega
     new URL("../src/brain/decisions/decidePostConfirmCustomerDm.js", import.meta.url),
     "utf8"
   );
+  assert.match(decideSrc, /POST_CONFIRM_FACT_KINDS/);
+  assert.match(decideSrc, /mapFactKindToTurnPlan/);
+  assert.match(decideSrc, /factKind=freeform_business/);
+  assert.match(decideSrc, /documents_checklist/);
   assert.match(
     decideSrc,
-    /Freeform THIS-business facts only: answer_from_saved_owner_answer/
+    /NOT documents_checklist or payment_method merely because "policy"/
   );
-  assert.match(decideSrc, /NEVER use saved_owner_answer \+ other\/answer for/);
-  assert.match(decideSrc, /general knowledge/);
-  assert.match(decideSrc, /current time or date/);
-  assert.match(decideSrc, /Never force capability=answer_from_saved_owner_answer or concept=other merely because the message is a question/);
+  assert.match(
+    decideSrc,
+    /Runtime builds capability \+ evidenceNeeds from factKind|runtime maps factKind|Runtime builds capability \+ evidenceNeeds from factKind/i
+  );
   assert.doesNotMatch(
     decideSrc,
     /fuel\/late return\/cancellation\/insurance → clarification_needed/
-  );
-  assert.match(
-    decideSrc,
-    /Do NOT use capability=social or capability=clarification_needed for a clear business\/booking fact ask/
-  );
-  assert.match(
-    decideSrc,
-    /named a concrete concept \(pickup\/delivery\/documents\/dates\/price\/status\) OR a concrete THIS-business freeform policy\/rule\/service\/item fact/
-  );
-  assert.doesNotMatch(
-    decideSrc,
-    /prefer a valid answer_from_\* \/ clarification_needed \/ availability_request/
-  );
-  assert.doesNotMatch(
-    decideSrc,
-    /This ask is factual\/informational\. Do NOT use capability=social/
   );
   const resolverSrc = fs.readFileSync(
     new URL("../src/brain/facts/resolvePostConfirmRequestedFact.js", import.meta.url),
@@ -1095,15 +1094,7 @@ test("decide guidance scopes freeform other to business facts with explicit nega
   // No customer-text phrase routers for fuel/refund/cancellation in resolver.
   assert.doesNotMatch(resolverSrc, /fuel policy|refund policy|cancellation policy/i);
   assert.doesNotMatch(resolverSrc, /messageText|userMessage|customerMessage/);
-  assert.match(
-    decideSrc,
-    /Never map an unknown "\* policy" into documents or payment merely because the word "policy" appears/
-  );
-  assert.match(
-    decideSrc,
-    /documents means REQUIRED PAPERS \/ document checklist/
-  );
-  // No runtime phrase → documents/other remappers in decide (prompt guidance only).
+  // No runtime phrase → documents/other remappers in decide.
   assert.doesNotMatch(
     decideSrc,
     /if\s*\(\s*\/(?:refund|fuel|cancellation)/i
@@ -1113,6 +1104,151 @@ test("decide guidance scopes freeform other to business facts with explicit nega
     decideSrc,
     /classifyCustomerBusinessPaActionIntent|phraseMap|keywordMap/
   );
+});
+
+test("factKind freeform_business overwrites Brain documents/policy evidence plan", () => {
+  const base = {
+    situation: "new_question",
+    conversationAct: "information_request",
+    customerIntent: "ask_fact",
+    customerIsAskingQuestion: true,
+    requestedInfoType: null,
+    requestedInformation: null,
+    factKind: "freeform_business",
+    capability: "answer_from_business_profile",
+    evidenceNeeds: [
+      {
+        entity: "business_profile",
+        concept: "documents",
+        attributes: ["policy"],
+      },
+    ],
+    shouldReply: true,
+    customerReply: "",
+    action: "reply",
+    mutationIntent: "none",
+    mutationExecutionRequested: false,
+    mutationExecutionStatus: "not_executed",
+    actionParameters: {
+      extensionDays: null,
+      startDate: null,
+      endDate: null,
+      durationDays: null,
+      itemId: null,
+      pickupDetails: null,
+      deliveryRequested: null,
+      deliveryAddress: null,
+      deliveryTime: null,
+    },
+    bookingSelectionMode: "focused",
+    selectedBookingIndex: 1,
+    candidateGroundings: [],
+    pendingAvailabilitySelectionIndex: null,
+    groundedFacts: {
+      itemId: null,
+      durationDays: null,
+      bookingStatus: null,
+      bookingReference: null,
+      totalAmount: null,
+      dailyRate: null,
+      advanceAmount: null,
+      startDate: null,
+      endDate: null,
+      pickupTime: null,
+      deliveryTime: null,
+      policyClaims: [],
+    },
+    replySemantics: {
+      claims: [],
+      languageStyle: "roman_urdu",
+      containsTimingPromise: false,
+      exposesInternalProcess: false,
+    },
+  };
+  const decision = parsePostConfirmCustomerDmDecision(JSON.stringify(base));
+  assert.ok(decision);
+  assert.equal(decision.factKind, "freeform_business");
+  assert.equal(decision.capability, "answer_from_saved_owner_answer");
+  assert.deepEqual(decision.evidenceNeeds, [
+    {
+      entity: "saved_owner_answer",
+      concept: "other",
+      attributes: ["answer"],
+    },
+  ]);
+  assert.equal(decision.informationalReplyDeferred, true);
+});
+
+test("factKind documents_checklist maps to business_profile documents policy", () => {
+  const decision = parsePostConfirmCustomerDmDecision(
+    JSON.stringify({
+      situation: "new_question",
+      conversationAct: "information_request",
+      customerIntent: "ask_fact",
+      customerIsAskingQuestion: true,
+      requestedInfoType: null,
+      requestedInformation: null,
+      factKind: "documents_checklist",
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
+      shouldReply: true,
+      customerReply: "",
+      action: "reply",
+      mutationIntent: "none",
+      mutationExecutionRequested: false,
+      mutationExecutionStatus: "not_executed",
+      actionParameters: {
+        extensionDays: null,
+        startDate: null,
+        endDate: null,
+        durationDays: null,
+        itemId: null,
+        pickupDetails: null,
+        deliveryRequested: null,
+        deliveryAddress: null,
+        deliveryTime: null,
+      },
+      bookingSelectionMode: "focused",
+      selectedBookingIndex: 1,
+      candidateGroundings: [],
+      pendingAvailabilitySelectionIndex: null,
+      groundedFacts: {
+        itemId: null,
+        durationDays: null,
+        bookingStatus: null,
+        bookingReference: null,
+        totalAmount: null,
+        dailyRate: null,
+        advanceAmount: null,
+        startDate: null,
+        endDate: null,
+        pickupTime: null,
+        deliveryTime: null,
+        policyClaims: [],
+      },
+      replySemantics: {
+        claims: [],
+        languageStyle: "roman_urdu",
+        containsTimingPromise: false,
+        exposesInternalProcess: false,
+      },
+    })
+  );
+  assert.ok(decision);
+  assert.equal(decision.capability, "answer_from_business_profile");
+  assert.deepEqual(decision.evidenceNeeds, [
+    {
+      entity: "business_profile",
+      concept: "documents",
+      attributes: ["policy"],
+    },
+  ]);
 });
 
 test("structured vs freeform missingInfoType matrix (resolver, no customer text)", () => {
