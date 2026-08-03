@@ -173,6 +173,81 @@ export function cleanPostConfirmFactKind(value) {
 }
 
 /**
+ * Parse RECENT_CONVERSATION / conversation history into ordered turns.
+ * Structural only — no customer-text meaning routing.
+ *
+ * @param {string | null | undefined} conversationHistory
+ * @returns {Array<{ role: "user" | "assistant", text: string }>}
+ */
+export function parsePostConfirmDialogueTurns(conversationHistory) {
+  const raw = String(conversationHistory ?? "");
+  if (!raw.trim()) return [];
+  const turns = [];
+  const re = /(User|Assistant|Emily)\s*:\s*/gi;
+  let match = re.exec(raw);
+  while (match) {
+    const roleRaw = String(match[1] ?? "").toLowerCase();
+    const role = roleRaw === "user" ? "user" : "assistant";
+    const start = match.index + match[0].length;
+    const next = re.exec(raw);
+    const end = next ? next.index : raw.length;
+    const text = raw.slice(start, end).replace(/\s+/g, " ").trim();
+    if (text) turns.push({ role, text });
+    match = next;
+  }
+  return turns;
+}
+
+/**
+ * Structural gate: prior unresolved user ask → Emily reply → current answer
+ * fragment, while Brain chose vague. Does not inspect car names or keywords.
+ *
+ * @param {{
+ *   conversationHistory?: string | null,
+ *   userMessage?: string | null,
+ * }} [p]
+ */
+export function hasPostConfirmClarificationAnswerContinuityContext({
+  conversationHistory = null,
+  userMessage = null,
+} = {}) {
+  const userLine = String(userMessage ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!userLine) return false;
+
+  const turns = parsePostConfirmDialogueTurns(conversationHistory);
+  if (turns.length < 2) return false;
+
+  let endIdx = turns.length - 1;
+  if (turns[endIdx]?.role === "user") {
+    const lastUser = String(turns[endIdx].text ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (lastUser.toLowerCase() === userLine.toLowerCase()) {
+      endIdx -= 1;
+    }
+  }
+  if (endIdx < 1) return false;
+  if (turns[endIdx]?.role !== "assistant") return false;
+  const emilyClarify = String(turns[endIdx].text ?? "").trim();
+  if (!emilyClarify) return false;
+
+  let priorAsk = "";
+  for (let i = endIdx - 1; i >= 0; i -= 1) {
+    if (turns[i]?.role === "user") {
+      priorAsk = String(turns[i].text ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
+      break;
+    }
+  }
+  if (!priorAsk) return false;
+  if (priorAsk.toLowerCase() === userLine.toLowerCase()) return false;
+  return true;
+}
+
+/**
  * Deterministic Turn Plan from Brain meaning (factKind).
  * Returns null when factKind is absent/invalid or action (mutation/AVR).
  * Callers must NOT retain Brain-authored capability/evidenceNeeds for factual
@@ -1724,6 +1799,48 @@ function buildPostConfirmFactualRequestedInformationCorrection(
 }
 
 /**
+ * Same-Brain correction: vague after Emily asked for clarification and the
+ * current message may answer that ask. Meaning stays with Brain — no text router.
+ *
+ * @param {Record<string, unknown> | null | undefined} priorDecision
+ * @param {string} userMessage
+ * @param {string | null | undefined} conversationHistory
+ */
+export function buildPostConfirmClarificationAnswerContinuityCorrection(
+  priorDecision,
+  userMessage,
+  conversationHistory = null
+) {
+  const historyBlock = String(conversationHistory ?? "")
+    .trim()
+    .slice(0, 1200);
+  return [
+    "CORRECTIVE REGENERATION (same post_confirm_pa Brain lane — not a second classifier).",
+    "factKind=vague was set, but RECENT_CONVERSATION shows an unresolved customer ask, Emily's clarifying reply, and a current message that may answer that clarification.",
+    `Exact current customer message: ${cleanCustomerReply(userMessage) || "(empty)"}`,
+    `RECENT_CONVERSATION:\n${historyBlock || "(none)"}`,
+    `Previous decision (reconsider): ${JSON.stringify({
+      situation: priorDecision?.situation ?? null,
+      conversationAct: priorDecision?.conversationAct ?? null,
+      customerIntent: priorDecision?.customerIntent ?? null,
+      action: priorDecision?.action ?? null,
+      factKind: priorDecision?.factKind ?? null,
+      capability: priorDecision?.capability ?? null,
+      evidenceNeeds: priorDecision?.evidenceNeeds ?? null,
+      customerReply: priorDecision?.customerReply ?? "",
+    })}`,
+    "Rules:",
+    "- If Emily's immediately preceding reply asked for a missing clarifying detail needed to interpret the prior unresolved customer ask, AND the current message answers that clarification, interpret the COMBINED meaning of (1) the prior unresolved ask, (2) Emily's clarification question, and (3) this answer.",
+    "- Set factKind to that combined meaning. Example shapes: item feature / mileage / registration / fuel / refund-style THIS-business facts → factKind=freeform_business; active booking fields → booking_fact with active_booking evidenceNeeds.",
+    "- Do NOT keep factKind=vague merely because the current message is a short fragment answering Emily's clarification.",
+    "- If the current message does NOT answer the clarification (ack/ok/thanks/farewell/still underspecified/unrelated), keep factKind=vague or non_business as appropriate — never invent a factual ask the customer did not make.",
+    "- Runtime builds capability + evidenceNeeds from factKind. customerReply MUST be empty for deferred factual factKinds.",
+    "- Keep action=reply, shouldReply=true, mutationIntent=none unless a real mutation applies.",
+    "- Return the same required JSON schema only.",
+  ].join("\n");
+}
+
+/**
  * Narrow factual-question evidence for the gated third required-reply recovery.
  * Broader read-only helper also accepts ask_action / bare action=reply; those must
  * not unlock “answer from booking facts” after silence.
@@ -3228,6 +3345,7 @@ Examples (meaning → factKind; leave customerReply="" for factual kinds):
 - extend/cancel/change pickup or delivery details / pending AVR confirm|decline → factKind=action with matching action/mutationIntent/AVR fields
 - "owner se confirm" without a concrete fact → factKind=vague
 - "koi gari available?" (new inventory) → factKind=booking_fact with availability_request capability hint (not an omitted factKind; never invent booking field answers for inventory)
+- CLARIFICATION ANSWER CONTINUITY: When RECENT_CONVERSATION shows Emily's immediately preceding reply asked for a missing clarifying detail needed to interpret a prior unresolved customer ask, and the current message answers that clarification, set factKind from the COMBINED meaning of (1) the prior unresolved ask, (2) Emily's clarification question, and (3) this answer. Do NOT use factKind=vague merely because the current message is a short fragment answering that clarification. Still use factKind=vague when there is no such pending clarification, or when the current message does not answer it (ok/thanks/still underspecified/unrelated).
 - Never invent attribute names. requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
 
 STEP 4 — action:
@@ -3336,6 +3454,7 @@ STRICT SAFETY:
     let emptyInvalidInformationalRecoveryUsed = false;
     let factualRequestedInfoCorrectionUsed = false;
     let socialFactualClaimCorrectionUsed = false;
+    let clarificationContinuityCorrectionUsed = false;
     /** @type {string | null} */
     let lastUsabilityClassification = null;
     const trustedFocusNonEmptyQuestion =
@@ -3347,7 +3466,8 @@ STRICT SAFETY:
         (trustedFocusRequiredReplyExtraUsed ? 1 : 0) +
         (emptyInvalidInformationalRecoveryUsed ? 1 : 0) +
         (factualRequestedInfoCorrectionUsed ? 1 : 0) +
-        (socialFactualClaimCorrectionUsed ? 1 : 0);
+        (socialFactualClaimCorrectionUsed ? 1 : 0) +
+        (clarificationContinuityCorrectionUsed ? 1 : 0);
       if (attempt > attemptLimit) {
         const exhaustedReason =
           lastReason === "EMPTY_OR_INVALID_REQUIRED_INFORMATIONAL_RECOVERY"
@@ -3400,6 +3520,12 @@ STRICT SAFETY:
                 ? `${userPayload}\n\n${buildPostConfirmSocialFactualClaimCorrection(
                     lastSuspiciousDecision || {},
                     userLine
+                  )}`
+              : lastReason === "CLARIFICATION_ANSWER_CONTINUITY_REQUIRED"
+                ? `${userPayload}\n\n${buildPostConfirmClarificationAnswerContinuityCorrection(
+                    lastSuspiciousDecision || {},
+                    userLine,
+                    conversationHistory
                   )}`
             : lastReason === "verified_item_mismatch"
               ? `${userPayload}\n\n${buildPostConfirmVerifiedItemMismatchCorrection(
@@ -3600,6 +3726,22 @@ STRICT SAFETY:
       // wording is composed after deterministic fact resolution. Clear any model
       // customerReply so invented claims cannot skip the resolver.
       if (isDeferredPostConfirmInformationalDecision(finalized)) {
+        // Vague after Emily asked for clarification + current may answer it:
+        // one same-Brain reconsideration of combined dialogue meaning.
+        // If still vague after correction, accept clarification_needed safely.
+        if (
+          cleanPostConfirmFactKind(finalized.factKind) === "vague" &&
+          !clarificationContinuityCorrectionUsed &&
+          hasPostConfirmClarificationAnswerContinuityContext({
+            conversationHistory,
+            userMessage: userLine,
+          })
+        ) {
+          clarificationContinuityCorrectionUsed = true;
+          lastReason = "CLARIFICATION_ANSWER_CONTINUITY_REQUIRED";
+          lastSuspiciousDecision = finalized;
+          continue;
+        }
         finalized.customerReply = "";
         finalized.shouldReply = true;
         finalized.informationalReplyDeferred = true;
