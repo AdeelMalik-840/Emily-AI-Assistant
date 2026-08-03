@@ -1398,6 +1398,7 @@ export async function executeWhatsAppAiPipeline(p) {
     whatsappRecipientType: whatsappRecipientTypeRaw,
     conversationCustomerNumber: conversationCustomerNumberRaw,
     messageId: messageIdRaw,
+    contextMessageId: contextMessageIdRaw = null,
     playwrightWebInbound: playwrightWebInboundRaw = false,
     playwrightWebTitleIdentity: playwrightWebTitleIdentityRaw = false,
     groupName: groupNameRaw,
@@ -2451,6 +2452,11 @@ export async function executeWhatsAppAiPipeline(p) {
         senderPhone: cloudConfirmPhone,
         messageText: latestMessage,
         messageId,
+        contextMessageId:
+          contextMessageIdRaw != null &&
+          String(contextMessageIdRaw).trim() !== ""
+            ? String(contextMessageIdRaw).trim()
+            : null,
         isGroupInbound,
         playwrightWebInbound,
         sendCredentials,
@@ -4017,6 +4023,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     participantKey: participantKeyPayload,
     messageId: messageIdPayload,
     messageTimestamp,
+    contextMessageId: contextMessageIdPayload,
     messageSender: messageSenderPayload,
     playwrightWebInbound: playwrightWebInboundPayload = false,
     playwrightWebTitleIdentity: playwrightWebTitleIdentityPayload = false,
@@ -4155,6 +4162,14 @@ export function scheduleBufferedWhatsAppInbound(payload) {
       messageIdPayload != null
         ? String(messageIdPayload)
         : String(entry.context?.messageId ?? ""),
+    contextMessageId:
+      contextMessageIdPayload != null &&
+      String(contextMessageIdPayload).trim() !== ""
+        ? String(contextMessageIdPayload).trim()
+        : entry.context?.contextMessageId != null &&
+            String(entry.context.contextMessageId).trim() !== ""
+          ? String(entry.context.contextMessageId).trim()
+          : null,
     messageTimestamp: messageTimestamp ?? null,
     messageSender:
       String(messageSenderPayload ?? "").trim() ||

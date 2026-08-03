@@ -506,7 +506,10 @@ function captureSend() {
       } else {
         customerSends.push({ to, text });
       }
-      return { ok: true, messages: [{ id: `wamid.out-${ownerSends.length + customerSends.length}` }] };
+      return {
+        ok: true,
+        providerMessageId: `wamid.out-${ownerSends.length + customerSends.length}`,
+      };
     },
   };
 }
@@ -689,7 +692,8 @@ test("missing advance with flags ON creates request, notifies owner, checking re
     assert.equal(result.ownerNotifyStatus, "sent");
     assert.match(result.reply, /confirm karke batata/i);
     assert.equal(sends.ownerSends.length, 1);
-    assert.match(String(sends.ownerSends[0].text), /pamiss_/i);
+    assert.doesNotMatch(String(sends.ownerSends[0].text), /pamiss_/i);
+    assert.match(String(sends.ownerSends[0].text), /Reply to this message/i);
     assert.equal(fake.listMissingInfo(BUSINESS_ID).length, 1);
     assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
     assert.equal(result.sentReply, false);
@@ -2749,7 +2753,8 @@ test("structured documents/payment/delivery/driver still escalate with matching 
       assert.equal(sends.ownerSends.length, 1, row.concept);
       const ownerText = String(sends.ownerSends[0].text || "");
       assert.match(ownerText, /❓ Customer question/);
-      assert.match(ownerText, /Reference:\n?pamiss_/i);
+      assert.doesNotMatch(ownerText, /Reference:/i);
+      assert.doesNotMatch(ownerText, /pamiss_/i);
       // Internal type must not be labeled in the operational header (question text may still mention the word).
       assert.doesNotMatch(ownerText, /Emily PA missing info\s*\(/i);
       assert.doesNotMatch(ownerText, /missingInfoType/i);
@@ -2758,7 +2763,7 @@ test("structured documents/payment/delivery/driver still escalate with matching 
   }
 });
 
-test("owner notification is multiline readable and keeps token for parser", async () => {
+test("owner notification is multiline readable without visible pamiss token", async () => {
   const { buildPaMissingInfoOwnerNotificationMessage } = await import(
     "../src/services/paMissingInfoOwnerNotifyService.js"
   );
@@ -2786,16 +2791,17 @@ test("owner notification is multiline readable and keeps token for parser", asyn
   assert.match(msg, /Customer:\n\+90 544 382 9990/);
   assert.match(msg, /Question:\n“Refund policy kya hai\?”/);
   assert.match(msg, /Reply to this message with the answer/);
-  assert.match(msg, /Reference:\n/);
-  assert.ok(msg.includes(requestId));
+  assert.doesNotMatch(msg, /Reference:/i);
+  assert.doesNotMatch(msg, /pamiss_/i);
+  assert.ok(!msg.includes(requestId));
   assert.doesNotMatch(msg, /\bdocuments\b/i);
   assert.doesNotMatch(msg, /\bother\b/i);
   assert.doesNotMatch(msg, new RegExp(bookingId));
   assert.doesNotMatch(msg, /Emily PA missing info/i);
 
-  // Owner can reply quoting the notification; token still parses.
+  // Token may still be stripped if owner pastes one for debug cleanliness.
   const parsed = parsePaMissingInfoOwnerAnswerMessage(
-    `${msg}\n\nFull refund within 24 hours.`
+    `${requestId}\n\nFull refund within 24 hours.`
   );
   assert.equal(parsed.requestId, requestId);
   assert.match(parsed.ownerAnswer, /Full refund within 24 hours/i);
@@ -2822,12 +2828,10 @@ test("owner notification is multiline readable and keeps token for parser", asyn
 
     assert.equal(result.missingInfoEscalated, true);
     assert.equal(sends.ownerSends.length, 1);
-    // Idempotent skip on second notify for same open request path covered elsewhere;
-    // one owner notification maximum after success for this turn.
     assert.equal(result.ownerNotifyStatus, "sent");
     const ownerText = String(sends.ownerSends[0].text || "");
     assert.match(ownerText, /❓ Customer question/);
-    assert.match(ownerText, /pamiss_/);
+    assert.doesNotMatch(ownerText, /pamiss_/);
     assert.doesNotMatch(ownerText, new RegExp(BOOKING_ID));
   });
 });

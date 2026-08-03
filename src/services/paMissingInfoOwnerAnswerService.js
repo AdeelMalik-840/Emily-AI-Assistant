@@ -1,6 +1,10 @@
 /**
  * Business PA missing-info Phase 2: owner answer → customer follow-up.
  * Cloud DM only. No Playwright. No booking/AVR mutation. No knowledge persist.
+ *
+ * Phase 1 correlation: WhatsApp quoted reply (context.id) →
+ * ownerNotifyProviderMessageId on the pamiss request. pamiss_* is not required
+ * from the owner (may appear in logs/debug only).
  */
 
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
@@ -13,6 +17,7 @@ import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveC
 import { resolvePaMissingInfoOwnerTarget } from "./paMissingInfoOwnerNotifyService.js";
 import {
   applyPaMissingInfoOwnerAnswer,
+  findPaMissingInfoRequestByOwnerNotifyProviderMessageId,
   getPaMissingInfoRequest,
   markPaMissingInfoCustomerFollowupFailed,
   markPaMissingInfoCustomerFollowupSent,
@@ -26,6 +31,10 @@ import {
 } from "./customerBusinessPaAiReply.js";
 
 const PAMISS_TOKEN_RE = /\b(pamiss_[a-f0-9]{12,32})\b/i;
+
+/** Owner-facing nudge when reply is not a WhatsApp quote of the notification. */
+export const PA_MISSING_INFO_OWNER_QUOTE_NUDGE =
+  "Please reply directly to the customer question notification (swipe/reply on that message) so Emily can match your answer.";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -55,7 +64,8 @@ function phonesMatch(a, b) {
 }
 
 /**
- * Extract pamiss_* token and owner answer text from owner WhatsApp body.
+ * Strip optional pamiss_* token from owner body for answer text / debug logs.
+ * Token is NOT used for request correlation in Phase 1.
  * @param {string} messageText
  * @returns {{ requestId: string | null, ownerAnswer: string, ownerAnswerRaw: string }}
  */
@@ -67,7 +77,6 @@ export function parsePaMissingInfoOwnerAnswerMessage(messageText) {
   if (match) {
     remainder = `${raw.slice(0, match.index)}${raw.slice(match.index + match[0].length)}`;
     remainder = remainder.replace(/^[\s:.\-–—]+/, "").trim();
-    // Optional leading type label only when token was present.
     const typeAlt = PA_MISSING_INFO_TYPES.join("|");
     const typePrefix = new RegExp(`^(?:${typeAlt})\\b[:\\s\\-–—]*`, "i");
     remainder = remainder.replace(typePrefix, "").trim();
@@ -81,11 +90,39 @@ export function parsePaMissingInfoOwnerAnswerMessage(messageText) {
 
 /**
  * @param {{
+ *   sendWhatsAppMessageFn: typeof sendWhatsAppMessage,
+ *   ownerPhone: string,
+ *   sendCredentials?: unknown,
+ * }} p
+ */
+async function sendOwnerQuoteNudge({
+  sendWhatsAppMessageFn,
+  ownerPhone,
+  sendCredentials = null,
+}) {
+  const to = phoneDigitsOnly(ownerPhone);
+  if (!to) return { sent: false };
+  try {
+    await sendWhatsAppMessageFn(
+      to,
+      PA_MISSING_INFO_OWNER_QUOTE_NUDGE,
+      sendCredentials ?? undefined,
+      { recipientType: "individual" }
+    );
+    return { sent: true };
+  } catch {
+    return { sent: false };
+  }
+}
+
+/**
+ * @param {{
  *   db?: unknown,
  *   businessId: string,
  *   senderPhone: string,
  *   messageText: string,
  *   messageId?: string | null,
+ *   contextMessageId?: string | null,
  *   isGroupInbound?: boolean,
  *   playwrightWebInbound?: boolean,
  *   sendCredentials?: unknown,
@@ -105,6 +142,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
   senderPhone,
   messageText,
   messageId = null,
+  contextMessageId = null,
   isGroupInbound = false,
   playwrightWebInbound = false,
   sendCredentials = null,
@@ -140,37 +178,68 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
   }
 
   const parsed = parsePaMissingInfoOwnerAnswerMessage(text);
-  let request = null;
-  let matchReason = null;
+  const quotedId = clean(contextMessageId, 160) || null;
 
-  // Phase 1: require pamiss_* token. No business-wide SINGLE_OPEN matching.
-  if (!parsed.requestId) {
+  // Phase 1: require WhatsApp quote of the owner notification. No SINGLE_OPEN.
+  if (!quotedId) {
+    await sendOwnerQuoteNudge({
+      sendWhatsAppMessageFn,
+      ownerPhone: ownerTarget,
+      sendCredentials,
+    });
     return {
       handled: true,
-      reason: "TOKEN_REQUIRED",
+      reason: "QUOTE_REQUIRED",
       action: "owner_answer_unmatched",
       customerFollowupSent: false,
+      matchReason: null,
+      debugTokenPresent: Boolean(parsed.requestId),
     };
   }
 
-  request = await getPaMissingInfoRequest({
+  let request = await findPaMissingInfoRequestByOwnerNotifyProviderMessageId({
     db: connection,
     businessId: uid,
-    requestId: parsed.requestId,
+    ownerNotifyProviderMessageId: quotedId,
   });
+  let matchReason = request ? "CONTEXT_ID" : null;
+
   if (!request) {
+    await sendOwnerQuoteNudge({
+      sendWhatsAppMessageFn,
+      ownerPhone: ownerTarget,
+      sendCredentials,
+    });
     return {
       handled: true,
-      reason: "TOKEN_NOT_FOUND",
+      reason: "CONTEXT_UNKNOWN",
       action: "owner_answer_unmatched",
-      requestId: parsed.requestId,
+      customerFollowupSent: false,
+      matchReason: null,
+      contextMessageId: quotedId,
+      debugTokenPresent: Boolean(parsed.requestId),
+    };
+  }
+
+  const requestId =
+    clean(request.requestId || request.id, 120) || null;
+  if (!requestId) {
+    return {
+      handled: true,
+      reason: "REQUEST_ID_MISSING",
+      action: "owner_answer_unmatched",
       customerFollowupSent: false,
     };
   }
-  matchReason = "TOKEN";
 
-  const requestId =
-    clean(request.requestId || request.id, 120) || parsed.requestId;
+  // Refresh full row (list may be projection-complete already).
+  const fresh = await getPaMissingInfoRequest({
+    db: connection,
+    businessId: uid,
+    requestId,
+  });
+  if (fresh) request = fresh;
+
   const status = clean(request.status, 40);
 
   if (PA_MISSING_INFO_POST_ANSWER_STATUSES.includes(status)) {
@@ -183,6 +252,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       action: "owner_answer_skipped",
       requestId,
       customerFollowupSent: false,
+      matchReason,
       status,
     };
   }
@@ -194,11 +264,12 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       action: "owner_answer_unmatched",
       requestId,
       customerFollowupSent: false,
+      matchReason,
       status,
     };
   }
 
-  const ownerAnswer = parsed.ownerAnswer;
+  const ownerAnswer = parsed.ownerAnswer || clean(text, 800);
   if (!ownerAnswer || !isUsablePaMissingInfoOwnerAnswerText(ownerAnswer)) {
     return {
       handled: true,
@@ -226,6 +297,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       reason: applied?.reason || "APPLY_FAILED",
       action: "owner_answer_unmatched",
       requestId,
+      matchReason,
       customerFollowupSent: false,
     };
   }
@@ -236,6 +308,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       reason: applied.reason || "IDEMPOTENT_SKIP",
       action: "owner_answer_skipped",
       requestId,
+      matchReason,
       customerFollowupSent: false,
       status: clean(applied.request?.status, 40) || status,
     };
@@ -256,6 +329,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       reason: "CUSTOMER_PHONE_MISSING",
       action: "owner_answer_followup_failed",
       requestId,
+      matchReason,
       customerFollowupSent: false,
     };
   }
@@ -295,13 +369,25 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       sendCredentials ?? undefined,
       { recipientType: "individual" }
     );
+    if (sendResult && sendResult.ok === false) {
+      throw new Error(
+        clean(
+          sendResult?.error?.message ||
+            sendResult?.error ||
+            sendResult?.reason,
+          200
+        ) || "WHATSAPP_SEND_FAILED"
+      );
+    }
     const providerMessageId = clean(
-      sendResult?.messages?.[0]?.id ||
+      sendResult?.providerMessageId ||
+        sendResult?.messages?.[0]?.id ||
         sendResult?.messageId ||
         sendResult?.id ||
         "",
       160
     );
+
     await markPaMissingInfoCustomerFollowupSent({
       db: connection,
       businessId: uid,
@@ -355,6 +441,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       reason: "CUSTOMER_FOLLOWUP_FAILED",
       action: "owner_answer_followup_failed",
       requestId,
+      matchReason,
       customerFollowupSent: false,
       error,
       status: "customer_followup_failed",

@@ -331,6 +331,7 @@ app.post("/webhook", async (req, res) => {
       inboundText
     );
     const inboundMessageId = String(message.id ?? "").trim();
+    const inboundContextMessageId = String(message.context?.id ?? "").trim();
 
     console.log("WHATSAPP INCOMING:", {
       from: message.from,
@@ -339,6 +340,7 @@ app.post("/webhook", async (req, res) => {
       isGroup,
       text: inboundText,
       isGroupMessage,
+      hasContextId: Boolean(inboundContextMessageId),
     });
 
     if (whatsappGroupDebug && isGroupMessage) {
@@ -692,6 +694,9 @@ app.post("/webhook", async (req, res) => {
       whatsappRecipientType,
       conversationCustomerNumber,
       messageId: inboundMessageId,
+      ...(inboundContextMessageId
+        ? { contextMessageId: inboundContextMessageId }
+        : {}),
       messageTimestamp: message.timestamp ?? null,
       ...(participantPhoneForDm
         ? { participantPhoneForDm: participantPhoneForDm }
