@@ -850,3 +850,107 @@ test("15. ownerCheckStarted false: no checking/pending promise in compose contra
     /customerInputRequired=false — for not_found\/unsupported\/conflicting say unconfirmed/
   );
 });
+
+test("16. ownerCheckStarted rejects unavailable wording then accepts checking reply", async () => {
+  const b = booking();
+  let attempts = 0;
+  const composed = await composePostConfirmInformationalCustomerReply({
+    facts: factsFor(b),
+    userMessage: "Gari ki fuel average kyaa hai?",
+    frozenDecision: frozenAnswerFrom({
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attributes: ["answer"],
+        },
+      ],
+    }),
+    factResolution: {
+      status: "not_found",
+      capability: "answer_from_saved_owner_answer",
+      factAvailable: false,
+      verifiedValue: null,
+      missingInfoType: "other",
+      ownerCheckStarted: true,
+      ownerCheckPending: false,
+      items: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attribute: "answer",
+          status: "missing",
+          verifiedValue: null,
+        },
+      ],
+    },
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  customerReply: "Is ki maloomat available nahi hai.",
+                  replySemantics: {
+                    claims: [],
+                    languageStyle: "roman_urdu",
+                    containsTimingPromise: false,
+                    exposesInternalProcess: false,
+                  },
+                }),
+              },
+            },
+          ],
+        };
+      }
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                customerReply:
+                  "Fuel average abhi confirm nahi hai. Main check karke aapko bata deta hun.",
+                replySemantics: {
+                  claims: [],
+                  languageStyle: "roman_urdu",
+                  containsTimingPromise: false,
+                  exposesInternalProcess: false,
+                },
+              }),
+            },
+          },
+        ],
+      };
+    },
+  });
+
+  assert.equal(composed.ok, true);
+  assert.equal(composed.source, "openai");
+  assert.equal(attempts, 2);
+  assert.match(composed.reply, /check karke/i);
+  assert.doesNotMatch(composed.reply, /available nahi|maloomat available nahi/i);
+});
+
+test("17. ownerCheckReplyContradictionReason truth boundary", async () => {
+  const { ownerCheckReplyContradictionReason } = await import(
+    "../src/services/customerBusinessPaAiReply.js"
+  );
+  assert.equal(
+    ownerCheckReplyContradictionReason("Is ki maloomat available nahi hai."),
+    "owner_check_unavailable_contradiction"
+  );
+  assert.equal(
+    ownerCheckReplyContradictionReason("We don't know this detail."),
+    "owner_check_unavailable_contradiction"
+  );
+  assert.equal(
+    ownerCheckReplyContradictionReason(
+      "Fuel average abhi confirm nahi hai. Main check karke aapko bata deta hun."
+    ),
+    null
+  );
+});

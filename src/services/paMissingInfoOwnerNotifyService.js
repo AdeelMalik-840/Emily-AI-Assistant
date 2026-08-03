@@ -125,14 +125,12 @@ function resolveCustomerSafeBookingReference(request, extra = {}) {
 
 /**
  * Deterministic owner-facing operational message (not customer conversation).
- * Token must stay visible for parsePaMissingInfoOwnerAnswerMessage.
- * Internal missingInfoType and raw booking Firestore IDs stay in the request
- * record only — not in visible text.
+ * Request id (pamiss_*) stays internal on the Firestore row / logs only —
+ * not in visible WhatsApp text. Owner correlates by replying to this message.
  * @param {Record<string, unknown>} request
  * @param {{ itemLabel?: string | null, customerSafeReference?: string | null }} [extra]
  */
 export function buildPaMissingInfoOwnerNotificationMessage(request, extra = {}) {
-  const requestId = clean(request?.requestId, 80) || "unknown";
   const customerPhone = formatCustomerPhoneForOwnerDisplay(request?.customerPhone);
   const question = clean(request?.customerQuestion, 280) || "(no question)";
   const itemLabel = formatItemLabelForOwnerDisplay(
@@ -154,10 +152,7 @@ export function buildPaMissingInfoOwnerNotificationMessage(request, extra = {}) 
     "Question:",
     `“${question}”`,
     "",
-    "Reply to this message with the answer. Emily will send it to the customer.",
-    "",
-    "Reference:",
-    requestId
+    "Reply to this message with the answer. Emily will send it to the customer."
   );
   return lines.join("\n");
 }
@@ -254,7 +249,8 @@ export async function sendPaMissingInfoOwnerNotification({
       { recipientType: "individual" }
     );
     const providerMessageId = clean(
-      sendResult?.messages?.[0]?.id ||
+      sendResult?.providerMessageId ||
+        sendResult?.messages?.[0]?.id ||
         sendResult?.messageId ||
         sendResult?.id ||
         "",

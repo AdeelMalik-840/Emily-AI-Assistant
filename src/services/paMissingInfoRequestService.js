@@ -396,6 +396,64 @@ function toMs(value) {
 }
 
 /**
+ * Find a missing-info request by outbound owner-notification WhatsApp id.
+ * Any status (open or post-answer) — exact match on ownerNotifyProviderMessageId.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   ownerNotifyProviderMessageId: string,
+ *   limit?: number,
+ * }} p
+ * @returns {Promise<Record<string, unknown> | null>}
+ */
+export async function findPaMissingInfoRequestByOwnerNotifyProviderMessageId({
+  db: connection,
+  businessId,
+  ownerNotifyProviderMessageId,
+  limit = 100,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  const uid = clean(businessId, 120);
+  const providerId = clean(ownerNotifyProviderMessageId, 160);
+  if (!col || !uid || !providerId) return null;
+
+  const snap = await col
+    .limit(Math.max(1, Math.min(120, Number(limit) || 100)))
+    .get()
+    .catch(() => null);
+
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data() || {};
+    const stored = clean(data.ownerNotifyProviderMessageId, 160);
+    if (stored && stored === providerId) {
+      return { id: doc.id, ...(data || {}) };
+    }
+  }
+  return null;
+}
+
+/**
+ * Open-for-answer only variant of notify-wamid lookup.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   ownerNotifyProviderMessageId: string,
+ *   limit?: number,
+ * }} p
+ * @returns {Promise<Record<string, unknown> | null>}
+ */
+export async function findOpenPaMissingInfoRequestByOwnerNotifyProviderMessageId(
+  p
+) {
+  const row = await findPaMissingInfoRequestByOwnerNotifyProviderMessageId(p);
+  if (!row) return null;
+  const status = clean(row.status, 40);
+  if (!PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES.includes(status)) return null;
+  if (isExpiredRequest(row, Date.now())) return null;
+  return row;
+}
+
+/**
  * Open missing-info requests for one booking + customer (situation context).
  * Does not write. Booking-scoped only.
  * @param {{

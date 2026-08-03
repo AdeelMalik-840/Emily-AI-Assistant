@@ -302,6 +302,38 @@ function enrichInformationalComposeGuardContract(baseContract, p) {
 }
 
 /**
+ * Truth-boundary only: reject customer wording that contradicts an authorized
+ * owner-check (started or pending). Does not generate replies.
+ * @param {string} reply
+ * @returns {string | null} reject reason, or null when allowed
+ */
+export function ownerCheckReplyContradictionReason(reply) {
+  const text = String(reply ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "owner_check_empty_reply";
+  const lower = text.toLowerCase();
+
+  // Positive checking / follow-up intent — allowed even when fact is still unconfirmed.
+  const hasCheckingIntent =
+    /\b(check|checking|confirm(?:ing|ation)?|confirm karke|bata (?:deta|dunga|dung|deti)|update you|get back|follow[\s-]?up|batata hun|batati hun)\b/i.test(
+      text
+    );
+
+  const unavailableClaim =
+    /\b(available nahi|not available|unavailable|no information|information (?:is )?(?:not |un)?available|we don'?t know|don'?t know|do not know|pata nahi)\b/i.test(
+      lower
+    ) ||
+    /\bmaloomat\b.{0,48}\b(available\s+)?nahi\b/i.test(lower) ||
+    /\b(detail|info|information)\b.{0,32}\b(available nahi|not available|unavailable)\b/i.test(
+      lower
+    );
+
+  if (unavailableClaim && !hasCheckingIntent) {
+    return "owner_check_unavailable_contradiction";
+  }
+  return null;
+}
+
+/**
  * Status-safe bilingual candidates so language-guard never empties the turn.
  * @param {{
  *   status: string,
@@ -1227,16 +1259,18 @@ STRICT SAFETY:
       requiredMeaning: replyContract.requiredMeaning,
     })}`;
 
+  const ownerCheckAuthorized =
+    verifiedResolution.ownerCheckStarted === true ||
+    verifiedResolution.ownerCheckPending === true;
+
   const composed = await composeGuardedCustomerReply({
     system,
     userBase,
-    firstAttemptReminder:
-      verifiedResolution.ownerCheckStarted === true ||
-      verifiedResolution.ownerCheckPending === true
-        ? "Remember: JSON only; ownerCheckStarted/ownerCheckPending verified — fact not yet confirmed; say naturally you are checking/confirming and will update the customer; no apology by default; no owner/staff/admin/token/request; no timing promises (soon/shortly/jald hi/minutes/deadline); do not ask the customer for the business fact; never invent the value; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
-        : customerInputRequired
-          ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
-          : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision.",
+    firstAttemptReminder: ownerCheckAuthorized
+      ? "Remember: JSON only; ownerCheckStarted/ownerCheckPending verified — fact not yet confirmed; say naturally you are checking/confirming and will update the customer; do NOT say information is unavailable / we don’t know / maloomat available nahi; no apology by default; no owner/staff/admin/token/request; no timing promises (soon/shortly/jald hi/minutes/deadline); do not ask the customer for the business fact; never invent the value; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
+      : customerInputRequired
+        ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
+        : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision.",
     responseFormatName: "post_confirm_informational_reply_compose",
     replyContract,
     enrichGuardContract: (contract) =>
@@ -1245,6 +1279,10 @@ STRICT SAFETY:
         hasVerifiedClock,
         verifiedValueForTiming: verifiedResolution.verifiedValue,
       }),
+    // Truth-bound owner-check: reject unavailable/"don't know" wording; same-lane retry once.
+    extraReject: ownerCheckAuthorized
+      ? (customerReply) => ownerCheckReplyContradictionReason(customerReply)
+      : null,
     fallbackReply: "",
     timeoutMs,
     timeoutErrorMessage: "POST_CONFIRM_INFORMATIONAL_COMPOSE_OPENAI_TIMEOUT",
