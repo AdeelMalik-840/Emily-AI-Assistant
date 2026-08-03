@@ -1074,7 +1074,15 @@ test("decide guidance scopes freeform other to business facts with explicit nega
   );
   assert.match(
     decideSrc,
-    /Do NOT use capability=social for a clear business\/booking fact ask/
+    /Do NOT use capability=social or capability=clarification_needed for a clear business\/booking fact ask/
+  );
+  assert.match(
+    decideSrc,
+    /named a concrete concept \(pickup\/delivery\/documents\/dates\/price\/status\) OR a concrete THIS-business freeform policy\/rule\/service\/item fact/
+  );
+  assert.doesNotMatch(
+    decideSrc,
+    /prefer a valid answer_from_\* \/ clarification_needed \/ availability_request/
   );
   assert.doesNotMatch(
     decideSrc,

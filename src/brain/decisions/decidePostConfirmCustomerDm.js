@@ -1544,7 +1544,7 @@ function buildPostConfirmFactualRequestedInformationCorrection(
     "- Clearly social, conversational, or general/non-business (even if phrased as a question; even if customerIsAskingQuestion was true) → capability=social with non-empty customerReply and NO business claims, OR capability=clarification_needed with evidenceNeeds=[] when unrelated/unclear. customerReply may be non-empty for social.",
     "- Never use answer_from_saved_owner_answer + other/answer for general knowledge, current time/date, weather, jokes, maths, politics, news, trivia, Emily personal identity, greetings, thanks, farewells, or any ask with no business/item/service/booking connection.",
     "- Never force capability=answer_from_saved_owner_answer or concept=other merely because the message is a question.",
-    "- Clearly business/item/service/booking factual ask → do NOT leave capability null; prefer a valid answer_from_* / clarification_needed / availability_request Turn Plan; customerReply MUST be empty for deferred factual plans. Do NOT use capability=social for a clear business/booking fact ask.",
+    "- Clearly business/item/service/booking factual ask → do NOT leave capability null; prefer a valid answer_from_* / availability_request Turn Plan; customerReply MUST be empty for deferred factual plans. Do NOT use capability=social or capability=clarification_needed for a clear business/booking fact ask.",
     "- Keep action=reply (or silence only for genuine social endings), mutationIntent=none unless a real mutation applies.",
     "- Set capability to one of: " + POST_CONFIRM_CAPABILITIES.join(", "),
     "- For answer_from_* capabilities, set non-empty evidenceNeeds: [{entity, concept, attributes}].",
@@ -2989,7 +2989,7 @@ Examples:
 - "owner se confirm" / ask Emily to check with owner without a concrete fact → clarification_needed (not answer_from_active_booking)
 - "koi gari available?" (new vehicle/inventory search) → availability_request (do NOT use active booking evidence; do NOT use availability_request for delivery-policy asks)
 - social hello / acha / thanks → capability=social, evidenceNeeds=[], non-empty customerReply with NO booking/business factual claims
-- "mujhe details chahiye" / vague only → clarification_needed. If the customer named a concrete concept (pickup/delivery/documents/dates/price/status), do NOT use clarification_needed — use answer_from_* even when evidenceAvailability is absent (resolver returns not_found).
+- "mujhe details chahiye" / vague only → clarification_needed. If the customer named a concrete concept (pickup/delivery/documents/dates/price/status) OR a concrete THIS-business freeform policy/rule/service/item fact, do NOT use clarification_needed — use answer_from_* even when evidenceAvailability is absent (resolver returns not_found).
 - Keep attributes ONLY from the compact attribute list (policy, location, time, days, value, label, total, daily, start, end, amount, answer). Never invent attribute names like deliveryPolicy.
 - requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
 
