@@ -46,6 +46,142 @@ function cleanCustomerReply(value) {
   return String(value ?? "").trim();
 }
 
+/** @type {Readonly<Record<string, unknown>>} */
+const POST_CONFIRM_AGENT_EMPTY_DECISION = Object.freeze({
+  situation: null,
+  conversationAct: null,
+  customerIntent: null,
+  action: null,
+  capability: null,
+  evidenceNeeds: Object.freeze([]),
+  bookingSelectionMode: null,
+  selectedBookingId: null,
+  mutationIntent: null,
+  actionParameters: null,
+  customerReply: "",
+  informationalReplyDeferred: false,
+});
+
+/** @type {Readonly<Record<string, unknown>>} */
+const POST_CONFIRM_AGENT_EMPTY_EVIDENCE = Object.freeze({
+  status: null,
+  items: Object.freeze([]),
+  verifiedValue: null,
+  missingInfoType: null,
+  selectionStatus: null,
+});
+
+/**
+ * Behavior-neutral return contract: nested slices mirror the same flat values.
+ * Does not reinterpret Brain/resolver/gate/compose outcomes.
+ * execution slots are exact refs to existing branch results (no precedence).
+ *
+ * @param {Record<string, unknown>} flat
+ * @param {{
+ *   decisionSource?: Record<string, unknown> | null,
+ *   pendingAvr?: unknown,
+ *   mutation?: unknown,
+ *   missingInfo?: unknown,
+ * }} [opts]
+ */
+function attachPostConfirmAgentReturnContract(flat, opts = {}) {
+  const row = flat && typeof flat === "object" ? flat : {};
+  const decisionSource =
+    opts.decisionSource && typeof opts.decisionSource === "object"
+      ? opts.decisionSource
+      : null;
+  const factResolution =
+    row.factResolution && typeof row.factResolution === "object"
+      ? /** @type {Record<string, unknown>} */ (row.factResolution)
+      : decisionSource?.factResolution &&
+          typeof decisionSource.factResolution === "object"
+        ? /** @type {Record<string, unknown>} */ (decisionSource.factResolution)
+        : null;
+
+  const evidenceNeedsRaw = Array.isArray(decisionSource?.evidenceNeeds)
+    ? decisionSource.evidenceNeeds
+    : Array.isArray(row.evidenceNeeds)
+      ? row.evidenceNeeds
+      : [];
+
+  const decision = decisionSource
+    ? {
+        situation: decisionSource.situation ?? null,
+        conversationAct: decisionSource.conversationAct ?? null,
+        customerIntent: decisionSource.customerIntent ?? null,
+        action: decisionSource.action ?? row.decisionAction ?? null,
+        capability: decisionSource.capability ?? null,
+        evidenceNeeds: evidenceNeedsRaw,
+        bookingSelectionMode: decisionSource.bookingSelectionMode ?? null,
+        selectedBookingId: decisionSource.selectedBookingId ?? null,
+        mutationIntent: decisionSource.mutationIntent ?? null,
+        actionParameters:
+          decisionSource.actionParameters &&
+          typeof decisionSource.actionParameters === "object"
+            ? decisionSource.actionParameters
+            : null,
+        customerReply: cleanCustomerReply(decisionSource.customerReply ?? ""),
+        informationalReplyDeferred:
+          decisionSource.informationalReplyDeferred === true,
+      }
+    : { ...POST_CONFIRM_AGENT_EMPTY_DECISION, evidenceNeeds: [] };
+
+  const evidence = factResolution
+    ? {
+        status: factResolution.status ?? null,
+        items: Array.isArray(factResolution.items)
+          ? factResolution.items
+          : [],
+        verifiedValue: factResolution.verifiedValue ?? null,
+        missingInfoType:
+          factResolution.missingInfoType ?? row.missingInfoType ?? null,
+        selectionStatus: factResolution.selectionStatus ?? null,
+      }
+    : {
+        ...POST_CONFIRM_AGENT_EMPTY_EVIDENCE,
+        items: [],
+        missingInfoType: row.missingInfoType ?? null,
+      };
+
+  const execution = {
+    pendingAvr:
+      opts.pendingAvr !== undefined
+        ? opts.pendingAvr ?? null
+        : row.pendingAvailabilityExecution ?? null,
+    mutation:
+      opts.mutation !== undefined
+        ? opts.mutation ?? null
+        : row.mutationExecution ?? null,
+    missingInfo:
+      opts.missingInfo !== undefined ? opts.missingInfo ?? null : null,
+  };
+
+  const replyEnvelope = {
+    source: row.finalReplySource ?? null,
+    text: typeof row.reply === "string" ? row.reply : "",
+  };
+
+  const outbound = {
+    handled: row.handled === true,
+    action: row.action ?? null,
+    reply: typeof row.reply === "string" ? row.reply : "",
+    terminalFailure: row.terminalFailure === true,
+    retryable: row.retryable === true,
+    finalReplySource: row.finalReplySource ?? null,
+    bookingId: row.bookingId ?? null,
+    availabilityRequestId: row.availabilityRequestId ?? null,
+  };
+
+  return {
+    ...row,
+    decision,
+    evidence,
+    execution,
+    replyEnvelope,
+    outbound,
+  };
+}
+
 /**
  * One missing-info owner-check executor.
  * Executes the gate outcome only — does not re-decide eligibility/lifecycle.
@@ -370,7 +506,15 @@ export async function handleCustomerBusinessPaInbound({
   const phone = String(customerPhone ?? "").trim();
   const text = clean(messageText);
   if (!uid || !phone || !text) {
-    return { handled: false, reason: "MISSING_CONTEXT" };
+    return attachPostConfirmAgentReturnContract(
+      { handled: false, reason: "MISSING_CONTEXT" },
+      {
+        decisionSource: null,
+        pendingAvr: null,
+        mutation: null,
+        missingInfo: null,
+      }
+    );
   }
 
   const resolved =
@@ -385,10 +529,18 @@ export async function handleCustomerBusinessPaInbound({
           inboundReceivedAtMs,
         });
   if (!resolved?.ok || !resolved.facts) {
-    return {
-      handled: false,
-      reason: resolved?.reason || "NO_CONTEXT",
-    };
+    return attachPostConfirmAgentReturnContract(
+      {
+        handled: false,
+        reason: resolved?.reason || "NO_CONTEXT",
+      },
+      {
+        decisionSource: null,
+        pendingAvr: null,
+        mutation: null,
+        missingInfo: null,
+      }
+    );
   }
 
   const facts = resolved.facts;
@@ -424,35 +576,47 @@ export async function handleCustomerBusinessPaInbound({
     const terminalDiagnostic = retryable
       ? null
       : logPostConfirmTerminalDiagnostic(decided);
-    return {
-      handled: true,
-      action: retryable
-        ? "business_pa_retryable_failure"
-        : "business_pa_terminal_model_failure",
-      reply: "",
-      sentReply: false,
-      bookingId: clean(facts.booking?.id) || null,
-      availabilityRequestId:
-        clean(facts.booking?.availabilityRequestId) || null,
-      reason: retryable
-        ? "OPENAI_POST_CONFIRM_FAILED"
-        : "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
-      retryable,
-      terminalFailure: !retryable,
-      openaiUsed: false,
-      openaiSource: decided?.source ?? "technical_fallback",
-      finalReplySource: "openai_post_confirm_pa",
-      failureReason: clean(decided?.reason, 160) || "OPENAI_POST_CONFIRM_FAILED",
-      silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
-      contentSafetyAttempts:
-        terminalDiagnostic?.contentSafetyAttempts ??
-        nonNegativeInteger(decided?.contentSafetyAttempts),
-    };
+    return attachPostConfirmAgentReturnContract(
+      {
+        handled: true,
+        action: retryable
+          ? "business_pa_retryable_failure"
+          : "business_pa_terminal_model_failure",
+        reply: "",
+        sentReply: false,
+        bookingId: clean(facts.booking?.id) || null,
+        availabilityRequestId:
+          clean(facts.booking?.availabilityRequestId) || null,
+        reason: retryable
+          ? "OPENAI_POST_CONFIRM_FAILED"
+          : "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
+        retryable,
+        terminalFailure: !retryable,
+        openaiUsed: false,
+        openaiSource: decided?.source ?? "technical_fallback",
+        finalReplySource: "openai_post_confirm_pa",
+        failureReason: clean(decided?.reason, 160) || "OPENAI_POST_CONFIRM_FAILED",
+        silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+        contentSafetyAttempts:
+          terminalDiagnostic?.contentSafetyAttempts ??
+          nonNegativeInteger(decided?.contentSafetyAttempts),
+      },
+      {
+        decisionSource:
+          decided?.decision && typeof decided.decision === "object"
+            ? decided.decision
+            : null,
+        pendingAvr: null,
+        mutation: null,
+        missingInfo: null,
+      }
+    );
   }
 
   let decision = decided.decision;
   let pendingAvailabilityExecution = null;
   let mutationExecution = null;
+  let missingInfoExecutionResult = null;
   let semanticDecisionCount = 1;
   let composeCalls = 0;
   // Post-exec pending lane may replace facts with verified execution Result.
@@ -581,35 +745,46 @@ export async function handleCustomerBusinessPaInbound({
       const terminalDiagnostic = retryable
         ? null
         : logPostConfirmTerminalDiagnostic(finalDecision);
-      return {
-        handled: true,
-        action: retryable
-          ? "business_pa_retryable_failure"
-          : "business_pa_terminal_model_failure",
-        reply: "",
-        sentReply: false,
-        bookingId: clean(facts.booking?.id) || null,
-        availabilityRequestId: selected?.requestId ?? null,
-        reason: retryable
-          ? "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED"
-          : "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
-        retryable,
-        terminalFailure: !retryable,
-        openaiUsed: false,
-        openaiSource: finalDecision?.source ?? "technical_fallback",
-        finalReplySource: "openai_post_confirm_pa",
-        failureReason:
-          clean(finalDecision?.reason, 160) ||
-          "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED",
-        pendingAvailabilityExecution,
-        silenceRecoveryAttempts:
-          Number(finalDecision?.silenceRecoveryAttempts ?? 0) || 0,
-        contentSafetyAttempts:
-          terminalDiagnostic?.contentSafetyAttempts ??
-          nonNegativeInteger(finalDecision?.contentSafetyAttempts),
-        semanticDecisionCount,
-        composeCalls,
-      };
+      return attachPostConfirmAgentReturnContract(
+        {
+          handled: true,
+          action: retryable
+            ? "business_pa_retryable_failure"
+            : "business_pa_terminal_model_failure",
+          reply: "",
+          sentReply: false,
+          bookingId: clean(facts.booking?.id) || null,
+          availabilityRequestId: selected?.requestId ?? null,
+          reason: retryable
+            ? "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED"
+            : "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
+          retryable,
+          terminalFailure: !retryable,
+          openaiUsed: false,
+          openaiSource: finalDecision?.source ?? "technical_fallback",
+          finalReplySource: "openai_post_confirm_pa",
+          failureReason:
+            clean(finalDecision?.reason, 160) ||
+            "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED",
+          pendingAvailabilityExecution,
+          silenceRecoveryAttempts:
+            Number(finalDecision?.silenceRecoveryAttempts ?? 0) || 0,
+          contentSafetyAttempts:
+            terminalDiagnostic?.contentSafetyAttempts ??
+            nonNegativeInteger(finalDecision?.contentSafetyAttempts),
+          semanticDecisionCount,
+          composeCalls,
+        },
+        {
+          decisionSource:
+            finalDecision?.decision && typeof finalDecision.decision === "object"
+              ? finalDecision.decision
+              : decision,
+          pendingAvr: pendingAvailabilityExecution,
+          mutation: null,
+          missingInfo: null,
+        }
+      );
     }
     // Verified execution Result is the only post-exec factual authority for compose.
     laneFacts = finalFacts;
@@ -659,38 +834,46 @@ export async function handleCustomerBusinessPaInbound({
     composeCalls += 1;
 
     if (composed?.ok !== true || !cleanCustomerReply(composed?.reply)) {
-      return {
-        handled: true,
-        action: "business_pa_terminal_model_failure",
-        reply: "",
-        sentReply: false,
-        bookingId: selectedBookingId || clean(facts.booking?.id) || null,
-        availabilityRequestId:
-          clean(selectedBooking?.availabilityRequestId) ||
-          clean(facts.booking?.availabilityRequestId) ||
-          null,
-        reason: "OPENAI_POST_CONFIRM_MUTATION_COMPOSE_FAILED",
-        retryable: false,
-        terminalFailure: true,
-        openaiUsed: false,
-        openaiSource: composed?.source ?? "technical_fallback",
-        finalReplySource: "openai_post_confirm_pa_mutation_compose",
-        failureReason:
-          clean(composed?.reason, 160) ||
-          "OPENAI_POST_CONFIRM_MUTATION_COMPOSE_FAILED",
-        mutationIntent: frozenDecision.mutationIntent ?? "none",
-        mutationExecutionRequested: true,
-        mutationExecutionStatus:
-          mutationExecution?.status ?? "not_executed",
-        mutationExecution,
-        bookingSelectionMode:
-          clean(frozenDecision.bookingSelectionMode, 40) || "none",
-        selectedBookingIndex: frozenDecision.selectedBookingIndex ?? null,
-        silenceRecoveryAttempts:
-          Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
-        semanticDecisionCount,
-        composeCalls,
-      };
+      return attachPostConfirmAgentReturnContract(
+        {
+          handled: true,
+          action: "business_pa_terminal_model_failure",
+          reply: "",
+          sentReply: false,
+          bookingId: selectedBookingId || clean(facts.booking?.id) || null,
+          availabilityRequestId:
+            clean(selectedBooking?.availabilityRequestId) ||
+            clean(facts.booking?.availabilityRequestId) ||
+            null,
+          reason: "OPENAI_POST_CONFIRM_MUTATION_COMPOSE_FAILED",
+          retryable: false,
+          terminalFailure: true,
+          openaiUsed: false,
+          openaiSource: composed?.source ?? "technical_fallback",
+          finalReplySource: "openai_post_confirm_pa_mutation_compose",
+          failureReason:
+            clean(composed?.reason, 160) ||
+            "OPENAI_POST_CONFIRM_MUTATION_COMPOSE_FAILED",
+          mutationIntent: frozenDecision.mutationIntent ?? "none",
+          mutationExecutionRequested: true,
+          mutationExecutionStatus:
+            mutationExecution?.status ?? "not_executed",
+          mutationExecution,
+          bookingSelectionMode:
+            clean(frozenDecision.bookingSelectionMode, 40) || "none",
+          selectedBookingIndex: frozenDecision.selectedBookingIndex ?? null,
+          silenceRecoveryAttempts:
+            Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+          semanticDecisionCount,
+          composeCalls,
+        },
+        {
+          decisionSource: frozenDecision,
+          pendingAvr: null,
+          mutation: mutationExecution,
+          missingInfo: null,
+        }
+      );
     }
 
     decision = {
@@ -763,6 +946,7 @@ export async function handleCustomerBusinessPaInbound({
         __sendPaMissingInfoOwnerNotificationFn,
         __sendWhatsAppMessageFn,
       });
+      missingInfoExecutionResult = escalateResult;
       missingInfoEscalated = escalateResult?.missingInfoEscalated === true;
       missingInfoRequestId =
         clean(escalateResult?.missingInfoRequestId, 120) || null;
@@ -803,39 +987,47 @@ export async function handleCustomerBusinessPaInbound({
       const failureReason =
         clean(composed?.reason, 160) ||
         "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED";
-      return {
-        handled: true,
-        action: "business_pa_terminal_model_failure",
-        reply: "",
-        sentReply: false,
-        bookingId: selectedBookingId || clean(laneFacts.booking?.id) || null,
-        availabilityRequestId:
-          clean(selectedBooking?.availabilityRequestId) ||
-          clean(laneFacts.booking?.availabilityRequestId) ||
-          null,
-        reason: "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED",
-        retryable: false,
-        terminalFailure: true,
-        openaiUsed: false,
-        openaiSource: composed?.source ?? "technical_fallback",
-        finalReplySource: "openai_post_confirm_pa_informational_compose",
-        failureReason,
-        composeFailure,
-        requestedInformation: frozenDecision.requestedInformation ?? null,
-        factResolution,
-        bookingSelectionMode:
-          clean(frozenDecision.bookingSelectionMode, 40) || "none",
-        selectedBookingIndex: frozenDecision.selectedBookingIndex ?? null,
-        pendingAvailabilityExecution,
-        silenceRecoveryAttempts:
-          Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
-        semanticDecisionCount,
-        composeCalls,
-        missingInfoEscalated,
-        missingInfoRequestId,
-        missingInfoType,
-        ownerNotifyStatus,
-      };
+      return attachPostConfirmAgentReturnContract(
+        {
+          handled: true,
+          action: "business_pa_terminal_model_failure",
+          reply: "",
+          sentReply: false,
+          bookingId: selectedBookingId || clean(laneFacts.booking?.id) || null,
+          availabilityRequestId:
+            clean(selectedBooking?.availabilityRequestId) ||
+            clean(laneFacts.booking?.availabilityRequestId) ||
+            null,
+          reason: "OPENAI_POST_CONFIRM_INFORMATIONAL_COMPOSE_FAILED",
+          retryable: false,
+          terminalFailure: true,
+          openaiUsed: false,
+          openaiSource: composed?.source ?? "technical_fallback",
+          finalReplySource: "openai_post_confirm_pa_informational_compose",
+          failureReason,
+          composeFailure,
+          requestedInformation: frozenDecision.requestedInformation ?? null,
+          factResolution,
+          bookingSelectionMode:
+            clean(frozenDecision.bookingSelectionMode, 40) || "none",
+          selectedBookingIndex: frozenDecision.selectedBookingIndex ?? null,
+          pendingAvailabilityExecution,
+          silenceRecoveryAttempts:
+            Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+          semanticDecisionCount,
+          composeCalls,
+          missingInfoEscalated,
+          missingInfoRequestId,
+          missingInfoType,
+          ownerNotifyStatus,
+        },
+        {
+          decisionSource: frozenDecision,
+          pendingAvr: pendingAvailabilityExecution,
+          mutation: null,
+          missingInfo: missingInfoExecutionResult,
+        }
+      );
     }
 
     decision = {
@@ -905,53 +1097,62 @@ export async function handleCustomerBusinessPaInbound({
     ownerNotifyStatus: decision.ownerNotifyStatus ?? null,
   });
 
-  return {
-    handled: true,
-    action: shouldSend ? "business_pa_reply" : "business_pa_silence",
-    reply: shouldSend ? reply : "",
-    sentReply: false,
-    bookingId,
-    availabilityRequestId,
-    reason,
-    openaiUsed,
-    openaiSource: decided?.source ?? "technical_fallback",
-    finalReplySource:
-      mutationExecution != null
-        ? "openai_post_confirm_pa_mutation_compose"
-        : decision.informationalReplyDeferred === true
-          ? "openai_post_confirm_pa_informational_compose"
-          : "openai_post_confirm_pa",
-    conversationAct: decision.conversationAct,
-    customerIntent: decision.customerIntent ?? "unclear",
-    requestedInformation: decision.requestedInformation ?? null,
-    capability: decision.capability ?? null,
-    evidenceNeeds: decision.evidenceNeeds ?? [],
-    factResolution: decision.factResolution ?? null,
-    mutationIntent: decision.mutationIntent ?? "none",
-    mutationExecutionRequested:
-      decision.mutationExecutionRequested === true ||
-      mutationExecution != null,
-    mutationExecutionStatus:
-      mutationExecution?.status ??
-      decision.mutationExecutionStatus ??
-      "not_executed",
-    mutationExecution,
-    bookingSelectionMode,
-    selectedBookingIndex: decision.selectedBookingIndex ?? null,
-    pendingAvailabilityExecution,
-    situation: decision.situation ?? "unclear",
-    decisionAction: decision.action,
-    shouldReply: decision.shouldReply !== false,
-    missingInfoEscalated: decision.missingInfoEscalated === true,
-    missingInfoRequestId: decision.missingInfoRequestId ?? null,
-    missingInfoType: decision.missingInfoType ?? null,
-    ownerNotifyStatus: decision.ownerNotifyStatus ?? null,
-    silenceRecoveryAttempts: Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
-    retryable: false,
-    terminalFailure: false,
-    semanticDecisionCount,
-    composeCalls,
-  };
+  return attachPostConfirmAgentReturnContract(
+    {
+      handled: true,
+      action: shouldSend ? "business_pa_reply" : "business_pa_silence",
+      reply: shouldSend ? reply : "",
+      sentReply: false,
+      bookingId,
+      availabilityRequestId,
+      reason,
+      openaiUsed,
+      openaiSource: decided?.source ?? "technical_fallback",
+      finalReplySource:
+        mutationExecution != null
+          ? "openai_post_confirm_pa_mutation_compose"
+          : decision.informationalReplyDeferred === true
+            ? "openai_post_confirm_pa_informational_compose"
+            : "openai_post_confirm_pa",
+      conversationAct: decision.conversationAct,
+      customerIntent: decision.customerIntent ?? "unclear",
+      requestedInformation: decision.requestedInformation ?? null,
+      capability: decision.capability ?? null,
+      evidenceNeeds: decision.evidenceNeeds ?? [],
+      factResolution: decision.factResolution ?? null,
+      mutationIntent: decision.mutationIntent ?? "none",
+      mutationExecutionRequested:
+        decision.mutationExecutionRequested === true ||
+        mutationExecution != null,
+      mutationExecutionStatus:
+        mutationExecution?.status ??
+        decision.mutationExecutionStatus ??
+        "not_executed",
+      mutationExecution,
+      bookingSelectionMode,
+      selectedBookingIndex: decision.selectedBookingIndex ?? null,
+      pendingAvailabilityExecution,
+      situation: decision.situation ?? "unclear",
+      decisionAction: decision.action,
+      shouldReply: decision.shouldReply !== false,
+      missingInfoEscalated: decision.missingInfoEscalated === true,
+      missingInfoRequestId: decision.missingInfoRequestId ?? null,
+      missingInfoType: decision.missingInfoType ?? null,
+      ownerNotifyStatus: decision.ownerNotifyStatus ?? null,
+      silenceRecoveryAttempts:
+        Number(decided?.silenceRecoveryAttempts ?? 0) || 0,
+      retryable: false,
+      terminalFailure: false,
+      semanticDecisionCount,
+      composeCalls,
+    },
+    {
+      decisionSource: decision,
+      pendingAvr: pendingAvailabilityExecution,
+      mutation: mutationExecution,
+      missingInfo: missingInfoExecutionResult,
+    }
+  );
 }
 
 /**

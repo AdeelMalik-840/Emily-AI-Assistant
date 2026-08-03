@@ -33,6 +33,41 @@ const {
   claimCloudInboundTurn,
 } = await import("../src/services/inboundTurnLedger.js");
 
+/** Nested↔flat parity for the post-confirm agent return contract. */
+function assertPostConfirmReturnContractParity(result) {
+  assert.ok(result?.outbound && typeof result.outbound === "object");
+  assert.ok(result?.decision && typeof result.decision === "object");
+  assert.ok(result?.evidence && typeof result.evidence === "object");
+  assert.ok(result?.execution && typeof result.execution === "object");
+  assert.ok(result?.replyEnvelope && typeof result.replyEnvelope === "object");
+  assert.equal(result.outbound.reply, result.reply ?? "");
+  assert.equal(result.outbound.action, result.action ?? null);
+  assert.equal(result.outbound.handled, result.handled === true);
+  assert.equal(result.outbound.terminalFailure, result.terminalFailure === true);
+  assert.equal(result.outbound.retryable, result.retryable === true);
+  assert.equal(
+    result.outbound.finalReplySource,
+    result.finalReplySource ?? null
+  );
+  assert.equal(result.outbound.bookingId, result.bookingId ?? null);
+  assert.equal(
+    result.outbound.availabilityRequestId,
+    result.availabilityRequestId ?? null
+  );
+  assert.equal(
+    result.replyEnvelope.text,
+    typeof result.reply === "string" ? result.reply : ""
+  );
+  assert.equal(result.replyEnvelope.source, result.finalReplySource ?? null);
+  assert.equal(
+    result.execution.pendingAvr,
+    result.pendingAvailabilityExecution ?? null
+  );
+  assert.equal(result.execution.mutation, result.mutationExecution ?? null);
+  assert.equal("kind" in result.execution, false);
+  assert.equal("result" in result.execution, false);
+}
+
 const BUSINESS_ID = "arch-business";
 const CUSTOMER_PHONE = "923009998877";
 
@@ -363,6 +398,12 @@ test("exact: 2 din aur extend kar do → focused unsupported, no data change", a
   assert.equal(result.mutationExecutionStatus, "unsupported");
   assert.equal(result.mutationExecution?.changedData, false);
   assert.equal(result.reply, safeReply);
+  assert.equal(result.sentReply, false);
+  assertPostConfirmReturnContractParity(result);
+  assert.equal(result.execution.mutation, result.mutationExecution);
+  assert.equal(result.execution.pendingAvr, null);
+  assert.equal(result.execution.missingInfo, null);
+  assert.equal(result.decision.mutationIntent, "extend_booking");
 });
 
 test("exact: Kia Stonic ki booking cancel kar do → candidate, unsupported", async () => {
@@ -780,4 +821,277 @@ test("actionParameters normalize nullable typed fields without raw-text parsing"
     normalizePostConfirmActionParameters({ extensionDays: 2 }, "none"),
     emptyParams()
   );
+});
+
+test("return contract: pending AVR confirm/decline populate execution.pendingAvr", async () => {
+  const pendingRow = {
+    selectionIndex: 1,
+    requestId: "avr-pending-1",
+    itemId: "civic-2026",
+    itemLabel: "Honda Civic 2026",
+    requestedDuration: 3,
+    priceQuote: { total: 24000, dailyRate: 8000 },
+    request: { id: "avr-pending-1" },
+  };
+  const factsWithPending = {
+    ...multiFacts({ withFocus: false }),
+    booking: null,
+    bookingCandidates: [],
+    pendingAvailabilityRequests: [pendingRow],
+  };
+
+  let decideCalls = 0;
+  const confirm = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "haan confirm kar do",
+    messageId: "msg-avr-confirm",
+    __resolveActiveCustomerBookingFactsFn: async () => ({
+      ok: true,
+      reason: "MATCHED",
+      facts: factsWithPending,
+    }),
+    __executeAvailabilityCustomerConfirmBookingFn: async () => ({
+      ok: true,
+      bookingId: "booking-from-avr",
+    }),
+    __decideCustomerTurnFn: async () => {
+      decideCalls += 1;
+      if (decideCalls === 1) {
+        return {
+          ok: true,
+          source: "openai",
+          decision: {
+            situation: "pending_availability",
+            conversationAct: "confirmation",
+            customerIntent: "confirm_pending",
+            action: "confirm_pending_availability",
+            capability: "confirm_pending_availability",
+            evidenceNeeds: [],
+            pendingAvailabilitySelectionIndex: 1,
+            informationalReplyDeferred: false,
+            shouldReply: true,
+            customerReply: "",
+            mutationIntent: "none",
+            bookingSelectionMode: "none",
+            selectedBookingId: null,
+          },
+        };
+      }
+      return {
+        ok: true,
+        source: "openai",
+        decision: {
+          situation: "acknowledgement_after_answer",
+          conversationAct: "acknowledgement",
+          customerIntent: "unclear",
+          action: "reply",
+          capability: "social",
+          evidenceNeeds: [],
+          informationalReplyDeferred: false,
+          shouldReply: true,
+          customerReply: "Booking confirm ho gayi.",
+          mutationIntent: "none",
+          bookingSelectionMode: "focused",
+          selectedBookingIndex: 1,
+          selectedBookingId: "booking-from-avr",
+        },
+      };
+    },
+  });
+  assert.equal(decideCalls, 2);
+  assert.equal(confirm.pendingAvailabilityExecution?.status, "succeeded");
+  assert.equal(confirm.reply, "Booking confirm ho gayi.");
+  assert.equal(confirm.sentReply, false);
+  assertPostConfirmReturnContractParity(confirm);
+  assert.equal(confirm.execution.pendingAvr, confirm.pendingAvailabilityExecution);
+  assert.equal(confirm.execution.mutation, null);
+  assert.equal(confirm.execution.missingInfo, null);
+
+  let declineDecideCalls = 0;
+  const decline = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "nahi chahiye",
+    messageId: "msg-avr-decline",
+    __resolveActiveCustomerBookingFactsFn: async () => ({
+      ok: true,
+      reason: "MATCHED",
+      facts: factsWithPending,
+    }),
+    __executeAvailabilityCustomerDeclineFn: async () => ({ ok: true }),
+    __decideCustomerTurnFn: async () => {
+      declineDecideCalls += 1;
+      if (declineDecideCalls === 1) {
+        return {
+          ok: true,
+          source: "openai",
+          decision: {
+            situation: "pending_availability",
+            conversationAct: "confirmation",
+            customerIntent: "decline_pending",
+            action: "decline_pending_availability",
+            capability: "decline_pending_availability",
+            evidenceNeeds: [],
+            pendingAvailabilitySelectionIndex: 1,
+            informationalReplyDeferred: false,
+            shouldReply: true,
+            customerReply: "",
+            mutationIntent: "none",
+            bookingSelectionMode: "none",
+            selectedBookingId: null,
+          },
+        };
+      }
+      return {
+        ok: true,
+        source: "openai",
+        decision: {
+          situation: "acknowledgement_after_answer",
+          conversationAct: "acknowledgement",
+          customerIntent: "unclear",
+          action: "reply",
+          capability: "social",
+          evidenceNeeds: [],
+          informationalReplyDeferred: false,
+          shouldReply: true,
+          customerReply: "Theek hai, cancel kar diya.",
+          mutationIntent: "none",
+          bookingSelectionMode: "none",
+          selectedBookingId: null,
+        },
+      };
+    },
+  });
+  assert.equal(declineDecideCalls, 2);
+  assert.equal(decline.pendingAvailabilityExecution?.action, "decline_pending_availability");
+  assertPostConfirmReturnContractParity(decline);
+  assert.equal(decline.execution.pendingAvr, decline.pendingAvailabilityExecution);
+  assert.equal(decline.execution.mutation, null);
+  assert.equal(decline.execution.missingInfo, null);
+});
+
+test("return contract: pending AVR + missing-info coexistence exposes both slots", async () => {
+  process.env.EMILY_BUSINESS_PA_MISSING_INFO_ENABLED = "true";
+  process.env.EMILY_BUSINESS_PA_MISSING_INFO_OWNER_ANSWER_ENABLED = "true";
+  process.env.EMILY_BUSINESS_PA_AGENT_ENABLED = "true";
+
+  const pendingRow = {
+    selectionIndex: 1,
+    requestId: "avr-pending-1",
+    itemId: "civic-2026",
+    itemLabel: "Honda Civic 2026",
+    requestedDuration: 3,
+    priceQuote: { total: 24000, dailyRate: 8000 },
+    request: { id: "avr-pending-1" },
+  };
+  const factsWithPending = {
+    ...multiFacts({ withFocus: false }),
+    booking: null,
+    bookingCandidates: [],
+    pendingAvailabilityRequests: [pendingRow],
+  };
+
+  const advanceDecision = {
+    situation: "new_question",
+    conversationAct: "information_request",
+    customerIntent: "ask_fact",
+    customerIsAskingQuestion: true,
+    capability: "answer_from_business_profile",
+    evidenceNeeds: [
+      {
+        entity: "business_profile",
+        concept: "advance",
+        attributes: ["amount", "policy"],
+      },
+    ],
+    requestedInformation: null,
+    informationalReplyDeferred: true,
+    shouldReply: true,
+    customerReply: "",
+    action: "reply",
+    mutationIntent: "none",
+    mutationExecutionRequested: false,
+    mutationExecutionStatus: "not_executed",
+    actionParameters: {},
+    bookingSelectionMode: "focused",
+    selectedBookingIndex: 1,
+    selectedBookingId: "booking-from-avr",
+  };
+
+  let decideCalls = 0;
+  const escalateResult = {
+    missingInfoEscalated: true,
+    missingInfoRequestId: "req-after-avr",
+    missingInfoType: "advance",
+    ownerNotifyStatus: "sent",
+    ownerCheckAuthorized: true,
+    ownerCheckPending: false,
+  };
+
+  const result = await handleCustomerBusinessPaInbound({
+    db: {},
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "Advance kitna?",
+    messageId: "msg-avr-mi-coexist",
+    __resolveActiveCustomerBookingFactsFn: async () => ({
+      ok: true,
+      reason: "MATCHED",
+      facts: factsWithPending,
+    }),
+    __executeAvailabilityCustomerConfirmBookingFn: async () => ({
+      ok: true,
+      bookingId: "booking-from-avr",
+    }),
+    __decideCustomerTurnFn: async () => {
+      decideCalls += 1;
+      if (decideCalls === 1) {
+        return {
+          ok: true,
+          source: "openai",
+          decision: {
+            situation: "pending_availability",
+            conversationAct: "confirmation",
+            customerIntent: "confirm_pending",
+            action: "confirm_pending_availability",
+            capability: "confirm_pending_availability",
+            evidenceNeeds: [],
+            pendingAvailabilitySelectionIndex: 1,
+            informationalReplyDeferred: false,
+            shouldReply: true,
+            customerReply: "",
+            mutationIntent: "none",
+            bookingSelectionMode: "none",
+            selectedBookingId: null,
+          },
+        };
+      }
+      return { ok: true, source: "openai", decision: advanceDecision };
+    },
+    __resolvePostConfirmRequestedFactFn: () => ({
+      status: "not_found",
+      missingInfoType: "advance",
+      verifiedValue: null,
+      factAvailable: false,
+    }),
+    __composePostConfirmInformationalCustomerReplyFn: async () => ({
+      ok: true,
+      reply: "Main yeh detail confirm karke batata hun.",
+      source: "openai",
+    }),
+    __executePostConfirmPaMissingInfoOwnerCheckFn: async () => escalateResult,
+  });
+
+  assert.equal(decideCalls, 2);
+  assert.ok(result.pendingAvailabilityExecution);
+  assert.equal(result.missingInfoEscalated, true);
+  assert.equal(result.execution.mutation, null);
+  assert.equal(result.execution.pendingAvr, result.pendingAvailabilityExecution);
+  assert.equal(result.execution.missingInfo, escalateResult);
+  assert.equal("kind" in result.execution, false);
+  assert.equal("result" in result.execution, false);
+  assertPostConfirmReturnContractParity(result);
 });

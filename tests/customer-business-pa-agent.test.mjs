@@ -1001,7 +1001,14 @@ test("missing customer identity fails before facts or OpenAI can run", async () 
       return mockOpenAiReply("must not run")();
     },
   });
-  assert.deepEqual(result, { handled: false, reason: "MISSING_CONTEXT" });
+  assert.equal(result.handled, false);
+  assert.equal(result.reason, "MISSING_CONTEXT");
+  assert.equal(result.outbound?.handled, false);
+  assert.equal(result.execution?.pendingAvr, null);
+  assert.equal(result.execution?.mutation, null);
+  assert.equal(result.execution?.missingInfo, null);
+  assert.equal(result.decision?.situation, null);
+  assert.equal(result.evidence?.status, null);
   assert.equal(factHydrations, 0);
   assert.equal(openaiCalls, 0);
 });
