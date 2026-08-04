@@ -321,6 +321,8 @@ test("quoted tokenless owner reply routes by context.id and sends customer follo
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -416,6 +418,7 @@ test("duplicate same owner message does not send twice", async () => {
   seedContext(fake);
   let sendCount = 0;
   const common = {
+    __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
     db: fake.db,
     businessId: BUSINESS_ID,
     senderPhone: OWNER_PHONE,
@@ -458,6 +461,8 @@ test("duplicate reply after closed does not send twice", async () => {
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -486,6 +491,8 @@ test("customer follow-up send failure does not close request or report success",
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -524,6 +531,8 @@ test("owner reply without quote is rejected and nudged (no SINGLE_OPEN)", async 
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -574,6 +583,8 @@ test("owner reply without quote + multiple open requests still requires quote", 
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -602,6 +613,8 @@ test("punctuation-only owner answer ??? rejected; request stays open", async () 
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -636,6 +649,8 @@ test("unknown context.id rejects safely and does not modify request", async () =
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -686,6 +701,8 @@ test("two simultaneous requests stay independent via context.id", async () => {
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -728,6 +745,8 @@ test("wrong customer never receives answer for another request", async () => {
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -798,6 +817,8 @@ test("non-owner customer DM does not trigger owner-answer handler", async () => 
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OTHER_PHONE,
@@ -812,6 +833,7 @@ test("non-owner customer DM does not trigger owner-answer handler", async () => 
     assert.equal(result.reason, "NOT_OWNER");
 
     const tryResult = await tryHandlePaMissingInfoOwnerAnswer({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OTHER_PHONE,
@@ -828,6 +850,8 @@ test("flag OFF means no owner-answer handling", async () => {
 
   await withFlags({ missingInfo: true, ownerAnswer: false }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -843,6 +867,8 @@ test("flag OFF means no owner-answer handling", async () => {
 
   await withFlags({ missingInfo: false, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -868,6 +894,8 @@ test("customer follow-up uses OpenAI helper, not canned reply map", async () => 
     assert.equal(typeof mod.PA_TOPIC_REPLY_MAP, "undefined");
 
     const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
+
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,

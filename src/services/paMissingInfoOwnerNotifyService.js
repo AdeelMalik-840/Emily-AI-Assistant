@@ -303,3 +303,152 @@ export async function sendPaMissingInfoOwnerNotification({
     };
   }
 }
+
+/**
+ * Deterministic owner message after customer answered a clarification.
+ * @param {Record<string, unknown>} request
+ */
+export function buildPaMissingInfoOwnerClarificationRelayMessage(request) {
+  const customerPhone = formatCustomerPhoneForOwnerDisplay(request?.customerPhone);
+  const question = clean(request?.customerQuestion, 280) || "(no question)";
+  const ownerAsk =
+    clean(request?.ownerClarificationText, 280) || "(clarification)";
+  const customerAnswer =
+    clean(request?.customerClarificationAnswer, 280) || "(no answer)";
+
+  return [
+    "↩️ Customer replied to your clarification",
+    "",
+    "Customer:",
+    customerPhone,
+    "",
+    "Original question:",
+    `“${question}”`,
+    "",
+    "Your clarification:",
+    `“${ownerAsk}”`,
+    "",
+    "Customer reply:",
+    `“${customerAnswer}”`,
+    "",
+    "Reply to this message with the final answer. Emily will send it to the customer.",
+  ].join("\n");
+}
+
+/**
+ * Re-notify owner with customer clarification answer; rotates quote wamid.
+ * Does not use the initial-notify idempotent skip (always a new outbound).
+ *
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   request: Record<string, unknown>,
+ *   sendCredentials?: unknown,
+ *   executionContext?: Record<string, unknown>,
+ *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
+ * }} p
+ */
+export async function sendPaMissingInfoOwnerClarificationRelay({
+  db: connection,
+  businessId,
+  request,
+  sendCredentials = null,
+  executionContext = {},
+  sendWhatsAppMessageFn = sendWhatsAppMessage,
+}) {
+  const uid = clean(businessId, 120);
+  const requestId = clean(request?.requestId || request?.id, 120);
+  if (!connection || !uid || !requestId) {
+    return {
+      ok: false,
+      reason: "MISSING_CONTEXT",
+      ownerNotifyStatus: "failed",
+      ownerTarget: null,
+    };
+  }
+
+  // Idempotent: already relayed for this customer clarification message.
+  if (
+    clean(request?.ownerClarificationRelayStatus, 40) === "sent" &&
+    clean(request?.ownerNotifyProviderMessageId, 160) &&
+    clean(request?.customerClarificationAnswer, 800)
+  ) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "IDEMPOTENT_SKIP",
+      ownerNotifyStatus: "sent",
+      ownerTarget: normalizePhone(request?.ownerTarget) || null,
+      requestId,
+      providerMessageId: clean(request.ownerNotifyProviderMessageId, 160),
+    };
+  }
+
+  const ownerTarget = await resolvePaMissingInfoOwnerTarget({
+    db: connection,
+    businessId: uid,
+    executionContext,
+  });
+  if (!ownerTarget) {
+    return {
+      ok: false,
+      reason: "OWNER_PHONE_MISSING",
+      ownerNotifyStatus: "failed",
+      ownerTarget: null,
+      requestId,
+    };
+  }
+
+  const message = buildPaMissingInfoOwnerClarificationRelayMessage(request);
+
+  try {
+    const sendResult = await sendWhatsAppMessageFn(
+      ownerTarget,
+      message,
+      sendCredentials ?? undefined,
+      { recipientType: "individual" }
+    );
+    if (sendResult && sendResult.ok === false) {
+      throw new Error(
+        clean(
+          sendResult?.error?.message ||
+            sendResult?.error ||
+            sendResult?.reason,
+          200
+        ) || "WHATSAPP_SEND_FAILED"
+      );
+    }
+    const providerMessageId = clean(
+      sendResult?.providerMessageId ||
+        sendResult?.messages?.[0]?.id ||
+        sendResult?.messageId ||
+        sendResult?.id ||
+        "",
+      160
+    );
+    if (!providerMessageId) {
+      throw new Error("OWNER_NOTIFY_PROVIDER_MESSAGE_ID_MISSING");
+    }
+
+    return {
+      ok: true,
+      sent: true,
+      reason: "SENT",
+      ownerNotifyStatus: "sent",
+      ownerTarget,
+      requestId,
+      providerMessageId,
+    };
+  } catch (err) {
+    const error =
+      clean(err?.message || String(err), 400) || "WHATSAPP_API_FAILED";
+    return {
+      ok: false,
+      reason: "WHATSAPP_API_FAILED",
+      ownerNotifyStatus: "failed",
+      ownerTarget,
+      requestId,
+      error,
+    };
+  }
+}

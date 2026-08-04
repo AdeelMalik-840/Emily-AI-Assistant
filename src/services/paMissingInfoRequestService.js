@@ -17,14 +17,25 @@ export const PA_MISSING_INFO_TYPES = Object.freeze([
 export const PA_MISSING_INFO_OPEN_STATUSES = Object.freeze([
   "open",
   "owner_notified",
+  // Owner asked the customer a clarifying question; loop still open.
+  "awaiting_customer_clarification",
   // Notify-failed rows stay reusable for REUSE_AND_NOTIFY (no duplicate create).
   "failed",
 ]);
 
-/** Statuses that may still accept an owner answer. */
+/** Statuses that may still accept an owner answer / clarification (quoted). */
 export const PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES = Object.freeze([
   "open",
   "owner_notified",
+]);
+
+/** Customer clarification answers bind only while awaiting. */
+export const PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS =
+  "awaiting_customer_clarification";
+
+export const PA_MISSING_INFO_OWNER_RESPONSE_KINDS = Object.freeze([
+  "final_answer",
+  "clarification_question",
 ]);
 
 /** Terminal / post-answer statuses — never send customer follow-up again. */
@@ -38,6 +49,7 @@ export const PA_MISSING_INFO_POST_ANSWER_STATUSES = Object.freeze([
 export const PA_MISSING_INFO_STATUSES = Object.freeze([
   "open",
   "owner_notified",
+  "awaiting_customer_clarification",
   "failed",
   "answered",
   "customer_notified",
@@ -660,6 +672,7 @@ export async function applyPaMissingInfoOwnerAnswer(p) {
     ownerAnswerRaw,
     ownerAnswerAt: now,
     ownerAnswerMessageId,
+    ownerResponseKind: "final_answer",
     status: "answered",
   };
   await patchPaMissingInfoRequest({
@@ -749,4 +762,436 @@ export async function markPaMissingInfoCustomerFollowupFailed(p) {
     },
   });
   return { ok: true, status: "customer_followup_failed" };
+}
+
+/**
+ * @param {unknown} value
+ * @returns {"final_answer" | "clarification_question" | null}
+ */
+export function cleanPaMissingInfoOwnerResponseKind(value) {
+  const kind = clean(value, 40).toLowerCase();
+  return PA_MISSING_INFO_OWNER_RESPONSE_KINDS.includes(kind) ? kind : null;
+}
+
+/**
+ * Persist owner clarification (not a final answer). Does not close.
+ * Idempotent on ownerClarificationMessageId.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   ownerClarificationText: string,
+ *   ownerClarificationMessageId?: string | null,
+ * }} p
+ */
+export async function applyPaMissingInfoOwnerClarification(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  const text = clean(p.ownerClarificationText, 800);
+  const messageId = clean(p.ownerClarificationMessageId, 160) || null;
+  if (!uid || !requestId || !text) {
+    return { ok: false, reason: "MISSING_CONTEXT", applied: false, request: null };
+  }
+
+  const existing = await getPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+  });
+  if (!existing) {
+    return { ok: false, reason: "NOT_FOUND", applied: false, request: null };
+  }
+
+  const status = clean(existing.status, 40);
+  if (
+    status === PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS &&
+    messageId &&
+    clean(existing.ownerClarificationMessageId, 160) === messageId
+  ) {
+    return {
+      ok: true,
+      reason: "IDEMPOTENT_SAME_MESSAGE",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (PA_MISSING_INFO_POST_ANSWER_STATUSES.includes(status)) {
+    return {
+      ok: true,
+      reason: "ALREADY_ANSWERED",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (!PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES.includes(status)) {
+    return {
+      ok: false,
+      reason: "NOT_OPEN_FOR_ANSWER",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (isExpiredRequest(existing)) {
+    return {
+      ok: false,
+      reason: "EXPIRED",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (
+    messageId &&
+    clean(existing.ownerClarificationMessageId, 160) === messageId &&
+    clean(existing.ownerClarificationText, 800) === text
+  ) {
+    // Successful clarification delivery already awaiting customer — idempotent.
+    if (
+      status === PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS
+    ) {
+      return {
+        ok: true,
+        reason: "IDEMPOTENT_SAME_MESSAGE",
+        applied: false,
+        request: existing,
+      };
+    }
+    // Failed customer delivery: allow retry of the same owner message.
+    if (clean(existing.ownerClarificationDeliveryError, 400)) {
+      return {
+        ok: true,
+        reason: "RETRY_DELIVERY",
+        applied: true,
+        request: existing,
+      };
+    }
+    return {
+      ok: true,
+      reason: "IDEMPOTENT_SAME_MESSAGE",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  const now = new Date();
+  const patch = {
+    ownerResponseKind: "clarification_question",
+    ownerClarificationText: text,
+    ownerClarificationAt: now,
+    ownerClarificationMessageId: messageId,
+    ownerClarificationDeliveryError: null,
+  };
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch,
+  });
+
+  return {
+    ok: true,
+    reason: "APPLIED",
+    applied: true,
+    request: { ...existing, ...patch, requestId },
+  };
+}
+
+/**
+ * After successful clarification send to customer — keep request open.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   customerClarificationPromptText: string,
+ *   providerMessageId?: string | null,
+ * }} p
+ */
+export async function markPaMissingInfoAwaitingCustomerClarification(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  const text = clean(p.customerClarificationPromptText, 800);
+  if (!uid || !requestId || !text) {
+    return { ok: false, reason: "MISSING_CONTEXT" };
+  }
+  const now = new Date();
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch: {
+      status: PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS,
+      customerClarificationPromptText: text,
+      customerClarificationPromptAt: now,
+      customerClarificationPromptProviderMessageId:
+        clean(p.providerMessageId, 160) || null,
+      customerClarificationPromptError: null,
+      // Clear prior customer answer if any (new clarification round).
+      customerClarificationAnswer: null,
+      customerClarificationMessageId: null,
+      customerClarificationAt: null,
+      ownerClarificationRelayStatus: null,
+      ownerClarificationRelayError: null,
+    },
+  });
+  return {
+    ok: true,
+    status: PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS,
+  };
+}
+
+/**
+ * Clarification send to customer failed — stay owner_notified / recoverable.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   error?: string | null,
+ *   customerClarificationPromptText?: string | null,
+ * }} p
+ */
+export async function markPaMissingInfoOwnerClarificationDeliveryFailed(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  if (!uid || !requestId) {
+    return { ok: false, reason: "MISSING_CONTEXT" };
+  }
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch: {
+      status: "owner_notified",
+      ownerClarificationDeliveryError:
+        clean(p.error, 400) || "CLARIFICATION_DELIVERY_FAILED",
+      customerClarificationPromptText:
+        clean(p.customerClarificationPromptText, 800) || null,
+    },
+  });
+  return { ok: true, status: "owner_notified" };
+}
+
+/**
+ * List awaiting_customer_clarification rows for one business + customer.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ *   limit?: number,
+ * }} p
+ * @returns {Promise<Array<Record<string, unknown>>>}
+ */
+export async function listAwaitingCustomerClarificationRequestsForCustomer({
+  db: connection,
+  businessId,
+  customerPhone,
+  limit = 40,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  const uid = clean(businessId, 120);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!col || !uid || !phone) return [];
+
+  const snap = await col
+    .limit(Math.max(1, Math.min(120, Number(limit) || 40)))
+    .get()
+    .catch(() => null);
+
+  const out = [];
+  const nowMs = Date.now();
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data() || {};
+    if (
+      clean(data.status, 40) !==
+      PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS
+    ) {
+      continue;
+    }
+    if (isExpiredRequest(data, nowMs)) continue;
+    const rowPhone = phoneDigitsOnly(data.customerPhone);
+    if (
+      !rowPhone ||
+      !(
+        rowPhone === phone ||
+        rowPhone.endsWith(phone) ||
+        phone.endsWith(rowPhone)
+      )
+    ) {
+      continue;
+    }
+    out.push({ id: doc.id, requestId: doc.id, ...(data || {}) });
+  }
+  return out;
+}
+
+/**
+ * Persist customer clarification answer while awaiting. Idempotent on messageId.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   customerClarificationAnswer: string,
+ *   customerClarificationMessageId?: string | null,
+ * }} p
+ */
+export async function applyPaMissingInfoCustomerClarificationAnswer(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  const answer = clean(p.customerClarificationAnswer, 800);
+  const messageId = clean(p.customerClarificationMessageId, 160) || null;
+  if (!uid || !requestId || !answer) {
+    return { ok: false, reason: "MISSING_CONTEXT", applied: false, request: null };
+  }
+
+  const existing = await getPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+  });
+  if (!existing) {
+    return { ok: false, reason: "NOT_FOUND", applied: false, request: null };
+  }
+
+  const status = clean(existing.status, 40);
+  if (status !== PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS) {
+    return {
+      ok: false,
+      reason: "NOT_AWAITING_CUSTOMER_CLARIFICATION",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  if (
+    messageId &&
+    clean(existing.customerClarificationMessageId, 160) === messageId
+  ) {
+    if (clean(existing.ownerClarificationRelayStatus, 40) === "sent") {
+      return {
+        ok: true,
+        reason: "IDEMPOTENT_SAME_MESSAGE",
+        applied: false,
+        request: existing,
+      };
+    }
+    if (clean(existing.ownerClarificationRelayStatus, 40) === "failed") {
+      return {
+        ok: true,
+        reason: "RETRY_RELAY",
+        applied: true,
+        request: existing,
+      };
+    }
+    return {
+      ok: true,
+      reason: "IDEMPOTENT_SAME_MESSAGE",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  // Already relayed to owner for a prior answer — do not overwrite silently.
+  if (
+    clean(existing.ownerClarificationRelayStatus, 40) === "sent" &&
+    clean(existing.customerClarificationAnswer, 800)
+  ) {
+    return {
+      ok: true,
+      reason: "ALREADY_RELAYED",
+      applied: false,
+      request: existing,
+    };
+  }
+
+  const now = new Date();
+  const patch = {
+    customerClarificationAnswer: answer,
+    customerClarificationMessageId: messageId,
+    customerClarificationAt: now,
+    ownerClarificationRelayStatus: null,
+    ownerClarificationRelayError: null,
+  };
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch,
+  });
+
+  return {
+    ok: true,
+    reason: "APPLIED",
+    applied: true,
+    request: { ...existing, ...patch, requestId },
+  };
+}
+
+/**
+ * After owner re-notify with customer clarification — rotate quote target.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   ownerNotifyProviderMessageId: string,
+ * }} p
+ */
+export async function markPaMissingInfoOwnerClarificationRelaySent(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  const providerMessageId = clean(p.ownerNotifyProviderMessageId, 160);
+  if (!uid || !requestId || !providerMessageId) {
+    return { ok: false, reason: "MISSING_CONTEXT" };
+  }
+  const now = new Date();
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch: {
+      status: "owner_notified",
+      ownerNotifyStatus: "sent",
+      ownerNotifyAt: now,
+      ownerNotifyError: null,
+      ownerNotifyProviderMessageId: providerMessageId,
+      ownerClarificationRelayStatus: "sent",
+      ownerClarificationRelayAt: now,
+      ownerClarificationRelayError: null,
+      ownerResponseKind: null,
+    },
+  });
+  return { ok: true, status: "owner_notified" };
+}
+
+/**
+ * Owner re-notify failed — keep awaiting; customer answer retained.
+ * @param {{
+ *   db: unknown,
+ *   businessId: string,
+ *   requestId: string,
+ *   error?: string | null,
+ * }} p
+ */
+export async function markPaMissingInfoOwnerClarificationRelayFailed(p) {
+  const uid = clean(p.businessId, 120);
+  const requestId = clean(p.requestId, 120);
+  if (!uid || !requestId) {
+    return { ok: false, reason: "MISSING_CONTEXT" };
+  }
+  await patchPaMissingInfoRequest({
+    db: p.db,
+    businessId: uid,
+    requestId,
+    patch: {
+      status: PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS,
+      ownerClarificationRelayStatus: "failed",
+      ownerClarificationRelayError:
+        clean(p.error, 400) || "OWNER_RELAY_FAILED",
+    },
+  });
+  return {
+    ok: true,
+    status: PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS,
+  };
 }
