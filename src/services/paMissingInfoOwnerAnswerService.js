@@ -14,20 +14,33 @@ import {
   isEmilyBusinessPaMissingInfoOwnerAnswerEnabled,
 } from "../brain/config/liveFeatureFlags.js";
 import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
-import { resolvePaMissingInfoOwnerTarget } from "./paMissingInfoOwnerNotifyService.js";
 import {
   applyPaMissingInfoOwnerAnswer,
+  applyPaMissingInfoOwnerClarification,
+  applyPaMissingInfoCustomerClarificationAnswer,
   findPaMissingInfoRequestByOwnerNotifyProviderMessageId,
   getPaMissingInfoRequest,
+  listAwaitingCustomerClarificationRequestsForCustomer,
+  markPaMissingInfoAwaitingCustomerClarification,
   markPaMissingInfoCustomerFollowupFailed,
   markPaMissingInfoCustomerFollowupSent,
+  markPaMissingInfoOwnerClarificationDeliveryFailed,
+  markPaMissingInfoOwnerClarificationRelayFailed,
+  markPaMissingInfoOwnerClarificationRelaySent,
   PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES,
   PA_MISSING_INFO_POST_ANSWER_STATUSES,
   PA_MISSING_INFO_TYPES,
 } from "./paMissingInfoRequestService.js";
 import {
+  resolvePaMissingInfoOwnerTarget,
+  sendPaMissingInfoOwnerClarificationRelay,
+} from "./paMissingInfoOwnerNotifyService.js";
+import {
   CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+  classifyPaMissingInfoOwnerResponseKind,
+  generatePaMissingInfoCustomerClarificationStatusReply,
   generatePaMissingInfoCustomerFollowupFromOwnerAnswer,
+  generatePaMissingInfoOwnerClarificationCustomerRelay,
 } from "./customerBusinessPaAiReply.js";
 
 const PAMISS_TOKEN_RE = /\b(pamiss_[a-f0-9]{12,32})\b/i;
@@ -35,6 +48,19 @@ const PAMISS_TOKEN_RE = /\b(pamiss_[a-f0-9]{12,32})\b/i;
 /** Owner-facing nudge when reply is not a WhatsApp quote of the notification. */
 export const PA_MISSING_INFO_OWNER_QUOTE_NUDGE =
   "Please reply directly to the customer question notification (swipe/reply on that message) so Emily can match your answer.";
+
+/**
+ * Owner-facing instruction when classifier cannot safely choose final vs clarification.
+ * Not customer-facing. No regex routing — meaning classify already failed/unsure.
+ */
+export const PA_MISSING_INFO_OWNER_RESPONSE_KIND_CLARIFY =
+  [
+    "Emily could not tell whether your reply is the final answer for the customer or a follow-up question.",
+    "",
+    "Please reply again to the same notification and clearly choose one:",
+    "A) Final answer — the information the customer should receive",
+    "B) Follow-up question — what you need the customer to clarify first",
+  ].join("\n");
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -99,13 +125,14 @@ async function sendOwnerQuoteNudge({
   sendWhatsAppMessageFn,
   ownerPhone,
   sendCredentials = null,
+  text = PA_MISSING_INFO_OWNER_QUOTE_NUDGE,
 }) {
   const to = phoneDigitsOnly(ownerPhone);
   if (!to) return { sent: false };
   try {
     await sendWhatsAppMessageFn(
       to,
-      PA_MISSING_INFO_OWNER_QUOTE_NUDGE,
+      text,
       sendCredentials ?? undefined,
       { recipientType: "individual" }
     );
@@ -132,6 +159,8 @@ async function sendOwnerQuoteNudge({
  *   __resolvePaMissingInfoOwnerTargetFn?: typeof resolvePaMissingInfoOwnerTarget,
  *   __resolveActiveCustomerBookingFactsFn?: typeof resolveActiveCustomerBookingFacts,
  *   __generateFollowupFn?: typeof generatePaMissingInfoCustomerFollowupFromOwnerAnswer,
+ *   __classifyOwnerResponseKindFn?: typeof classifyPaMissingInfoOwnerResponseKind,
+ *   __generateClarificationRelayFn?: typeof generatePaMissingInfoOwnerClarificationCustomerRelay,
  *   __chatCompletionsCreateForTests?: Function,
  *   __appendConversationMessageFn?: typeof appendConversationMessage,
  * }} p
@@ -152,6 +181,9 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
   __resolvePaMissingInfoOwnerTargetFn = resolvePaMissingInfoOwnerTarget,
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
   __generateFollowupFn = generatePaMissingInfoCustomerFollowupFromOwnerAnswer,
+  __classifyOwnerResponseKindFn = classifyPaMissingInfoOwnerResponseKind,
+  __generateClarificationRelayFn =
+    generatePaMissingInfoOwnerClarificationCustomerRelay,
   __chatCompletionsCreateForTests = null,
   __appendConversationMessageFn = appendConversationMessage,
 } = {}) {
@@ -257,6 +289,24 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
     };
   }
 
+  // Already awaiting customer after this same clarification webhook.
+  if (
+    status === "awaiting_customer_clarification" &&
+    messageId &&
+    clean(request.ownerClarificationMessageId, 160) === clean(messageId, 160)
+  ) {
+    return {
+      handled: true,
+      reason: "IDEMPOTENT_SAME_MESSAGE",
+      action: "owner_clarification_skipped",
+      requestId,
+      matchReason,
+      customerFollowupSent: false,
+      status,
+      ownerResponseKind: "clarification_question",
+    };
+  }
+
   if (!PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES.includes(status)) {
     return {
       handled: true,
@@ -282,6 +332,225 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
     };
   }
 
+  const kindResult = await __classifyOwnerResponseKindFn({
+    customerQuestion: request.customerQuestion,
+    missingInfoType: request.missingInfoType,
+    ownerMessage: ownerAnswer,
+    __chatCompletionsCreateForTests,
+  });
+  const rawKind = clean(kindResult?.kind, 40);
+  const ownerResponseKind =
+    kindResult?.ok === true && rawKind === "final_answer"
+      ? "final_answer"
+      : kindResult?.ok === true && rawKind === "clarification_question"
+        ? "clarification_question"
+        : "unclear";
+
+  // Unclear / classifier failure: do not apply final or start clarification loop.
+  if (ownerResponseKind === "unclear") {
+    await sendOwnerQuoteNudge({
+      sendWhatsAppMessageFn,
+      ownerPhone: ownerTarget,
+      sendCredentials,
+      text: PA_MISSING_INFO_OWNER_RESPONSE_KIND_CLARIFY,
+    });
+    console.log("[pa_missing_info_owner_answer_result]", {
+      businessId: uid,
+      requestId,
+      matchReason,
+      customerFollowupSent: false,
+      ownerResponseKind: "unclear",
+      classifyOk: kindResult?.ok === true,
+      classifyReason: clean(kindResult?.reason, 160) || null,
+    });
+    return {
+      handled: true,
+      reason: "OWNER_RESPONSE_KIND_UNCLEAR",
+      action: "owner_answer_kind_unclear",
+      requestId,
+      matchReason,
+      customerFollowupSent: false,
+      ownerResponseKind: "unclear",
+      status,
+      recoverable: true,
+      classifyReason: clean(kindResult?.reason, 160) || null,
+    };
+  }
+
+  // --- Clarification question: keep pamiss open ---
+  if (ownerResponseKind === "clarification_question") {
+    const appliedClarification = await applyPaMissingInfoOwnerClarification({
+      db: connection,
+      businessId: uid,
+      requestId,
+      ownerClarificationText: ownerAnswer,
+      ownerClarificationMessageId: clean(messageId, 160) || null,
+    });
+
+    if (!appliedClarification?.ok) {
+      return {
+        handled: true,
+        reason: appliedClarification?.reason || "APPLY_CLARIFICATION_FAILED",
+        action: "owner_answer_unmatched",
+        requestId,
+        matchReason,
+        customerFollowupSent: false,
+      };
+    }
+
+    if (appliedClarification.applied === false) {
+      return {
+        handled: true,
+        reason: appliedClarification.reason || "IDEMPOTENT_SKIP",
+        action: "owner_clarification_skipped",
+        requestId,
+        matchReason,
+        customerFollowupSent: false,
+        status:
+          clean(appliedClarification.request?.status, 40) || status,
+        ownerResponseKind: "clarification_question",
+      };
+    }
+
+    const customerPhone = phoneDigitsOnly(
+      appliedClarification.request?.customerPhone || request.customerPhone
+    );
+    if (!customerPhone) {
+      await markPaMissingInfoOwnerClarificationDeliveryFailed({
+        db: connection,
+        businessId: uid,
+        requestId,
+        error: "CUSTOMER_PHONE_MISSING",
+      });
+      return {
+        handled: true,
+        reason: "CUSTOMER_PHONE_MISSING",
+        action: "owner_clarification_failed",
+        requestId,
+        matchReason,
+        customerFollowupSent: false,
+        ownerResponseKind: "clarification_question",
+      };
+    }
+
+    let facts = null;
+    try {
+      const resolved = await __resolveActiveCustomerBookingFactsFn({
+        db: connection,
+        businessId: uid,
+        customerPhone,
+      });
+      if (resolved?.ok && resolved.facts) facts = resolved.facts;
+    } catch {
+      facts = null;
+    }
+
+    const ai = await __generateClarificationRelayFn({
+      facts,
+      customerQuestion:
+        appliedClarification.request?.customerQuestion ||
+        request.customerQuestion,
+      ownerClarification: ownerAnswer,
+      styleKey: "casual_local",
+      __chatCompletionsCreateForTests,
+    });
+
+    const followupText = clean(
+      ai?.reply || ownerAnswer || CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
+      500
+    );
+
+    try {
+      const sendResult = await sendWhatsAppMessageFn(
+        customerPhone,
+        followupText,
+        sendCredentials ?? undefined,
+        { recipientType: "individual" }
+      );
+      if (sendResult && sendResult.ok === false) {
+        throw new Error(
+          clean(
+            sendResult?.error?.message ||
+              sendResult?.error ||
+              sendResult?.reason,
+            200
+          ) || "WHATSAPP_SEND_FAILED"
+        );
+      }
+      const providerMessageId = clean(
+        sendResult?.providerMessageId ||
+          sendResult?.messages?.[0]?.id ||
+          sendResult?.messageId ||
+          sendResult?.id ||
+          "",
+        160
+      );
+
+      await markPaMissingInfoAwaitingCustomerClarification({
+        db: connection,
+        businessId: uid,
+        requestId,
+        customerClarificationPromptText: followupText,
+        providerMessageId,
+      });
+
+      if (typeof __appendConversationMessageFn === "function") {
+        await __appendConversationMessageFn(connection, {
+          ownerUserId: uid,
+          customerNumber: customerPhone,
+          role: "assistant",
+          text: followupText,
+        }).catch(() => null);
+      }
+
+      console.log("[pa_missing_info_owner_answer_result]", {
+        businessId: uid,
+        requestId,
+        matchReason,
+        customerFollowupSent: true,
+        ownerResponseKind: "clarification_question",
+        openaiUsed: ai?.source === "openai",
+      });
+
+      return {
+        handled: true,
+        reason: "CUSTOMER_CLARIFICATION_SENT",
+        action: "owner_clarification_sent",
+        requestId,
+        matchReason,
+        customerPhone,
+        customerFollowupSent: true,
+        customerFollowupText: followupText,
+        openaiUsed: ai?.source === "openai",
+        openaiSource: ai?.source ?? "technical_fallback",
+        ownerResponseKind: "clarification_question",
+        status: "awaiting_customer_clarification",
+      };
+    } catch (err) {
+      const error =
+        clean(err?.message || String(err), 400) || "WHATSAPP_API_FAILED";
+      await markPaMissingInfoOwnerClarificationDeliveryFailed({
+        db: connection,
+        businessId: uid,
+        requestId,
+        error,
+        customerClarificationPromptText: followupText,
+      });
+      return {
+        handled: true,
+        reason: "CUSTOMER_CLARIFICATION_FAILED",
+        action: "owner_clarification_failed",
+        requestId,
+        matchReason,
+        customerFollowupSent: false,
+        error,
+        ownerResponseKind: "clarification_question",
+        status: "owner_notified",
+      };
+    }
+  }
+
+  // --- Final answer: existing path ---
   const applied = await applyPaMissingInfoOwnerAnswer({
     db: connection,
     businessId: uid,
@@ -411,6 +680,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       requestId,
       matchReason,
       customerFollowupSent: true,
+      ownerResponseKind: "final_answer",
       openaiUsed: ai?.source === "openai",
     });
 
@@ -425,6 +695,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       customerFollowupText: followupText,
       openaiUsed: ai?.source === "openai",
       openaiSource: ai?.source ?? "technical_fallback",
+      ownerResponseKind: "final_answer",
       status: "closed",
     };
   } catch (err) {
@@ -460,5 +731,293 @@ export async function tryHandlePaMissingInfoOwnerAnswer(params) {
   if (result.reason === "NOT_CLOUD_DM" || result.reason === "MISSING_CONTEXT") {
     return null;
   }
+  return result;
+}
+
+/**
+ * Bind a customer DM to exactly one awaiting_customer_clarification pamiss.
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ *   messageText: string,
+ *   messageId?: string | null,
+ *   sendCredentials?: unknown,
+ *   missingInfoEnabled?: boolean,
+ *   ownerAnswerEnabled?: boolean,
+ *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
+ *   __listAwaitingFn?: Function,
+ *   __sendOwnerClarificationRelayFn?: Function,
+ *   __generateClarificationStatusReplyFn?: typeof generatePaMissingInfoCustomerClarificationStatusReply,
+ *   __chatCompletionsCreateForTests?: Function,
+ *   __appendConversationMessageFn?: typeof appendConversationMessage,
+ * }} p
+ */
+export async function handlePaMissingInfoCustomerClarificationInbound({
+  db: connection,
+  businessId,
+  customerPhone,
+  messageText,
+  messageId = null,
+  sendCredentials = null,
+  missingInfoEnabled = isEmilyBusinessPaMissingInfoEnabled(),
+  ownerAnswerEnabled = isEmilyBusinessPaMissingInfoOwnerAnswerEnabled(),
+  sendWhatsAppMessageFn = sendWhatsAppMessage,
+  __listAwaitingFn = null,
+  __sendOwnerClarificationRelayFn = null,
+  __generateClarificationStatusReplyFn = null,
+  __chatCompletionsCreateForTests = null,
+  __appendConversationMessageFn = appendConversationMessage,
+} = {}) {
+  if (!missingInfoEnabled || !ownerAnswerEnabled) {
+    return { handled: false, reason: "FLAG_OFF" };
+  }
+
+  const uid = clean(businessId, 120);
+  const phone = phoneDigitsOnly(customerPhone);
+  const text = clean(messageText, 800);
+  if (!connection || !uid || !phone || !text) {
+    return { handled: false, reason: "MISSING_CONTEXT" };
+  }
+
+  const listFn =
+    typeof __listAwaitingFn === "function"
+      ? __listAwaitingFn
+      : listAwaitingCustomerClarificationRequestsForCustomer;
+  const relayFn =
+    typeof __sendOwnerClarificationRelayFn === "function"
+      ? __sendOwnerClarificationRelayFn
+      : sendPaMissingInfoOwnerClarificationRelay;
+  const statusReplyFn =
+    typeof __generateClarificationStatusReplyFn === "function"
+      ? __generateClarificationStatusReplyFn
+      : generatePaMissingInfoCustomerClarificationStatusReply;
+
+  async function sendCustomerStatusReply(situation, trusted = {}) {
+    const ai = await statusReplyFn({
+      situation,
+      styleKey: "casual_local",
+      __chatCompletionsCreateForTests,
+      ...trusted,
+    });
+    const reply = clean(ai?.reply, 500);
+    if (!reply) return { sent: false, reply: "", source: ai?.source ?? null };
+    try {
+      await sendWhatsAppMessageFn(
+        phone,
+        reply,
+        sendCredentials ?? undefined,
+        { recipientType: "individual" }
+      );
+      if (typeof __appendConversationMessageFn === "function") {
+        await __appendConversationMessageFn(connection, {
+          ownerUserId: uid,
+          customerNumber: phone,
+          role: "assistant",
+          text: reply,
+        }).catch(() => null);
+      }
+      return { sent: true, reply, source: ai?.source ?? null };
+    } catch {
+      return { sent: false, reply, source: ai?.source ?? null };
+    }
+  }
+
+  const awaiting = await listFn({
+    db: connection,
+    businessId: uid,
+    customerPhone: phone,
+  });
+
+  // Idempotent webhook after relay already completed (status no longer awaiting).
+  if ((!Array.isArray(awaiting) || awaiting.length === 0) && messageId) {
+    const col = connection
+      ?.collection?.("businesses")
+      ?.doc?.(uid)
+      ?.collection?.("paMissingInfoRequests");
+    if (col) {
+      const snap = await col.limit(80).get().catch(() => null);
+      for (const doc of snap?.docs ?? []) {
+        const data = doc.data() || {};
+        const rowPhone = phoneDigitsOnly(data.customerPhone);
+        if (
+          !rowPhone ||
+          !(
+            rowPhone === phone ||
+            rowPhone.endsWith(phone) ||
+            phone.endsWith(rowPhone)
+          )
+        ) {
+          continue;
+        }
+        if (
+          clean(data.customerClarificationMessageId, 160) ===
+            clean(messageId, 160) &&
+          clean(data.ownerClarificationRelayStatus, 40) === "sent"
+        ) {
+          return {
+            handled: true,
+            reason: "IDEMPOTENT_SAME_MESSAGE",
+            action: "customer_clarification_skipped",
+            requestId: clean(data.requestId || doc.id, 120),
+            customerFollowupSent: false,
+            status: clean(data.status, 40) || null,
+          };
+        }
+      }
+    }
+  }
+
+  if (!Array.isArray(awaiting) || awaiting.length === 0) {
+    return { handled: false, reason: "NO_AWAITING_CLARIFICATION" };
+  }
+
+  if (awaiting.length > 1) {
+    const statusSend = await sendCustomerStatusReply(
+      "multiple_awaiting_clarification",
+      {
+        awaitingCount: awaiting.length,
+        customerClarificationAnswer: text,
+      }
+    );
+    return {
+      handled: true,
+      reason: "AMBIGUOUS_AWAITING_CLARIFICATION",
+      action: "customer_clarification_ambiguous",
+      awaitingCount: awaiting.length,
+      customerFollowupSent: statusSend.sent,
+      customerFollowupText: statusSend.reply || null,
+    };
+  }
+
+  const request = awaiting[0];
+  const requestId =
+    clean(request.requestId || request.id, 120) || null;
+  if (!requestId) {
+    await sendCustomerStatusReply(
+      "customer_clarification_could_not_be_safely_bound",
+      {
+        customerQuestion: request?.customerQuestion,
+        ownerClarification: request?.ownerClarificationText,
+        customerClarificationAnswer: text,
+      }
+    );
+    return {
+      handled: true,
+      reason: "REQUEST_ID_MISSING",
+      action: "customer_clarification_bind_unsafe",
+      customerFollowupSent: false,
+    };
+  }
+
+  const applied = await applyPaMissingInfoCustomerClarificationAnswer({
+    db: connection,
+    businessId: uid,
+    requestId,
+    customerClarificationAnswer: text,
+    customerClarificationMessageId: clean(messageId, 160) || null,
+  });
+
+  if (!applied?.ok) {
+    await sendCustomerStatusReply(
+      "customer_clarification_could_not_be_safely_bound",
+      {
+        customerQuestion: request.customerQuestion,
+        ownerClarification: request.ownerClarificationText,
+        customerClarificationAnswer: text,
+      }
+    );
+    return {
+      handled: true,
+      reason: applied?.reason || "APPLY_CUSTOMER_CLARIFICATION_FAILED",
+      action: "customer_clarification_bind_unsafe",
+      requestId,
+      customerFollowupSent: false,
+    };
+  }
+
+  if (applied.applied === false) {
+    // Idempotent / already relayed — do not resend.
+    return {
+      handled: true,
+      reason: applied.reason || "IDEMPOTENT_SKIP",
+      action: "customer_clarification_skipped",
+      requestId,
+      customerFollowupSent: false,
+      status: clean(applied.request?.status, 40) || null,
+    };
+  }
+
+  const row = applied.request || request;
+  const relay = await relayFn({
+    db: connection,
+    businessId: uid,
+    request: { ...row, requestId },
+    sendCredentials,
+    sendWhatsAppMessageFn,
+  });
+
+  if (!relay?.ok || !relay.providerMessageId) {
+    await markPaMissingInfoOwnerClarificationRelayFailed({
+      db: connection,
+      businessId: uid,
+      requestId,
+      error: relay?.error || relay?.reason || "OWNER_RELAY_FAILED",
+    });
+    return {
+      handled: true,
+      reason: "OWNER_CLARIFICATION_RELAY_FAILED",
+      action: "customer_clarification_relay_failed",
+      requestId,
+      customerFollowupSent: false,
+      status: "awaiting_customer_clarification",
+      recoverable: true,
+    };
+  }
+
+  await markPaMissingInfoOwnerClarificationRelaySent({
+    db: connection,
+    businessId: uid,
+    requestId,
+    ownerNotifyProviderMessageId: relay.providerMessageId,
+  });
+
+  // Customer status wording — OpenAI from trusted situation only (not a fact answer).
+  const statusSend = await sendCustomerStatusReply(
+    "customer_answer_forwarded_to_owner",
+    {
+      customerQuestion:
+        row.customerQuestion || request.customerQuestion || null,
+      ownerClarification:
+        row.ownerClarificationText || request.ownerClarificationText || null,
+      customerClarificationAnswer: text,
+    }
+  );
+
+  console.log("[pa_missing_info_customer_clarification_result]", {
+    businessId: uid,
+    requestId,
+    ownerNotifyProviderMessageId: relay.providerMessageId,
+    customerStatusSent: statusSend.sent,
+  });
+
+  return {
+    handled: true,
+    reason: "OWNER_CLARIFICATION_RELAY_SENT",
+    action: "customer_clarification_relayed",
+    requestId,
+    ownerNotifyProviderMessageId: relay.providerMessageId,
+    customerFollowupSent: true,
+    customerFollowupText: statusSend.reply || null,
+    status: "owner_notified",
+  };
+}
+
+/**
+ * Buffer/agent entry for customer clarification bind.
+ */
+export async function tryHandlePaMissingInfoCustomerClarification(params) {
+  const result = await handlePaMissingInfoCustomerClarificationInbound(params);
+  if (!result || result.handled !== true) return null;
   return result;
 }

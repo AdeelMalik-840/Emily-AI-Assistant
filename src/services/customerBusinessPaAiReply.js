@@ -777,6 +777,526 @@ STRICT SAFETY:
 }
 
 /**
+ * Brain meaning-only: owner quoted reply is a final answer vs clarification ask.
+ * No regex / punctuation routing.
+ * Clear kinds only when confident; unsure / failure → kind "unclear" (ok:false).
+ * Callers must not guess final vs clarification on unclear.
+ *
+ * @param {{
+ *   customerQuestion?: string | null,
+ *   missingInfoType?: string | null,
+ *   ownerMessage: string,
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   kind: "final_answer" | "clarification_question" | "unclear",
+ *   source: string,
+ *   reason?: string,
+ * }>}
+ */
+export async function classifyPaMissingInfoOwnerResponseKind({
+  customerQuestion = null,
+  missingInfoType = null,
+  ownerMessage,
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const message = String(ownerMessage ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  if (!message) {
+    return {
+      ok: false,
+      kind: "unclear",
+      source: "technical_fallback",
+      reason: "MISSING_OWNER_MESSAGE",
+    };
+  }
+
+  const question = String(customerQuestion ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const type = cleanType(missingInfoType);
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "pa_missing_info_owner_response_kind",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ownerResponseKind: {
+          type: "string",
+          enum: ["final_answer", "clarification_question", "unclear"],
+        },
+        reason: { type: "string" },
+      },
+      required: ["ownerResponseKind", "reason"],
+    }
+  );
+
+  const system = [
+    "You classify ONE owner WhatsApp reply about a customer missing-info request.",
+    "Return STRICT JSON only.",
+    "ownerResponseKind=final_answer only when clearly giving the information the customer asked for (a usable answer the customer can receive).",
+    "ownerResponseKind=clarification_question only when clearly asking the customer for more detail before answering (which item/booking/date/etc.).",
+    "ownerResponseKind=unclear when the meaning is mixed, incomplete, or you are not confident.",
+    "Do not use punctuation alone. Judge meaning.",
+    "Never guess between final_answer and clarification_question when unsure — choose unclear.",
+  ].join(" ");
+
+  const userContent =
+    `MISSING_INFO_TYPE:\n${type || "other"}\n\n` +
+    `ORIGINAL_CUSTOMER_QUESTION:\n${question || "(none)"}\n\n` +
+    `OWNER_MESSAGE:\n${message}\n\n` +
+    `Return JSON: {"ownerResponseKind":"final_answer"|"clarification_question"|"unclear","reason":"<short>"}`;
+
+  const completionFn =
+    typeof __chatCompletionsCreateForTests === "function"
+      ? __chatCompletionsCreateForTests
+      : resolveOpenAiChatCompletionsCreate();
+
+  if (!completionFn) {
+    return {
+      ok: false,
+      kind: "unclear",
+      source: "technical_fallback",
+      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+    };
+  }
+
+  try {
+    const createPromise = Promise.resolve(
+      completionFn({
+        model: resolveOpenAiChatModel(),
+        temperature: 0,
+        max_tokens: 80,
+        response_format: responseFormat,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: userContent },
+        ],
+      })
+    );
+    const timed =
+      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Promise.race([
+            createPromise,
+            new Promise((_, reject) => {
+              setTimeout(
+                () =>
+                  reject(
+                    new Error("PA_MISSING_INFO_OWNER_KIND_OPENAI_TIMEOUT")
+                  ),
+                Math.floor(Number(timeoutMs))
+              );
+            }),
+          ])
+        : createPromise;
+    const resp = await timed;
+    const raw = resp?.choices?.[0]?.message?.content ?? "";
+    let text = String(raw ?? "").trim();
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) text = fence[1].trim();
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) text = text.slice(start, end + 1);
+    let kind = null;
+    try {
+      const parsed = JSON.parse(text);
+      const rawKind = String(parsed?.ownerResponseKind ?? "")
+        .trim()
+        .toLowerCase();
+      if (
+        rawKind === "final_answer" ||
+        rawKind === "clarification_question" ||
+        rawKind === "unclear"
+      ) {
+        kind = rawKind;
+      }
+    } catch {
+      kind = null;
+    }
+    if (!kind || kind === "unclear") {
+      return {
+        ok: false,
+        kind: "unclear",
+        source: kind ? "openai" : "technical_fallback",
+        reason: kind ? "OWNER_RESPONSE_KIND_UNCLEAR" : "INVALID_OWNER_RESPONSE_KIND",
+      };
+    }
+    return { ok: true, kind, source: "openai" };
+  } catch (err) {
+    return {
+      ok: false,
+      kind: "unclear",
+      source: "technical_fallback",
+      reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
+    };
+  }
+}
+
+/**
+ * Relay owner clarification question to the customer (not a final fact answer).
+ *
+ * @param {{
+ *   facts?: Record<string, unknown> | null,
+ *   customerQuestion?: string | null,
+ *   ownerClarification: string,
+ *   styleKey?: "casual_local" | "neutral_english",
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ */
+export async function generatePaMissingInfoOwnerClarificationCustomerRelay({
+  facts = null,
+  customerQuestion = null,
+  ownerClarification,
+  styleKey = "casual_local",
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const clarification = String(ownerClarification ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  if (!clarification) {
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: "MISSING_OWNER_CLARIFICATION",
+    };
+  }
+
+  const question = String(customerQuestion ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const factsObj = facts && typeof facts === "object" ? facts : {};
+  const factsJson = compactPostConfirmFactsForPrompt(factsObj);
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "dm",
+    styleKey,
+    businessCommunicationProfile:
+      factsObj?.business && typeof factsObj.business === "object"
+        ? /** @type {Record<string, unknown>} */ (factsObj.business)
+        : factsObj?.tone != null
+          ? { tone: factsObj.tone }
+          : null,
+  });
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "pa_missing_info_owner_clarification_relay",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        customerReply: { type: "string" },
+        replySemantics: REPLY_SEMANTICS_SCHEMA,
+      },
+      required: ["customerReply", "replySemantics"],
+    }
+  );
+
+  const system = `${shared}
+
+LANE OBJECTIVE (PA missing-info owner clarification relay):
+Return STRICT JSON:
+{"customerReply":"<short WhatsApp text>","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+
+TASK:
+- The owner needs more detail from the customer before answering ORIGINAL_CUSTOMER_QUESTION.
+- Relay OWNER_CLARIFICATION_QUESTION naturally to the customer.
+- Do NOT invent a factual answer. Do NOT invent policies, amounts, or item facts.
+- Do NOT mention pamiss tokens, Brain, or internal systems.`;
+
+  const userBase =
+    `VERIFIED_BUSINESS_PA_FACTS_JSON:\n${factsJson}\n\n` +
+    `ORIGINAL_CUSTOMER_QUESTION:\n${question || "(none)"}\n\n` +
+    `OWNER_CLARIFICATION_QUESTION:\n${clarification}\n\n` +
+    `Remember: JSON only; relay the clarification; invent nothing.`;
+
+  const completionFn =
+    typeof __chatCompletionsCreateForTests === "function"
+      ? __chatCompletionsCreateForTests
+      : resolveOpenAiChatCompletionsCreate();
+
+  if (!completionFn) {
+    return {
+      ok: true,
+      reply: clarification.slice(0, 500),
+      source: "technical_fallback",
+      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+    };
+  }
+
+  try {
+    const createPromise = Promise.resolve(
+      completionFn({
+        model: resolveOpenAiChatModel(),
+        temperature: 0.35,
+        max_tokens: 160,
+        response_format: responseFormat,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: userBase },
+        ],
+      })
+    );
+    const timed =
+      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Promise.race([
+            createPromise,
+            new Promise((_, reject) => {
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      "PA_MISSING_INFO_CLARIFICATION_RELAY_OPENAI_TIMEOUT"
+                    )
+                  ),
+                Math.floor(Number(timeoutMs))
+              );
+            }),
+          ])
+        : createPromise;
+    const resp = await timed;
+    const raw = resp?.choices?.[0]?.message?.content ?? "";
+    let text = String(raw ?? "").trim();
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) text = fence[1].trim();
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) text = text.slice(start, end + 1);
+    let customerReply = "";
+    try {
+      const parsed = JSON.parse(text);
+      customerReply = String(parsed?.customerReply ?? "")
+        .replace(/^\s*["']|["']\s*$/g, "")
+        .trim();
+    } catch {
+      customerReply = "";
+    }
+    if (!customerReply) {
+      return {
+        ok: true,
+        reply: clarification.slice(0, 500),
+        source: "technical_fallback",
+        reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+      };
+    }
+    return {
+      ok: true,
+      reply: customerReply.slice(0, 500),
+      source: "openai",
+    };
+  } catch (err) {
+    return {
+      ok: true,
+      reply: clarification.slice(0, 500),
+      source: "technical_fallback",
+      reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
+    };
+  }
+}
+
+/**
+ * Trusted situation keys for customer clarification-loop status wording.
+ * Deterministic code may pass only these; customerReply must be model-generated.
+ */
+export const PA_MISSING_INFO_CUSTOMER_CLARIFICATION_SITUATIONS = Object.freeze([
+  "customer_answer_forwarded_to_owner",
+  "multiple_awaiting_clarification",
+  "customer_clarification_could_not_be_safely_bound",
+]);
+
+/**
+ * OpenAI wording for clarification-loop customer status (not a factual answer).
+ * Prompt receives only a trusted situation + non-secret state labels.
+ *
+ * @param {{
+ *   situation: string,
+ *   customerQuestion?: string | null,
+ *   ownerClarification?: string | null,
+ *   customerClarificationAnswer?: string | null,
+ *   awaitingCount?: number | null,
+ *   styleKey?: "casual_local" | "neutral_english",
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ */
+export async function generatePaMissingInfoCustomerClarificationStatusReply({
+  situation,
+  customerQuestion = null,
+  ownerClarification = null,
+  customerClarificationAnswer = null,
+  awaitingCount = null,
+  styleKey = "casual_local",
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const sit = String(situation ?? "").trim();
+  if (!PA_MISSING_INFO_CUSTOMER_CLARIFICATION_SITUATIONS.includes(sit)) {
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: "INVALID_SITUATION",
+    };
+  }
+
+  const question = String(customerQuestion ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const ownerAsk = String(ownerClarification ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const customerAnswer = String(customerClarificationAnswer ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const count =
+    Number.isFinite(Number(awaitingCount)) && Number(awaitingCount) > 0
+      ? Math.floor(Number(awaitingCount))
+      : null;
+
+  const shared = buildCustomerCommunicationPolicy({
+    channel: "dm",
+    styleKey,
+    businessCommunicationProfile: null,
+  });
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "pa_missing_info_customer_clarification_status",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        customerReply: { type: "string" },
+        replySemantics: REPLY_SEMANTICS_SCHEMA,
+      },
+      required: ["customerReply", "replySemantics"],
+    }
+  );
+
+  const situationMeaning = {
+    customer_answer_forwarded_to_owner:
+      "The customer's clarification answer was forwarded to the business owner. Acknowledge briefly; do not invent the owner's answer.",
+    multiple_awaiting_clarification:
+      "More than one clarification request is pending for this customer, so this message could not be bound safely. Ask them to be clearer which pending question they are answering. Do not invent facts.",
+    customer_clarification_could_not_be_safely_bound:
+      "This customer message could not be safely bound to a pending clarification request. Say so briefly and ask them to restate clearly. Do not invent facts.",
+  };
+
+  const system = `${shared}
+
+LANE OBJECTIVE (PA missing-info clarification status wording):
+Return STRICT JSON:
+{"customerReply":"<short WhatsApp text>","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+
+TASK:
+- Word a short customer WhatsApp message for TRUSTED_SITUATION only.
+- SITUATION_MEANING describes what happened; do not invent business facts, amounts, items, or owner answers.
+- Do NOT mention pamiss tokens, Brain, or internal systems.
+- Do NOT promise a specific wait time.`;
+
+  const userBase =
+    `TRUSTED_SITUATION:\n${sit}\n\n` +
+    `SITUATION_MEANING:\n${situationMeaning[sit]}\n\n` +
+    `ORIGINAL_CUSTOMER_QUESTION:\n${question || "(none)"}\n\n` +
+    `OWNER_CLARIFICATION_QUESTION:\n${ownerAsk || "(none)"}\n\n` +
+    `CUSTOMER_CLARIFICATION_ANSWER:\n${customerAnswer || "(none)"}\n\n` +
+    `AWAITING_COUNT:\n${count == null ? "(n/a)" : String(count)}\n\n` +
+    `Remember: JSON only; wording from situation only; invent nothing.`;
+
+  const completionFn =
+    typeof __chatCompletionsCreateForTests === "function"
+      ? __chatCompletionsCreateForTests
+      : resolveOpenAiChatCompletionsCreate();
+
+  if (!completionFn) {
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+    };
+  }
+
+  try {
+    const createPromise = Promise.resolve(
+      completionFn({
+        model: resolveOpenAiChatModel(),
+        temperature: 0.35,
+        max_tokens: 120,
+        response_format: responseFormat,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: userBase },
+        ],
+      })
+    );
+    const timed =
+      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Promise.race([
+            createPromise,
+            new Promise((_, reject) => {
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      "PA_MISSING_INFO_CLARIFICATION_STATUS_OPENAI_TIMEOUT"
+                    )
+                  ),
+                Math.floor(Number(timeoutMs))
+              );
+            }),
+          ])
+        : createPromise;
+    const resp = await timed;
+    const raw = resp?.choices?.[0]?.message?.content ?? "";
+    let text = String(raw ?? "").trim();
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) text = fence[1].trim();
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) text = text.slice(start, end + 1);
+    let customerReply = "";
+    try {
+      const parsed = JSON.parse(text);
+      customerReply = String(parsed?.customerReply ?? "")
+        .replace(/^\s*["']|["']\s*$/g, "")
+        .trim();
+    } catch {
+      customerReply = "";
+    }
+    if (!customerReply) {
+      return {
+        ok: false,
+        reply: "",
+        source: "technical_fallback",
+        reason: "EMPTY_OR_INVALID_OPENAI_REPLY",
+      };
+    }
+    return {
+      ok: true,
+      reply: customerReply.slice(0, 500),
+      source: "openai",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reply: "",
+      source: "technical_fallback",
+      reason: String(err?.message ?? err ?? "OPENAI_ERROR").slice(0, 160),
+    };
+  }
+}
+
+/**
  * Constrained post-confirm mutation reply composer.
  * Not a second semantic Brain: frozen decision fields cannot change.
  * Writes customerReply only from verified mutationExecution + original decision.

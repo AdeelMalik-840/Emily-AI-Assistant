@@ -500,6 +500,7 @@ export async function handleCustomerBusinessPaInbound({
   __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
   __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
   __sendWhatsAppMessageFn = sendWhatsAppMessage,
+  __tryHandlePaMissingInfoCustomerClarificationFn = null,
   __chatCompletionsCreateForTests = null,
 }) {
   const uid = clean(businessId);
@@ -515,6 +516,58 @@ export async function handleCustomerBusinessPaInbound({
         missingInfo: null,
       }
     );
+  }
+
+  // Owner-assist clarification loop: bind customer reply to exactly one
+  // awaiting_customer_clarification pamiss before normal post-confirm decide.
+  {
+    const { tryHandlePaMissingInfoCustomerClarification } = await import(
+      "./paMissingInfoOwnerAnswerService.js"
+    );
+    const tryClarificationFn =
+      typeof __tryHandlePaMissingInfoCustomerClarificationFn === "function"
+        ? __tryHandlePaMissingInfoCustomerClarificationFn
+        : tryHandlePaMissingInfoCustomerClarification;
+    const clarificationResult = await tryClarificationFn({
+      db: connection,
+      businessId: uid,
+      customerPhone: phone,
+      messageText: text,
+      messageId,
+      sendCredentials,
+      sendWhatsAppMessageFn: __sendWhatsAppMessageFn,
+    });
+    if (clarificationResult?.handled === true) {
+      return attachPostConfirmAgentReturnContract(
+        {
+          handled: true,
+          action: "business_pa_silence",
+          reply: "",
+          sentReply: false,
+          reason:
+            clarificationResult.reason || "CUSTOMER_CLARIFICATION_HANDLED",
+          openaiUsed: false,
+          openaiSource: "none",
+          finalReplySource: "pa_missing_info_customer_clarification",
+          missingInfoRequestId: clarificationResult.requestId ?? null,
+          missingInfoEscalated: false,
+          ownerNotifyStatus:
+            clarificationResult.reason === "OWNER_CLARIFICATION_RELAY_SENT"
+              ? "sent"
+              : null,
+        },
+        {
+          decisionSource: null,
+          pendingAvr: null,
+          mutation: null,
+          missingInfo: {
+            customerClarification: true,
+            reason: clarificationResult.reason,
+            requestId: clarificationResult.requestId ?? null,
+          },
+        }
+      );
+    }
   }
 
   const resolved =
