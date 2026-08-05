@@ -29,6 +29,12 @@ export const PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES = Object.freeze([
   "owner_notified",
 ]);
 
+/** Owner notify delivery states eligible for tokenless single-open fallback. */
+export const PA_MISSING_INFO_OWNER_NOTIFY_SENT_STATUSES = Object.freeze([
+  "sent",
+  "queued",
+]);
+
 /** Customer clarification answers bind only while awaiting. */
 export const PA_MISSING_INFO_AWAITING_CUSTOMER_CLARIFICATION_STATUS =
   "awaiting_customer_clarification";
@@ -376,6 +382,54 @@ export async function listOpenForAnswerPaMissingInfoRequests({
     const status = clean(data.status, 40);
     if (!PA_MISSING_INFO_OPEN_FOR_ANSWER_STATUSES.includes(status)) continue;
     if (isExpiredRequest(data, now)) continue;
+    out.push({ id: doc.id, ...(data || {}) });
+  }
+  return out;
+}
+
+/**
+ * Tokenless owner-reply fallback eligibility (narrow): owner_notified only,
+ * notify actually sent/queued, non-empty ownerNotifyProviderMessageId, not expired.
+ * @param {Record<string, unknown> | null | undefined} data
+ * @param {number} [nowMs]
+ */
+export function isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback(
+  data,
+  nowMs = Date.now()
+) {
+  if (!data || typeof data !== "object") return false;
+  if (clean(data.status, 40) !== "owner_notified") return false;
+  if (isExpiredRequest(data, nowMs)) return false;
+  const notifyStatus = clean(data.ownerNotifyStatus, 40).toLowerCase();
+  if (!PA_MISSING_INFO_OWNER_NOTIFY_SENT_STATUSES.includes(notifyStatus)) {
+    return false;
+  }
+  if (!clean(data.ownerNotifyProviderMessageId, 160)) return false;
+  return true;
+}
+
+/**
+ * Complete business-scoped list for tokenless owner-reply fallback.
+ * @param {{ db: unknown, businessId: string }} p
+ */
+export async function listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests({
+  db: connection,
+  businessId,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  if (!col) return [];
+
+  const now = Date.now();
+  const snap = await col
+    .where("status", "==", "owner_notified")
+    .get()
+    .catch(() => null);
+  const out = [];
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data?.() ?? doc.data ?? {};
+    if (!isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback(data, now)) {
+      continue;
+    }
     out.push({ id: doc.id, ...(data || {}) });
   }
   return out;

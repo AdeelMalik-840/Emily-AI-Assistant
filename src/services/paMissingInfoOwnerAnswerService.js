@@ -20,6 +20,8 @@ import {
   applyPaMissingInfoCustomerClarificationAnswer,
   findPaMissingInfoRequestByOwnerNotifyProviderMessageId,
   getPaMissingInfoRequest,
+  isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback,
+  listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests,
   listAwaitingCustomerClarificationRequestsForCustomer,
   markPaMissingInfoAwaitingCustomerClarification,
   markPaMissingInfoCustomerFollowupFailed,
@@ -48,6 +50,10 @@ const PAMISS_TOKEN_RE = /\b(pamiss_[a-f0-9]{12,32})\b/i;
 /** Owner-facing nudge when reply is not a WhatsApp quote of the notification. */
 export const PA_MISSING_INFO_OWNER_QUOTE_NUDGE =
   "Please reply directly to the customer question notification (swipe/reply on that message) so Emily can match your answer.";
+
+/** Owner-facing nudge when multiple eligible owner_notified requests exist. */
+export const PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE =
+  "Multiple customer questions are waiting for your answer. Please reply directly to the correct customer question notification (swipe/reply on that message) so Emily can match your answer.";
 
 /**
  * Owner-facing instruction when classifier cannot safely choose final vs clarification.
@@ -163,6 +169,7 @@ async function sendOwnerQuoteNudge({
  *   __generateClarificationRelayFn?: typeof generatePaMissingInfoOwnerClarificationCustomerRelay,
  *   __chatCompletionsCreateForTests?: Function,
  *   __appendConversationMessageFn?: typeof appendConversationMessage,
+ *   __listOwnerNotifiedEligibleForTokenlessFallbackFn?: typeof listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests,
  * }} p
  */
 export async function handlePaMissingInfoOwnerAnswerInbound({
@@ -186,6 +193,8 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
     generatePaMissingInfoOwnerClarificationCustomerRelay,
   __chatCompletionsCreateForTests = null,
   __appendConversationMessageFn = appendConversationMessage,
+  __listOwnerNotifiedEligibleForTokenlessFallbackFn =
+    listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests,
 } = {}) {
   if (!missingInfoEnabled || !ownerAnswerEnabled) {
     return { handled: false, reason: "FLAG_OFF" };
@@ -212,45 +221,72 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
   const parsed = parsePaMissingInfoOwnerAnswerMessage(text);
   const quotedId = clean(contextMessageId, 160) || null;
 
-  // Phase 1: require WhatsApp quote of the owner notification. No SINGLE_OPEN.
-  if (!quotedId) {
-    await sendOwnerQuoteNudge({
-      sendWhatsAppMessageFn,
-      ownerPhone: ownerTarget,
-      sendCredentials,
-    });
-    return {
-      handled: true,
-      reason: "QUOTE_REQUIRED",
-      action: "owner_answer_unmatched",
-      customerFollowupSent: false,
-      matchReason: null,
-      debugTokenPresent: Boolean(parsed.requestId),
-    };
-  }
+  /** @type {Record<string, unknown> | null} */
+  let request = null;
+  /** @type {string | null} */
+  let matchReason = null;
 
-  let request = await findPaMissingInfoRequestByOwnerNotifyProviderMessageId({
-    db: connection,
-    businessId: uid,
-    ownerNotifyProviderMessageId: quotedId,
-  });
-  let matchReason = request ? "CONTEXT_ID" : null;
-
-  if (!request) {
-    await sendOwnerQuoteNudge({
-      sendWhatsAppMessageFn,
-      ownerPhone: ownerTarget,
-      sendCredentials,
+  if (quotedId) {
+    request = await findPaMissingInfoRequestByOwnerNotifyProviderMessageId({
+      db: connection,
+      businessId: uid,
+      ownerNotifyProviderMessageId: quotedId,
     });
-    return {
-      handled: true,
-      reason: "CONTEXT_UNKNOWN",
-      action: "owner_answer_unmatched",
-      customerFollowupSent: false,
-      matchReason: null,
-      contextMessageId: quotedId,
-      debugTokenPresent: Boolean(parsed.requestId),
-    };
+    matchReason = request ? "CONTEXT_ID" : null;
+
+    if (!request) {
+      await sendOwnerQuoteNudge({
+        sendWhatsAppMessageFn,
+        ownerPhone: ownerTarget,
+        sendCredentials,
+      });
+      return {
+        handled: true,
+        reason: "CONTEXT_UNKNOWN",
+        action: "owner_answer_unmatched",
+        customerFollowupSent: false,
+        matchReason: null,
+        contextMessageId: quotedId,
+        debugTokenPresent: Boolean(parsed.requestId),
+      };
+    }
+  } else {
+    const eligible =
+      await __listOwnerNotifiedEligibleForTokenlessFallbackFn({
+        db: connection,
+        businessId: uid,
+      });
+
+    if (eligible.length === 0) {
+      return {
+        handled: false,
+        reason: "NO_ELIGIBLE_OWNER_NOTIFIED_REQUEST",
+        customerFollowupSent: false,
+        matchReason: null,
+        debugTokenPresent: Boolean(parsed.requestId),
+      };
+    }
+
+    if (eligible.length > 1) {
+      await sendOwnerQuoteNudge({
+        sendWhatsAppMessageFn,
+        ownerPhone: ownerTarget,
+        sendCredentials,
+        text: PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE,
+      });
+      return {
+        handled: true,
+        reason: "AMBIGUOUS_ELIGIBLE_REQUESTS",
+        action: "owner_answer_unmatched",
+        customerFollowupSent: false,
+        matchReason: null,
+        eligibleCount: eligible.length,
+        debugTokenPresent: Boolean(parsed.requestId),
+      };
+    }
+
+    request = eligible[0];
+    matchReason = "SINGLE_OWNER_NOTIFIED";
   }
 
   const requestId =
@@ -271,6 +307,19 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
     requestId,
   });
   if (fresh) request = fresh;
+
+  if (
+    matchReason === "SINGLE_OWNER_NOTIFIED" &&
+    !isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback(request)
+  ) {
+    return {
+      handled: false,
+      reason: "NO_ELIGIBLE_OWNER_NOTIFIED_REQUEST",
+      customerFollowupSent: false,
+      matchReason: null,
+      debugTokenPresent: Boolean(parsed.requestId),
+    };
+  }
 
   const status = clean(request.status, 40);
 
@@ -731,6 +780,7 @@ export async function tryHandlePaMissingInfoOwnerAnswer(params) {
   if (result.reason === "NOT_CLOUD_DM" || result.reason === "MISSING_CONTEXT") {
     return null;
   }
+  if (result.reason === "NO_ELIGIBLE_OWNER_NOTIFIED_REQUEST") return null;
   return result;
 }
 
