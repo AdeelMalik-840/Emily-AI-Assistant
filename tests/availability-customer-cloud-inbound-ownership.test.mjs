@@ -835,6 +835,72 @@ test("fresh Corolla waiting-confirm wins over older Civic post-confirm ownership
   assert.deepEqual(activeFacts, activeFactsBefore);
 });
 
+test("Corolla focus release continues once into fresh Civic availability routing", async () => {
+  let paCalls = 0;
+  let availabilityCalls = 0;
+  const { brainV2Calls, processCalls, outcome } = await runCloudOwnershipPipeline({
+    availabilityRequestData: null,
+    inboundText: "Honda Civic 5 din k lye chyh",
+    pipelineParams: {
+      __sendOutboundMessageFn: async () => ({
+        ok: true,
+        providerMessageId: "wamid.fresh-civic-release",
+      }),
+      __resolveActiveCustomerBookingFactsFn: async () => ({
+        ok: true,
+        reason: "MATCHED_TRUSTED_FOCUS",
+        facts: {
+          booking: {
+            id: "booking-old-corolla",
+            itemId: "corolla-1",
+            itemLabel: "Toyota Corolla (Metallic Grey)",
+            durationDays: 7,
+            status: "approved",
+          },
+          pendingAvailabilityRequests: [],
+        },
+      }),
+      __tryHandleCustomerBusinessPaInboundFn: async () => {
+        paCalls += 1;
+        return {
+          handled: false,
+          ownershipReleased: true,
+          releaseReason: "FRESH_AVAILABILITY_REQUEST",
+          bookingId: "booking-old-corolla",
+          semanticDecisionCount: 1,
+          composeCalls: 0,
+          mutationExecutionRequested: false,
+        };
+      },
+    },
+    brainV2Spy: async ({ message }) => {
+      availabilityCalls += 1;
+      assert.match(message, /Honda Civic 5 din/i);
+      return {
+        handled: true,
+        legacyBypassed: true,
+        workflowType: "availability_inquiry",
+        reply: "Honda Civic ki availability check kar raha hun.",
+        sendVia: "CLOUD_API",
+        messageMeta: {
+          outboundTrace: { finalReplySource: "BRAIN_V2_LIVE" },
+        },
+      };
+    },
+  });
+
+  assert.equal(paCalls, 1);
+  assert.equal(availabilityCalls, 1);
+  assert.equal(brainV2Calls, 1);
+  assert.equal(processCalls, 0);
+  assert.match(outcome?.reply ?? "", /Honda Civic/i);
+  assert.equal(outcome?.messageMeta?.customerBusinessPaHandled, undefined);
+  assert.equal(
+    outcome?.messageMeta?.outboundTrace?.finalReplySource,
+    "BRAIN_V2_LIVE"
+  );
+});
+
 test("full pipeline retries a failed confirmed-booking reply as send-only recovery", async () => {
   resetPipelineTestIsolation();
   const fake = createFakeDb();

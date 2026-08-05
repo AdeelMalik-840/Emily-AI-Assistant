@@ -2516,7 +2516,21 @@ export async function executeWhatsAppAiPipeline(p) {
         sendCredentials,
         preResolvedBookingFacts: preResolvedPostConfirmBookingFacts,
       });
-      if (businessPaResult) {
+      if (businessPaResult?.ownershipReleased === true) {
+        console.log("[customer_business_pa_release_continued]", {
+          traceId,
+          businessId: ownerUserId,
+          bookingId: businessPaResult.bookingId ?? null,
+          releaseReason:
+            businessPaResult.releaseReason ?? businessPaResult.reason ?? null,
+          semanticDecisionCount:
+            Number(businessPaResult.semanticDecisionCount ?? 0) || 0,
+          composeCalls: Number(businessPaResult.composeCalls ?? 0) || 0,
+          mutationExecutionRequested:
+            businessPaResult.mutationExecutionRequested === true,
+          messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
+        });
+      } else if (businessPaResult) {
         if (businessPaResult.retryable === true) {
           throw new Error(
             String(
