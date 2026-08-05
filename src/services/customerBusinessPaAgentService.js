@@ -46,12 +46,28 @@ function cleanCustomerReply(value) {
   return String(value ?? "").trim();
 }
 
+/**
+ * The shared post-confirm Brain uses this exact plan for a new inventory
+ * availability request. Release before any PA resolver, executor, or composer
+ * runs so the existing availability workflow can own the turn.
+ */
+export function shouldReleasePostConfirmForFreshAvailability(decision) {
+  return (
+    decision?.factKind === "booking_fact" &&
+    decision?.capability === "availability_request" &&
+    decision?.action === "reply" &&
+    decision?.mutationIntent === "none" &&
+    decision?.pendingAvailabilitySelectionIndex == null
+  );
+}
+
 /** @type {Readonly<Record<string, unknown>>} */
 const POST_CONFIRM_AGENT_EMPTY_DECISION = Object.freeze({
   situation: null,
   conversationAct: null,
   customerIntent: null,
   action: null,
+  factKind: null,
   capability: null,
   evidenceNeeds: Object.freeze([]),
   bookingSelectionMode: null,
@@ -110,6 +126,7 @@ function attachPostConfirmAgentReturnContract(flat, opts = {}) {
         conversationAct: decisionSource.conversationAct ?? null,
         customerIntent: decisionSource.customerIntent ?? null,
         action: decisionSource.action ?? row.decisionAction ?? null,
+        factKind: decisionSource.factKind ?? null,
         capability: decisionSource.capability ?? null,
         evidenceNeeds: evidenceNeedsRaw,
         bookingSelectionMode: decisionSource.bookingSelectionMode ?? null,
@@ -687,6 +704,46 @@ export async function handleCustomerBusinessPaInbound({
   let laneFacts = facts;
   let mutationAlreadyComposed = false;
 
+  if (shouldReleasePostConfirmForFreshAvailability(decision)) {
+    console.log("[customer_business_pa_ownership_released]", {
+      businessId: uid,
+      bookingId: clean(facts.booking?.id) || null,
+      reason: "FRESH_AVAILABILITY_REQUEST",
+      factKind: decision.factKind,
+      capability: decision.capability,
+      decisionAction: decision.action,
+      semanticDecisionCount,
+      composeCalls,
+    });
+    return attachPostConfirmAgentReturnContract(
+      {
+        handled: false,
+        ownershipReleased: true,
+        releaseReason: "FRESH_AVAILABILITY_REQUEST",
+        action: "business_pa_release",
+        reply: "",
+        sentReply: false,
+        bookingId: clean(facts.booking?.id) || null,
+        availabilityRequestId: null,
+        reason: "FRESH_AVAILABILITY_REQUEST",
+        openaiUsed: true,
+        openaiSource: decided.source,
+        semanticDecisionCount,
+        composeCalls,
+        mutationExecutionRequested: false,
+        mutationExecutionStatus: "not_executed",
+        pendingAvailabilityExecution: null,
+        missingInfoEscalated: false,
+      },
+      {
+        decisionSource: decision,
+        pendingAvr: null,
+        mutation: null,
+        missingInfo: null,
+      }
+    );
+  }
+
   if (
     decision.action === "confirm_pending_availability" ||
     decision.action === "decline_pending_availability"
@@ -1227,5 +1284,7 @@ export async function handleCustomerBusinessPaInbound({
  */
 export async function tryHandleCustomerBusinessPaInbound(params) {
   const result = await handleCustomerBusinessPaInbound(params);
-  return result?.handled === true ? result : null;
+  return result?.handled === true || result?.ownershipReleased === true
+    ? result
+    : null;
 }

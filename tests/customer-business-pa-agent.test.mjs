@@ -439,6 +439,90 @@ test("no active booking → PA not handled", async () => {
   });
 });
 
+test("fresh availability decision releases post-confirm ownership before every PA side effect", async () => {
+  const facts = {
+    ok: true,
+    reason: "MATCHED_TRUSTED_FOCUS",
+    facts: {
+      booking: baseApprovedBooking({
+        itemId: "corolla-1",
+        itemLabel: "Toyota Corolla (Metallic Grey)",
+        durationDays: 7,
+      }),
+      pendingAvailabilityRequests: [],
+    },
+  };
+  let decisions = 0;
+  const mustNotRun = (name) => () => {
+    assert.fail(`${name} must not run after ownership release`);
+  };
+
+  const result = await handleCustomerBusinessPaInbound({
+    db: createFakeDb().db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "Honda Civic 5 din k lye chyh",
+    preResolvedBookingFacts: facts,
+    __tryHandlePaMissingInfoCustomerClarificationFn: async () => null,
+    __decideCustomerTurnFn: async () => {
+      decisions += 1;
+      return {
+        ok: true,
+        source: "openai",
+        decision: {
+          situation: "new_question",
+          conversationAct: "information_request",
+          customerIntent: "ask_fact",
+          customerIsAskingQuestion: true,
+          factKind: "booking_fact",
+          capability: "availability_request",
+          evidenceNeeds: [],
+          informationalReplyDeferred: true,
+          action: "reply",
+          shouldReply: true,
+          customerReply: "",
+          mutationIntent: "none",
+          pendingAvailabilitySelectionIndex: null,
+        },
+      };
+    },
+    __executeAvailabilityCustomerConfirmBookingFn: mustNotRun("pending AVR confirm"),
+    __executeAvailabilityCustomerDeclineFn: mustNotRun("pending AVR decline"),
+    __executePostConfirmBookingMutationFn: mustNotRun("booking mutation"),
+    __resolvePostConfirmRequestedFactFn: mustNotRun("fact resolver"),
+    __executePostConfirmPaMissingInfoOwnerCheckFn: mustNotRun("owner check"),
+    __composePostConfirmInformationalCustomerReplyFn: mustNotRun("informational compose"),
+    __composePostConfirmMutationCustomerReplyFn: mustNotRun("mutation compose"),
+  });
+
+  assert.equal(decisions, 1);
+  assert.equal(result.handled, false);
+  assert.equal(result.ownershipReleased, true);
+  assert.equal(result.releaseReason, "FRESH_AVAILABILITY_REQUEST");
+  assert.equal(result.reply, "");
+  assert.equal(result.composeCalls, 0);
+  assert.equal(result.semanticDecisionCount, 1);
+  assert.equal(result.mutationExecutionRequested, false);
+  assert.equal(result.execution.pendingAvr, null);
+  assert.equal(result.execution.mutation, null);
+  assert.equal(result.execution.missingInfo, null);
+
+  const routed = await tryHandleCustomerBusinessPaInbound({
+    db: createFakeDb().db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "Honda Civic 5 din k lye chyh",
+    preResolvedBookingFacts: facts,
+    __tryHandlePaMissingInfoCustomerClarificationFn: async () => null,
+    __decideCustomerTurnFn: async () => ({
+      ok: true,
+      source: "openai",
+      decision: result.decision,
+    }),
+  });
+  assert.equal(routed?.ownershipReleased, true);
+});
+
 test("ambiguous active bookings → same OpenAI lane owns safe clarification", async () => {
   const fake = createFakeDb();
   fake.seedBooking(BUSINESS_ID, "bk_a", baseApprovedBooking({ id: "bk_a" }));
