@@ -330,18 +330,29 @@ export async function executePostConfirmPaMissingInfoOwnerCheck({
   const priorNotify =
     clean(created.request.ownerNotifyStatus, 40) || "not_started";
 
+  // Subject safety: freeform/other must not display the focused booking/item as
+  // the customer's subject (e.g. Civic ask must not show focused Corolla).
+  // bookingId remains on the request for correlation. Item: only when the
+  // pamiss row already carries an explicit itemLabel, or for structured
+  // booking-scoped types where focus label is the trusted booking context.
+  const ownerNotifyItemLabel =
+    type === "other"
+      ? clean(created.request?.itemLabel, 200) || null
+      : clean(
+          selectedBooking?.itemLabel ||
+            facts?.booking?.itemLabel ||
+            facts?.known?.itemLabel ||
+            created.request?.itemLabel,
+          200
+        ) || null;
+
   let notify;
   try {
     notify = await __sendPaMissingInfoOwnerNotificationFn({
       db: connection,
       businessId: uid,
       request: created.request,
-      itemLabel: clean(
-        selectedBooking?.itemLabel ||
-          facts?.booking?.itemLabel ||
-          facts?.known?.itemLabel,
-        200
-      ),
+      itemLabel: ownerNotifyItemLabel,
       sendCredentials,
       sendWhatsAppMessageFn: __sendWhatsAppMessageFn,
     });
