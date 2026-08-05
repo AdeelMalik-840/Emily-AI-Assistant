@@ -12,6 +12,7 @@ const { resolveActiveCustomerBookingFacts } = await import(
 );
 const {
   handleCustomerBusinessPaInbound,
+  executePostConfirmPaMissingInfoOwnerCheck,
 } = await import("../src/services/customerBusinessPaAgentService.js");
 const {
   canEscalatePostConfirmMissingInfo,
@@ -2753,6 +2754,7 @@ test("structured documents/payment/delivery/driver still escalate with matching 
       assert.equal(sends.ownerSends.length, 1, row.concept);
       const ownerText = String(sends.ownerSends[0].text || "");
       assert.match(ownerText, /❓ Customer question/);
+      assert.match(ownerText, /Item:\nHonda Civic 2026/);
       assert.doesNotMatch(ownerText, /Reference:/i);
       assert.doesNotMatch(ownerText, /pamiss_/i);
       // Internal type must not be labeled in the operational header (question text may still mention the word).
@@ -2831,7 +2833,261 @@ test("owner notification is multiline readable without visible pamiss token", as
     assert.equal(result.ownerNotifyStatus, "sent");
     const ownerText = String(sends.ownerSends[0].text || "");
     assert.match(ownerText, /❓ Customer question/);
+    assert.match(ownerText, /Question:\n“Refund policy kya hai\?”/);
+    // Freeform/other: do not stamp focused booking as Item.
+    assert.doesNotMatch(ownerText, /^Item:/m);
+    assert.doesNotMatch(ownerText, /Honda Civic/i);
     assert.doesNotMatch(ownerText, /pamiss_/);
     assert.doesNotMatch(ownerText, new RegExp(BOOKING_ID));
   });
+});
+
+test("freeform/other owner notify omits focused Item across business fixtures", async () => {
+  const fixtures = [
+    {
+      name: "automotive",
+      focusLabel: "Toyota Corolla (Metallic Grey)",
+      question: "Honda Civic ki mileage kya hai?",
+      mustNotMatch: /Toyota Corolla/i,
+    },
+    {
+      name: "salon",
+      focusLabel: "Basic Haircut",
+      question: "Keratin Treatment ki aftercare kya hai?",
+      mustNotMatch: /Basic Haircut/i,
+    },
+    {
+      name: "restaurant",
+      focusLabel: "Standard Table",
+      question: "Private Room ka corkage charge kitna hai?",
+      mustNotMatch: /Standard Table/i,
+    },
+    {
+      name: "healthcare",
+      focusLabel: "GP Consultation",
+      question: "Physio Session ki duration kitni hai?",
+      mustNotMatch: /GP Consultation/i,
+    },
+    {
+      name: "ecommerce",
+      focusLabel: "Running Shoes",
+      question: "Steel Kettle ki return window kitni hai?",
+      mustNotMatch: /Running Shoes/i,
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    const ownerTexts = [];
+    const createdIds = [];
+    const result = await executePostConfirmPaMissingInfoOwnerCheck({
+      db: { __fake: true },
+      businessId: BUSINESS_ID,
+      customerPhone: CUSTOMER_PHONE,
+      messageText: fixture.question,
+      messageId: `wamid.${fixture.name}`,
+      facts: {
+        booking: {
+          id: BOOKING_ID,
+          itemLabel: fixture.focusLabel,
+          availabilityRequestId: AVR_ID,
+        },
+        known: { itemLabel: fixture.focusLabel },
+      },
+      decision: { action: "reply", requestedInfoType: null },
+      factResolution: {
+        status: "missing",
+        missingInfoType: "other",
+      },
+      gate: {
+        outcome: PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY,
+        missingInfoType: "other",
+      },
+      selectedBooking: {
+        id: BOOKING_ID,
+        itemLabel: fixture.focusLabel,
+        availabilityRequestId: AVR_ID,
+      },
+      __createOrGetOpenPaMissingInfoRequestFn: async (p) => {
+        assert.equal(p.missingInfoType, "other", fixture.name);
+        assert.equal(p.customerQuestion, fixture.question, fixture.name);
+        assert.equal(p.bookingId, BOOKING_ID, fixture.name);
+        const requestId = `pamiss_${fixture.name}`;
+        createdIds.push(requestId);
+        return {
+          ok: true,
+          reason: "CREATED",
+          created: true,
+          request: {
+            requestId,
+            bookingId: p.bookingId,
+            customerPhone: p.customerPhone,
+            missingInfoType: p.missingInfoType,
+            customerQuestion: p.customerQuestion,
+            ownerNotifyStatus: "not_started",
+            // No explicit itemLabel on freeform create row.
+          },
+        };
+      },
+      __sendPaMissingInfoOwnerNotificationFn: async (p) => {
+        assert.equal(p.itemLabel, null, fixture.name);
+        const { buildPaMissingInfoOwnerNotificationMessage } = await import(
+          "../src/services/paMissingInfoOwnerNotifyService.js"
+        );
+        const text = buildPaMissingInfoOwnerNotificationMessage(p.request, {
+          itemLabel: p.itemLabel,
+        });
+        ownerTexts.push(text);
+        return {
+          ok: true,
+          sent: true,
+          ownerNotifyStatus: "sent",
+        };
+      },
+      __sendWhatsAppMessageFn: async () => ({ ok: true }),
+    });
+
+    assert.equal(result.missingInfoEscalated, true, fixture.name);
+    assert.equal(result.missingInfoType, "other", fixture.name);
+    assert.equal(ownerTexts.length, 1, fixture.name);
+    const ownerText = ownerTexts[0];
+    assert.match(ownerText, /❓ Customer question/, fixture.name);
+    assert.match(
+      ownerText,
+      new RegExp(
+        `Question:\\n“${fixture.question.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}”`
+      ),
+      fixture.name
+    );
+    assert.doesNotMatch(ownerText, /^Item:/m, fixture.name);
+    assert.doesNotMatch(ownerText, fixture.mustNotMatch, fixture.name);
+    assert.equal(createdIds[0], `pamiss_${fixture.name}`, fixture.name);
+  }
+});
+
+test("structured booking-scoped owner notify still shows trusted focused Item", async () => {
+  const ownerTexts = [];
+  const focusLabel = "Toyota Corolla (Metallic Grey)";
+  const question = "Kaun se documents chahiye?";
+
+  const result = await executePostConfirmPaMissingInfoOwnerCheck({
+    db: { __fake: true },
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: question,
+    messageId: "wamid.docs-focus",
+    facts: {
+      booking: {
+        id: BOOKING_ID,
+        itemLabel: focusLabel,
+        availabilityRequestId: AVR_ID,
+      },
+      known: { itemLabel: focusLabel },
+    },
+    decision: { action: "reply", requestedInfoType: null },
+    factResolution: {
+      status: "missing",
+      missingInfoType: "documents",
+    },
+    gate: {
+      outcome: PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY,
+      missingInfoType: "documents",
+    },
+    selectedBooking: {
+      id: BOOKING_ID,
+      itemLabel: focusLabel,
+      availabilityRequestId: AVR_ID,
+    },
+    __createOrGetOpenPaMissingInfoRequestFn: async (p) => ({
+      ok: true,
+      reason: "CREATED",
+      created: true,
+      request: {
+        requestId: "pamiss_docs_focus",
+        bookingId: p.bookingId,
+        customerPhone: p.customerPhone,
+        missingInfoType: p.missingInfoType,
+        customerQuestion: p.customerQuestion,
+        ownerNotifyStatus: "not_started",
+      },
+    }),
+    __sendPaMissingInfoOwnerNotificationFn: async (p) => {
+      assert.equal(p.itemLabel, focusLabel);
+      const { buildPaMissingInfoOwnerNotificationMessage } = await import(
+        "../src/services/paMissingInfoOwnerNotifyService.js"
+      );
+      ownerTexts.push(
+        buildPaMissingInfoOwnerNotificationMessage(p.request, {
+          itemLabel: p.itemLabel,
+        })
+      );
+      return { ok: true, sent: true, ownerNotifyStatus: "sent" };
+    },
+    __sendWhatsAppMessageFn: async () => ({ ok: true }),
+  });
+
+  assert.equal(result.missingInfoEscalated, true);
+  assert.equal(result.missingInfoType, "documents");
+  assert.equal(ownerTexts.length, 1);
+  assert.match(ownerTexts[0], /Item:\nToyota Corolla — Metallic Grey/);
+  assert.match(ownerTexts[0], /Question:\n“Kaun se documents chahiye\?”/);
+});
+
+test("freeform/other with explicit request.itemLabel still shows Item", async () => {
+  const ownerTexts = [];
+  const explicitLabel = "Honda Civic 2026";
+
+  const result = await executePostConfirmPaMissingInfoOwnerCheck({
+    db: { __fake: true },
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "Honda Civic ki mileage kya hai?",
+    facts: {
+      booking: {
+        id: BOOKING_ID,
+        itemLabel: "Toyota Corolla (Metallic Grey)",
+      },
+      known: { itemLabel: "Toyota Corolla (Metallic Grey)" },
+    },
+    decision: { action: "reply" },
+    factResolution: { status: "missing", missingInfoType: "other" },
+    gate: {
+      outcome: PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY,
+      missingInfoType: "other",
+    },
+    selectedBooking: {
+      id: BOOKING_ID,
+      itemLabel: "Toyota Corolla (Metallic Grey)",
+    },
+    __createOrGetOpenPaMissingInfoRequestFn: async (p) => ({
+      ok: true,
+      reason: "CREATED",
+      created: true,
+      request: {
+        requestId: "pamiss_explicit_item",
+        bookingId: p.bookingId,
+        customerPhone: p.customerPhone,
+        missingInfoType: "other",
+        customerQuestion: p.customerQuestion,
+        itemLabel: explicitLabel,
+        ownerNotifyStatus: "not_started",
+      },
+    }),
+    __sendPaMissingInfoOwnerNotificationFn: async (p) => {
+      assert.equal(p.itemLabel, explicitLabel);
+      const { buildPaMissingInfoOwnerNotificationMessage } = await import(
+        "../src/services/paMissingInfoOwnerNotifyService.js"
+      );
+      ownerTexts.push(
+        buildPaMissingInfoOwnerNotificationMessage(p.request, {
+          itemLabel: p.itemLabel,
+        })
+      );
+      return { ok: true, sent: true, ownerNotifyStatus: "sent" };
+    },
+    __sendWhatsAppMessageFn: async () => ({ ok: true }),
+  });
+
+  assert.equal(result.missingInfoEscalated, true);
+  assert.match(ownerTexts[0], /Item:\nHonda Civic 2026/);
+  assert.doesNotMatch(ownerTexts[0], /Toyota Corolla/i);
 });
