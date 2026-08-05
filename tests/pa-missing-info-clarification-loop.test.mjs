@@ -730,7 +730,7 @@ test("multiple awaiting customer matches fail safely", async () => {
   });
 });
 
-test("no quote and unknown context remain safe", async () => {
+test("single eligible no-quote binds while unknown quoted context remains safe", async () => {
   const fake = createFakeDb();
   seed(fake);
   const nudges = [];
@@ -748,7 +748,12 @@ test("no quote and unknown context remain safe", async () => {
         return { ok: true };
       },
     });
-    assert.equal(noQuote.reason, "QUOTE_REQUIRED");
+    assert.equal(noQuote.reason, "CUSTOMER_CLARIFICATION_SENT");
+    assert.equal(noQuote.matchReason, "SINGLE_OWNER_NOTIFIED");
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "awaiting_customer_clarification"
+    );
     const unknown = await handlePaMissingInfoOwnerAnswerInbound({
       db: fake.db,
       businessId: BUSINESS_ID,
@@ -763,7 +768,10 @@ test("no quote and unknown context remain safe", async () => {
       },
     });
     assert.equal(unknown.reason, "CONTEXT_UNKNOWN");
-    assert.equal(fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status, "owner_notified");
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "awaiting_customer_clarification"
+    );
   });
 });
 

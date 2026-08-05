@@ -12,10 +12,13 @@ const {
   handlePaMissingInfoOwnerAnswerInbound,
   tryHandlePaMissingInfoOwnerAnswer,
   parsePaMissingInfoOwnerAnswerMessage,
+  PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE,
 } = await import("../src/services/paMissingInfoOwnerAnswerService.js");
-const { getPaMissingInfoRequest } = await import(
-  "../src/services/paMissingInfoRequestService.js"
-);
+const {
+  getPaMissingInfoRequest,
+  isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback,
+  listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests,
+} = await import("../src/services/paMissingInfoRequestService.js");
 
 const BUSINESS_ID = "owner-pa-ans-1";
 const CUSTOMER_PHONE = "923001112233";
@@ -524,43 +527,48 @@ test("customer follow-up send failure does not close request or report success",
   });
 });
 
-test("owner reply without quote is rejected and nudged (no SINGLE_OPEN)", async () => {
+test("no quote + exactly one eligible owner_notified request binds (tokenless fallback)", async () => {
   const fake = createFakeDb();
   seedContext(fake);
-  const sends = [];
+  const customerSends = [];
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
-      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
-
+      __classifyOwnerResponseKindFn: async () => ({
+        ok: true,
+        kind: "final_answer",
+        source: "test",
+      }),
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
       messageText: "Advance 50 percent hai",
       messageId: "wamid.owner-no-quote",
       sendWhatsAppMessageFn: async (to, text) => {
-        sends.push({ to, text });
-        return { ok: true };
+        customerSends.push({ to, text });
+        return { ok: true, providerMessageId: "wamid.cust-out-tokenless" };
       },
+      __chatCompletionsCreateForTests: async () =>
+        followupOpenAiResponse("Advance 50 percent before pickup."),
     });
     assert.equal(result.handled, true);
-    assert.equal(result.reason, "QUOTE_REQUIRED");
-    assert.equal(result.customerFollowupSent, false);
-    assert.equal(sends.length, 1);
-    assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
-    assert.match(sends[0].text, /reply directly to the customer question/i);
+    assert.equal(result.reason, "CUSTOMER_FOLLOWUP_SENT");
+    assert.equal(result.matchReason, "SINGLE_OWNER_NOTIFIED");
+    assert.equal(result.customerFollowupSent, true);
+    assert.equal(customerSends.length, 1);
+    assert.equal(phoneDigits(customerSends[0].to), CUSTOMER_PHONE);
     assert.equal(
       fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
-      "owner_notified"
+      "closed"
     );
     assert.equal(
-      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer ?? null,
-      null
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer,
+      "Advance 50 percent hai"
     );
   });
 });
 
-test("owner reply without quote + multiple open requests still requires quote", async () => {
+test("no quote + two eligible owner_notified requests → ambiguous nudge, rows unchanged", async () => {
   const fake = createFakeDb();
   const now = new Date();
   seedContext(fake, {
@@ -583,8 +591,11 @@ test("owner reply without quote + multiple open requests still requires quote", 
 
   await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
     const result = await handlePaMissingInfoOwnerAnswerInbound({
-      __classifyOwnerResponseKindFn: async () => ({ ok: true, kind: "final_answer", source: "test" }),
-
+      __classifyOwnerResponseKindFn: async () => ({
+        ok: true,
+        kind: "final_answer",
+        source: "test",
+      }),
       db: fake.db,
       businessId: BUSINESS_ID,
       senderPhone: OWNER_PHONE,
@@ -596,13 +607,223 @@ test("owner reply without quote + multiple open requests still requires quote", 
       },
     });
     assert.equal(result.handled, true);
-    assert.equal(result.reason, "QUOTE_REQUIRED");
+    assert.equal(result.reason, "AMBIGUOUS_ELIGIBLE_REQUESTS");
+    assert.equal(result.eligibleCount, 2);
     assert.equal(result.customerFollowupSent, false);
     assert.equal(sends.length, 1);
+    assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
+    assert.equal(sends[0].text, PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE);
     assert.equal(
       fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
       "owner_notified"
     );
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, "pamiss_bbbbbbbbbbbbbbbbbb").status,
+      "owner_notified"
+    );
+  });
+});
+
+test("no quote + zero eligible requests is not consumed as pamiss answer", async () => {
+  const fake = createFakeDb();
+  seedContext(fake, {
+    requestOverrides: {
+      status: "open",
+      ownerNotifyStatus: "not_started",
+      ownerNotifyProviderMessageId: null,
+    },
+  });
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance 50 percent hai",
+      messageId: "wamid.owner-zero",
+    });
+    assert.equal(result.handled, false);
+    assert.equal(result.reason, "NO_ELIGIBLE_OWNER_NOTIFIED_REQUEST");
+    const viaTry = await tryHandlePaMissingInfoOwnerAnswer({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance 50 percent hai",
+      messageId: "wamid.owner-zero-try",
+    });
+    assert.equal(viaTry, null);
+  });
+});
+
+test("tokenless eligibility permits sent/queued and excludes all other request states", async () => {
+  const now = new Date();
+  const expired = new Date(now.getTime() - 60_000);
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "owner_notified",
+      ownerNotifyStatus: "sent",
+      ownerNotifyProviderMessageId: NOTIFY_WAMID,
+      expiresAt: new Date(now.getTime() + 60_000),
+    }),
+    true
+  );
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "awaiting_customer_clarification",
+      ownerNotifyStatus: "sent",
+      ownerNotifyProviderMessageId: NOTIFY_WAMID,
+    }),
+    false
+  );
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "open",
+      ownerNotifyStatus: "not_started",
+      ownerNotifyProviderMessageId: null,
+    }),
+    false
+  );
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "owner_notified",
+      ownerNotifyStatus: "queued",
+      ownerNotifyProviderMessageId: NOTIFY_WAMID,
+      expiresAt: new Date(now.getTime() + 60_000),
+    }),
+    true
+  );
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "owner_notified",
+      ownerNotifyStatus: "sending",
+      ownerNotifyProviderMessageId: NOTIFY_WAMID,
+    }),
+    false
+  );
+  for (const status of [
+    "open",
+    "awaiting_customer_clarification",
+    "failed",
+    "answered",
+    "customer_notified",
+    "customer_followup_failed",
+    "closed",
+  ]) {
+    assert.equal(
+      isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+        status,
+        ownerNotifyStatus: "sent",
+        ownerNotifyProviderMessageId: NOTIFY_WAMID,
+      }),
+      false,
+      status
+    );
+  }
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "owner_notified",
+      ownerNotifyStatus: "failed",
+      ownerNotifyProviderMessageId: NOTIFY_WAMID,
+    }),
+    false
+  );
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "closed",
+      ownerNotifyStatus: "sent",
+      ownerNotifyProviderMessageId: NOTIFY_WAMID,
+    }),
+    false
+  );
+  assert.equal(
+    isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback({
+      status: "owner_notified",
+      ownerNotifyStatus: "sent",
+      ownerNotifyProviderMessageId: NOTIFY_WAMID,
+      expiresAt: expired,
+    }),
+    false
+  );
+
+  const fake = createFakeDb();
+  const future = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  fake.seedMissingInfo(BUSINESS_ID, REQUEST_ID, baseRequest());
+  fake.seedMissingInfo(BUSINESS_ID, "pamiss_open_only", {
+    ...baseRequest({ requestId: "pamiss_open_only" }),
+    status: "open",
+    ownerNotifyStatus: "not_started",
+    ownerNotifyProviderMessageId: null,
+  });
+  fake.seedMissingInfo(BUSINESS_ID, "pamiss_awaiting", {
+    ...baseRequest({ requestId: "pamiss_awaiting" }),
+    status: "awaiting_customer_clarification",
+    ownerNotifyStatus: "sent",
+    ownerNotifyProviderMessageId: "wamid.awaiting",
+  });
+  fake.seedMissingInfo(BUSINESS_ID, "pamiss_expired", {
+    ...baseRequest({ requestId: "pamiss_expired" }),
+    expiresAt: expired,
+  });
+
+  const eligible =
+    await listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests({
+      db: fake.db,
+      businessId: BUSINESS_ID,
+    });
+  assert.equal(eligible.length, 1);
+  assert.equal(eligible[0].requestId, REQUEST_ID);
+});
+
+test("context.id wins with multiple eligible owner_notified requests open", async () => {
+  const fake = createFakeDb();
+  const now = new Date();
+  const otherRequestId = "pamiss_ccccccccccccccc";
+  seedContext(fake, {
+    secondRequest: {
+      requestId: otherRequestId,
+      businessId: BUSINESS_ID,
+      customerPhone: OTHER_CUSTOMER,
+      bookingId: BOOKING_ID,
+      missingInfoType: "other",
+      customerQuestion: "Fuel average?",
+      status: "owner_notified",
+      ownerNotifyStatus: "sent",
+      ownerNotifyProviderMessageId: OTHER_NOTIFY_WAMID,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(now.getTime() + 48 * 60 * 60 * 1000),
+    },
+  });
+  const customerSends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({
+        ok: true,
+        kind: "final_answer",
+        source: "test",
+      }),
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "45 km/ltr",
+      messageId: "wamid.owner-fuel-ctx",
+      contextMessageId: OTHER_NOTIFY_WAMID,
+      sendWhatsAppMessageFn: async (to, text) => {
+        customerSends.push({ to, text });
+        return { ok: true, providerMessageId: "wamid.out-fuel-ctx" };
+      },
+      __chatCompletionsCreateForTests: async () =>
+        followupOpenAiResponse("Gari ki average 45 km/ltr hai."),
+    });
+
+    assert.equal(result.matchReason, "CONTEXT_ID");
+    assert.equal(result.requestId, otherRequestId);
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "owner_notified"
+    );
+    assert.equal(fake.getMissingInfo(BUSINESS_ID, otherRequestId).status, "closed");
   });
 });
 
