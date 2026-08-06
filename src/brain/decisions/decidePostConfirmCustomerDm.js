@@ -148,42 +148,6 @@ function cleanCustomerReply(value) {
   return String(value ?? "").trim();
 }
 
-function normalizedPostConfirmRawAuditText(value) {
-  return String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function shouldCapturePostConfirmRawAudit({
-  traceId,
-  businessId,
-  userMessage,
-}) {
-  const expectedMessage = normalizedPostConfirmRawAuditText(
-    process.env.POST_CONFIRM_RAW_AUDIT_MESSAGE_TEXT
-  );
-  if (!expectedMessage) return false;
-  if (normalizedPostConfirmRawAuditText(userMessage) !== expectedMessage) {
-    return false;
-  }
-  const expectedBusiness = clean(
-    process.env.POST_CONFIRM_RAW_AUDIT_BUSINESS_ID,
-    160
-  );
-  if (expectedBusiness && clean(businessId, 160) !== expectedBusiness) {
-    return false;
-  }
-  const expectedTrace = clean(
-    process.env.POST_CONFIRM_RAW_AUDIT_TRACE_ID,
-    160
-  );
-  if (expectedTrace && clean(traceId, 160) !== expectedTrace) {
-    return false;
-  }
-  return true;
-}
-
 function cleanAct(value) {
   const act = clean(value, 40).toLowerCase();
   return POST_CONFIRM_CONVERSATION_ACTS.includes(act) ? act : "unknown";
@@ -3007,8 +2971,6 @@ export function canEscalatePostConfirmMissingInfo({
  * @param {{
  *   facts: Record<string, unknown>,
  *   userMessage: string,
- *   traceId?: string | null,
- *   businessId?: string | null,
  *   conversationHistory?: string | null,
  *   styleKey?: "casual_local" | "neutral_english",
  *   timeoutMs?: number,
@@ -3019,8 +2981,6 @@ export function canEscalatePostConfirmMissingInfo({
 export async function executePostConfirmPaLaneDecision({
   facts,
   userMessage,
-  traceId = null,
-  businessId = null,
   conversationHistory = null,
   styleKey = "casual_local",
   timeoutMs = 8000,
@@ -3035,20 +2995,6 @@ export async function executePostConfirmPaLaneDecision({
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 1200);
-  const rawAuditEnabled = shouldCapturePostConfirmRawAudit({
-    traceId,
-    businessId,
-    userMessage: userLine,
-  });
-  const logRawAudit = (stage, payload = {}) => {
-    if (!rawAuditEnabled) return;
-    console.log("[post_confirm_raw_audit]", {
-      stage,
-      traceId: clean(traceId, 160) || null,
-      businessId: clean(businessId, 160) || null,
-      ...payload,
-    });
-  };
   const lastEmilyMatch = String(conversationHistory ?? "").match(
     /(?:Assistant|Emily)\s*:\s*([^\n]+)/gi
   );
@@ -3592,22 +3538,18 @@ STRICT SAFETY:
                     userLine
                   )}`
               : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
-      const requestArgs = {
-        model: resolveOpenAiChatModel(),
-        temperature: 0.35,
-        max_tokens: POST_CONFIRM_DECISION_MAX_TOKENS,
-        response_format: responseFormat,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: userContent },
-        ],
-      };
-      logRawAudit("request", {
-        attempt,
-        correctionReason: attempt === 1 ? null : lastReason,
-        request: requestArgs,
-      });
-      const createPromise = Promise.resolve(completionFn(requestArgs));
+      const createPromise = Promise.resolve(
+        completionFn({
+          model: resolveOpenAiChatModel(),
+          temperature: 0.35,
+          max_tokens: POST_CONFIRM_DECISION_MAX_TOKENS,
+          response_format: responseFormat,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userContent },
+          ],
+        })
+      );
 
       const timed =
         Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
@@ -3625,15 +3567,9 @@ STRICT SAFETY:
 
       const resp = await timed;
       const raw = resp?.choices?.[0]?.message?.content ?? "";
-      logRawAudit("raw_response", {
-        attempt,
-        finishReason: resp?.choices?.[0]?.finish_reason ?? null,
-        raw,
-      });
       const decision = parsePostConfirmCustomerDmDecision(raw, {
         userMessage: userLine,
       });
-      logRawAudit("parsed", { attempt, decision });
       const hasSendableReply = Boolean(cleanCustomerReply(decision?.customerReply));
       const isSilence =
         decision?.action === "silence" || decision?.shouldReply === false;
@@ -3777,11 +3713,6 @@ STRICT SAFETY:
           finalized.actionParameters,
           finalized.mutationIntent
         );
-        logRawAudit("finalized", {
-          attempt,
-          bookingSelection,
-          decision: stripInternalReplySemantics(finalized),
-        });
         return {
           ok: true,
           decision: stripInternalReplySemantics(finalized),
@@ -3824,11 +3755,6 @@ STRICT SAFETY:
         finalized.mutationIntent = "none";
         finalized.mutationExecutionRequested = false;
         finalized.actionParameters = emptyPostConfirmActionParameters();
-        logRawAudit("finalized", {
-          attempt,
-          bookingSelection,
-          decision: stripInternalReplySemantics(finalized),
-        });
         return {
           ok: true,
           decision: stripInternalReplySemantics(finalized),
@@ -4116,11 +4042,6 @@ STRICT SAFETY:
         continue;
       }
 
-      logRawAudit("finalized", {
-        attempt,
-        bookingSelection,
-        decision: stripInternalReplySemantics(finalized),
-      });
       return {
         ok: true,
         decision: stripInternalReplySemantics(finalized),
@@ -4158,7 +4079,6 @@ STRICT SAFETY:
  * @param {{
  *   facts: Record<string, unknown>,
  *   userMessage: string,
- *   traceId?: string | null,
  *   conversationHistory?: string | null,
  *   styleKey?: "casual_local" | "neutral_english",
  *   timeoutMs?: number,
@@ -4176,7 +4096,6 @@ export async function decidePostConfirmCustomerDm(p = {}) {
     businessId: facts.businessId ?? null,
     customerPhone: facts.customerPhoneDigits ?? null,
     messageText: p.userMessage,
-    traceId: p.traceId ?? null,
     recentDialogue: p.conversationHistory ?? null,
     activeBooking: facts.booking ?? null,
     activeAvailabilityRequest: facts.availabilityRequest ?? null,

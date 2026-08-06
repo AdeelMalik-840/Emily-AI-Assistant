@@ -35,7 +35,6 @@ export const CUSTOMER_TURN_LANES = Object.freeze([
  * @property {string | null} [customerPhone]
  * @property {string | null} [messageText]
  * @property {string | null} [messageId]
- * @property {string | null} [traceId]
  * @property {string | null} [recentDialogue]
  * @property {string | null} [lastEmilyMessage]
  * @property {string | null} [lastCustomerDmPromptType]
@@ -132,7 +131,6 @@ export function normalizeTurnContext(raw = {}) {
           ? String(r.userMessage)
           : null,
     messageId: r.messageId != null ? String(r.messageId) : null,
-    traceId: r.traceId != null ? String(r.traceId) : null,
     recentDialogue:
       r.recentDialogue != null
         ? String(r.recentDialogue)
@@ -325,8 +323,6 @@ export async function decideCustomerTurn(turnContextInput = {}) {
     const result = await executePostConfirmPaLaneDecision({
       facts: postConfirmFacts,
       userMessage: turnContext.messageText || "",
-      traceId: turnContext.traceId,
-      businessId: turnContext.businessId,
       conversationHistory: turnContext.recentDialogue,
       styleKey: turnContext.styleKey || "casual_local",
       timeoutMs:
