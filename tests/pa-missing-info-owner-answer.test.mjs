@@ -12,6 +12,7 @@ const {
   handlePaMissingInfoOwnerAnswerInbound,
   tryHandlePaMissingInfoOwnerAnswer,
   parsePaMissingInfoOwnerAnswerMessage,
+  extractTrustedOwnerAdvanceAmount,
   PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE,
 } = await import("../src/services/paMissingInfoOwnerAnswerService.js");
 const {
@@ -288,6 +289,96 @@ test("parse pamiss token and answer", () => {
   assert.equal(b.ownerAnswer, "5000 PKR");
 });
 
+test("trusted owner advance extractor requires a positive PKR amount", () => {
+  assert.equal(extractTrustedOwnerAdvanceAmount("Advance 10,000 PKR hoga"), 10000);
+  assert.equal(extractTrustedOwnerAdvanceAmount("PKR 7500 advance"), 7500);
+  assert.equal(extractTrustedOwnerAdvanceAmount("Advance 50 percent hai"), null);
+  assert.equal(extractTrustedOwnerAdvanceAmount("Advance 0 PKR hai"), null);
+});
+
+test("exact context-matched owner PKR answer is grounded as advance only", async () => {
+  const fake = createFakeDb();
+  seedContext(fake);
+  const bookingBefore = structuredClone(fake.getBooking(BUSINESS_ID, BOOKING_ID));
+  const customerSends = [];
+  let capturedFacts = null;
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({
+        ok: true,
+        kind: "final_answer",
+        source: "test",
+      }),
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance 10000 PKR hoga",
+      messageId: "wamid.owner-advance-10000",
+      contextMessageId: NOTIFY_WAMID,
+      sendWhatsAppMessageFn: async (to, text) => {
+        customerSends.push({ to, text });
+        return { ok: true, providerMessageId: "wamid.cust-advance-10000" };
+      },
+      __chatCompletionsCreateForTests: async (payload) => {
+        capturedFacts = payload.messages[1].content;
+        return followupOpenAiResponse("Advance 10,000 PKR hoga.");
+      },
+    });
+
+    assert.equal(result.customerFollowupSent, true);
+    assert.equal(result.matchReason, "CONTEXT_ID");
+    assert.equal(result.customerFollowupText, "Advance 10,000 PKR hoga.");
+    assert.equal(customerSends.length, 1);
+    assert.match(capturedFacts, /\"advanceAmount\":10000/);
+    assert.equal(fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status, "closed");
+
+    assert.deepEqual(
+      fake.getBooking(BUSINESS_ID, BOOKING_ID),
+      bookingBefore
+    );
+  });
+});
+
+test("unquoted owner PKR amount is rejected without changing the request", async () => {
+  const fake = createFakeDb();
+  seedContext(fake);
+  const sends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({
+        ok: true,
+        kind: "final_answer",
+        source: "test",
+      }),
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance 10000 PKR hoga",
+      messageId: "wamid.owner-unquoted-money",
+      sendWhatsAppMessageFn: async (to, text) => {
+        sends.push({ to, text });
+        return { ok: true };
+      },
+    });
+
+    assert.equal(result.reason, "ADVANCE_AMOUNT_REQUIRES_EXACT_CONTEXT");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(result.matchReason, "SINGLE_OWNER_NOTIFIED");
+    assert.equal(sends.length, 1); // owner quote nudge only
+    assert.equal(phoneDigits(sends[0].to), phoneDigits(OWNER_PHONE));
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "owner_notified"
+    );
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer ?? null,
+      null
+    );
+  });
+});
+
 test("multiline owner notification has no visible pamiss token", async () => {
   const { buildPaMissingInfoOwnerNotificationMessage } = await import(
     "../src/services/paMissingInfoOwnerNotifyService.js"
@@ -523,6 +614,44 @@ test("customer follow-up send failure does not close request or report success",
     assert.notEqual(row.status, "closed");
     assert.equal(row.customerFollowupStatus, "failed");
     assert.equal(row.customerFollowupStatus !== "sent", true);
+    assert.equal(row.closedAt ?? null, null);
+  });
+});
+
+test("failed owner-answer composition sends no fallback and reports no delivery", async () => {
+  const fake = createFakeDb();
+  seedContext(fake);
+  let sendCount = 0;
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: async () => ({
+        ok: true,
+        kind: "final_answer",
+        source: "test",
+      }),
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance 10000 PKR hoga",
+      messageId: "wamid.owner-compose-fail",
+      contextMessageId: NOTIFY_WAMID,
+      sendWhatsAppMessageFn: async () => {
+        sendCount += 1;
+        return { ok: true };
+      },
+      __chatCompletionsCreateForTests: async () => ({
+        choices: [{ message: { content: "not-json" } }],
+      }),
+    });
+
+    assert.equal(result.reason, "CUSTOMER_FOLLOWUP_PREPARATION_FAILED");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(sendCount, 0);
+    const row = fake.getMissingInfo(BUSINESS_ID, REQUEST_ID);
+    assert.equal(row.status, "customer_followup_failed");
+    assert.equal(row.customerFollowupStatus, "failed");
+    assert.equal(row.customerFollowupText ?? null, null);
     assert.equal(row.closedAt ?? null, null);
   });
 });

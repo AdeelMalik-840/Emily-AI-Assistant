@@ -557,6 +557,7 @@ function cleanType(value) {
  *   customerQuestion?: string | null,
  *   missingInfoType?: string | null,
  *   ownerAnswer: string,
+ *   trustedOwnerAdvanceAmount?: number | null,
  *   styleKey?: "casual_local" | "neutral_english",
  *   timeoutMs?: number,
  *   __chatCompletionsCreateForTests?: Function,
@@ -567,6 +568,7 @@ export async function generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
   customerQuestion = null,
   missingInfoType = null,
   ownerAnswer,
+  trustedOwnerAdvanceAmount = null,
   styleKey = "casual_local",
   timeoutMs = 8000,
   __chatCompletionsCreateForTests = null,
@@ -590,9 +592,35 @@ export async function generatePaMissingInfoCustomerFollowupFromOwnerAnswer({
     .slice(0, 800);
   const type = cleanType(missingInfoType);
   const factsObj = facts && typeof facts === "object" ? facts : {};
-  const factsJson = compactPostConfirmFactsForPrompt(factsObj);
+  const groundedAdvanceAmount =
+    type === "advance" &&
+    Number.isFinite(Number(trustedOwnerAdvanceAmount)) &&
+    Number(trustedOwnerAdvanceAmount) > 0
+      ? Number(trustedOwnerAdvanceAmount)
+      : null;
+  const groundedFacts =
+    groundedAdvanceAmount == null
+      ? factsObj
+      : {
+          ...factsObj,
+          advanceAmount: groundedAdvanceAmount,
+          known: {
+            ...(factsObj?.known && typeof factsObj.known === "object"
+              ? factsObj.known
+              : {}),
+            advanceAmount: groundedAdvanceAmount,
+          },
+          replyGuardFacts: {
+            ...(factsObj?.replyGuardFacts &&
+            typeof factsObj.replyGuardFacts === "object"
+              ? factsObj.replyGuardFacts
+              : {}),
+            advanceAmount: groundedAdvanceAmount,
+          },
+        };
+  const factsJson = compactPostConfirmFactsForPrompt(groundedFacts);
   const replyContract = buildPaMissingInfoFollowupContract({
-    ...factsObj,
+    ...groundedFacts,
     ownerAnswer: answer,
     customerQuestion: question,
     missingInfoType: type,
