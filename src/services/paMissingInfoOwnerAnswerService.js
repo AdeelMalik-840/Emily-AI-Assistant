@@ -73,6 +73,21 @@ function clean(value, max = 500) {
   return text ? text.slice(0, max) : "";
 }
 
+/** Extract an explicitly PKR-denominated positive amount from a trusted answer. */
+export function extractTrustedOwnerAdvanceAmount(value) {
+  const text = clean(value, 800);
+  if (!text || !/\b(?:pkr|rs\.?|rupees?)\b/i.test(text)) return null;
+  const afterCurrency = text.match(
+    /\b(?:pkr|rs\.?|rupees?)\s*([0-9][0-9,]*(?:\.\d+)?)/i
+  );
+  const beforeCurrency = text.match(
+    /([0-9][0-9,]*(?:\.\d+)?)\s*\b(?:pkr|rs\.?|rupees?)\b/i
+  );
+  const raw = afterCurrency?.[1] || beforeCurrency?.[1] || "";
+  const amount = Number(raw.replace(/,/g, ""));
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
 /**
  * Phase 1: reject empty / punctuation-only owner replies (e.g. "???").
  * Requires at least one letter or digit. Request stays open on reject.
@@ -395,6 +410,33 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
         ? "clarification_question"
         : "unclear";
 
+  const missingInfoType = clean(request.missingInfoType, 40);
+  const trustedOwnerAdvanceAmount =
+    missingInfoType === "advance"
+      ? extractTrustedOwnerAdvanceAmount(ownerAnswer)
+      : null;
+
+  if (
+    trustedOwnerAdvanceAmount != null &&
+    matchReason !== "CONTEXT_ID"
+  ) {
+    await sendOwnerQuoteNudge({
+      sendWhatsAppMessageFn,
+      ownerPhone: ownerTarget,
+      sendCredentials,
+    });
+    return {
+      handled: true,
+      reason: "ADVANCE_AMOUNT_REQUIRES_EXACT_CONTEXT",
+      action: "owner_answer_rejected",
+      requestId,
+      matchReason,
+      customerFollowupSent: false,
+      ownerResponseKind,
+      status,
+    };
+  }
+
   // Unclear / classifier failure: do not apply final or start clarification loop.
   if (ownerResponseKind === "unclear") {
     await sendOwnerQuoteNudge({
@@ -671,14 +713,33 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
     missingInfoType:
       applied.request?.missingInfoType || request.missingInfoType,
     ownerAnswer,
+    trustedOwnerAdvanceAmount,
     styleKey: "casual_local",
     __chatCompletionsCreateForTests,
   });
 
-  const followupText = clean(
-    ai?.reply || CUSTOMER_BUSINESS_PA_TECHNICAL_FALLBACK,
-    500
-  );
+  const followupText = clean(ai?.ok === true ? ai.reply : "", 500);
+
+  if (!followupText || ai?.source !== "openai") {
+    const error = clean(ai?.reason, 400) || "OWNER_ANSWER_COMPOSITION_FAILED";
+    await markPaMissingInfoCustomerFollowupFailed({
+      db: connection,
+      businessId: uid,
+      requestId,
+      error,
+    });
+    return {
+      handled: true,
+      reason: "CUSTOMER_FOLLOWUP_PREPARATION_FAILED",
+      action: "owner_answer_followup_failed",
+      requestId,
+      matchReason,
+      customerFollowupSent: false,
+      error,
+      ownerResponseKind: "final_answer",
+      status: "customer_followup_failed",
+    };
+  }
 
   try {
     const sendResult = await sendWhatsAppMessageFn(
