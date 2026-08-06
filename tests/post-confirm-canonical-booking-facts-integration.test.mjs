@@ -207,8 +207,8 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
       shouldReply: false,
       customerReply: "",
       action: "silence",
-      bookingSelectionMode: "none",
-      selectedBookingIndex: null,
+      bookingSelectionMode: "focused",
+      selectedBookingIndex: 1,
       groundedFacts: grounded(),
     }),
   ];
