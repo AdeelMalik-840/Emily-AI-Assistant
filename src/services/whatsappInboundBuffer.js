@@ -2511,6 +2511,7 @@ export async function executeWhatsAppAiPipeline(p) {
         customerPhone: cloudConfirmPhone,
         messageText: latestMessage,
         messageId,
+        traceId,
         inboundReceivedAtMs,
         conversationHistory,
         sendCredentials,
