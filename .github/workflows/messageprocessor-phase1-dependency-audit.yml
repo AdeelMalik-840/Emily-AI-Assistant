@@ -1,0 +1,52 @@
+name: messageProcessor phase 1 dependency audit
+
+on:
+  push:
+    branches:
+      - refactor/remove-messageprocessor-phase1
+    paths:
+      - .github/workflows/messageprocessor-phase1-dependency-audit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture dependency definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit-output
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('src/services/messageProcessor.js').read_text()
+          lines = source.splitlines()
+          needles = [
+              'function memoryStageBlocksPriceDurationFollowup',
+              'function resolveLastVerifiedCatalogAnswerForPriceFollowup',
+              'function normalizeId',
+              'function normalizeForContextMatch',
+              'function buildDisplayLabel',
+              'function hasSafePreviousCatalogItemForPriceFollowup',
+          ]
+          out = []
+          for needle in needles:
+              found = False
+              for i, line in enumerate(lines):
+                  if needle in line:
+                      found = True
+                      start = max(0, i - 20)
+                      end = min(len(lines), i + 260)
+                      out.append(f'===== {needle} at line {i+1} =====')
+                      out.extend(f'{n+1:06d}: {lines[n]}' for n in range(start, end))
+              if not found:
+                  out.append(f'===== NOT FOUND: {needle} =====')
+          Path('audit-output/dependencies.txt').write_text('\n'.join(out) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: messageprocessor-dependency-audit
+          path: audit-output/
