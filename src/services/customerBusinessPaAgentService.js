@@ -46,64 +46,6 @@ function cleanCustomerReply(value) {
   return String(value ?? "").trim();
 }
 
-function normalizedPostConfirmAuditText(value) {
-  return String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function shouldCapturePostConfirmRawAudit({
-  traceId,
-  businessId,
-  messageText,
-}) {
-  const expectedMessage = normalizedPostConfirmAuditText(
-    process.env.POST_CONFIRM_RAW_AUDIT_MESSAGE_TEXT
-  );
-  if (!expectedMessage) return false;
-  if (normalizedPostConfirmAuditText(messageText) !== expectedMessage) {
-    return false;
-  }
-  const expectedBusiness = clean(
-    process.env.POST_CONFIRM_RAW_AUDIT_BUSINESS_ID,
-    160
-  );
-  if (expectedBusiness && clean(businessId, 160) !== expectedBusiness) {
-    return false;
-  }
-  const expectedTrace = clean(
-    process.env.POST_CONFIRM_RAW_AUDIT_TRACE_ID,
-    160
-  );
-  if (expectedTrace && clean(traceId, 160) !== expectedTrace) {
-    return false;
-  }
-  return true;
-}
-
-function logPostConfirmReleaseAudit({ traceId, businessId, messageText, decision }) {
-  if (
-    !shouldCapturePostConfirmRawAudit({ traceId, businessId, messageText })
-  ) {
-    return;
-  }
-  console.log("[post_confirm_raw_audit]", {
-    stage: "release_gate",
-    traceId: clean(traceId, 160) || null,
-    businessId: clean(businessId, 160) || null,
-    decision,
-    guards: {
-      factKind: decision?.factKind === "booking_fact",
-      capability: decision?.capability === "availability_request",
-      action: decision?.action === "reply",
-      mutationIntent: decision?.mutationIntent === "none",
-      pendingAvailabilitySelectionIndex:
-        decision?.pendingAvailabilitySelectionIndex == null,
-    },
-  });
-}
-
 /**
  * The shared post-confirm Brain uses this exact plan for a new inventory
  * availability request. Release before any PA resolver, executor, or composer
@@ -539,7 +481,6 @@ function logPostConfirmTerminalDiagnostic(decided) {
  *   customerPhone: string,
  *   messageText: string,
  *   messageId?: string | null,
- *   traceId?: string | null,
  *   inboundReceivedAtMs?: number | null,
  *   conversationHistory?: string | null,
  *   sendCredentials?: unknown,
@@ -565,7 +506,6 @@ export async function handleCustomerBusinessPaInbound({
   customerPhone,
   messageText,
   messageId = null,
-  traceId = null,
   inboundReceivedAtMs = null,
   conversationHistory = null,
   sendCredentials = null,
@@ -696,7 +636,6 @@ export async function handleCustomerBusinessPaInbound({
     customerPhone: phone,
     messageText: text,
     messageId,
-    traceId,
     recentDialogue: conversationHistory,
     ownershipLane: "post_confirm_pa",
     activeBooking: facts.booking ?? null,
@@ -764,13 +703,6 @@ export async function handleCustomerBusinessPaInbound({
   // Post-exec pending lane may replace facts with verified execution Result.
   let laneFacts = facts;
   let mutationAlreadyComposed = false;
-
-  logPostConfirmReleaseAudit({
-    traceId,
-    businessId: uid,
-    messageText: text,
-    decision,
-  });
 
   if (shouldReleasePostConfirmForFreshAvailability(decision)) {
     console.log("[customer_business_pa_ownership_released]", {
@@ -913,7 +845,6 @@ export async function handleCustomerBusinessPaInbound({
       customerPhone: phone,
       messageText: text,
       messageId,
-      traceId,
       recentDialogue: conversationHistory,
       ownershipLane: "post_confirm_pa",
       activeBooking: finalFacts.booking ?? null,

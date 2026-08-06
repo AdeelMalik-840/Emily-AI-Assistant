@@ -609,6 +609,7 @@ test("unverified booking mutations cannot be claimed complete", async () => {
     const safeReply =
       "Aap ki request samajh aa gayi hai, lekin yeh change abhi complete nahi hua.";
     const mutationShape = {
+      factKind: "action",
       situation: "protected_action",
       conversationAct: "action_request",
       customerIntent: "ask_action",
@@ -617,6 +618,7 @@ test("unverified booking mutations cannot be claimed complete", async () => {
       mutationIntent,
       mutationExecutionRequested: true,
       mutationExecutionStatus: "succeeded",
+      bookingSelectionMode: "focused",
     };
     const result = await runOwnedTurn({
       message: "meri booking update kar dein",
@@ -1093,6 +1095,7 @@ test("trusted latest-confirmed focus answers generic duration from Corolla only"
     facts: trustedMultiBookingFacts(),
     responses: [
       factualDecision({
+        factKind: "booking_fact",
         concept: "duration",
         attributes: ["days"],
         bookingSelectionMode: "focused",
@@ -1279,6 +1282,7 @@ test("all_candidates rejects cross-booking duration swaps and regenerates once",
     facts: trustedMultiBookingFacts(),
     responses: [
       factualDecision({
+        factKind: "booking_fact",
         concept: "duration",
         attributes: ["days"],
         bookingSelectionMode: "all_candidates",
@@ -1359,6 +1363,7 @@ test("selected Corolla rejects Civic duration and regenerates without repeating 
     facts: trustedMultiBookingFacts(),
     responses: [
       factualDecision({
+        factKind: "booking_fact",
         concept: "duration",
         attributes: ["days"],
         bookingSelectionMode: "focused",
@@ -1496,7 +1501,7 @@ test("no active booking leaves the existing general path unclaimed", async () =>
   assert.equal(openaiCalls, 0);
 });
 
-test("trusted focus + ask_fact + bookingSelectionMode none auto-selects focused booking", async () => {
+test("trusted focus + ask_fact explicitly selects the focused booking", async () => {
   const counters = {};
   const reply = "Toyota Corolla 4 din ke liye book hai.";
   const result = await runOwnedTurn({
@@ -1504,10 +1509,11 @@ test("trusted focus + ask_fact + bookingSelectionMode none auto-selects focused 
     facts: trustedMultiBookingFacts({ withFocus: true }),
     responses: [
       factualDecision({
+        factKind: "booking_fact",
         concept: "duration",
         attributes: ["days"],
-        bookingSelectionMode: "none",
-        selectedBookingIndex: null,
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
         groundedFacts: {
           itemId: "corolla-grey",
           durationDays: 4,
@@ -1536,7 +1542,7 @@ test("trusted focus + ask_fact + bookingSelectionMode none auto-selects focused 
   assert.equal(result.terminalFailure, false);
 });
 
-test("trusted focus auto-select covers rent, pickup, and status ask_fact with mode none", async () => {
+test("trusted focus explicitly covers rent, pickup, and status ask_fact", async () => {
   const cases = [
     [
       "4 din ka total rent kitna hoga?",
@@ -1574,9 +1580,11 @@ test("trusted focus auto-select covers rent, pickup, and status ask_fact with mo
       facts: trustedMultiBookingFacts({ withFocus: true }),
       responses: [
         factualDecision({
+          factKind: "booking_fact",
           concept: meta.concept,
           attributes: meta.attributes,
-          bookingSelectionMode: "none",
+          bookingSelectionMode: "focused",
+          selectedBookingIndex: 2,
           groundedFacts: {
             itemId: grounded.itemId ?? null,
             durationDays: grounded.durationDays ?? null,
@@ -1632,9 +1640,11 @@ test("live semantic-drift silence recovers with one corrective Brain regeneratio
         bookingSelectionMode: "none",
       }),
       factualDecision({
+        factKind: "booking_fact",
         concept: "duration",
         attributes: ["days"],
-        bookingSelectionMode: "none",
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
         groundedFacts: {
           itemId: "corolla-grey",
           durationDays: 4,
@@ -2183,6 +2193,7 @@ test("trusted Stonic focus recovers duration ask after Corolla verified_item_mis
     facts: trustedStonicFocusFacts(),
     responses: [
       factualDecision({
+        factKind: "booking_fact",
         concept: "duration",
         attributes: ["days"],
         bookingSelectionMode: "focused",
@@ -2279,6 +2290,7 @@ test("trusted Stonic focus recovers rent, pickup, and status after wrong-item at
       facts: trustedStonicFocusFacts(),
       responses: [
         factualDecision({
+          factKind: "booking_fact",
           concept: meta.concept,
           attributes: meta.attributes,
           bookingSelectionMode: "focused",

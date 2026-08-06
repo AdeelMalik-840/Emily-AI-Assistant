@@ -148,42 +148,6 @@ function cleanCustomerReply(value) {
   return String(value ?? "").trim();
 }
 
-function normalizedPostConfirmRawAuditText(value) {
-  return String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function shouldCapturePostConfirmRawAudit({
-  traceId,
-  businessId,
-  userMessage,
-}) {
-  const expectedMessage = normalizedPostConfirmRawAuditText(
-    process.env.POST_CONFIRM_RAW_AUDIT_MESSAGE_TEXT
-  );
-  if (!expectedMessage) return false;
-  if (normalizedPostConfirmRawAuditText(userMessage) !== expectedMessage) {
-    return false;
-  }
-  const expectedBusiness = clean(
-    process.env.POST_CONFIRM_RAW_AUDIT_BUSINESS_ID,
-    160
-  );
-  if (expectedBusiness && clean(businessId, 160) !== expectedBusiness) {
-    return false;
-  }
-  const expectedTrace = clean(
-    process.env.POST_CONFIRM_RAW_AUDIT_TRACE_ID,
-    160
-  );
-  if (expectedTrace && clean(traceId, 160) !== expectedTrace) {
-    return false;
-  }
-  return true;
-}
-
 function cleanAct(value) {
   const act = clean(value, 40).toLowerCase();
   return POST_CONFIRM_CONVERSATION_ACTS.includes(act) ? act : "unknown";
@@ -343,6 +307,15 @@ export function mapFactKindToTurnPlan(
       return { capability: "social", evidenceNeeds: [] };
     case "booking_fact": {
       const normalized = normalizeEvidenceNeeds(brainEvidenceNeeds);
+      // Availability is a booking_fact but is not an active-booking lookup.
+      // Preserve the Brain's explicit fresh-request capability even if it asks
+      // for catalog evidence that normalizes alongside booking evidence.
+      if (cleanPostConfirmCapability(brainCapability) === "availability_request") {
+        return {
+          capability: "availability_request",
+          evidenceNeeds: normalized,
+        };
+      }
       const bookingNeeds = normalized.filter((n) => n.entity === "active_booking");
       if (bookingNeeds.length > 0) {
         return {
@@ -357,13 +330,6 @@ export function mapFactKindToTurnPlan(
       ) {
         return {
           capability: "answer_from_active_booking",
-          evidenceNeeds: normalized,
-        };
-      }
-      // Preserve inventory availability asks when Brain still emits that capability.
-      if (cleanPostConfirmCapability(brainCapability) === "availability_request") {
-        return {
-          capability: "availability_request",
           evidenceNeeds: normalized,
         };
       }
@@ -458,6 +424,39 @@ export function normalizePostConfirmActionParameters(
     deliveryAddress: stringOrNull(raw.deliveryAddress, 240),
     deliveryTime: stringOrNull(raw.deliveryTime, 80),
   };
+}
+
+/**
+ * Whether a recognized mutation has the minimum structured parameters needed
+ * to reach the deterministic executor. Never derives values from customer text.
+ */
+export function hasRequiredPostConfirmMutationParameters(
+  mutationIntent,
+  actionParameters
+) {
+  const intent = cleanMutationIntent(mutationIntent);
+  const p = normalizePostConfirmActionParameters(actionParameters, intent);
+  switch (intent) {
+    case "cancel_booking":
+      return true;
+    case "extend_booking":
+      return Number.isFinite(p.extensionDays) && p.extensionDays > 0;
+    case "change_duration":
+      return Number.isFinite(p.durationDays) && p.durationDays > 0;
+    case "change_dates":
+      return Boolean(p.startDate || p.endDate);
+    case "change_item":
+      return Boolean(p.itemId);
+    case "update_pickup":
+      return Boolean(p.pickupDetails);
+    case "update_delivery":
+      return (
+        p.deliveryRequested !== null ||
+        Boolean(p.deliveryAddress || p.deliveryTime)
+      );
+    default:
+      return false;
+  }
 }
 
 export const POST_CONFIRM_ACTION_PARAMETERS_SCHEMA = Object.freeze({
@@ -688,7 +687,7 @@ function buildPostConfirmSuspiciousSilenceCorrection(
     "- Silence is valid ONLY for a purely social acknowledgement with no question, request, concern, or requested information.",
     "- When the customer asks anything factual about the booking/business: set capability + evidenceNeeds Turn Plan with customerReply=\"\". Do NOT answer facts here.",
     "- Genuine social small-talk only: capability=social with a non-empty customerReply that states NO booking facts, prices, policies, dates, times, locations, or references.",
-    "- For read-only informational questions with a trusted bookingFocus, use bookingSelectionMode=focused (or leave none — the system may apply trusted focus).",
+    "- For read-only informational questions about the trusted bookingFocus, use bookingSelectionMode=focused. Never use none when that booking is intended.",
     "- Never invent amounts, dates, policies, or booking mutations. Strict JSON only.",
   ].join("\n");
 }
@@ -740,7 +739,7 @@ function buildPostConfirmTrustedFocusRequiredReplyCorrection(
     "- Must set action=reply, shouldReply=true.",
     "- Factual/booking/business asks: capability + evidenceNeeds Turn Plan, customerReply=\"\". Wording happens after trusted resolve.",
     "- Genuine social only: capability=social with non-empty customerReply and NO factual business/booking claims.",
-    "- Use bookingSelectionMode=focused (or none — the system may apply trusted focus).",
+    "- Use bookingSelectionMode=focused. Never use none when the trusted booking is intended.",
     "- Do not silence. Do not invent amounts, dates, policies, or mutations. Strict JSON only.",
   ].join("\n");
 }
@@ -2020,33 +2019,23 @@ export function resolvePostConfirmBookingSelection(decision, facts) {
     };
   }
 
+  if (mode === "none") {
+    return {
+      ok: true,
+      reason: "NO_BOOKING_SELECTED",
+      mode,
+      selectedBookingIndex: null,
+      booking: null,
+      bookings: [],
+    };
+  }
+
   let selectedIndex = null;
   let resolvedMode = mode;
   if (mode === "candidate") {
     selectedIndex = requestedIndex;
   } else if (mode === "focused") {
     selectedIndex = focusIndex ?? (candidates.length === 1 ? 1 : null);
-  } else if (
-    mode === "none" &&
-    hasTrustedPostConfirmBookingFocus(facts) &&
-    focusIndex != null &&
-    !mutationRequested &&
-    !pendingAvailabilityAction &&
-    isPostConfirmReadOnlyInformationalDecision(decision)
-  ) {
-    // System already resolved MATCHED_TRUSTED_FOCUS — do not require the model
-    // to echo bookingSelectionMode=focused for read-only informational turns.
-    selectedIndex = focusIndex;
-    resolvedMode = "focused";
-  } else if (
-    candidates.length === 1 &&
-    mode === "none" &&
-    (mutationRequested ||
-      decision?.conversationAct === "information_request" ||
-      decision?.customerIntent === "ask_fact")
-  ) {
-    // One active booking has no selection ambiguity; preserve main behavior.
-    selectedIndex = 1;
   }
 
   if (selectedIndex != null) {
@@ -2703,6 +2692,16 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   if (action === "request_booking_mutation") {
     capability = "mutation_requested";
     evidenceNeeds = [];
+    if (
+      mutationIntent !== "none" &&
+      hasRequiredPostConfirmMutationParameters(mutationIntent, actionParameters)
+    ) {
+      // Pre-execution wording is deliberately empty. Preserve the structured
+      // request through anti-silence normalization; the service/executor still
+      // owns authorization and verified execution.
+      shouldReply = true;
+      customerReply = "";
+    }
   }
 
   // Act-driven situation hardening.
@@ -3007,8 +3006,6 @@ export function canEscalatePostConfirmMissingInfo({
  * @param {{
  *   facts: Record<string, unknown>,
  *   userMessage: string,
- *   traceId?: string | null,
- *   businessId?: string | null,
  *   conversationHistory?: string | null,
  *   styleKey?: "casual_local" | "neutral_english",
  *   timeoutMs?: number,
@@ -3019,8 +3016,6 @@ export function canEscalatePostConfirmMissingInfo({
 export async function executePostConfirmPaLaneDecision({
   facts,
   userMessage,
-  traceId = null,
-  businessId = null,
   conversationHistory = null,
   styleKey = "casual_local",
   timeoutMs = 8000,
@@ -3035,20 +3030,6 @@ export async function executePostConfirmPaLaneDecision({
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 1200);
-  const rawAuditEnabled = shouldCapturePostConfirmRawAudit({
-    traceId,
-    businessId,
-    userMessage: userLine,
-  });
-  const logRawAudit = (stage, payload = {}) => {
-    if (!rawAuditEnabled) return;
-    console.log("[post_confirm_raw_audit]", {
-      stage,
-      traceId: clean(traceId, 160) || null,
-      businessId: clean(businessId, 160) || null,
-      ...payload,
-    });
-  };
   const lastEmilyMatch = String(conversationHistory ?? "").match(
     /(?:Assistant|Emily)\s*:\s*([^\n]+)/gi
   );
@@ -3357,7 +3338,9 @@ MEANING + TURN PLAN (critical):
 - vague = underspecified with no identifiable fact ("mujhe details chahiye")
 - non_business = social/general/time/weather/jokes/maths/politics/trivia/Emily personal — never owner escalation
 - action = mutation or pending AVR confirm/decline — keep mutationIntent/AVR fields; runtime does not map factKind to evidence stores
-- New inventory availability ("koi gari available?") → factKind=booking_fact with capability hint availability_request (runtime may preserve availability_request from that hint); never answer inventory from active booking fields alone. Never omit factKind on factual asks.
+- Fresh inventory availability includes a named item/service plus a requested date or duration (for example "Civic 5 din ke liye", "Civic kal ke liye", or "ek aur Civic weekend ke liye"), even when another booking is focused. Return factKind=booking_fact, capability=availability_request, mutationIntent=none, bookingSelectionMode=none, and selectedBookingIndex=null. Never answer it from active booking fields.
+- Trusted booking focus applies only when the customer asks a question or requests a mutation about that existing booking. A clearly new request for the same named item is still fresh availability.
+- New inventory availability without a named item ("koi gari available?") follows the same availability_request contract. Never omit factKind on factual asks.
 - Never invent dates, times, amounts, locations, statuses, policies, references, or items in this call.
 
 INFORMATIONAL VS MUTATION (delivery/pickup):
@@ -3398,7 +3381,8 @@ Examples (meaning → factKind; leave customerReply="" for factual kinds):
 - general knowledge / time / weather / jokes / maths / politics / Emily personal / hello / thanks → factKind=non_business
 - extend/cancel/change pickup or delivery details / pending AVR confirm|decline → factKind=action with matching action/mutationIntent/AVR fields
 - "owner se confirm" without a concrete fact → factKind=vague
-- "koi gari available?" (new inventory) → factKind=booking_fact with availability_request capability hint (not an omitted factKind; never invent booking field answers for inventory)
+- named item/service + new date or duration (including "ek aur" or clearly framed same-item requests) → factKind=booking_fact, capability=availability_request, mutationIntent=none, bookingSelectionMode=none, selectedBookingIndex=null
+- "koi gari available?" (new inventory) → the same availability_request contract (not an omitted factKind; never invent booking field answers for inventory)
 - CLARIFICATION ANSWER CONTINUITY: When RECENT_CONVERSATION shows Emily's immediately preceding reply asked for a missing clarifying detail needed to interpret a prior unresolved customer ask, and the current message answers that clarification, set factKind from the COMBINED meaning of (1) the prior unresolved ask, (2) Emily's clarification question, and (3) this answer. Do NOT use factKind=vague merely because the current message is a short fragment answering that clarification. Still use factKind=vague when there is no such pending clarification, or when the current message does not answer it (ok/thanks/still underspecified/unrelated).
 - Never invent attribute names. requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
 
@@ -3419,8 +3403,8 @@ STEP 4 — action:
   candidate = customer explicitly identified one bookingCandidates row, and selectedBookingIndex must be that row;
   all_candidates = customer explicitly asked for facts about all listed bookingCandidates; read-only information only;
   clarification_required = more than one booking could apply and the customer did not identify one;
-  none = no booking is relevant (for example social conversation).
-- A trusted focused booking may default only read-only informational questions when bookingSelectionMode is none.
+  none = no existing booking is relevant (for example social conversation or a fresh availability request). It prohibits booking selection: selectedBookingIndex and selectedBookingId remain null, and runtime must not default to trusted focus.
+- Existing-booking questions and mutations must explicitly use bookingSelectionMode=focused when trusted focus is intended. Never rely on none to recover focus.
 - For request_booking_mutation with multiple bookings: use bookingSelectionMode=focused to mutate the trusted CURRENT_BOOKING_IN_SCOPE booking; use candidate + selectedBookingIndex when the customer clearly named a different booking. If unclear, clarification_required with selectedBookingIndex=null. Never treat mode=none as focused for mutations.
 - For all_candidates, set selectedBookingIndex=null and provide exactly one candidateGroundings row for every bookingCandidates row. Each replySegment must be an exact non-overlapping substring of customerReply, name that booking using customer-safe facts, and contain only facts for its selectionIndex.
 - Never use all_candidates for a mutation or action request.
@@ -3592,22 +3576,18 @@ STRICT SAFETY:
                     userLine
                   )}`
               : `${userPayload}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
-      const requestArgs = {
-        model: resolveOpenAiChatModel(),
-        temperature: 0.35,
-        max_tokens: POST_CONFIRM_DECISION_MAX_TOKENS,
-        response_format: responseFormat,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: userContent },
-        ],
-      };
-      logRawAudit("request", {
-        attempt,
-        correctionReason: attempt === 1 ? null : lastReason,
-        request: requestArgs,
-      });
-      const createPromise = Promise.resolve(completionFn(requestArgs));
+      const createPromise = Promise.resolve(
+        completionFn({
+          model: resolveOpenAiChatModel(),
+          temperature: 0.35,
+          max_tokens: POST_CONFIRM_DECISION_MAX_TOKENS,
+          response_format: responseFormat,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userContent },
+          ],
+        })
+      );
 
       const timed =
         Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
@@ -3625,15 +3605,9 @@ STRICT SAFETY:
 
       const resp = await timed;
       const raw = resp?.choices?.[0]?.message?.content ?? "";
-      logRawAudit("raw_response", {
-        attempt,
-        finishReason: resp?.choices?.[0]?.finish_reason ?? null,
-        raw,
-      });
       const decision = parsePostConfirmCustomerDmDecision(raw, {
         userMessage: userLine,
       });
-      logRawAudit("parsed", { attempt, decision });
       const hasSendableReply = Boolean(cleanCustomerReply(decision?.customerReply));
       const isSilence =
         decision?.action === "silence" || decision?.shouldReply === false;
@@ -3777,11 +3751,6 @@ STRICT SAFETY:
           finalized.actionParameters,
           finalized.mutationIntent
         );
-        logRawAudit("finalized", {
-          attempt,
-          bookingSelection,
-          decision: stripInternalReplySemantics(finalized),
-        });
         return {
           ok: true,
           decision: stripInternalReplySemantics(finalized),
@@ -3824,11 +3793,6 @@ STRICT SAFETY:
         finalized.mutationIntent = "none";
         finalized.mutationExecutionRequested = false;
         finalized.actionParameters = emptyPostConfirmActionParameters();
-        logRawAudit("finalized", {
-          attempt,
-          bookingSelection,
-          decision: stripInternalReplySemantics(finalized),
-        });
         return {
           ok: true,
           decision: stripInternalReplySemantics(finalized),
@@ -4116,11 +4080,6 @@ STRICT SAFETY:
         continue;
       }
 
-      logRawAudit("finalized", {
-        attempt,
-        bookingSelection,
-        decision: stripInternalReplySemantics(finalized),
-      });
       return {
         ok: true,
         decision: stripInternalReplySemantics(finalized),
@@ -4158,7 +4117,6 @@ STRICT SAFETY:
  * @param {{
  *   facts: Record<string, unknown>,
  *   userMessage: string,
- *   traceId?: string | null,
  *   conversationHistory?: string | null,
  *   styleKey?: "casual_local" | "neutral_english",
  *   timeoutMs?: number,
@@ -4176,7 +4134,6 @@ export async function decidePostConfirmCustomerDm(p = {}) {
     businessId: facts.businessId ?? null,
     customerPhone: facts.customerPhoneDigits ?? null,
     messageText: p.userMessage,
-    traceId: p.traceId ?? null,
     recentDialogue: p.conversationHistory ?? null,
     activeBooking: facts.booking ?? null,
     activeAvailabilityRequest: facts.availabilityRequest ?? null,

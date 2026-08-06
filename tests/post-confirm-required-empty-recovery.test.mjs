@@ -195,8 +195,8 @@ function silenceInformationDecision() {
     shouldReply: false,
     customerReply: "",
     action: "silence",
-    bookingSelectionMode: "none",
-    selectedBookingIndex: null,
+    bookingSelectionMode: "focused",
+    selectedBookingIndex: 1,
     groundedFacts: groundedFacts(),
   });
 }
