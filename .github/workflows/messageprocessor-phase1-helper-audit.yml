@@ -1,0 +1,46 @@
+name: messageProcessor phase 1 helper audit
+
+on:
+  push:
+    branches:
+      - refactor/remove-messageprocessor-phase1
+    paths:
+      - .github/workflows/messageprocessor-phase1-helper-audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture helper definition and call sites
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit-output
+          grep -RIn --exclude-dir=.git "__hasSafePreviousCatalogItemForPriceFollowupForTests\|hasSafePreviousCatalogItemForPriceFollowup" src tests > audit-output/matches.txt || true
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('src/services/messageProcessor.js').read_text()
+          needles = [
+              '__hasSafePreviousCatalogItemForPriceFollowupForTests',
+              'hasSafePreviousCatalogItemForPriceFollowup',
+          ]
+          lines = source.splitlines()
+          out = []
+          for needle in needles:
+              for i, line in enumerate(lines):
+                  if needle in line:
+                      start = max(0, i - 80)
+                      end = min(len(lines), i + 180)
+                      out.append(f'===== {needle} at line {i+1} =====')
+                      out.extend(f'{n+1:06d}: {lines[n]}' for n in range(start, end))
+          Path('audit-output/context.txt').write_text('\n'.join(out) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: messageprocessor-helper-audit
+          path: audit-output/
