@@ -10,8 +10,11 @@ const { runBrainV2LivePipeline } = await import(
 const { ITEMLESS_PRICE_CLARIFICATION_REPLY } = await import(
   "../src/services/turnContextAuthority.js"
 );
-const { __hasSafePreviousCatalogItemForPriceFollowupForTests } = await import(
-  "../src/services/messageProcessor.js"
+const {
+  resolveTrustedPreviousItemContinuation:
+    __hasSafePreviousCatalogItemForPriceFollowupForTests,
+} = await import(
+  "../src/brain/context/previousItemContinuationResolver.js"
 );
 
 const BUSINESS_ID = "dm-pricing-business";

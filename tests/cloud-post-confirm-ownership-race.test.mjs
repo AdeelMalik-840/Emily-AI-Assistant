@@ -158,14 +158,15 @@ function basePipelineParams({
     },
     __tryHandlePaMissingInfoOwnerAnswerFn: async () => null,
     __tryHandleCustomerBusinessPaInboundFn: async (params) => onPa?.(params) ?? null,
-    __tryBrainV2LiveBeforeLegacyFn: async () => null,
-    __processMessageFn: async () => {
+    __tryBrainV2LiveBeforeLegacyFn: async () => {
       const generalResult = await onGeneral?.();
-      if (generalResult) return generalResult;
+      if (generalResult) return { handled: true, legacyBypassed: true, ...generalResult };
       return {
+        handled: true,
+        legacyBypassed: true,
         reply: "Existing normal route reply",
         sendVia: "CLOUD_API",
-        messageMeta: { finalReplySource: "LEGACY_TEST" },
+        messageMeta: { finalReplySource: "BRAIN_V2_TEST" },
       };
     },
     __sendOutboundMessageFn: async (payload) =>
@@ -372,10 +373,12 @@ test("real active-job finally drains queued Cloud ownership into post_confirm_pa
     messageText: "Han kar do",
     resolveFacts: async () => noActiveFacts(),
   });
-  confirmationParams.__processMessageFn = async () => {
+  confirmationParams.__tryBrainV2LiveBeforeLegacyFn = async () => {
     confirmationJobStarted();
     await confirmationRelease;
     return {
+      handled: true,
+      legacyBypassed: true,
       reply: "",
       sendVia: "NONE",
       messageMeta: {
@@ -604,10 +607,14 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
             finalReplySource: "openai_post_confirm_pa",
           };
         },
-        __tryBrainV2LiveBeforeLegacyFn: async () => null,
-        __processMessageFn: async () => {
+        __tryBrainV2LiveBeforeLegacyFn: async () => {
           generalCalls += 1;
-          return { reply: "legacy", sendVia: "CLOUD_API" };
+          return {
+            handled: true,
+            legacyBypassed: true,
+            reply: "Brain V2 reply",
+            sendVia: "CLOUD_API",
+          };
         },
         __sendOutboundMessageFn: async () => {
           sends += 1;
@@ -727,13 +734,14 @@ test("startup recovery releases queued ownership only after final no-booking rec
           paCalls += 1;
           return null;
         },
-        __tryBrainV2LiveBeforeLegacyFn: async () => null,
-        __processMessageFn: async () => {
+        __tryBrainV2LiveBeforeLegacyFn: async () => {
           generalCalls += 1;
           return {
+            handled: true,
+            legacyBypassed: true,
             reply: "Existing normal route reply",
             sendVia: "CLOUD_API",
-            messageMeta: { finalReplySource: "LEGACY_TEST" },
+            messageMeta: { finalReplySource: "BRAIN_V2_TEST" },
           };
         },
         __sendOutboundMessageFn: async () => {
@@ -1610,10 +1618,14 @@ test("startup retryCount 5 failure becomes terminal without fallthrough", async 
           paCalls += 1;
           return null;
         },
-        __tryBrainV2LiveBeforeLegacyFn: async () => null,
-        __processMessageFn: async () => {
+        __tryBrainV2LiveBeforeLegacyFn: async () => {
           generalCalls += 1;
-          return { reply: "legacy", sendVia: "CLOUD_API" };
+          return {
+            handled: true,
+            legacyBypassed: true,
+            reply: "Brain V2 reply",
+            sendVia: "CLOUD_API",
+          };
         },
         __sendOutboundMessageFn: async () => {
           sends += 1;

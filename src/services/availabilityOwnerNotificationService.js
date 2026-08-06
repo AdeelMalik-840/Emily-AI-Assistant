@@ -1,5 +1,6 @@
 import db from "../config/firebase.js";
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
+import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import {
   findExistingAvailabilityRequestForTurn,
   getAvailabilityRequest,
@@ -121,6 +122,7 @@ export async function sendAvailabilityOwnerNotification({
   executionContext = {},
   sendWhatsAppMessageFn = sendWhatsAppMessage,
 }) {
+  assertExecutionOwnership(executionContext);
   const firestore = connection ?? db;
   const uid = clean(businessId ?? executionContext.businessId ?? executionContext.userId);
   const rid = clean(requestId ?? request?.requestId ?? executionContext.requestId);
@@ -135,6 +137,7 @@ export async function sendAvailabilityOwnerNotification({
     request,
     executionContext,
   });
+  assertExecutionOwnership(executionContext);
   if (!current) {
     return { ok: false, reason: "REQUEST_NOT_FOUND", requestId: rid, ownerTarget: null };
   }
@@ -156,6 +159,7 @@ export async function sendAvailabilityOwnerNotification({
     request: current,
     executionContext,
   });
+  assertExecutionOwnership(executionContext);
   if (!ownerTarget) {
     await markAvailabilityRequestOwnerNotificationFailed({
       db: firestore,
@@ -172,6 +176,7 @@ export async function sendAvailabilityOwnerNotification({
     };
   }
 
+  assertExecutionOwnership(executionContext);
   await markAvailabilityRequestOwnerNotificationQueued({
     db: firestore,
     businessId: uid,
@@ -184,6 +189,7 @@ export async function sendAvailabilityOwnerNotification({
     requestId: rid,
     ownerTarget,
   });
+  assertExecutionOwnership(executionContext);
 
   const liveRequest =
     (await getAvailabilityRequest({ db: firestore, businessId: uid, requestId: rid })) ||
@@ -200,8 +206,9 @@ export async function sendAvailabilityOwnerNotification({
       ownerTarget,
       message,
       sendCredentials ?? undefined,
-      { recipientType: "individual" }
+      { recipientType: "individual", signal: executionContext?.abortSignal }
     );
+    assertExecutionOwnership(executionContext);
 
     if (result === undefined) {
       sendSucceeded = true;
@@ -214,10 +221,12 @@ export async function sendAvailabilityOwnerNotification({
       )}`;
     }
   } catch (err) {
+    if (executionContext?.abortSignal?.aborted) throw err;
     sendFailureDetail = String(err?.message ?? err ?? "unknown");
   }
 
   if (!sendSucceeded) {
+    assertExecutionOwnership(executionContext);
     await markAvailabilityRequestOwnerNotificationFailed({
       db: firestore,
       businessId: uid,
@@ -233,6 +242,7 @@ export async function sendAvailabilityOwnerNotification({
     };
   }
 
+  assertExecutionOwnership(executionContext);
   await markAvailabilityRequestOwnerNotificationSent({
     db: firestore,
     businessId: uid,
@@ -241,6 +251,7 @@ export async function sendAvailabilityOwnerNotification({
     ownerTarget,
     ownerNotificationProviderMessageId: providerMessageId || null,
   });
+  assertExecutionOwnership(executionContext);
 
   return {
     ok: true,

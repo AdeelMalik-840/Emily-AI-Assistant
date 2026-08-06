@@ -344,6 +344,7 @@ export async function executeLiveSideEffects(p) {
   let skipRemainingActions = false;
 
   for (const item of rawActions) {
+    assertLiveExecutionActive(p.executionContext);
     if (skipRemainingActions) break;
     const type = String(item?.type ?? "").trim();
     const payload =
@@ -358,6 +359,7 @@ export async function executeLiveSideEffects(p) {
         payload,
         executionContext: p.executionContext,
       });
+      assertLiveExecutionActive(p.executionContext);
       sideEffectResults.CREATE_BOOKING = result;
       if (isItemAlreadyBookedResult(/** @type {Record<string, unknown>} */ (result))) {
         customerReplyOverride = buildItemAlreadyBookedReply(
@@ -382,6 +384,7 @@ export async function executeLiveSideEffects(p) {
         payload,
         executionContext: p.executionContext,
       });
+      assertLiveExecutionActive(p.executionContext);
       sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED = availabilityCheckResult;
 
       const lifecycleKind = cleanStatus(availabilityCheckResult?.lifecycleKind);
@@ -464,6 +467,7 @@ export async function executeLiveSideEffects(p) {
               undefined,
           },
         });
+        assertLiveExecutionActive(p.executionContext);
         sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION = notifyResult;
 
         // Refresh request snapshot after notify so IDEMPOTENT_SKIP can be validated against status.
@@ -530,6 +534,7 @@ export async function executeLiveSideEffects(p) {
         booking: bookingCreated,
         executionContext: p.executionContext,
       });
+      assertLiveExecutionActive(p.executionContext);
     } else if (type === "DM_CUSTOMER" || type === "HANDOFF_DM") {
       const recipient = String(
         payload.recipientPhone ??
@@ -544,6 +549,7 @@ export async function executeLiveSideEffects(p) {
         payload: { ...payload, recipientPhone: recipient },
         executionContext: p.executionContext,
       });
+      assertLiveExecutionActive(p.executionContext);
     }
   }
 
@@ -653,6 +659,7 @@ export function buildOwnerCheckPostExecuteFacts(p) {
  * @param {Record<string, unknown>} [executionContext]
  */
 export async function routeAndExecuteLiveActionPlan(actionPlan, flags, executionContext = {}) {
+  assertLiveExecutionActive(executionContext);
   const routed = assertLiveActionPlanIsSafe(actionPlan, flags);
   const {
     sideEffectResults,
@@ -666,6 +673,7 @@ export async function routeAndExecuteLiveActionPlan(actionPlan, flags, execution
     flags,
     executionContext,
   });
+  assertLiveExecutionActive(executionContext);
 
   const awaitsPostExecute =
     String(actionPlan?.postExecuteCustomerReply ?? "").trim() === "owner_check_result";
@@ -719,6 +727,7 @@ export async function routeAndExecuteLiveActionPlan(actionPlan, flags, execution
                 businessId: String(executionContext.businessId ?? "").trim(),
                 getBookingsForItemFn: executionContext.getBookingsForItemFn ?? undefined,
               });
+              assertLiveExecutionActive(executionContext);
               freshConflictDetected = conflictResult?.conflict === true;
             } catch {
               freshConflictDetected = true;
@@ -842,4 +851,12 @@ export async function routeAndExecuteLiveActionPlan(actionPlan, flags, execution
     skipRemainingActions,
     awaitsPostExecuteBrainReply: false,
   };
+}
+
+/** @param {Record<string, unknown> | null | undefined} context */
+function assertLiveExecutionActive(context) {
+  if (context?.abortSignal?.aborted) {
+    throw context.abortSignal.reason ?? new Error("Brain V2 action execution aborted");
+  }
+  context?.executionGuard?.assertActive?.();
 }

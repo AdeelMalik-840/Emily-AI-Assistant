@@ -10,6 +10,7 @@ import {
   buildInitialAvailabilityPhoneExtractionFields,
   isRetryablePhoneExtractionError,
 } from "./availabilityCustomerPhone.js";
+import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
@@ -517,6 +518,7 @@ export async function findExistingAvailabilityRequestForTurn({
  * @returns {Promise<{ ok: boolean, blocked?: boolean, reason?: string, requestId?: string | null, status?: string | null, request?: Record<string, unknown> | null, created?: boolean }>}
  */
 export async function createAvailabilityRequest({ db: connection, payload, executionContext = {} }) {
+  assertExecutionOwnership(executionContext);
   const normalized = normalizeAvailabilityRequestPayload(payload, executionContext);
   if (!normalized.businessId) {
     return { ok: false, blocked: true, reason: "MISSING_BUSINESS_ID", requestId: null, status: null, request: null, created: false };
@@ -538,6 +540,7 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
   }
 
   const existing = await ref.get();
+  assertExecutionOwnership(executionContext);
   if (existing?.exists) {
     const request = { requestId: normalized.requestId, ...(existing.data() || {}) };
     return {
@@ -559,6 +562,7 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     normalized,
     logicalRequestKey: normalized.logicalRequestKey,
   });
+  assertExecutionOwnership(executionContext);
   if (semanticExisting?.requestId) {
     const request = await getAvailabilityRequest({
       db: connection,
@@ -615,7 +619,9 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     ...phoneExtractionFields,
   };
 
+  assertExecutionOwnership(executionContext);
   await ref.set(request, { merge: true });
+  assertExecutionOwnership(executionContext);
   return {
     ok: true,
     requestId: normalized.requestId,

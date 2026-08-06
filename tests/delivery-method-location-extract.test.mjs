@@ -11,9 +11,12 @@ const {
   interpretDeliveryMethodMessage,
   isValidDeliveryAddressCandidate,
   validateBookingSlotForState,
-  __groupPrivatePromptGuardForTests,
   __shortBookingPolicyForTests,
 } = await import("../src/services/messageProcessor.js");
+const {
+  inspectGroupPrivacyReply: __groupPrivatePromptGuardForTests,
+  GROUP_PRIVATE_DETAIL_SAFETY_REPLY,
+} = await import("../src/services/outbound/hybridOutboundRouter.js");
 import {
   detectBroadDeliveryAreaHint,
   parseDeliveryDetails,
@@ -210,7 +213,7 @@ test("group private-detail prompts are replaced with safe copy", () => {
     { durationDays: 45 }
   );
   assert.equal(out.blocked, true);
-  assert.equal(out.reply, "Perfect 👍 request receive ho gayi hai. Main confirm kar ke bata deta hun.");
+  assert.equal(out.reply, GROUP_PRIVATE_DETAIL_SAFETY_REPLY);
   assert.doesNotMatch(out.reply, /contact|naam|address|time|pickup|delivery/i);
 });
 
@@ -402,4 +405,3 @@ test("awaiting_delivery_location rejects phone-like text as address", () => {
   assert.equal(out.accepted.deliveryAddress, undefined);
   assert.equal(out.rejected?.includes("deliveryAddress"), true);
 });
-

@@ -2,7 +2,7 @@
  * Outbound reply executor — sender plumbing only (no brain decisions).
  */
 import { planGroupHybridDelivery } from "../replyRouting.js";
-import { __applyHybridOutboundResultForTests } from "../messageProcessor.js";
+import { routeHybridOutbound } from "../outbound/hybridOutboundRouter.js";
 
 /**
  * @param {{
@@ -31,7 +31,7 @@ import { __applyHybridOutboundResultForTests } from "../messageProcessor.js";
  * }}
  */
 export function executeOutboundReply({ reply, messageMeta = {}, routingCtx, aiStructuredMode = null }) {
-  const result = __applyHybridOutboundResultForTests(
+  const result = routeHybridOutbound(
     {
       reply: String(reply ?? ""),
       type: "AI_MESSAGE",

@@ -241,7 +241,8 @@ async function postWhatsAppMessagesResult(
   phoneNumberId,
   token,
   payload,
-  credentialMeta = {}
+  credentialMeta = {},
+  signal = undefined
 ) {
   const url = `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`;
   const res = await fetch(url, {
@@ -251,6 +252,7 @@ async function postWhatsAppMessagesResult(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal,
   });
   const text = await res.text();
   let data = {};
@@ -441,13 +443,15 @@ export async function sendWhatsAppTemplateMessage({
  * @param {string} body
  * @param {Array<{ id: string, title: string }>} buttons
  * @param {{ phoneNumberId?: string, accessToken?: string } | null} [credentials]
+ * @param {{ signal?: AbortSignal }} [opts]
  * @returns {Promise<{ ok: boolean }>}
  */
 export async function sendWhatsAppInteractiveButtons(
   to,
   body,
   buttons,
-  credentials = null
+  credentials = null,
+  opts = {}
 ) {
   const { toField } = resolveWhatsAppToField(to, "individual");
   const resolved = resolveWhatsAppCredentials(credentials, { recipient: toField || to });
@@ -482,7 +486,7 @@ export async function sendWhatsAppInteractiveButtons(
     tokenSource: resolved.tokenSource,
     phoneNumberId,
     recipientLast4: toField.replace(/\D/g, "").slice(-4) || null,
-  });
+  }, opts.signal);
   return {
     ok: Boolean(result.ok),
     providerMessageId: result.ok ? extractProviderMessageId(result.data) : null,
@@ -503,6 +507,7 @@ export async function sendWhatsAppInteractiveButtons(
  *   fallbackDmTo?: string,
  *   includeGroupDmNotice?: boolean,
  *   groupDmNoticeBody?: string,
+ *   signal?: AbortSignal,
  * }} [opts]
  * @returns {Promise<{ ok: boolean, groupSendFailed: boolean }>}
  */
@@ -550,7 +555,8 @@ export async function sendWhatsAppMessage(to, text, credentials = null, opts = {
         tokenSource: resolved.tokenSource,
         phoneNumberId,
         recipientLast4: toField.replace(/\D/g, "").slice(-4) || null,
-      }
+      },
+      opts.signal
     );
 
     if (result.ok) {

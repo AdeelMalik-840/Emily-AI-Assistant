@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY ||= "test-key";
 
 import {
-  __applyHybridOutboundResultForTests,
   __buildIntentionalSilentNoopMessageMetaForTests,
   __buildOutboundTraceForTests,
   __canResolvePureAckWithoutConsumablePendingForTests,
@@ -17,6 +16,7 @@ import {
   __buildPendingActionForTests,
   __wasPreviousAssistantTurnTerminalInfoForTests,
 } from "../src/services/messageProcessor.js";
+import { routeHybridOutbound as __applyHybridOutboundResultForTests } from "../src/services/outbound/hybridOutboundRouter.js";
 
 test("classify verified catalog composer trace as terminal_info", () => {
   const kind = __classifyAssistantOutboundKindForTests(

@@ -105,7 +105,7 @@ export function isV2LiveEnvironmentAllowed(env = process.env) {
  *   businessAllowlisted: boolean,
  *   nodeEnv: string,
  *   railwayEnv: string | null,
- *   selected: "v2_live" | "legacy" | "blocked",
+ *   selected: "v2_live" | "blocked",
  *   rejectReason: string | null,
  *   hardV2Mode: boolean,
  *   hasV2LivePipeline: boolean,
@@ -142,32 +142,22 @@ export function evaluateBrainRouteGate(params = {}) {
 
   if (!hasV2LivePipeline) {
     rejectReason = "PIPELINE_UNAVAILABLE";
-  } else if (!v2LiveEnabled) {
-    rejectReason = "V2_LIVE_DISABLED";
   } else if (!businessIdNormalized) {
     rejectReason = "MISSING_BUSINESS_ID";
-  } else if (allowlistNormalized.length === 0) {
-    rejectReason = "EMPTY_ALLOWLIST";
-  } else if (!businessAllowlisted) {
-    rejectReason = "BUSINESS_NOT_ALLOWLISTED";
-  } else if (!v2EnvironmentAllowed) {
-    rejectReason = "PRODUCTION_NOT_ALLOWED";
   }
 
   const canRunV2Live = rejectReason == null;
-  const businessHardV2Eligible = hardV2Mode && businessAllowlisted;
+  const businessHardV2Eligible = Boolean(businessIdNormalized);
 
-  /** @type {"v2_live" | "legacy" | "blocked"} */
+  /** @type {"v2_live" | "blocked"} */
   let selected;
   if (canRunV2Live) {
     selected = "v2_live";
-  } else if (businessHardV2Eligible) {
-    selected = "blocked";
   } else {
-    selected = "legacy";
+    selected = "blocked";
   }
 
-  const route = canRunV2Live ? "v2_live" : rejectReason ?? "legacy";
+  const route = canRunV2Live ? "v2_live" : rejectReason ?? "blocked";
 
   return {
     businessId: businessIdNormalized,
@@ -196,11 +186,11 @@ export function evaluateBrainRouteGate(params = {}) {
 }
 
 /**
- * Hard no-legacy applies only to allowlisted businesses under global hard-v2 flags.
- * @param {Pick<ReturnType<typeof evaluateBrainRouteGate>, "hardV2Mode" | "businessAllowlisted">} gate
+ * A resolved supported business is always V2-only.
+ * @param {Pick<ReturnType<typeof evaluateBrainRouteGate>, "businessIdNormalized">} gate
  */
 export function isBusinessHardV2Eligible(gate) {
-  return gate.hardV2Mode === true && gate.businessAllowlisted === true;
+  return Boolean(gate.businessIdNormalized);
 }
 
 /**
@@ -211,11 +201,8 @@ export function isBusinessHardV2Eligible(gate) {
  * }} p
  */
 export function isLegacyProcessMessageAllowed(p) {
-  const gate = p.routeGate;
-  if (isBusinessHardV2Eligible(gate)) return false;
-  if (gate.selected === "blocked") return false;
-  if (p.handledByBrainV2Live === true || p.handledByBrainV2InfoLive === true) return false;
-  return true;
+  void p;
+  return false;
 }
 
 /**

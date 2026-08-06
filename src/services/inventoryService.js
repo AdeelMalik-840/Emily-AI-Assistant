@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import db from "../config/firebase.js";
 import admin from "firebase-admin";
 import { logBookingEvent } from "../utils/bookingLogger.js";
+import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import { bookingOverlapsRequestedWindow } from "./bookingIntervalOverlap.js";
 
 const Timestamp = admin.firestore.Timestamp;
@@ -953,7 +954,7 @@ export function __displayNameFromParticipantKeyForTests(value) {
 /**
  * @param {string} traceId - Correlates with pipeline / processMessage logs
  * @param {string} userId
- * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, availabilityRequestId?: string | null, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceTurnKey?: string | null, guaranteeKey?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null, dbOverride?: unknown }} opts
+ * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, availabilityRequestId?: string | null, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceTurnKey?: string | null, guaranteeKey?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null, dbOverride?: unknown, abortSignal?: AbortSignal, executionGuard?: Record<string, unknown> }} opts
  */
 export async function createBooking(
   traceId,
@@ -997,8 +998,12 @@ export async function createBooking(
     sourceMessageIndex,
     originalUserMessageText,
     dbOverride,
+    abortSignal,
+    executionGuard,
   }
 ) {
+  const executionContext = { abortSignal, executionGuard };
+  assertExecutionOwnership(executionContext);
   logAvailabilityPolicyOnce();
   const tid = String(traceId ?? "").trim() || "unknown-trace";
   const id = String(itemId ?? "").trim();
@@ -1205,6 +1210,7 @@ export async function createBooking(
     let existingSourceBooking = null;
 
     await firestoreDb.runTransaction(async (tx) => {
+      assertExecutionOwnership(executionContext);
       if (sourceDedupeKey && sourceLockRef) {
         const sourceLockSnap = await tx.get(sourceLockRef);
         if (sourceLockSnap?.exists === true) {
@@ -1273,6 +1279,7 @@ export async function createBooking(
         throw new Error("ITEM_ALREADY_BOOKED");
       }
 
+      assertExecutionOwnership(executionContext);
       const bookingRef = bookingsRef.doc();
       createdBookingId = String(bookingRef.id ?? "").trim();
       tx.set(bookingRef, {
@@ -1438,6 +1445,7 @@ export async function createBooking(
         }
       }
     });
+    assertExecutionOwnership(executionContext);
 
     if (existingSourceBooking) {
       console.log("[booking_source_idempotency_hit]", {

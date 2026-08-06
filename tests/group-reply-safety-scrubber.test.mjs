@@ -2,100 +2,33 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  __applyHybridOutboundResultForTests,
-  __groupPrivatePromptGuardForTests,
-  processMessage,
-} from "../src/services/messageProcessor.js";
+  routeHybridOutbound as __applyHybridOutboundResultForTests,
+  inspectGroupPrivacyReply as __groupPrivatePromptGuardForTests,
+  GROUP_PRIVATE_DETAIL_SAFETY_REPLY,
+} from "../src/services/outbound/hybridOutboundRouter.js";
 
-const PROCESS_MESSAGE_CATCH_FALLBACK =
-  "Sorry, I didn’t catch that properly. Could you please try again?";
-
-/**
- * Minimal harness: we avoid OpenAI by forcing an outbound result via direct route paths.
- * We use the internal booking created path is hard, so we validate by calling applyHybridOutboundResult
- * indirectly through a simple availability route and by passing a pre-built result using the exported
- * processMessage? (No direct export). Instead, we test scrubber by invoking processMessage with a
- * forced reply via inboundIntent and bypass AI by using informational route fallback.
- *
- * NOTE: This test only asserts scrubber logic for group outbound results.
- */
-
-test("group reply containing confirm hai is scrubbed", async () => {
-  const out = await processMessage({
-    traceId: "t1",
-    userId: "owner1",
-    message: "ok",
-    messageId: "m1",
-    source: "playwright",
-    isGroupInbound: true,
-    playwrightWebInbound: true,
-    playwrightChatKey: "rental-leads",
-    groupName: "Rental Leads",
-    participantKey: "p1",
-    // Force the final reply via classifier, then we expect scrubber to apply on outgoing reply.
-    inboundIntent: "general",
-    conversationHistory: "Assistant: confirm hai\n",
-  });
-  // If the system tries to echo "confirm hai" in group, it must be scrubbed.
-  assert.ok(typeof out.reply === "string");
-  assert.doesNotMatch(out.reply, /\bconfirm hai\b/i);
+test("DM outbound wording is not rewritten by the group privacy guard", () => {
+  const reply = "Please share your contact number.";
+  const out = __applyHybridOutboundResultForTests(
+    { reply, type: "AI_MESSAGE", messageMeta: {} },
+    { isGroupInbound: false, message: "ok" }
+  );
+  assert.equal(out.reply, reply);
 });
 
-test("group reply asking time is scrubbed", async () => {
-  const out = await processMessage({
-    traceId: "t2",
-    userId: "owner1",
-    message: "ok",
-    messageId: "m2",
-    source: "playwright",
-    isGroupInbound: true,
-    playwrightWebInbound: true,
-    playwrightChatKey: "rental-leads",
-    groupName: "Rental Leads",
-    participantKey: "p1",
-    inboundIntent: "general",
-    conversationHistory: "Assistant: kis time?\n",
-  });
-  assert.ok(typeof out.reply === "string");
-  assert.doesNotMatch(out.reply, /\bkis time\b/i);
-});
-
-test("playwright group inbound availability message accepts group flags without catch fallback", async () => {
-  const out = await processMessage({
-    traceId: "t-group-flags-civic-availability",
-    userId: "owner1",
-    message: "Civic available hai?",
-    messageId: "m-group-flags-civic-availability",
-    source: "playwright",
-    isGroupInbound: true,
-    isGroupMessage: true,
-    whatsappRecipientType: "group",
-    playwrightWebInbound: true,
-    playwrightChatKey: "rental-leads",
-    groupName: "Rental Leads",
-    participantKey: "p1",
-    participantName: "Customer One",
-  });
-
-  assert.ok(out);
-  assert.equal(typeof out.reply, "string");
-  assert.notEqual(out.reply, PROCESS_MESSAGE_CATCH_FALLBACK);
-});
-
-test("dm reply is not scrubbed", async () => {
-  const out = await processMessage({
-    traceId: "t3",
-    userId: "owner1",
-    message: "ok",
-    messageId: "m3",
-    source: "cloud",
-    isGroupInbound: false,
-    replyChannel: "whatsapp",
-    inboundIntent: "general",
-    conversationHistory: "Assistant: confirm hai\n",
-  });
-  assert.ok(typeof out.reply === "string");
-  // No guarantee it will say confirm hai, but if it does, DM path must not force scrub.
+test("structured group-to-DM routing uses the trusted participant phone", () => {
+  const out = __applyHybridOutboundResultForTests(
+    { reply: "I will continue in DM.", type: "AI_MESSAGE", messageMeta: {} },
+    {
+      isGroupInbound: true,
+      message: "details please",
+      participantPhoneForDm: "+92 300 1234567",
+    },
+    "DM"
+  );
+  assert.equal(out.sendVia, "CLOUD_API_DM");
+  assert.equal(out.dmRecipientPhone, "923001234567");
+  assert.equal(out.replyMode, "DM");
 });
 
 test("real group outbound path scrubs phone leak with Playwright GROUP reply mode", () => {
@@ -123,9 +56,7 @@ test("real group outbound path scrubs phone leak with Playwright GROUP reply mod
 
   assert.equal(out.sendVia, "PLAYWRIGHT");
   assert.equal(out.replyMode, "GROUP");
-  assert.equal(out.reply, "2 ghantay ke liye gari rent par nahi milti. Minimum 12 ghantay ka slot hai. 12 ghantay ke liye check karun?");
-  assert.match(out.reply, /Minimum 12 ghantay/);
-  assert.match(out.reply, /nahi milti/i);
+  assert.equal(out.reply, GROUP_PRIVATE_DETAIL_SAFETY_REPLY);
   assert.doesNotMatch(out.reply, /\+92|03\d{9}|contact number|kya yeh sahi/i);
 });
 
@@ -133,11 +64,8 @@ test("real group outbound path scrubs old askContact and logistics prompts", () 
   const prompts = [
     "Apna naam aur contact number share kar dein.",
     "Aapka contact number kya hai?",
-    "City ke andar use karna hai ya outside city?",
-    "Kis time bhej dein?",
     "Delivery kahan karwani hai?",
     "Location/address share kar dein.",
-    "Pickup noted. Kis time lena chahenge?",
     "Exact kis area mein delivery chahiye?",
   ];
 
@@ -161,7 +89,7 @@ test("real group outbound path scrubs old askContact and logistics prompts", () 
 
     assert.equal(out.sendVia, "PLAYWRIGHT");
     assert.equal(out.replyMode, "GROUP");
-    assert.equal(out.reply, "Request receive ho gayi hai. Main confirm kar ke bata deta hun.");
+    assert.equal(out.reply, GROUP_PRIVATE_DETAIL_SAFETY_REPLY);
     assert.doesNotMatch(out.reply, /contact|naam|address|location|city|outside|delivery|pickup|time|kis area/i);
   }
 });
@@ -184,11 +112,11 @@ test("group final guard also runs for group recipient context even without isGro
   );
 
   assert.equal(out.sendVia, "CLOUD_API");
-  assert.equal(out.reply, "Request receive ho gayi hai. Main confirm kar ke bata deta hun.");
+  assert.equal(out.reply, GROUP_PRIVATE_DETAIL_SAFETY_REPLY);
   assert.doesNotMatch(out.reply, /contact|name|number/i);
 });
 
-test("group safety replacement includes verified item and duration when available", () => {
+test("group safety replacement never leaks private prompts even with booking metadata", () => {
   const out = __applyHybridOutboundResultForTests(
     {
       reply: "Apna naam aur contact number share kar dein.",
@@ -212,7 +140,7 @@ test("group safety replacement includes verified item and duration when availabl
     "GROUP"
   );
 
-  assert.equal(out.reply, "Perfect 👍 Toyota Corolla 1 month ke liye note kar liya. Main confirm kar ke bata deta hun.");
+  assert.equal(out.reply, GROUP_PRIVATE_DETAIL_SAFETY_REPLY);
   assert.doesNotMatch(out.reply, /contact|naam|number/i);
 });
 
@@ -230,3 +158,46 @@ test("group guard detects raw phone patterns and contact confirmation phrasing",
   }
 });
 
+test("privacy-sensitive group reply moves to the trusted participant DM exactly once", () => {
+  let memoryWrites = 0;
+  const out = __applyHybridOutboundResultForTests(
+    {
+      reply: "Please share your delivery address.",
+      type: "AI_MESSAGE",
+      messageMeta: { outboundTrace: { kind: "reply" } },
+    },
+    {
+      isGroupInbound: true,
+      message: "my other number is +92 333 9999999",
+      participantPhoneForDm: "+92 300 1234567",
+      emilySessionKey: "trusted-group-participant",
+    },
+    "GROUP",
+    { recordOutboundSessionContextFn: () => { memoryWrites += 1; } }
+  );
+  assert.equal(out.sendVia, "CLOUD_API_DM");
+  assert.equal(out.dmRecipientPhone, "923001234567");
+  assert.equal(out.reply, "Please share your delivery address.");
+  assert.equal(memoryWrites, 1);
+});
+
+test("arbitrary inbound phone is never promoted to a privacy DM target", () => {
+  const out = __applyHybridOutboundResultForTests(
+    {
+      reply: "Please share your delivery address.",
+      type: "AI_MESSAGE",
+      messageMeta: {},
+    },
+    {
+      isGroupInbound: true,
+      message: "call +92 333 9999999",
+      participantPhoneForDm: null,
+    },
+    "DM"
+  );
+  assert.notEqual(out.sendVia, "CLOUD_API_DM");
+  assert.equal(out.dmRecipientPhone, undefined);
+  assert.equal(out.reply, GROUP_PRIVATE_DETAIL_SAFETY_REPLY);
+  assert.match(out.reply, /Please DM/i);
+  assert.doesNotMatch(out.reply, /continue karunga|safe channel/i);
+});

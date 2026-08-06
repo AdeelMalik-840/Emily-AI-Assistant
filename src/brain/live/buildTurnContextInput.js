@@ -26,9 +26,10 @@ import { chatSessionKey } from "../../services/memory.js";
  *   traceId?: string | null,
  *   resolveTrustedSessionItem?: (p: {
  *     memory: Record<string, unknown> | null,
- *     message: unknown,
  *     catalogItems: unknown[],
  *     participantKey: string | null,
+ *     continuationContextNeeded: boolean,
+ *     continuationKind: string,
  *   }) => { ok: boolean, item?: Record<string, unknown> | null, reason?: string | null },
  * }} p
  * @returns {import("../contracts/turnContextInput.js").TurnContextInput}
@@ -64,9 +65,10 @@ export function buildTurnContextInput(p) {
         ? (inner) =>
             p.resolveTrustedSessionItem({
               memory: inner.memory,
-              message: inner.message,
               catalogItems: inner.catalogItems,
               participantKey: inner.participantKey,
+              continuationContextNeeded: inner.continuationContextNeeded,
+              continuationKind: inner.continuationKind,
               chatContextKey,
               sessionKey: emilySessionKey,
               traceId: p.traceId,

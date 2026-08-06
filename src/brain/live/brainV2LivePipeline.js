@@ -97,10 +97,12 @@ export async function runBrainV2LivePipeline(params) {
   }
 
   try {
+    assertBrainV2ExecutionActive(params);
     let catalogItems = Array.isArray(params.catalogItems) ? params.catalogItems : [];
     if (catalogItems.length === 0) {
       const catalogMod = await import("../../services/inventoryService.js");
       catalogItems = await catalogMod.getCachedItemsForUser(businessId);
+      assertBrainV2ExecutionActive(params);
     }
 
     const turnContextInput = buildTurnContextInput({
@@ -253,6 +255,7 @@ export async function runBrainV2LivePipeline(params) {
       getBookingsForItemFn: params.getBookingsForItemFn,
       getBusinessProfileFn: params.getBusinessProfileFn,
     });
+    assertBrainV2ExecutionActive(params);
 
     const orchestratorInput = {
       traceId: `${traceId}::v2_live`,
@@ -294,6 +297,7 @@ export async function runBrainV2LivePipeline(params) {
       );
       // Active availability-assist context: never map empty plan → onboarding clarify.
       if (freshAssist) {
+        assertBrainV2ExecutionActive(params);
         const emilySessionKey = String(
           turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
         ).trim();
@@ -325,6 +329,7 @@ export async function runBrainV2LivePipeline(params) {
 
     // Explicit assist no-reply (NO_OP) — handled silence, never outbound / clarify.
     if (isAvailabilityAssistContextNoReplyPlan(result.actionPlan)) {
+      assertBrainV2ExecutionActive(params);
       const emilySessionKey = String(
         turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
       ).trim();
@@ -393,7 +398,10 @@ export async function runBrainV2LivePipeline(params) {
         sourcePlaywrightChatKey: params.playwrightChatKey ?? params.chatId ?? null,
         source: params.playwrightWebInbound === true ? "playwright" : channel,
         isGroupInbound: params.isGroupInbound,
+        abortSignal: params.abortSignal,
+        executionGuard: params.executionGuard,
       });
+    assertBrainV2ExecutionActive(params);
 
     // ── Post-execute Brain reply (PR1B) ────────────────────────────────────
     // When actionRouter signals awaitsPostExecuteBrainReply, call the existing
@@ -440,6 +448,7 @@ export async function runBrainV2LivePipeline(params) {
         __chatCompletionsCreateForTests:
           params.executionContext?.__groupPostExecuteChatCreate ?? null,
       });
+      assertBrainV2ExecutionActive(params);
 
       postExecuteBrainDecision = brainResult;
 
@@ -477,6 +486,7 @@ export async function runBrainV2LivePipeline(params) {
     // ── End post-execute Brain reply ────────────────────────────────────────
 
     if (customerReplySuppressed === true) {
+      assertBrainV2ExecutionActive(params);
       const emilySessionKeySilent = String(
         turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
       ).trim();
@@ -497,6 +507,7 @@ export async function runBrainV2LivePipeline(params) {
       });
     }
 
+    assertBrainV2ExecutionActive(params);
     const emilySessionKey = String(turnContextInput._emilySessionKey ?? params.sessionKey ?? "").trim();
     applyInfoLiveSessionMemoryPatch({
       sessionKey: emilySessionKey,
@@ -532,6 +543,9 @@ export async function runBrainV2LivePipeline(params) {
       decisionTrace: result.trace,
     });
   } catch (err) {
+    if (params.abortSignal?.aborted) {
+      throw params.abortSignal.reason ?? err;
+    }
     console.warn("[brain_v2_live_error]", {
       traceId,
       businessId,
@@ -572,6 +586,7 @@ export async function runBrainV2LivePipeline(params) {
  * @param {Record<string, unknown>} p
  */
 function finalizeLivePipelineResult(p) {
+  assertBrainV2ExecutionActive(p.params);
   const reply = String(p.reply ?? "").trim();
   const routingCtx = {
     isGroupInbound: Boolean(p.params.isGroupInbound),
@@ -585,6 +600,8 @@ function finalizeLivePipelineResult(p) {
     whatsappRecipientType: p.params.whatsappRecipientType ?? null,
     flowId: p.params.traceId ?? null,
     emilySessionKey: p.turnContextInput?._emilySessionKey ?? p.params.sessionKey ?? null,
+    abortSignal: p.params.abortSignal,
+    executionGuard: p.params.executionGuard,
   };
 
   const messageMeta = buildLiveMessageMeta({
@@ -614,6 +631,14 @@ function finalizeLivePipelineResult(p) {
     reason: "V2_LIVE_OK",
     legacyBypassed: true,
   };
+}
+
+/** @param {Record<string, unknown>} params */
+function assertBrainV2ExecutionActive(params) {
+  if (params?.abortSignal?.aborted) {
+    throw params.abortSignal.reason ?? new Error("Brain V2 execution aborted");
+  }
+  params?.executionGuard?.assertActive?.();
 }
 
 /**

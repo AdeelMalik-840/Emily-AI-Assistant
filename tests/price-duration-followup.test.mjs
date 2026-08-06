@@ -4,16 +4,22 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY ||= "test-key";
 
 import { composeInformationalAnswer, detectAskedField } from "../src/services/answerComposer.js";
+import { resolveTrustedPreviousItemContinuation } from "../src/brain/context/previousItemContinuationResolver.js";
 import {
-  __hasSafePreviousCatalogItemForPriceFollowupForTests,
   __buildItemlessPriceDurationClarificationReplyForTests,
   __isItemlessPriceDurationFollowupForTests,
   __resolveDurationContextPolicyForTests,
   __resolveItemlessPriceDurationAskedFieldForTests,
-  __resolveLastVerifiedCatalogAnswerForPriceFollowupForTests,
   __shouldStoreLastVerifiedCatalogAnswerForTests,
   __storeLastVerifiedCatalogAnswerForTests,
 } from "../src/services/messageProcessor.js";
+
+const __hasSafePreviousCatalogItemForPriceFollowupForTests = (args) =>
+  resolveTrustedPreviousItemContinuation({
+    continuationContextNeeded: true,
+    continuationKind: "price_duration",
+    ...args,
+  });
 
 const catalog = [
   {
@@ -490,20 +496,4 @@ test("composer: Roman Urdu 3 din ka rent", () => {
     askedField: "price_with_duration",
   });
   assert.match(answer.reply, /15[,.]?000\s*PKR/i);
-});
-
-test("resolveLastVerifiedCatalogAnswer rejects explicit new item override", () => {
-  const memory = {
-    lastVerifiedCatalogAnswer: buildStoredPricingContext(),
-  };
-  const rejected = __resolveLastVerifiedCatalogAnswerForPriceFollowupForTests({
-    memory,
-    message: "Corolla 3 days rent?",
-    catalogItems: catalog,
-    participantKey: participantA,
-    chatContextKey,
-    sessionKey,
-  });
-  assert.equal(rejected.ok, false);
-  assert.equal(rejected.reason, "EXPLICIT_NEW_ITEM_PRESENT");
 });

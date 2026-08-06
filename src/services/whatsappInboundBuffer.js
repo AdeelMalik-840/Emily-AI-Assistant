@@ -1,10 +1,16 @@
 /**
  * Debounced merge of rapid consecutive WhatsApp text messages per customer thread,
- * then a single processMessage + outbound send (human-like handling of fragments).
+ * then a single Brain V2 turn + outbound send (human-like handling of fragments).
  */
 
 import { createHash } from "node:crypto";
-import { processMessage } from "./messageProcessor.js";
+import { resolveTrustedPreviousItemContinuation } from "../brain/context/previousItemContinuationResolver.js";
+import {
+  brainV2TimeoutMs,
+  runBrainV2WithinBoundary,
+} from "../brain/live/brainV2ExecutionBoundary.js";
+import { validateBrainV2PipelineResult } from "../brain/live/brainV2ResultContract.js";
+import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import {
   appendConversationMessage,
   getRecentConversationForPrompt,
@@ -221,21 +227,12 @@ export function isEmilyBrainV2LiveQuickGate(businessId) {
  *   isPlaywrightDmWithIdentity?: boolean,
  *   bookingHint?: unknown,
  * }} p
- * @returns {"v2_live" | "info_live" | "legacy"}
+ * @returns {"v2_live" | "blocked"}
  */
 export function evaluateInboundBrainRoute(p) {
   const gate = evaluateBrainRouteGate({ businessId: p.businessId });
   if (gate.selected === "v2_live") return "v2_live";
-  if (
-    gate.selected === "legacy" &&
-    !p.isPlaywrightDmWithIdentity &&
-    !p.bookingHint &&
-    isEmilyBrainV2InfoLiveQuickGate(p.businessId)
-  ) {
-    return "info_live";
-  }
-  if (gate.selected === "blocked") return "blocked";
-  return "legacy";
+  return "blocked";
 }
 
 function cleanBookingValue(value) {
@@ -363,7 +360,7 @@ function applyDmHandoffItemToMemorySnapshot({
 }
 
 /**
- * Attempt v2 full live routing — never falls back to legacy unless explicit rollback flag.
+ * Attempt the sole Brain V2 semantic route. Failures return the controlled V2 policy.
  * @param {Record<string, unknown>} params
  */
 export async function tryBrainV2LiveBeforeLegacy(params) {
@@ -372,12 +369,10 @@ export async function tryBrainV2LiveBeforeLegacy(params) {
     const runLive = /** @type {typeof import("../brain/live/brainV2LivePipeline.js").runBrainV2LivePipeline} */ (
       liveModule.runBrainV2LivePipeline
     );
-    let resolveTrustedSessionItem = params.resolveTrustedSessionItem;
-    if (typeof resolveTrustedSessionItem !== "function") {
-      const mp = await import("./messageProcessor.js");
-      resolveTrustedSessionItem =
-        mp.__hasSafePreviousCatalogItemForPriceFollowupForTests;
-    }
+    const resolveTrustedSessionItem =
+      typeof params.resolveTrustedSessionItem === "function"
+        ? params.resolveTrustedSessionItem
+        : resolveTrustedPreviousItemContinuation;
     return await runLive({
       ...params,
       resolveTrustedSessionItem:
@@ -391,9 +386,6 @@ export async function tryBrainV2LiveBeforeLegacy(params) {
       businessId: params?.businessId,
       error: String(err?.message ?? err ?? "").slice(0, 160),
     });
-    if (envTruthyFlag("EMILY_BRAIN_V2_LEGACY_FALLBACK")) {
-      return { handled: false, reason: "V2_LIVE_ERROR", legacyBypassed: false };
-    }
     return {
       handled: true,
       reply:
@@ -410,7 +402,7 @@ export async function tryBrainV2LiveBeforeLegacy(params) {
 }
 
 /**
- * Attempt v2 informational live routing before legacy processMessage.
+ * Compatibility adapter for the retired informational-only V2 route.
  * @param {Record<string, unknown>} params
  */
 export async function tryBrainV2InfoLiveBeforeLegacy(params) {
@@ -419,12 +411,10 @@ export async function tryBrainV2InfoLiveBeforeLegacy(params) {
     const tryLive = /** @type {typeof import("../brain/live/brainV2InfoLiveAdapter.js").tryBrainV2InfoLiveTurn} */ (
       liveModule.tryBrainV2InfoLiveTurn
     );
-    let resolveTrustedSessionItem = params.resolveTrustedSessionItem;
-    if (typeof resolveTrustedSessionItem !== "function") {
-      const mp = await import("./messageProcessor.js");
-      resolveTrustedSessionItem =
-        mp.__hasSafePreviousCatalogItemForPriceFollowupForTests;
-    }
+    const resolveTrustedSessionItem =
+      typeof params.resolveTrustedSessionItem === "function"
+        ? params.resolveTrustedSessionItem
+        : resolveTrustedPreviousItemContinuation;
     return await tryLive({
       ...params,
       resolveTrustedSessionItem:
@@ -517,38 +507,6 @@ export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
   return loadBrainV2SessionMemorySnapshot(p);
 }
 
-/**
- * Schedule shadow evaluation after legacy processing; failures never escape.
- *
- * @param {{
- *   shadowEligible: boolean,
- *   params: Record<string, unknown>,
- *   loadShadowModule?: () => Promise<Record<string, unknown>>,
- * }} p
- */
-export async function scheduleEmilyBrainV2ShadowAfterLegacy(p) {
-  if (!p.shadowEligible) return false;
-  try {
-    const shadowModule = await (p.loadShadowModule ?? (() =>
-      import("../brain/shadow/brainShadowHook.js")))();
-    const schedule = /** @type {(params: Record<string, unknown>) => unknown} */ (
-      shadowModule.scheduleEmilyBrainV2ShadowEvaluation
-    );
-    await schedule(p.params);
-    return true;
-  } catch (shadowScheduleErr) {
-    console.log("[emily_brain_shadow_schedule_failed]", {
-      traceId: p.params?.traceId,
-      businessId: p.params?.businessId,
-      error: String(shadowScheduleErr?.message ?? shadowScheduleErr ?? "").slice(
-        0,
-        160
-      ),
-    });
-    return false;
-  }
-}
-
 /** @type {Map<string, BufferEntry>} */
 const messageBuffer = new Map();
 
@@ -565,7 +523,7 @@ const recentInboundByOwnerAndText = new Map();
 
 /**
  * Playwright Web tab: a second flush can call `executeWhatsAppAiPipeline` while the first is still
- * in `processMessage` — the early active-job guard used to drop that work entirely (e.g. KIA Stonic
+ * in semantic processing — the early active-job guard used to drop that work entirely (e.g. KIA Stonic
  * batch lost while "Jee krwani hai" batch ran). Queue and run FIFO after each job completes.
  * @type {Map<string, object[]>}
  */
@@ -727,6 +685,7 @@ async function markBookingNotificationQueuedForBooking(db, userId, bookingId) {
  *   booking: Record<string, unknown>,
  *   customerPhone: string,
  *   sendCredentials: { accessToken?: string, phoneNumberId?: string } | null | undefined,
+ *   executionContext?: Record<string, unknown>,
  * }} p
  */
 async function triggerBusinessBookingNotification({
@@ -736,7 +695,9 @@ async function triggerBusinessBookingNotification({
   booking,
   customerPhone,
   sendCredentials,
+  executionContext = {},
 }) {
+  assertExecutionOwnership(executionContext);
   const tid = String(traceId ?? "").trim() || "unknown-trace";
   const bookingId =
     booking?.id != null && String(booking.id).trim() !== ""
@@ -758,6 +719,7 @@ async function triggerBusinessBookingNotification({
   let ownerPhone = "";
   try {
     const businessSnap = await db.collection("businesses").doc(String(userId ?? "").trim()).get();
+    assertExecutionOwnership(executionContext);
     const business = businessSnap.exists ? businessSnap.data() || {} : {};
     const businessProfile =
       business.businessProfile &&
@@ -790,6 +752,7 @@ async function triggerBusinessBookingNotification({
   }
 
   const alreadyNotified = await hasBookingNotificationBeenSent(db, userId, bookingId);
+  assertExecutionOwnership(executionContext);
   if (alreadyNotified) {
     console.log("⏭ Notification already sent for", bookingId);
     logBookingEvent({
@@ -800,7 +763,9 @@ async function triggerBusinessBookingNotification({
     });
     return;
   }
+  assertExecutionOwnership(executionContext);
   await markBookingNotificationSending(db, userId, bookingId);
+  assertExecutionOwnership(executionContext);
   logBookingEvent({
     traceId: tid,
     step: "notification_trigger",
@@ -846,8 +811,10 @@ REJECT ${bookingId}
         { id: `approve:${bookingId}`, title: "Approve" },
         { id: `reject:${bookingId}`, title: "Reject" },
       ],
-      sendCredentials ?? undefined
+      sendCredentials ?? undefined,
+      { signal: executionContext?.abortSignal }
     );
+    assertExecutionOwnership(executionContext);
     if (buttonResult?.ok === true) {
       sendSucceeded = true;
       providerMessageId = String(buttonResult?.providerMessageId ?? "").trim();
@@ -862,8 +829,9 @@ REJECT ${bookingId}
         ownerPhone,
         message,
         sendCredentials ?? undefined,
-        { recipientType: "individual" }
+        { recipientType: "individual", signal: executionContext?.abortSignal }
       );
+      assertExecutionOwnership(executionContext);
       if (result === true || result?.ok === true || result?.success === true) {
         sendSucceeded = true;
         providerMessageId = String(result?.providerMessageId ?? "").trim();
@@ -879,11 +847,13 @@ REJECT ${bookingId}
       }
     }
   } catch (err) {
+    if (executionContext?.abortSignal?.aborted) throw err;
     sendFailureDetail = String(err?.message ?? err ?? "unknown");
     console.warn("❌ WhatsApp send threw error:", sendFailureDetail);
   }
 
   if (!sendSucceeded) {
+    assertExecutionOwnership(executionContext);
     console.warn("❌ WhatsApp send failed — NOT marking notification as sent", {
       bookingId,
     });
@@ -909,6 +879,7 @@ REJECT ${bookingId}
     return;
   }
 
+  assertExecutionOwnership(executionContext);
   await markBookingNotificationSent(db, userId, bookingId);
   await markBookingNotificationProviderAccepted({
     db,
@@ -916,6 +887,7 @@ REJECT ${bookingId}
     bookingId,
     providerMessageId,
   });
+  assertExecutionOwnership(executionContext);
 
   console.log("📤 Booking notification sent:", {
     bookingId,
@@ -2180,7 +2152,7 @@ export async function executeWhatsAppAiPipeline(p) {
 
   console.log("[DEBUG] isGreetingFirst:", isGreetingFirst);
   console.log("[DEBUG] messageText (combined):", combinedMessage);
-  console.log("[DEBUG] processMessage userId (owner):", ownerUserId);
+  console.log("[DEBUG] Brain V2 business owner:", ownerUserId);
 
   const shadowEligible = isEmilyBrainV2ShadowQuickGate(ownerUserId);
   const v2LiveMemoryNeeded = isEmilyBrainV2LiveQuickGate(ownerUserId);
@@ -2684,32 +2656,11 @@ export async function executeWhatsAppAiPipeline(p) {
     },
   };
 
-  const v2LiveEligible = routeGate.selected === "v2_live";
-  const infoLiveEligible =
-    routeGate.selected === "legacy" &&
-    !isPlaywrightDmWithIdentity &&
-    !p?.bookingHint &&
-    isEmilyBrainV2InfoLiveQuickGate(ownerUserId);
+  // Single semantic authority: every unowned customer turn runs full Brain V2.
+  const v2LiveEligible = true;
+  const infoLiveEligible = false;
 
-  if (routeGate.selected === "blocked") {
-    handledByBrainV2HardBlock = true;
-    const blocked = buildHardBlockedPipelineResult(true);
-    reply = blocked.reply;
-    messageMeta = blocked.messageMeta;
-    sendVia = isGroupInbound ? "GROUP" : "CLOUD_API";
-    dmRecipientPhone = null;
-    if (shouldLogBrainV2ExpectedButNotSelected({ routeGate, handledByBrainV2Live: false })) {
-      console.warn("[brain_v2_expected_but_not_selected]", {
-        traceId,
-        businessId: ownerUserId,
-        rejectReason: routeGate.rejectReason,
-        route: routeGate.route,
-        selected: routeGate.selected,
-        businessAllowlisted: routeGate.businessAllowlisted,
-        hasV2LivePipeline: routeGate.hasV2LivePipeline,
-      });
-    }
-  } else if (v2LiveEligible) {
+  if (v2LiveEligible) {
     console.log("[brain_v2_live_selected]", {
       traceId,
       businessId: ownerUserId,
@@ -2720,14 +2671,28 @@ export async function executeWhatsAppAiPipeline(p) {
       typeof p.__tryBrainV2LiveBeforeLegacyFn === "function"
         ? p.__tryBrainV2LiveBeforeLegacyFn
         : tryBrainV2LiveBeforeLegacy;
-    const v2LiveResult = await tryBrainV2LiveFn(sharedBrainParams);
+    const v2LiveResult = await runBrainV2WithinBoundary({
+      timeoutMs:
+        Number.isFinite(Number(p.__brainV2TimeoutMsForTests))
+          ? Number(p.__brainV2TimeoutMsForTests)
+          : brainV2TimeoutMs(),
+      setTimer: p.__brainV2SetTimerForTests ?? setTimeout,
+      clearTimer: p.__brainV2ClearTimerForTests ?? clearTimeout,
+      runner: ({ signal, executionGuard }) =>
+        tryBrainV2LiveFn({
+          ...sharedBrainParams,
+          abortSignal: signal,
+          executionGuard,
+        }),
+    });
     logLatency("brainV2Live", v2LiveStartedAt, {
       handled: v2LiveResult?.handled === true,
       reason: v2LiveResult?.reason ?? null,
       workflowType: v2LiveResult?.workflowType ?? null,
       legacyBypassed: v2LiveResult?.legacyBypassed === true,
     });
-    if (v2LiveResult?.legacyBypassed === true || v2LiveResult?.handled === true) {
+    const validatedV2Result = validateBrainV2PipelineResult(v2LiveResult);
+    if (validatedV2Result.ok) {
       handledByBrainV2Live = true;
       console.log("[legacy_brain_bypassed]", {
         traceId,
@@ -2735,26 +2700,19 @@ export async function executeWhatsAppAiPipeline(p) {
         workflowType: v2LiveResult?.workflowType ?? null,
         reason: v2LiveResult?.reason ?? null,
       });
-      reply = String(v2LiveResult.reply ?? "").trim();
+      reply = String(validatedV2Result.result.reply).trim();
       messageMeta =
-        v2LiveResult.messageMeta && typeof v2LiveResult.messageMeta === "object"
-          ? v2LiveResult.messageMeta
-          : {};
-      sendVia = v2LiveResult.sendVia ?? (isGroupInbound ? "GROUP" : "WHATSAPP");
-      dmRecipientPhone = v2LiveResult.dmRecipientPhone ?? undefined;
-    } else if (
-      shouldLogBrainV2ExpectedButNotSelected({
-        routeGate,
-        handledByBrainV2Live: false,
-      })
-    ) {
+        validatedV2Result.result.messageMeta;
+      sendVia = validatedV2Result.result.sendVia;
+      dmRecipientPhone = validatedV2Result.result.dmRecipientPhone ?? undefined;
+    } else {
       handledByBrainV2HardBlock = true;
       const blocked = buildHardBlockedPipelineResult(true);
       console.warn("[brain_v2_expected_but_not_selected]", {
         traceId,
         businessId: ownerUserId,
-        rejectReason: "V2_PIPELINE_DID_NOT_HANDLE",
-        v2ResultReason: v2LiveResult?.reason ?? null,
+        rejectReason: "V2_SINGLE_SOURCE_DID_NOT_HANDLE",
+        v2ResultReason: validatedV2Result.reason ?? v2LiveResult?.reason ?? null,
         legacyBypassed: v2LiveResult?.legacyBypassed ?? null,
         route: routeGate.route,
       });
@@ -2793,94 +2751,6 @@ export async function executeWhatsAppAiPipeline(p) {
     }
   }
 
-  const processMessageFn =
-    typeof p.__processMessageFn === "function" ? p.__processMessageFn : processMessage;
-
-  const legacyAllowed = isLegacyProcessMessageAllowed({
-    routeGate,
-    handledByBrainV2Live,
-    handledByBrainV2InfoLive,
-  });
-
-  if (!legacyAllowed && !handledByBrainV2Live && !handledByBrainV2InfoLive && !handledByBrainV2HardBlock) {
-    handledByBrainV2HardBlock = true;
-    const blocked = buildHardBlockedPipelineResult(true);
-    console.warn("[brain_v2_expected_but_not_selected]", {
-      traceId,
-      businessId: ownerUserId,
-      rejectReason: "LEGACY_BLOCKED_BY_HARD_V2_MODE",
-      route: routeGate.route,
-      selected: routeGate.selected,
-    });
-    reply = blocked.reply;
-    messageMeta = blocked.messageMeta;
-    sendVia = isGroupInbound ? "GROUP" : "CLOUD_API";
-    dmRecipientPhone = null;
-  }
-
-  if (legacyAllowed && !handledByBrainV2Live && !handledByBrainV2InfoLive && !handledByBrainV2HardBlock) {
-  ({
-    reply,
-    messageMeta,
-    sendVia,
-    dmRecipientPhone,
-  } = await processMessageFn({
-    traceId,
-    userId: normalizedInbound.userId,
-    message: normalizedInbound.message,
-    messageId: normalizedInbound.messageId,
-    source: normalizedInbound.source,
-    timestamp: normalizedInbound.timestamp,
-    contextMessages,
-    sessionKey: normalizedInbound.sessionKey,
-    conversationHistory,
-    fragmentCount,
-    hasMultipleFragments,
-    isGreetingFirst,
-    isGroupInbound,
-    isGroupMessage,
-    whatsappRecipientType,
-    playwrightWebInbound,
-    bookingHint: p?.bookingHint ?? null,
-    participantPhoneForDm:
-      String(participantPhoneForDmRaw ?? "").trim() || undefined,
-    participantKey:
-      participantKeyRaw != null && String(participantKeyRaw).trim() !== ""
-        ? String(participantKeyRaw).trim()
-        : undefined,
-    inboundIntent:
-      inboundIntentRaw != null && String(inboundIntentRaw).trim() !== ""
-        ? String(inboundIntentRaw).trim().toLowerCase()
-        : null,
-    inboundEntity:
-      inboundEntityRaw != null && String(inboundEntityRaw).trim() !== ""
-        ? String(inboundEntityRaw).trim()
-        : null,
-    resetTopicContext: Boolean(resetTopicContextRaw),
-    playwrightChatKey:
-      playwrightChatKeyRaw != null && String(playwrightChatKeyRaw).trim() !== ""
-        ? String(playwrightChatKeyRaw).trim()
-        : null,
-    groupName: groupNameResolved || null,
-    participantName:
-      participantNameRaw != null && String(participantNameRaw).trim() !== ""
-        ? String(participantNameRaw).trim()
-        : null,
-    senderScope:
-      senderScopeRaw != null && String(senderScopeRaw).trim() !== ""
-        ? String(senderScopeRaw).trim()
-        : null,
-    sourceRowKey:
-      sourceRowKeyRaw != null && String(sourceRowKeyRaw).trim() !== ""
-        ? String(sourceRowKeyRaw).trim()
-        : null,
-    sourceMessageIndex:
-      sourceMessageIndexRaw != null && Number.isFinite(Number(sourceMessageIndexRaw))
-        ? Number(sourceMessageIndexRaw)
-        : null,
-    inboundSourceOrigin: effectiveInboundSourceOrigin,
-  }));
-  }
   }
   const finalReplySourceFromMeta = String(
     messageMeta?.outboundTrace?.finalReplySource ?? ""
@@ -2917,7 +2787,7 @@ export async function executeWhatsAppAiPipeline(p) {
       intentionalSilent,
     });
   }
-  logLatency("processMessage", processStartedAt, {
+  logLatency("brainV2SemanticPipeline", processStartedAt, {
     sendVia,
     hasReply: String(reply ?? "").trim() !== "",
     intentionalSilent,
@@ -2926,32 +2796,6 @@ export async function executeWhatsAppAiPipeline(p) {
     skippedForBrainV2HardBlock: handledByBrainV2HardBlock,
     brainRouteSelected: routeGate.selected,
     brainRouteRejectReason: routeGate.rejectReason,
-  });
-
-  await scheduleEmilyBrainV2ShadowAfterLegacy({
-    shadowEligible,
-    params: {
-      traceId,
-      businessId: ownerUserId,
-      message: normalizedInbound.message,
-      messageId: normalizedInbound.messageId,
-      channelId: playwrightWebInbound ? "whatsapp_web" : "whatsapp_cloud",
-      chatKey:
-        String(playwrightChatKeyRaw ?? "").trim() || groupNameResolved || sessionKey,
-      participantKey: participantKeyRaw,
-      sessionKey,
-      playwrightChatKey: playwrightChatKeyRaw,
-      isGroupInbound,
-      playwrightWebInbound,
-      memorySnapshot: shadowPreTurnMemorySnapshot,
-      conversationHistory,
-      inboundSourceOrigin: effectiveInboundSourceOrigin,
-      legacyOutcome: {
-        reply,
-        messageMeta:
-          messageMeta && typeof messageMeta === "object" ? messageMeta : null,
-      },
-    },
   });
 
   const bookingIdMeta =

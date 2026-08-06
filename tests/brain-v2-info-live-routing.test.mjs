@@ -24,7 +24,7 @@ import {
   resolveCatalogItemFromMessage,
 } from "../src/brain/golden/goldenHarness.js";
 import { patchEmilySessionState, getEmilySessionState } from "../src/services/conversationIntelligence.js";
-import { __hasSafePreviousCatalogItemForPriceFollowupForTests } from "../src/services/messageProcessor.js";
+import { resolveTrustedPreviousItemContinuation as __hasSafePreviousCatalogItemForPriceFollowupForTests } from "../src/brain/context/previousItemContinuationResolver.js";
 
 const BUSINESS_ID = "synthetic-car-rental-business-001";
 const OTHER_BUSINESS = "other-business-not-allowlisted";
@@ -193,6 +193,8 @@ test("C4: same stable participant Civic follow-up returns Civic price", async ()
         sessionKey: p.sessionKey,
         traceId: p.traceId,
         isGroupInbound: p.isGroupInbound,
+        continuationContextNeeded: p.continuationContextNeeded,
+        continuationKind: p.continuationKind,
       }),
   });
   assert.equal(result.handled, true);

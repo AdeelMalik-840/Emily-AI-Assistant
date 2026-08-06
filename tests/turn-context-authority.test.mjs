@@ -52,6 +52,41 @@ test("A: explicit Civic availability without participant identity must not clari
   assert.equal(ctx.memoryAllowed, false);
 });
 
+test("explicit current item bypasses previous-item continuation resolver", () => {
+  let resolverCalls = 0;
+  const ctx = resolveTurnContext({
+    message: "Stonic 10 din ka rent kitna hai?",
+    catalogItems: catalog,
+    participantKey: participantA,
+    isGroupInbound: true,
+    memory: { lastItem: catalog[0] },
+    resolveTrustedSessionItem: () => {
+      resolverCalls += 1;
+      return { ok: true, item: catalog[0] };
+    },
+  });
+  assert.equal(resolverCalls, 0);
+  assert.equal(ctx.authoritativeItem?.id, "stonic-1");
+});
+
+test("itemless continuation passes a structured need, not current message semantics", () => {
+  let received;
+  resolveTurnContext({
+    message: "10 din k lye rent kitna hai?",
+    catalogItems: catalog,
+    participantKey: participantA,
+    isGroupInbound: true,
+    memory: { lastItem: catalog[0] },
+    resolveTrustedSessionItem: (args) => {
+      received = args;
+      return { ok: true, item: catalog[0] };
+    },
+  });
+  assert.equal(received.continuationContextNeeded, true);
+  assert.equal(received.continuationKind, "price_duration");
+  assert.equal(Object.hasOwn(received, "message"), false);
+});
+
 test("B: itemless price without trusted memory must clarify", () => {
   const ctx = resolveTurnContext({
     message: "10 din k lye rent kitna hai?",

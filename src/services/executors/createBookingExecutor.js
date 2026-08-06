@@ -4,6 +4,7 @@
  */
 import { getAvailabilityRequest } from "../availabilityRequestService.js";
 import { createBooking } from "../inventoryService.js";
+import { assertExecutionOwnership } from "./executionOwnershipGuard.js";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -69,6 +70,7 @@ async function validateAvailabilityConfirmGate({
  * @returns {Promise<{ ok: boolean, blocked?: boolean, reason?: string, error?: string, code?: string, booking?: Record<string, unknown> | null, itemName?: string }>}
  */
 export async function executeCreateBooking({ payload, executionContext = {} }) {
+  assertExecutionOwnership(executionContext);
   const itemId = String(payload?.itemId ?? "").trim();
   if (!itemId) {
     return { ok: false, blocked: true, reason: "MISSING_ITEM_ID", booking: null };
@@ -98,6 +100,7 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
       payload?.sourceParticipantPhone,
     db: executionContext?.dbOverride ?? executionContext?.db,
   });
+  assertExecutionOwnership(executionContext);
   if (!gate.ok) {
     return { ok: false, blocked: true, reason: gate.reason || "AVAILABILITY_CONFIRM_GATE_FAILED", booking: null };
   }
@@ -106,7 +109,9 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
     const requestedItemName =
       String(payload?.itemName ?? payload?.itemLabel ?? executionContext?.itemName ?? "").trim() ||
       undefined;
-    const booking = await createBooking(traceId, userId, {
+    const createBookingFn = executionContext?.__createBookingForTests ?? createBooking;
+    assertExecutionOwnership(executionContext);
+    const booking = await createBookingFn(traceId, userId, {
       itemId,
       itemName: requestedItemName,
       durationDays: Math.max(1, Math.floor(Number(durationDays))),
@@ -215,7 +220,10 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
         String(payload?.dmTargetSource ?? executionContext?.dmTargetSource ?? "").trim() ||
         undefined,
       dbOverride: executionContext?.dbOverride ?? executionContext?.db,
+      abortSignal: executionContext?.abortSignal,
+      executionGuard: executionContext?.executionGuard,
     });
+    assertExecutionOwnership(executionContext);
     if (booking && typeof booking === "object" && booking.ok === false) {
       const code =
         String(booking.code ?? booking.error ?? "BOOKING_CREATE_FAILED").trim() ||

@@ -4,9 +4,9 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY ||= "test-key";
 
 import {
-  __applyHybridOutboundResultForTests,
   __buildIntentionalSilentNoopMessageMetaForTests,
 } from "../src/services/messageProcessor.js";
+import { routeHybridOutbound as __applyHybridOutboundResultForTests } from "../src/services/outbound/hybridOutboundRouter.js";
 import {
   __isIntentionalSilentInboundResultForTests,
   __playwrightInboundTurnCompleteForTests,

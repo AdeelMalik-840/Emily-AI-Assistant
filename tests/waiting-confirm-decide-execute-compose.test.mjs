@@ -41,6 +41,12 @@ const BUSINESS_ID = "owner-wc-dec-1";
 const REQUEST_ID = "avr_wc_dec_001";
 const CUSTOMER_PHONE = "+923009991122";
 const ITEM_ID = "civic-wc-dec";
+const CATALOG_ROW = {
+  id: ITEM_ID,
+  name: "Honda Civic",
+  displayLabel: "Honda Civic",
+  dailyRate: 8000,
+};
 
 function createFakeDb() {
   const store = { businesses: {} };
@@ -260,6 +266,7 @@ test("shared path: success confirm composes after execute (no extension language
       return { ok: true };
     },
     availabilityConfirmExecute: true,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: async () => {
       decideCalls += 1;
       return confirmDecision();
@@ -296,6 +303,7 @@ test("shared path: execute disabled → compose failure wording, no booking", as
       return { ok: true };
     },
     availabilityConfirmExecute: false,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: async () => confirmDecision(),
     __composeWaitingConfirmExecutionReplyForTests:
       composeWaitingConfirmExecutionReplyForTests,
@@ -327,6 +335,7 @@ test("shared path: duplicate inbound — no second decide/compose/outbound", asy
       return { ok: true };
     },
     availabilityConfirmExecute: true,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: decide,
     __composeWaitingConfirmExecutionReplyForTests:
       composeWaitingConfirmExecutionReplyForTests,
@@ -347,6 +356,7 @@ test("shared path: duplicate inbound — no second decide/compose/outbound", asy
       return { ok: true };
     },
     availabilityConfirmExecute: true,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: decide,
     __composeWaitingConfirmExecutionReplyForTests:
       composeWaitingConfirmExecutionReplyForTests,
@@ -398,6 +408,7 @@ test("Playwright confirm: compose after execute (disabled = failure wording)", a
       return true;
     },
     availabilityConfirmExecute: false,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: async () => confirmDecision(),
     __composeWaitingConfirmExecutionReplyForTests:
       composeWaitingConfirmExecutionReplyForTests,
@@ -423,6 +434,7 @@ test("decline: execute then compose; no booking", async () => {
       return { ok: true };
     },
     availabilityConfirmExecute: true,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: async () => ({
       ok: true,
       decision: {
@@ -470,6 +482,7 @@ test("factual Q: reply path, no execute, no composeAfterExecution", async () => 
       return { ok: true };
     },
     availabilityConfirmExecute: true,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: async () => ({
       ok: true,
       decision: {
@@ -559,6 +572,7 @@ test("compose injector missing → technical fallback still after execute attemp
       return { ok: true };
     },
     availabilityConfirmExecute: false,
+    __catalogRowForTests: CATALOG_ROW,
     __decideCustomerTurnForTests: async () => confirmDecision(),
     __composeWaitingConfirmExecutionReplyForTests: async () => ({
       ok: false,

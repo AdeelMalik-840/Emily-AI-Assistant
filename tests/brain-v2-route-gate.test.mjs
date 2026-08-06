@@ -52,48 +52,48 @@ test("allowlisted business in hard v2 mode selects v2_live", () => {
   assert.equal(gate.businessAllowlisted, true);
 });
 
-test("non-allowlisted business in hard v2 mode falls back to legacy", () => {
+test("non-allowlisted business with resolved businessId still selects v2_live", () => {
   const gate = evaluateBrainRouteGate({
     businessId: OTHER,
     chatId: "group-chat-1",
     env: hardV2Env(),
     hasV2LivePipeline: true,
   });
-  assert.equal(gate.selected, "legacy");
-  assert.equal(gate.rejectReason, "BUSINESS_NOT_ALLOWLISTED");
+  assert.equal(gate.selected, "v2_live");
+  assert.equal(gate.rejectReason, null);
   assert.equal(gate.businessAllowlisted, false);
-  assert.equal(gate.businessHardV2Eligible, false);
+  assert.equal(gate.businessHardV2Eligible, true);
   assert.equal(
     isLegacyProcessMessageAllowed({ routeGate: gate, handledByBrainV2Live: false }),
-    true
+    false
   );
   assert.equal(shouldLogBrainV2ExpectedButNotSelected({ routeGate: gate }), false);
 });
 
-test("missing businessId in hard v2 mode falls back to legacy", () => {
+test("missing businessId in hard v2 mode is blocked", () => {
   const gate = evaluateBrainRouteGate({
     businessId: "",
     chatId: "group-chat-1",
     env: hardV2Env(),
     hasV2LivePipeline: true,
   });
-  assert.equal(gate.selected, "legacy");
+  assert.equal(gate.selected, "blocked");
   assert.equal(gate.rejectReason, "MISSING_BUSINESS_ID");
-  assert.equal(isLegacyProcessMessageAllowed({ routeGate: gate }), true);
+  assert.equal(isLegacyProcessMessageAllowed({ routeGate: gate }), false);
 });
 
-test("empty allowlist in hard v2 mode does not hard-block businesses", () => {
+test("empty allowlist does not block v2 when businessId is present", () => {
   const gate = evaluateBrainRouteGate({
     businessId: OTHER,
     chatId: "group-chat-1",
     env: hardV2Env({ EMILY_BRAIN_V2_LIVE_BUSINESSES: "" }),
     hasV2LivePipeline: true,
   });
-  assert.equal(gate.selected, "legacy");
-  assert.equal(gate.rejectReason, "EMPTY_ALLOWLIST");
-  assert.equal(gate.allowlistConfigError, true);
-  assert.equal(gate.businessHardV2Eligible, false);
-  assert.equal(isLegacyProcessMessageAllowed({ routeGate: gate }), true);
+  assert.equal(gate.selected, "v2_live");
+  assert.equal(gate.rejectReason, null);
+  assert.equal(gate.allowlistConfigError, false);
+  assert.equal(gate.businessHardV2Eligible, true);
+  assert.equal(isLegacyProcessMessageAllowed({ routeGate: gate }), false);
 });
 
 test("pipeline unavailable → PIPELINE_UNAVAILABLE and blocked in hard v2 mode", () => {
@@ -128,16 +128,16 @@ test("allowlisted hard-v2 business cannot fall back to legacy when v2 selected",
   );
 });
 
-test("soft mode (legacy fallback true) allows legacy for non-allowlisted business", () => {
+test("soft mode (legacy fallback true) still selects v2_live and never allows legacy", () => {
   const gate = evaluateBrainRouteGate({
     businessId: OTHER,
     chatId: "group-chat-1",
     env: hardV2Env({ EMILY_BRAIN_V2_LEGACY_FALLBACK: "true" }),
     hasV2LivePipeline: true,
   });
-  assert.equal(gate.selected, "legacy");
+  assert.equal(gate.selected, "v2_live");
   assert.equal(gate.hardV2Mode, false);
-  assert.equal(isLegacyProcessMessageAllowed({ routeGate: gate }), true);
+  assert.equal(isLegacyProcessMessageAllowed({ routeGate: gate }), false);
 });
 
 test("hard blocked pipeline result uses customer-safe copy", () => {
@@ -152,12 +152,15 @@ test("detectHasV2LivePipeline is true in this repo", () => {
   assert.equal(detectHasV2LivePipeline(), true);
 });
 
-test("executeWhatsAppAiPipeline source includes route gate logging", async () => {
-  const { executeWhatsAppAiPipeline } = await import("../src/services/whatsappInboundBuffer.js");
-  const source = executeWhatsAppAiPipeline.toString();
+test("whatsappInboundBuffer source includes route gate logging", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(
+    new URL("../src/services/whatsappInboundBuffer.js", import.meta.url),
+    "utf8"
+  );
   assert.ok(source.includes("[brain_route_gate_evaluated]"));
   assert.ok(source.includes("[brain_v2_expected_but_not_selected]"));
-  assert.ok(source.includes("isLegacyProcessMessageAllowed"));
+  assert.doesNotMatch(source, /\bprocessMessageFn\b|\bprocessMessage\s*\(/);
 });
 
 test("buffer re-exports legacy guard compatible with hard v2 mode", () => {

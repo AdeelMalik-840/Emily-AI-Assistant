@@ -173,6 +173,11 @@ import {
   shouldBlockBookingForAssistantOrigin,
   INBOUND_SOURCE_REAL_CUSTOMER,
 } from "./inboundOriginGuard.js";
+import { resolveTrustedPreviousItemContinuation } from "../brain/context/previousItemContinuationResolver.js";
+import {
+  inspectGroupPrivacyReply,
+  routeHybridOutbound,
+} from "./outbound/hybridOutboundRouter.js";
 
 async function createBookingFromValidatedIntent({
   callerTag,
@@ -4384,16 +4389,6 @@ function isItemlessPriceDurationFollowup(message, catalogItems) {
 }
 
 /**
- * @param {Record<string, unknown> | null | undefined} memory
- */
-function memoryStageBlocksPriceDurationFollowup(memory) {
-  const stage = String(memory?.stage ?? "").trim().toLowerCase();
-  if (stage === "confirmed") return true;
-  if (/^(?:browsing|browse|options?|select_item|item_selection)$/i.test(stage)) return true;
-  return false;
-}
-
-/**
  * @param {string[]} recentAssistantReplies
  * @param {Record<string, unknown> | null | undefined} item
  */
@@ -4497,139 +4492,6 @@ function storeLastVerifiedCatalogAnswer(p) {
   return ctx;
 }
 
-/**
- * @param {{
- *   memory?: Record<string, unknown> | null,
- *   message: unknown,
- *   catalogItems: unknown[],
- *   participantKey?: string | null,
- *   chatContextKey?: string | null,
- *   sessionKey?: string | null,
- *   traceId?: string | null,
- *   nowMs?: number,
- * }} p
- */
-function resolveLastVerifiedCatalogAnswerForPriceFollowup(p) {
-  const memory = p.memory && typeof p.memory === "object" ? p.memory : null;
-  const ctx =
-    memory?.lastVerifiedCatalogAnswer &&
-    typeof memory.lastVerifiedCatalogAnswer === "object"
-      ? memory.lastVerifiedCatalogAnswer
-      : null;
-  const logReject = (reason, extra = {}) => {
-    console.log("[price_duration_followup_context_rejected]", {
-      traceId: String(p.traceId ?? "").trim() || null,
-      reason,
-      ...extra,
-    });
-    return { ok: false, reason, itemId: null, item: null };
-  };
-  if (!resolveItemlessPriceDurationAskedField(p.message)) {
-    return logReject("NOT_PRICE_DURATION_FOLLOWUP");
-  }
-  if (!ctx) {
-    return logReject("NO_LAST_VERIFIED_CATALOG_ANSWER");
-  }
-  const nowMs = Number.isFinite(p.nowMs) ? Number(p.nowMs) : Date.now();
-  const expiresMs = Date.parse(String(ctx.expiresAt ?? ""));
-  if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) {
-    return logReject("LAST_VERIFIED_CATALOG_ANSWER_EXPIRED", {
-      expiresAt: ctx.expiresAt ?? null,
-    });
-  }
-  const source = String(ctx.source ?? "").trim();
-  if (!TRUSTED_VERIFIED_CATALOG_ANSWER_SOURCES.has(source)) {
-    return logReject("UNTRUSTED_SOURCE", { source });
-  }
-  if (String(ctx.answerType ?? "").trim() !== VERIFIED_CATALOG_PRICING_ANSWER_TYPE) {
-    return logReject("AMBIGUOUS_CONTEXT", { answerType: ctx.answerType ?? null });
-  }
-  const storedField = String(ctx.requestedField ?? "").trim().toLowerCase();
-  if (!VERIFIED_CATALOG_PRICING_REQUESTED_FIELDS.has(storedField)) {
-    return logReject("AMBIGUOUS_CONTEXT", { requestedField: storedField || null });
-  }
-  const currentParticipantKey = String(p.participantKey ?? "").trim();
-  const storedParticipantKey = String(ctx.participantKey ?? "").trim();
-  if (p.isGroupInbound === true) {
-    if (!currentParticipantKey) {
-      return logReject("MISSING_STABLE_PARTICIPANT_SESSION");
-    }
-    if (!storedParticipantKey || storedParticipantKey !== currentParticipantKey) {
-      return logReject(
-        storedParticipantKey ? "PARTICIPANT_MISMATCH" : "UNTRUSTED_STORED_PARTICIPANT",
-        {
-          participantKey: currentParticipantKey,
-          storedParticipantKey: storedParticipantKey || null,
-        }
-      );
-    }
-  } else if (
-    storedParticipantKey &&
-    currentParticipantKey &&
-    storedParticipantKey !== currentParticipantKey
-  ) {
-    return logReject("PARTICIPANT_MISMATCH", {
-      participantKey: currentParticipantKey,
-      storedParticipantKey,
-    });
-  }
-  const currentSessionKey = String(p.sessionKey ?? "").trim();
-  const storedSessionKey = String(ctx.sessionKey ?? "").trim();
-  if (storedSessionKey && currentSessionKey && storedSessionKey !== currentSessionKey) {
-    return logReject("SESSION_MISMATCH", {
-      sessionKey: currentSessionKey,
-      storedSessionKey,
-    });
-  }
-  const currentChatContextKey = String(p.chatContextKey ?? "").trim();
-  const storedChatContextKey = String(ctx.chatContextKey ?? "").trim();
-  if (
-    storedChatContextKey &&
-    currentChatContextKey &&
-    storedChatContextKey !== currentChatContextKey
-  ) {
-    return logReject("SESSION_MISMATCH", {
-      chatContextKey: currentChatContextKey,
-      storedChatContextKey,
-    });
-  }
-  const itemId = normalizeId(ctx.itemId);
-  if (!itemId) {
-    return logReject("NO_LAST_VERIFIED_CATALOG_ANSWER");
-  }
-  const explicitNew = hasExplicitNewItemMention(p.message, p.catalogItems, itemId);
-  if (explicitNew.found) {
-    return logReject("EXPLICIT_NEW_ITEM_PRESENT", {
-      itemId: explicitNew.itemId,
-      itemLabel: explicitNew.itemLabel,
-    });
-  }
-  const catalogItems = Array.isArray(p.catalogItems) ? p.catalogItems : [];
-  const catalogRow = catalogItems.find(
-    (row) =>
-      row &&
-      typeof row === "object" &&
-      !Array.isArray(row) &&
-      normalizeId(/** @type {Record<string, unknown>} */ (row).id) === itemId
-  );
-  if (!catalogRow || typeof catalogRow !== "object" || Array.isArray(catalogRow)) {
-    return logReject("ITEM_NOT_IN_CATALOG", { itemId });
-  }
-  const row = /** @type {Record<string, unknown>} */ (catalogRow);
-  const item = {
-    ...row,
-    id: itemId,
-    itemId,
-    displayLabel:
-      String(ctx.itemDisplayLabel ?? "").trim() ||
-      buildDisplayLabel(row) ||
-      String(row.name ?? "").trim() ||
-      null,
-    name: String(row.name ?? ctx.itemDisplayLabel ?? "").trim() || null,
-  };
-  return { ok: true, reason: "LAST_VERIFIED_CATALOG_ANSWER", itemId, item, ctx };
-}
-
 function recentAssistantVerifiedPriceAnswerForItem(recentAssistantReplies, item) {
   const itemTokens = new Set();
   for (const part of [item?.displayLabel, item?.name]) {
@@ -4665,128 +4527,6 @@ function recentAssistantVerifiedPriceAnswerForItem(recentAssistantReplies, item)
  *   isGroupInbound?: boolean,
  * }} p
  */
-function hasSafePreviousCatalogItemForPriceFollowup(p) {
-  const memory = p.memory && typeof p.memory === "object" ? p.memory : null;
-  if (memoryStageBlocksPriceDurationFollowup(memory)) {
-    return {
-      ok: false,
-      reason: "STAGE_BLOCKED",
-      itemId: normalizeId(memory?.lastItem?.id) || null,
-      item: null,
-      proofSource: null,
-    };
-  }
-  if (memory?.pendingAction) {
-    // Availability-duration pending carries the trusted item (e.g. Civic ask-duration).
-    // Do not treat it as a generic blocker that forces "which car?" price clarification.
-    if (isAvailabilityDurationPendingAction(memory.pendingAction)) {
-      const pendingItemId =
-        normalizeId(memory.pendingAction?.itemId) ||
-        normalizeId(memory?.emilyPending?.itemId) ||
-        normalizeId(memory?.lastItem?.id) ||
-        normalizeId(memory?.lastResolvedItemId);
-      if (pendingItemId) {
-        const item =
-          memory?.lastItem &&
-          typeof memory.lastItem === "object" &&
-          normalizeId(memory.lastItem.id) === pendingItemId
-            ? memory.lastItem
-            : { id: pendingItemId };
-        return {
-          ok: true,
-          reason: "AVAILABILITY_DURATION_PENDING_ITEM",
-          itemId: pendingItemId,
-          item,
-          proofSource: "AVAILABILITY_DURATION_PENDING",
-        };
-      }
-    } else if (hasOpenAvailabilityDurationPendingMemory(memory)) {
-      const pendingItemId =
-        normalizeId(memory?.emilyPending?.itemId) ||
-        normalizeId(memory?.lastItem?.id) ||
-        normalizeId(memory?.lastResolvedItemId);
-      if (pendingItemId) {
-        return {
-          ok: true,
-          reason: "AVAILABILITY_DURATION_PENDING_ITEM",
-          itemId: pendingItemId,
-          item:
-            memory?.lastItem && typeof memory.lastItem === "object"
-              ? memory.lastItem
-              : { id: pendingItemId },
-          proofSource: "AVAILABILITY_DURATION_PENDING",
-        };
-      }
-    } else {
-      return {
-        ok: false,
-        reason: "PENDING_ACTION_ACTIVE",
-        itemId: normalizeId(memory?.lastItem?.id) || null,
-        item: null,
-        proofSource: null,
-      };
-    }
-  }
-  const structured = resolveLastVerifiedCatalogAnswerForPriceFollowup({
-    memory,
-    message: p.message,
-    catalogItems: p.catalogItems ?? [],
-    participantKey: p.participantKey,
-    chatContextKey: p.chatContextKey,
-    sessionKey: p.sessionKey,
-    traceId: p.traceId,
-    isGroupInbound: p.isGroupInbound === true,
-  });
-  if (structured.ok) {
-    return {
-      ok: true,
-      reason: "LAST_VERIFIED_CATALOG_ANSWER",
-      itemId: structured.itemId,
-      item: structured.item,
-      proofSource: "LAST_VERIFIED_CATALOG_ANSWER",
-    };
-  }
-  const structuredRejectReason = structured.reason;
-  if (
-    structuredRejectReason &&
-    structuredRejectReason !== "NO_LAST_VERIFIED_CATALOG_ANSWER"
-  ) {
-    return {
-      ok: false,
-      reason: structuredRejectReason,
-      itemId: null,
-      item: null,
-      proofSource: null,
-    };
-  }
-  const participantKey = String(p.participantKey ?? "").trim();
-  if (p.isGroupInbound === true && !participantKey) {
-    return {
-      ok: false,
-      reason: "MISSING_STABLE_PARTICIPANT_SESSION",
-      itemId: null,
-      item: null,
-      proofSource: null,
-    };
-  }
-  const itemId =
-    normalizeId(memory?.lastItem?.id) || normalizeId(memory?.lastResolvedItemId);
-  if (!itemId) {
-    return { ok: false, reason: "NO_ITEM_ID", itemId: null, item: null, proofSource: null };
-  }
-  const item =
-    memory?.lastItem && typeof memory.lastItem === "object"
-      ? memory.lastItem
-      : { id: itemId };
-  return {
-    ok: true,
-    reason: "SAME_PARTICIPANT_SESSION_MEMORY",
-    itemId,
-    item,
-    proofSource: "PARTICIPANT_SESSION_MEMORY",
-  };
-}
-
 /**
  * @param {{
  *   message: unknown,
@@ -4811,15 +4551,16 @@ function resolveDurationContextPolicy(p) {
     p.catalogItems
   );
   const safePrevious = itemlessPriceDurationFollowup
-    ? hasSafePreviousCatalogItemForPriceFollowup({
+      ? resolveTrustedPreviousItemContinuation({
         memory: p.memory,
-        message: p.message,
         catalogItems: p.catalogItems,
         participantKey: p.participantKey,
         chatContextKey: p.chatContextKey,
         sessionKey: p.sessionKey,
         traceId: p.traceId,
         isGroupInbound: p.isGroupInbound === true,
+        continuationContextNeeded: true,
+        continuationKind: "price_duration",
       })
     : { ok: false, reason: null, proofSource: null, item: null, itemId: null };
   const priceDurationFollowupWithSafeItem =
@@ -8909,11 +8650,12 @@ export async function processMessage({
       memory: getEmilySessionState(emilySessionKey),
       traceId,
       resolveTrustedSessionItem: (p) =>
-        hasSafePreviousCatalogItemForPriceFollowup({
+        resolveTrustedPreviousItemContinuation({
           memory: p.memory,
-          message: p.message,
           catalogItems: p.catalogItems,
           participantKey: p.participantKey,
+          continuationContextNeeded: p.continuationContextNeeded,
+          continuationKind: p.continuationKind,
           chatContextKey,
           sessionKey: emilySessionKey,
           traceId,
@@ -16146,20 +15888,12 @@ export function __groupSafeRequestReceivedReplyForTests(args = {}) {
 }
 
 export function __groupPrivatePromptGuardForTests(reply, meta = {}) {
-  const blocked = isPrivateDetailPromptText(reply);
-  return {
-    blocked,
-    ...groupPrivateDetailBlockDiagnostics(reply),
-    reply: blocked
-      ? groupSafeRequestReceivedReply({
-          itemAndDurationKnown: Boolean(meta.bookingCreated || meta.durationDays || meta.durationHours),
-        })
-      : String(reply ?? ""),
-  };
+  void meta;
+  return inspectGroupPrivacyReply(reply);
 }
 
 export function __applyHybridOutboundResultForTests(result = {}, routingCtx = {}, aiStructuredMode) {
-  return applyHybridOutboundResult(result, routingCtx, aiStructuredMode);
+  return routeHybridOutbound(result, routingCtx, aiStructuredMode);
 }
 
 export function __numericDailyRateFromItemForTests(item = {}) {
@@ -16398,7 +16132,7 @@ export function __buildItemlessPriceDurationClarificationReplyForTests() {
 }
 
 export function __hasSafePreviousCatalogItemForPriceFollowupForTests(args = {}) {
-  return hasSafePreviousCatalogItemForPriceFollowup(args);
+  return resolveTrustedPreviousItemContinuation(args);
 }
 
 export function __resolveDurationContextPolicyForTests(args = {}) {
@@ -16411,10 +16145,6 @@ export function __shouldStoreLastVerifiedCatalogAnswerForTests(args = {}) {
 
 export function __storeLastVerifiedCatalogAnswerForTests(args = {}) {
   return storeLastVerifiedCatalogAnswer(args);
-}
-
-export function __resolveLastVerifiedCatalogAnswerForPriceFollowupForTests(args = {}) {
-  return resolveLastVerifiedCatalogAnswerForPriceFollowup(args);
 }
 
 export function __assistantReplySignalsCatalogSelectionPromptForTests(text) {

@@ -296,9 +296,11 @@ export function resolveTurnContext(opts = {}) {
   ) {
     const trusted = opts.resolveTrustedSessionItem({
       memory: opts.memory && typeof opts.memory === "object" ? opts.memory : null,
-      message,
       catalogItems,
       participantKey,
+      continuationContextNeeded: true,
+      continuationKind:
+        itemlessPriceDurationFollowup ? "price_duration" : requestedField === "media" ? "media" : "availability",
     });
     if (trusted?.ok && trusted.item) {
       trustedSessionItem = normalizeAuthorityItem(trusted.item) || trusted.item;

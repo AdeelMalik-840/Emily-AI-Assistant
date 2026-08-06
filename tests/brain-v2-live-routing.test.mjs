@@ -30,7 +30,7 @@ import {
   resolveCatalogItemFromMessage,
 } from "../src/brain/golden/goldenHarness.js";
 import { patchEmilySessionState, getEmilySessionState } from "../src/services/conversationIntelligence.js";
-import { __hasSafePreviousCatalogItemForPriceFollowupForTests } from "../src/services/messageProcessor.js";
+import { resolveTrustedPreviousItemContinuation as __hasSafePreviousCatalogItemForPriceFollowupForTests } from "../src/brain/context/previousItemContinuationResolver.js";
 import { executeCreateBooking } from "../src/services/executors/createBookingExecutor.js";
 import { executeOwnerNotification } from "../src/services/executors/ownerNotificationExecutor.js";
 import { executeReplyPrivate } from "../src/services/executors/replyPrivateExecutor.js";
@@ -221,23 +221,22 @@ test.afterEach(() => {
   }
 });
 
-test("A: flags off → legacy route", () => {
+test("A: flags off still routes every supported business to Brain V2", () => {
   delete process.env.EMILY_BRAIN_V2_LIVE;
-  assert.equal(isEmilyBrainV2LiveQuickGate(BUSINESS_ID), false);
   assert.equal(
     evaluateInboundBrainRoute({ businessId: BUSINESS_ID }),
-    "legacy"
+    "v2_live"
   );
 });
 
-test("B: v2 live disabled → legacy route uses processMessage", () => {
+test("B: inbound production pipeline contains no legacy processMessage route", () => {
   delete process.env.EMILY_BRAIN_V2_LIVE;
   const source = executeWhatsAppAiPipeline.toString();
-  assert.ok(source.includes("await processMessageFn({"));
-  assert.equal(evaluateInboundBrainRoute({ businessId: BUSINESS_ID }), "legacy");
+  assert.doesNotMatch(source, /processMessageFn|processMessage\s*\(/);
+  assert.equal(evaluateInboundBrainRoute({ businessId: BUSINESS_ID }), "v2_live");
 });
 
-test("C: v2 live enabled + allowlisted → legacy guard blocks processMessage in hard mode", async () => {
+test("C: V2 route never authorizes legacy semantic fallback", async () => {
   enableV2LiveForSyntheticBusiness();
   process.env.EMILY_BRAIN_V2_PRODUCTION_ALLOW = "true";
   process.env.EMILY_BRAIN_V2_LEGACY_FALLBACK = "false";
@@ -256,7 +255,7 @@ test("C: v2 live enabled + allowlisted → legacy guard blocks processMessage in
 
   const source = executeWhatsAppAiPipeline.toString();
   assert.ok(source.includes("[brain_route_gate_evaluated]"));
-  assert.ok(source.includes("isLegacyProcessMessageAllowed"));
+  assert.doesNotMatch(source, /processMessageFn|processMessage\s*\(/);
 });
 
 test("D: Civic available? handled by v2 live", async () => {
@@ -267,6 +266,8 @@ test("D: Civic available? handled by v2 live", async () => {
     businessId: BUSINESS_ID,
     message: "Civic available?",
     catalogItems: fixture.items,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
     isGroupInbound: true,
     chatType: "group",
   });
@@ -284,6 +285,8 @@ test("E: Stonic 10-day price handled by v2 live", async () => {
     businessId: BUSINESS_ID,
     message: "Stonic 10 din ka rent kitna hai?",
     catalogItems: fixture.items,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
     isGroupInbound: true,
     chatType: "group",
   });
@@ -303,6 +306,8 @@ test("F: itemless price without trusted item asks clarification", async () => {
     isGroupInbound: true,
     chatType: "group",
     catalogItems: fixture.items,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
     memorySnapshot: {},
   });
   assert.equal(result.handled, true);
@@ -326,6 +331,8 @@ test("G: stable participant follow-up uses trusted v2 session item", async () =>
     isGroupInbound: true,
     chatType: "group",
     catalogItems: fixture.items,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
     memorySnapshot: getEmilySessionState(SESSION_A),
     sessionKey: SESSION_A,
     playwrightChatKey: "car-rental-queries",
@@ -339,6 +346,8 @@ test("G: stable participant follow-up uses trusted v2 session item", async () =>
         sessionKey: p.sessionKey,
         traceId: p.traceId,
         isGroupInbound: p.isGroupInbound,
+        continuationContextNeeded: p.continuationContextNeeded,
+        continuationKind: p.continuationKind,
       }),
   });
   assert.equal(result.workflowType, "pricing_with_duration");
@@ -388,6 +397,8 @@ test("J: booking request produces v2 action plan", async () => {
     businessId: BUSINESS_ID,
     message: "book kr do Civic 3 din",
     catalogItems: fixture.items,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
     isGroupInbound: true,
     chatType: "group",
   });
@@ -487,6 +498,8 @@ test("O/P: v2 live path does not invoke legacy fuzzy or memory resolver", async 
     participantKey: null,
     isGroupInbound: true,
     catalogItems: fixture.items,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
     memorySnapshot: { lastItem: { id: "stonic-1", name: "Kia Stonic" } },
   });
   assert.match(String(result.reply ?? ""), /Kis car ke liye price pooch rahe hain/i);
@@ -499,10 +512,10 @@ test("live workflow set includes booking and greeting", () => {
   assert.equal(isLiveWorkflowType("unknown_clarification"), true);
 });
 
-test("non-allowlisted business stays off v2 live", () => {
+test("non-allowlisted business still routes to sole Brain V2 authority", () => {
   enableV2LiveForSyntheticBusiness();
   process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES = OTHER_BUSINESS;
-  assert.equal(isEmilyBrainV2LiveEnabledForBusiness(BUSINESS_ID), false);
+  assert.equal(evaluateInboundBrainRoute({ businessId: BUSINESS_ID }), "v2_live");
 });
 
 test("buffer wrapper returns v2 live result when enabled", async () => {
@@ -512,6 +525,8 @@ test("buffer wrapper returns v2 live result when enabled", async () => {
     businessId: BUSINESS_ID,
     message: "Civic available?",
     catalogItems: loadSyntheticCarRentalCatalogFixture().items,
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => ({}),
     isGroupInbound: true,
     chatType: "group",
   });
@@ -671,10 +686,11 @@ test("owner executor blocked without booking context", async () => {
   assert.equal(out.reason, "MISSING_BOOKING_ID");
 });
 
-test("pipeline source guards processMessage when v2 live handled", () => {
+test("pipeline source routes all unowned turns through V2 without processMessage", () => {
   const source = executeWhatsAppAiPipeline.toString();
   assert.ok(source.includes("handledByBrainV2Live"));
   assert.ok(source.includes("v2LiveEligible"));
+  assert.doesNotMatch(source, /processMessageFn|processMessage\s*\(/);
   assert.ok(source.includes("participantName: normalizedParticipantName"));
   assert.ok(source.includes("sourceParticipantDisplayName: normalizedParticipantDisplayName"));
   assert.ok(source.includes("sourceParticipantKey: normalizedSourceParticipantKey"));
