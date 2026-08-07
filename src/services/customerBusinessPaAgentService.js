@@ -52,8 +52,11 @@ function cleanCustomerReply(value) {
  * availability request. Release before any PA resolver, executor, or composer
  * runs so the existing availability workflow can own the turn.
  *
- * After the semantic availability_request shape, fail closed on booking-tied
- * selection and on current-turn multi-item / booked+other catalog evidence.
+ * After the semantic availability_request shape, fail closed on current-turn
+ * multi-item / booked+other catalog evidence. Stale bookingSelectionMode /
+ * selectedBookingIndex may be ignored only when this turn names exactly one
+ * explicit catalog item different from the focused/booked item (restore PR #100
+ * fresh-release under leftover trusted focus).
  *
  * @param {Record<string, unknown> | null | undefined} decision
  * @param {{ messageText?: string | null, facts?: Record<string, unknown> | null }} [ctx]
@@ -71,8 +74,6 @@ export function shouldReleasePostConfirmForFreshAvailability(
   ) {
     return false;
   }
-  if (decision?.bookingSelectionMode !== "none") return false;
-  if (decision?.selectedBookingIndex != null) return false;
 
   const facts =
     ctx?.facts && typeof ctx.facts === "object" ? ctx.facts : null;
@@ -99,7 +100,17 @@ export function shouldReleasePostConfirmForFreshAvailability(
   // Multi-item current turn (incl. booked + other) cannot own a single AVR.
   if (currentTurnExplicitIds.length >= 2) return false;
 
-  return true;
+  const selectionClean =
+    decision?.bookingSelectionMode === "none" &&
+    decision?.selectedBookingIndex == null;
+  if (selectionClean) return true;
+
+  // Narrow stale-focus exception: one explicit other item proves independent
+  // fresh availability even if the model left trusted booking focus selected.
+  return (
+    currentTurnExplicitIds.length === 1 &&
+    currentTurnExplicitIds[0] !== bookedItemId
+  );
 }
 
 /** @type {Readonly<Record<string, unknown>>} */

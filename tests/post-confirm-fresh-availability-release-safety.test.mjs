@@ -130,23 +130,29 @@ test("6) catalog unavailable → release false", () => {
   );
 });
 
-test("7) bookingSelectionMode != none → release false", () => {
+test("7) stale focused + single other item (Stonic) → release true", () => {
   assert.equal(
     release(
-      pr100Shape({ bookingSelectionMode: "focused" }),
+      pr100Shape({
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+      }),
       "Stonic kal ke liye chahiye"
     ),
-    false
+    true
   );
 });
 
-test("8) selectedBookingIndex != null → release false", () => {
+test("8) stale focused + selectedBookingIndex + Civic → release true", () => {
   assert.equal(
     release(
-      pr100Shape({ selectedBookingIndex: 1 }),
-      "Stonic kal ke liye chahiye"
+      pr100Shape({
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+      }),
+      "Honda Civic 5 din k lye chyh"
     ),
-    false
+    true
   );
 });
 
@@ -163,6 +169,60 @@ test("9) pickup / genuine booking question shape → release false", () => {
         selectedBookingIndex: 1,
       },
       "Pickup kahan se hogi?"
+    ),
+    false
+  );
+});
+
+test("10) compare + stale focus still blocked by multi-item deny", () => {
+  assert.equal(
+    release(
+      pr100Shape({
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+      }),
+      "Corolla ki jagah Civic mil sakti hai?"
+    ),
+    false
+  );
+});
+
+test("11) change_item mutation → release false", () => {
+  assert.equal(
+    release(
+      {
+        factKind: "action",
+        capability: "mutation_requested",
+        action: "request_booking_mutation",
+        mutationIntent: "change_item",
+        pendingAvailabilitySelectionIndex: null,
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+      },
+      "Civic instead of my current one"
+    ),
+    false
+  );
+});
+
+test("12) pending AVR selection → release false", () => {
+  assert.equal(
+    release(
+      pr100Shape({ pendingAvailabilitySelectionIndex: 1 }),
+      "Stonic kal ke liye chahiye"
+    ),
+    false
+  );
+});
+
+test("13) same-item + stale focus → no stale-focus exception", () => {
+  assert.equal(
+    release(
+      pr100Shape({
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 1,
+      }),
+      "Corolla 5 din ke liye new request"
     ),
     false
   );
