@@ -49,6 +49,29 @@ function toFiniteNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * Defence-in-depth: trusted conflict / unavailable must never create a new AVR.
+ * @param {Record<string, unknown>} payload
+ * @param {Record<string, unknown>} normalized
+ * @returns {boolean}
+ */
+function isTrustedUnavailableAvailabilityPayload(payload, normalized) {
+  const status = clean(
+    normalized?.canonicalAvailabilityStatus ?? payload?.canonicalAvailabilityStatus,
+    80
+  ).toLowerCase();
+  if (status === "unavailable") return true;
+
+  const av =
+    asPlainObject(payload?.canonicalAvailability) ||
+    asPlainObject(normalized?.canonicalAvailability);
+  if (!av) return false;
+  const avStatus = clean(av.status, 80).toLowerCase();
+  if (avStatus === "unavailable") return true;
+  if (av.isAvailable === false) return true;
+  return false;
+}
+
 function normalizeRequestedDates(value) {
   if (Array.isArray(value)) {
     return value.map((entry) => clean(entry)).filter(Boolean);
@@ -552,6 +575,21 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
       reused: true,
       reuseReason: "EXACT_SOURCE_TURN",
       lifecycleKind: "exact_source_replay",
+    };
+  }
+
+  // Defence-in-depth: never create a *new* approvable AVR when trusted facts already
+  // say the item is unavailable for the requested window. Exact-source replay above
+  // still returns an already-persisted doc for idempotency.
+  if (isTrustedUnavailableAvailabilityPayload(payload, normalized)) {
+    return {
+      ok: false,
+      blocked: true,
+      reason: "CANONICAL_UNAVAILABLE_NO_OWNER_CHECK",
+      requestId: normalized.requestId,
+      status: null,
+      request: null,
+      created: false,
     };
   }
 

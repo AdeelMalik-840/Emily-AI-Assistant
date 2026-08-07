@@ -73,6 +73,39 @@ function collectWeakContextSignals(normalizedMessage) {
 }
 
 /**
+ * Align availability fact windows with AvailabilityInquiryWorkflow owner-check timing.
+ *
+ * Explicit / assist duration wins. Otherwise date_context or duration_context (the same
+ * weak signals that make owner-check "ready") map to durationDays=1.
+ *
+ * Contract (unchanged product semantics): durationDays=1 means a rolling
+ * now → now+1d window via resolveBookingDateWindowFromDuration — not calendar-day
+ * "tomorrow" boundaries in PK/business timezone.
+ *
+ * @param {{
+ *   explicitDurationDays?: number | null,
+ *   assistDurationDays?: number | null,
+ *   normalizedMessage?: string,
+ * }} p
+ * @returns {number | null}
+ */
+export function resolveOwnerCheckAlignedDurationDays(p = {}) {
+  const explicit = Number(p.explicitDurationDays);
+  if (Number.isFinite(explicit) && explicit >= 1) {
+    return Math.max(1, Math.floor(explicit));
+  }
+  const assist = Number(p.assistDurationDays);
+  if (Number.isFinite(assist) && assist >= 1) {
+    return Math.max(1, Math.floor(assist));
+  }
+  const weak = collectWeakContextSignals(String(p.normalizedMessage ?? ""));
+  if (weak.includes("date_context") || weak.includes("duration_context")) {
+    return 1;
+  }
+  return null;
+}
+
+/**
  * Bare chahiye/need/want with resolved item + duration/date is an owner availability check,
  * not a final booking command.
  *
@@ -430,11 +463,12 @@ export async function resolveBusinessTurnContext(params) {
     memorySnapshot.lastAvailabilityAssist
   );
 
-  const durationDaysResolved =
-    durationDaysForFacts ??
-    (lastAvailabilityAssist?.durationDays != null
-      ? Math.max(1, Math.floor(Number(lastAvailabilityAssist.durationDays)))
-      : null);
+  // Same timing the availability workflow will use for owner-check readiness / AVR window.
+  const durationDaysResolved = resolveOwnerCheckAlignedDurationDays({
+    explicitDurationDays: durationDaysForFacts,
+    assistDurationDays: lastAvailabilityAssist?.durationDays,
+    normalizedMessage,
+  });
 
   const availabilityFacts = await resolveAvailabilityFacts({
     businessId,
