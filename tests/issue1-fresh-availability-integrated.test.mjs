@@ -195,6 +195,7 @@ test("Issue 1 integrated: stale Corolla focus releases Civic unavailable flow an
           status: "approved",
         },
         pendingAvailabilityRequests: [],
+        replyGuardFacts: { catalogItems: CATALOG },
       },
     },
     __tryHandlePaMissingInfoCustomerClarificationFn: async () => null,
@@ -209,6 +210,8 @@ test("Issue 1 integrated: stale Corolla focus releases Civic unavailable flow an
           capability: "availability_request",
           action: "reply",
           mutationIntent: "none",
+          bookingSelectionMode: "none",
+          selectedBookingIndex: null,
           pendingAvailabilitySelectionIndex: null,
         },
       };

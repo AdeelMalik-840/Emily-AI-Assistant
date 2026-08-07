@@ -450,6 +450,20 @@ test("fresh availability decision releases post-confirm ownership before every P
         durationDays: 7,
       }),
       pendingAvailabilityRequests: [],
+      replyGuardFacts: {
+        catalogItems: [
+          {
+            id: "corolla-1",
+            name: "Toyota Corolla (Metallic Grey)",
+            displayLabel: "Toyota Corolla (Metallic Grey)",
+          },
+          {
+            id: "honda-civic",
+            name: "Honda Civic",
+            displayLabel: "Honda Civic",
+          },
+        ],
+      },
     },
   };
   let decisions = 0;
@@ -482,6 +496,8 @@ test("fresh availability decision releases post-confirm ownership before every P
           shouldReply: true,
           customerReply: "",
           mutationIntent: "none",
+          bookingSelectionMode: "none",
+          selectedBookingIndex: null,
           pendingAvailabilitySelectionIndex: null,
         },
       };

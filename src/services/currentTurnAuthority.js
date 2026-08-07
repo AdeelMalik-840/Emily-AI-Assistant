@@ -146,6 +146,31 @@ export function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
   return { found: false, itemId: null, itemLabel: null };
 }
 
+/**
+ * All catalog item IDs explicitly represented in THIS inbound message.
+ * Reuses the same explicit matcher as hasExplicitNewItemMention.
+ * Does not use session/memory, fuzzy matching, or intent detection.
+ *
+ * @param {unknown} message
+ * @param {unknown[]} [catalogItems]
+ * @returns {string[]}
+ */
+export function listExplicitCatalogItemIds(message, catalogItems = []) {
+  const items = Array.isArray(catalogItems) ? catalogItems : [];
+  if (!String(message ?? "").trim() || items.length === 0) return [];
+  const ids = [];
+  const seen = new Set();
+  for (const row of items) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const id = normalizeId(row.id);
+    if (!id || seen.has(id)) continue;
+    if (resolveLatestExplicitCatalogMentionPosition(message, row) < 0) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
 export function findConservativeFuzzyCatalogMention(message, catalogItems = []) {
   const items = Array.isArray(catalogItems) ? catalogItems : [];
   const msgTokens = normalizeCatalogMatchText(message)

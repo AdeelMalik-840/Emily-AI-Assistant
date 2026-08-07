@@ -152,7 +152,8 @@ for (const message of freshRequests) {
       message,
       availabilityDecision()
     );
-    assert.match(system, /named item\/service plus a requested date or duration/i);
+    assert.match(system, /INDEPENDENT fresh inventory availability/i);
+    assert.match(system, /BOOKING-RELATIVE comparison/i);
     assert.match(system, /prohibits booking selection/i);
     assert.equal(decision.factKind, "booking_fact");
     assert.equal(decision.capability, "availability_request");

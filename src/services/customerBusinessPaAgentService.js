@@ -26,6 +26,7 @@ import {
   executeAvailabilityCustomerDecline,
 } from "./availabilityCustomerConfirmService.js";
 import { executePostConfirmBookingMutation } from "./postConfirmBookingMutationExecutor.js";
+import { listExplicitCatalogItemIds } from "./currentTurnAuthority.js";
 import {
   composePostConfirmInformationalCustomerReply,
   composePostConfirmMutationCustomerReply,
@@ -50,15 +51,55 @@ function cleanCustomerReply(value) {
  * The shared post-confirm Brain uses this exact plan for a new inventory
  * availability request. Release before any PA resolver, executor, or composer
  * runs so the existing availability workflow can own the turn.
+ *
+ * After the semantic availability_request shape, fail closed on booking-tied
+ * selection and on current-turn multi-item / booked+other catalog evidence.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ * @param {{ messageText?: string | null, facts?: Record<string, unknown> | null }} [ctx]
  */
-export function shouldReleasePostConfirmForFreshAvailability(decision) {
-  return (
-    decision?.factKind === "booking_fact" &&
-    decision?.capability === "availability_request" &&
-    decision?.action === "reply" &&
-    decision?.mutationIntent === "none" &&
-    decision?.pendingAvailabilitySelectionIndex == null
+export function shouldReleasePostConfirmForFreshAvailability(
+  decision,
+  ctx = {}
+) {
+  if (
+    decision?.factKind !== "booking_fact" ||
+    decision?.capability !== "availability_request" ||
+    decision?.action !== "reply" ||
+    decision?.mutationIntent !== "none" ||
+    decision?.pendingAvailabilitySelectionIndex != null
+  ) {
+    return false;
+  }
+  if (decision?.bookingSelectionMode !== "none") return false;
+  if (decision?.selectedBookingIndex != null) return false;
+
+  const facts =
+    ctx?.facts && typeof ctx.facts === "object" ? ctx.facts : null;
+  const messageText = String(ctx?.messageText ?? "").trim();
+  if (!facts || !messageText) return false;
+
+  const catalogItems = Array.isArray(facts.replyGuardFacts?.catalogItems)
+    ? facts.replyGuardFacts.catalogItems
+    : Array.isArray(facts.catalogItems)
+      ? facts.catalogItems
+      : null;
+  if (!catalogItems || catalogItems.length === 0) return false;
+
+  const bookedItemId =
+    clean(facts.booking?.itemId, 160) ||
+    clean(facts.bookingFocus?.itemId, 160) ||
+    "";
+  if (!bookedItemId) return false;
+
+  const currentTurnExplicitIds = listExplicitCatalogItemIds(
+    messageText,
+    catalogItems
   );
+  // Multi-item current turn (incl. booked + other) cannot own a single AVR.
+  if (currentTurnExplicitIds.length >= 2) return false;
+
+  return true;
 }
 
 /** @type {Readonly<Record<string, unknown>>} */
@@ -704,7 +745,12 @@ export async function handleCustomerBusinessPaInbound({
   let laneFacts = facts;
   let mutationAlreadyComposed = false;
 
-  if (shouldReleasePostConfirmForFreshAvailability(decision)) {
+  if (
+    shouldReleasePostConfirmForFreshAvailability(decision, {
+      messageText: text,
+      facts,
+    })
+  ) {
     console.log("[customer_business_pa_ownership_released]", {
       businessId: uid,
       bookingId: clean(facts.booking?.id) || null,
