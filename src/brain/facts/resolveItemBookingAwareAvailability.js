@@ -8,6 +8,7 @@ import {
 } from "../../services/inventoryService.js";
 import { latestBlockingBookingEnd } from "./bookingDateUtils.js";
 import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
+import { resolveCalendarDateWindow } from "./resolveCalendarDateWindow.js";
 
 /**
  * @param {Record<string, unknown>} booking
@@ -67,6 +68,41 @@ export function isConfidentInventoryUnavailable(availability) {
 }
 
 /**
+ * Prefer calendar-relative window when provided; otherwise rolling duration.
+ * `durationDays` must not drive overlap when `calendarRelative` is set.
+ *
+ * @param {{
+ *   durationDays?: number | null,
+ *   calendarRelative?: "tomorrow" | null,
+ *   timeZone?: string | null,
+ *   nowMs?: number,
+ * }} p
+ * @returns {{
+ *   startAt: Date,
+ *   endAt: Date,
+ *   confidence: string,
+ * } | null}
+ */
+export function resolveAvailabilityOverlapWindow(p = {}) {
+  const relative = String(p.calendarRelative ?? "").trim().toLowerCase();
+  if (relative === "tomorrow") {
+    const calendar = resolveCalendarDateWindow({
+      relative: "tomorrow",
+      timeZone: p.timeZone,
+      nowMs: p.nowMs,
+    });
+    if (calendar) {
+      return {
+        startAt: calendar.startAt,
+        endAt: calendar.endAt,
+        confidence: calendar.confidence,
+      };
+    }
+  }
+  return resolveBookingDateWindowFromDuration(p.durationDays, p.nowMs);
+}
+
+/**
  * @param {{
  *   businessId: string,
  *   catalogRow?: Record<string, unknown> | null,
@@ -74,6 +110,8 @@ export function isConfidentInventoryUnavailable(availability) {
  *   itemName?: string | null,
  *   wantsAvailability?: boolean,
  *   durationDays?: number | null,
+ *   calendarRelative?: "tomorrow" | null,
+ *   timeZone?: string | null,
  *   nowMs?: number,
  *   getBookingsForItemFn?: typeof getBookingsForItem,
  * }} p
@@ -82,7 +120,12 @@ export async function resolveItemBookingAwareAvailability(p) {
   const itemId = String(p.itemId ?? p.catalogRow?.id ?? "").trim() || null;
   const itemName = String(p.itemName ?? p.catalogRow?.name ?? "").trim() || null;
   const wantsAvailability = Boolean(p.wantsAvailability);
-  const window = resolveBookingDateWindowFromDuration(p.durationDays, p.nowMs);
+  const window = resolveAvailabilityOverlapWindow({
+    durationDays: p.durationDays,
+    calendarRelative: p.calendarRelative,
+    timeZone: p.timeZone,
+    nowMs: p.nowMs,
+  });
 
   const catalogAvailabilityFalse =
     p.catalogRow != null &&

@@ -13,6 +13,8 @@ import { resolveItemBookingAwareAvailability } from "./resolveItemBookingAwareAv
  *   signals?: { availabilityAsk?: boolean },
  *   requestedField?: string | null,
  *   durationDays?: number | null,
+ *   calendarRelative?: "tomorrow" | null,
+ *   timeZone?: string | null,
  *   nowMs?: number,
  *   getBookingsForItemFn?: typeof getBookingsForItem,
  * }} p
@@ -58,6 +60,8 @@ export async function resolveAvailabilityFacts(p) {
     itemName: p.itemName,
     wantsAvailability,
     durationDays: p.durationDays,
+    calendarRelative: p.calendarRelative,
+    timeZone: p.timeZone,
     nowMs: p.nowMs,
     getBookingsForItemFn: p.getBookingsForItemFn,
   });

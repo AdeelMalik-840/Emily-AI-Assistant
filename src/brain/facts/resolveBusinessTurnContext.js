@@ -21,6 +21,9 @@ import { decideAvailabilityAssistFollowUp } from "../availability/decideAvailabi
 import { isConfidentInventoryUnavailable } from "./resolveItemBookingAwareAvailability.js";
 import { findVerifiedAvailabilityAlternatives } from "../../services/availabilityRejectionAlternatives.js";
 import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
+import {
+  FALLBACK_BUSINESS_TIMEZONE,
+} from "./resolveCalendarDateWindow.js";
 import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCompletionsCreate.js";
 import { isAvailabilityDurationPendingAction } from "../availability/availabilityPendingActions.js";
 import { decideEmilyPendingFollowUp } from "../availability/decideEmilyPendingFollowUp.js";
@@ -73,14 +76,14 @@ function collectWeakContextSignals(normalizedMessage) {
 }
 
 /**
- * Align availability fact windows with AvailabilityInquiryWorkflow owner-check timing.
+ * Owner-check readiness / turn metadata duration.
  *
  * Explicit / assist duration wins. Otherwise date_context or duration_context (the same
- * weak signals that make owner-check "ready") map to durationDays=1.
+ * weak signals that make owner-check "ready") map to durationDays=1 for readiness only.
  *
- * Contract (unchanged product semantics): durationDays=1 means a rolling
- * now → now+1d window via resolveBookingDateWindowFromDuration — not calendar-day
- * "tomorrow" boundaries in PK/business timezone.
+ * Window math for date_context ("kal"/tomorrow) is resolved separately via
+ * calendar-relative boundaries — do not treat this `1` as a rolling now→now+1d
+ * overlap window when calendarRelative is applied.
  *
  * @param {{
  *   explicitDurationDays?: number | null,
@@ -103,6 +106,42 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
     return 1;
   }
   return null;
+}
+
+/**
+ * Calendar relative for availability overlap only.
+ * Explicit numeric duration always wins; "kal"/tomorrow uses calendar window.
+ *
+ * @param {{
+ *   explicitDurationDays?: number | null,
+ *   normalizedMessage?: string,
+ * }} p
+ * @returns {"tomorrow" | null}
+ */
+export function resolveAvailabilityCalendarRelative(p = {}) {
+  const explicit = Number(p.explicitDurationDays);
+  if (Number.isFinite(explicit) && explicit >= 1) return null;
+  const weak = collectWeakContextSignals(String(p.normalizedMessage ?? ""));
+  if (weak.includes("date_context")) return "tomorrow";
+  return null;
+}
+
+/**
+ * Business IANA timezone for calendar windows.
+ * Prefers an explicit caller/profile value; falls back to CarUpNow temporary default.
+ *
+ * @param {{
+ *   businessTimeZone?: string | null,
+ *   timeZone?: string | null,
+ * }} [p]
+ * @returns {string}
+ */
+export function resolveBusinessTimeZoneForAvailability(p = {}) {
+  const fromCaller =
+    String(p.businessTimeZone ?? p.timeZone ?? "").trim() || null;
+  if (fromCaller) return fromCaller;
+  // Future: read structured business-profile timezone when available.
+  return FALLBACK_BUSINESS_TIMEZONE;
 }
 
 /**
@@ -463,12 +502,22 @@ export async function resolveBusinessTurnContext(params) {
     memorySnapshot.lastAvailabilityAssist
   );
 
-  // Same timing the availability workflow will use for owner-check readiness / AVR window.
+  // Readiness/metadata duration (may be 1 for date_context). Overlap window is separate.
   const durationDaysResolved = resolveOwnerCheckAlignedDurationDays({
     explicitDurationDays: durationDaysForFacts,
     assistDurationDays: lastAvailabilityAssist?.durationDays,
     normalizedMessage,
   });
+  const calendarRelative = resolveAvailabilityCalendarRelative({
+    explicitDurationDays: durationDaysForFacts,
+    normalizedMessage,
+  });
+  const availabilityTimeZone = resolveBusinessTimeZoneForAvailability({
+    businessTimeZone: params.businessTimeZone ?? params.timeZone ?? null,
+  });
+  const clockNowMs = Number.isFinite(Number(params.nowMs))
+    ? Number(params.nowMs)
+    : Date.now();
 
   const availabilityFacts = await resolveAvailabilityFacts({
     businessId,
@@ -477,18 +526,24 @@ export async function resolveBusinessTurnContext(params) {
     itemName: itemFacts.name,
     signals,
     requestedField: understanding?.askedField ?? turnContextInput?.requestedField ?? null,
-    durationDays: durationDaysResolved,
+    // Do not let readiness durationDays=1 drive rolling overlap for "kal".
+    durationDays: calendarRelative ? null : durationDaysResolved,
+    calendarRelative,
+    timeZone: availabilityTimeZone,
     getBookingsForItemFn: params.getBookingsForItemFn,
-    ...(function resolveAssistNowMs() {
+    ...(function resolveAvailabilityNowMs() {
+      if (calendarRelative) {
+        return { nowMs: clockNowMs };
+      }
       const startMs = Date.parse(String(lastAvailabilityAssist?.windowStartAt ?? ""));
       const hasExplicitCurrentDates =
         Array.isArray(understanding?.requestedDates) &&
         understanding.requestedDates.some((d) => String(d ?? "").trim());
-      // Reuse stored assist start whenever follow-up keeps the original calendar window.
+      // Reuse stored assist start whenever follow-up keeps the original duration window.
       if (lastAvailabilityAssist && Number.isFinite(startMs) && !hasExplicitCurrentDates) {
         return { nowMs: startMs };
       }
-      return {};
+      return { nowMs: clockNowMs };
     })(),
   });
 

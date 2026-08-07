@@ -1,6 +1,6 @@
 /**
  * P1 Gate A (facts-layer): date-context / duration-context timing aligned before workflow.
- * Rolling duration window (now→now+Nd), not calendar-day "kal".
+ * "kal" uses calendar-relative tomorrow window; numeric duration stays rolling now→now+Nd.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -11,9 +11,11 @@ process.env.OPENAI_API_KEY ||= "test-key";
 import {
   resolveBusinessTurnContext,
   resolveOwnerCheckAlignedDurationDays,
+  resolveAvailabilityCalendarRelative,
 } from "../src/brain/facts/resolveBusinessTurnContext.js";
 import { isConfidentInventoryUnavailable } from "../src/brain/facts/resolveItemBookingAwareAvailability.js";
 import { resolveBookingDateWindowFromDuration } from "../src/brain/facts/resolveBookingDateWindow.js";
+import { resolveCalendarDateWindow } from "../src/brain/facts/resolveCalendarDateWindow.js";
 import { buildAvailabilityInquiryActionPlan } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import { createAvailabilityRequest } from "../src/services/availabilityRequestService.js";
 import { detectAvailabilityRequestBookingConflict } from "../src/services/availabilityBookingConflictGuard.js";
@@ -22,7 +24,8 @@ import { shouldReleasePostConfirmForFreshAvailability } from "../src/services/cu
 const BUSINESS_ID = "gate-a-facts-biz";
 const STONIC_ID = "kia_stonic_ex_plus_2021_white_color_1df55684";
 const STONIC_LABEL = "Kia Stonic EX Plus 2021 (White Color)";
-const NOW_MS = Date.parse("2026-08-07T04:40:56.172Z");
+/** 2026-08-07 12:00 Asia/Karachi */
+const NOW_MS = Date.parse("2026-08-07T07:00:00.000Z");
 const MESSAGE_KAL = "Stonic kal ke liye chahiye";
 
 const EXISTING_STONIC_BOOKING = Object.freeze({
@@ -100,6 +103,7 @@ async function resolveFacts({ message, bookings = [], duration = null }) {
     businessId: BUSINESS_ID,
     rawMessage: message,
     catalogItems: CATALOG,
+    nowMs: NOW_MS,
     getBookingsForItemFn: async () => bookings,
     __unavailableReplyForTests:
       "Kia Stonic EX Plus 2021 (White Color) 1 din ke liye abhi available nahi hai. Abhi koi aur option available nahi hai.",
@@ -167,7 +171,7 @@ function hasOwnerCheck(plan) {
   return (plan.actions || []).some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED");
 }
 
-test("timing helper: kal / date_context → durationDays=1 (rolling, not calendar)", () => {
+test("timing helper: kal readiness durationDays=1; window is calendar_relative", () => {
   assert.equal(
     resolveOwnerCheckAlignedDurationDays({
       normalizedMessage: "stonic kal ke liye chahiye",
@@ -181,10 +185,25 @@ test("timing helper: kal / date_context → durationDays=1 (rolling, not calenda
     }),
     3
   );
-  const window = resolveBookingDateWindowFromDuration(1, NOW_MS);
-  assert.equal(window.startAt.toISOString(), "2026-08-07T04:40:56.172Z");
-  assert.equal(window.endAt.toISOString(), "2026-08-08T04:40:56.172Z");
-  assert.equal(window.confidence, "duration_default_now");
+  assert.equal(
+    resolveAvailabilityCalendarRelative({
+      normalizedMessage: "stonic kal ke liye chahiye",
+    }),
+    "tomorrow"
+  );
+  const calendar = resolveCalendarDateWindow({
+    relative: "tomorrow",
+    timeZone: "Asia/Karachi",
+    nowMs: NOW_MS,
+  });
+  assert.equal(calendar.startAt.toISOString(), "2026-08-07T19:00:00.000Z");
+  assert.equal(calendar.endAt.toISOString(), "2026-08-08T19:00:00.000Z");
+  assert.equal(calendar.confidence, "calendar_relative");
+
+  const durationWindow = resolveBookingDateWindowFromDuration(3, NOW_MS);
+  assert.equal(durationWindow.startAt.toISOString(), "2026-08-07T07:00:00.000Z");
+  assert.equal(durationWindow.endAt.toISOString(), "2026-08-10T07:00:00.000Z");
+  assert.equal(durationWindow.confidence, "duration_default_now");
 });
 
 test("A: overlapping approved Stonic + kal → facts windowApplied + unavailable plan, zero AVR action", async () => {
@@ -195,6 +214,9 @@ test("A: overlapping approved Stonic + kal → facts windowApplied + unavailable
   const av = canonical.verified.availability;
   assert.equal(canonical.turn.durationDays, 1);
   assert.equal(av.windowApplied, true);
+  assert.equal(av.dateWindowConfidence, "calendar_relative");
+  assert.equal(av.requestedStartAt, "2026-08-07T19:00:00.000Z");
+  assert.equal(av.requestedEndAt, "2026-08-08T19:00:00.000Z");
   assert.equal(av.isAvailable, false);
   assert.equal(av.status, "unavailable");
   assert.equal(isConfidentInventoryUnavailable(av), true);
@@ -215,6 +237,7 @@ test("B: no overlapping booking → owner-check still planned", async () => {
   });
   assert.equal(canonical.turn.durationDays, 1);
   assert.equal(canonical.verified.availability.windowApplied, true);
+  assert.equal(canonical.verified.availability.dateWindowConfidence, "calendar_relative");
   assert.equal(canonical.verified.availability.isAvailable, true);
   assert.equal(isConfidentInventoryUnavailable(canonical.verified.availability), false);
 
@@ -297,8 +320,20 @@ test("D: duration-only request still windows from explicit duration", async () =
     duration: 3,
   });
   // understanding may also parse 3 din; either way windowed available
-  assert.ok(Number(canonical.turn.durationDays) >= 1);
+  assert.equal(Number(canonical.turn.durationDays), 3);
   assert.equal(canonical.verified.availability.windowApplied, true);
+  assert.equal(
+    canonical.verified.availability.dateWindowConfidence,
+    "duration_default_now"
+  );
+  assert.equal(
+    canonical.verified.availability.requestedStartAt,
+    "2026-08-07T07:00:00.000Z"
+  );
+  assert.equal(
+    canonical.verified.availability.requestedEndAt,
+    "2026-08-10T07:00:00.000Z"
+  );
   assert.equal(isConfidentInventoryUnavailable(canonical.verified.availability), false);
   const plan = planFromFacts(canonical, "Stonic 3 din ke liye chahiye");
   assert.equal(hasOwnerCheck(plan), true);
