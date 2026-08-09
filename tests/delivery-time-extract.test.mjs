@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { extractDeliveryTime } from "../src/services/messageProcessor.js";
+import { extractDeliveryTime } from "../src/services/bookingSlotParsers.js";
 
 test('extractDeliveryTime: "kal 5 baje" is high confidence', () => {
   const r = extractDeliveryTime("kal 5 baje");

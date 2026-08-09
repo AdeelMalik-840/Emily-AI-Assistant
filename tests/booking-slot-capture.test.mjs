@@ -6,7 +6,7 @@ const {
   extractCustomerNameFromMessage,
   isAwaitingBookingContactCapture,
   maybeHandleGroupBookingSlotCapture,
-} = await import("../src/services/messageProcessor.js");
+} = await import("../src/services/bookingStabilityHelpers.js");
 
 test("extractCustomerNameFromMessage parses Malik hai mera name", () => {
   assert.equal(extractCustomerNameFromMessage("Malik hai mera name"), "Malik");

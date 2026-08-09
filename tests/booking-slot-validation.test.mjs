@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { validateBookingSlotForState } from "../src/services/messageProcessor.js";
+import { validateBookingSlotForState } from "../src/services/bookingSlotParsers.js";
 
 describe("validateBookingSlotForState", () => {
   it("treats number-only '12' as ambiguous in awaiting_delivery_time", () => {

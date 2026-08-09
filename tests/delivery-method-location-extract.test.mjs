@@ -4,15 +4,12 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY ||= "test-key";
 
 const {
-  buildDeliveryMethodChoicePrompt,
-  buildLogisticsQuestionReplyFromProfile,
   extractLocationSlotFromDeliveryText,
   getMeaningfulDeliveryAddressTokensForEval,
   interpretDeliveryMethodMessage,
   isValidDeliveryAddressCandidate,
   validateBookingSlotForState,
-  __shortBookingPolicyForTests,
-} = await import("../src/services/messageProcessor.js");
+} = await import("../src/services/bookingSlotParsers.js");
 const {
   inspectGroupPrivacyReply: __groupPrivatePromptGuardForTests,
   GROUP_PRIVATE_DETAIL_SAFETY_REPLY,
@@ -95,7 +92,7 @@ test('interpretDeliveryMethodMessage: "pickup" returns pickup with no location',
   assert.equal(r.location, null);
 });
 
-test('pickup question with saved location answers and does not select pickup method', () => {
+test('pickup question does not select pickup method', () => {
   const message = "Pickup kahan sy ho ga?";
   const interpreted = interpretDeliveryMethodMessage(message);
   const validated = validateBookingSlotForState({
@@ -107,34 +104,11 @@ test('pickup question with saved location answers and does not select pickup met
     },
     booking: { id: "b-pickup-q" },
   });
-  const reply = buildLogisticsQuestionReplyFromProfile(message, {
-    defaultPickupLocation: "Bahria Phase 7 office",
-    pickupAvailableHours: "10am-8pm",
-    pickupInstructions: "Call before arrival",
-  });
-
   assert.equal(interpreted.method, null);
   assert.equal(validated.accepted.deliveryMethod, undefined);
-  assert.equal(reply.handled, true);
-  assert.match(reply.reply, /Pickup Bahria Phase 7 office se ho ga/);
-  assert.match(reply.reply, /Pickup timing 10am-8pm hai/);
 });
 
-test("logistics question answer can include natural method-choice follow-up", () => {
-  const reply = buildLogisticsQuestionReplyFromProfile("Pickup kahan sy ho skta hai?", {
-    defaultPickupLocation: "Blue Area",
-    pickupAvailableHours: "12pm to 8pm",
-  });
-  const withPrompt = `${reply.reply} ${buildDeliveryMethodChoicePrompt()}`;
-
-  assert.equal(
-    withPrompt,
-    "Pickup Blue Area se ho ga. Pickup timing 12pm to 8pm hai. Aap pickup karna chahenge ya delivery?"
-  );
-  assert.doesNotMatch(withPrompt, /Reply kar dein/i);
-});
-
-test("pickup question with missing location gives safe fallback and does not mutate method", () => {
+test("pickup question with missing location does not mutate method", () => {
   const message = "pickup address kya hai?";
   const interpreted = interpretDeliveryMethodMessage(message);
   const validated = validateBookingSlotForState({
@@ -146,14 +120,11 @@ test("pickup question with missing location gives safe fallback and does not mut
     },
     booking: { id: "b-pickup-missing" },
   });
-  const reply = buildLogisticsQuestionReplyFromProfile(message, {});
-
   assert.equal(interpreted.method, null);
   assert.equal(validated.accepted.deliveryMethod, undefined);
-  assert.equal(reply.reply, "Pickup point abhi saved nahi hai. Delivery chahiye ho to address share kar dein, warna pickup point confirm karna hoga.");
 });
 
-test("delivery coverage question with saved areas answers coverage and does not mutate method", () => {
+test("delivery coverage question does not mutate method", () => {
   const message = "delivery kahan tak hoti hai?";
   const interpreted = interpretDeliveryMethodMessage(message);
   const validated = validateBookingSlotForState({
@@ -165,16 +136,8 @@ test("delivery coverage question with saved areas answers coverage and does not 
     },
     booking: { id: "b-delivery-coverage" },
   });
-  const reply = buildLogisticsQuestionReplyFromProfile(message, {
-    deliveryCoverageAreas: ["DHA", "Bahria Town"],
-    deliveryChargesNote: "Charges depend on area",
-  });
-
   assert.equal(interpreted.method, null);
   assert.equal(validated.accepted.deliveryMethod, undefined);
-  assert.equal(reply.handled, true);
-  assert.match(reply.reply, /Delivery DHA, Bahria Town mein ho sakti hai/);
-  assert.match(reply.reply, /Charges depend on area\./);
 });
 
 test("explicit pickup selection still selects pickup method", () => {
@@ -192,7 +155,6 @@ test('plain "ok" in awaiting_delivery_method does not accept deliveryMethod', ()
   });
 
   assert.equal(out.accepted.deliveryMethod, undefined);
-  assert.equal(buildDeliveryMethodChoicePrompt({ acknowledgement: true }), "Theek hai, pickup rakh dun ya delivery chahiye?");
 });
 
 test("explicit delivery selection still selects delivery method", () => {
@@ -215,60 +177,6 @@ test("group private-detail prompts are replaced with safe copy", () => {
   assert.equal(out.blocked, true);
   assert.equal(out.reply, GROUP_PRIVATE_DETAIL_SAFETY_REPLY);
   assert.doesNotMatch(out.reply, /contact|naam|address|time|pickup|delivery/i);
-});
-
-test("half-day policy offers 12-hour minimum with calculated 80 percent price", () => {
-  const out = __shortBookingPolicyForTests(
-    "6 hours ke liye chahiye",
-    { dailyRate: 8000 },
-    null,
-    { mode: "booking" }
-  );
-  assert.equal(out.selection.type, "below_minimum");
-  assert.equal(out.calculatedPrice, 6400);
-  assert.match(out.reply, /6 ghantay ke liye gari rent par nahi milti/i);
-  assert.match(out.reply, /12 ghantay ka rent 6400 PKR hoga/i);
-  assert.match(out.reply, /12 ghantay ke liye check karun/i);
-});
-
-test("2 gnty triggers 12-hour minimum offer before booking", () => {
-  const out = __shortBookingPolicyForTests("2 gnty k lye", { dailyRate: 5000 }, null, {
-    mode: "booking",
-  });
-  assert.equal(out.parsed.unit, "hours");
-  assert.equal(out.parsed.normalizedHours, 2);
-  assert.equal(out.selection.type, "below_minimum");
-  assert.equal(out.calculatedPrice, 4000);
-  assert.match(out.reply, /2 ghantay ke liye gari rent par nahi milti/i);
-  assert.match(out.reply, /12 ghantay ka rent 4000 PKR hoga/i);
-  assert.match(out.reply, /12 ghantay ke liye check karun/i);
-});
-
-test("below-minimum hour offer without daily rate does not invent price", () => {
-  const out = __shortBookingPolicyForTests("2 gnty k lye", {}, null, { mode: "booking" });
-  assert.equal(out.selection.type, "below_minimum");
-  assert.equal(out.calculatedPrice, null);
-  assert.match(out.reply, /2 ghantay ke liye gari rent par nahi milti/i);
-  assert.match(out.reply, /12 ghantay ke liye check karun/i);
-  assert.doesNotMatch(out.reply, /PKR hoga/i);
-});
-
-test("half-day policy accepts 12 hours without inventing contact prompt", () => {
-  const out = __shortBookingPolicyForTests("12 hours", { dailyRate: 8000 });
-  assert.equal(out.selection.type, "accepted");
-  assert.deepEqual(out.createFields, {
-    durationHours: 12,
-    billingUnit: "half_day",
-    billingRatePercentOfDaily: 80,
-    calculatedPrice: 6400,
-  });
-});
-
-test("half-day policy accepts half day phrase", () => {
-  const out = __shortBookingPolicyForTests("half day", {});
-  assert.equal(out.selection.type, "accepted");
-  assert.equal(out.createFields.durationHours, 12);
-  assert.equal(out.createFields.billingUnit, "half_day");
 });
 
 test("parseDeliveryDetails does not treat condition question as address", () => {

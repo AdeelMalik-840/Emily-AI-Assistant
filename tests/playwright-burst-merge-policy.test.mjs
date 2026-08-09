@@ -10,7 +10,7 @@ import {
   buildParticipantForwardCandidate,
   splitBurstMergeRuns,
 } from "../src/services/playwrightListener/listener.js";
-import { resolveCurrentTurnAuthority } from "../src/services/messageProcessor.js";
+import { resolveCurrentTurnAuthority } from "../src/services/currentTurnAuthority.js";
 
 const CHAT = "leads";
 

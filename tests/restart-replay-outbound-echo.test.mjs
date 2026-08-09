@@ -23,7 +23,7 @@ const {
   __clearPlaywrightOutboundRegistryForTests,
 } = await import("../src/services/playwrightOutboundRegistry.js");
 const { resolveCurrentTurnAuthority } = await import(
-  "../src/services/messageProcessor.js"
+  "../src/services/currentTurnAuthority.js"
 );
 
 const PRICING_REPLY =

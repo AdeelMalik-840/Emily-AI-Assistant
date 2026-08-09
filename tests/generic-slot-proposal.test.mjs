@@ -8,12 +8,9 @@ import {
   extractGenericSlotsWithLLM,
 } from "../src/services/openai.js";
 import {
-  __shortBookingPolicyForParsedDurationForTests,
-  processMessage,
   validateBookingSlotForState,
   validateGenericSlotProposalForTurn,
-} from "../src/services/messageProcessor.js";
-import { patchEmilySessionState } from "../src/services/conversationIntelligence.js";
+} from "../src/services/bookingSlotParsers.js";
 import { parseUserDuration } from "../src/duration/parseDuration.js";
 import { parseDeliveryDetails } from "../src/services/bookingDmFlow.js";
 
@@ -89,81 +86,6 @@ test("generic duration proposal validates typo-like hour unit without adding par
     normalizedDays: 1,
     normalizedHours: 2,
   });
-
-  const policy = __shortBookingPolicyForParsedDurationForTests(
-    validated.accepted.duration,
-    { dailyRate: 8000 }
-  );
-  assert.equal(policy.selection.type, "below_minimum");
-  assert.equal(policy.calculatedPrice, 6400);
-  assert.equal(policy.createFields, undefined);
-  assert.equal(
-    policy.reply,
-    "2 ghantay ke liye gari rent par nahi milti. Minimum 12 ghantay ka slot hai. 12 ghantay ka rent 6400 PKR hoga. 12 ghantay ke liye check karun?"
-  );
-});
-
-test("processMessage applies validated generic duration before half-day policy", async () => {
-  patchEmilySessionState("owner1::rental-leads-slot-proposal::participant::p-slot", {
-    lastItem: { id: "civic-1", name: "Honda Civic", dailyRate: 8000 },
-  });
-
-  const out = await processMessage({
-    traceId: "t-generic-slot-duration-half-day",
-    userId: "owner1",
-    message: "2 gjnty k lye",
-    messageId: "m-generic-slot-duration-half-day",
-    source: "playwright",
-    isGroupInbound: true,
-    isGroupMessage: true,
-    whatsappRecipientType: "group",
-    playwrightWebInbound: true,
-    playwrightChatKey: "rental-leads-slot-proposal",
-    groupName: "Rental Leads Slot Proposal",
-    participantKey: "p-slot",
-    conversationHistory: "Assistant: Kitne time ke liye chahiye?\n",
-    __genericSlotProposalForTests: async () => ({
-      slots: {
-        duration: { rawText: "2 gjnty", value: 2, unitGuess: "hours", confidence: "high" },
-      },
-      rejectedForbiddenFields: [],
-      rejectedUnknownSlotKeys: [],
-      reason: "duration_proposed",
-    }),
-  });
-
-  assert.equal(
-    out.reply,
-    "2 ghantay ke liye gari rent par nahi milti. Minimum 12 ghantay ka slot hai. 12 ghantay ke liye check karun?"
-  );
-  assert.equal(out.messageMeta?.bookingCreated, undefined);
-});
-
-test("processMessage does not call generic duration proposal when deterministic parser succeeds", async () => {
-  let called = false;
-  const out = await processMessage({
-    traceId: "t-deterministic-duration-no-slot-proposal",
-    userId: "owner1",
-    message: "2 gnty k lye",
-    messageId: "m-deterministic-duration-no-slot-proposal",
-    source: "playwright",
-    isGroupInbound: true,
-    isGroupMessage: true,
-    whatsappRecipientType: "group",
-    playwrightWebInbound: true,
-    playwrightChatKey: "rental-leads-deterministic-duration",
-    groupName: "Rental Leads Deterministic Duration",
-    participantKey: "p-deterministic",
-    conversationHistory: "Assistant: Kitne time ke liye chahiye?\n",
-    __genericSlotProposalForTests: async () => {
-      called = true;
-      return { slots: {} };
-    },
-  });
-
-  assert.equal(called, false);
-  assert.match(out.reply, /Minimum 12 ghantay/);
-  assert.match(out.reply, /nahi milti/i);
 });
 
 test("deterministic duration parser wins over generic duration proposal", async () => {

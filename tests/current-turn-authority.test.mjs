@@ -9,7 +9,7 @@ const {
   applyTurnAuthorityMask,
   gateUnavailableReplyAuthority,
   buildUnavailableReplyWithAuthorityGate,
-} = await import("../src/services/messageProcessor.js");
+} = await import("../src/services/currentTurnAuthority.js");
 
 const civic = {
   id: "civic-1",

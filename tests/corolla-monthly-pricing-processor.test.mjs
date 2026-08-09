@@ -6,7 +6,7 @@ import { composeInformationalAnswer } from "../src/services/answerComposer.js";
 import {
   resolveExplicitUnlistedMention,
   reconcileItemContextWithExplicitMessage,
-} from "../src/services/messageProcessor.js";
+} from "../src/services/bookingStabilityHelpers.js";
 
 const catalog = [
   { id: "civic-1", name: "Honda Civic 2026 Oriel (White)" },

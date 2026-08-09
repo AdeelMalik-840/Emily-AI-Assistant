@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   resolveBookingContactPhone,
   extractContactPhoneFromText,
-} from "../src/services/messageProcessor.js";
+} from "../src/utils/extractContactPhoneFromText.js";
 
 test("resolveBookingContactPhone: customerPhone exists -> resolves and does not ask", () => {
   const r = resolveBookingContactPhone({
