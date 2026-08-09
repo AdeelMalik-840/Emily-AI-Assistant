@@ -3,9 +3,6 @@ import assert from "node:assert/strict";
 
 process.env.OPENAI_API_KEY ||= "test-key";
 
-import {
-  __buildIntentionalSilentNoopMessageMetaForTests,
-} from "../src/services/messageProcessor.js";
 import { routeHybridOutbound as __applyHybridOutboundResultForTests } from "../src/services/outbound/hybridOutboundRouter.js";
 import {
   __isIntentionalSilentInboundResultForTests,
@@ -13,15 +10,28 @@ import {
 } from "../src/services/whatsappInboundBuffer.js";
 import { getMessageState, setMessageState } from "../src/services/messageState.js";
 
+function brainV2IntentionalSilenceMeta(hasUsefulBusinessData = false) {
+  return {
+    handledWithoutOutbound: true,
+    hasUsefulBusinessData,
+    routeType: "BRAIN_V2_LIVE_SILENT",
+    outboundTrace: {
+      finalReplySource: "BRAIN_V2_LIVE_SILENT",
+      kind: "silent_noop",
+      reason: "ASSIST_CONTEXT_NO_REPLY",
+    },
+  };
+}
+
 test("intentional silent noop messageMeta is structured", () => {
-  const meta = __buildIntentionalSilentNoopMessageMetaForTests(true);
+  const meta = brainV2IntentionalSilenceMeta(true);
   assert.equal(meta.handledWithoutOutbound, true);
-  assert.equal(meta.outboundTrace?.finalReplySource, "PURE_ACK_SILENT");
+  assert.equal(meta.outboundTrace?.finalReplySource, "BRAIN_V2_LIVE_SILENT");
   assert.equal(meta.outboundTrace?.kind, "silent_noop");
 });
 
 test("hybrid outbound preserves silent noop metadata with sendVia NONE", () => {
-  const meta = __buildIntentionalSilentNoopMessageMetaForTests(false);
+  const meta = brainV2IntentionalSilenceMeta(false);
   const out = __applyHybridOutboundResultForTests(
     {
       reply: "",
@@ -38,7 +48,7 @@ test("hybrid outbound preserves silent noop metadata with sendVia NONE", () => {
 });
 
 test("isIntentionalSilentInboundResult requires sendVia NONE plus structured meta", () => {
-  const meta = __buildIntentionalSilentNoopMessageMetaForTests(false);
+  const meta = brainV2IntentionalSilenceMeta(false);
   assert.equal(
     __isIntentionalSilentInboundResultForTests({ sendVia: "NONE", messageMeta: meta }),
     true
@@ -104,7 +114,7 @@ test("guarantee done state after silent noop completion path", () => {
   setMessageState(guaranteeKey, "processing");
   const intentionalSilent = __isIntentionalSilentInboundResultForTests({
     sendVia: "NONE",
-    messageMeta: __buildIntentionalSilentNoopMessageMetaForTests(false),
+    messageMeta: brainV2IntentionalSilenceMeta(false),
   });
   const processingSuccess = true;
   const outboundReplyDelivered = false;

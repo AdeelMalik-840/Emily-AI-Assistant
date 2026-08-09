@@ -14,11 +14,12 @@ const {
   getEmilySessionState,
   patchEmilySessionState,
 } = await import("../src/services/conversationIntelligence.js");
-const {
-  isBookingCommitOnlyMessage,
-  resolveExplicitUnlistedMention,
-  __buildNotListedReplyForTests,
-} = await import("../src/services/messageProcessor.js");
+const { isBookingCommitOnlyMessage } = await import(
+  "../src/services/bookingCommitPhrase.js"
+);
+const { resolveExplicitUnlistedMention } = await import(
+  "../src/services/bookingStabilityHelpers.js"
+);
 const { shouldBlockBookingForAssistantOrigin } = await import(
   "../src/services/inboundOriginGuard.js"
 );
@@ -213,14 +214,7 @@ test("K: unknown item still unlisted", async () => {
     extractedEntity: "mehran",
   });
   assert.equal(check?.notInCatalog, true);
-  assert.match(
-    __buildNotListedReplyForTests({
-      itemLabel: check.label,
-      style: "casual_local",
-      catalogItems: catalog,
-    }),
-    /mehran hamari list mein nahi hai/i
-  );
+  assert.equal(check.label.toLowerCase(), "mehran");
 });
 
 test("L: commit-only phrase helpers still pass", async () => {

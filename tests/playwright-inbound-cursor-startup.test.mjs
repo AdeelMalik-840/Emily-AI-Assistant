@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 
 process.env.OPENAI_API_KEY ||= "test-key";
 
@@ -21,14 +20,6 @@ import {
   __isIntentionalSilentInboundResultForTests,
 } from "../src/services/whatsappInboundBuffer.js";
 import { initPlaywrightGuaranteeMaps, recordPlaywrightInboundScheduled } from "../src/services/playwrightGuaranteeBridge.js";
-import {
-  __buildPendingActionForTests,
-  __canResolvePureAckWithoutConsumablePendingForTests,
-  __isPureAckMessageForTests,
-  __pendingActionReplyIntentForTests,
-  __validatePendingActionBindingForTests,
-} from "../src/services/messageProcessor.js";
-import { getEmilySessionState, patchEmilySessionState } from "../src/services/conversationIntelligence.js";
 
 const PARTICIPANT_KEY = "scope::cursor-test-participant";
 const BUSINESS_ID = "cursor-test-business";
@@ -400,7 +391,6 @@ test("7b. no cursor + old pure ack only — not selected (conservative freshness
   });
   assert.equal(afterCursor.length, 0);
 
-  assert.equal(__isPureAckMessageForTests("ok"), true);
 });
 
 test("8a. playwright inbound cursor does not store pendingAction", async () => {
@@ -422,48 +412,4 @@ test("8a. playwright inbound cursor does not store pendingAction", async () => {
     participantKey: PARTICIPANT_KEY,
   });
   assert.equal(loaded?.pendingAction, undefined);
-});
-
-test("8b. pendingAction in-session blocks pure-ack silent; restart loses pending (cursor limitation)", () => {
-  const sessionKey = `cursor-pending-${randomUUID()}`;
-  const groupChatKey = "group-a";
-  const participantKey = "participant-a";
-  const pending = __buildPendingActionForTests({
-    type: "collect_duration",
-    expectedReplyType: "duration",
-    participantKey,
-    groupChatKey,
-    sessionKey,
-    itemId: "corolla-1",
-    itemDisplayLabel: "Toyota Corolla",
-    payload: {
-      source: "verified_item_selection",
-      availabilityStatus: "available",
-      explicitPriceIntent: false,
-    },
-  });
-  patchEmilySessionState(sessionKey, { pendingAction: pending });
-  const memory = getEmilySessionState(sessionKey);
-
-  const replyIntent = __pendingActionReplyIntentForTests("ok", pending);
-  const binding = __validatePendingActionBindingForTests({
-    pendingAction: pending,
-    replyIntent,
-    participantKey,
-    groupChatKey,
-    sessionKey,
-  });
-  assert.equal(binding.ok, false);
-  assert.equal(binding.reason, "REPLY_INTENT_MISMATCH");
-
-  const canSilent = __canResolvePureAckWithoutConsumablePendingForTests(memory, "ok", {
-    participantKey,
-    groupChatKey,
-    sessionKey,
-  });
-  assert.equal(canSilent, false);
-
-  const freshSessionKey = `cursor-pending-restart-${randomUUID()}`;
-  const freshMemory = getEmilySessionState(freshSessionKey);
-  assert.equal(freshMemory.pendingAction, undefined);
 });

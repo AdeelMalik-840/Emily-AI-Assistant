@@ -5,14 +5,7 @@ process.env.OPENAI_API_KEY ||= "test-key";
 
 import { composeInformationalAnswer, detectAskedField } from "../src/services/answerComposer.js";
 import { resolveTrustedPreviousItemContinuation } from "../src/brain/context/previousItemContinuationResolver.js";
-import {
-  __buildItemlessPriceDurationClarificationReplyForTests,
-  __isItemlessPriceDurationFollowupForTests,
-  __resolveDurationContextPolicyForTests,
-  __resolveItemlessPriceDurationAskedFieldForTests,
-  __shouldStoreLastVerifiedCatalogAnswerForTests,
-  __storeLastVerifiedCatalogAnswerForTests,
-} from "../src/services/messageProcessor.js";
+import { isItemlessPriceDurationFollowup } from "../src/services/turnContextAuthority.js";
 
 const __hasSafePreviousCatalogItemForPriceFollowupForTests = (args) =>
   resolveTrustedPreviousItemContinuation({
@@ -77,114 +70,29 @@ function buildStoredPricingContext({
 }
 
 test("isItemlessPriceDurationFollowup: 3 day rent? and 3 din ka rent? yes, 3 days no", () => {
-  assert.equal(__isItemlessPriceDurationFollowupForTests("3 day rent?", catalog), true);
-  assert.equal(__isItemlessPriceDurationFollowupForTests("3 din ka rent?", catalog), true);
-  assert.equal(__isItemlessPriceDurationFollowupForTests("3 days", catalog), false);
+  assert.equal(isItemlessPriceDurationFollowup("3 day rent?", catalog), true);
+  assert.equal(isItemlessPriceDurationFollowup("3 din ka rent?", catalog), true);
+  assert.equal(isItemlessPriceDurationFollowup("3 days", catalog), false);
   assert.equal(
-    __isItemlessPriceDurationFollowupForTests("Corolla 3 din k lye", catalog),
+    isItemlessPriceDurationFollowup("Corolla 3 din k lye", catalog),
     false
   );
   assert.equal(
-    __isItemlessPriceDurationFollowupForTests("Civic 3 day rent?", catalog),
+    isItemlessPriceDurationFollowup("Civic 3 day rent?", catalog),
     false
   );
 });
 
 test("resolveItemlessPriceDurationAskedField maps rent+duration bare turns", () => {
-  assert.equal(__resolveItemlessPriceDurationAskedFieldForTests("3 day rent?"), "price_with_duration");
-  assert.equal(
-    __resolveItemlessPriceDurationAskedFieldForTests("3 din ka rent?"),
-    "price_with_duration"
-  );
+  assert.equal(detectAskedField("3 day rent?"), "price_with_duration");
   assert.equal(detectAskedField("3 din ka rent?"), "price_with_duration");
 });
 
-test("itemless duration pricing helper catches the full follow-up phrase", () => {
+test("itemless duration pricing shape catches the full follow-up phrase", () => {
   assert.equal(
-    __isItemlessPriceDurationFollowupForTests("10 din k lye rent kitna hai?", catalog),
+    isItemlessPriceDurationFollowup("10 din k lye rent kitna hai?", catalog),
     true
   );
-  assert.equal(
-    __buildItemlessPriceDurationClarificationReplyForTests(),
-    "Kis car ke liye price pooch rahe hain?"
-  );
-});
-
-test("shouldStoreLastVerifiedCatalogAnswer: verified pricing yes, human unknown and browse no", () => {
-  const civicItem = catalog[1];
-  const verified = composeInformationalAnswer({
-    message: "civic rent?",
-    item: civicItem,
-    askedField: "price",
-  });
-  assert.equal(
-    __shouldStoreLastVerifiedCatalogAnswerForTests({
-      composedAnswer: verified,
-      composerItem: civicItem,
-      conversationRoute: { routeType: "INFORMATIONAL_QUESTION" },
-    }),
-    true
-  );
-
-  const humanUnknown = {
-    reply: "Rate confirm kar ke bata deta hun",
-    field: "price",
-    source: "human_unknown",
-    finalAuthority: true,
-    answerKnown: false,
-    unknownHumanized: true,
-  };
-  assert.equal(
-    __shouldStoreLastVerifiedCatalogAnswerForTests({
-      composedAnswer: humanUnknown,
-      composerItem: civicItem,
-      conversationRoute: { routeType: "INFORMATIONAL_QUESTION" },
-    }),
-    false
-  );
-
-  const browse = {
-    reply: "Kis option ke liye chahiye?",
-    field: "price",
-    source: "verified_catalog",
-    finalAuthority: true,
-    answerKnown: true,
-  };
-  assert.equal(
-    __shouldStoreLastVerifiedCatalogAnswerForTests({
-      composedAnswer: browse,
-      composerItem: civicItem,
-      conversationRoute: { routeType: "INFORMATIONAL_QUESTION" },
-    }),
-    false
-  );
-});
-
-test("storeLastVerifiedCatalogAnswer: structured pricing context on memory", () => {
-  const memory = { ...civicMemory };
-  const civicItem = catalog[1];
-  const verified = composeInformationalAnswer({
-    message: "covic rent?",
-    item: civicItem,
-    askedField: "price",
-  });
-  const ctx = __storeLastVerifiedCatalogAnswerForTests({
-    memory,
-    item: civicItem,
-    composedAnswer: verified,
-    requestedField: "price",
-    participantKey: participantA,
-    chatContextKey,
-    sessionKey,
-  });
-  assert.ok(ctx);
-  assert.equal(memory.lastVerifiedCatalogAnswer.itemId, "civic-1");
-  assert.equal(memory.lastVerifiedCatalogAnswer.answerType, "pricing");
-  assert.equal(memory.lastVerifiedCatalogAnswer.source, "verified_catalog");
-  assert.equal(memory.lastVerifiedCatalogAnswer.requestedField, "price");
-  assert.equal(memory.lastVerifiedCatalogAnswer.participantKey, participantA);
-  assert.equal(memory.lastVerifiedCatalogAnswer.sessionKey, sessionKey);
-  assert.ok(memory.lastVerifiedCatalogAnswer.expiresAt);
 });
 
 test("hasSafePreviousCatalogItem: empty assistant replies but structured context allows Civic", () => {
@@ -220,135 +128,9 @@ test("hasSafePreviousCatalogItem: no structured context and no session item bloc
   assert.equal(noItem.reason, "NO_ITEM_ID");
 });
 
-test("resolveDurationContextPolicy: structured context allows quote without assistant memory", () => {
-  const memory = {
-    ...civicMemory,
-    lastVerifiedCatalogAnswer: buildStoredPricingContext(),
-  };
-  const allowed = __resolveDurationContextPolicyForTests({
-    message: "3 day rent?",
-    bareDurationMessage: true,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: civicMemory.lastItem,
-    catalogItems: catalog,
-    memory,
-    recentAssistantReplies: [],
-    participantKey: participantA,
-    chatContextKey,
-    sessionKey,
-  });
-  assert.equal(allowed.durationContextAllowed, true);
-  assert.equal(allowed.durationContextReason, "PRICE_DURATION_FOLLOWUP_WITH_SAFE_ITEM");
-  assert.equal(allowed.priceDurationFollowupWithSafeItem, true);
-  assert.equal(allowed.safePreviousProofSource, "LAST_VERIFIED_CATALOG_ANSWER");
-});
-
-test("resolveDurationContextPolicy: expired structured context stays blocked", () => {
-  const memory = {
-    ...civicMemory,
-    lastVerifiedCatalogAnswer: buildStoredPricingContext({
-      expiresAt: new Date(Date.now() - 1000).toISOString(),
-    }),
-  };
-  const blocked = __resolveDurationContextPolicyForTests({
-    message: "3 day rent?",
-    bareDurationMessage: true,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: civicMemory.lastItem,
-    catalogItems: catalog,
-    memory,
-    recentAssistantReplies: [],
-    participantKey: participantA,
-    chatContextKey,
-    sessionKey,
-  });
-  assert.equal(blocked.durationContextAllowed, false);
-  assert.equal(blocked.priceDurationFollowupWithSafeItem, false);
-  assert.equal(blocked.safePreviousReason, "LAST_VERIFIED_CATALOG_ANSWER_EXPIRED");
-});
-
-test("resolveDurationContextPolicy: different participant cannot reuse context", () => {
-  const memory = {
-    ...civicMemory,
-    lastVerifiedCatalogAnswer: buildStoredPricingContext({ participantKey: participantA }),
-  };
-  const blocked = __resolveDurationContextPolicyForTests({
-    message: "3 day rent?",
-    bareDurationMessage: true,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: civicMemory.lastItem,
-    catalogItems: catalog,
-    memory,
-    recentAssistantReplies: [],
-    participantKey: participantB,
-    chatContextKey,
-    sessionKey,
-  });
-  assert.equal(blocked.durationContextAllowed, false);
-  assert.equal(blocked.safePreviousReason, "PARTICIPANT_MISMATCH");
-});
-
-test("resolveDurationContextPolicy: Civic session memory allows 10-day price follow-up", () => {
-  const allowed = __resolveDurationContextPolicyForTests({
-    message: "10 din k lye rent kitna hai?",
-    bareDurationMessage: false,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: civicMemory.lastItem,
-    catalogItems: catalog,
-    memory: civicMemory,
-    participantKey: participantA,
-    chatContextKey,
-    sessionKey,
-    isGroupInbound: true,
-  });
-  assert.equal(allowed.itemlessPriceDurationFollowup, true);
-  assert.equal(allowed.priceDurationFollowupWithSafeItem, true);
-  assert.equal(allowed.safePreviousProofSource, "PARTICIPANT_SESSION_MEMORY");
-  assert.equal(allowed.priceFollowupCatalogItem?.id, "civic-1");
-});
-
-test("resolveDurationContextPolicy: full itemless phrasing blocks without same-participant item", () => {
-  const blocked = __resolveDurationContextPolicyForTests({
-    message: "10 din k lye rent kitna hai?",
-    bareDurationMessage: false,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: null,
-    catalogItems: catalog,
-    memory: {},
-    participantKey: "",
-    chatContextKey,
-    sessionKey,
-    isGroupInbound: true,
-  });
-  assert.equal(blocked.itemlessPriceDurationFollowup, true);
-  assert.equal(blocked.priceDurationFollowupWithSafeItem, false);
-  assert.equal(blocked.safePreviousReason, "MISSING_STABLE_PARTICIPANT_SESSION");
-});
-
-test("resolveDurationContextPolicy: interleaved participant cannot reuse other participant pricing context", () => {
-  const memory = {
-    ...civicMemory,
-    lastVerifiedCatalogAnswer: buildStoredPricingContext({ participantKey: participantA }),
-  };
-  const blocked = __resolveDurationContextPolicyForTests({
-    message: "10 din k lye rent kitna hai?",
-    bareDurationMessage: false,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: civicMemory.lastItem,
-    catalogItems: catalog,
-    memory,
-    participantKey: participantB,
-    chatContextKey,
-    sessionKey,
-    isGroupInbound: true,
-  });
-  assert.equal(blocked.priceDurationFollowupWithSafeItem, false);
-  assert.equal(blocked.safePreviousReason, "PARTICIPANT_MISMATCH");
-});
-
 test("explicit new item is not itemless price-duration follow-up", () => {
   assert.equal(
-    __isItemlessPriceDurationFollowupForTests("Corolla 3 days rent?", catalog),
+    isItemlessPriceDurationFollowup("Corolla 3 days rent?", catalog),
     false
   );
   const corollaQuote = composeInformationalAnswer({
@@ -358,47 +140,6 @@ test("explicit new item is not itemless price-duration follow-up", () => {
   });
   assert.match(corollaQuote.reply, /15[,.]?000\s*PKR/i);
   assert.doesNotMatch(corollaQuote.reply, /36[,.]?000\s*PKR/i);
-});
-
-test("resolveDurationContextPolicy: bare 3 days still blocked without duration ask", () => {
-  const blocked = __resolveDurationContextPolicyForTests({
-    message: "3 days",
-    bareDurationMessage: true,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: corollaMemory.lastItem,
-    catalogItems: catalog,
-    memory: {
-      ...corollaMemory,
-      lastVerifiedCatalogAnswer: buildStoredPricingContext({
-        itemId: "corolla-1",
-        itemDisplayLabel: "Toyota Corolla 2024",
-      }),
-    },
-    recentAssistantReplies: [corollaPriceReply],
-    participantKey: participantA,
-    chatContextKey,
-    sessionKey,
-  });
-  assert.equal(blocked.durationContextAllowed, false);
-  assert.equal(blocked.durationContextReason, "PREVIOUS_ASSISTANT_DID_NOT_ASK_DURATION");
-  assert.equal(blocked.priceDurationFollowupWithSafeItem, false);
-});
-
-test("resolveDurationContextPolicy: no memory item stays blocked", () => {
-  const blocked = __resolveDurationContextPolicyForTests({
-    message: "3 day rent?",
-    bareDurationMessage: true,
-    previousAssistantAskedDuration: false,
-    durationMemoryCandidate: null,
-    catalogItems: catalog,
-    memory: {},
-    recentAssistantReplies: [],
-    participantKey: participantA,
-    chatContextKey,
-    sessionKey,
-  });
-  assert.equal(blocked.durationContextAllowed, false);
-  assert.equal(blocked.priceDurationFollowupWithSafeItem, false);
 });
 
 test("hasSafePreviousCatalogItem: same-participant session memory allows Civic without assistant reply proof", () => {

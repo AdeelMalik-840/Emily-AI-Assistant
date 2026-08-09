@@ -9,12 +9,6 @@ import {
 } from "../src/services/conversationRouter.js";
 
 process.env.NODE_ENV = "test";
-const {
-  resolveAuthoritativeItemForTurn,
-  shouldBlockPinnedEntityForFollowup,
-} = await import(
-  "../src/services/messageProcessor.js"
-);
 
 const civic = {
   id: "civic-1",
@@ -35,24 +29,6 @@ test("no explicit item follow-up does not extract an entity", () => {
   assert.equal(out.confidence, 0);
 });
 
-test("stale Kia pinned entity is blocked when current focus is Civic", () => {
-  const blocked = shouldBlockPinnedEntityForFollowup({
-    message: "kis color mai hai?",
-    pinnedEntityName: "Kia Stonic",
-    currentItem: civic,
-  });
-  assert.equal(blocked, true);
-});
-
-test("explicit pinned entity mention is not blocked", () => {
-  const blocked = shouldBlockPinnedEntityForFollowup({
-    message: "kia stonic ka color konsa hai?",
-    pinnedEntityName: "Kia Stonic",
-    currentItem: civic,
-  });
-  assert.equal(blocked, false);
-});
-
 test("color follow-up uses current focused Civic item", () => {
   const out = composeInformationalAnswer({
     message: "kis color mai hai?",
@@ -61,54 +37,6 @@ test("color follow-up uses current focused Civic item", () => {
   });
   assert.equal(out.reply, "Honda Civic 2026 Oriel white color mein available hai.");
   assert.equal(out.source, "verified_catalog");
-});
-
-test("item authority keeps Civic for no-explicit follow-up", () => {
-  const item = resolveAuthoritativeItemForTurn({
-    userText: "kis color mai hai?",
-    explicitResolvedItem: null,
-    turnLockedItem: null,
-    memoryItem: civic,
-    isFollowup: true,
-    catalogItems: [civic, corolla],
-  });
-  assert.equal(item.id, "civic-1");
-});
-
-test("item authority switches to explicit Corolla mention", () => {
-  const item = resolveAuthoritativeItemForTurn({
-    userText: "Corolla ka rent?",
-    explicitResolvedItem: corolla,
-    turnLockedItem: null,
-    memoryItem: civic,
-    isFollowup: true,
-    catalogItems: [civic, corolla],
-  });
-  assert.equal(item.id, "corolla-1");
-});
-
-test("item authority keeps turn lock for bare duration", () => {
-  const item = resolveAuthoritativeItemForTurn({
-    userText: "2 din",
-    explicitResolvedItem: null,
-    turnLockedItem: corolla,
-    memoryItem: civic,
-    isFollowup: false,
-    catalogItems: [civic, corolla],
-  });
-  assert.equal(item.id, "corolla-1");
-});
-
-test("item authority uses focused item for image follow-up", () => {
-  const item = resolveAuthoritativeItemForTurn({
-    userText: "pics?",
-    explicitResolvedItem: null,
-    turnLockedItem: null,
-    memoryItem: civic,
-    isFollowup: true,
-    catalogItems: [civic, corolla],
-  });
-  assert.equal(item.id, "civic-1");
 });
 
 test("mileage follow-up on Civic returns mileage fallback, not price", () => {

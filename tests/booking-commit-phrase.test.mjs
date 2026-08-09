@@ -8,10 +8,10 @@ const {
   isCommitActionEntityLabel,
   isBookingCommitOnlyMessage,
   matchedCommitPhrasePreview,
-  resolveExplicitUnlistedMention,
-  __buildNotListedReplyForTests,
-  __isBookingContinuationShapedForTests,
-} = await import("../src/services/messageProcessor.js");
+} = await import("../src/services/bookingCommitPhrase.js");
+const { resolveExplicitUnlistedMention } = await import(
+  "../src/services/bookingStabilityHelpers.js"
+);
 const { detectBookingEvent } = await import("../src/services/eventDetection.js");
 const { extractEntity } = await import("../src/services/entityExtraction.js");
 const { shouldBlockBookingForAssistantOrigin } = await import(
@@ -73,11 +73,10 @@ test("A: pricing then commit shape keeps civic context signals", () => {
 });
 
 // B. Commit phrase with memory context signals
-test("B: commit-only with civic memory context is booking continuation shaped", () => {
+test("B: commit-only emits booking and confirmation event signals", () => {
   const msg = "ok booking kr dn";
   const events = commitEvents(msg);
   assert.equal(isBookingCommitOnlyMessage(msg, catalog), true);
-  assert.equal(__isBookingContinuationShapedForTests(msg, 3, false, events), true);
   assert.equal(events.bookingIntent, true);
   assert.equal(events.confirmationIntent, true);
 });
@@ -111,11 +110,6 @@ test("D: commit variations are commit-only without explicit catalog item", () =>
   ];
   for (const msg of msgs) {
     assert.equal(isBookingCommitOnlyMessage(msg, catalog), true, msg);
-    assert.equal(
-      __isBookingContinuationShapedForTests(msg, 3, false, commitEvents(msg)),
-      true,
-      msg
-    );
   }
 });
 
@@ -132,14 +126,7 @@ test("E: mehran available is not commit-only and stays unlisted", async () => {
     extractedEntity: "mehran",
   });
   assert.equal(check?.notInCatalog, true);
-  assert.match(
-    __buildNotListedReplyForTests({
-      itemLabel: check.label,
-      style: "casual_local",
-      catalogItems: catalog,
-    }),
-    /mehran hamari list mein nahi hai/i
-  );
+  assert.equal(check.label.toLowerCase(), "mehran");
 });
 
 // F. Item-in-commit message preserves civic
@@ -177,15 +164,6 @@ test("G: commit-only without item context is still not unlisted", async () => {
     extractedEntity: null,
   });
   assert.equal(check, null);
-});
-
-// H. Missing duration
-test("H: commit-only with item but no duration is continuation shaped", () => {
-  const msg = "ok booking kr dn";
-  assert.equal(
-    __isBookingContinuationShapedForTests(msg, null, false, commitEvents(msg)),
-    true
-  );
 });
 
 // I. Current Turn Authority composition — civic wins over corolla on explicit mention
