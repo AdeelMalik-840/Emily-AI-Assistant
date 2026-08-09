@@ -567,7 +567,7 @@ test("booking executor preserves ITEM_ALREADY_BOOKED from inventory", async () =
   assert.equal(result.itemName, "Toyota Corolla");
 });
 
-test("ITEM_ALREADY_BOOKED returns unavailable reply and skips owner notification", async () => {
+test("ITEM_ALREADY_BOOKED fail-closes customer reply and skips owner notification", async () => {
   const fake = createFakeBookingDb();
   seedActiveCorollaBooking(fake);
 
@@ -587,8 +587,10 @@ test("ITEM_ALREADY_BOOKED returns unavailable reply and skips owner notification
   assert.equal(result.sideEffectResults.NOTIFY_OWNER, undefined);
   assert.equal(result.bookingCreated, null);
   assert.equal(result.skipRemainingActions, true);
-  assert.match(result.reply, /Toyota Corolla is waqt available nahi hai/i);
-  assert.doesNotMatch(result.reply, /reply nahi bhej pa rahi/i);
+  assert.equal(result.customerReplySuppressed, true);
+  assert.equal(String(result.reply ?? "").trim(), "");
+  assert.doesNotMatch(String(result.reply ?? ""), /Civic|Stonic/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /reply nahi bhej pa rahi/i);
 });
 
 test("unexpected live booking failure still uses safe apology", async () => {

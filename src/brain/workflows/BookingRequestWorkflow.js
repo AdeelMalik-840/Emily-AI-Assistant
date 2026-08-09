@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
+import { buildUnavailableAvailabilityFailsafeReply } from "./AvailabilityInquiryWorkflow.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
@@ -75,6 +77,106 @@ function canExecuteCreateBooking(canonical, payload) {
 }
 
 /**
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {Array<{ itemId: string, itemLabel: string }>}
+ */
+function readVerifiedAlternatives(availability) {
+  const rows = Array.isArray(availability?.verifiedAlternatives)
+    ? availability.verifiedAlternatives
+    : [];
+  /** @type {Array<{ itemId: string, itemLabel: string }>} */
+  const out = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const altId = String(row.itemId ?? "").trim();
+    const altLabel = String(row.itemLabel ?? "").trim();
+    if (!altId || !altLabel) continue;
+    out.push({ itemId: altId, itemLabel: altLabel });
+  }
+  return out;
+}
+
+/**
+ * CASE 1 — strong booking but item already confidently unavailable:
+ * REPLY only from precomposed canonical unavailable facts. No booking mutation.
+ *
+ * @param {{
+ *   canonical: Record<string, unknown>,
+ *   itemId: string | null,
+ *   itemLabel: string,
+ *   durationDays: number | null,
+ * }} p
+ * @returns {ActionPlan | null}
+ */
+function buildConfidentUnavailableBookingReplyPlan(p) {
+  const decision = asObject(p.canonical?.decision);
+  if (decision?.workflowType !== "booking_request") return null;
+  if (decision?.strongBookingCommand !== true) return null;
+
+  const availability = asObject(asObject(p.canonical?.verified)?.availability);
+  if (!isConfidentInventoryUnavailable(availability)) return null;
+
+  const alternatives = readVerifiedAlternatives(availability);
+  const hasAlternatives = alternatives.length > 0;
+  const durationN = Math.max(
+    1,
+    Math.floor(
+      Number(
+        p.durationDays ??
+          asObject(p.canonical?.turn)?.durationDays ??
+          1
+      ) || 1
+    )
+  );
+  const composed = String(p.canonical?.unavailableCustomerReply ?? "").trim();
+  const failsafe = buildUnavailableAvailabilityFailsafeReply(
+    p.itemLabel,
+    durationN,
+    alternatives
+  );
+  // Same sanitization as availability unavailable offer: empty alts must not offer options.
+  const replyDraft =
+    composed &&
+    !(
+      !hasAlternatives && /koi aur option dekhun|other option|aur option/i.test(composed)
+    )
+      ? composed
+      : failsafe;
+
+  return Object.freeze({
+    planId: randomUUID(),
+    workflowType: "booking_request",
+    replyDraft,
+    actions: Object.freeze([
+      Object.freeze({
+        type: "REPLY",
+        payload: Object.freeze({
+          channel: "whatsapp_web",
+          text: replyDraft,
+          field: "availability",
+          itemId: p.itemId,
+          itemLabel: p.itemLabel,
+          source: hasAlternatives
+            ? "booking_request_canonical_unavailable_alternative_offer"
+            : "booking_request_canonical_unavailable_no_alternatives",
+          verifiedAlternatives: Object.freeze(alternatives.map((row) => Object.freeze({ ...row }))),
+          execute: false,
+        }),
+      }),
+    ]),
+    persistenceIntent: Object.freeze({
+      rememberResolvedItem: true,
+      itemId: p.itemId,
+      rememberDuration: true,
+      durationDays: durationN,
+      bookingIntent: true,
+      ownerApprovalRequired: false,
+      execute: false,
+    }),
+  });
+}
+
+/**
  * Translate an already-selected booking_request decision into an action plan.
  *
  * @param {{
@@ -104,6 +206,17 @@ export function buildBookingRequestActionPlan({
     understanding.durationDays != null && Number.isFinite(Number(understanding.durationDays))
       ? Math.max(1, Math.floor(Number(understanding.durationDays)))
       : null;
+
+  const unavailablePlan = canonical
+    ? buildConfidentUnavailableBookingReplyPlan({
+        canonical,
+        itemId,
+        itemLabel,
+        durationDays,
+      })
+    : null;
+  if (unavailablePlan) return unavailablePlan;
+
   const createBookingExecute = canExecuteCreateBooking(canonical, {
     businessId,
     itemId,
