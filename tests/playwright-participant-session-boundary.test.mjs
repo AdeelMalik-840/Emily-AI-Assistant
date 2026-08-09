@@ -94,7 +94,7 @@ test("different group participants never share final participant memory", async 
   assert.notEqual(userA.conversationCustomerNumber, userB.conversationCustomerNumber);
 });
 
-test("missing sender scope preserves extracted participant identity without group-wide fallback", async () => {
+test("missing sender scope rejects extracted first-seen identity for reusable memory", async () => {
   const first = await captureGroupPayload({
     messageId: "unresolved-1",
     sourceRowKey: "unresolved-row-1",
@@ -111,12 +111,37 @@ test("missing sender scope preserves extracted participant identity without grou
     senderName: "Adeel Malik",
   });
 
-  assert.equal(first.participantKey, "adeel::first-seen-1");
-  assert.equal(second.participantKey, "adeel-malik::first-seen-2");
-  assert.equal(first.sourceParticipantKey, "adeel::first-seen-1");
-  assert.equal(second.sourceParticipantKey, "adeel-malik::first-seen-2");
+  assert.equal(first.participantKey, "");
+  assert.equal(second.participantKey, "");
+  assert.equal(first.sourceParticipantKey, undefined);
+  assert.equal(second.sourceParticipantKey, undefined);
   assert.notEqual(first.sessionKey, second.sessionKey);
-  assert.equal(first.conversationCustomerNumber, second.conversationCustomerNumber);
+  assert.notEqual(first.conversationCustomerNumber, second.conversationCustomerNumber);
+});
+
+test("two unresolved turns cannot share conversation memory", async () => {
+  const first = await captureGroupPayload({
+    messageId: "unresolved-memory-a",
+    sourceRowKey: "unresolved-memory-row-a",
+    senderAnchor: "",
+    participantKey: "same-name::first-seen-1",
+    senderName: "Same Name",
+  });
+  patchEmilySessionState(first.sessionKey, { privateMarker: "first-only" });
+
+  const second = await captureGroupPayload({
+    messageId: "unresolved-memory-b",
+    sourceRowKey: "unresolved-memory-row-b",
+    sourceMessageIndex: 2,
+    senderAnchor: "",
+    participantKey: "same-name::first-seen-1",
+    senderName: "Same Name",
+  });
+
+  assert.equal(first.participantKey, "");
+  assert.equal(second.participantKey, "");
+  assert.notEqual(first.sessionKey, second.sessionKey);
+  assert.equal(getEmilySessionState(second.sessionKey).privateMarker, undefined);
 });
 
 test("Civic availability then 10-day price retains Civic across display-name variation", async () => {

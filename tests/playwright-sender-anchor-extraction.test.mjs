@@ -148,6 +148,49 @@ test("F: missing data-id and missing DOM attrs keeps unresolved isolated session
   assert.notEqual(first.sessionKey, second.sessionKey);
 });
 
+test("F2: same display name without trusted sender evidence cannot reuse memory", async () => {
+  const first = await capturePayload({
+    messageId: "same-name-unresolved-a",
+    sourceRowKey: "same-name-unresolved-row-a",
+    senderAnchor: "",
+    senderName: "Same Customer",
+  });
+  const second = await capturePayload({
+    messageId: "same-name-unresolved-b",
+    sourceRowKey: "same-name-unresolved-row-b",
+    sourceMessageIndex: 2,
+    senderAnchor: "",
+    senderName: "Same Customer",
+  });
+
+  assert.equal(first.participantKey, "");
+  assert.equal(second.participantKey, "");
+  assert.notEqual(first.sessionKey, second.sessionKey);
+  patchEmilySessionState(first.sessionKey, { marker: "first-customer-only" });
+  assert.equal(getEmilySessionState(second.sessionKey).marker, undefined);
+});
+
+test("F3: verified participant phone preserves reusable identity", async () => {
+  const first = await capturePayload({
+    messageId: "phone-trusted-a",
+    senderAnchor: "",
+    senderName: "Phone Customer",
+    participantPhoneForDm: "923001112233",
+  });
+  const second = await capturePayload({
+    messageId: "phone-trusted-b",
+    sourceRowKey: "phone-trusted-row-b",
+    sourceMessageIndex: 2,
+    senderAnchor: "",
+    senderName: "Renamed Phone Customer",
+    participantPhoneForDm: "923001112233",
+  });
+
+  assert.match(first.participantKey, /^scope::/);
+  assert.equal(first.participantKey, second.participantKey);
+  assert.equal(first.sessionKey, second.sessionKey);
+});
+
 test("G: Civic then 3-day duration retains same participant session memory", async () => {
   const fixture = loadSyntheticCarRentalCatalogFixture();
   const civic = resolveCatalogItemFromMessage(fixture, "Civic available?");
