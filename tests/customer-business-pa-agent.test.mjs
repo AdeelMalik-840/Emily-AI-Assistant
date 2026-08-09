@@ -1615,12 +1615,10 @@ test("buffer: waiting_confirm kar do still confirm before PA", async () => {
   assert.equal(outcome?.messageMeta?.customerBusinessPaHandled, undefined);
 });
 
-test("messageProcessor and Brain workflows remain free of PA imports", async () => {
+test("Brain workflows remain free of PA imports", async () => {
   const { readFileSync } = await import("node:fs");
   const { join } = await import("node:path");
   const root = join(process.cwd());
-  const mp = readFileSync(join(root, "src/services/messageProcessor.js"), "utf8");
-  assert.doesNotMatch(mp, /customerBusinessPa/);
   const clar = readFileSync(
     join(root, "src/brain/workflows/ClarificationWorkflow.js"),
     "utf8"

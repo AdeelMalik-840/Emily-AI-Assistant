@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,6 +32,13 @@ function sourceFiles(directory) {
     return /\.(?:m?js)$/.test(entry.name) ? [path] : [];
   });
 }
+
+test("legacy messageProcessor is physically absent", () => {
+  assert.equal(
+    existsSync(resolve(root, "src/services/messageProcessor.js")),
+    false
+  );
+});
 
 for (const entry of [
   "src/brain/live/brainV2LivePipeline.js",
@@ -76,5 +83,14 @@ test("no production source module imports messageProcessor", () => {
         dependency.endsWith("/messageProcessor.js")
       )
     );
+  assert.deepEqual(offenders, []);
+});
+
+test("no test module imports messageProcessor", () => {
+  const offenders = sourceFiles(resolve(root, "tests")).filter((file) =>
+    relativeImports(file).some((dependency) =>
+      dependency.endsWith("/messageProcessor.js")
+    )
+  );
   assert.deepEqual(offenders, []);
 });
