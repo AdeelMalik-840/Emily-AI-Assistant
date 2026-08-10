@@ -297,23 +297,6 @@ function isItemAlreadyBookedResult(result) {
   return bookingResultCode(result) === "ITEM_ALREADY_BOOKED";
 }
 
-/**
- * @param {Record<string, unknown> | null | undefined} payload
- * @param {Record<string, unknown> | null | undefined} executionContext
- * @param {Record<string, unknown> | null | undefined} result
- */
-function buildItemAlreadyBookedReply(payload, executionContext, result) {
-  const itemName =
-    String(
-      result?.itemName ??
-        payload?.itemName ??
-        payload?.itemLabel ??
-        executionContext?.itemName ??
-        ""
-    ).trim() || "Ye car";
-  return `Sorry, ${itemName} is waqt available nahi hai. Aap Civic, Stonic ya koi aur car dekhna chahenge?`;
-}
-
 /** @deprecated use routeLiveActionPlan */
 export function routeInfoLiveActionPlan(actionPlan, flags) {
   return routeLiveActionPlan(actionPlan, flags);
@@ -362,14 +345,14 @@ export async function executeLiveSideEffects(p) {
       assertLiveExecutionActive(p.executionContext);
       sideEffectResults.CREATE_BOOKING = result;
       if (isItemAlreadyBookedResult(/** @type {Record<string, unknown>} */ (result))) {
-        customerReplyOverride = buildItemAlreadyBookedReply(
-          payload,
-          p.executionContext,
-          /** @type {Record<string, unknown>} */ (result)
-        );
+        // Defensive race only: CASE 1 should skip CREATE_BOOKING before this.
+        // Never invent alternatives (Civic/Stonic) — fail closed (suppress reply).
+        customerReplyOverride = null;
+        suppressCustomerReply = true;
         sideEffectResults.CREATE_BOOKING = {
           ...result,
-          customerReplyOverride,
+          customerReplyOverride: null,
+          customerReplySuppressed: true,
           skipRemainingActions: true,
         };
         skipRemainingActions = true;

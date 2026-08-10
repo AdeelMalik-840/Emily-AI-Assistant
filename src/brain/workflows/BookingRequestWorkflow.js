@@ -1,21 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
+import {
+  AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
+  AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
+  buildOfferedAlternativesAssist,
+} from "../availability/availabilityAssistContext.js";
+import {
+  buildUnavailableAvailabilityFailsafeReply,
+  buildOwnerCheckActionPlan,
+  resolveOwnerCheckWindowForPlan,
+} from "./AvailabilityInquiryWorkflow.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
 /** @typedef {import("../contracts/action.js").ActionPlan} ActionPlan */
-
-/**
- * Draft only when CREATE_BOOKING actually executes. Never used as a false
- * "checking" promise when execute is false.
- *
- * @param {string} itemLabel
- * @param {number | undefined} durationDays
- * @returns {string}
- */
-function buildGroupBookingSubmittedDraft(itemLabel, durationDays) {
-  return "Theek hai, mai check kr k btata hun.";
-}
 
 /**
  * @param {unknown} value
@@ -44,34 +43,163 @@ function hasDuration(value) {
 }
 
 /**
- * @param {Record<string, unknown> | null} canonical
- * @returns {{ bookingExecute: boolean, ownerExecute: boolean }}
- */
-function resolveExecutionPolicy(canonical) {
-  const actions = asObject(canonical?.actions);
-  const allowed = Array.isArray(actions?.allowed) ? actions.allowed.map(String) : [];
-  return {
-    bookingExecute: allowed.includes("CREATE_BOOKING"),
-    ownerExecute: allowed.includes("NOTIFY_OWNER"),
-  };
-}
-
-/**
+ * CASE 2 gate — canonical booking_request with resolved item+duration that is not CASE 1.
+ * Trusts resolveBusinessDecision.workflowType (single booking-intent source of truth).
+ * Plans existing owner-check / AVR lane; never CREATE_BOOKING.
+ *
  * @param {Record<string, unknown> | null} canonical
  * @param {{ itemId: unknown, durationDays: unknown, businessId: unknown }} payload
  */
-function canExecuteCreateBooking(canonical, payload) {
+function canPlanOwnerCheckForBookingRequest(canonical, payload) {
   const decision = asObject(canonical?.decision);
-  const policy = resolveExecutionPolicy(canonical);
   return (
+    canonical != null &&
     decision?.workflowType === "booking_request" &&
-    decision?.primaryIntent === "booking_request" &&
-    decision?.strongBookingCommand === true &&
-    policy.bookingExecute === true &&
     hasValue(payload.businessId) &&
     hasValue(payload.itemId) &&
     hasDuration(payload.durationDays)
   );
+}
+
+/**
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {Array<{ itemId: string, itemLabel: string }>}
+ */
+function readVerifiedAlternatives(availability) {
+  const rows = Array.isArray(availability?.verifiedAlternatives)
+    ? availability.verifiedAlternatives
+    : [];
+  /** @type {Array<{ itemId: string, itemLabel: string }>} */
+  const out = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const altId = String(row.itemId ?? "").trim();
+    const altLabel = String(row.itemLabel ?? "").trim();
+    if (!altId || !altLabel) continue;
+    out.push({ itemId: altId, itemLabel: altLabel });
+  }
+  return out;
+}
+
+/**
+ * CASE 1 — canonical booking_request but item already confidently unavailable:
+ * REPLY only from precomposed canonical unavailable facts. No booking mutation.
+ *
+ * @param {{
+ *   canonical: Record<string, unknown>,
+ *   itemId: string | null,
+ *   itemLabel: string,
+ *   durationDays: number | null,
+ * }} p
+ * @returns {ActionPlan | null}
+ */
+function buildConfidentUnavailableBookingReplyPlan(p) {
+  const decision = asObject(p.canonical?.decision);
+  if (decision?.workflowType !== "booking_request") return null;
+
+  const availability = asObject(asObject(p.canonical?.verified)?.availability);
+  if (!isConfidentInventoryUnavailable(availability)) return null;
+
+  const alternatives = readVerifiedAlternatives(availability);
+  const hasAlternatives = alternatives.length > 0;
+  const rawDuration =
+    p.durationDays ?? asObject(p.canonical?.turn)?.durationDays ?? null;
+  const hasRealDuration = hasDuration(rawDuration);
+  const durationN = hasRealDuration
+    ? Math.max(1, Math.floor(Number(rawDuration)))
+    : 1;
+  const composed = String(p.canonical?.unavailableCustomerReply ?? "").trim();
+  const failsafe = buildUnavailableAvailabilityFailsafeReply(
+    p.itemLabel,
+    durationN,
+    alternatives
+  );
+  // Same sanitization as availability unavailable offer: empty alts must not offer options.
+  const replyDraft =
+    composed &&
+    !(
+      !hasAlternatives && /koi aur option dekhun|other option|aur option/i.test(composed)
+    )
+      ? composed
+      : failsafe;
+
+  // Reuse AvailabilityInquiry offered_alternatives contract — no parallel booking context.
+  // Only when verified alternatives exist AND original requested duration is known.
+  const windowFactsBase = resolveOwnerCheckWindowForPlan({
+    canonical: p.canonical,
+    understanding: null,
+    assist: null,
+    durationN,
+  });
+  // Prefer canonical availability window when applied (same as AvailabilityInquiry offer).
+  const windowFacts =
+    availability?.windowApplied === true &&
+    String(availability.requestedStartAt ?? "").trim() &&
+    String(availability.requestedEndAt ?? "").trim()
+      ? {
+          requestedDates: windowFactsBase.requestedDates,
+          windowStartAt: String(availability.requestedStartAt).trim(),
+          windowEndAt: String(availability.requestedEndAt).trim(),
+        }
+      : windowFactsBase;
+  const sourceTurnKey =
+    String(asObject(p.canonical?.turn)?.sourceTurnKey ?? "").trim() || null;
+  const participantKey =
+    String(asObject(p.canonical?.participant)?.key ?? "").trim() ||
+    String(asObject(p.canonical?.sourceIdentity)?.participantKey ?? "").trim() ||
+    null;
+  const assist =
+    hasAlternatives && hasValue(p.itemId) && hasRealDuration
+      ? buildOfferedAlternativesAssist({
+          unavailableItemId: String(p.itemId),
+          unavailableItemLabel: p.itemLabel,
+          durationDays: durationN,
+          windowStartAt: windowFacts.windowStartAt,
+          windowEndAt: windowFacts.windowEndAt,
+          requestedDates: windowFacts.requestedDates,
+          pendingQuestion: replyDraft,
+          pendingPromptType: AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
+          assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
+          sourceTurnKey,
+          participantKey,
+        })
+      : null;
+
+  return Object.freeze({
+    planId: randomUUID(),
+    workflowType: "booking_request",
+    replyDraft,
+    actions: Object.freeze([
+      Object.freeze({
+        type: "REPLY",
+        payload: Object.freeze({
+          channel: "whatsapp_web",
+          text: replyDraft,
+          field: "availability",
+          itemId: p.itemId,
+          itemLabel: p.itemLabel,
+          source: hasAlternatives
+            ? "booking_request_canonical_unavailable_alternative_offer"
+            : "booking_request_canonical_unavailable_no_alternatives",
+          verifiedAlternatives: Object.freeze(alternatives.map((row) => Object.freeze({ ...row }))),
+          execute: false,
+        }),
+      }),
+    ]),
+    persistenceIntent: Object.freeze({
+      rememberResolvedItem: true,
+      itemId: p.itemId,
+      rememberDuration: hasRealDuration,
+      durationDays: hasRealDuration ? durationN : null,
+      rememberLastAvailabilityAssist: Boolean(assist),
+      lastAvailabilityAssist: assist,
+      clearLastAvailabilityAssist: !assist,
+      clearLastDurationDays: !hasRealDuration,
+      bookingIntent: true,
+      ownerApprovalRequired: false,
+      execute: false,
+    }),
+  });
 }
 
 /**
@@ -91,46 +219,109 @@ export function buildBookingRequestActionPlan({
   understanding,
   businessContext = null,
 }) {
-  const message = String(admittedTurn?.turn?.text ?? "");
   const itemLabel = String(understanding.resolvedItemLabel ?? "item").trim() || "item";
   const canonical = asObject(businessContext?.resolvedBusinessTurnContext);
-  const canonicalTurn = asObject(canonical?.turn);
-  const sourceIdentity = asObject(canonical?.sourceIdentity);
-  const policy = resolveExecutionPolicy(canonical);
   const businessId =
-    String(turnContext?.businessId ?? admittedTurn?.turn?.businessId ?? "").trim() || null;
-  const itemId = String(understanding.resolvedItemId ?? "").trim() || null;
-  const durationDays =
-    understanding.durationDays != null && Number.isFinite(Number(understanding.durationDays))
-      ? Math.max(1, Math.floor(Number(understanding.durationDays)))
-      : null;
-  const createBookingExecute = canExecuteCreateBooking(canonical, {
-    businessId,
-    itemId,
-    durationDays,
-  });
-  const notifyOwnerExecute = createBookingExecute && policy.ownerExecute === true;
-  // Truthfulness: never promise checking/booking when CREATE_BOOKING will not run.
-  const replyDraft = createBookingExecute
-    ? buildGroupBookingSubmittedDraft(itemLabel, durationDays ?? undefined)
-    : "";
+    String(
+      turnContext?.businessId ??
+        admittedTurn?.turn?.businessId ??
+        canonical?.businessId ??
+        ""
+    ).trim() || null;
+  const itemId =
+    String(
+      asObject(canonical?.resolvedItem)?.id ??
+        understanding.resolvedItemId ??
+        ""
+    ).trim() || null;
 
-  /** @type {import("../contracts/action.js").ActionPlanItem[]} */
-  const actions = [];
-  if (createBookingExecute) {
-    actions.push(
-      Object.freeze({
-        type: "REPLY",
-        payload: Object.freeze({
-          channel: "whatsapp_web",
-          text: replyDraft,
-          groupSafeBookingAck: true,
-          execute: false,
-        }),
+  // Canonical rental duration only — never re-parse message or read session here.
+  const canonicalDuration = asObject(canonical?.duration);
+  const durationDays = hasDuration(canonicalDuration?.days)
+    ? Math.max(1, Math.floor(Number(canonicalDuration.days)))
+    : hasDuration(asObject(canonical?.turn)?.durationDays)
+      ? Math.max(1, Math.floor(Number(asObject(canonical?.turn)?.durationDays)))
+      : hasDuration(asObject(canonical?.decision)?.durationDays)
+        ? Math.max(1, Math.floor(Number(asObject(canonical?.decision)?.durationDays)))
+        : null;
+
+  const unavailablePlan = canonical
+    ? buildConfidentUnavailableBookingReplyPlan({
+        canonical,
+        itemId,
+        itemLabel,
+        durationDays,
       })
-    );
-  } else {
-    actions.push(
+    : null;
+  if (unavailablePlan) return unavailablePlan;
+
+  // CASE 2 — appears available / not confidently unavailable:
+  // reuse existing owner-check AVR plan. Never CREATE_BOOKING here.
+  if (
+    canPlanOwnerCheckForBookingRequest(canonical, {
+      businessId,
+      itemId,
+      durationDays,
+    })
+  ) {
+    const durationN = Math.max(1, Math.floor(Number(durationDays)));
+    const freshAssist = null; // window comes from canonical duration / turn; assist cleared after owner-check
+    const windowFacts = resolveOwnerCheckWindowForPlan({
+      canonical,
+      understanding: /** @type {Record<string, unknown>} */ (understanding),
+      assist:
+        canonicalDuration?.source === "assist"
+          ? {
+              durationDays: durationN,
+              windowStartAt: canonicalDuration.windowStartAt,
+              windowEndAt: canonicalDuration.windowEndAt,
+            }
+          : freshAssist,
+      durationN,
+    });
+    const execute = asObject(canonical?.actions)?.availabilityOwnerCheckExecute === true;
+    return buildOwnerCheckActionPlan({
+      canonical: {
+        ...canonical,
+        businessId: canonical?.businessId ?? businessId,
+        resolvedItem: {
+          ...(asObject(canonical?.resolvedItem) || {}),
+          id: itemId,
+          displayLabel: itemLabel,
+          name: itemLabel,
+        },
+        turn: {
+          ...(asObject(canonical?.turn) || {}),
+          durationDays: durationN,
+          ...(windowFacts.requestedDates.length > 0
+            ? { requestedDates: windowFacts.requestedDates }
+            : {}),
+          ...(windowFacts.windowStartAt
+            ? { requestedStartAt: windowFacts.windowStartAt }
+            : {}),
+          ...(windowFacts.windowEndAt ? { requestedEndAt: windowFacts.windowEndAt } : {}),
+        },
+      },
+      itemId: /** @type {string} */ (itemId),
+      itemLabel,
+      durationN,
+      requestedDates: windowFacts.requestedDates,
+      windowStartAt: windowFacts.windowStartAt,
+      windowEndAt: windowFacts.windowEndAt,
+      execute,
+      clearAssist: true,
+      workflowType: "booking_request",
+      bookingIntent: true,
+    });
+  }
+
+  // Incomplete strong booking (missing item/duration/canonical): stay silent.
+  // Do not invent CREATE_BOOKING or a canned checking acknowledgment.
+  return Object.freeze({
+    planId: randomUUID(),
+    workflowType: "booking_request",
+    replyDraft: "",
+    actions: Object.freeze([
       Object.freeze({
         type: "NO_OP",
         payload: Object.freeze({
@@ -138,63 +329,12 @@ export function buildBookingRequestActionPlan({
           reason: "booking_request_no_executable_action",
           execute: false,
         }),
-      })
-    );
-  }
-  actions.push(
-    Object.freeze({
-      type: "CREATE_BOOKING",
-      payload: Object.freeze({
-        itemId,
-        itemLabel,
-        itemName: itemLabel,
-        durationDays,
-        sourceMessage: message,
-        sourceMessageId:
-          String(canonicalTurn?.sourceMessageId ?? sourceIdentity?.sourceMessageId ?? "").trim() ||
-          null,
-        sourceRowKey:
-          String(canonicalTurn?.sourceRowKey ?? sourceIdentity?.sourceRowKey ?? "").trim() ||
-          null,
-        sourceTurnKey:
-          String(canonicalTurn?.sourceTurnKey ?? sourceIdentity?.sourceTurnKey ?? "").trim() ||
-          null,
-        guaranteeKey:
-          String(canonicalTurn?.guaranteeKey ?? sourceIdentity?.guaranteeKey ?? "").trim() ||
-          null,
-        participantKey: String(sourceIdentity?.participantKey ?? "").trim() || null,
-        approvalStage: "pending_owner_approval",
-        execute: createBookingExecute,
       }),
-    }),
-    Object.freeze({
-      type: "NOTIFY_OWNER",
-      payload: Object.freeze({
-        reason: "booking_pending_owner_approval",
-        itemId,
-        execute: notifyOwnerExecute,
-      }),
-    }),
-    Object.freeze({
-      type: "UPDATE_STATE",
-      payload: Object.freeze({
-        clearPendingAction: true,
-        pendingActionType: "collect_duration",
-        stage: "pending_owner_approval",
-        execute: false,
-      }),
-    })
-  );
-
-  return Object.freeze({
-    planId: randomUUID(),
-    workflowType: "booking_request",
-    replyDraft,
-    actions: Object.freeze(actions),
+    ]),
     persistenceIntent: Object.freeze({
       bookingIntent: true,
       ownerApprovalRequired: true,
-      execute: createBookingExecute,
+      execute: false,
     }),
   });
 }

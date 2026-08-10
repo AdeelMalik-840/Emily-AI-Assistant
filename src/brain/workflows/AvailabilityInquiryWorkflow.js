@@ -509,7 +509,7 @@ export function logCanonicalAvailabilityUsed(p) {
  */
 export function logAvailabilityOwnerCheckPlanned(p) {
   console.log("[availability_owner_check_planned]", {
-    workflowType: "availability_inquiry",
+    workflowType: String(p.workflowType ?? "").trim() || "availability_inquiry",
     itemId: String(p.itemId ?? "").trim() || null,
     itemLabel: String(p.itemLabel ?? "").trim() || null,
     durationDays: p.durationDays ?? null,
@@ -771,6 +771,9 @@ function resolveLatestOwnerCheckWindow(p = {}) {
 }
 
 /**
+ * Shared owner-check / AVR action plan (AvailabilityInquiry + BookingRequest CASE 2).
+ * Callers that need a semantic booking_request intent pass workflowType explicitly.
+ *
  * @param {{
  *   canonical: Record<string, unknown>,
  *   itemId: string,
@@ -781,16 +784,19 @@ function resolveLatestOwnerCheckWindow(p = {}) {
  *   requestedDates?: string[] | null,
  *   windowStartAt?: string | null,
  *   windowEndAt?: string | null,
+ *   workflowType?: string | null,
+ *   bookingIntent?: boolean,
  * }} p
  * @returns {ActionPlan}
  */
-function buildOwnerCheckActionPlan(p) {
+export function buildOwnerCheckActionPlan(p) {
   const { canonical, itemId, itemLabel, durationN, execute, clearAssist = true } = p;
   const requestedDates = Array.isArray(p.requestedDates)
     ? p.requestedDates.map((entry) => String(entry ?? "").trim()).filter(Boolean)
     : [];
   const windowStartAt = String(p.windowStartAt ?? "").trim() || null;
   const windowEndAt = String(p.windowEndAt ?? "").trim() || null;
+  const workflowType = String(p.workflowType ?? "").trim() || null;
   const conversationalLabel = conversationalItemLabelFromResolvedItem({
     displayLabel: itemLabel,
     name: itemLabel,
@@ -815,6 +821,7 @@ function buildOwnerCheckActionPlan(p) {
   const replyDraft = "";
 
   logAvailabilityOwnerCheckPlanned({
+    workflowType,
     itemId,
     itemLabel,
     durationDays: durationN,
@@ -824,6 +831,7 @@ function buildOwnerCheckActionPlan(p) {
 
   return Object.freeze({
     planId: randomUUID(),
+    ...(workflowType ? { workflowType } : {}),
     replyDraft,
     ...(usePostExecuteReply
       ? { postExecuteCustomerReply: /** @type {"owner_check_result"} */ ("owner_check_result") }
@@ -886,6 +894,7 @@ function buildOwnerCheckActionPlan(p) {
       rememberDuration: true,
       durationDays: durationN,
       ownerCheckPlanned: true,
+      ...(p.bookingIntent === true ? { bookingIntent: true } : {}),
       clearLastAvailabilityAssist: clearAssist === true,
       clearPendingAction: true,
       clearEmilyPending: true,
@@ -893,6 +902,26 @@ function buildOwnerCheckActionPlan(p) {
       execute: false,
     }),
   });
+}
+
+/**
+ * Resolve request window facts for the shared owner-check plan.
+ * Exported so BookingRequestWorkflow reuses the same window rules.
+ *
+ * @param {{
+ *   canonical?: Record<string, unknown> | null,
+ *   understanding?: Record<string, unknown> | null,
+ *   assist?: Record<string, unknown> | null,
+ *   durationN?: number | null,
+ * }} [p]
+ * @returns {{
+ *   requestedDates: string[],
+ *   windowStartAt: string | null,
+ *   windowEndAt: string | null,
+ * }}
+ */
+export function resolveOwnerCheckWindowForPlan(p = {}) {
+  return resolveLatestOwnerCheckWindow(p);
 }
 
 /**

@@ -389,8 +389,11 @@ test("I: missing identity + itemless follow-up clarifies", () => {
   assert.equal(input.shouldClarifyItem, true);
 });
 
-test("J: booking request produces v2 action plan", async () => {
+test("J: booking request produces v2 owner-check action plan", async () => {
   enableV2LiveForSyntheticBusiness();
+  // Plan-only (execute off): same posture as prior CREATE_BOOKING plan assertions.
+  // Execute-on path needs sourceTurnKey/participant for AVR and is covered by Fix 2 unit tests.
+  process.env.EMILY_BRAIN_V2_AVAILABILITY_OWNER_CHECK_EXECUTE = "false";
   const fixture = loadSyntheticCarRentalCatalogFixture();
   const result = await runBrainV2LivePipeline({
     traceId: "booking-plan",
@@ -405,9 +408,22 @@ test("J: booking request produces v2 action plan", async () => {
   assert.equal(result.handled, true);
   assert.equal(result.workflowType, "booking_request");
   assert.ok(result.messageMeta?.actionPlan);
+  assert.equal(result.messageMeta.actionPlan.workflowType, "booking_request");
   assert.ok(
     Array.isArray(result.messageMeta?.actionPlan?.actions) &&
-      result.messageMeta.actionPlan.actions.some((a) => a.type === "CREATE_BOOKING")
+      result.messageMeta.actionPlan.actions.some(
+        (a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"
+      )
+  );
+  assert.equal(
+    result.messageMeta.actionPlan.actions.some((a) => a.type === "CREATE_BOOKING"),
+    false
+  );
+  assert.equal(
+    result.messageMeta.actionPlan.actions.find(
+      (a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"
+    )?.payload?.execute,
+    false
   );
 });
 
@@ -567,7 +583,7 @@ test("booking executor preserves ITEM_ALREADY_BOOKED from inventory", async () =
   assert.equal(result.itemName, "Toyota Corolla");
 });
 
-test("ITEM_ALREADY_BOOKED returns unavailable reply and skips owner notification", async () => {
+test("ITEM_ALREADY_BOOKED fail-closes customer reply and skips owner notification", async () => {
   const fake = createFakeBookingDb();
   seedActiveCorollaBooking(fake);
 
@@ -587,8 +603,10 @@ test("ITEM_ALREADY_BOOKED returns unavailable reply and skips owner notification
   assert.equal(result.sideEffectResults.NOTIFY_OWNER, undefined);
   assert.equal(result.bookingCreated, null);
   assert.equal(result.skipRemainingActions, true);
-  assert.match(result.reply, /Toyota Corolla is waqt available nahi hai/i);
-  assert.doesNotMatch(result.reply, /reply nahi bhej pa rahi/i);
+  assert.equal(result.customerReplySuppressed, true);
+  assert.equal(String(result.reply ?? "").trim(), "");
+  assert.doesNotMatch(String(result.reply ?? ""), /Civic|Stonic/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /reply nahi bhej pa rahi/i);
 });
 
 test("unexpected live booking failure still uses safe apology", async () => {
