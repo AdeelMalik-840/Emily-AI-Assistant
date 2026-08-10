@@ -88,7 +88,7 @@ test("orchestrator: pricing_with_duration yields reply-only action plan", () => 
   assert.deepEqual({ turnContext, admittedTurn }, inputSnapshot);
 });
 
-test("orchestrator: booking_request yields booking + owner + update-state plan", () => {
+test("orchestrator: booking_request yields owner-check plan (no direct CREATE_BOOKING)", () => {
   const turnContext = makeCollectDurationContext();
   const admittedTurn = makeAdmittedTurn("10 din k lye book kar do");
   const inputSnapshot = structuredClone({ turnContext, admittedTurn });
@@ -97,20 +97,55 @@ test("orchestrator: booking_request yields booking + owner + update-state plan",
     traceId: "orch-core-booking",
     admittedTurn,
     turnContext,
-    businessContext: { catalogItems: CATALOG_ITEMS },
+    businessContext: {
+      catalogItems: CATALOG_ITEMS,
+      resolvedBusinessTurnContext: {
+        businessId: "orch-core-biz",
+        decision: {
+          workflowType: "booking_request",
+          primaryIntent: "booking_request",
+          strongBookingCommand: true,
+        },
+        resolvedItem: {
+          id: "civic_2026_oriel_white",
+          displayLabel: "Honda Civic 2026 Oriel (White)",
+          name: "Honda Civic 2026 Oriel",
+        },
+        turn: { durationDays: 10 },
+        actions: {
+          availabilityOwnerCheckExecute: false,
+          allowed: ["AVAILABILITY_OWNER_CHECK_REQUIRED"],
+        },
+        verified: {
+          availability: {
+            status: "available",
+            isAvailable: true,
+            windowApplied: true,
+          },
+        },
+        participant: { key: "cust-1", identity: "stable" },
+        sourceIdentity: {
+          participantKey: "cust-1",
+          chatId: "leads",
+          chatType: "group",
+        },
+      },
+    },
   });
 
   assert.equal(result.workflowDecision.workflowType, "booking_request");
   assert.equal(isActionPlan(result.actionPlan), true);
-  assert.equal(result.actionPlan.actions.length, 4);
+  assert.equal(result.actionPlan.workflowType, "booking_request");
   assert.deepEqual(
     result.actionPlan.actions.map((a) => [a.type, a.payload.execute]),
     [
       ["REPLY", false],
-      ["CREATE_BOOKING", false],
-      ["NOTIFY_OWNER", false],
-      ["UPDATE_STATE", false],
+      ["AVAILABILITY_OWNER_CHECK_REQUIRED", false],
     ]
+  );
+  assert.equal(
+    result.actionPlan.actions.some((a) => a.type === "CREATE_BOOKING"),
+    false
   );
   assert.deepEqual({ turnContext, admittedTurn }, inputSnapshot);
 });

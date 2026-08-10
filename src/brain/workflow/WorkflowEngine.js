@@ -323,6 +323,31 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
     };
   }
 
+  // W2: when canonical decision is present and unresolved, do not invent
+  // booking_request from free-floating phrase/duration heuristics. Lifecycle
+  // gates above (contact, avail-duration pending, assist, collect_duration)
+  // already owned the turn when applicable.
+  const canonicalDecisionUnresolved =
+    decision != null && decisionWorkflowType === "unknown_clarification";
+  if (canonicalDecisionUnresolved) {
+    if (
+      Boolean(understanding.signals?.availabilityAsk) &&
+      understanding.resolvedItemId &&
+      !understanding.signals?.priceAsk
+    ) {
+      return {
+        workflowType: "availability_inquiry",
+        reason: "availability_ask_blocks_booking_continuation",
+        priority: 84,
+      };
+    }
+    return {
+      workflowType: "unknown_clarification",
+      reason: "canonical_decision_unresolved_no_phrase_booking_invent",
+      priority: 0,
+    };
+  }
+
   if (isExplicitBookingRequest(understanding, inboundText) && understanding.resolvedItemId) {
     return {
       workflowType: "booking_request",

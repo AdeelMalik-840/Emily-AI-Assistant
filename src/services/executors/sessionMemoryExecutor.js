@@ -51,10 +51,17 @@ export function applySessionMemoryFromActionPlan(p) {
     if (Number.isFinite(durationDays) && durationDays >= 1) {
       patch.lastDurationDays = Math.max(1, Math.floor(durationDays));
     }
+  } else if (persistence?.clearLastDurationDays === true) {
+    patch.lastDurationDays = null;
   }
 
   if (persistence?.clearLastAvailabilityAssist === true) {
     patch.lastAvailabilityAssist = null;
+    // Assist expiry/clear ends trusted duration continuation unless this same
+    // patch also remembers a fresh duration (handled above).
+    if (persistence?.rememberDuration !== true) {
+      patch.lastDurationDays = null;
+    }
   } else if (
     persistence?.rememberLastAvailabilityAssist === true &&
     persistence?.lastAvailabilityAssist &&

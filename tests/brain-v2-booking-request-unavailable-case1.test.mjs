@@ -146,8 +146,28 @@ test("CASE A: unavailable + Civic/Stonic alts → REPLY only from trusted unavai
     { itemId: CIVIC_ID, itemLabel: "Honda Civic 2026 Oriel (White)" },
     { itemId: STONIC_ID, itemLabel: "Kia Stonic EX Plus 2021 (White Color)" },
   ]);
+  assert.equal(plan.persistenceIntent?.rememberLastAvailabilityAssist, true);
+  assert.equal(plan.persistenceIntent?.lastAvailabilityAssist?.action, "offered_alternatives");
+  assert.equal(plan.persistenceIntent?.lastAvailabilityAssist?.unavailableItemId, COROLLA_ID);
+  assert.equal(plan.persistenceIntent?.lastAvailabilityAssist?.durationDays, 5);
+  assert.ok(plan.persistenceIntent?.lastAvailabilityAssist?.expiresAt);
+  assert.equal(plan.persistenceIntent?.clearLastAvailabilityAssist, false);
 });
 
+test("CASE A2: empty alts → no fake assist", () => {
+  const reply =
+    "Toyota Corolla (Metallic Grey) 5 din ke liye available nahi hai. Filhal koi dusri car available nahi hai.";
+  const plan = planFor(
+    unavailableCanonical({
+      alternatives: [],
+      unavailableCustomerReply: reply,
+    })
+  );
+  assertNoBookingMutation(plan);
+  assert.equal(plan.persistenceIntent?.rememberLastAvailabilityAssist, false);
+  assert.equal(plan.persistenceIntent?.lastAvailabilityAssist, null);
+  assert.equal(plan.persistenceIntent?.clearLastAvailabilityAssist, true);
+});
 test("CASE B: Swift-only alts → no invented Civic/Stonic", () => {
   const reply =
     "Toyota Corolla (Metallic Grey) 5 din ke liye available nahi hai. Swift available hai — dekhun?";
@@ -202,26 +222,40 @@ test("CASE C failsafe: empty composed + empty alts uses no-option failsafe", () 
   assert.doesNotMatch(String(plan.replyDraft), /Civic|Stonic/i);
 });
 
-test("CASE D: not confidently unavailable → CREATE_BOOKING path unchanged", () => {
-  const plan = planFor(availableCanonical());
+test("CASE D: not confidently unavailable → owner-check plan (no CREATE_BOOKING)", () => {
+  const plan = planFor({
+    ...availableCanonical(),
+    businessId: BUSINESS_ID,
+    actions: {
+      allowed: ["AVAILABILITY_OWNER_CHECK_REQUIRED"],
+      availabilityOwnerCheckExecute: true,
+    },
+  });
   assert.equal(plan.workflowType, "booking_request");
   assert.equal(
-    plan.actions.find((a) => a.type === "CREATE_BOOKING")?.payload?.execute,
+    plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
     true
   );
   assert.equal(
-    plan.actions.find((a) => a.type === "NOTIFY_OWNER")?.payload?.execute,
-    true
+    plan.actions.some((a) => a.type === "CREATE_BOOKING"),
+    false
   );
-  assert.match(String(plan.replyDraft), /mai check kr k btata hun/i);
+  assert.equal(
+    plan.actions.some((a) => a.type === "NOTIFY_OWNER"),
+    false
+  );
+  assert.equal(plan.postExecuteCustomerReply, "owner_check_result");
+  assert.equal(String(plan.replyDraft ?? "").trim(), "");
+  assert.doesNotMatch(String(plan.replyDraft ?? ""), /mai check kr k btata hun/i);
 });
 
-test("CASE E: BookingRequestWorkflow does not wire waiting_confirm / AVR create", () => {
+test("CASE E: BookingRequestWorkflow does not duplicate AVR / waiting_confirm logic", () => {
   const src = readFileSync(
     new URL("../src/brain/workflows/BookingRequestWorkflow.js", import.meta.url),
     "utf8"
   );
-  assert.doesNotMatch(src, /waiting_confirm|availabilityRequestId|AVAILABILITY_OWNER_CHECK/);
+  assert.doesNotMatch(src, /waiting_confirm|availabilityRequestId|createAvailabilityRequest/);
+  assert.match(src, /buildOwnerCheckActionPlan/);
 });
 
 test("CASE F: defensive ITEM_ALREADY_BOOKED race — no Civic/Stonic customer copy", async () => {

@@ -18,9 +18,9 @@
   ],
   "expectations": {
     "finalWorkflowType": "booking_request",
-    "mustCreateBooking": true,
-    "mustNotifyOwner": true,
-    "mustUseGroupBookingAck": true,
+    "mustNotCreateBooking": true,
+    "mustNotNotifyOwner": true,
+    "mustNotUseGroupBookingAck": true,
     "mustNotIncludePriceQuote": false
   }
 }

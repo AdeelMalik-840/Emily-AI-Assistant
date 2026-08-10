@@ -109,6 +109,154 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
 }
 
 /**
+ * Canonical rental duration for booking/pricing/owner-check windows.
+ * Never treats weak readiness `1` (kal/date_context) as rental days.
+ * Never inherits `lastDurationDays` without a trusted continuation co-signal.
+ *
+ * Precedence:
+ * 1. explicit current-message duration
+ * 2. fresh trusted availability assist
+ * 3. active trusted AVR lifecycle duration
+ * 4. gated session duration only with trustedContinuation co-signal
+ * 5. none
+ *
+ * @param {{
+ *   explicitDurationDays?: number | null,
+ *   freshAssist?: Record<string, unknown> | null,
+ *   activeAvrDurationDays?: number | null,
+ *   sessionDurationDays?: number | null,
+ *   trustedContinuation?: boolean,
+ * }} p
+ * @returns {{
+ *   days: number | null,
+ *   source: "explicit" | "assist" | "avr" | "gated_session" | "none",
+ *   trustedContinuation: boolean,
+ *   windowStartAt: string | null,
+ *   windowEndAt: string | null,
+ *   calendarRelative: "tomorrow" | null,
+ * }}
+ */
+export function resolveCanonicalRentalDuration(p = {}) {
+  const empty = Object.freeze({
+    days: null,
+    source: /** @type {const} */ ("none"),
+    trustedContinuation: false,
+    windowStartAt: null,
+    windowEndAt: null,
+    calendarRelative: null,
+  });
+
+  const explicit = Number(p.explicitDurationDays);
+  if (Number.isFinite(explicit) && explicit >= 1) {
+    return Object.freeze({
+      days: Math.max(1, Math.floor(explicit)),
+      source: /** @type {const} */ ("explicit"),
+      trustedContinuation: false,
+      windowStartAt: null,
+      windowEndAt: null,
+      calendarRelative: null,
+    });
+  }
+
+  const assist =
+    p.freshAssist && typeof p.freshAssist === "object"
+      ? /** @type {Record<string, unknown>} */ (p.freshAssist)
+      : null;
+  const assistDays = Number(assist?.durationDays);
+  if (assist && Number.isFinite(assistDays) && assistDays >= 1) {
+    return Object.freeze({
+      days: Math.max(1, Math.floor(assistDays)),
+      source: /** @type {const} */ ("assist"),
+      trustedContinuation: true,
+      windowStartAt: String(assist.windowStartAt ?? "").trim() || null,
+      windowEndAt: String(assist.windowEndAt ?? "").trim() || null,
+      calendarRelative: null,
+    });
+  }
+
+  const avrDays = Number(p.activeAvrDurationDays);
+  if (Number.isFinite(avrDays) && avrDays >= 1) {
+    return Object.freeze({
+      days: Math.max(1, Math.floor(avrDays)),
+      source: /** @type {const} */ ("avr"),
+      trustedContinuation: true,
+      windowStartAt: null,
+      windowEndAt: null,
+      calendarRelative: null,
+    });
+  }
+
+  const sessionDays = Number(p.sessionDurationDays);
+  if (
+    p.trustedContinuation === true &&
+    Number.isFinite(sessionDays) &&
+    sessionDays >= 1
+  ) {
+    return Object.freeze({
+      days: Math.max(1, Math.floor(sessionDays)),
+      source: /** @type {const} */ ("gated_session"),
+      trustedContinuation: true,
+      windowStartAt: null,
+      windowEndAt: null,
+      calendarRelative: null,
+    });
+  }
+
+  return empty;
+}
+
+/**
+ * Trusted co-signals that may authorize gated session duration inheritance.
+ * Assist / active AVR own the request window. emilyPending and duration-ask
+ * pending do NOT — pending often means duration is missing or unrelated.
+ *
+ * @param {{
+ *   freshAssist?: Record<string, unknown> | null,
+ *   memorySnapshot?: Record<string, unknown> | null,
+ *   activeAvrDurationDays?: number | null,
+ *   participantKey?: string | null,
+ * }} p
+ * @returns {boolean}
+ */
+export function hasTrustedDurationContinuation(p = {}) {
+  if (p.freshAssist) return true;
+  const avrDays = Number(p.activeAvrDurationDays);
+  if (Number.isFinite(avrDays) && avrDays >= 1) return true;
+  // Do not treat emilyPending / collect-duration pending as duration ownership.
+  return false;
+}
+
+/**
+ * Optional active AVR duration from session memory (no new timer service).
+ * @param {Record<string, unknown> | null | undefined} memory
+ * @returns {number | null}
+ */
+function readActiveAvrDurationDaysFromMemory(memory) {
+  if (!memory || typeof memory !== "object") return null;
+  const candidates = [
+    memory.activeAvailabilityRequest,
+    memory.lastAvailabilityRequest,
+    memory.pendingAvailabilityRequest,
+  ];
+  for (const raw of candidates) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const row = /** @type {Record<string, unknown>} */ (raw);
+    const status = String(row.status ?? "").trim().toLowerCase();
+    if (
+      status &&
+      ["rejected", "expired", "cancelled", "canceled", "superseded", "closed"].includes(
+        status
+      )
+    ) {
+      continue;
+    }
+    const days = Number(row.requestedDuration ?? row.durationDays ?? row.requestedDurationDays);
+    if (Number.isFinite(days) && days >= 1) return Math.max(1, Math.floor(days));
+  }
+  return null;
+}
+
+/**
  * Calendar relative for availability overlap only.
  * Explicit numeric duration always wins; "kal"/tomorrow uses calendar window.
  *
@@ -204,16 +352,23 @@ function buildContextToPersist(p) {
  *   itemFacts: Record<string, unknown>,
  *   participantFacts: Record<string, unknown>,
  *   memoryPendingAction?: unknown,
+ *   canonicalDurationDays?: number | null,
  * }} p
  */
 function resolveBusinessDecision(p) {
   const signals = p.signals ?? {};
   const understanding = p.understanding ?? {};
   const resolvedItemId = hasValue(p.itemFacts?.id) ? String(p.itemFacts.id) : null;
-  const durationDays =
+  const understandingDuration =
     understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
       ? Math.max(1, Math.floor(Number(understanding.durationDays)))
       : null;
+  const canonicalDuration =
+    p.canonicalDurationDays != null && Number.isFinite(Number(p.canonicalDurationDays))
+      ? Math.max(1, Math.floor(Number(p.canonicalDurationDays)))
+      : null;
+  // Single SoT: prefer packed canonical rental duration; fall back to message-only.
+  const durationDays = canonicalDuration ?? understandingDuration;
   const requestedField =
     String(understanding?.askedField ?? signals.askedFieldRaw ?? signals.askedField ?? "").trim() || null;
   const weakContextSignals = collectWeakContextSignals(p.normalizedMessage);
@@ -293,12 +448,21 @@ function resolveBusinessDecision(p) {
     replyType = "availability_answer";
     confidence = "high";
     reason = "item_duration_need_is_owner_availability_check";
-  } else if (strongBookingCommand && hasResolvedItem) {
+  } else if (
+    hasResolvedItem &&
+    (strongBookingCommand || Boolean(signals.bookingCommitment))
+  ) {
+    // Single booking-intent source of truth for Fix 1/2 gates: workflowType.
+    // bookingCommitment already powers WorkflowEngine explicit_booking_commitment;
+    // do not require a second stronger phrase test downstream. Weak need /
+    // price / availability branches above still win first.
     primaryIntent = "booking_request";
     workflowType = "booking_request";
     replyType = "booking_ack";
     confidence = "high";
-    reason = "strong_booking_command";
+    reason = strongBookingCommand
+      ? "strong_booking_command"
+      : "explicit_booking_commitment";
     sideEffectsAllowed = ["booking_request"];
   } else if (clearBusinessIntentWithoutResolvedItem) {
     primaryIntent = "unlisted_item";
@@ -478,13 +642,6 @@ export async function resolveBusinessTurnContext(params) {
   };
   const actionFacts = resolveActionPolicyFacts(flags);
 
-  const durationDaysForFacts =
-    understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
-      ? Math.max(1, Math.floor(Number(understanding.durationDays)))
-      : turnContextInput?.duration != null && Number.isFinite(Number(turnContextInput.duration))
-        ? Math.max(1, Math.floor(Number(turnContextInput.duration)))
-        : null;
-
   const memorySnapshot =
     (params.turnContext?.memorySnapshot &&
     typeof params.turnContext.memorySnapshot === "object" &&
@@ -502,16 +659,50 @@ export async function resolveBusinessTurnContext(params) {
     memorySnapshot.lastAvailabilityAssist
   );
 
+  const explicitDurationDaysForFacts =
+    understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
+      ? Math.max(1, Math.floor(Number(understanding.durationDays)))
+      : turnContextInput?.duration != null && Number.isFinite(Number(turnContextInput.duration))
+        ? Math.max(1, Math.floor(Number(turnContextInput.duration)))
+        : null;
+
+  const activeAvrDurationDays = readActiveAvrDurationDaysFromMemory(memorySnapshot);
+  const participantKeyForDuration =
+    String(participantFacts?.participant?.key ?? "").trim() ||
+    String(sourceIdentity?.participantKey ?? "").trim() ||
+    null;
+  const trustedContinuation = hasTrustedDurationContinuation({
+    freshAssist: lastAvailabilityAssist,
+    memorySnapshot,
+    activeAvrDurationDays,
+    participantKey: participantKeyForDuration,
+  });
+  const sessionDurationDays =
+    memorySnapshot.lastDurationDays != null &&
+    Number.isFinite(Number(memorySnapshot.lastDurationDays))
+      ? Math.max(1, Math.floor(Number(memorySnapshot.lastDurationDays)))
+      : null;
+
+  const canonicalDuration = resolveCanonicalRentalDuration({
+    explicitDurationDays: explicitDurationDaysForFacts,
+    freshAssist: lastAvailabilityAssist,
+    activeAvrDurationDays,
+    sessionDurationDays,
+    trustedContinuation,
+  });
+
   // Readiness/metadata duration (may be 1 for date_context). Overlap window is separate.
+  // Rental/booking windows must use canonicalDuration.days — never weak readiness 1 alone.
   const durationDaysResolved = resolveOwnerCheckAlignedDurationDays({
-    explicitDurationDays: durationDaysForFacts,
+    explicitDurationDays: explicitDurationDaysForFacts,
     assistDurationDays: lastAvailabilityAssist?.durationDays,
     normalizedMessage,
   });
   const calendarRelative = resolveAvailabilityCalendarRelative({
-    explicitDurationDays: durationDaysForFacts,
+    explicitDurationDays: explicitDurationDaysForFacts,
     normalizedMessage,
   });
+  const rentalDurationDays = canonicalDuration.days;
   const availabilityTimeZone = resolveBusinessTimeZoneForAvailability({
     businessTimeZone: params.businessTimeZone ?? params.timeZone ?? null,
   });
@@ -526,8 +717,11 @@ export async function resolveBusinessTurnContext(params) {
     itemName: itemFacts.name,
     signals,
     requestedField: understanding?.askedField ?? turnContextInput?.requestedField ?? null,
-    // Do not let readiness durationDays=1 drive rolling overlap for "kal".
-    durationDays: calendarRelative ? null : durationDaysResolved,
+    // Prefer canonical rental days; fall back to readiness only when calendarRelative
+    // is unset and no rental days (legacy owner-check readiness path).
+    durationDays: calendarRelative
+      ? null
+      : rentalDurationDays ?? durationDaysResolved,
     calendarRelative,
     timeZone: availabilityTimeZone,
     getBookingsForItemFn: params.getBookingsForItemFn,
@@ -535,12 +729,18 @@ export async function resolveBusinessTurnContext(params) {
       if (calendarRelative) {
         return { nowMs: clockNowMs };
       }
-      const startMs = Date.parse(String(lastAvailabilityAssist?.windowStartAt ?? ""));
+      const startMs = Date.parse(
+        String(canonicalDuration.windowStartAt ?? lastAvailabilityAssist?.windowStartAt ?? "")
+      );
       const hasExplicitCurrentDates =
         Array.isArray(understanding?.requestedDates) &&
         understanding.requestedDates.some((d) => String(d ?? "").trim());
       // Reuse stored assist start whenever follow-up keeps the original duration window.
-      if (lastAvailabilityAssist && Number.isFinite(startMs) && !hasExplicitCurrentDates) {
+      if (
+        (canonicalDuration.source === "assist" || lastAvailabilityAssist) &&
+        Number.isFinite(startMs) &&
+        !hasExplicitCurrentDates
+      ) {
         return { nowMs: startMs };
       }
       return { nowMs: clockNowMs };
@@ -635,7 +835,8 @@ export async function resolveBusinessTurnContext(params) {
       1,
       Math.floor(
         Number(
-          durationDaysResolved ??
+          rentalDurationDays ??
+            durationDaysResolved ??
             lastAvailabilityAssist?.durationDays ??
             understanding?.durationDays ??
             1
@@ -682,7 +883,7 @@ export async function resolveBusinessTurnContext(params) {
           askedField: understanding?.askedField ?? null,
         },
         verifiedAlternatives,
-        requestedDurationDays: durationDaysResolved,
+        requestedDurationDays: rentalDurationDays ?? durationDaysResolved,
         requestedStartAt: lastAvailabilityAssist.windowStartAt,
         requestedEndAt: lastAvailabilityAssist.windowEndAt,
         pendingQuestion: lastAvailabilityAssist.pendingQuestion ?? null,
@@ -744,13 +945,29 @@ export async function resolveBusinessTurnContext(params) {
       turnShape: turnContextInput?.turnShape ?? null,
       requestedField:
         understanding?.askedField ?? turnContextInput?.requestedField ?? null,
-      durationDays: durationDaysResolved ?? understanding?.durationDays ?? turnContextInput?.duration ?? null,
+      // Canonical rental days only — never weak readiness `1` as booking duration.
+      durationDays: rentalDurationDays,
       confidence: understanding?.itemConfidence ?? null,
       sourceMessageId,
       sourceRowKey,
       guaranteeKey,
       sourceTurnKey,
+      ...(canonicalDuration.windowStartAt
+        ? { requestedStartAt: canonicalDuration.windowStartAt }
+        : {}),
+      ...(canonicalDuration.windowEndAt
+        ? { requestedEndAt: canonicalDuration.windowEndAt }
+        : {}),
     },
+
+    duration: Object.freeze({
+      days: canonicalDuration.days,
+      source: canonicalDuration.source,
+      trustedContinuation: canonicalDuration.trustedContinuation,
+      windowStartAt: canonicalDuration.windowStartAt,
+      windowEndAt: canonicalDuration.windowEndAt,
+      calendarRelative,
+    }),
 
     signals: {
       priceAsk: Boolean(signals.priceAsk),
@@ -841,6 +1058,7 @@ export async function resolveBusinessTurnContext(params) {
     itemFacts,
     participantFacts,
     memoryPendingAction,
+    canonicalDurationDays: rentalDurationDays,
   });
 
   resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);
@@ -852,7 +1070,7 @@ export async function resolveBusinessTurnContext(params) {
       null,
     understanding: {
       ...(understanding && typeof understanding === "object" ? understanding : {}),
-      durationDays: durationDaysResolved ?? understanding?.durationDays ?? null,
+      durationDays: rentalDurationDays ?? understanding?.durationDays ?? null,
       resolvedItemId: itemFacts.id,
       itemSource: understanding?.itemSource ?? null,
       signals,
