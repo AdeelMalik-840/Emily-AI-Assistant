@@ -316,7 +316,13 @@ export function buildGroupPostExecutePendingAvailabilityContract(facts = {}) {
 export function buildWaitingConfirmVerifiedQuotationContract(facts = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
   const guardFacts = buildWaitingConfirmGuardFacts(f);
-  const hasQuote = guardFacts.totalAmount != null;
+  const hasQuote =
+    guardFacts.totalAmount != null ||
+    guardFacts.dailyRate != null ||
+    (Array.isArray(guardFacts.activeBookings) &&
+      guardFacts.activeBookings.some(
+        (row) => row?.totalAmount != null || row?.dailyRate != null
+      ));
   const lang = langOptsFromFacts(f);
   return buildCustomerReplyContract({
     channel: "dm",

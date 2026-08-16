@@ -6,6 +6,7 @@
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { resolveAvailabilityApprovedPriceQuote } from "../../services/availabilityMessageBuilder.js";
+import { isWaitingConfirmLifecycleActive } from "../../services/availabilityRequestService.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 import {
   CUSTOMER_CLAIMS,
@@ -67,6 +68,23 @@ export function isWaitingConfirmDmBookingPromptActive(turnContext) {
     clean(ctx.lastCustomerDmPromptType, 80) ||
     clean(facts.lastCustomerDmPromptType, 80);
   return promptType === "booking_confirmation_prompt";
+}
+
+/** Active transaction state is independent from the latest conversational prompt. */
+export function isWaitingConfirmDmTransactionActive(turnContext) {
+  const ctx = turnContext && typeof turnContext === "object" ? turnContext : {};
+  const facts = ctx.facts && typeof ctx.facts === "object" ? ctx.facts : {};
+  const avr =
+    ctx.activeAvailabilityRequest &&
+    typeof ctx.activeAvailabilityRequest === "object"
+      ? ctx.activeAvailabilityRequest
+      : facts.availabilityRequest && typeof facts.availabilityRequest === "object"
+        ? facts.availabilityRequest
+        : {};
+  return (
+    facts.waitingConfirmTransactionActive === true &&
+    isWaitingConfirmLifecycleActive(avr)
+  );
 }
 
 /**
@@ -134,8 +152,8 @@ export function evaluateWaitingConfirmDmBrainConfirmGuard({
   if (confidence == null || confidence < WAITING_CONFIRM_DM_CONFIRM_CONFIDENCE_MIN) {
     reasons.push("CONFIDENCE_TOO_LOW");
   }
-  if (!isWaitingConfirmDmBookingPromptActive(turnContext)) {
-    reasons.push("BOOKING_PROMPT_NOT_ACTIVE");
+  if (!isWaitingConfirmDmTransactionActive(turnContext)) {
+    reasons.push("WAITING_CONFIRM_TRANSACTION_NOT_ACTIVE");
   }
   return { ok: reasons.length === 0, reasons };
 }
@@ -149,6 +167,7 @@ export function packWaitingConfirmDmTurnContext({
   conversationHistory = null,
   request,
   catalogRow = null,
+  historicalBookingContext = null,
 } = {}) {
   const req = request && typeof request === "object" ? request : {};
   const quote =
@@ -167,6 +186,31 @@ export function packWaitingConfirmDmTurnContext({
       ? Math.max(1, Math.floor(Number(req.requestedDuration)))
       : null;
   const row = catalogRow && typeof catalogRow === "object" ? catalogRow : {};
+  const historical =
+    historicalBookingContext && typeof historicalBookingContext === "object"
+      ? {
+          booking:
+            historicalBookingContext.booking &&
+            typeof historicalBookingContext.booking === "object"
+              ? historicalBookingContext.booking
+              : null,
+          bookingCandidates: Array.isArray(
+            historicalBookingContext.bookingCandidates
+          )
+            ? historicalBookingContext.bookingCandidates.slice(0, 8)
+            : [],
+          bookingFocus:
+            historicalBookingContext.bookingFocus &&
+            typeof historicalBookingContext.bookingFocus === "object"
+              ? historicalBookingContext.bookingFocus
+              : null,
+          known:
+            historicalBookingContext.known &&
+            typeof historicalBookingContext.known === "object"
+              ? historicalBookingContext.known
+              : null,
+        }
+      : null;
   const profile =
     row.businessProfile && typeof row.businessProfile === "object"
       ? row.businessProfile
@@ -189,6 +233,8 @@ export function packWaitingConfirmDmTurnContext({
     itemLabel: clean(req.itemLabel) || null,
     requestedDuration: durationDays,
     linkedBookingId: clean(req.linkedBookingId) || null,
+    supersededByAvailabilityRequestId:
+      clean(req.supersededByAvailabilityRequestId) || null,
     confirmExpiresAt: req.confirmExpiresAt ?? null,
     customerConfirmationChannel: clean(req.customerConfirmationChannel) || null,
   };
@@ -203,10 +249,65 @@ export function packWaitingConfirmDmTurnContext({
   const facts = {
     businessId: clean(businessId) || null,
     customerPhoneDigits: String(customerPhone ?? "").replace(/\D/g, "") || null,
+    referentOptions: [
+      {
+        targetContext: "pending_availability",
+        targetId: availabilityRequest.id,
+        lifecycleRole: "current_pending_transaction",
+        itemId: availabilityRequest.itemId,
+        itemLabel: availabilityRequest.itemLabel,
+        durationDays: availabilityRequest.requestedDuration,
+        dailyRate: quote?.dailyRate ?? null,
+        totalAmount: quote?.total ?? null,
+      },
+      ...(historical?.booking
+        ? [
+            {
+              targetContext: "confirmed_booking",
+              targetId: clean(historical.booking.id) || null,
+              lifecycleRole: "older_confirmed_booking",
+              itemId: clean(historical.booking.itemId) || null,
+              itemLabel:
+                clean(
+                  historical.booking.itemLabel ?? historical.booking.itemName
+                ) || null,
+              durationDays:
+                historical.booking.durationDays != null &&
+                Number.isFinite(Number(historical.booking.durationDays))
+                  ? Math.floor(Number(historical.booking.durationDays))
+                  : null,
+              dailyRate:
+                historical.booking.dailyRate != null &&
+                Number.isFinite(Number(historical.booking.dailyRate))
+                  ? Number(historical.booking.dailyRate)
+                  : null,
+              totalAmount:
+                historical.booking.totalAmount != null &&
+                Number.isFinite(Number(historical.booking.totalAmount))
+                  ? Number(historical.booking.totalAmount)
+                  : null,
+            },
+          ]
+        : []),
+    ],
     lastEmilyMessage,
     lastCustomerDmPromptType,
     bookingPromptActive,
+    waitingConfirmTransactionActive:
+      clean(req.status) === "approved" &&
+      clean(req.approvalCustomerNotificationStatus) === "sent" &&
+      clean(req.customerConfirmationStatus) === "waiting_confirm" &&
+      !clean(req.linkedBookingId) &&
+      !clean(req.supersededByAvailabilityRequestId),
     availabilityRequest,
+    pendingAvailabilityRequest: availabilityRequest,
+    historicalBookingContext: historical,
+    activeConfirmedBooking:
+      historical?.booking && typeof historical.booking === "object"
+        ? historical.booking
+        : null,
+    confirmedBookingCandidates: historical?.bookingCandidates ?? [],
+    activeBookings: historical?.bookingCandidates ?? [],
     quotedPrice: quote
       ? {
           total: quote.total ?? null,
@@ -410,6 +511,15 @@ export function parseWaitingConfirmDmDecision(raw) {
     asksForBookingConfirmation,
     outboundPromptType: outboundPromptType || null,
     requestedInfoType: clean(parsed.requestedInfoType, 40) || null,
+    targetContext: [
+      "pending_availability",
+      "confirmed_booking",
+      "general",
+      "unclear",
+    ].includes(clean(parsed.targetContext, 40))
+      ? clean(parsed.targetContext, 40)
+      : "unclear",
+    targetId: clean(parsed.targetId, 160) || null,
     shouldReply,
     customerReply,
     action,
@@ -434,6 +544,8 @@ function defaultDecision(overrides = {}) {
     asksForBookingConfirmation: false,
     outboundPromptType: null,
     requestedInfoType: null,
+    targetContext: "unclear",
+    targetId: null,
     shouldReply: false,
     customerReply: "",
     action: "silence",
@@ -457,6 +569,16 @@ const WAITING_CONFIRM_DM_OUTPUT_SCHEMA = {
     customerIsDeclining: { type: "boolean" },
     customerWantsChange: { type: "boolean" },
     requestedInfoType: { type: ["string", "null"] },
+    targetContext: {
+      type: "string",
+      enum: [
+        "pending_availability",
+        "confirmed_booking",
+        "general",
+        "unclear",
+      ],
+    },
+    targetId: { type: ["string", "null"] },
     shouldReply: { type: "boolean" },
     customerReply: { type: "string" },
     action: {
@@ -487,6 +609,8 @@ const WAITING_CONFIRM_DM_OUTPUT_SCHEMA = {
     "customerIsDeclining",
     "customerWantsChange",
     "requestedInfoType",
+    "targetContext",
+    "targetId",
     "shouldReply",
     "customerReply",
     "action",
@@ -551,11 +675,14 @@ AVR approved, waiting_confirm Cloud DM.
 Decide meaning from latest message + last Emily + history + VERIFIED_FACTS_JSON (not keyword lists).
 Return STRICT JSON only (schema enforced). Include replySemantics for validation.
 Match customerLanguageStyle in replySemantics.languageStyle and in customerReply wording.
-Example shape: {"conversationStage":"booking_offer","customerMood":null,"customerIntent":"ask_fact","situation":"awaiting_confirm","customerIsConfirmingBooking":false,"customerIsAskingQuestion":true,"customerIsDeclining":false,"customerWantsChange":false,"requestedInfoType":null,"shouldReply":true,"customerReply":"...","action":"reply","confidence":0.9,"safetyNotes":null,"reason":"price_question","asksForBookingConfirmation":false,"replySemantics":{"claims":["quotation_verified"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+Example shape: {"conversationStage":"booking_offer","customerMood":null,"customerIntent":"ask_fact","situation":"awaiting_confirm","customerIsConfirmingBooking":false,"customerIsAskingQuestion":true,"customerIsDeclining":false,"customerWantsChange":false,"requestedInfoType":null,"targetContext":"pending_availability","targetId":"the trusted AVR id","shouldReply":true,"customerReply":"...","action":"reply","confidence":0.9,"safetyNotes":null,"reason":"price_question","asksForBookingConfirmation":false,"replySemantics":{"claims":["quotation_verified"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 action: confirm_booking|decline_request|change_request|reply|silence|clarify|none
-Natural confirm after Emily's book-confirm prompt (e.g. "Haan book kar do", "Yes, please book it.") → action=confirm_booking (not clarify/reply). After Q&A ambiguous ack ≠ confirm. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social no/thanks after Q&A → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up.
+The active pending availability transaction remains active through informational Q&A. Decide the referent and meaning semantically from the latest message, full dialogue, pendingAvailabilityRequest, and historicalBookingContext. Never substitute an older confirmed booking for the pending transaction before interpretation. A question is not confirmation; a clear semantic confirmation of the pending transaction uses action=confirm_booking. Questions/negotiate → facts-only reply; never invent amounts/policies/discounts. Clear offer decline → decline_request. Social turns → silence/reply. Change car/duration → change_request (no mutation). No pamiss/owner follow-up.
+First choose the matching entry from referentOptions using the latest CUSTOMER_MESSAGE. Copy its targetContext and targetId exactly. Use general only for business/social facts and unclear when no referent can be resolved.
+The latest CUSTOMER_MESSAGE has highest priority for referent selection. If it identifies an item or reference that differs from the pending item and exactly belongs to a historical confirmed booking, targetContext MUST be confirmed_booking with that booking id. Pending-transaction precedence MUST NOT erase an explicit historical referent. Select the referent before choosing the action.
+If the customer proposes a duration, item, or date different from the pending transaction, action MUST be change_request and customerWantsChange=true, even when phrased as a statement. The proposed replacement value is not a verified current fact to echo in a read-only reply.
 If your reply intentionally asks the customer to confirm booking again, set asksForBookingConfirmation=true (structured). Do not set it for ordinary Q&A answers.
-When stating a verified total from facts.quotedPrice, include the exact total digits (e.g. 15000) in customerReply and claim quotation_verified.
+When stating a price, use only the exact verified amount from the selected targetContext and claim quotation_verified.
 When action=confirm_booking|decline_request|change_request: set customerReply to "" (final wording is composed AFTER deterministic validate/execute). Decide meaning/action only. Do NOT claim booking created, confirmed, declined-complete wording as final outbound, or use extension language ("aage barhati", extend, process karti). Do not paste the customer's message back.
 When action=reply|clarify: customerReply is the final customer-facing answer from trusted facts (read-only; no booking executor).`;
 
@@ -578,18 +705,16 @@ When action=reply|clarify: customerReply is the final customer-facing answer fro
     ...(factsObj?.quotedPrice?.total != null &&
     Number.isFinite(Number(factsObj.quotedPrice.total))
       ? {
-          verifiedQuotedTotal: Math.floor(Number(factsObj.quotedPrice.total)),
-          verifiedQuotedCurrency:
+          pendingAvailabilityQuotedTotal: Math.floor(
+            Number(factsObj.quotedPrice.total)
+          ),
+          pendingAvailabilityQuotedCurrency:
             String(factsObj.quotedPrice.currency ?? "PKR").slice(0, 8) || "PKR",
         }
       : {}),
   })}\n\n${languageDirective}`;
-  if (
-    factsObj?.quotedPrice?.total != null &&
-    Number.isFinite(Number(factsObj.quotedPrice.total))
-  ) {
-    userPayload += `\nWhen answering a price/total question, customerReply MUST include the exact digits ${Math.floor(Number(factsObj.quotedPrice.total))}.`;
-  }
+  userPayload +=
+    "\nFor any price/total answer, first select targetContext, then use only that target's verified digits.";
 
   const completionFn =
     typeof __chatCompletionsCreateForTests === "function"
@@ -695,19 +820,20 @@ When action=reply|clarify: customerReply is the final customer-facing answer fro
           decision.customerReply = "";
           decision.shouldReply = false;
         } else {
-          const claims = Array.isArray(decision.replySemantics?.claims)
-            ? decision.replySemantics.claims
-            : [];
-          const askNeedsQuote =
-            decision.customerIsAskingQuestion === true ||
-            claims.includes("quotation_verified");
+          const asksForVerifiedTotal =
+            decision.customerIsAskingQuestion === true &&
+            ["total", "total_price", "total_amount"].includes(
+              clean(decision.requestedInfoType, 40).toLowerCase()
+            );
           const hasQuote =
             factsObj?.quotedPrice?.total != null &&
             Number.isFinite(Number(factsObj.quotedPrice.total));
           const activeContract = {
             ...replyContract,
             requiredMeaning:
-              askNeedsQuote && hasQuote
+              asksForVerifiedTotal &&
+              hasQuote &&
+              decision.targetContext === "pending_availability"
                 ? "state_verified_quotation"
                 : replyContract.requiredMeaning,
           };

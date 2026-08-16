@@ -9,7 +9,6 @@ process.env.NODE_ENV = "test";
 
 import { selectAvailabilityRequestForCustomerMessage } from "../src/services/availabilityCustomerConfirmService.js";
 import {
-  buildConfirmExpiresAt,
   compareWaitingConfirmTrustRank,
   availabilityRequestMatchesCloudCustomerPhone,
   isCloudWaitingConfirmAvailabilityRequestEligible,
@@ -128,7 +127,6 @@ class FakeDb {
 }
 
 function baseTrusted(overrides = {}) {
-  const sentAt = new Date("2026-07-25T10:33:32.000Z");
   return {
     requestId: "avr_base",
     businessId: BUSINESS_ID,
@@ -143,7 +141,7 @@ function baseTrusted(overrides = {}) {
     lastCustomerDmPromptType: "booking_confirmation_prompt",
     linkedBookingId: null,
     customerConfirmProcessingStatus: "idle",
-    confirmExpiresAt: buildConfirmExpiresAt(sentAt),
+    confirmExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
     customerPhone: CUSTOMER_PHONE,
     customerWaId: CUSTOMER_PHONE,
     customerDmTarget: CUSTOMER_PHONE,
@@ -221,7 +219,7 @@ test("B: old Corolla + latest Civic bare message binds latest Civic (no Kaunsi)"
     [corolla, civic],
     "bare customer reply"
   );
-  assert.equal(selected.reason, "LATEST_TRUSTED_MATCH");
+  assert.equal(selected.reason, "LATEST_ACTIVE_TRANSACTION");
   assert.equal(selected.request.requestId, "avr_civic");
   assert.equal(selected.disambiguationReply, undefined);
 });
@@ -258,8 +256,8 @@ test("C2: explicit Corolla when only superseded Corolla exists does not bind Civ
   assert.match(String(selected.disambiguationReply), /Kaunsi car book karni hai/i);
 });
 
-test("D: candidates without booking_confirmation_prompt do not bind as latest trusted", () => {
-  const bothUntrusted = selectAvailabilityRequestForCustomerMessage(
+test("D: informational Q&A does not destroy latest active transaction binding", () => {
+  const afterQna = selectAvailabilityRequestForCustomerMessage(
     [
       baseTrusted({
         requestId: "avr_a",
@@ -274,8 +272,8 @@ test("D: candidates without booking_confirmation_prompt do not bind as latest tr
     ],
     "bare reply"
   );
-  assert.equal(bothUntrusted.reason, "AMBIGUOUS");
-  assert.match(String(bothUntrusted.disambiguationReply), /Kaunsi car book karun/i);
+  assert.equal(afterQna.reason, "LATEST_ACTIVE_TRANSACTION");
+  assert.equal(afterQna.request.requestId, "avr_b");
 });
 
 test("E: two trusted candidates same timestamps → disambiguation", () => {
@@ -394,7 +392,7 @@ test("L: no new keyword confirmation phrase gates in binding/supersede files", (
     join(ROOT, "src/services/availabilityCustomerConfirmService.js"),
     "utf8"
   );
-  assert.match(selectSrc, /LATEST_TRUSTED_MATCH/);
+  assert.match(selectSrc, /LATEST_ACTIVE_TRANSACTION/);
   assert.doesNotMatch(selectSrc, /Honda Civic 2026 Oriel/);
 });
 
@@ -415,7 +413,7 @@ test("6: expired latest AVR is not trusted / not eligible", () => {
     [expired, olderValid],
     "bare reply"
   );
-  assert.equal(selected.reason, "LATEST_TRUSTED_MATCH");
+  assert.equal(selected.reason, "LATEST_ACTIVE_TRANSACTION");
   assert.equal(selected.request.requestId, "avr_older");
 });
 
@@ -573,7 +571,7 @@ test("17: item-token disambiguation still preferred over latest fallback", () =>
     [corolla, civic],
     "generic follow-up"
   );
-  assert.equal(byLatest.reason, "LATEST_TRUSTED_MATCH");
+  assert.equal(byLatest.reason, "LATEST_ACTIVE_TRANSACTION");
   assert.equal(byLatest.request.requestId, "avr_civic");
 });
 
