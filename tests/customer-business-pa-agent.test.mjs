@@ -243,6 +243,8 @@ function mockOpenAiReply(text) {
       {
         message: {
           content: JSON.stringify({
+            turnScope: "OLD_BOOKING_REFERENCE",
+            targetId: BOOKING_ID,
             situation: "new_question",
             conversationAct: "information_request",
             customerIntent: "ask_fact",
@@ -303,11 +305,14 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
         {
           message: {
             content: JSON.stringify({
+              turnScope: "OLD_BOOKING_REFERENCE",
+              targetId: BOOKING_ID,
               situation: "new_question",
               conversationAct: "information_request",
               customerIntent: "ask_fact",
               customerIsAskingQuestion: true,
               requestedInfoType: null,
+              factKind: "booking_fact",
               capability,
               evidenceNeeds,
               shouldReply: true,
@@ -352,7 +357,9 @@ function mockOpenAiSocialReply(text) {
     choices: [
       {
         message: {
-          content: JSON.stringify({
+            content: JSON.stringify({
+            turnScope: "SOCIAL_GENERAL",
+            targetId: null,
             situation: "acknowledgement_after_answer",
             conversationAct: "chit_chat",
             customerIntent: "ack",
@@ -403,9 +410,8 @@ test("flag off → confirmed-booking continuity still uses OpenAI", async () => 
         return { choices: [{ message: { content: "should not run" } }] };
       },
     });
-    assert.equal(result.handled, true);
-    assert.equal(result.reason, "HANDLED");
-    assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+    assert.equal(result.handled, false);
+    assert.equal(result.ownershipReleased, true);
     assert.equal(openaiCalls, 1);
     assert.equal(
       (
@@ -484,6 +490,8 @@ test("fresh availability decision releases post-confirm ownership before every P
         ok: true,
         source: "openai",
         decision: {
+          turnScope: "NEW_TRANSACTION",
+          targetId: null,
           situation: "new_question",
           conversationAct: "information_request",
           customerIntent: "ask_fact",
@@ -514,7 +522,7 @@ test("fresh availability decision releases post-confirm ownership before every P
   assert.equal(decisions, 1);
   assert.equal(result.handled, false);
   assert.equal(result.ownershipReleased, true);
-  assert.equal(result.releaseReason, "FRESH_AVAILABILITY_REQUEST");
+  assert.equal(result.releaseReason, "SEMANTIC_SCOPE_NEW_TRANSACTION");
   assert.equal(result.reply, "");
   assert.equal(result.composeCalls, 0);
   assert.equal(result.semanticDecisionCount, 1);
@@ -1158,7 +1166,7 @@ test("facts helper: shapes for no booking / ambiguous / AVR missing", async () =
   assert.equal(okMissingAvr.facts.policy.readOnly, true);
 });
 
-test("active booking + hello → OpenAI called; reply equals mock", async () => {
+test("active booking + hello → OpenAI called then social scope releases ownership", async () => {
   const fake = createFakeDb();
   fake.seedBooking(BUSINESS_ID, BOOKING_ID, baseApprovedBooking());
   let openaiCalls = 0;
@@ -1170,9 +1178,8 @@ test("active booking + hello → OpenAI called; reply equals mock", async () => 
       businessId: BUSINESS_ID,
       customerPhone: CUSTOMER_PHONE,
       messageText: "hello",
-      sendWhatsAppMessageFn: async (_p, text) => {
-        assert.equal(text, mockReply);
-        return { ok: true };
+      sendWhatsAppMessageFn: async () => {
+        assert.fail("social/general must release before PA outbound");
       },
       __resolveActiveCustomerBookingFactsFn: async (p) =>
         resolveActiveCustomerBookingFacts({
@@ -1188,8 +1195,10 @@ test("active booking + hello → OpenAI called; reply equals mock", async () => 
         return mockOpenAiSocialReply(mockReply)(args);
       },
     });
-    assert.equal(result.handled, true);
-    assert.equal(result.reply, mockReply);
+    assert.equal(result.handled, false);
+    assert.equal(result.ownershipReleased, true);
+    assert.equal(result.releaseReason, "SEMANTIC_SCOPE_SOCIAL_GENERAL");
+    assert.equal(result.reply, "");
     assert.equal(result.openaiUsed, true);
     assert.equal(openaiCalls, 1);
     assert.doesNotMatch(result.reply, /Advance mai btata hun/i);
@@ -1336,8 +1345,8 @@ test("post-confirm action meaning is not pre-classified before OpenAI", async ()
           return { choices: [{ message: { content: "nope" } }] };
         },
       });
-      assert.equal(result.handled, true);
-      assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+      assert.equal(result.handled, false);
+      assert.equal(result.ownershipReleased, true);
       assert.equal(openaiCalls, 1);
       assert.equal(sends, 0);
       assert.equal(fake.getBooking(BUSINESS_ID, BOOKING_ID).status, "approved");
@@ -1376,7 +1385,7 @@ test("OpenAI failure → one technical fallback; handled true", async () => {
 });
 
 test("OpenAI helper compact facts include booking total + linked AVR", async () => {
-  const compact = __compactCustomerBusinessPaFactsForTests({
+  const facts = {
     businessId: BUSINESS_ID,
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Cars", category: "rental", tone: null, instructions: "hi" },
@@ -1395,7 +1404,8 @@ test("OpenAI helper compact facts include booking total + linked AVR", async () 
     },
     known: { totalAmount: 16000, itemLabel: "Honda Civic 2026" },
     policy: { readOnly: true, doNotInventAmounts: true, doNotMutateBooking: true },
-  });
+  };
+  const compact = __compactCustomerBusinessPaFactsForTests(facts);
   assert.match(compact, /16000/);
   assert.match(compact, /Honda Civic/);
   assert.doesNotMatch(compact, /avr_pa_001|bk_pa_001|owner-business-pa-1/);
@@ -1403,7 +1413,7 @@ test("OpenAI helper compact facts include booking total + linked AVR", async () 
   // generateCustomerBusinessPaReplyFromFacts is decide-only; factual wording is
   // deferred to resolve+compose. Turn Plan → empty customerReply.
   const ai = await generateCustomerBusinessPaReplyFromFacts({
-    facts: JSON.parse(compact),
+    facts,
     userMessage: "Rent kitna?",
     __chatCompletionsCreateForTests: mockOpenAiFactualDecideThenCompose(
       "16000 total tha.",
@@ -1494,6 +1504,12 @@ test("buffer: PA reply skips general Brain and uses normal Cloud outbound", asyn
           bookingId: BOOKING_ID,
           openaiUsed: true,
           finalReplySource: "openai_post_confirm_pa",
+          decision: {
+            turnScope: "OLD_BOOKING_REFERENCE",
+            targetContext: "CONFIRMED_BOOKING",
+            targetId: BOOKING_ID,
+            selectedBookingId: BOOKING_ID,
+          },
         };
       },
       __sendOutboundMessageFn: async ({ reply, sendVia }) => {

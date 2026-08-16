@@ -278,6 +278,9 @@ export function enrichSharedCustomerTurnDecision(decision) {
   return {
     // Preserve Phase A fields, then seed shared aliases.
     ...d,
+    turnScope: d.turnScope ?? "UNCLEAR",
+    targetContext: d.targetContext ?? "NONE",
+    targetId: d.targetId ?? null,
     conversationStage: d.conversationStage ?? d.situation ?? null,
     customerMood: d.customerMood ?? null,
     customerIntent: d.customerIntent ?? "unclear",

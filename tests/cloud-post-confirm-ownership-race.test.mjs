@@ -42,6 +42,12 @@ __setInboundTurnLedgerPathForTests(path.join(ledgerDir, "ledger.json"));
 
 const BUSINESS_ID = "biz-cloud-race";
 const CUSTOMER_PHONE = "923001234567";
+const OLD_BOOKING_DECISION = Object.freeze({
+  turnScope: "OLD_BOOKING_REFERENCE",
+  targetContext: "CONFIRMED_BOOKING",
+  targetId: "booking-cloud-race",
+  selectedBookingId: "booking-cloud-race",
+});
 
 function createFakeDb() {
   const messages = [];
@@ -342,6 +348,7 @@ test("real active-job finally drains queued Cloud ownership into post_confirm_pa
         action: "business_pa_reply",
         reply: "OpenAI: booking 5 din ke liye hai.",
         bookingId: "booking-cloud-race",
+        decision: OLD_BOOKING_DECISION,
         openaiUsed: true,
         openaiSource: "openai",
         finalReplySource: "openai_post_confirm_pa",
@@ -602,6 +609,7 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
             action: "business_pa_reply",
             reply: "OpenAI: booking 5 din ke liye hai.",
             bookingId: "booking-cloud-race",
+            decision: OLD_BOOKING_DECISION,
             openaiUsed: true,
             openaiSource: "openai",
             finalReplySource: "openai_post_confirm_pa",
@@ -985,6 +993,7 @@ test("non-exhausted queued lookup retry consumes token and preserves original ow
         action: "business_pa_reply",
         reply: "OpenAI: booking 5 din ke liye hai.",
         bookingId: "booking-cloud-race",
+        decision: OLD_BOOKING_DECISION,
         openaiUsed: true,
         openaiSource: "openai",
         finalReplySource: "openai_post_confirm_pa",
@@ -1092,6 +1101,7 @@ test("non-exhausted post_confirm_pa retry preserves lifecycle and sends once", a
         action: "business_pa_reply",
         reply: "OpenAI: pickup details verified.",
         bookingId: "booking-cloud-race",
+        decision: OLD_BOOKING_DECISION,
         openaiUsed: true,
         openaiSource: "openai",
         finalReplySource: "openai_post_confirm_pa",
@@ -1193,6 +1203,7 @@ test("startup recovery runs retryCount 5 final attempt with the original identit
             action: "business_pa_reply",
             reply: "OpenAI: pickup details verified.",
             bookingId: "booking-cloud-race",
+            decision: OLD_BOOKING_DECISION,
             openaiUsed: true,
             openaiSource: "openai",
             finalReplySource: "openai_post_confirm_pa",
@@ -1276,6 +1287,7 @@ test("concurrent delayed resuming sweeps permit only one expired-lease claim", a
             action: "business_pa_reply",
             reply: "OpenAI: delivery details verified.",
             bookingId: "booking-cloud-race",
+            decision: OLD_BOOKING_DECISION,
             openaiUsed: true,
             openaiSource: "openai",
             finalReplySource: "openai_post_confirm_pa",
@@ -1419,6 +1431,7 @@ test("fresh resuming entry is deferred until stale and then recovered", async ()
           action: "business_pa_reply",
           reply: "OpenAI: delivery details verified.",
           bookingId: "booking-cloud-race",
+          decision: OLD_BOOKING_DECISION,
           openaiUsed: true,
           openaiSource: "openai",
         }),
@@ -1552,6 +1565,7 @@ test("retryable startup recovery respects timing and original claim owner", asyn
           action: "business_pa_reply",
           reply: "OpenAI: condition details verified.",
           bookingId: "booking-cloud-race",
+          decision: OLD_BOOKING_DECISION,
           openaiUsed: true,
           openaiSource: "openai",
         }),

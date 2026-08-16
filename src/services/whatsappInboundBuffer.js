@@ -1829,16 +1829,34 @@ export async function executeWhatsAppAiPipeline(p) {
           : "initial",
       ok: resolvedPostConfirm?.ok === true,
       reason: String(resolvedPostConfirm?.reason ?? "").trim() || null,
+      historicalBookingCandidateIds: Array.isArray(
+        resolvedPostConfirm?.facts?.bookingCandidates
+      )
+        ? resolvedPostConfirm.facts.bookingCandidates
+            .map((row) => String(row?.id ?? "").trim())
+            .filter(Boolean)
+        : [],
+      pendingAvailabilityRequestIds: Array.isArray(
+        resolvedPostConfirm?.facts?.pendingAvailabilityRequests
+      )
+        ? resolvedPostConfirm.facts.pendingAvailabilityRequests
+            .map((row) =>
+              String(
+                row?.requestId ??
+                  row?.request?.requestId ??
+                  row?.request?.id ??
+                  ""
+              ).trim()
+            )
+            .filter(Boolean)
+        : [],
     });
   }
   const hasConfirmedBookingReplyRecovery =
     Boolean(preResolvedConfirmedBookingReplyRecovery);
-  const hasActivePostConfirmOwnership =
+  const hasActivePostConfirmContext =
     preResolvedPostConfirmBookingFacts?.ok === true;
   if (hasConfirmedBookingReplyRecovery) {
-    cloudLifecycleClaimed = true;
-  } else if (hasActivePostConfirmOwnership) {
-    markCloudInboundTurnPostConfirmOwned({ identity: cloudLifecycleIdentity });
     cloudLifecycleClaimed = true;
   }
 
@@ -1920,7 +1938,7 @@ export async function executeWhatsAppAiPipeline(p) {
   globalThis.__forceProcessing = false;
 
   if (
-    !hasActivePostConfirmOwnership &&
+    !hasActivePostConfirmContext &&
     !hasConfirmedBookingReplyRecovery &&
     cloudLifecycleIdentity?.guaranteeKey
   ) {
@@ -2273,8 +2291,8 @@ export async function executeWhatsAppAiPipeline(p) {
     Boolean(preResolvedFreshWaitingConfirmRequest);
   const canTryCloudConfirmOwnership =
     (hasConfirmedBookingReplyRecovery ||
-      !hasActivePostConfirmOwnership ||
-      hasFreshWaitingConfirmOwnership) &&
+      hasFreshWaitingConfirmOwnership ||
+      !hasActivePostConfirmContext) &&
     !isGroupInbound &&
     !playwrightWebInbound &&
     Boolean(String(ownerUserId ?? "").trim()) &&
@@ -2358,7 +2376,6 @@ export async function executeWhatsAppAiPipeline(p) {
   }
 
   if (
-    !hasActivePostConfirmOwnership &&
     !skipGeneralBrainForWaitingConfirmOwnership
   ) {
   const ownershipGuard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
@@ -2403,7 +2420,6 @@ export async function executeWhatsAppAiPipeline(p) {
   // Business PA missing-info Phase 2: owner answer → customer follow-up.
   // After confirm + waiting-confirm ownership; before Business PA / Brain.
   if (
-    !hasActivePostConfirmOwnership &&
     !skipGeneralBrainForWaitingConfirmOwnership
   ) {
     const canTryOwnerAnswer =
@@ -2491,6 +2507,25 @@ export async function executeWhatsAppAiPipeline(p) {
         preResolvedBookingFacts: preResolvedPostConfirmBookingFacts,
       });
       if (businessPaResult?.ownershipReleased === true) {
+        const semanticDecision =
+          businessPaResult.decision &&
+          typeof businessPaResult.decision === "object"
+            ? businessPaResult.decision
+            : {};
+        if (
+          cloudLifecycleIdentity?.guaranteeKey &&
+          !cloudNormalRoutingClaimed
+        ) {
+          markCloudInboundTurnNormalRouting({
+            identity: cloudLifecycleIdentity,
+            bookingResolutionReason:
+              businessPaResult.releaseReason ??
+              businessPaResult.reason ??
+              "SEMANTIC_OWNERSHIP_RELEASED",
+          });
+          cloudLifecycleClaimed = true;
+          cloudNormalRoutingClaimed = true;
+        }
         console.log("[customer_business_pa_release_continued]", {
           traceId,
           businessId: ownerUserId,
@@ -2502,10 +2537,19 @@ export async function executeWhatsAppAiPipeline(p) {
           composeCalls: Number(businessPaResult.composeCalls ?? 0) || 0,
           mutationExecutionRequested:
             businessPaResult.mutationExecutionRequested === true,
+          turnScope: semanticDecision.turnScope ?? null,
+          targetContext: semanticDecision.targetContext ?? null,
+          targetId: semanticDecision.targetId ?? null,
+          ownershipLane: "normal_routing",
           messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
         });
       } else if (businessPaResult) {
         if (businessPaResult.retryable === true) {
+          // The inbound ledger claim already exists; keep retry bookkeeping
+          // active without assigning either semantic ownership lane.
+          cloudLifecycleClaimed = Boolean(
+            cloudLifecycleIdentity?.guaranteeKey
+          );
           throw new Error(
             String(
               businessPaResult.failureReason ??
@@ -2513,6 +2557,26 @@ export async function executeWhatsAppAiPipeline(p) {
                 "OPENAI_POST_CONFIRM_FAILED"
             )
           );
+        }
+        const semanticDecision =
+          businessPaResult.decision &&
+          typeof businessPaResult.decision === "object"
+            ? businessPaResult.decision
+            : {};
+        if (businessPaResult.terminalFailure !== true) {
+          if (
+            semanticDecision.turnScope !== "OLD_BOOKING_REFERENCE" ||
+            semanticDecision.targetContext !== "CONFIRMED_BOOKING" ||
+            !String(semanticDecision.targetId ?? "").trim() ||
+            String(semanticDecision.targetId).trim() !==
+              String(semanticDecision.selectedBookingId ?? "").trim()
+          ) {
+            throw new Error("POST_CONFIRM_SEMANTIC_OWNERSHIP_INVALID");
+          }
+          markCloudInboundTurnPostConfirmOwned({
+            identity: cloudLifecycleIdentity,
+          });
+          cloudLifecycleClaimed = true;
         }
         skipGeneralBrainForWaitingConfirmOwnership = true;
         postConfirmPaOwnershipHandled = true;
@@ -2527,6 +2591,10 @@ export async function executeWhatsAppAiPipeline(p) {
           missingInfoRequestId: businessPaResult.missingInfoRequestId ?? null,
           missingInfoType: businessPaResult.missingInfoType ?? null,
           ownerNotifyStatus: businessPaResult.ownerNotifyStatus ?? null,
+          turnScope: semanticDecision.turnScope ?? null,
+          targetContext: semanticDecision.targetContext ?? null,
+          targetId: semanticDecision.targetId ?? null,
+          ownershipLane: "post_confirm_pa",
           terminalFailure: businessPaResult.terminalFailure === true,
           isGroupInbound,
           messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
@@ -2570,7 +2638,7 @@ export async function executeWhatsAppAiPipeline(p) {
     selected: "legacy",
     route: "ownership_skipped",
     rejectReason:
-      hasActivePostConfirmOwnership || postConfirmPaOwnershipHandled
+      postConfirmPaOwnershipHandled
         ? "POST_CONFIRM_PA_OWNERSHIP_HANDLED"
         : "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP",
     businessAllowlisted: false,
