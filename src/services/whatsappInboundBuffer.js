@@ -2299,6 +2299,8 @@ export async function executeWhatsAppAiPipeline(p) {
       sendCredentials,
       preselectedWaitingConfirmRequest:
         preResolvedFreshWaitingConfirmRequest,
+      historicalBookingContext:
+        preResolvedPostConfirmBookingFacts?.facts ?? null,
       inboundReceivedAtMs,
     });
     if (cloudConfirmResult?.handled === true) {

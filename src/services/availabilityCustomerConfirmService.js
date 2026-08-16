@@ -9,6 +9,7 @@ import {
   packWaitingConfirmDmTurnContext,
   resolveWaitingConfirmDmOutboundPromptType,
   WAITING_CONFIRM_DM_ALLOWED_ACTIONS,
+  WAITING_CONFIRM_DM_LANE,
   WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/waitingConfirmDmLane.js";
 import {
@@ -52,9 +53,9 @@ import {
   getAvailabilityRequest,
   isFreshTrustedWaitingConfirmCloudOwnershipCandidate,
   isDuplicateAvailabilityCustomerInboundDm,
-  isTrustedWaitingConfirmBookingPromptCandidate,
+  isTrustedWaitingConfirmTransactionCandidate,
   patchAvailabilityConfirmBookingMetadata,
-  pickLatestTrustedWaitingConfirmRequest,
+  pickLatestWaitingConfirmTransactionRequest,
   recordAvailabilityCustomerDmOutbound,
   recordAvailabilityCustomerInboundDm,
   resolveAvailabilityParticipantDisplayName,
@@ -236,13 +237,13 @@ export function selectAvailabilityRequestForCustomerMessage(requests, message, o
     return { request: pool[0], reason: "SINGLE_MATCH" };
   }
 
-  const trustedLatest = pickLatestTrustedWaitingConfirmRequest(pool, nowMs);
+  const trustedLatest = pickLatestWaitingConfirmTransactionRequest(pool, nowMs);
   if (trustedLatest) {
-    return { request: trustedLatest, reason: "LATEST_TRUSTED_MATCH" };
+    return { request: trustedLatest, reason: "LATEST_ACTIVE_TRANSACTION" };
   }
 
   const trusted = pool.filter((row) =>
-    isTrustedWaitingConfirmBookingPromptCandidate(row, nowMs)
+    isTrustedWaitingConfirmTransactionCandidate(row, nowMs)
   );
   const optionsSource = trusted.length > 1 ? trusted : pool;
   const options = optionsSource.slice(0, 3).map((row) => {
@@ -1083,6 +1084,7 @@ function resolveBrainFailReason(turnResult) {
  *   chatCompletionsCreateForTests?: Function | null,
  *   sendCredentials?: Record<string, unknown> | null,
  *   composeWaitingConfirmExecutionReplyFn?: Function | null,
+ *   historicalBookingContext?: Record<string, unknown> | null,
  *   sendReply: (p: {
  *     reply: string,
  *     promptType: string,
@@ -1107,6 +1109,7 @@ async function runWaitingConfirmDmBrainTurn({
   chatCompletionsCreateForTests = null,
   sendCredentials = null,
   composeWaitingConfirmExecutionReplyFn = null,
+  historicalBookingContext = null,
   sendReply,
   afterHandled = null,
 }) {
@@ -1126,6 +1129,7 @@ async function runWaitingConfirmDmBrainTurn({
     conversationHistory,
     request,
     catalogRow,
+    historicalBookingContext,
   });
   turnContext.channel = channel;
   turnContext.chatType = "dm";
@@ -1158,6 +1162,27 @@ async function runWaitingConfirmDmBrainTurn({
   const decision = turnResult.decision;
   const action = clean(decision.action, 40);
   const resultAction = resolveWaitingConfirmResultAction(decision);
+  console.log("[waiting_confirm_dm_semantic_decision]", {
+    inboundId: inboundMessageId || null,
+    requestId,
+    semanticLane: WAITING_CONFIRM_DM_LANE,
+    action: action || null,
+    targetContext: clean(decision?.targetContext, 40) || null,
+    targetId: clean(decision?.targetId, 160) || null,
+    confidence:
+      Number.isFinite(Number(decision?.confidence))
+        ? Number(decision.confidence)
+        : null,
+    selectedExecutionTarget: [
+      "confirm_booking",
+      "decline_request",
+      "change_request",
+    ].includes(action)
+      ? requestId
+      : null,
+    activeOldBookingId:
+      clean(turnContext?.facts?.activeConfirmedBooking?.id) || null,
+  });
   const quote = resolveAvailabilityApprovedPriceQuote(request, catalogRow).priceQuote;
   const trustedFacts = {
     itemId: clean(request?.itemId, 120) || null,
@@ -1182,6 +1207,15 @@ async function runWaitingConfirmDmBrainTurn({
       reply = await sendReply({ reply, promptType: recordedPromptType });
     }
     if (typeof afterHandled === "function") await afterHandled();
+    console.log("[waiting_confirm_dm_final_decision]", {
+      inboundId: inboundMessageId || null,
+      requestId,
+      semanticAction: action || null,
+      finalAction: payload.action != null ? payload.action : resultAction,
+      mutationAttempted: payload?.executionResult?.attempted === true,
+      mutationSucceeded: payload?.executionResult?.succeeded === true,
+      mutationReason: payload?.executionResult?.reason ?? null,
+    });
     return waitingConfirmBrainMeta({
       handled: true,
       decision,
@@ -1241,6 +1275,15 @@ async function runWaitingConfirmDmBrainTurn({
         });
       }
       if (typeof afterHandled === "function") await afterHandled();
+      console.log("[waiting_confirm_dm_final_decision]", {
+        inboundId: inboundMessageId || null,
+        requestId,
+        semanticAction: action || null,
+        finalAction: payload.action != null ? payload.action : resultAction,
+        mutationAttempted: executionResult?.attempted === true,
+        mutationSucceeded: executionResult?.succeeded === true,
+        mutationReason: executionResult?.reason ?? null,
+      });
       return waitingConfirmBrainMeta({
         handled: true,
         decision,
@@ -1413,6 +1456,7 @@ async function runWaitingConfirmDmBrainTurn({
  *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
  *   availabilityConfirmExecute?: boolean,
  *   preselectedWaitingConfirmRequest?: Record<string, unknown> | null,
+ *   historicalBookingContext?: Record<string, unknown> | null,
  *   inboundReceivedAtMs?: number | null,
  *   __waitingConfirmDmBrainEnabled?: boolean,
  *   __decideCustomerTurnForTests?: Function | null,
@@ -1432,6 +1476,7 @@ export async function handleAvailabilityCustomerCloudInbound({
   sendWhatsAppMessageFn = sendWhatsAppMessage,
   availabilityConfirmExecute = isEmilyBrainV2AvailabilityConfirmExecuteEnabled(),
   preselectedWaitingConfirmRequest = null,
+  historicalBookingContext = null,
   inboundReceivedAtMs = null,
   __waitingConfirmDmBrainEnabled = null,
   __decideCustomerTurnForTests = null,
@@ -1545,6 +1590,16 @@ export async function handleAvailabilityCustomerCloudInbound({
   });
   let request = selection.request;
 
+  console.log("[waiting_confirm_cloud_binding]", {
+    inboundId: inboundMessageId || null,
+    customerSuffix: phone.replace(/\D/g, "").slice(-4) || null,
+    candidateRequestIds: waiting.map((row) => clean(row?.requestId ?? row?.id)).filter(Boolean),
+    selectedRequestId: clean(request?.requestId ?? request?.id) || null,
+    selectionReason: selection.reason || null,
+    activeOldBookingId:
+      clean(historicalBookingContext?.booking?.id) || null,
+  });
+
   if (!request && waiting.length === 0 && selection.reason !== "NAMED_INACTIVE") {
     return { handled: false, reason: "NO_WAITING_REQUEST" };
   }
@@ -1618,6 +1673,7 @@ export async function handleAvailabilityCustomerCloudInbound({
       typeof __composeWaitingConfirmExecutionReplyForTests === "function"
         ? __composeWaitingConfirmExecutionReplyForTests
         : null,
+    historicalBookingContext,
     sendCredentials,
     afterHandled: async () =>
       recordCloudInboundIdempotency({
