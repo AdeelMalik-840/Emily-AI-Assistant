@@ -38,6 +38,9 @@ function focusedCorollaFacts() {
 
 function rawDecision(overrides = {}) {
   return JSON.stringify({
+    turnScope: "OLD_BOOKING_REFERENCE",
+    targetContext: "CONFIRMED_BOOKING",
+    targetId: COROLLA_BOOKING_ID,
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -100,6 +103,9 @@ function rawDecision(overrides = {}) {
 
 function availabilityDecision({ withCatalogEvidence = false } = {}) {
   return rawDecision({
+    turnScope: "NEW_TRANSACTION",
+    targetContext: "NEW_TRANSACTION",
+    targetId: null,
     factKind: "booking_fact",
     capability: "availability_request",
     evidenceNeeds: withCatalogEvidence
@@ -154,7 +160,7 @@ for (const message of freshRequests) {
     );
     assert.match(system, /INDEPENDENT fresh inventory availability/i);
     assert.match(system, /BOOKING-RELATIVE comparison/i);
-    assert.match(system, /prohibits booking selection/i);
+    assert.match(system, /Runtime derives/i);
     assert.equal(decision.factKind, "booking_fact");
     assert.equal(decision.capability, "availability_request");
     assert.equal(decision.mutationIntent, "none");
@@ -419,6 +425,9 @@ test("named Civic mileage fact cannot attach focused Corolla", async () => {
   const { decision } = await runBrainContract(
     "Mileage kitni hai Civic ki?",
     rawDecision({
+      turnScope: "NEW_TRANSACTION",
+      targetContext: "NEW_TRANSACTION",
+      targetId: null,
       factKind: "freeform_business",
       capability: "answer_from_saved_owner_answer",
       evidenceNeeds: [
@@ -442,6 +451,9 @@ test("live vague/none model failure cannot deterministically attach Corolla", as
   const { decision } = await runBrainContract(
     "HONDA CIVIC 5 DIN K LYE CHYH",
     rawDecision({
+      turnScope: "UNCLEAR",
+      targetContext: "NONE",
+      targetId: null,
       conversationAct: "unknown",
       customerIntent: "unclear",
       customerIsAskingQuestion: false,

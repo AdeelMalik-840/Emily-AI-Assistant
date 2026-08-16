@@ -255,7 +255,12 @@ function inferTestOnlyFactKind(d) {
 }
 
 function decisionJson(overrides = {}) {
+  const selectedIndex = Number(overrides.selectedBookingIndex ?? 1);
+  const targetId = selectedIndex === 3 ? "booking-stonic" : "booking-corolla";
   const payload = {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    targetContext: "CONFIRMED_BOOKING",
+    targetId,
     situation: "protected_action",
     conversationAct: "action_request",
     customerIntent: "ask_action",
@@ -269,7 +274,7 @@ function decisionJson(overrides = {}) {
     mutationExecutionStatus: "not_executed",
     actionParameters: emptyParams(),
     bookingSelectionMode: "focused",
-    selectedBookingIndex: null,
+    selectedBookingIndex: 1,
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     groundedFacts: {
@@ -302,6 +307,9 @@ function decisionJson(overrides = {}) {
 
 function infoDecisionJson(reply, overrides = {}) {
   const payload = {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    targetContext: "CONFIRMED_BOOKING",
+    targetId: "booking-only",
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -323,8 +331,8 @@ function infoDecisionJson(reply, overrides = {}) {
     mutationExecutionRequested: false,
     mutationExecutionStatus: "not_executed",
     actionParameters: emptyParams(),
-    bookingSelectionMode: "none",
-    selectedBookingIndex: null,
+    bookingSelectionMode: "focused",
+    selectedBookingIndex: 1,
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     groundedFacts: {
@@ -913,6 +921,9 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
           ok: true,
           source: "openai",
           decision: {
+            turnScope: "PENDING_AVAILABILITY_REFERENCE",
+            targetContext: "PENDING_AVAILABILITY",
+            targetId: "avr-pending-1",
             situation: "pending_availability",
             conversationAct: "confirmation",
             customerIntent: "confirm_pending",
@@ -933,6 +944,9 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
         ok: true,
         source: "openai",
         decision: {
+          turnScope: "OLD_BOOKING_REFERENCE",
+          targetContext: "CONFIRMED_BOOKING",
+          targetId: "booking-from-avr",
           situation: "acknowledgement_after_answer",
           conversationAct: "acknowledgement",
           customerIntent: "unclear",
@@ -979,6 +993,9 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
           ok: true,
           source: "openai",
           decision: {
+            turnScope: "PENDING_AVAILABILITY_REFERENCE",
+            targetContext: "PENDING_AVAILABILITY",
+            targetId: "avr-pending-1",
             situation: "pending_availability",
             conversationAct: "confirmation",
             customerIntent: "decline_pending",
@@ -999,6 +1016,9 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
         ok: true,
         source: "openai",
         decision: {
+          turnScope: "SOCIAL_GENERAL",
+          targetContext: "NONE",
+          targetId: null,
           situation: "acknowledgement_after_answer",
           conversationAct: "acknowledgement",
           customerIntent: "unclear",
@@ -1045,6 +1065,9 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
   };
 
   const advanceDecision = {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    targetContext: "CONFIRMED_BOOKING",
+    targetId: "booking-from-avr",
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -1103,6 +1126,9 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
           ok: true,
           source: "openai",
           decision: {
+            turnScope: "PENDING_AVAILABILITY_REFERENCE",
+            targetContext: "PENDING_AVAILABILITY",
+            targetId: "avr-pending-1",
             situation: "pending_availability",
             conversationAct: "confirmation",
             customerIntent: "confirm_pending",

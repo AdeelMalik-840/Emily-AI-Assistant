@@ -13,6 +13,7 @@ import { resolveActiveCustomerBookingFacts } from "../brain/facts/resolveActiveC
 import { resolvePostConfirmRequestedFact } from "../brain/facts/resolvePostConfirmRequestedFact.js";
 import { decideCustomerTurn } from "../brain/decisions/decideCustomerTurn.js";
 import {
+  applyPostConfirmDerivedOwnershipMechanics,
   canEscalatePostConfirmMissingInfo,
   isDeferredPostConfirmInformationalDecision,
   PA_MISSING_INFO_GATE_OUTCOME,
@@ -26,7 +27,6 @@ import {
   executeAvailabilityCustomerDecline,
 } from "./availabilityCustomerConfirmService.js";
 import { executePostConfirmBookingMutation } from "./postConfirmBookingMutationExecutor.js";
-import { listExplicitCatalogItemIds } from "./currentTurnAuthority.js";
 import {
   composePostConfirmInformationalCustomerReply,
   composePostConfirmMutationCustomerReply,
@@ -48,73 +48,33 @@ function cleanCustomerReply(value) {
 }
 
 /**
- * The shared post-confirm Brain uses this exact plan for a new inventory
- * availability request. Release before any PA resolver, executor, or composer
- * runs so the existing availability workflow can own the turn.
- *
- * After the semantic availability_request shape, fail closed on current-turn
- * multi-item / booked+other catalog evidence. Stale bookingSelectionMode /
- * selectedBookingIndex may be ignored only when this turn names exactly one
- * explicit catalog item different from the focused/booked item (restore PR #100
- * fresh-release under leftover trusted focus).
+ * Compatibility export for callers/tests. Meaning comes only from Brain's
+ * structured semantic scope; raw text and catalog matching are never ownership
+ * authority.
  *
  * @param {Record<string, unknown> | null | undefined} decision
  * @param {{ messageText?: string | null, facts?: Record<string, unknown> | null }} [ctx]
  */
 export function shouldReleasePostConfirmForFreshAvailability(
   decision,
-  ctx = {}
+  _ctx = {}
 ) {
-  if (
-    decision?.factKind !== "booking_fact" ||
-    decision?.capability !== "availability_request" ||
-    decision?.action !== "reply" ||
-    decision?.mutationIntent !== "none" ||
-    decision?.pendingAvailabilitySelectionIndex != null
-  ) {
-    return false;
-  }
+  return decision?.turnScope === "NEW_TRANSACTION";
+}
 
-  const facts =
-    ctx?.facts && typeof ctx.facts === "object" ? ctx.facts : null;
-  const messageText = String(ctx?.messageText ?? "").trim();
-  if (!facts || !messageText) return false;
-
-  const catalogItems = Array.isArray(facts.replyGuardFacts?.catalogItems)
-    ? facts.replyGuardFacts.catalogItems
-    : Array.isArray(facts.catalogItems)
-      ? facts.catalogItems
-      : null;
-  if (!catalogItems || catalogItems.length === 0) return false;
-
-  const bookedItemId =
-    clean(facts.booking?.itemId, 160) ||
-    clean(facts.bookingFocus?.itemId, 160) ||
-    "";
-  if (!bookedItemId) return false;
-
-  const currentTurnExplicitIds = listExplicitCatalogItemIds(
-    messageText,
-    catalogItems
-  );
-  // Multi-item current turn (incl. booked + other) cannot own a single AVR.
-  if (currentTurnExplicitIds.length >= 2) return false;
-
-  const selectionClean =
-    decision?.bookingSelectionMode === "none" &&
-    decision?.selectedBookingIndex == null;
-  if (selectionClean) return true;
-
-  // Narrow stale-focus exception: one explicit other item proves independent
-  // fresh availability even if the model left trusted booking focus selected.
-  return (
-    currentTurnExplicitIds.length === 1 &&
-    currentTurnExplicitIds[0] !== bookedItemId
-  );
+export function shouldReleasePostConfirmOwnership(decision) {
+  return [
+    "NEW_TRANSACTION",
+    "SOCIAL_GENERAL",
+    "UNCLEAR",
+  ].includes(decision?.turnScope);
 }
 
 /** @type {Readonly<Record<string, unknown>>} */
 const POST_CONFIRM_AGENT_EMPTY_DECISION = Object.freeze({
+  turnScope: null,
+  targetContext: null,
+  targetId: null,
   situation: null,
   conversationAct: null,
   customerIntent: null,
@@ -173,7 +133,10 @@ function attachPostConfirmAgentReturnContract(flat, opts = {}) {
       : [];
 
   const decision = decisionSource
-    ? {
+      ? {
+        turnScope: decisionSource.turnScope ?? null,
+        targetContext: decisionSource.targetContext ?? null,
+        targetId: decisionSource.targetId ?? null,
         situation: decisionSource.situation ?? null,
         conversationAct: decisionSource.conversationAct ?? null,
         customerIntent: decisionSource.customerIntent ?? null,
@@ -746,7 +709,10 @@ export async function handleCustomerBusinessPaInbound({
     );
   }
 
-  let decision = decided.decision;
+  let decision = applyPostConfirmDerivedOwnershipMechanics(
+    decided.decision,
+    facts
+  );
   let pendingAvailabilityExecution = null;
   let mutationExecution = null;
   let missingInfoExecutionResult = null;
@@ -756,16 +722,38 @@ export async function handleCustomerBusinessPaInbound({
   let laneFacts = facts;
   let mutationAlreadyComposed = false;
 
-  if (
-    shouldReleasePostConfirmForFreshAvailability(decision, {
-      messageText: text,
-      facts,
-    })
-  ) {
+  console.log("[customer_business_pa_semantic_ownership]", {
+    businessId: uid,
+    turnScope: decision.turnScope ?? null,
+    targetContext: decision.targetContext ?? null,
+    targetId: decision.targetId ?? null,
+    bookingCandidateIds: Array.isArray(facts.bookingCandidates)
+      ? facts.bookingCandidates.map((row) => clean(row?.id)).filter(Boolean)
+      : [],
+    pendingAvailabilityRequestIds: Array.isArray(
+      facts.pendingAvailabilityRequests
+    )
+      ? facts.pendingAvailabilityRequests
+          .map((row) => clean(row?.requestId || row?.request?.requestId))
+          .filter(Boolean)
+      : [],
+    chosenLane:
+      decision.turnScope === "OLD_BOOKING_REFERENCE"
+        ? "post_confirm_pa"
+        : decision.turnScope === "PENDING_AVAILABILITY_REFERENCE"
+          ? "pending_availability_executor"
+        : "normal_routing",
+  });
+
+  if (shouldReleasePostConfirmOwnership(decision)) {
+    const releaseReason = `SEMANTIC_SCOPE_${decision.turnScope}`;
     console.log("[customer_business_pa_ownership_released]", {
       businessId: uid,
       bookingId: clean(facts.booking?.id) || null,
-      reason: "FRESH_AVAILABILITY_REQUEST",
+      reason: releaseReason,
+      turnScope: decision.turnScope,
+      targetContext: decision.targetContext,
+      targetId: decision.targetId,
       factKind: decision.factKind,
       capability: decision.capability,
       decisionAction: decision.action,
@@ -776,13 +764,13 @@ export async function handleCustomerBusinessPaInbound({
       {
         handled: false,
         ownershipReleased: true,
-        releaseReason: "FRESH_AVAILABILITY_REQUEST",
+        releaseReason,
         action: "business_pa_release",
         reply: "",
         sentReply: false,
         bookingId: clean(facts.booking?.id) || null,
         availabilityRequestId: null,
-        reason: "FRESH_AVAILABILITY_REQUEST",
+        reason: releaseReason,
         openaiUsed: true,
         openaiSource: decided.source,
         semanticDecisionCount,
@@ -798,6 +786,58 @@ export async function handleCustomerBusinessPaInbound({
         mutation: null,
         missingInfo: null,
       }
+    );
+  }
+
+  const isOldBookingScope =
+    decision.turnScope === "OLD_BOOKING_REFERENCE" &&
+    decision.targetContext === "CONFIRMED_BOOKING";
+  const isPendingAvailabilityScope =
+    decision.turnScope === "PENDING_AVAILABILITY_REFERENCE" &&
+    decision.targetContext === "PENDING_AVAILABILITY";
+  if (!isOldBookingScope && !isPendingAvailabilityScope) {
+    return attachPostConfirmAgentReturnContract(
+      {
+        handled: true,
+        action: "business_pa_terminal_semantic_ownership_failure",
+        reply: "",
+        sentReply: false,
+        terminalFailure: true,
+        retryable: false,
+        reason: "SEMANTIC_OWNERSHIP_SCOPE_INVALID",
+        failureReason: "SEMANTIC_OWNERSHIP_SCOPE_INVALID",
+        openaiUsed: true,
+        openaiSource: decided.source,
+        finalReplySource: "openai_post_confirm_pa",
+      },
+      { decisionSource: decision }
+    );
+  }
+
+  const semanticTarget = isOldBookingScope
+    ? resolveLaneSelectedBooking(facts, decision.targetId)
+    : null;
+  if (
+    isOldBookingScope &&
+    (!semanticTarget?.selectedBooking ||
+      !semanticTarget.selectedBookingId ||
+      semanticTarget.selectedBookingId !== clean(decision.selectedBookingId))
+  ) {
+    return attachPostConfirmAgentReturnContract(
+      {
+        handled: true,
+        action: "business_pa_terminal_semantic_target_failure",
+        reply: "",
+        sentReply: false,
+        terminalFailure: true,
+        retryable: false,
+        reason: "SEMANTIC_OWNERSHIP_TARGET_INVALID",
+        failureReason: "SEMANTIC_OWNERSHIP_TARGET_INVALID",
+        openaiUsed: true,
+        openaiSource: decided.source,
+        finalReplySource: "openai_post_confirm_pa",
+      },
+      { decisionSource: decision }
     );
   }
 
