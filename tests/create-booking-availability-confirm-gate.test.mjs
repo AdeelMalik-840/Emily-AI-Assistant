@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Timestamp } from "firebase-admin/firestore";
 
 process.env.NODE_ENV = "test";
 
@@ -274,6 +275,44 @@ test("rejects when confirmExpiresAt is in the past", async () => {
   assert.equal(result.ok, false);
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "AVAILABILITY_REQUEST_EXPIRED");
+  assert.equal(result.booking, null);
+});
+
+test("rejects expired Firestore Timestamp at the final booking gate", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(
+    REQUEST_ID,
+    baseWaitingConfirmRequest({
+      confirmExpiresAt: Timestamp.fromDate(new Date(Date.now() - 60_000)),
+    })
+  );
+
+  const result = await executeCreateBooking({
+    payload: basePayload(),
+    executionContext: baseExecutionContext(fake.db),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "AVAILABILITY_REQUEST_EXPIRED");
+  assert.equal(result.booking, null);
+});
+
+test("rejects malformed expiry at the final booking gate", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(
+    REQUEST_ID,
+    baseWaitingConfirmRequest({ confirmExpiresAt: { seconds: "bad" } })
+  );
+
+  const result = await executeCreateBooking({
+    payload: basePayload(),
+    executionContext: baseExecutionContext(fake.db),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "AVAILABILITY_REQUEST_EXPIRY_INVALID");
   assert.equal(result.booking, null);
 });
 

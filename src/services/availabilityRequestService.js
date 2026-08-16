@@ -177,17 +177,6 @@ function scanAvailabilityRequestsFromTestStore(connection, businessId) {
   return rows;
 }
 
-function isTimestampExpired(value, nowMs = Date.now()) {
-  if (value == null || value === "") return false;
-  const ms =
-    value instanceof Date
-      ? value.getTime()
-      : typeof value?.toDate === "function"
-        ? value.toDate().getTime()
-        : new Date(value).getTime();
-  return Number.isFinite(ms) && ms <= nowMs;
-}
-
 /**
  * When both sides have explicit requestedDates, they must match for semantic reuse.
  * Duration-only identity is unchanged; this is a post-match eligibility gate.
@@ -256,14 +245,22 @@ export function evaluateSemanticAvailabilityReuseEligibility(
   }
 
   if (status === "approved" && confirmStatus === "waiting_confirm") {
-    if (isTimestampExpired(row.confirmExpiresAt, nowMs)) {
+    const expiry = classifyOptionalExpiryTimestamp(row.confirmExpiresAt, nowMs);
+    if (expiry.state === "invalid") {
+      return { reusable: false, kind: null, reason: "CONFIRM_EXPIRY_INVALID" };
+    }
+    if (expiry.state === "expired") {
       return { reusable: false, kind: null, reason: "CONFIRM_EXPIRED" };
     }
     return { reusable: true, kind: "waiting_confirm", reason: null };
   }
 
   if (status === "waiting_confirm") {
-    if (isTimestampExpired(row.confirmExpiresAt, nowMs)) {
+    const expiry = classifyOptionalExpiryTimestamp(row.confirmExpiresAt, nowMs);
+    if (expiry.state === "invalid") {
+      return { reusable: false, kind: null, reason: "CONFIRM_EXPIRY_INVALID" };
+    }
+    if (expiry.state === "expired") {
       return { reusable: false, kind: null, reason: "CONFIRM_EXPIRED" };
     }
     return { reusable: true, kind: "waiting_confirm", reason: null };
@@ -1261,11 +1258,9 @@ export function isWaitingConfirmLifecycleActive(request, nowMs = Date.now()) {
   if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
   if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
   if (clean(request?.linkedBookingId)) return false;
-  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
-  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
-    return false;
-  }
-  return true;
+  if (clean(request?.supersededByAvailabilityRequestId)) return false;
+  const expiry = classifyOptionalExpiryTimestamp(request?.confirmExpiresAt, nowMs);
+  return expiry.state === "missing" || expiry.state === "active";
 }
 
 /**
@@ -1598,8 +1593,11 @@ export async function claimAvailabilityRequestCustomerConfirmProcessing({
   if (processing === "processing" || processing === "done") {
     return { ok: false, reason: "ALREADY_PROCESSING", request: { requestId, ...data } };
   }
-  const expiresAt = data.confirmExpiresAt ? new Date(data.confirmExpiresAt) : null;
-  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= Date.now()) {
+  const expiry = classifyOptionalExpiryTimestamp(data.confirmExpiresAt);
+  if (expiry.state === "invalid") {
+    return { ok: false, reason: "REQUEST_EXPIRY_INVALID", request: { requestId, ...data } };
+  }
+  if (expiry.state === "expired") {
     return { ok: false, reason: "REQUEST_EXPIRED", request: { requestId, ...data } };
   }
   const updated = await updateAvailabilityRequestFields({
@@ -1646,8 +1644,8 @@ export async function findWaitingConfirmAvailabilityRequestsByPhone({
     .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
     .filter((row) => {
       if (clean(row.linkedBookingId)) return false;
-      const expiresAt = row.confirmExpiresAt ? new Date(row.confirmExpiresAt) : null;
-      if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= now) {
+      const expiry = classifyOptionalExpiryTimestamp(row.confirmExpiresAt, now);
+      if (expiry.state === "invalid" || expiry.state === "expired") {
         return false;
       }
       const targets = [
@@ -1829,15 +1827,45 @@ export function normalizeTimestampToMs(value) {
       null;
 
     const seconds = typeof secondsRaw === "number" ? secondsRaw : Number(secondsRaw);
-    const nanos = typeof nanosRaw === "number" ? nanosRaw : Number(nanosRaw);
+    const nanos =
+      nanosRaw == null
+        ? 0
+        : typeof nanosRaw === "number"
+          ? nanosRaw
+          : Number(nanosRaw);
 
     if (!Number.isFinite(seconds) || seconds <= 0) return null;
-    const safeNanos = Number.isFinite(nanos) && nanos > 0 ? nanos : 0;
-    const ms = seconds * 1000 + Math.floor(safeNanos / 1e6);
+    if (!Number.isFinite(nanos) || nanos < 0 || nanos >= 1e9) return null;
+    const ms = seconds * 1000 + Math.floor(nanos / 1e6);
     return Number.isFinite(ms) ? ms : null;
   }
 
   return null;
+}
+
+/**
+ * Classify an optional expiry without collapsing a malformed persisted value
+ * into the intentionally supported missing-expiry state.
+ *
+ * Missing confirmExpiresAt remains active under the existing lifecycle rule.
+ * Callers must treat "invalid" and "expired" as untrusted / inactive.
+ *
+ * @param {unknown} value
+ * @param {number} [nowMs]
+ * @returns {{ state: "missing" | "invalid" | "active" | "expired", timestampMs: number | null }}
+ */
+export function classifyOptionalExpiryTimestamp(value, nowMs = Date.now()) {
+  if (value == null || value === "") {
+    return { state: "missing", timestampMs: null };
+  }
+  const timestampMs = normalizeTimestampToMs(value);
+  const comparisonMs = Number(nowMs);
+  if (!Number.isFinite(timestampMs) || !Number.isFinite(comparisonMs)) {
+    return { state: "invalid", timestampMs: null };
+  }
+  return timestampMs <= comparisonMs
+    ? { state: "expired", timestampMs }
+    : { state: "active", timestampMs };
 }
 
 export function hashAvailabilityCustomerInboundDmText(text) {
