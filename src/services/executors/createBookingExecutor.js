@@ -2,7 +2,10 @@
  * Booking executor — executes v2-approved CREATE_BOOKING actions only.
  * Does not make brain/routing decisions.
  */
-import { getAvailabilityRequest } from "../availabilityRequestService.js";
+import {
+  classifyOptionalExpiryTimestamp,
+  getAvailabilityRequest,
+} from "../availabilityRequestService.js";
 import { createBooking } from "../inventoryService.js";
 import { assertExecutionOwnership } from "./executionOwnershipGuard.js";
 
@@ -55,8 +58,11 @@ async function validateAvailabilityConfirmGate({
   if (phone && requestPhone && phone !== requestPhone) {
     return { ok: false, reason: "AVAILABILITY_CUSTOMER_MISMATCH" };
   }
-  const expiresAt = request.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
-  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= Date.now()) {
+  const expiry = classifyOptionalExpiryTimestamp(request.confirmExpiresAt);
+  if (expiry.state === "invalid") {
+    return { ok: false, reason: "AVAILABILITY_REQUEST_EXPIRY_INVALID" };
+  }
+  if (expiry.state === "expired") {
     return { ok: false, reason: "AVAILABILITY_REQUEST_EXPIRED" };
   }
   return { ok: true, request };

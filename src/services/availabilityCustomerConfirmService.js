@@ -44,6 +44,7 @@ import { findItemByName } from "./inventoryService.js";
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
 import {
   availabilityRequestMatchesCloudCustomerPhone,
+  classifyOptionalExpiryTimestamp,
   claimAvailabilityRequestCustomerConfirmProcessing,
   findAvailabilityRequestByCloudInboundMessageId,
   findLatestWaitingConfirmAvailabilityRequest,
@@ -877,14 +878,11 @@ export async function executeAvailabilityCustomerDecline({
   if (clean(fresh.supersededByAvailabilityRequestId)) {
     return { ok: false, reason: "REQUEST_SUPERSEDED" };
   }
-  const expiresAt = fresh.confirmExpiresAt
-    ? new Date(fresh.confirmExpiresAt)
-    : null;
-  if (
-    expiresAt &&
-    Number.isFinite(expiresAt.getTime()) &&
-    expiresAt.getTime() <= Date.now()
-  ) {
+  const expiry = classifyOptionalExpiryTimestamp(fresh.confirmExpiresAt);
+  if (expiry.state === "invalid") {
+    return { ok: false, reason: "REQUEST_EXPIRY_INVALID" };
+  }
+  if (expiry.state === "expired") {
     return { ok: false, reason: "REQUEST_EXPIRED" };
   }
   const updated = await updateAvailabilityRequestCustomerConfirmationState({
