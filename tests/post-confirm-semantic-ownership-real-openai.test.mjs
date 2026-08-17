@@ -1,6 +1,9 @@
 import "dotenv/config";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const runReal =
   process.env.RUN_REAL_POST_CONFIRM_SEMANTIC_OWNERSHIP === "true" &&
@@ -8,6 +11,16 @@ const runReal =
 
 const { executePostConfirmPaLaneDecision } = await import(
   "../src/brain/decisions/decidePostConfirmCustomerDm.js"
+);
+const {
+  __clearInboundTurnLedgerForTests,
+  __setInboundTurnLedgerPathForTests,
+  buildCloudInboundLifecycleIdentity,
+  claimCloudInboundTurn,
+  getCloudInboundSemanticDecision,
+} = await import("../src/services/inboundTurnLedger.js");
+const { handleCustomerBusinessPaInbound } = await import(
+  "../src/services/customerBusinessPaAgentService.js"
 );
 
 function factsFor(itemId = "kia-stonic", itemLabel = "Kia Stonic") {
@@ -39,6 +52,43 @@ function factsFor(itemId = "kia-stonic", itemLabel = "Kia Stonic") {
   };
 }
 
+function stonicCivicHistoryFacts() {
+  const stonic = {
+    id: "MHFaQZBnBVgEeRoCIFQ3",
+    selectionIndex: 1,
+    itemId: "kia-stonic",
+    itemLabel: "Kia Stonic",
+    status: "approved",
+    durationDays: 4,
+  };
+  const civic = {
+    id: "E55qPBHJUW1NsUvNLAhH",
+    selectionIndex: 2,
+    itemId: "honda-civic",
+    itemLabel: "Honda Civic",
+    status: "approved",
+    durationDays: 5,
+  };
+  return {
+    business: { name: "Test Rentals", tone: "friendly" },
+    booking: civic,
+    bookingCandidates: [stonic, civic],
+    activeBookings: [stonic, civic],
+    bookingFocus: {
+      source: "latest_confirmed_linked_avr",
+      confidence: "trusted",
+      selectedBookingIndex: 2,
+      selectedBookingId: civic.id,
+      bookingId: civic.id,
+      itemId: civic.itemId,
+      itemLabel: civic.itemLabel,
+    },
+    pendingAvailabilityRequests: [],
+    known: {},
+    policy: { readOnly: true },
+  };
+}
+
 async function decide(message, facts = factsFor()) {
   const result = await executePostConfirmPaLaneDecision({
     facts,
@@ -54,7 +104,10 @@ test(
   "real OpenAI: fresh Civic does not belong to old Stonic",
   { skip: !runReal },
   async () => {
-    const result = await decide("Honda Civic 3 din k liye chahiye");
+    const result = await decide(
+      "Honda Civic 3 din k liye chahiye",
+      stonicCivicHistoryFacts()
+    );
     assert.equal(result.turnScope, "NEW_TRANSACTION");
     assert.equal(result.targetContext, "NEW_TRANSACTION");
     assert.equal(result.targetId, null);
@@ -96,5 +149,61 @@ test(
     const result = await decide("Civic 3 din", civicFacts);
     assert.ok(["NEW_TRANSACTION", "UNCLEAR"].includes(result.turnScope));
     assert.equal(result.mutationIntent, "none");
+  }
+);
+
+test(
+  "real OpenAI accepted decision is not semantically re-decided on retry",
+  { skip: !runReal },
+  async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "emily-real-semantic-resume-"));
+    __setInboundTurnLedgerPathForTests(path.join(dir, "ledger.json"));
+    __clearInboundTurnLedgerForTests();
+    try {
+      const identity = buildCloudInboundLifecycleIdentity({
+        businessId: "biz-real-resume",
+        customerPhone: "923001234567",
+        messageId: "wamid.real-semantic-resume",
+      });
+      claimCloudInboundTurn({
+        businessId: "biz-real-resume",
+        customerPhone: "923001234567",
+        messageId: "wamid.real-semantic-resume",
+      });
+      let decideCalls = 0;
+      const params = {
+        db: {},
+        businessId: "biz-real-resume",
+        customerPhone: "923001234567",
+        messageText: "Honda Civic 3 din k liye chahiye",
+        messageId: "wamid.real-semantic-resume",
+        cloudLifecycleIdentity: identity,
+        __resolveActiveCustomerBookingFactsFn: async () => ({
+          ok: true,
+          facts: stonicCivicHistoryFacts(),
+        }),
+        __decideCustomerTurnFn: async (args) => {
+          decideCalls += 1;
+          return executePostConfirmPaLaneDecision({
+            facts: args.facts,
+            userMessage: args.messageText,
+            timeoutMs: 20000,
+          });
+        },
+      };
+      const first = await handleCustomerBusinessPaInbound(params);
+      assert.equal(decideCalls, 1);
+      assert.equal(first.decision.turnScope, "NEW_TRANSACTION");
+      assert.equal(
+        getCloudInboundSemanticDecision({ identity })?.semanticDecisionStatus,
+        "released"
+      );
+      const second = await handleCustomerBusinessPaInbound(params);
+      assert.equal(decideCalls, 1);
+      assert.equal(second.decision.turnScope, "NEW_TRANSACTION");
+      assert.equal(second.ownershipReleased, true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 );
