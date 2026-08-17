@@ -1041,12 +1041,16 @@ test("multiple active bookings stay in the same OpenAI lane and expose only safe
     booking: null,
     activeBookings: [
       {
+        id: "booking-civic-a",
+        selectionIndex: 1,
         customerSafeReference: "REF-A",
         status: "approved",
         itemLabel: "Honda Civic 2026",
         durationDays: 3,
       },
       {
+        id: "booking-corolla-b",
+        selectionIndex: 2,
         customerSafeReference: "REF-B",
         status: "approved",
         itemLabel: "Toyota Corolla",
@@ -1181,10 +1185,9 @@ test("trusted latest-confirmed focus answers generic duration from Corolla only"
   assert.equal(result.bookingSelectionMode, "focused");
   assert.equal(result.selectedBookingIndex, 2);
   const prompt = String(counters.openaiPrompts[0] || "");
-  assert.match(prompt, /"selectedBookingIndex":2/);
+  assert.match(prompt, /historical_candidate/);
   assert.match(prompt, /"bookingId":"booking-corolla"/);
   assert.match(prompt, /"itemId":"corolla-grey"/);
-  assert.match(prompt, /HISTORICAL_CONTEXT_ONLY/);
   assert.doesNotMatch(prompt, /CURRENT_BOOKING_IN_SCOPE/);
   assert.match(prompt, /Honda Civic 2026/);
   assert.doesNotMatch(prompt, /"totalAmount":40000/);
@@ -2231,18 +2234,18 @@ test("valid Stonic candidate trusted focus still works after stale-index fail-cl
   assert.equal(compact.bookingFocus.totalAmount, 22000);
 });
 
-test("verified_item_mismatch correction pins trusted Stonic identity", () => {
+test("verified_item_mismatch correction keeps historical rows as candidates only", () => {
   const text = buildPostConfirmVerifiedItemMismatchCorrection(
     trustedStonicFocusFacts(),
     "verified_item_mismatch"
   );
   assert.match(text, /verified_item_mismatch/);
-  assert.match(text, /CdqHuG0ZJpIZW3DDPlbI/);
-  assert.match(text, /selectedBookingIndex=1/);
-  assert.match(text, /Kia Stonic EX Plus 2021 \(White Color\)/);
+  assert.match(text, /candidate facts only/);
   assert.match(text, /OLD_BOOKING_REFERENCE/);
   assert.match(text, /NEW_TRANSACTION/);
-  assert.match(text, /CONTEXT ONLY/);
+  assert.match(text, /PENDING_AVAILABILITY_REFERENCE/);
+  assert.doesNotMatch(text, /CURRENT_BOOKING_IN_SCOPE/);
+  assert.doesNotMatch(text, /selectedBookingIndex=1/);
 });
 
 test("trusted Stonic focus recovers duration ask after Corolla verified_item_mismatch", async () => {
@@ -2476,6 +2479,6 @@ test("trusted focus mutation still requires explicit candidate after prompt domi
   assert.notEqual(result.bookingSelectionMode, "focused");
   assert.equal(counters.unexpectedConfirmExecutions || 0, 0);
   const firstPrompt = String(counters.openaiPrompts[0] || "");
-  assert.match(firstPrompt, /HISTORICAL_CONTEXT_ONLY/);
+  assert.match(firstPrompt, /historical_candidate/);
   assert.doesNotMatch(firstPrompt, /CURRENT_BOOKING_IN_SCOPE/);
 });

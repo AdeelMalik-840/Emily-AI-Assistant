@@ -641,6 +641,56 @@ async function runCloudOwnershipPipeline({
       combinedMessage: pipelineMessage,
       latestMessage: pipelineMessage,
       messageId: `wamid.pipeline-${randomUUID()}`,
+      __executeCloudDmOwnershipDecisionFn:
+        pipelineParams.__executeCloudDmOwnershipDecisionFn ||
+        (async () =>
+          availabilityRequestData
+            ? {
+                ok: true,
+                source: "openai",
+                facts: {
+                  pendingAvailabilityRequests: [
+                    {
+                      selectionIndex: 1,
+                      requestId: REQUEST_ID,
+                      itemLabel: "Honda Civic",
+                      request: { requestId: REQUEST_ID },
+                    },
+                  ],
+                },
+                decision: {
+                  turnScope: "PENDING_AVAILABILITY_REFERENCE",
+                  targetId: REQUEST_ID,
+                  action: /kar\s*do|haan|han/i.test(pipelineMessage)
+                    ? "confirm_pending_availability"
+                    : "reply",
+                  mutationIntent: "none",
+                  factKind: "booking_fact",
+                },
+              }
+            : {
+                ok: true,
+                source: "openai",
+                facts: {
+                  booking: {
+                    id: "booking-existing-civic",
+                    selectionIndex: 1,
+                  },
+                  bookingCandidates: [
+                    {
+                      id: "booking-existing-civic",
+                      selectionIndex: 1,
+                    },
+                  ],
+                },
+                decision: {
+                  turnScope: "OLD_BOOKING_REFERENCE",
+                  targetId: "booking-existing-civic",
+                  action: "reply",
+                  mutationIntent: "none",
+                  factKind: "booking_fact",
+                },
+              }),
       __tryHandleAvailabilityCustomerCloudInboundFn:
         cloudConfirmSpy ||
         (async (params) => {
@@ -720,6 +770,32 @@ async function runCloudOwnershipPipeline({
     processCalls,
     cloudConfirmCalls,
     outcome,
+  };
+}
+
+function civicOldBookingOwnershipDecision() {
+  return {
+    ok: true,
+    source: "openai",
+    facts: {
+      booking: {
+        id: "booking-existing-civic",
+        selectionIndex: 1,
+      },
+      bookingCandidates: [
+        {
+          id: "booking-existing-civic",
+          selectionIndex: 1,
+        },
+      ],
+    },
+    decision: {
+      turnScope: "OLD_BOOKING_REFERENCE",
+      targetId: "booking-existing-civic",
+      action: "reply",
+      mutationIntent: "none",
+      factKind: "booking_fact",
+    },
   };
 }
 
@@ -865,6 +941,17 @@ test("Corolla focus release continues once into fresh Civic availability routing
         ok: true,
         providerMessageId: "wamid.fresh-civic-release",
       }),
+      __executeCloudDmOwnershipDecisionFn: async () => ({
+        ok: true,
+        source: "openai",
+        decision: {
+          turnScope: "NEW_TRANSACTION",
+          targetId: null,
+          action: "reply",
+          mutationIntent: "none",
+          factKind: "booking_fact",
+        },
+      }),
       __resolveActiveCustomerBookingFactsFn: async () => ({
         ok: true,
         reason: "MATCHED_TRUSTED_FOCUS",
@@ -916,7 +1003,7 @@ test("Corolla focus release continues once into fresh Civic availability routing
     },
   });
 
-  assert.equal(paCalls, 1);
+  assert.equal(paCalls, 0);
   assert.equal(availabilityCalls, 1);
   assert.equal(brainV2Calls, 1);
   assert.equal(processCalls, 0);
@@ -951,6 +1038,7 @@ test("full pipeline retries a failed confirmed-booking reply as send-only recove
   const providerMessageId = `wamid.confirm-recovery-${randomUUID()}`;
   const inboundText = `Han done kro [test:${randomUUID()}]`;
   let openAiCalls = 0;
+  let ownershipCalls = 0;
   let bookingPaCalls = 0;
   let sends = 0;
   const params = {
@@ -967,6 +1055,30 @@ test("full pipeline retries a failed confirmed-booking reply as send-only recove
     latestMessage: inboundText,
     messageId: providerMessageId,
     messageTimestamp: Math.floor(Date.now() / 1000),
+    __executeCloudDmOwnershipDecisionFn: async () => {
+      ownershipCalls += 1;
+      return {
+        ok: true,
+        source: "openai",
+        facts: {
+          pendingAvailabilityRequests: [
+            {
+              selectionIndex: 1,
+              requestId: REQUEST_ID,
+              itemLabel: "Toyota Corolla",
+              request: { requestId: REQUEST_ID },
+            },
+          ],
+        },
+        decision: {
+          turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          targetId: REQUEST_ID,
+          action: "confirm_pending_availability",
+          mutationIntent: "none",
+          factKind: "action",
+        },
+      };
+    },
     __resolveActiveCustomerBookingFactsFn: async () =>
       activeCivicPostConfirmFacts(),
     __tryHandleAvailabilityCustomerCloudInboundFn: async (handlerParams) =>
@@ -981,6 +1093,8 @@ test("full pipeline retries a failed confirmed-booking reply as send-only recove
           displayLabel: "Toyota Corolla",
           dailyRate: 5000,
         },
+        __composeWaitingConfirmExecutionReplyForTests:
+          composeWaitingConfirmExecutionReplyForTests,
         __decideCustomerTurnForTests: async (turnContext) => {
           openAiCalls += 1;
           return {
@@ -1024,7 +1138,8 @@ test("full pipeline retries a failed confirmed-booking reply as send-only recove
   };
 
   await executeWhatsAppAiPipeline(params);
-  assert.equal(openAiCalls, 1);
+  assert.equal(ownershipCalls, 1);
+  assert.equal(openAiCalls, 0);
   assert.equal(fake.getBookingCount(), 1);
   assert.equal(sends, 1);
   assert.equal(
@@ -1044,7 +1159,8 @@ test("full pipeline retries a failed confirmed-booking reply as send-only recove
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 
-  assert.equal(openAiCalls, 1);
+  assert.equal(ownershipCalls, 1);
+  assert.equal(openAiCalls, 0);
   assert.equal(bookingPaCalls, 0);
   assert.equal(fake.getBookingCount(), 1);
   assert.equal(sends, 2);
@@ -1063,7 +1179,8 @@ test("full pipeline retries a failed confirmed-booking reply as send-only recove
     ...params,
     __cloudResumeProcessing: true,
   });
-  assert.equal(openAiCalls, 1);
+  assert.equal(ownershipCalls, 1);
+  assert.equal(openAiCalls, 0);
   assert.equal(bookingPaCalls, 0);
   assert.equal(fake.getBookingCount(), 1);
   assert.equal(sends, 2);
@@ -1171,6 +1288,8 @@ test("without eligible waiting-confirm, existing Civic post-confirm behavior is 
     availabilityRequestData: null,
     inboundText: "Pickup details?",
     pipelineParams: {
+      __executeCloudDmOwnershipDecisionFn: async () =>
+        civicOldBookingOwnershipDecision(),
       __resolveActiveCustomerBookingFactsFn: async () =>
         activeCivicPostConfirmFacts(),
       __tryHandleCustomerBusinessPaInboundFn: async ({ preResolvedBookingFacts }) => {
@@ -1201,6 +1320,8 @@ for (const [label, requestPatch] of [
       availabilityRequestData: baseCloudWaitingRequest(requestPatch),
       inboundText: "Pickup details?",
       pipelineParams: {
+        __executeCloudDmOwnershipDecisionFn: async () =>
+          civicOldBookingOwnershipDecision(),
         __resolveActiveCustomerBookingFactsFn: async () =>
           activeCivicPostConfirmFacts(),
         __tryHandleCustomerBusinessPaInboundFn: async () => {
@@ -1219,7 +1340,7 @@ for (const [label, requestPatch] of [
   });
 }
 
-test("genuine waiting-confirm NO_MATCH falls through once to Civic post-confirm", async () => {
+test("frozen Civic booking ownership does not fall through from pending executor miss", async () => {
   let confirmCalls = 0;
   let paCalls = 0;
   const { outcome } = await runCloudOwnershipPipeline({
@@ -1227,11 +1348,13 @@ test("genuine waiting-confirm NO_MATCH falls through once to Civic post-confirm"
     inboundText: "Pickup details?",
     pipelineParams: {
       messageTimestamp: Math.floor(Date.now() / 1000),
+      __executeCloudDmOwnershipDecisionFn: async () =>
+        civicOldBookingOwnershipDecision(),
       __resolveActiveCustomerBookingFactsFn: async () =>
         activeCivicPostConfirmFacts(),
       __tryHandleCustomerBusinessPaInboundFn: async () => {
         paCalls += 1;
-          return ownedCivicPaResult("OpenAI Civic fallback reply");
+        return ownedCivicPaResult("OpenAI Civic fallback reply");
       },
     },
     cloudConfirmSpy: async () => {
@@ -1239,7 +1362,7 @@ test("genuine waiting-confirm NO_MATCH falls through once to Civic post-confirm"
       return { handled: false, reason: "NO_MATCH" };
     },
   });
-  assert.equal(confirmCalls, 1);
+  assert.equal(confirmCalls, 0);
   assert.equal(paCalls, 1);
   assert.equal(outcome?.reply, "OpenAI Civic fallback reply");
   assert.equal(outcome?.messageMeta?.finalReplySource, "openai_post_confirm_pa");
@@ -1325,12 +1448,30 @@ test("buffer does not send a second reply when confirm service handled", async (
   assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, true);
 });
 
+function newTransactionOwnershipDecision() {
+  return {
+    ok: true,
+    source: "openai",
+    decision: {
+      turnScope: "NEW_TRANSACTION",
+      targetId: null,
+      action: "reply",
+      mutationIntent: "none",
+      factKind: "booking_fact",
+    },
+  };
+}
+
 test("no active AVR falls back to Brain unchanged", async () => {
   const { brainV2Calls, processCalls, cloudConfirmCalls, outcome } =
     await runCloudOwnershipPipeline({
       availabilityRequestData: null,
+      pipelineParams: {
+        __executeCloudDmOwnershipDecisionFn: async () =>
+          newTransactionOwnershipDecision(),
+      },
     });
-  assert.equal(cloudConfirmCalls, 1);
+  assert.equal(cloudConfirmCalls, 0);
   assert.equal(brainV2Calls, 1);
   assert.equal(processCalls, 0);
   assert.equal(outcome?.reply, "Main samajh nahi paaya.");
@@ -1345,6 +1486,10 @@ test("wrong phone falls back to Brain unchanged", async () => {
       customerWaId: "923009999999",
       customerPhoneNormalized: "923009999999",
     }),
+    pipelineParams: {
+      __executeCloudDmOwnershipDecisionFn: async () =>
+        newTransactionOwnershipDecision(),
+    },
   });
   assert.equal(brainV2Calls, 1);
   assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, undefined);
@@ -1355,6 +1500,10 @@ test("expired AVR falls back to Brain unchanged", async () => {
     availabilityRequestData: baseCloudWaitingRequest({
       confirmExpiresAt: new Date(Date.now() - 60_000),
     }),
+    pipelineParams: {
+      __executeCloudDmOwnershipDecisionFn: async () =>
+        newTransactionOwnershipDecision(),
+    },
   });
   assert.equal(brainV2Calls, 1);
   assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, undefined);

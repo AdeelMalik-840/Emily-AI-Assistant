@@ -118,7 +118,11 @@ function persistAcceptedPaSemanticDecision({
     messageId,
     openaiSource,
     semanticDecisionStatus: released ? "released" : "accepted",
-    ownershipLane: released ? "normal_routing" : "post_confirm_pa",
+    ownershipLane: released
+      ? "normal_routing"
+      : decision?.turnScope === "PENDING_AVAILABILITY_REFERENCE"
+        ? "waiting_confirm_dm"
+        : "post_confirm_pa",
   });
 }
 
@@ -578,6 +582,7 @@ export async function handleCustomerBusinessPaInbound({
   sendCredentials = null,
   preResolvedBookingFacts = null,
   cloudLifecycleIdentity = null,
+  canonicalSemanticDecision = null,
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
   __decideCustomerTurnFn = decideCustomerTurn,
   __executeAvailabilityCustomerConfirmBookingFn =
@@ -697,21 +702,26 @@ export async function handleCustomerBusinessPaInbound({
     cloudLifecycleIdentity && typeof cloudLifecycleIdentity === "object"
       ? cloudLifecycleIdentity
       : null;
+  const frozenFromCaller =
+    canonicalSemanticDecision && typeof canonicalSemanticDecision === "object"
+      ? canonicalSemanticDecision
+      : null;
   const savedCanonical = hasAcceptedCloudInboundSemanticDecision({ identity })
     ? getCloudInboundSemanticDecision({ identity })
     : null;
+  const frozenOwnership = frozenFromCaller || savedCanonical;
 
   let decided;
   let semanticDecisionCount = 0;
-  if (savedCanonical) {
+  if (frozenOwnership) {
     decided = {
       ok: true,
-      source: savedCanonical.openaiSource || "openai",
-      decision: hydrateDecisionFromCanonicalSnapshot(savedCanonical),
+      source: frozenOwnership.openaiSource || "openai",
+      decision: hydrateDecisionFromCanonicalSnapshot(frozenOwnership),
       reusedCanonicalSemanticDecision: true,
     };
   } else {
-    // Brain shared entrypoint — one semantic decision for this customer turn.
+    // Tests/direct callers without a frozen Cloud DM snapshot.
     decided = await __decideCustomerTurnFn({
       lane: "post_confirm_pa",
       channel: "whatsapp",

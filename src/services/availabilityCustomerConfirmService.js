@@ -9,6 +9,7 @@ import {
   packWaitingConfirmDmTurnContext,
   resolveWaitingConfirmDmOutboundPromptType,
   WAITING_CONFIRM_DM_ALLOWED_ACTIONS,
+  WAITING_CONFIRM_DM_CONFIRM_EXECUTOR,
   WAITING_CONFIRM_DM_LANE,
   WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
 } from "../brain/decisions/waitingConfirmDmLane.js";
@@ -360,6 +361,40 @@ function resolveBrainEnabledOutboundReply(decision) {
 /**
  * @param {Record<string, unknown> | null | undefined} turnResult
  */
+function mapFrozenPendingOwnershipToWaitingConfirmDecision(frozen, requestId) {
+  const rawAction = clean(frozen?.action, 40);
+  let action = "reply";
+  if (rawAction === "confirm_pending_availability") action = "confirm_booking";
+  else if (rawAction === "decline_pending_availability") action = "decline_request";
+  else if (rawAction === "silence" || rawAction === "none") action = "silence";
+  else if (rawAction === "clarify") action = "clarify";
+  else if (WAITING_CONFIRM_DM_ALLOWED_ACTIONS.has(rawAction)) action = rawAction;
+  return {
+    ...(frozen && typeof frozen === "object" ? frozen : {}),
+    action,
+    targetContext: "pending_availability",
+    targetId: requestId,
+    customerReply: frozen?.customerReply ?? "",
+    shouldReply: frozen?.shouldReply !== false && action !== "silence",
+    confidence:
+      Number.isFinite(Number(frozen?.confidence))
+        ? Number(frozen.confidence)
+        : 1,
+    customerIsConfirmingBooking: action === "confirm_booking",
+    customerIsDeclining: action === "decline_request",
+    customerIsAskingQuestion:
+      action === "confirm_booking" || action === "decline_request"
+        ? false
+        : frozen?.customerIsAskingQuestion === true,
+    requiredExecutor:
+      action === "confirm_booking"
+        ? WAITING_CONFIRM_DM_CONFIRM_EXECUTOR
+        : action === "decline_request"
+          ? "decline_request_executor"
+          : frozen?.requiredExecutor || "whatsapp_cloud_dm",
+  };
+}
+
 function isUsableWaitingConfirmBrainTurn(turnResult) {
   if (!turnResult || typeof turnResult !== "object") return false;
   if (turnResult.ok === false) return false;
@@ -1108,6 +1143,7 @@ async function runWaitingConfirmDmBrainTurn({
   sendCredentials = null,
   composeWaitingConfirmExecutionReplyFn = null,
   historicalBookingContext = null,
+  frozenCanonicalTargetId = null,
   sendReply,
   afterHandled = null,
 }) {
@@ -1143,6 +1179,28 @@ async function runWaitingConfirmDmBrainTurn({
   }
 
   const turnResult = await decideCustomerTurnFn(turnContext);
+  const frozenTargetId = clean(frozenCanonicalTargetId, 160);
+  if (frozenTargetId && turnResult?.decision && typeof turnResult.decision === "object") {
+    const chosenId = clean(turnResult.decision.targetId, 160);
+    if (chosenId && chosenId !== frozenTargetId && chosenId !== requestId) {
+      if (typeof afterHandled === "function") await afterHandled();
+      return waitingConfirmBrainMeta({
+        handled: true,
+        action: "silence",
+        reply: null,
+        decision: turnResult.decision,
+        requestId,
+        turnContext,
+        brainFailed: true,
+        reason: "CANONICAL_PENDING_REFERENT_REWRITE",
+      });
+    }
+    turnResult.decision = {
+      ...turnResult.decision,
+      targetId: frozenTargetId,
+      targetContext: "pending_availability",
+    };
+  }
   if (!isUsableWaitingConfirmBrainTurn(turnResult)) {
     if (typeof afterHandled === "function") await afterHandled();
     return waitingConfirmBrainMeta({
@@ -1476,6 +1534,7 @@ export async function handleAvailabilityCustomerCloudInbound({
   preselectedWaitingConfirmRequest = null,
   historicalBookingContext = null,
   inboundReceivedAtMs = null,
+  canonicalSemanticDecision = null,
   __waitingConfirmDmBrainEnabled = null,
   __decideCustomerTurnForTests = null,
   __catalogRowForTests = undefined,
@@ -1552,41 +1611,68 @@ export async function handleAvailabilityCustomerCloudInbound({
   }
 
   let waiting = [];
-  const preselectedRequestId = clean(
-    preselectedWaitingConfirmRequest?.requestId ??
-      preselectedWaitingConfirmRequest?.id
-  );
-  if (preselectedRequestId) {
-    const freshPreselected = await getAvailabilityRequest({
+  const frozenPendingScope =
+    String(canonicalSemanticDecision?.turnScope ?? "").trim() ===
+    "PENDING_AVAILABILITY_REFERENCE";
+  const frozenPendingId = clean(canonicalSemanticDecision?.targetId, 160);
+  if (canonicalSemanticDecision && !frozenPendingScope) {
+    return { handled: false, reason: "CANONICAL_SCOPE_NOT_PENDING" };
+  }
+
+  let request = null;
+  let selection = { request: null, reason: null };
+  if (frozenPendingScope && frozenPendingId) {
+    const frozenRequest = await getAvailabilityRequest({
       db: connection,
       businessId: uid,
-      requestId: preselectedRequestId,
+      requestId: frozenPendingId,
     });
     if (
-      freshPreselected &&
-      availabilityRequestMatchesCloudCustomerPhone(freshPreselected, phone) &&
-      isFreshTrustedWaitingConfirmCloudOwnershipCandidate(freshPreselected, {
-        inboundReceivedAtMs,
-      })
+      !frozenRequest ||
+      !availabilityRequestMatchesCloudCustomerPhone(frozenRequest, phone)
     ) {
-      waiting = [{ requestId: preselectedRequestId, ...freshPreselected }];
+      return { handled: false, reason: "CANONICAL_PENDING_TARGET_UNTRUSTED" };
     }
+    request = { requestId: frozenPendingId, ...frozenRequest };
+    selection = { request, reason: "CANONICAL_FROZEN_TARGET" };
+    waiting = [request];
   } else {
-    waiting = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
+    const preselectedRequestId = clean(
+      preselectedWaitingConfirmRequest?.requestId ??
+        preselectedWaitingConfirmRequest?.id
+    );
+    if (preselectedRequestId) {
+      const freshPreselected = await getAvailabilityRequest({
+        db: connection,
+        businessId: uid,
+        requestId: preselectedRequestId,
+      });
+      if (
+        freshPreselected &&
+        availabilityRequestMatchesCloudCustomerPhone(freshPreselected, phone) &&
+        isFreshTrustedWaitingConfirmCloudOwnershipCandidate(freshPreselected, {
+          inboundReceivedAtMs,
+        })
+      ) {
+        waiting = [{ requestId: preselectedRequestId, ...freshPreselected }];
+      }
+    } else {
+      waiting = await findWaitingConfirmCloudAvailabilityRequestsByPhone({
+        db: connection,
+        businessId: uid,
+        customerPhone: phone,
+      });
+    }
+    const inactiveOrSuperseded = await findSupersededCloudAvailabilityRequestsByPhone({
       db: connection,
       businessId: uid,
       customerPhone: phone,
+    }).catch(() => []);
+    selection = selectAvailabilityRequestForCustomerMessage(waiting, text, {
+      inactiveOrSupersededRequests: inactiveOrSuperseded,
     });
+    request = selection.request;
   }
-  const inactiveOrSuperseded = await findSupersededCloudAvailabilityRequestsByPhone({
-    db: connection,
-    businessId: uid,
-    customerPhone: phone,
-  }).catch(() => []);
-  const selection = selectAvailabilityRequestForCustomerMessage(waiting, text, {
-    inactiveOrSupersededRequests: inactiveOrSuperseded,
-  });
-  let request = selection.request;
 
   console.log("[waiting_confirm_cloud_binding]", {
     inboundId: inboundMessageId || null,
@@ -1647,12 +1733,20 @@ export async function handleAvailabilityCustomerCloudInbound({
     };
   }
 
-  // PR1: waiting_confirm meaning always uses decideCustomerTurn (Cloud + Playwright).
-  // Classifier / canned path is no longer the final authority for active waiting_confirm.
+  // Frozen Cloud DM ownership: do not call waitingConfirmDmLane OpenAI.
   const decideFn =
-    typeof __decideCustomerTurnForTests === "function"
-      ? __decideCustomerTurnForTests
-      : decideCustomerTurn;
+    frozenPendingScope && frozenPendingId
+      ? async () => ({
+          ok: true,
+          source: "canonical_frozen_ownership",
+          decision: mapFrozenPendingOwnershipToWaitingConfirmDecision(
+            canonicalSemanticDecision,
+            requestId
+          ),
+        })
+      : typeof __decideCustomerTurnForTests === "function"
+        ? __decideCustomerTurnForTests
+        : decideCustomerTurn;
   return runWaitingConfirmDmBrainTurn({
     connection,
     businessId: uid,
@@ -1672,6 +1766,8 @@ export async function handleAvailabilityCustomerCloudInbound({
         ? __composeWaitingConfirmExecutionReplyForTests
         : null,
     historicalBookingContext,
+    frozenCanonicalTargetId:
+      frozenPendingScope && frozenPendingId ? frozenPendingId : null,
     sendCredentials,
     afterHandled: async () =>
       recordCloudInboundIdempotency({

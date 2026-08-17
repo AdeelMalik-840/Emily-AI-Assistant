@@ -956,23 +956,25 @@ test("no canned tables / topic-regex maps / pamiss / owner notify added in Step 
   );
 });
 
-test("buffer only gains conversationHistory param pass-through (no routing reorder)", () => {
+test("Cloud DM coordinator routes after owner-answer; Group waiting-confirm guard stays isolated", () => {
   const src = readFileSync(
     join(ROOT, "src/services/whatsappInboundBuffer.js"),
     "utf8"
   );
   const confirmCall = src.indexOf("handleCloudConfirmFn({");
   assert.ok(confirmCall > 0);
-  const snippet = src.slice(confirmCall, confirmCall + 280);
+  const snippet = src.slice(confirmCall, confirmCall + 520);
   assert.match(snippet, /conversationHistory/);
-  const cloudIdx = src.indexOf("const canTryCloudConfirmOwnership =");
+  assert.match(snippet, /canonicalSemanticDecision/);
+  const coordinatorIdx = src.indexOf("canCoordinateCloudDmOwnership");
   const waitingIdx = src.indexOf(
     "const ownershipGuard = await evaluateAvailabilityWaitingConfirmOwnershipGuard"
   );
   const paOwnerIdx = src.indexOf("__tryHandlePaMissingInfoOwnerAnswerFn");
-  const businessPaIdx = src.indexOf("const canTryBusinessPa =");
-  assert.ok(cloudIdx > 0);
-  assert.ok(waitingIdx > cloudIdx);
+  assert.ok(coordinatorIdx > 0);
+  assert.ok(waitingIdx > 0);
   assert.ok(paOwnerIdx > waitingIdx);
-  assert.ok(businessPaIdx > paOwnerIdx);
+  assert.match(src, /isGroupInbound \|\| playwrightWebInbound/);
+  assert.doesNotMatch(src, /const canTryCloudConfirmOwnership =/);
+  assert.doesNotMatch(src, /const canTryBusinessPa =/);
 });

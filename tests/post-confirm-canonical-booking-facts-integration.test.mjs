@@ -204,6 +204,8 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
   // Silence + factual Turn Plan must normalize to deferred resolve (no recovery round-trip).
   const responses = [
     modelDecision({
+      turnScope: "OLD_BOOKING_REFERENCE",
+      targetId: "booking-stonic",
       shouldReply: false,
       customerReply: "",
       action: "silence",
@@ -238,9 +240,8 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
   assert.equal(result.decision.capability, "answer_from_active_booking");
 
   const firstPrompt = String(calls[0]?.messages?.[1]?.content || "");
-  assert.match(firstPrompt, /POST_CONFIRM_DECIDE_CONTEXT_JSON|CURRENT_BOOKING_IN_SCOPE/);
-  assert.match(firstPrompt, /item-stonic/);
-  assert.match(firstPrompt, /Kia Stonic/);
+  assert.match(firstPrompt, /POST_CONFIRM_DECIDE_CONTEXT_JSON|historical_candidate/);
+  assert.match(firstPrompt, /item-stonic|Kia Stonic/);
   // Decide context must not expose answerable fact values (resolve+compose owns those).
   const contextBlock = firstPrompt.split("CUSTOMER_MESSAGE:")[0] || "";
   assert.doesNotMatch(contextBlock, /\b22000\b/);

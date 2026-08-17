@@ -1511,6 +1511,20 @@ const CLOUD_SEMANTIC_TURN_SCOPES = new Set([
   "UNCLEAR",
 ]);
 
+export function isReleasedCloudTurnScope(turnScope) {
+  return (
+    turnScope === "NEW_TRANSACTION" ||
+    turnScope === "SOCIAL_GENERAL" ||
+    turnScope === "UNCLEAR"
+  );
+}
+
+export function deriveCloudSemanticOwnershipLane(turnScope) {
+  if (turnScope === "PENDING_AVAILABILITY_REFERENCE") return "waiting_confirm_dm";
+  if (turnScope === "OLD_BOOKING_REFERENCE") return "post_confirm_pa";
+  return "normal_routing";
+}
+
 function cleanSemanticField(value, max = 160) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : null;
