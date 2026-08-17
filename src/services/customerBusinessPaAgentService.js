@@ -37,6 +37,11 @@ import {
 } from "./paMissingInfoRequestService.js";
 import { sendPaMissingInfoOwnerNotification } from "./paMissingInfoOwnerNotifyService.js";
 import { sendWhatsAppMessage } from "./whatsappCloud.js";
+import {
+  getCloudInboundSemanticDecision,
+  hasAcceptedCloudInboundSemanticDecision,
+  persistCloudInboundSemanticDecision,
+} from "./inboundTurnLedger.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -68,6 +73,53 @@ export function shouldReleasePostConfirmOwnership(decision) {
     "SOCIAL_GENERAL",
     "UNCLEAR",
   ].includes(decision?.turnScope);
+}
+
+function hydrateDecisionFromCanonicalSnapshot(snapshot) {
+  const row = snapshot && typeof snapshot === "object" ? snapshot : {};
+  const action = row.action ?? null;
+  const pendingAction =
+    action === "confirm_pending_availability" ||
+    action === "decline_pending_availability";
+  const mutationAction = action === "request_booking_mutation";
+  return {
+    turnScope: row.turnScope ?? null,
+    targetContext: row.targetContext ?? null,
+    targetId: row.targetId ?? null,
+    selectedBookingId: row.selectedBookingId ?? null,
+    pendingAvailabilitySelectionIndex:
+      row.pendingAvailabilitySelectionIndex ?? null,
+    mutationIntent: row.mutationIntent ?? "none",
+    action,
+    factKind: row.factKind ?? null,
+    capability: row.capability ?? null,
+    evidenceNeeds: Array.isArray(row.evidenceNeeds) ? row.evidenceNeeds : [],
+    customerReply: "",
+    shouldReply: true,
+    informationalReplyDeferred: !mutationAction && !pendingAction,
+    mutationExecutionRequested: mutationAction,
+    mutationExecutionStatus: "not_executed",
+  };
+}
+
+function persistAcceptedPaSemanticDecision({
+  identity,
+  decision,
+  messageId,
+  openaiSource,
+}) {
+  if (!identity?.guaranteeKey) {
+    return { ok: true, skipped: true, reason: "MISSING_CLOUD_IDENTITY" };
+  }
+  const released = shouldReleasePostConfirmOwnership(decision);
+  return persistCloudInboundSemanticDecision({
+    identity,
+    decision,
+    messageId,
+    openaiSource,
+    semanticDecisionStatus: released ? "released" : "accepted",
+    ownershipLane: released ? "normal_routing" : "post_confirm_pa",
+  });
 }
 
 /** @type {Readonly<Record<string, unknown>>} */
@@ -525,6 +577,7 @@ export async function handleCustomerBusinessPaInbound({
   conversationHistory = null,
   sendCredentials = null,
   preResolvedBookingFacts = null,
+  cloudLifecycleIdentity = null,
   __resolveActiveCustomerBookingFactsFn = resolveActiveCustomerBookingFacts,
   __decideCustomerTurnFn = decideCustomerTurn,
   __executeAvailabilityCustomerConfirmBookingFn =
@@ -640,32 +693,50 @@ export async function handleCustomerBusinessPaInbound({
   }
 
   const facts = resolved.facts;
+  const identity =
+    cloudLifecycleIdentity && typeof cloudLifecycleIdentity === "object"
+      ? cloudLifecycleIdentity
+      : null;
+  const savedCanonical = hasAcceptedCloudInboundSemanticDecision({ identity })
+    ? getCloudInboundSemanticDecision({ identity })
+    : null;
 
-  // Brain shared entrypoint — one semantic decision for this customer turn.
-  // Informational post-booking turns have no missing-info or owner-notification executor.
-  const decided = await __decideCustomerTurnFn({
-    lane: "post_confirm_pa",
-    channel: "whatsapp",
-    chatType: "dm",
-    businessId: uid,
-    customerPhone: phone,
-    messageText: text,
-    messageId,
-    recentDialogue: conversationHistory,
-    ownershipLane: "post_confirm_pa",
-    activeBooking: facts.booking ?? null,
-    activeAvailabilityRequest: facts.availabilityRequest ?? null,
-    knownPolicies: facts.known ?? null,
-    openMissingInfoRequests: facts.openMissingInfoRequests ?? null,
-    latestClosedMissingInfoAnswers:
-      facts.latestClosedMissingInfoAnswers ?? null,
-    safetyPolicy: facts.policy ?? null,
-    allowedExecutors: ["whatsapp_cloud_dm"],
-    facts,
-    styleKey: "casual_local",
-    missingInfoLoopFullyEnabled: false,
-    __chatCompletionsCreateForTests,
-  });
+  let decided;
+  let semanticDecisionCount = 0;
+  if (savedCanonical) {
+    decided = {
+      ok: true,
+      source: savedCanonical.openaiSource || "openai",
+      decision: hydrateDecisionFromCanonicalSnapshot(savedCanonical),
+      reusedCanonicalSemanticDecision: true,
+    };
+  } else {
+    // Brain shared entrypoint — one semantic decision for this customer turn.
+    decided = await __decideCustomerTurnFn({
+      lane: "post_confirm_pa",
+      channel: "whatsapp",
+      chatType: "dm",
+      businessId: uid,
+      customerPhone: phone,
+      messageText: text,
+      messageId,
+      recentDialogue: conversationHistory,
+      ownershipLane: "post_confirm_pa",
+      activeBooking: facts.booking ?? null,
+      activeAvailabilityRequest: facts.availabilityRequest ?? null,
+      knownPolicies: facts.known ?? null,
+      openMissingInfoRequests: facts.openMissingInfoRequests ?? null,
+      latestClosedMissingInfoAnswers:
+        facts.latestClosedMissingInfoAnswers ?? null,
+      safetyPolicy: facts.policy ?? null,
+      allowedExecutors: ["whatsapp_cloud_dm"],
+      facts,
+      styleKey: "casual_local",
+      missingInfoLoopFullyEnabled: false,
+      __chatCompletionsCreateForTests,
+    });
+    semanticDecisionCount = 1;
+  }
 
   if (decided?.ok !== true || decided?.source !== "openai") {
     const retryable = decided?.retryable === true;
@@ -713,10 +784,36 @@ export async function handleCustomerBusinessPaInbound({
     decided.decision,
     facts
   );
+  if (!savedCanonical) {
+    const persisted = persistAcceptedPaSemanticDecision({
+      identity,
+      decision,
+      messageId,
+      openaiSource: decided.source,
+    });
+    if (persisted?.ok === false && persisted?.reason !== "MISSING_CLOUD_IDENTITY") {
+      return attachPostConfirmAgentReturnContract(
+        {
+          handled: true,
+          action: "business_pa_terminal_semantic_ownership_failure",
+          reply: "",
+          sentReply: false,
+          terminalFailure: true,
+          retryable: false,
+          reason: persisted.reason || "SEMANTIC_DECISION_PERSIST_FAILED",
+          failureReason: persisted.reason || "SEMANTIC_DECISION_PERSIST_FAILED",
+          openaiUsed: semanticDecisionCount > 0,
+          openaiSource: decided.source,
+          finalReplySource: "openai_post_confirm_pa",
+          semanticDecisionCount,
+        },
+        { decisionSource: decision }
+      );
+    }
+  }
   let pendingAvailabilityExecution = null;
   let mutationExecution = null;
   let missingInfoExecutionResult = null;
-  let semanticDecisionCount = 1;
   let composeCalls = 0;
   // Post-exec pending lane may replace facts with verified execution Result.
   let laneFacts = facts;
@@ -934,79 +1031,28 @@ export async function handleCustomerBusinessPaInbound({
             : guardRows,
       },
     };
-    const finalDecision = await __decideCustomerTurnFn({
-      lane: "post_confirm_pa",
-      channel: "whatsapp",
-      chatType: "dm",
-      businessId: uid,
-      customerPhone: phone,
-      messageText: text,
-      messageId,
-      recentDialogue: conversationHistory,
-      ownershipLane: "post_confirm_pa",
-      activeBooking: finalFacts.booking ?? null,
-      activeAvailabilityRequest: null,
-      knownPolicies: finalFacts.known ?? null,
-      openMissingInfoRequests: [],
-      latestClosedMissingInfoAnswers:
-        finalFacts.latestClosedMissingInfoAnswers ?? null,
-      safetyPolicy: finalFacts.policy ?? null,
-      allowedExecutors: ["whatsapp_cloud_dm"],
-      facts: finalFacts,
-      styleKey: "casual_local",
-      missingInfoLoopFullyEnabled: false,
-      __chatCompletionsCreateForTests,
-    });
-    semanticDecisionCount += 1;
-    if (finalDecision?.ok !== true || finalDecision?.source !== "openai") {
-      const retryable = finalDecision?.retryable === true;
-      const terminalDiagnostic = retryable
-        ? null
-        : logPostConfirmTerminalDiagnostic(finalDecision);
-      return attachPostConfirmAgentReturnContract(
-        {
-          handled: true,
-          action: retryable
-            ? "business_pa_retryable_failure"
-            : "business_pa_terminal_model_failure",
-          reply: "",
-          sentReply: false,
-          bookingId: clean(facts.booking?.id) || null,
-          availabilityRequestId: selected?.requestId ?? null,
-          reason: retryable
-            ? "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED"
-            : "OPENAI_POST_CONFIRM_MODEL_CONTRACT_TERMINAL",
-          retryable,
-          terminalFailure: !retryable,
-          openaiUsed: false,
-          openaiSource: finalDecision?.source ?? "technical_fallback",
-          finalReplySource: "openai_post_confirm_pa",
-          failureReason:
-            clean(finalDecision?.reason, 160) ||
-            "OPENAI_POST_CONFIRM_AFTER_EXECUTION_FAILED",
-          pendingAvailabilityExecution,
-          silenceRecoveryAttempts:
-            Number(finalDecision?.silenceRecoveryAttempts ?? 0) || 0,
-          contentSafetyAttempts:
-            terminalDiagnostic?.contentSafetyAttempts ??
-            nonNegativeInteger(finalDecision?.contentSafetyAttempts),
-          semanticDecisionCount,
-          composeCalls,
-        },
-        {
-          decisionSource:
-            finalDecision?.decision && typeof finalDecision.decision === "object"
-              ? finalDecision.decision
-              : decision,
-          pendingAvr: pendingAvailabilityExecution,
-          mutation: null,
-          missingInfo: null,
-        }
-      );
-    }
     // Verified execution Result is the only post-exec factual authority for compose.
+    // Frozen semantic ownership stays unchanged; wording is compose-only.
     laneFacts = finalFacts;
-    decision = finalDecision.decision;
+    decision = {
+      ...decision,
+      action: "reply",
+      shouldReply: true,
+      customerReply: "",
+      informationalReplyDeferred: true,
+      mutationIntent: "none",
+      mutationExecutionRequested: false,
+      factKind:
+        decision.factKind && decision.factKind !== "action"
+          ? decision.factKind
+          : "booking_fact",
+      capability:
+        decision.capability &&
+        decision.capability !== "mutation_requested" &&
+        decision.capability !== "confirm_pending_availability"
+          ? decision.capability
+          : "availability_request",
+    };
     // Fall through: deferred Turn Plans continue into the shared resolve→compose
     // path below (do not nest compose only under else-if after confirm/decline).
   } else if (decision.action === "request_booking_mutation") {

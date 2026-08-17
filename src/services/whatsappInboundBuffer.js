@@ -49,6 +49,8 @@ import {
 import {
   claimCloudInboundTurn,
   claimOutboundLockedRecovery,
+  getCloudInboundSemanticDecision,
+  hasAcceptedCloudInboundSemanticDecision,
   markCloudInboundTurnOwnershipQueued,
   markCloudInboundTurnNormalRouting,
   markCloudInboundTurnPostConfirmOwned,
@@ -60,6 +62,7 @@ import {
   markInboundTurnLedgerFailedForGuarantee,
   markInboundTurnLedgerOutboundLockedForGuarantee,
   markOutboundLockedRecoverySent,
+  persistCloudInboundSemanticDecision,
   releaseOutboundLockedRecoveryClaim,
   resolveInboundTurnAdmissionBlock,
 } from "./inboundTurnLedger.js";
@@ -1854,6 +1857,7 @@ export async function executeWhatsAppAiPipeline(p) {
   }
   const hasConfirmedBookingReplyRecovery =
     Boolean(preResolvedConfirmedBookingReplyRecovery);
+  // Historical booking rows load context only. Presence never grants ownership.
   const hasActivePostConfirmContext =
     preResolvedPostConfirmBookingFacts?.ok === true;
   if (hasConfirmedBookingReplyRecovery) {
@@ -2489,6 +2493,22 @@ export async function executeWhatsAppAiPipeline(p) {
       cloudConfirmPhone !== "unknown" &&
       Boolean(String(latestMessage ?? "").trim());
     if (canTryBusinessPa) {
+      if (
+        hasAcceptedCloudInboundSemanticDecision({
+          identity: cloudLifecycleIdentity,
+        })
+      ) {
+        const saved = getCloudInboundSemanticDecision({
+          identity: cloudLifecycleIdentity,
+        });
+        console.log("[cloud_dm_semantic_decision_resume]", {
+          traceId,
+          messageId,
+          guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+          turnScope: saved?.turnScope ?? null,
+          semanticDecisionStatus: saved?.semanticDecisionStatus ?? null,
+        });
+      }
       const tryBusinessPaFn =
         typeof p.__tryHandleCustomerBusinessPaInboundFn === "function"
           ? p.__tryHandleCustomerBusinessPaInboundFn
@@ -2505,6 +2525,7 @@ export async function executeWhatsAppAiPipeline(p) {
         conversationHistory,
         sendCredentials,
         preResolvedBookingFacts: preResolvedPostConfirmBookingFacts,
+        cloudLifecycleIdentity,
       });
       if (businessPaResult?.ownershipReleased === true) {
         const semanticDecision =
@@ -2512,6 +2533,24 @@ export async function executeWhatsAppAiPipeline(p) {
           typeof businessPaResult.decision === "object"
             ? businessPaResult.decision
             : {};
+        if (cloudLifecycleIdentity?.guaranteeKey) {
+          const persistReleased = persistCloudInboundSemanticDecision({
+            identity: cloudLifecycleIdentity,
+            decision: semanticDecision,
+            messageId,
+            openaiSource: businessPaResult.openaiSource,
+            semanticDecisionStatus: "released",
+            ownershipLane: "normal_routing",
+          });
+          const savedReleased = getCloudInboundSemanticDecision({
+            identity: cloudLifecycleIdentity,
+          });
+          if (savedReleased?.semanticDecisionStatus !== "released") {
+            throw new Error(
+              persistReleased?.reason || "RELEASED_SEMANTIC_DECISION_MISSING"
+            );
+          }
+        }
         if (
           cloudLifecycleIdentity?.guaranteeKey &&
           !cloudNormalRoutingClaimed
@@ -2703,6 +2742,10 @@ export async function executeWhatsAppAiPipeline(p) {
     guaranteeKey: buildPlaywrightGuaranteeKey(groupNameResolved, messageIdRaw),
     groupName: groupNameResolved || null,
     whatsappRecipientType,
+    canonicalSemanticDecision: cloudLifecycleIdentity?.guaranteeKey
+      ? getCloudInboundSemanticDecision({ identity: cloudLifecycleIdentity })
+      : null,
+    cloudLifecycleIdentity,
     executionContext: {
       traceId,
       businessId: ownerUserId,
@@ -3469,7 +3512,9 @@ export async function executeWhatsAppAiPipeline(p) {
   }
   } catch (err) {
     console.error("❌ Processing error:", err);
-    if (cloudLifecycleClaimed && cloudLifecycleIdentity?.guaranteeKey) {
+    // Historical booking context must not skip retry bookkeeping. If this inbound
+    // already has a Cloud ledger identity, resume from that claim.
+    if (cloudLifecycleIdentity?.guaranteeKey) {
       const lastError = String(err?.message ?? err ?? "processing_error");
       const pauseContractAutoRetry =
         shouldPauseCloudPostConfirmModelContractAutoRetry(lastError);

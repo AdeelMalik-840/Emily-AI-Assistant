@@ -6,6 +6,7 @@ process.env.OPENAI_API_KEY ||= "test-key";
 const {
   applyPostConfirmDerivedOwnershipMechanics,
   buildPostConfirmDecideFactsForPrompt,
+  buildPostConfirmVerifiedItemMismatchCorrection,
   validatePostConfirmSemanticOwnership,
 } = await import(
   "../src/brain/decisions/decidePostConfirmCustomerDm.js"
@@ -223,7 +224,22 @@ test("decide context exposes exact candidate IDs without answerable booking fact
     historicalStonicFacts()
   );
   assert.equal(context.bookingCandidates[0].bookingId, STONIC_BOOKING_ID);
+  assert.equal(context.bookingCandidates[0].scope, "HISTORICAL_CONTEXT_ONLY");
+  assert.equal(context.bookingFocus?.scope, "HISTORICAL_CONTEXT_ONLY");
   assert.equal(context.booking, null);
   assert.equal(context.known, null);
   assert.equal(context.pendingAvailabilityRequests.length, 0);
+});
+
+test("item mismatch correction does not force OLD_BOOKING_REFERENCE from trusted focus", () => {
+  const text = buildPostConfirmVerifiedItemMismatchCorrection(
+    historicalStonicFacts(),
+    "verified_item_mismatch"
+  );
+  assert.match(text, /NEW_TRANSACTION/);
+  assert.match(text, /CONTEXT ONLY/i);
+  assert.doesNotMatch(
+    text,
+    /Use turnScope=OLD_BOOKING_REFERENCE with this booking's exact bookingId as targetId for read-only factual answers/
+  );
 });

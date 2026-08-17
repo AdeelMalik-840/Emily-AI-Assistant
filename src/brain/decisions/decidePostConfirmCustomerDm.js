@@ -702,7 +702,8 @@ function buildPostConfirmSuspiciousSilenceCorrection(
     "- Silence is valid ONLY for a purely social acknowledgement with no question, request, concern, or requested information.",
     "- When the customer asks anything factual about the booking/business: set capability + evidenceNeeds Turn Plan with customerReply=\"\". Do NOT answer facts here.",
     "- Genuine social small-talk only: capability=social with a non-empty customerReply that states NO booking facts, prices, policies, dates, times, locations, or references.",
-    "- For read-only informational questions about the trusted bookingFocus, use turnScope=OLD_BOOKING_REFERENCE and that booking's exact bookingId as targetId.",
+    "- Historical bookingFocus is CONTEXT ONLY. Use turnScope=OLD_BOOKING_REFERENCE only when this message semantically refers to one listed historical booking.",
+    "- An independent inventory/pricing/availability request, including the same named item with a new duration or date, uses turnScope=NEW_TRANSACTION and targetId=null.",
     "- Never invent amounts, dates, policies, or booking mutations. Strict JSON only.",
   ].join("\n");
 }
@@ -754,7 +755,7 @@ function buildPostConfirmTrustedFocusRequiredReplyCorrection(
     "- Must set action=reply, shouldReply=true.",
     "- Factual/booking/business asks: capability + evidenceNeeds Turn Plan, customerReply=\"\". Wording happens after trusted resolve.",
     "- Genuine social only: capability=social with non-empty customerReply and NO factual business/booking claims.",
-    "- Use turnScope=OLD_BOOKING_REFERENCE and the trusted booking's exact bookingId as targetId.",
+    "- Historical bookingFocus is CONTEXT ONLY. Do not set turnScope=OLD_BOOKING_REFERENCE merely because a trusted focus exists.",
     "- Do not silence. Do not invent amounts, dates, policies, or mutations. Strict JSON only.",
   ].join("\n");
 }
@@ -1059,21 +1060,17 @@ export function buildPostConfirmVerifiedItemMismatchCorrection(
       "Do not invent booking or business fact values in decide. For factual asks use capability + evidenceNeeds with customerReply=\"\".",
       "Genuine social replies must not include prices, policies, dates, times, locations, or references.",
       "Keep action=reply. No silence, no mutation.",
+      "Historical booking presence is context only. If this message is an independent inventory/pricing/availability request, use turnScope=NEW_TRANSACTION and targetId=null.",
       "Return the same required JSON schema. Return JSON only.",
     ].join("\n");
   }
   return [
     `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
-    "Answer and groundedFacts must use ONLY the trusted focused booking below.",
-    `selectedBookingIndex: ${identity.selectedBookingIndex}`,
-    `bookingId: ${identity.bookingId ?? "(none)"}`,
-    `itemId: ${identity.itemId ?? "(none)"}`,
-    `itemLabel: ${identity.itemLabel ?? "(none)"}`,
-    "The final customerReply and groundedFacts.itemId MUST refer only to this focused booking.",
-    "Do not use any OUT_OF_SCOPE_CONTEXT_ONLY candidate in customerReply or groundedFacts.",
-    "For factual asks: prefer capability + evidenceNeeds with customerReply=\"\" (wording after resolve). Do not invent fact values.",
-    "Use turnScope=OLD_BOOKING_REFERENCE with this booking's exact bookingId as targetId for read-only factual answers.",
-    "If a requested detail is absent from verified facts, say it is not confirmed or ask one useful clarification — never invent a substitute.",
+    "Do not invent booking or business fact values. For factual asks use capability + evidenceNeeds with customerReply=\"\".",
+    `Trusted latest-confirmed booking is CONTEXT ONLY: selectedBookingIndex=${identity.selectedBookingIndex}, bookingId=${identity.bookingId ?? "(none)"}, itemLabel=${identity.itemLabel ?? "(none)"}.`,
+    "If the customer semantically refers to that historical booking, keep turnScope=OLD_BOOKING_REFERENCE with that exact bookingId as targetId.",
+    "If the customer made an independent inventory/pricing/availability request, including the same named item with a new duration or date, use turnScope=NEW_TRANSACTION and targetId=null. Do not keep a historical booking as owner merely because bookingFocus exists.",
+    "Do not use any historical candidate in customerReply or groundedFacts unless turnScope=OLD_BOOKING_REFERENCE and targetId is that booking's exact id.",
     "Keep action=reply. No silence, no mutation.",
     "Return the same required JSON schema, including honest replySemantics.claims and languageStyle.",
     "Return JSON only.",
@@ -1726,14 +1723,14 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
             bookingId,
             itemId,
             itemLabel,
-            scope: "CURRENT_BOOKING_IN_SCOPE",
+            scope: "HISTORICAL_CONTEXT_ONLY",
           };
         }
         return {
           selectionIndex,
           bookingId,
           itemLabel,
-          scope: "OUT_OF_SCOPE_CONTEXT_ONLY",
+          scope: "HISTORICAL_CONTEXT_ONLY",
         };
       }
       return { selectionIndex, bookingId, itemId, itemLabel };
@@ -1750,7 +1747,7 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
         availabilityRequestId: trustedFocusIdentity.availabilityRequestId,
         itemId: trustedFocusIdentity.itemId,
         itemLabel: trustedFocusIdentity.itemLabel,
-        scope: "CURRENT_BOOKING_IN_SCOPE",
+        scope: "HISTORICAL_CONTEXT_ONLY",
       }
     : null;
 
@@ -1791,13 +1788,7 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
     },
     bookingFocus,
     bookingCandidates,
-    activeBookings: bookingCandidates
-      .filter((row) => row?.scope === "CURRENT_BOOKING_IN_SCOPE")
-      .map((row) => ({
-        itemId: row.itemId ?? null,
-        itemLabel: row.itemLabel ?? null,
-      }))
-      .slice(0, 1),
+    activeBookings: [],
     pendingAvailabilityRequests,
     mutationExecution,
     // present|absent|conflicting only — never values the model could quote.
@@ -3118,6 +3109,7 @@ export function applyPostConfirmDerivedOwnershipMechanics(decision, facts) {
   );
   const hitIndex = positiveIntegerOrNull(hit.selectionIndex);
   next.selectedBookingIndex = hitIndex;
+  next.selectedBookingId = targetId;
   next.bookingSelectionMode =
     (focusId && focusId === targetId) ||
     (focusIndex != null && hitIndex === focusIndex)
@@ -3538,9 +3530,9 @@ export async function executePostConfirmPaLaneDecision({
 LANE OBJECTIVE (post_confirm_pa):
 SEMANTIC OWNERSHIP (decide before any transactional lane):
 - Always return turnScope and targetId. Runtime derives targetContext, bookingSelectionMode, selectedBookingIndex, and pendingAvailabilitySelectionIndex. Do not try to keep a historical booking selected unless turnScope is OLD_BOOKING_REFERENCE.
-- NEW_TRANSACTION = an independent new inventory/pricing/availability request. targetId=null. No booking mutation.
+- NEW_TRANSACTION = an independent new inventory/pricing/availability request, including a same-item request with a new duration or date. targetId=null. No booking mutation. Historical bookingFocus never blocks this scope.
 - PENDING_AVAILABILITY_REFERENCE = the customer semantically refers to one pendingAvailabilityRequests row. targetId must be that row's exact requestId.
-- OLD_BOOKING_REFERENCE = the customer semantically refers to one historical confirmed booking. targetId must be that booking's exact bookingId. A booking's mere presence never grants this scope.
+- OLD_BOOKING_REFERENCE = the customer semantically refers to one historical confirmed booking. targetId must be that booking's exact bookingId. A booking's mere presence, bookingFocus, or latest-confirmed ranking never grants this scope.
 - SOCIAL_GENERAL = greeting, thanks, farewell, or a general/non-transactional turn. targetId=null. No mutation.
 - UNCLEAR = scope/referent cannot be selected safely. targetId=null. No mutation. Never guess a historical booking.
 - A mutation intent is valid only with OLD_BOOKING_REFERENCE, except pending confirm/decline actions which require PENDING_AVAILABILITY_REFERENCE. Contradictory scope/target/action combinations fail closed in runtime.
@@ -3664,7 +3656,7 @@ LANE FACT RULES:
   }
 - ${
     hasTrustedBookingFocus
-      ? "Multiple active bookings are present with a trusted latest-confirmed focus. bookingFocus and any CURRENT_BOOKING_IN_SCOPE row are the only booking identity for generic/read-only questions. Use bookingFocus.itemId and bookingFocus.itemLabel in groundedFacts when identifying that booking. Entries marked OUT_OF_SCOPE_CONTEXT_ONLY are context only — never put them in customerReply or groundedFacts.itemId unless turnScope=OLD_BOOKING_REFERENCE and targetId is that booking's exact id. For generic read-only questions about the focused booking, use OLD_BOOKING_REFERENCE plus its exact bookingId and defer factual wording."
+      ? "Multiple historical bookings may be listed. bookingFocus is the latest-confirmed CONTEXT ONLY — never ownership. Do not put historical itemId/itemLabel into groundedFacts unless turnScope=OLD_BOOKING_REFERENCE and targetId is that booking's exact id. Generic presence of a focused booking does not make this an old-booking turn. Independent inventory/pricing/availability requests, including same named item + new duration/date, use NEW_TRANSACTION and targetId=null."
       : hasAmbiguousBookings
         ? "Multiple active bookings are present without trusted focus. Generic booking questions require turnScope=UNCLEAR and a natural clarification. Do not guess or mutate one."
         : "There is no multi-booking ambiguity."

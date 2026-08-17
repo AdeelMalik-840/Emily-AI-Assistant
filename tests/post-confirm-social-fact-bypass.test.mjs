@@ -165,7 +165,7 @@ test("decide facts prompt strips booking/business/owner answerable values", () =
   const blob = JSON.stringify(ctx);
   assert.doesNotMatch(blob, /22000|5500|11000|10:00|DHA|Fuel is customer|Lahore only|Corolla|99999|2026-09-01|STONIC-PROD|Johar/i);
   assert.match(blob, /Kia Stonic/);
-  assert.match(blob, /CURRENT_BOOKING_IN_SCOPE/);
+  assert.match(blob, /HISTORICAL_CONTEXT_ONLY/);
   assert.match(blob, /evidenceAvailability/);
 });
 

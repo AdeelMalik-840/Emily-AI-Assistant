@@ -49,6 +49,7 @@ import { normalizePhoneE164 } from "./connections.js";
  *   cloudRecoveryContext?: Record<string, unknown> | null,
  *   cloudOwnershipQueue?: Record<string, unknown> | null,
  *   cloudOriginalClaimOwner?: string | null,
+ *   cloudSemanticDecision?: Record<string, unknown> | null,
  *   providerOutboundMessageId?: string | null,
  *   processingOwner?: string | null,
  *   terminalAt?: number | null,
@@ -1492,6 +1493,201 @@ export function markCloudInboundTurnPostConfirmOwned({ identity } = {}) {
       cloudOwnershipQueue: null,
     },
     true
+  );
+}
+
+const CLOUD_SEMANTIC_DECISION_VERSION = 1;
+const CLOUD_SEMANTIC_DECISION_STATUSES = new Set(["accepted", "released"]);
+const CLOUD_SEMANTIC_OWNERSHIP_LANES = new Set([
+  "post_confirm_pa",
+  "waiting_confirm_dm",
+  "normal_routing",
+]);
+const CLOUD_SEMANTIC_TURN_SCOPES = new Set([
+  "NEW_TRANSACTION",
+  "PENDING_AVAILABILITY_REFERENCE",
+  "OLD_BOOKING_REFERENCE",
+  "SOCIAL_GENERAL",
+  "UNCLEAR",
+]);
+
+function cleanSemanticField(value, max = 160) {
+  const text = String(value ?? "").trim();
+  return text ? text.slice(0, max) : null;
+}
+
+function sameSemanticMeaning(left, right) {
+  return (
+    cleanSemanticField(left?.turnScope) === cleanSemanticField(right?.turnScope) &&
+    cleanSemanticField(left?.targetId) === cleanSemanticField(right?.targetId) &&
+    cleanSemanticField(left?.targetContext) ===
+      cleanSemanticField(right?.targetContext) &&
+    cleanSemanticField(left?.selectedBookingId) ===
+      cleanSemanticField(right?.selectedBookingId) &&
+    Number(left?.pendingAvailabilitySelectionIndex ?? 0) ===
+      Number(right?.pendingAvailabilitySelectionIndex ?? 0) &&
+    cleanSemanticField(left?.mutationIntent) ===
+      cleanSemanticField(right?.mutationIntent) &&
+    cleanSemanticField(left?.action) === cleanSemanticField(right?.action) &&
+    cleanSemanticField(left?.factKind) === cleanSemanticField(right?.factKind)
+  );
+}
+
+function sanitizeSemanticEvidenceNeeds(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .slice(0, 8)
+    .map((row) => ({
+      entity: cleanSemanticField(row?.entity, 80),
+      concept: cleanSemanticField(row?.concept, 80),
+      attributes: Array.isArray(row?.attributes)
+        ? row.attributes
+            .map((value) => cleanSemanticField(value, 40))
+            .filter(Boolean)
+            .slice(0, 8)
+        : [],
+    }))
+    .filter((row) => row.entity && row.concept);
+}
+
+function sanitizeCloudSemanticDecision(p = {}) {
+  const turnScope = cleanSemanticField(p.turnScope, 80);
+  if (!CLOUD_SEMANTIC_TURN_SCOPES.has(turnScope)) return null;
+  const status = cleanSemanticField(p.semanticDecisionStatus, 40);
+  if (!CLOUD_SEMANTIC_DECISION_STATUSES.has(status)) return null;
+  const ownershipLane =
+    cleanSemanticField(p.ownershipLane, 40) || "post_confirm_pa";
+  if (!CLOUD_SEMANTIC_OWNERSHIP_LANES.has(ownershipLane)) return null;
+  const pendingIndex = Number(p.pendingAvailabilitySelectionIndex);
+  return {
+    messageId: cleanSemanticField(p.messageId, 300),
+    guaranteeKey: cleanSemanticField(p.guaranteeKey, 300),
+    turnScope,
+    targetId: cleanSemanticField(p.targetId, 160),
+    targetContext: cleanSemanticField(p.targetContext, 80),
+    selectedBookingId: cleanSemanticField(p.selectedBookingId, 160),
+    pendingAvailabilitySelectionIndex: Number.isFinite(pendingIndex)
+      ? Math.floor(pendingIndex)
+      : null,
+    mutationIntent: cleanSemanticField(p.mutationIntent, 80) || "none",
+    action: cleanSemanticField(p.action, 80),
+    factKind: cleanSemanticField(p.factKind, 80),
+    capability: cleanSemanticField(p.capability, 80),
+    evidenceNeeds: sanitizeSemanticEvidenceNeeds(p.evidenceNeeds),
+    semanticDecisionVersion: CLOUD_SEMANTIC_DECISION_VERSION,
+    semanticDecisionStatus: status,
+    acceptedAtMs: Number(p.acceptedAtMs) > 0 ? Number(p.acceptedAtMs) : Date.now(),
+    openaiSource: cleanSemanticField(p.openaiSource, 80) || "openai",
+    ownershipLane,
+  };
+}
+
+/**
+ * Write-once Cloud DM semantic snapshot. Frozen meaning cannot be replaced.
+ * @returns {{ ok: boolean, reason?: string, decision?: Record<string, unknown> | null, entry?: InboundTurnLedgerEntry | null }}
+ */
+export function persistCloudInboundSemanticDecision({
+  identity,
+  decision,
+  semanticDecisionStatus,
+  ownershipLane,
+  openaiSource,
+  messageId,
+} = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  const guaranteeKey =
+    String(identity?.guaranteeKey ?? "").trim() ||
+    buildInboundTurnLedgerKey(chatKey, stableId);
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key || !guaranteeKey) {
+    return { ok: false, reason: "MISSING_CLOUD_IDENTITY", decision: null, entry: null };
+  }
+  const snapshot = sanitizeCloudSemanticDecision({
+    ...(decision && typeof decision === "object" ? decision : {}),
+    messageId: messageId ?? decision?.messageId,
+    guaranteeKey,
+    semanticDecisionStatus,
+    ownershipLane: ownershipLane ?? decision?.ownershipLane,
+    openaiSource: openaiSource ?? decision?.openaiSource,
+  });
+  if (!snapshot) {
+    return {
+      ok: false,
+      reason: "INVALID_SEMANTIC_DECISION",
+      decision: null,
+      entry: null,
+    };
+  }
+  initInboundTurnLedger(true);
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  const prior =
+    existing?.cloudSemanticDecision &&
+    typeof existing.cloudSemanticDecision === "object"
+      ? existing.cloudSemanticDecision
+      : null;
+  if (
+    prior &&
+    CLOUD_SEMANTIC_DECISION_STATUSES.has(
+      String(prior.semanticDecisionStatus ?? "").trim()
+    )
+  ) {
+    if (
+      sameSemanticMeaning(prior, snapshot) &&
+      String(prior.semanticDecisionStatus) === snapshot.semanticDecisionStatus
+    ) {
+      return { ok: true, decision: prior, entry: existing, reason: "already_accepted" };
+    }
+    return {
+      ok: false,
+      reason: "SEMANTIC_DECISION_REWRITE_CONTRADICTION",
+      decision: prior,
+      entry: existing,
+    };
+  }
+  const next = upsertEntry(
+    key,
+    {
+      ...(existing || {
+        chatKey,
+        stableId,
+        guaranteeKey,
+        state: "processing",
+        receivedAt: Date.now(),
+      }),
+      cloudSemanticDecision: snapshot,
+    },
+    true
+  );
+  return { ok: true, decision: snapshot, entry: next };
+}
+
+export function getCloudInboundSemanticDecision({ identity } = {}) {
+  const chatKey = String(identity?.chatKey ?? "").trim();
+  const stableId = String(identity?.stableId ?? "").trim();
+  if (!chatKey || !stableId) return null;
+  const existing = getInboundTurnLedgerEntry(chatKey, stableId, { force: true });
+  const snapshot =
+    existing?.cloudSemanticDecision &&
+    typeof existing.cloudSemanticDecision === "object"
+      ? existing.cloudSemanticDecision
+      : null;
+  if (
+    !snapshot ||
+    !CLOUD_SEMANTIC_DECISION_STATUSES.has(
+      String(snapshot.semanticDecisionStatus ?? "").trim()
+    )
+  ) {
+    return null;
+  }
+  return { ...snapshot };
+}
+
+export function hasAcceptedCloudInboundSemanticDecision({ identity } = {}) {
+  const snapshot = getCloudInboundSemanticDecision({ identity });
+  return (
+    snapshot?.semanticDecisionStatus === "accepted" ||
+    snapshot?.semanticDecisionStatus === "released"
   );
 }
 

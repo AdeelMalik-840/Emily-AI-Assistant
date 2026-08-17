@@ -740,6 +740,25 @@ function activeCivicPostConfirmFacts() {
   };
 }
 
+function ownedCivicPaResult(reply) {
+  return {
+    handled: true,
+    reply,
+    bookingId: "booking-existing-civic",
+    openaiUsed: true,
+    openaiSource: "openai_post_confirm_pa",
+    decision: {
+      turnScope: "OLD_BOOKING_REFERENCE",
+      targetContext: "CONFIRMED_BOOKING",
+      targetId: "booking-existing-civic",
+      selectedBookingId: "booking-existing-civic",
+      mutationIntent: "none",
+      action: "reply",
+      factKind: "booking_fact",
+    },
+  };
+}
+
 function waitingConfirmOpenAiDecision(overrides = {}) {
   return {
     conversationStage: "booking_offer",
@@ -865,8 +884,16 @@ test("Corolla focus release continues once into fresh Civic availability routing
         return {
           handled: false,
           ownershipReleased: true,
-          releaseReason: "FRESH_AVAILABILITY_REQUEST",
+          releaseReason: "SEMANTIC_SCOPE_NEW_TRANSACTION",
           bookingId: "booking-old-corolla",
+          decision: {
+            turnScope: "NEW_TRANSACTION",
+            targetContext: "NEW_TRANSACTION",
+            targetId: null,
+            mutationIntent: "none",
+            action: "reply",
+            factKind: "booking_fact",
+          },
           semanticDecisionCount: 1,
           composeCalls: 0,
           mutationExecutionRequested: false,
@@ -1152,13 +1179,7 @@ test("without eligible waiting-confirm, existing Civic post-confirm behavior is 
           preResolvedBookingFacts?.facts?.booking?.itemId,
           "civic-1"
         );
-        return {
-          handled: true,
-          reply: "OpenAI Civic post-confirm reply",
-          bookingId: "booking-existing-civic",
-          openaiUsed: true,
-          openaiSource: "openai_post_confirm_pa",
-        };
+        return ownedCivicPaResult("OpenAI Civic post-confirm reply");
       },
     },
   });
@@ -1184,13 +1205,7 @@ for (const [label, requestPatch] of [
           activeCivicPostConfirmFacts(),
         __tryHandleCustomerBusinessPaInboundFn: async () => {
           paCalls += 1;
-          return {
-            handled: true,
-            reply: "OpenAI Civic post-confirm reply",
-            bookingId: "booking-existing-civic",
-            openaiUsed: true,
-            openaiSource: "openai_post_confirm_pa",
-          };
+          return ownedCivicPaResult("OpenAI Civic post-confirm reply");
         },
       },
       cloudConfirmSpy: async () => {
@@ -1216,13 +1231,7 @@ test("genuine waiting-confirm NO_MATCH falls through once to Civic post-confirm"
         activeCivicPostConfirmFacts(),
       __tryHandleCustomerBusinessPaInboundFn: async () => {
         paCalls += 1;
-        return {
-          handled: true,
-          reply: "OpenAI Civic fallback reply",
-          bookingId: "booking-existing-civic",
-          openaiUsed: true,
-          openaiSource: "openai_post_confirm_pa",
-        };
+          return ownedCivicPaResult("OpenAI Civic fallback reply");
       },
     },
     cloudConfirmSpy: async () => {
