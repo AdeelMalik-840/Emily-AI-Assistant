@@ -42,7 +42,7 @@ const CANONICAL_MUTATION_ACTION_TYPES = new Set([
   "NOTIFY_OWNER",
 ]);
 
-function resolveReleasedCanonicalDecision(params) {
+function resolveFrozenCanonicalDecision(params) {
   if (params?.isGroupInbound === true || params?.chatType === "group") {
     return null;
   }
@@ -52,9 +52,11 @@ function resolveReleasedCanonicalDecision(params) {
       ? params.canonicalSemanticDecision
       : null;
   if (!decision) return null;
-  if (decision.semanticDecisionStatus !== "released") return null;
-  if (!CANONICAL_RELEASED_SCOPES.has(String(decision.turnScope ?? "").trim())) {
-    return null;
+  const status = String(decision.semanticDecisionStatus ?? "").trim();
+  if (status !== "released" && status !== "accepted") return null;
+  const turnScope = String(decision.turnScope ?? "").trim();
+  if (!CANONICAL_RELEASED_SCOPES.has(turnScope)) {
+    return { ...decision, turnScope, _ownershipBlockedForBrainV2: true };
   }
   return decision;
 }
@@ -175,7 +177,13 @@ export async function runBrainV2LivePipeline(params) {
       availabilityRequest: params.preResolvedWaitingConfirmRequest ?? null,
       waitingConfirmCandidates: params.waitingConfirmCandidates ?? null,
     });
-    const canonicalReleased = resolveReleasedCanonicalDecision(params);
+    const canonicalReleased = resolveFrozenCanonicalDecision(params);
+    if (canonicalReleased?._ownershipBlockedForBrainV2 === true) {
+      return buildSilentPipelineResult({
+        traceId,
+        reason: "CANONICAL_OWNERSHIP_NOT_BRAIN_V2",
+      });
+    }
     if (canonicalReleased) {
       continuation = {
         ...continuation,

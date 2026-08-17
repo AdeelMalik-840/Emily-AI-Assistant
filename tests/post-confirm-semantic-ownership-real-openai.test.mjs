@@ -9,7 +9,7 @@ const runReal =
   process.env.RUN_REAL_POST_CONFIRM_SEMANTIC_OWNERSHIP === "true" &&
   Boolean(process.env.OPENAI_API_KEY);
 
-const { executePostConfirmPaLaneDecision } = await import(
+const { executePostConfirmPaLaneDecision, buildNeutralCloudDmOwnershipFacts } = await import(
   "../src/brain/decisions/decidePostConfirmCustomerDm.js"
 );
 const {
@@ -89,10 +89,38 @@ function stonicCivicHistoryFacts() {
   };
 }
 
-async function decide(message, facts = factsFor()) {
+function pendingCivicFacts() {
+  const stonic = {
+    id: "MHFaQZBnBVgEeRoCIFQ3",
+    selectionIndex: 1,
+    itemId: "kia-stonic",
+    itemLabel: "Kia Stonic",
+    status: "approved",
+    durationDays: 4,
+  };
+  return {
+    business: { name: "Test Rentals", tone: "friendly" },
+    booking: stonic,
+    bookingCandidates: [stonic],
+    activeBookings: [stonic],
+    bookingFocus: null,
+    pendingAvailabilityRequests: [
+      {
+        selectionIndex: 1,
+        requestId: "avr-civic-pending-1",
+        itemLabel: "Honda Civic",
+      },
+    ],
+    known: {},
+    policy: { readOnly: true },
+  };
+}
+
+async function decide(message, facts = factsFor(), conversationHistory = null) {
   const result = await executePostConfirmPaLaneDecision({
-    facts,
+    facts: buildNeutralCloudDmOwnershipFacts(facts),
     userMessage: message,
+    conversationHistory,
     timeoutMs: 20000,
   });
   assert.equal(result.ok, true, JSON.stringify(result));
@@ -111,6 +139,27 @@ test(
     assert.equal(result.turnScope, "NEW_TRANSACTION");
     assert.equal(result.targetContext, "NEW_TRANSACTION");
     assert.equal(result.targetId, null);
+  }
+);
+
+test(
+  "real OpenAI: pending Civic factual stays on exact AVR",
+  { skip: !runReal },
+  async () => {
+    const result = await decide("per day kitna hai?", pendingCivicFacts());
+    assert.equal(result.turnScope, "PENDING_AVAILABILITY_REFERENCE");
+    assert.equal(result.targetId, "avr-civic-pending-1");
+  }
+);
+
+test(
+  "real OpenAI: pending Civic confirm stays on exact AVR",
+  { skip: !runReal },
+  async () => {
+    const result = await decide("haan kar do", pendingCivicFacts());
+    assert.equal(result.turnScope, "PENDING_AVAILABILITY_REFERENCE");
+    assert.equal(result.targetId, "avr-civic-pending-1");
+    assert.equal(result.action, "confirm_pending_availability");
   }
 );
 

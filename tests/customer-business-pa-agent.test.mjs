@@ -1491,6 +1491,21 @@ test("buffer: PA reply skips general Brain and uses normal Cloud outbound", asyn
           },
         };
       },
+      __executeCloudDmOwnershipDecisionFn: async () => ({
+        ok: true,
+        source: "openai",
+        facts: {
+          booking: { id: BOOKING_ID, selectionIndex: 1 },
+          bookingCandidates: [{ id: BOOKING_ID, selectionIndex: 1 }],
+        },
+        decision: {
+          turnScope: "OLD_BOOKING_REFERENCE",
+          targetId: BOOKING_ID,
+          action: "reply",
+          mutationIntent: "none",
+          factKind: "booking_fact",
+        },
+      }),
       __tryHandleAvailabilityCustomerCloudInboundFn: async () => {
         confirmCalls += 1;
         return null;
@@ -1593,6 +1608,27 @@ test("buffer: waiting_confirm kar do still confirm before PA", async () => {
       combinedMessage: msg,
       latestMessage: msg,
       messageId: `wamid.pa-confirm-${randomUUID()}`,
+      __executeCloudDmOwnershipDecisionFn: async () => ({
+        ok: true,
+        source: "openai",
+        facts: {
+          pendingAvailabilityRequests: [
+            {
+              selectionIndex: 1,
+              requestId: AVR_ID,
+              itemLabel: "Honda Civic",
+              request: { requestId: AVR_ID },
+            },
+          ],
+        },
+        decision: {
+          turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          targetId: AVR_ID,
+          action: "confirm_pending_availability",
+          mutationIntent: "none",
+          factKind: "action",
+        },
+      }),
       __tryHandleAvailabilityCustomerCloudInboundFn: async () => {
         confirmCalls += 1;
         return {
