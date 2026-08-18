@@ -9,6 +9,7 @@ import {
 } from "../../services/intentShapeResolver.js";
 import { hasExplicitNewItemMention } from "../../services/currentTurnAuthority.js";
 import { detectUnlistedMentionLabel } from "./unlistedMention.js";
+import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
@@ -97,7 +98,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
       explicitMention.itemLabel || (row ? catalogItemLabel(row) : null) || null;
     itemSource = "explicit";
     itemConfidence = "high";
-  } else {
+  } else if (!signals.browseAsk && !isGenericBrowseListAsk(message)) {
     const memoryItemId = String(
       turnContext?.lastResolvedItemId ??
         pendingAction?.itemId ??

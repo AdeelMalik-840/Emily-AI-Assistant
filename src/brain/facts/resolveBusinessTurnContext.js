@@ -437,6 +437,15 @@ function resolveBusinessDecision(p) {
       weakContextSignals.length > 0
         ? "explicit_price_question_wins_over_weak_context"
         : "explicit_price_question";
+  } else if (
+    signals.browseAsk ||
+    isGenericBrowseListAsk(p.normalizedMessage)
+  ) {
+    primaryIntent = "browse_options";
+    workflowType = "browse_options";
+    replyType = "browse_options";
+    confidence = "high";
+    reason = "broad_browse_does_not_inherit_trusted_item";
   } else if (signals.availabilityAsk && hasResolvedItem) {
     primaryIntent = "availability_inquiry";
     workflowType = "availability_inquiry";

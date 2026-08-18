@@ -10,6 +10,8 @@ import {
   hasExplicitNewItemMention,
 } from "./currentTurnAuthority.js";
 import { hasStrongBookingCommitPhrase } from "./conversationRouter.js";
+import { extractTurnSignals } from "./intentShapeResolver.js";
+import { isGenericBrowseListAsk } from "../brain/workflow/browseIntent.js";
 import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
   isAvailabilityDurationPendingAction,
@@ -271,9 +273,12 @@ export function resolveTurnContext(opts = {}) {
   const itemlessPriceDurationFollowup =
     itemlessPriceDurationFollowupRaw && !hasExplicitItem;
   const requestedField = String(detectAskedField(message) ?? "").trim().toLowerCase();
+  const browseAsk = Boolean(extractTurnSignals({ message }).browseAsk);
+  const broadBrowseAsk = browseAsk || isGenericBrowseListAsk(message);
   const itemlessTrustedContextFollowup =
     !hasExplicitItem &&
     !fuzzyAmbiguous &&
+    !broadBrowseAsk &&
     (itemlessPriceDurationFollowup ||
       messageLooksLikeAvailabilityQuery(message) ||
       requestedField === "media");
