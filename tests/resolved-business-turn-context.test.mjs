@@ -384,6 +384,34 @@ test("group participant B does not inherit participant A Civic memory", async ()
   assert.match(String(result.reply ?? ""), /Kis car ke liye price pooch rahe hain/i);
 });
 
+test("decision: trusted Civic itemless chyh+rent follow-up stays pricing, not weak-need availability", async () => {
+  const memorySnapshot = {
+    lastItem: { id: CIVIC_ID, itemId: CIVIC_ID },
+    lastResolvedItemId: CIVIC_ID,
+  };
+  for (const message of ["3 din k lye chyh h rent p", "3 din ka rent?"]) {
+    const decision = await resolveDecision(message, { memorySnapshot });
+    assert.equal(decision.workflowType, "pricing_with_duration", message);
+    assert.equal(decision.primaryIntent, "pricing_with_duration", message);
+    assert.equal(decision.resolvedItemId, CIVIC_ID, message);
+    assert.equal(decision.durationDays, 3, message);
+    assert.match(decision.reason, /itemless_price_followup|explicit_rent_question/i, message);
+    assert.doesNotMatch(decision.reason, /owner_availability_check/i, message);
+  }
+});
+
+test("live: trusted Civic itemless chyh+rent follow-up answers price, not owner-check", async () => {
+  const memorySnapshot = {
+    lastItem: { id: CIVIC_ID, itemId: CIVIC_ID },
+    lastResolvedItemId: CIVIC_ID,
+  };
+  const result = await runLive("3 din k lye chyh h rent p", { memorySnapshot });
+  assert.equal(result.workflowType, "pricing_with_duration");
+  assert.match(String(result.reply ?? ""), /Civic/i);
+  assert.match(String(result.reply ?? ""), /24,000 PKR/i);
+  assert.ok(!liveActionTypes(result).includes("AVAILABILITY_OWNER_CHECK_REQUIRED"));
+});
+
 const weakNeedAvailabilityCases = [
   "Civic 3 din k lye chahiye",
   "Corolla 2 din ke liye chahiye",

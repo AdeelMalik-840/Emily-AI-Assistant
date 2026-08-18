@@ -173,6 +173,16 @@ export function isWeakNeedOwnerAvailabilityInquiry(
 }
 
 /**
+ * Canonical price field from turn authority / answerComposer — not signals.priceAsk.
+ * @param {string | null | undefined} requestedField
+ * @returns {boolean}
+ */
+function isCanonicalPriceRequestedField(requestedField) {
+  const field = String(requestedField ?? "").trim().toLowerCase();
+  return field.startsWith("price");
+}
+
+/**
  * @param {Record<string, unknown>} p
  */
 function buildContextToPersist(p) {
@@ -204,11 +214,13 @@ function buildContextToPersist(p) {
  *   itemFacts: Record<string, unknown>,
  *   participantFacts: Record<string, unknown>,
  *   memoryPendingAction?: unknown,
+ *   turnShape?: string | null,
  * }} p
  */
 function resolveBusinessDecision(p) {
   const signals = p.signals ?? {};
   const understanding = p.understanding ?? {};
+  const turnShape = String(p.turnShape ?? "").trim();
   const resolvedItemId = hasValue(p.itemFacts?.id) ? String(p.itemFacts.id) : null;
   const durationDays =
     understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
@@ -230,6 +242,9 @@ function resolveBusinessDecision(p) {
   if (signals.availabilityAsk && signals.priceAsk) secondaryIntents.push("availability_context");
   if (durationDays != null) secondaryIntents.push("duration_context");
   const availabilityDurationPending = isAvailabilityDurationPendingAction(p.memoryPendingAction);
+  const canonicalItemlessPriceFollowup =
+    turnShape === "itemless_price_followup" &&
+    isCanonicalPriceRequestedField(requestedField);
 
   let primaryIntent = "unknown";
   let workflowType = "unknown_clarification";
@@ -244,13 +259,18 @@ function resolveBusinessDecision(p) {
     replyType = "image_catalog";
     confidence = "high";
     reason = "explicit_media_request_wins";
-  } else if (signals.priceAsk && hasResolvedItem && durationDays != null) {
+  } else if (
+    hasResolvedItem &&
+    durationDays != null &&
+    (signals.priceAsk || canonicalItemlessPriceFollowup)
+  ) {
     primaryIntent = "pricing_with_duration";
     workflowType = "pricing_with_duration";
     replyType = "price_answer";
     confidence = "high";
-    reason =
-      weakContextSignals.length > 0
+    reason = canonicalItemlessPriceFollowup && !signals.priceAsk
+      ? "itemless_price_followup_wins_over_weak_need"
+      : weakContextSignals.length > 0
         ? "explicit_rent_question_wins_over_weak_need_duration_context"
         : "explicit_rent_question_with_duration";
   } else if (signals.priceAsk && hasResolvedItem) {
@@ -841,6 +861,7 @@ export async function resolveBusinessTurnContext(params) {
     itemFacts,
     participantFacts,
     memoryPendingAction,
+    turnShape: turnContextInput?.turnShape ?? null,
   });
 
   resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);
