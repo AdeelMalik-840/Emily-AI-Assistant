@@ -177,3 +177,43 @@ test("G: bare duration and booking commit shapes classify correctly", () => {
   assert.equal(isItemlessPriceDurationFollowup("10 din k lye rent kitna hai?", catalog), true);
   assert.equal(isItemlessPriceDurationFollowup("Stonic 10 din ka rent kitna hai?", catalog), false);
 });
+
+test("broad browse after Civic does not bind trusted session item", () => {
+  for (const message of [
+    "Or kon c gariyan hain rent k lye available?",
+    "koi aur gari available hai?",
+  ]) {
+    let resolverCalls = 0;
+    const ctx = resolveTurnContext({
+      message,
+      catalogItems: catalog,
+      participantKey: participantA,
+      isGroupInbound: true,
+      memory: { lastItem: catalog[0], lastResolvedItemId: "civic-1" },
+      resolveTrustedSessionItem: () => {
+        resolverCalls += 1;
+        return { ok: true, item: catalog[0], proofSource: "PARTICIPANT_SESSION_MEMORY" };
+      },
+    });
+    assert.equal(resolverCalls, 0, message);
+    assert.equal(ctx.authoritativeItem, null, message);
+    assert.equal(ctx.trustedSessionItem, null, message);
+    assert.equal(ctx.hasExplicitItem, false, message);
+  }
+});
+
+test("referential availability after Civic still binds trusted session item", () => {
+  for (const message of ["kal available hai?", "available hai?"]) {
+    const ctx = resolveTurnContext({
+      message,
+      catalogItems: catalog,
+      participantKey: participantA,
+      isGroupInbound: true,
+      memory: { lastItem: catalog[0], lastResolvedItemId: "civic-1" },
+      resolveTrustedSessionItem: trustedCivicResolver(),
+    });
+    assert.equal(ctx.authoritativeItem?.id, "civic-1", message);
+    assert.equal(ctx.trustedSessionItem?.id, "civic-1", message);
+    assert.equal(ctx.hasExplicitItem, false, message);
+  }
+});

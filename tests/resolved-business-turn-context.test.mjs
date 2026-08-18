@@ -347,6 +347,41 @@ test("same participant context: availability follow-ups use remembered Civic", a
   assert.match(String(ownerCheck.payload?.itemLabel ?? ""), /Civic/i);
 });
 
+test("same participant context: referential available hai? keeps remembered Civic", async () => {
+  const memorySnapshot = {
+    lastItem: { id: CIVIC_ID, itemId: CIVIC_ID },
+    lastResolvedItemId: CIVIC_ID,
+  };
+  const decision = await resolveDecision("available hai?", { memorySnapshot });
+  assert.equal(decision.workflowType, "availability_inquiry");
+  assert.equal(decision.resolvedItemId, CIVIC_ID);
+  assert.notEqual(decision.workflowType, "browse_options");
+
+  const result = await runLive("available hai?", { memorySnapshot });
+  assert.equal(result.workflowType, "availability_inquiry");
+  assert.notEqual(result.workflowType, "browse_options");
+});
+
+test("same participant context: broad browse after Civic does not inherit Civic", async () => {
+  const memorySnapshot = {
+    lastItem: { id: CIVIC_ID, itemId: CIVIC_ID },
+    lastResolvedItemId: CIVIC_ID,
+  };
+  for (const message of [
+    "Or kon c gariyan hain rent k lye available?",
+    "koi aur gari available hai?",
+  ]) {
+    const result = await runLive(message, { memorySnapshot });
+    assert.equal(result.workflowType, "browse_options", message);
+    assert.notEqual(result.workflowType, "availability_inquiry", message);
+    assert.doesNotMatch(String(result.reply ?? ""), /Civic ka mai check/i, message);
+    assert.ok(
+      !liveActionTypes(result).includes("AVAILABILITY_OWNER_CHECK_REQUIRED"),
+      message
+    );
+  }
+});
+
 test("same participant context: fuzzy itemless amount follow-up stays pricing, not booking", async () => {
   const memorySnapshot = {
     lastItem: { id: CIVIC_ID, itemId: CIVIC_ID },
