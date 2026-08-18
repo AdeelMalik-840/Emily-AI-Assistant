@@ -1,6 +1,7 @@
 /**
  * Cloud DM ownership decision (historical name: post_confirm_pa).
- * Sole Cloud DM ownership AI: executePostConfirmPaLaneDecision.
+ * Cloud DM ownership AI: executeCloudDmOwnershipDecision (ownership-only, one completion).
+ * executePostConfirmPaLaneDecision remains the PA wording/decide lane after freeze.
  * Historical bookings and pending AVRs are candidate facts only — never pre-owners.
  * Executors must not re-interpret meaning — they execute `action` only (plus safety gates).
  */
@@ -57,6 +58,14 @@ export const POST_CONFIRM_TURN_SCOPES = Object.freeze([
   "SOCIAL_GENERAL",
   "UNCLEAR",
 ]);
+
+/** Durable ownership schema version. Independent of PA wording schema. */
+export const CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION = 1;
+/**
+ * Neutral candidate order: ascending bookingId / requestId.
+ * Stable for reproducibility only. Does not mean preferred, current, latest, or selected.
+ */
+export const CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER = "stable_id_asc";
 
 export const POST_CONFIRM_TARGET_CONTEXTS = Object.freeze([
   "NEW_TRANSACTION",
@@ -1683,12 +1692,71 @@ function buildPostConfirmEvidenceAvailability(facts) {
   };
 }
 
+function compactHistoricalOwnershipCandidate(row) {
+  const id = clean(row?.id || row?.bookingId, 160) || null;
+  if (!id) return null;
+  return {
+    id,
+    bookingId: id,
+    itemId: clean(row?.itemId, 160) || null,
+    itemLabel: clean(row?.itemLabel || row?.itemName, 200) || null,
+    status: clean(row?.status, 60) || null,
+    approvalStage: clean(row?.approvalStage, 80) || null,
+    durationDays: finiteNumberOrNull(row?.durationDays),
+    startDate: clean(row?.startDate || row?.startAt, 40) || null,
+    endDate: clean(row?.endDate || row?.endAt, 40) || null,
+    availabilityRequestId: clean(row?.availabilityRequestId, 160) || null,
+    dailyRate: finiteNumberOrNull(row?.dailyRate),
+    totalAmount: finiteNumberOrNull(row?.totalAmount),
+    role: "historical_candidate",
+  };
+}
+
+function compactPendingOwnershipCandidate(row) {
+  const requestId = pendingAvailabilityRequestId(row);
+  if (!requestId) return null;
+  const nested =
+    row?.request && typeof row.request === "object" ? row.request : row;
+  const quote =
+    nested?.priceQuote && typeof nested.priceQuote === "object"
+      ? nested.priceQuote
+      : {};
+  return {
+    requestId,
+    itemId: clean(nested?.itemId || row?.itemId, 160) || null,
+    itemLabel:
+      clean(
+        row?.itemLabel || nested?.itemLabel || nested?.itemName,
+        200
+      ) || null,
+    status: clean(nested?.status, 60) || null,
+    requestedDuration: finiteNumberOrNull(
+      nested?.requestedDuration ?? row?.requestedDuration
+    ),
+    dailyRate: finiteNumberOrNull(quote.dailyRate ?? row?.dailyRate),
+    totalAmount: finiteNumberOrNull(quote.total ?? row?.totalAmount),
+    role: "pending_availability_candidate",
+  };
+}
+
+function assignStableOwnershipSelectionIndexes(rows, idKey) {
+  return [...rows]
+    .filter(Boolean)
+    .sort((left, right) =>
+      String(left[idKey] ?? "").localeCompare(String(right[idKey] ?? ""))
+    )
+    .slice(0, 12)
+    .map((row, index) => ({
+      ...row,
+      selectionIndex: index + 1,
+    }));
+}
+
 /**
- * Decide-lane context: identity/tone + evidence presence only — never answerable
- * fact values. Social direct wording must not see prices, policies, owner answers,
- * catalog, times, dates, locations, or amounts.
+ * Strip PA pre-own fields. Candidates are equal facts, ordered stable_id_asc.
  *
- * @param {Record<string, unknown> | null | undefined} facts
+ * @param {Record<string, unknown> | null | undefined} rawFacts
+ * @param {Record<string, unknown> | null | undefined} pendingRequest
  */
 export function buildNeutralCloudDmOwnershipFacts(
   rawFacts = {},
@@ -1696,6 +1764,10 @@ export function buildNeutralCloudDmOwnershipFacts(
 ) {
   const facts =
     rawFacts && typeof rawFacts === "object" ? { ...rawFacts } : {};
+  const historical = assignStableOwnershipSelectionIndexes(
+    bookingCandidatesForFacts(facts).map(compactHistoricalOwnershipCandidate),
+    "id"
+  );
   const pendingRows = Array.isArray(facts.pendingAvailabilityRequests)
     ? [...facts.pendingAvailabilityRequests]
     : [];
@@ -1704,20 +1776,91 @@ export function buildNeutralCloudDmOwnershipFacts(
     pendingId &&
     !pendingRows.some((row) => pendingAvailabilityRequestId(row) === pendingId)
   ) {
-    pendingRows.unshift({
-      selectionIndex: 1,
+    pendingRows.push({
       requestId: pendingId,
       itemLabel: clean(pendingRequest?.itemLabel, 200) || null,
       request: pendingRequest,
     });
   }
+  const pending = assignStableOwnershipSelectionIndexes(
+    pendingRows.map(compactPendingOwnershipCandidate),
+    "requestId"
+  );
+  const business =
+    facts.business && typeof facts.business === "object" ? facts.business : {};
+  const name = clean(business.name ?? business.businessName, 120) || null;
+  const tone = clean(business.tone, 200) || null;
   return {
-    ...facts,
+    business: {
+      ...(name ? { name } : {}),
+      ...(tone ? { tone } : {}),
+    },
+    booking: null,
     bookingFocus: null,
-    pendingAvailabilityRequests: pendingRows,
+    activeBookings: [],
+    known: null,
+    knownPolicies: null,
+    replyGuardFacts: null,
+    availabilityRequest: null,
+    catalogItems: null,
+    sourceEvidence: null,
+    openMissingInfoRequests: [],
+    latestClosedMissingInfoAnswers: [],
+    bookingCandidates: historical,
+    pendingAvailabilityRequests: pending,
+    candidateOrder: CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER,
+    policy: {
+      readOnly: true,
+      doNotInventAmounts: true,
+      doNotInventPolicies: true,
+      doNotMutateBooking: true,
+    },
   };
 }
 
+function omitOwnershipPromptPosition(row) {
+  if (!row || typeof row !== "object") return row;
+  const { selectionIndex: _ignored, ...rest } = row;
+  return rest;
+}
+
+/**
+ * Ownership-only prompt facts. No current/active/trusted/selected booking.
+ * selectionIndex is runtime-only and is omitted so list position is not a model input.
+ */
+export function buildCloudDmOwnershipPromptFacts(facts) {
+  const f = buildNeutralCloudDmOwnershipFacts(
+    facts && typeof facts === "object" ? facts : {}
+  );
+  return {
+    decideContextOnly: true,
+    candidateOrder: CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER,
+    candidateOrderMeaning:
+      "stable identity sort only — not preferred, current, latest, or selected",
+    business: f.business,
+    bookingFocus: null,
+    booking: null,
+    activeBookings: [],
+    known: null,
+    replyGuardFacts: null,
+    evidenceAvailability: null,
+    availabilityRequest: null,
+    catalogItems: null,
+    bookingCandidates: f.bookingCandidates.map(omitOwnershipPromptPosition),
+    pendingAvailabilityRequests: f.pendingAvailabilityRequests.map(
+      omitOwnershipPromptPosition
+    ),
+    policy: f.policy,
+  };
+}
+
+/**
+ * PA wording decide-lane context: identity/tone + evidence presence only —
+ * never answerable fact values. Ownership classification uses
+ * buildCloudDmOwnershipPromptFacts instead.
+ *
+ * @param {Record<string, unknown> | null | undefined} facts
+ */
 export function buildPostConfirmDecideFactsForPrompt(facts) {
   const f = facts && typeof facts === "object" ? facts : {};
   const business =
@@ -1732,7 +1875,7 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
         positiveIntegerOrNull(row?.selectionIndex) ?? index + 1;
       return {
         selectionIndex,
-        bookingId: clean(row?.id, 160) || null,
+        bookingId: clean(row?.id || row?.bookingId, 160) || null,
         itemId: clean(row?.itemId, 160) || null,
         itemLabel: clean(row?.itemLabel || row?.itemName, 200) || null,
         role: "historical_candidate",
@@ -1775,9 +1918,7 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
     activeBookings: [],
     pendingAvailabilityRequests,
     mutationExecution,
-    // present|absent|conflicting only — never values the model could quote.
     evidenceAvailability: buildPostConfirmEvidenceAvailability(f),
-    // Explicit denial of answerable stores.
     known: null,
     knownPolicies: null,
     latestClosedMissingInfoAnswers: null,
@@ -3053,6 +3194,12 @@ export function applyPostConfirmDerivedOwnershipMechanics(decision, facts) {
     next.selectedBookingIndex = null;
     next.pendingAvailabilitySelectionIndex = null;
     next.selectedBookingId = null;
+    if (scope === "SOCIAL_GENERAL" || scope === "UNCLEAR") {
+      next.mutationIntent = "none";
+      if (cleanAction(next.action) === "request_booking_mutation") {
+        next.action = "reply";
+      }
+    }
     return next;
   }
 
@@ -3070,7 +3217,10 @@ export function applyPostConfirmDerivedOwnershipMechanics(decision, facts) {
     next.pendingAvailabilitySelectionIndex = hit
       ? positiveIntegerOrNull(hit.selectionIndex)
       : null;
-    if (
+    if (cleanMutationIntent(next.mutationIntent) === "cancel_booking") {
+      next.action = "decline_pending_availability";
+      next.mutationIntent = "none";
+    } else if (
       cleanAction(next.action) === "request_booking_mutation" &&
       cleanMutationIntent(next.mutationIntent) === "none"
     ) {
@@ -3219,47 +3369,405 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
   return invalid("UNKNOWN_TURN_SCOPE");
 }
 
+export const CLOUD_DM_OWNERSHIP_UNUSABLE_REASON = "CLOUD_DM_OWNERSHIP_UNUSABLE";
+
+function historicalCandidateItemKey(row) {
+  return (
+    clean(row?.itemId, 160) ||
+    clean(row?.itemLabel || row?.itemName, 200).toLowerCase() ||
+    null
+  );
+}
+
+function messageCitesExactToken(message, token) {
+  const needle = clean(token, 160);
+  if (!needle) return false;
+  return String(message ?? "").includes(needle);
+}
+
+/**
+ * Same-item siblings cannot be owned by list position. Unique different-item
+ * historical matches are left unchanged. Distinguishing evidence is only an
+ * exact trusted bookingId or linked AVR id cited in the customer message.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ * @param {Record<string, unknown> | null | undefined} facts
+ * @param {string | null | undefined} userMessage
+ */
+export function collapseIndistinguishableSameItemOwnership(
+  decision,
+  facts,
+  userMessage
+) {
+  const next =
+    decision && typeof decision === "object" ? { ...decision } : {};
+  if (next.turnScope !== "OLD_BOOKING_REFERENCE") return next;
+  const targetId = clean(next.targetId, 160) || null;
+  if (!targetId) return next;
+  const candidates = bookingCandidatesForFacts(facts);
+  const hit = candidates.find(
+    (row) => clean(row?.id || row?.bookingId, 160) === targetId
+  );
+  if (!hit) return next;
+  const itemKey = historicalCandidateItemKey(hit);
+  if (!itemKey) return next;
+  const siblings = candidates.filter(
+    (row) => historicalCandidateItemKey(row) === itemKey
+  );
+  if (siblings.length < 2) return next;
+  const cited = siblings.filter((row) => {
+    const id = clean(row?.id || row?.bookingId, 160);
+    const avr = clean(row?.availabilityRequestId, 160);
+    return (
+      messageCitesExactToken(userMessage, id) ||
+      messageCitesExactToken(userMessage, avr)
+    );
+  });
+  if (
+    cited.length === 1 &&
+    clean(cited[0]?.id || cited[0]?.bookingId, 160) === targetId
+  ) {
+    return next;
+  }
+  return defaultDecision({
+    turnScope: "UNCLEAR",
+    targetId: null,
+    mutationIntent: "none",
+    action: "reply",
+    factKind: "vague",
+    customerReply: "",
+    semanticDecisionVersion: CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION,
+  });
+}
+
+/**
+ * Parse ownership-only JSON. customerReply is never required and is always cleared.
+ * Invalid/missing turnScope is unusable (null) — not silently UNCLEAR.
+ *
+ * @param {unknown} raw
+ * @returns {Record<string, unknown> | null}
+ */
+export function parseCloudDmOwnershipDecision(raw) {
+  let text = String(raw ?? "").trim();
+  if (!text) return null;
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    text = text.slice(start, end + 1);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  if (!POST_CONFIRM_TURN_SCOPES.includes(parsed.turnScope)) return null;
+
+  const turnScope = parsed.turnScope;
+  let targetId = clean(parsed.targetId, 160) || null;
+  if (
+    turnScope === "NEW_TRANSACTION" ||
+    turnScope === "SOCIAL_GENERAL" ||
+    turnScope === "UNCLEAR"
+  ) {
+    targetId = null;
+  }
+  const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
+  const action = cleanAction(parsed.action);
+  const factKind = cleanPostConfirmFactKind(parsed.factKind);
+  return defaultDecision({
+    turnScope,
+    targetId,
+    mutationIntent,
+    action,
+    factKind,
+    customerReply: "",
+    shouldReply: action !== "silence",
+    semanticDecisionVersion: CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION,
+    conversationAct:
+      action === "request_booking_mutation" ||
+      action === "confirm_pending_availability" ||
+      action === "decline_pending_availability"
+        ? "action_request"
+        : turnScope === "SOCIAL_GENERAL"
+          ? "chit_chat"
+          : "information_request",
+    customerIntent:
+      mutationIntent !== "none"
+        ? "ask_action"
+        : turnScope === "SOCIAL_GENERAL"
+          ? "unclear"
+          : "ask_fact",
+    situation: turnScope === "UNCLEAR" ? "unclear" : "new_question",
+  });
+}
+
+function cloudDmOwnershipUnusableResult({
+  reason = CLOUD_DM_OWNERSHIP_UNUSABLE_REASON,
+  retryable = true,
+  ownershipCompletionCount = 1,
+  usabilityClassification = null,
+} = {}) {
+  return {
+    ok: false,
+    retryable,
+    source: "technical_fallback",
+    reason,
+    decision: defaultDecision(),
+    ownershipCompletionCount,
+    usabilityClassification,
+  };
+}
+
+/**
+ * Cloud DM ownership-only OpenAI path.
+ * Exactly one completion per attempt. Never requires customerReply.
+ * Never runs reply guards or EMPTY_OR_INVALID regeneration.
+ *
+ * @param {{
+ *   facts?: Record<string, unknown>,
+ *   userMessage?: string,
+ *   conversationHistory?: string | null,
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ */
+export async function executeCloudDmOwnershipDecision({
+  facts,
+  userMessage,
+  conversationHistory = null,
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const userLine = String(userMessage ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const historyLine = String(conversationHistory ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1200);
+  const promptFacts = buildCloudDmOwnershipPromptFacts(facts);
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "cloud_dm_ownership_decision",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        turnScope: {
+          type: "string",
+          enum: [...POST_CONFIRM_TURN_SCOPES],
+        },
+        targetId: { type: ["string", "null"] },
+        mutationIntent: {
+          type: "string",
+          enum: [...POST_CONFIRM_MUTATION_INTENTS],
+        },
+        action: {
+          type: "string",
+          enum: [...POST_CONFIRM_ACTIONS],
+        },
+        factKind: {
+          anyOf: [
+            { type: "string", enum: [...POST_CONFIRM_FACT_KINDS] },
+            { type: "null" },
+          ],
+        },
+      },
+      required: [
+        "turnScope",
+        "targetId",
+        "mutationIntent",
+        "action",
+        "factKind",
+      ],
+    }
+  );
+
+  const system = [
+    "You classify Cloud DM transaction ownership only.",
+    "Return JSON with turnScope, targetId, mutationIntent, action, factKind.",
+    "Do not write customer wording. customerReply is not part of this schema.",
+    "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
+    `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
+    "ALLOWED turnScope: NEW_TRANSACTION | PENDING_AVAILABILITY_REFERENCE | OLD_BOOKING_REFERENCE | SOCIAL_GENERAL | UNCLEAR.",
+    "targetId rules:",
+    "- NEW_TRANSACTION, SOCIAL_GENERAL, UNCLEAR → targetId must be null.",
+    "- PENDING_AVAILABILITY_REFERENCE → exact requestId from pendingAvailabilityRequests.",
+    "- OLD_BOOKING_REFERENCE → exact id/bookingId from bookingCandidates.",
+    "Never invent an id.",
+    "UNIQUE historical match: if the customer asks about or mutates an existing booking, and exactly one historical_candidate matches that named item/service identity, use OLD_BOOKING_REFERENCE with that row's exact id. Other different-item historical rows do not make this UNCLEAR.",
+    "SAME-ITEM collision: if two or more historical_candidate rows share that same item identity, and the customer did not cite an exact bookingId or linked AVR id belonging to only one of them, use UNCLEAR, targetId=null, mutationIntent=none, action=reply. Never use list position, first, last, or sort order as evidence.",
+    "Independent new inventory request (named item and/or new date/duration that is NOT changing a listed historical booking) → turnScope=NEW_TRANSACTION, targetId=null, mutationIntent=none, action=reply, factKind=booking_fact.",
+    "Same named item with a new duration/date, framed as a separate request, is still NEW_TRANSACTION even when a historical candidate for that item exists.",
+    "A uniquely matched existing-booking question uses action=reply, mutationIntent=none, factKind=booking_fact. A uniquely matched existing-booking mutation uses action=request_booking_mutation and the matching mutationIntent.",
+    "A question, confirm, or decline about a listed pending availability offer → PENDING_AVAILABILITY_REFERENCE with that exact requestId. Confirm → action=confirm_pending_availability. Decline → action=decline_pending_availability. Factual pending questions (price, duration, item, status of the outstanding offer) → action=reply, mutationIntent=none, factKind=booking_fact. This is never SOCIAL_GENERAL.",
+    "Never use request_booking_mutation, cancel_booking, or any booking mutationIntent under PENDING_AVAILABILITY_REFERENCE. Rejecting/cancelling the outstanding offer is decline_pending_availability with mutationIntent=none.",
+    "If exactly one pendingAvailabilityRequests row is listed, a price/duration/item/status question or a clear confirm/decline of the outstanding offer uses that requestId unless the customer uniquely names a different listed historical booking.",
+    "Hello / thanks / chit-chat with no transaction referent → SOCIAL_GENERAL, targetId=null, mutationIntent=none, action=reply, factKind=non_business.",
+    "Ambiguous which listed candidate is meant → UNCLEAR, targetId=null, mutationIntent=none, action=reply, factKind=vague.",
+    "If multiple pending offers exist and the customer does not uniquely identify one, use UNCLEAR. Do not pick by list order.",
+    "Do not emit bookingSelectionMode, selectedBookingIndex, targetContext, or pendingAvailabilitySelectionIndex.",
+  ].join("\n");
+
+  const userPayload = [
+    `CLOUD_DM_OWNERSHIP_CANDIDATE_JSON:\n${JSON.stringify(promptFacts)}`,
+    `CUSTOMER_MESSAGE:\n${userLine || "(empty)"}`,
+    historyLine ? `RECENT_CONVERSATION:\n${historyLine}` : "",
+    "JSON only. Ownership fields only. One decision. No customerReply.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const completionFn =
+    typeof __chatCompletionsCreateForTests === "function"
+      ? __chatCompletionsCreateForTests
+      : (() => {
+          const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+          if (!apiKey) return null;
+          const client = new OpenAI({ apiKey });
+          return (args) => client.chat.completions.create(args);
+        })();
+
+  if (!completionFn) {
+    return cloudDmOwnershipUnusableResult({
+      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+      retryable: true,
+      ownershipCompletionCount: 0,
+    });
+  }
+
+  try {
+    const createPromise = Promise.resolve(
+      completionFn({
+        model: resolveOpenAiChatModel(),
+        temperature: 0,
+        max_tokens: 400,
+        response_format: responseFormat,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: userPayload },
+        ],
+      })
+    );
+    const timed =
+      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Promise.race([
+            createPromise,
+            new Promise((_, reject) => {
+              setTimeout(
+                () =>
+                  reject(new Error("CLOUD_DM_OWNERSHIP_OPENAI_TIMEOUT")),
+                Math.floor(Number(timeoutMs))
+              );
+            }),
+          ])
+        : createPromise;
+    const resp = await timed;
+    const raw = resp?.choices?.[0]?.message?.content ?? "";
+    const parsed = parseCloudDmOwnershipDecision(raw);
+    if (!parsed) {
+      return cloudDmOwnershipUnusableResult({
+        reason: CLOUD_DM_OWNERSHIP_UNUSABLE_REASON,
+        retryable: true,
+        ownershipCompletionCount: 1,
+        usabilityClassification: "malformed_or_empty_ownership_json",
+      });
+    }
+    const decision = collapseIndistinguishableSameItemOwnership(
+      parsed,
+      facts,
+      userLine
+    );
+    console.log("[cloud_dm_ownership_decided]", {
+      turnScope: decision.turnScope,
+      targetId: decision.targetId,
+      mutationIntent: decision.mutationIntent,
+      action: decision.action,
+      factKind: decision.factKind,
+      ownershipCompletionCount: 1,
+    });
+    return {
+      ok: true,
+      source: "openai",
+      decision,
+      ownershipCompletionCount: 1,
+      retryable: false,
+    };
+  } catch (err) {
+    const reason = String(err?.message ?? err ?? "OPENAI_ERROR");
+    return cloudDmOwnershipUnusableResult({
+      reason: /TIMEOUT/i.test(reason)
+        ? "CLOUD_DM_OWNERSHIP_OPENAI_TIMEOUT"
+        : `CLOUD_DM_OWNERSHIP_OPENAI_ERROR:${reason.slice(0, 120)}`,
+      retryable: true,
+      ownershipCompletionCount: 1,
+    });
+  }
+}
+
 export async function resolveCloudDmCanonicalOwnership({
   facts,
   pendingRequest = null,
   userMessage,
   conversationHistory = null,
-  styleKey = "casual_local",
   timeoutMs = 8000,
-  missingInfoLoopFullyEnabled = false,
   __chatCompletionsCreateForTests = null,
+  __executeCloudDmOwnershipDecisionFn = null,
   __executePostConfirmPaLaneDecisionFn = null,
 } = {}) {
   const neutralFacts = buildNeutralCloudDmOwnershipFacts(facts, pendingRequest);
   const executeFn =
-    typeof __executePostConfirmPaLaneDecisionFn === "function"
-      ? __executePostConfirmPaLaneDecisionFn
-      : executePostConfirmPaLaneDecision;
+    typeof __executeCloudDmOwnershipDecisionFn === "function"
+      ? __executeCloudDmOwnershipDecisionFn
+      : typeof __executePostConfirmPaLaneDecisionFn === "function"
+        ? __executePostConfirmPaLaneDecisionFn
+        : executeCloudDmOwnershipDecision;
   const decided = await executeFn({
     facts: neutralFacts,
     userMessage,
     conversationHistory,
-    styleKey,
     timeoutMs,
-    missingInfoLoopFullyEnabled,
     __chatCompletionsCreateForTests,
   });
+  const ownershipCompletionCount =
+    Number.isFinite(Number(decided?.ownershipCompletionCount))
+      ? Number(decided.ownershipCompletionCount)
+      : decided?.ok === true
+        ? 1
+        : 1;
   if (decided?.ok !== true || decided?.source !== "openai") {
-    return decided;
+    return {
+      ...decided,
+      ok: false,
+      retryable: decided?.retryable !== false,
+      ownershipCompletionCount,
+      facts: neutralFacts,
+    };
   }
   const decision = applyPostConfirmDerivedOwnershipMechanics(
-    decided.decision,
+    collapseIndistinguishableSameItemOwnership(
+      decided.decision,
+      neutralFacts,
+      userMessage
+    ),
     neutralFacts
   );
+  decision.semanticDecisionVersion = CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION;
+  decision.customerReply = "";
   const validation = validatePostConfirmSemanticOwnership(decision, neutralFacts);
   if (!validation.ok) {
     return {
       ok: false,
-      retryable: false,
+      retryable: true,
       source: decided.source,
       reason: validation.reason || "SEMANTIC_OWNERSHIP_INVALID",
       decision,
       facts: neutralFacts,
+      ownershipCompletionCount,
     };
   }
   return {
@@ -3267,6 +3775,7 @@ export async function resolveCloudDmCanonicalOwnership({
     ok: true,
     decision,
     facts: neutralFacts,
+    ownershipCompletionCount,
   };
 }
 

@@ -9,8 +9,10 @@ process.env.OPENAI_API_KEY ||= "test-key";
 
 const {
   applyPostConfirmDerivedOwnershipMechanics,
+  buildCloudDmOwnershipPromptFacts,
   buildNeutralCloudDmOwnershipFacts,
   buildPostConfirmDecideFactsForPrompt,
+  CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER,
   validatePostConfirmSemanticOwnership,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
 const {
@@ -89,6 +91,34 @@ test("neutral packing never pre-owns historical Civic/Stonic or pending AVR", ()
   const blob = JSON.stringify(packed);
   assert.doesNotMatch(blob, /latest_confirmed_linked_avr/);
   assert.doesNotMatch(blob, /"confidence":"trusted"/);
+});
+
+test("ownership prompt packing is identity-sorted and never pre-owns", () => {
+  const packed = buildCloudDmOwnershipPromptFacts(
+    buildNeutralCloudDmOwnershipFacts(historyFacts(), {
+      requestId: AVR_ID,
+      itemLabel: "Honda Civic",
+    })
+  );
+  assert.equal(packed.candidateOrder, CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER);
+  assert.equal(packed.bookingFocus, null);
+  assert.equal(packed.booking, null);
+  assert.equal(packed.known, null);
+  assert.equal(packed.replyGuardFacts, null);
+  assert.equal(packed.evidenceAvailability, null);
+  assert.deepEqual(
+    packed.bookingCandidates.map((row) => row.id),
+    [CIVIC_OLD_ID, STONIC_ID]
+  );
+  assert.equal(packed.bookingCandidates[0].selectionIndex, undefined);
+  assert.equal(packed.bookingCandidates[1].selectionIndex, undefined);
+  assert.equal(packed.pendingAvailabilityRequests[0].selectionIndex, undefined);
+  const blob = JSON.stringify(packed);
+  assert.doesNotMatch(blob, /selectionIndex/);
+  assert.doesNotMatch(blob, /latest_confirmed_linked_avr/);
+  assert.doesNotMatch(blob, /"confidence":"trusted"/);
+  assert.doesNotMatch(blob, /current booking/i);
+  assert.doesNotMatch(blob, /trusted focus/i);
 });
 
 test("fresh Civic independent ask validates as NEW_TRANSACTION with null targetId", () => {
