@@ -85,7 +85,13 @@ function focusedFacts(extra = {}) {
 }
 
 function decisionJson(overrides = {}) {
+  const social =
+    overrides.factKind === "non_business" ||
+    overrides.capability === "social";
   return JSON.stringify({
+    turnScope: social ? "SOCIAL_GENERAL" : "OLD_BOOKING_REFERENCE",
+    targetContext: social ? "NONE" : "CONFIRMED_BOOKING",
+    targetId: social ? null : "bk-1",
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -112,8 +118,8 @@ function decisionJson(overrides = {}) {
       deliveryAddress: null,
       deliveryTime: null,
     },
-    bookingSelectionMode: "focused",
-    selectedBookingIndex: 1,
+    bookingSelectionMode: social ? "none" : "focused",
+    selectedBookingIndex: social ? null : 1,
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     groundedFacts: {
@@ -159,7 +165,8 @@ test("decide facts prompt strips booking/business/owner answerable values", () =
   const blob = JSON.stringify(ctx);
   assert.doesNotMatch(blob, /22000|5500|11000|10:00|DHA|Fuel is customer|Lahore only|Corolla|99999|2026-09-01|STONIC-PROD|Johar/i);
   assert.match(blob, /Kia Stonic/);
-  assert.match(blob, /CURRENT_BOOKING_IN_SCOPE/);
+  assert.match(blob, /historical_candidate/);
+  assert.doesNotMatch(blob, /"bookingFocus":\{/);
   assert.match(blob, /evidenceAvailability/);
 });
 

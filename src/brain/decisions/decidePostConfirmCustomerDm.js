@@ -1,7 +1,8 @@
 /**
- * Post-confirm PA lane decision implementation (Brain-owned).
- * Shared conversational authority entrypoint: decideCustomerTurn.js
- * This module keeps the post_confirm_pa OpenAI decision + helpers.
+ * Cloud DM ownership decision (historical name: post_confirm_pa).
+ * Cloud DM ownership AI: executeCloudDmOwnershipDecision (ownership-only, one completion).
+ * executePostConfirmPaLaneDecision remains the PA wording/decide lane after freeze.
+ * Historical bookings and pending AVRs are candidate facts only — never pre-owners.
  * Executors must not re-interpret meaning — they execute `action` only (plus safety gates).
  */
 
@@ -48,6 +49,29 @@ export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "action_request",
   "correction",
   "unknown",
+]);
+
+export const POST_CONFIRM_TURN_SCOPES = Object.freeze([
+  "NEW_TRANSACTION",
+  "PENDING_AVAILABILITY_REFERENCE",
+  "OLD_BOOKING_REFERENCE",
+  "SOCIAL_GENERAL",
+  "UNCLEAR",
+]);
+
+/** Durable ownership schema version. Independent of PA wording schema. */
+export const CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION = 1;
+/**
+ * Neutral candidate order: ascending bookingId / requestId.
+ * Stable for reproducibility only. Does not mean preferred, current, latest, or selected.
+ */
+export const CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER = "stable_id_asc";
+
+export const POST_CONFIRM_TARGET_CONTEXTS = Object.freeze([
+  "NEW_TRANSACTION",
+  "PENDING_AVAILABILITY",
+  "CONFIRMED_BOOKING",
+  "NONE",
 ]);
 
 
@@ -687,7 +711,8 @@ function buildPostConfirmSuspiciousSilenceCorrection(
     "- Silence is valid ONLY for a purely social acknowledgement with no question, request, concern, or requested information.",
     "- When the customer asks anything factual about the booking/business: set capability + evidenceNeeds Turn Plan with customerReply=\"\". Do NOT answer facts here.",
     "- Genuine social small-talk only: capability=social with a non-empty customerReply that states NO booking facts, prices, policies, dates, times, locations, or references.",
-    "- For read-only informational questions about the trusted bookingFocus, use bookingSelectionMode=focused. Never use none when that booking is intended.",
+    "- Historical bookings are candidate facts only. Use turnScope=OLD_BOOKING_REFERENCE only when this message explicitly refers to one listed historical booking.",
+    "- An independent inventory/pricing/availability request, including the same named item with a new duration or date, uses turnScope=NEW_TRANSACTION and targetId=null.",
     "- Never invent amounts, dates, policies, or booking mutations. Strict JSON only.",
   ].join("\n");
 }
@@ -739,7 +764,7 @@ function buildPostConfirmTrustedFocusRequiredReplyCorrection(
     "- Must set action=reply, shouldReply=true.",
     "- Factual/booking/business asks: capability + evidenceNeeds Turn Plan, customerReply=\"\". Wording happens after trusted resolve.",
     "- Genuine social only: capability=social with non-empty customerReply and NO factual business/booking claims.",
-    "- Use bookingSelectionMode=focused. Never use none when the trusted booking is intended.",
+    "- Historical bookings are candidate facts only. Do not set turnScope=OLD_BOOKING_REFERENCE merely because a candidate exists.",
     "- Do not silence. Do not invent amounts, dates, policies, or mutations. Strict JSON only.",
   ].join("\n");
 }
@@ -1028,7 +1053,8 @@ export function resolveTrustedFocusedBookingIdentity(facts) {
 }
 
 /**
- * Same-lane correction after verified_item_mismatch — pins trusted focus only.
+ * Same-lane correction after verified_item_mismatch.
+ * Candidates stay candidates — presence never grants ownership.
  * @param {Record<string, unknown> | null | undefined} facts
  * @param {string} reason
  */
@@ -1036,32 +1062,18 @@ export function buildPostConfirmVerifiedItemMismatchCorrection(
   facts,
   reason
 ) {
-  const identity = resolveTrustedFocusedBookingIdentity(facts);
   const failureReason = clean(reason, 160) || "verified_item_mismatch";
-  if (!identity) {
-    return [
-      `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
-      "Do not invent booking or business fact values in decide. For factual asks use capability + evidenceNeeds with customerReply=\"\".",
-      "Genuine social replies must not include prices, policies, dates, times, locations, or references.",
-      "Keep action=reply. No silence, no mutation.",
-      "Return the same required JSON schema. Return JSON only.",
-    ].join("\n");
-  }
   return [
     `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
-    "Answer and groundedFacts must use ONLY the trusted focused booking below.",
-    `selectedBookingIndex: ${identity.selectedBookingIndex}`,
-    `bookingId: ${identity.bookingId ?? "(none)"}`,
-    `itemId: ${identity.itemId ?? "(none)"}`,
-    `itemLabel: ${identity.itemLabel ?? "(none)"}`,
-    "The final customerReply and groundedFacts.itemId MUST refer only to this focused booking.",
-    "Do not use any OUT_OF_SCOPE_CONTEXT_ONLY candidate in customerReply or groundedFacts.",
-    "For factual asks: prefer capability + evidenceNeeds with customerReply=\"\" (wording after resolve). Do not invent fact values.",
-    "Use bookingSelectionMode=focused with this selectedBookingIndex for read-only factual answers.",
-    "If a requested detail is absent from verified facts, say it is not confirmed or ask one useful clarification — never invent a substitute.",
+    "Do not invent booking or business fact values in decide. For factual asks use capability + evidenceNeeds with customerReply=\"\".",
+    "Genuine social replies must not include prices, policies, dates, times, locations, or references.",
     "Keep action=reply. No silence, no mutation.",
-    "Return the same required JSON schema, including honest replySemantics.claims and languageStyle.",
-    "Return JSON only.",
+    "Historical bookings and pending availability rows are candidate facts only. Presence never owns this turn.",
+    "Independent inventory/pricing/availability requests, including the same named item with a new duration or date, use turnScope=NEW_TRANSACTION and targetId=null.",
+    "Explicit reference to one listed pendingAvailabilityRequests row uses PENDING_AVAILABILITY_REFERENCE and that exact requestId.",
+    "Explicit reference to one listed historical booking uses OLD_BOOKING_REFERENCE and that exact bookingId.",
+    "Do not use any historical candidate in customerReply or groundedFacts unless turnScope=OLD_BOOKING_REFERENCE and targetId is that booking's exact id.",
+    "Return the same required JSON schema. Return JSON only.",
   ].join("\n");
 }
 
@@ -1680,10 +1692,172 @@ function buildPostConfirmEvidenceAvailability(facts) {
   };
 }
 
+function compactHistoricalOwnershipCandidate(row) {
+  const id = clean(row?.id || row?.bookingId, 160) || null;
+  if (!id) return null;
+  return {
+    id,
+    bookingId: id,
+    itemId: clean(row?.itemId, 160) || null,
+    itemLabel: clean(row?.itemLabel || row?.itemName, 200) || null,
+    status: clean(row?.status, 60) || null,
+    approvalStage: clean(row?.approvalStage, 80) || null,
+    durationDays: finiteNumberOrNull(row?.durationDays),
+    startDate: clean(row?.startDate || row?.startAt, 40) || null,
+    endDate: clean(row?.endDate || row?.endAt, 40) || null,
+    availabilityRequestId: clean(row?.availabilityRequestId, 160) || null,
+    dailyRate: finiteNumberOrNull(row?.dailyRate),
+    totalAmount: finiteNumberOrNull(row?.totalAmount),
+    role: "historical_candidate",
+  };
+}
+
+function compactPendingOwnershipCandidate(row) {
+  const requestId = pendingAvailabilityRequestId(row);
+  if (!requestId) return null;
+  const nested =
+    row?.request && typeof row.request === "object" ? row.request : row;
+  const quote =
+    nested?.priceQuote && typeof nested.priceQuote === "object"
+      ? nested.priceQuote
+      : {};
+  return {
+    requestId,
+    itemId: clean(nested?.itemId || row?.itemId, 160) || null,
+    itemLabel:
+      clean(
+        row?.itemLabel || nested?.itemLabel || nested?.itemName,
+        200
+      ) || null,
+    status: clean(nested?.status, 60) || null,
+    requestedDuration: finiteNumberOrNull(
+      nested?.requestedDuration ?? row?.requestedDuration
+    ),
+    dailyRate: finiteNumberOrNull(quote.dailyRate ?? row?.dailyRate),
+    totalAmount: finiteNumberOrNull(quote.total ?? row?.totalAmount),
+    role: "pending_availability_candidate",
+  };
+}
+
+function assignStableOwnershipSelectionIndexes(rows, idKey) {
+  return [...rows]
+    .filter(Boolean)
+    .sort((left, right) =>
+      String(left[idKey] ?? "").localeCompare(String(right[idKey] ?? ""))
+    )
+    .slice(0, 12)
+    .map((row, index) => ({
+      ...row,
+      selectionIndex: index + 1,
+    }));
+}
+
 /**
- * Decide-lane context: identity/tone + evidence presence only — never answerable
- * fact values. Social direct wording must not see prices, policies, owner answers,
- * catalog, times, dates, locations, or amounts.
+ * Strip PA pre-own fields. Candidates are equal facts, ordered stable_id_asc.
+ *
+ * @param {Record<string, unknown> | null | undefined} rawFacts
+ * @param {Record<string, unknown> | null | undefined} pendingRequest
+ */
+export function buildNeutralCloudDmOwnershipFacts(
+  rawFacts = {},
+  pendingRequest = null
+) {
+  const facts =
+    rawFacts && typeof rawFacts === "object" ? { ...rawFacts } : {};
+  const historical = assignStableOwnershipSelectionIndexes(
+    bookingCandidatesForFacts(facts).map(compactHistoricalOwnershipCandidate),
+    "id"
+  );
+  const pendingRows = Array.isArray(facts.pendingAvailabilityRequests)
+    ? [...facts.pendingAvailabilityRequests]
+    : [];
+  const pendingId = pendingAvailabilityRequestId(pendingRequest);
+  if (
+    pendingId &&
+    !pendingRows.some((row) => pendingAvailabilityRequestId(row) === pendingId)
+  ) {
+    pendingRows.push({
+      requestId: pendingId,
+      itemLabel: clean(pendingRequest?.itemLabel, 200) || null,
+      request: pendingRequest,
+    });
+  }
+  const pending = assignStableOwnershipSelectionIndexes(
+    pendingRows.map(compactPendingOwnershipCandidate),
+    "requestId"
+  );
+  const business =
+    facts.business && typeof facts.business === "object" ? facts.business : {};
+  const name = clean(business.name ?? business.businessName, 120) || null;
+  const tone = clean(business.tone, 200) || null;
+  return {
+    business: {
+      ...(name ? { name } : {}),
+      ...(tone ? { tone } : {}),
+    },
+    booking: null,
+    bookingFocus: null,
+    activeBookings: [],
+    known: null,
+    knownPolicies: null,
+    replyGuardFacts: null,
+    availabilityRequest: null,
+    catalogItems: null,
+    sourceEvidence: null,
+    openMissingInfoRequests: [],
+    latestClosedMissingInfoAnswers: [],
+    bookingCandidates: historical,
+    pendingAvailabilityRequests: pending,
+    candidateOrder: CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER,
+    policy: {
+      readOnly: true,
+      doNotInventAmounts: true,
+      doNotInventPolicies: true,
+      doNotMutateBooking: true,
+    },
+  };
+}
+
+function omitOwnershipPromptPosition(row) {
+  if (!row || typeof row !== "object") return row;
+  const { selectionIndex: _ignored, ...rest } = row;
+  return rest;
+}
+
+/**
+ * Ownership-only prompt facts. No current/active/trusted/selected booking.
+ * selectionIndex is runtime-only and is omitted so list position is not a model input.
+ */
+export function buildCloudDmOwnershipPromptFacts(facts) {
+  const f = buildNeutralCloudDmOwnershipFacts(
+    facts && typeof facts === "object" ? facts : {}
+  );
+  return {
+    decideContextOnly: true,
+    candidateOrder: CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER,
+    candidateOrderMeaning:
+      "stable identity sort only — not preferred, current, latest, or selected",
+    business: f.business,
+    bookingFocus: null,
+    booking: null,
+    activeBookings: [],
+    known: null,
+    replyGuardFacts: null,
+    evidenceAvailability: null,
+    availabilityRequest: null,
+    catalogItems: null,
+    bookingCandidates: f.bookingCandidates.map(omitOwnershipPromptPosition),
+    pendingAvailabilityRequests: f.pendingAvailabilityRequests.map(
+      omitOwnershipPromptPosition
+    ),
+    policy: f.policy,
+  };
+}
+
+/**
+ * PA wording decide-lane context: identity/tone + evidence presence only —
+ * never answerable fact values. Ownership classification uses
+ * buildCloudDmOwnershipPromptFacts instead.
  *
  * @param {Record<string, unknown> | null | undefined} facts
  */
@@ -1692,8 +1866,6 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
   const business =
     f.business && typeof f.business === "object" ? f.business : {};
   const policy = f.policy && typeof f.policy === "object" ? f.policy : {};
-  const trustedFocusIdentity = resolveTrustedFocusedBookingIdentity(f);
-  const trustedFocusIndex = trustedFocusIdentity?.selectedBookingIndex ?? null;
   const name = clean(business.name ?? business.businessName, 120) || null;
   const tone = clean(business.tone, 200) || null;
 
@@ -1701,51 +1873,26 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
     .map((row, index) => {
       const selectionIndex =
         positiveIntegerOrNull(row?.selectionIndex) ?? index + 1;
-      const itemLabel = clean(row?.itemLabel || row?.itemName, 200) || null;
-      const itemId = clean(row?.itemId, 160) || null;
-      if (trustedFocusIdentity) {
-        if (selectionIndex === trustedFocusIndex) {
-          return {
-            selectionIndex,
-            itemId,
-            itemLabel,
-            scope: "CURRENT_BOOKING_IN_SCOPE",
-          };
-        }
-        return {
-          selectionIndex,
-          itemLabel,
-          scope: "OUT_OF_SCOPE_CONTEXT_ONLY",
-        };
-      }
-      return { selectionIndex, itemId, itemLabel };
+      return {
+        selectionIndex,
+        bookingId: clean(row?.id || row?.bookingId, 160) || null,
+        itemId: clean(row?.itemId, 160) || null,
+        itemLabel: clean(row?.itemLabel || row?.itemName, 200) || null,
+        role: "historical_candidate",
+      };
     })
-    .filter(Boolean)
+    .filter((row) => row.bookingId)
     .slice(0, 12);
-
-  const bookingFocus = trustedFocusIdentity
-    ? {
-        source: trustedFocusIdentity.source,
-        confidence: trustedFocusIdentity.confidence,
-        selectedBookingIndex: trustedFocusIdentity.selectedBookingIndex,
-        bookingId: trustedFocusIdentity.bookingId,
-        availabilityRequestId: trustedFocusIdentity.availabilityRequestId,
-        itemId: trustedFocusIdentity.itemId,
-        itemLabel: trustedFocusIdentity.itemLabel,
-        scope: "CURRENT_BOOKING_IN_SCOPE",
-      }
-    : null;
 
   const pendingAvailabilityRequests = Array.isArray(
     f.pendingAvailabilityRequests
   )
-    ? f.pendingAvailabilityRequests.slice(0, 12).map((row) => ({
+    ? f.pendingAvailabilityRequests.slice(0, 12).map((row, index) => ({
         selectionIndex:
-          Number.isFinite(Number(row?.selectionIndex))
-            ? Number(row.selectionIndex)
-            : null,
+          positiveIntegerOrNull(row?.selectionIndex) ?? index + 1,
+        requestId: pendingAvailabilityRequestId(row),
         itemLabel: clean(row?.itemLabel, 200) || null,
-        // No priceQuote, dates, or status details — selection identity only.
+        role: "pending_availability_candidate",
       }))
     : [];
 
@@ -1766,20 +1913,12 @@ export function buildPostConfirmDecideFactsForPrompt(facts) {
       name,
       ...(tone ? { tone } : {}),
     },
-    bookingFocus,
+    bookingFocus: null,
     bookingCandidates,
-    activeBookings: bookingCandidates
-      .filter((row) => row?.scope === "CURRENT_BOOKING_IN_SCOPE")
-      .map((row) => ({
-        itemId: row.itemId ?? null,
-        itemLabel: row.itemLabel ?? null,
-      }))
-      .slice(0, 1),
+    activeBookings: [],
     pendingAvailabilityRequests,
     mutationExecution,
-    // present|absent|conflicting only — never values the model could quote.
     evidenceAvailability: buildPostConfirmEvidenceAvailability(f),
-    // Explicit denial of answerable stores.
     known: null,
     knownPolicies: null,
     latestClosedMissingInfoAnswers: null,
@@ -2443,6 +2582,9 @@ export function isPaMissingInfoOwnerNotifyAlreadyPending(row) {
 
 function defaultDecision(overrides = {}) {
   return {
+    turnScope: "UNCLEAR",
+    targetContext: "NONE",
+    targetId: null,
     conversationAct: "unknown",
     customerIntent: "unclear",
     customerIsAskingQuestion: false,
@@ -2472,7 +2614,7 @@ function defaultDecision(overrides = {}) {
 /**
  * Normalize / harden model JSON into the Brain decision contract.
  * @param {string} raw
- * @param {{ userMessage?: string | null }} [opts]
+ * @param {{ userMessage?: string | null, facts?: Record<string, unknown> | null }} [opts]
  */
 export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   const userMessage = String(opts.userMessage ?? "").trim();
@@ -2504,6 +2646,11 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   }
 
   if (!parsed || typeof parsed !== "object") return null;
+
+  const turnScope = POST_CONFIRM_TURN_SCOPES.includes(parsed.turnScope)
+    ? parsed.turnScope
+    : "UNCLEAR";
+  const targetId = clean(parsed.targetId, 160) || null;
 
   let customerReply = String(parsed.customerReply ?? parsed.reply ?? "")
     .replace(/^\s*["']|["']\s*$/g, "")
@@ -2812,8 +2959,11 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     mutationIntent === "none" &&
     capabilityRequiresEvidenceResolution(capability);
 
-  return applyPostConfirmAntiEchoAndSilence(
+  return applyPostConfirmDerivedOwnershipMechanics(
+    applyPostConfirmAntiEchoAndSilence(
     {
+      turnScope,
+      targetId,
       conversationAct,
       customerIntent,
       customerIsAskingQuestion,
@@ -2852,6 +3002,8 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
       groundedFacts: normalizeGroundedFacts(parsed.groundedFacts),
     },
     userMessage
+    ),
+    opts.facts
   );
 }
 
@@ -3000,6 +3152,634 @@ export function canEscalatePostConfirmMissingInfo({
 }
 
 /**
+ * Mechanical targetContext from Brain turnScope. Does not infer customer meaning.
+ */
+export function derivePostConfirmTargetContext(turnScope) {
+  if (turnScope === "NEW_TRANSACTION") return "NEW_TRANSACTION";
+  if (turnScope === "PENDING_AVAILABILITY_REFERENCE") {
+    return "PENDING_AVAILABILITY";
+  }
+  if (turnScope === "OLD_BOOKING_REFERENCE") return "CONFIRMED_BOOKING";
+  return "NONE";
+}
+
+function pendingAvailabilityRequestId(row) {
+  return (
+    clean(
+      row?.requestId || row?.request?.requestId || row?.request?.id,
+      160
+    ) || null
+  );
+}
+
+/**
+ * Derive routing mechanics from turnScope + targetId.
+ * Does not change turnScope, targetId, or mutationIntent.
+ */
+export function applyPostConfirmDerivedOwnershipMechanics(decision, facts) {
+  const next =
+    decision && typeof decision === "object" ? { ...decision } : {};
+  const scope = POST_CONFIRM_TURN_SCOPES.includes(next.turnScope)
+    ? next.turnScope
+    : "UNCLEAR";
+  next.turnScope = scope;
+  next.targetContext = derivePostConfirmTargetContext(scope);
+
+  if (
+    scope === "NEW_TRANSACTION" ||
+    scope === "SOCIAL_GENERAL" ||
+    scope === "UNCLEAR"
+  ) {
+    next.bookingSelectionMode = "none";
+    next.selectedBookingIndex = null;
+    next.pendingAvailabilitySelectionIndex = null;
+    next.selectedBookingId = null;
+    if (scope === "SOCIAL_GENERAL" || scope === "UNCLEAR") {
+      next.mutationIntent = "none";
+      if (cleanAction(next.action) === "request_booking_mutation") {
+        next.action = "reply";
+      }
+    }
+    return next;
+  }
+
+  if (scope === "PENDING_AVAILABILITY_REFERENCE") {
+    next.bookingSelectionMode = "none";
+    next.selectedBookingIndex = null;
+    next.selectedBookingId = null;
+    const targetId = clean(next.targetId, 160) || null;
+    const pendingRows = Array.isArray(facts?.pendingAvailabilityRequests)
+      ? facts.pendingAvailabilityRequests
+      : [];
+    const hit = pendingRows.find(
+      (row) => pendingAvailabilityRequestId(row) === targetId
+    );
+    next.pendingAvailabilitySelectionIndex = hit
+      ? positiveIntegerOrNull(hit.selectionIndex)
+      : null;
+    if (cleanMutationIntent(next.mutationIntent) === "cancel_booking") {
+      next.action = "decline_pending_availability";
+      next.mutationIntent = "none";
+    } else if (
+      cleanAction(next.action) === "request_booking_mutation" &&
+      cleanMutationIntent(next.mutationIntent) === "none"
+    ) {
+      next.action = "confirm_pending_availability";
+    }
+    if (
+      next.action === "confirm_pending_availability" ||
+      next.action === "decline_pending_availability"
+    ) {
+      next.mutationIntent = "none";
+    }
+    return next;
+  }
+
+  next.pendingAvailabilitySelectionIndex = null;
+  const targetId = clean(next.targetId, 160) || null;
+  const candidates = bookingCandidatesForFacts(facts);
+  const hit = candidates.find((row) => clean(row?.id, 160) === targetId);
+  if (!hit) {
+    next.bookingSelectionMode = "none";
+    next.selectedBookingIndex = null;
+    next.selectedBookingId = null;
+    return next;
+  }
+  const focusId =
+    clean(
+      facts?.bookingFocus?.selectedBookingId || facts?.bookingFocus?.bookingId,
+      160
+    ) || null;
+  const focusIndex = positiveIntegerOrNull(
+    facts?.bookingFocus?.selectedBookingIndex
+  );
+  const hitIndex = positiveIntegerOrNull(hit.selectionIndex);
+  next.selectedBookingIndex = hitIndex;
+  next.selectedBookingId = targetId;
+  next.bookingSelectionMode =
+    (focusId && focusId === targetId) ||
+    (focusIndex != null && hitIndex === focusIndex)
+      ? "focused"
+      : "candidate";
+  return next;
+}
+
+/**
+ * Fail-closed structural validation of Brain ownership. This validates exact
+ * trusted IDs and compatible action/selection fields only; it never
+ * re-interprets customer text.
+ */
+export function validatePostConfirmSemanticOwnership(decision, facts) {
+  const scope = decision?.turnScope;
+  const context = decision?.targetContext;
+  const targetId = clean(decision?.targetId, 160) || null;
+  const mutation = cleanMutationIntent(decision?.mutationIntent);
+  const action = cleanAction(decision?.action);
+  const bookingMode = cleanBookingSelectionMode(
+    decision?.bookingSelectionMode
+  );
+
+  const invalid = (reason) => ({ ok: false, reason, scope, context, targetId });
+  const mutationDeclared =
+    mutation !== "none" || action === "request_booking_mutation";
+
+  if (scope === "OLD_BOOKING_REFERENCE") {
+    if (context !== "CONFIRMED_BOOKING" || !targetId) {
+      return invalid("OLD_BOOKING_TARGET_REQUIRED");
+    }
+    if (!['focused', 'candidate'].includes(bookingMode)) {
+      return invalid("OLD_BOOKING_SELECTION_REQUIRED");
+    }
+    const selectedId = clean(decision?.selectedBookingId, 160) || null;
+    if (!selectedId || selectedId !== targetId) {
+      return invalid("OLD_BOOKING_TARGET_MISMATCH");
+    }
+    const trustedIds = new Set(
+      bookingCandidatesForFacts(facts)
+        .map((row) => clean(row?.id, 160))
+        .filter(Boolean)
+    );
+    if (!trustedIds.has(targetId)) {
+      return invalid("OLD_BOOKING_TARGET_UNTRUSTED");
+    }
+    if (
+      action === "confirm_pending_availability" ||
+      action === "decline_pending_availability"
+    ) {
+      return invalid("OLD_BOOKING_PENDING_ACTION_CONTRADICTION");
+    }
+    return { ok: true, scope, context, targetId };
+  }
+
+  if (scope === "PENDING_AVAILABILITY_REFERENCE") {
+    if (context !== "PENDING_AVAILABILITY" || !targetId) {
+      return invalid("PENDING_AVAILABILITY_TARGET_REQUIRED");
+    }
+    if (mutationDeclared) {
+      return invalid("PENDING_AVAILABILITY_BOOKING_MUTATION_CONTRADICTION");
+    }
+    const pendingRows = Array.isArray(facts?.pendingAvailabilityRequests)
+      ? facts.pendingAvailabilityRequests
+      : [];
+    const selected = pendingRows.find(
+      (row) =>
+        Number(row?.selectionIndex) ===
+        Number(decision?.pendingAvailabilitySelectionIndex)
+    );
+    const selectedId = clean(
+      selected?.requestId || selected?.request?.requestId || selected?.request?.id,
+      160
+    );
+    if (!selectedId || selectedId !== targetId) {
+      return invalid("PENDING_AVAILABILITY_TARGET_MISMATCH");
+    }
+    return { ok: true, scope, context, targetId };
+  }
+
+  if (scope === "NEW_TRANSACTION") {
+    if (
+      context !== "NEW_TRANSACTION" ||
+      targetId ||
+      mutationDeclared ||
+      bookingMode !== "none" ||
+      decision?.selectedBookingId != null ||
+      action === "confirm_pending_availability" ||
+      action === "decline_pending_availability"
+    ) {
+      return invalid("NEW_TRANSACTION_CONTRADICTION");
+    }
+    return { ok: true, scope, context, targetId: null };
+  }
+
+  if (scope === "SOCIAL_GENERAL" || scope === "UNCLEAR") {
+    if (
+      context !== "NONE" ||
+      targetId ||
+      mutationDeclared ||
+      bookingMode !== "none" ||
+      decision?.selectedBookingId != null ||
+      action === "confirm_pending_availability" ||
+      action === "decline_pending_availability"
+    ) {
+      return invalid(`${scope}_CONTRADICTION`);
+    }
+    return { ok: true, scope, context, targetId: null };
+  }
+
+  return invalid("UNKNOWN_TURN_SCOPE");
+}
+
+export const CLOUD_DM_OWNERSHIP_UNUSABLE_REASON = "CLOUD_DM_OWNERSHIP_UNUSABLE";
+
+function historicalCandidateItemKey(row) {
+  return (
+    clean(row?.itemId, 160) ||
+    clean(row?.itemLabel || row?.itemName, 200).toLowerCase() ||
+    null
+  );
+}
+
+function messageCitesExactToken(message, token) {
+  const needle = clean(token, 160);
+  if (!needle) return false;
+  return String(message ?? "").includes(needle);
+}
+
+/**
+ * Same-item siblings cannot be owned by list position. Unique different-item
+ * historical matches are left unchanged. Distinguishing evidence is only an
+ * exact trusted bookingId or linked AVR id cited in the customer message.
+ *
+ * @param {Record<string, unknown> | null | undefined} decision
+ * @param {Record<string, unknown> | null | undefined} facts
+ * @param {string | null | undefined} userMessage
+ */
+export function collapseIndistinguishableSameItemOwnership(
+  decision,
+  facts,
+  userMessage
+) {
+  const next =
+    decision && typeof decision === "object" ? { ...decision } : {};
+  if (next.turnScope !== "OLD_BOOKING_REFERENCE") return next;
+  const targetId = clean(next.targetId, 160) || null;
+  if (!targetId) return next;
+  const candidates = bookingCandidatesForFacts(facts);
+  const hit = candidates.find(
+    (row) => clean(row?.id || row?.bookingId, 160) === targetId
+  );
+  if (!hit) return next;
+  const itemKey = historicalCandidateItemKey(hit);
+  if (!itemKey) return next;
+  const siblings = candidates.filter(
+    (row) => historicalCandidateItemKey(row) === itemKey
+  );
+  if (siblings.length < 2) return next;
+  const cited = siblings.filter((row) => {
+    const id = clean(row?.id || row?.bookingId, 160);
+    const avr = clean(row?.availabilityRequestId, 160);
+    return (
+      messageCitesExactToken(userMessage, id) ||
+      messageCitesExactToken(userMessage, avr)
+    );
+  });
+  if (
+    cited.length === 1 &&
+    clean(cited[0]?.id || cited[0]?.bookingId, 160) === targetId
+  ) {
+    return next;
+  }
+  return defaultDecision({
+    turnScope: "UNCLEAR",
+    targetId: null,
+    mutationIntent: "none",
+    action: "reply",
+    factKind: "vague",
+    customerReply: "",
+    semanticDecisionVersion: CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION,
+  });
+}
+
+/**
+ * Parse ownership-only JSON. customerReply is never required and is always cleared.
+ * Invalid/missing turnScope is unusable (null) — not silently UNCLEAR.
+ *
+ * @param {unknown} raw
+ * @returns {Record<string, unknown> | null}
+ */
+export function parseCloudDmOwnershipDecision(raw) {
+  let text = String(raw ?? "").trim();
+  if (!text) return null;
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    text = text.slice(start, end + 1);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  if (!POST_CONFIRM_TURN_SCOPES.includes(parsed.turnScope)) return null;
+
+  const turnScope = parsed.turnScope;
+  let targetId = clean(parsed.targetId, 160) || null;
+  if (
+    turnScope === "NEW_TRANSACTION" ||
+    turnScope === "SOCIAL_GENERAL" ||
+    turnScope === "UNCLEAR"
+  ) {
+    targetId = null;
+  }
+  const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
+  const action = cleanAction(parsed.action);
+  const factKind = cleanPostConfirmFactKind(parsed.factKind);
+  return defaultDecision({
+    turnScope,
+    targetId,
+    mutationIntent,
+    action,
+    factKind,
+    customerReply: "",
+    shouldReply: action !== "silence",
+    semanticDecisionVersion: CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION,
+    conversationAct:
+      action === "request_booking_mutation" ||
+      action === "confirm_pending_availability" ||
+      action === "decline_pending_availability"
+        ? "action_request"
+        : turnScope === "SOCIAL_GENERAL"
+          ? "chit_chat"
+          : "information_request",
+    customerIntent:
+      mutationIntent !== "none"
+        ? "ask_action"
+        : turnScope === "SOCIAL_GENERAL"
+          ? "unclear"
+          : "ask_fact",
+    situation: turnScope === "UNCLEAR" ? "unclear" : "new_question",
+  });
+}
+
+function cloudDmOwnershipUnusableResult({
+  reason = CLOUD_DM_OWNERSHIP_UNUSABLE_REASON,
+  retryable = true,
+  ownershipCompletionCount = 1,
+  usabilityClassification = null,
+} = {}) {
+  return {
+    ok: false,
+    retryable,
+    source: "technical_fallback",
+    reason,
+    decision: defaultDecision(),
+    ownershipCompletionCount,
+    usabilityClassification,
+  };
+}
+
+/**
+ * Cloud DM ownership-only OpenAI path.
+ * Exactly one completion per attempt. Never requires customerReply.
+ * Never runs reply guards or EMPTY_OR_INVALID regeneration.
+ *
+ * @param {{
+ *   facts?: Record<string, unknown>,
+ *   userMessage?: string,
+ *   conversationHistory?: string | null,
+ *   timeoutMs?: number,
+ *   __chatCompletionsCreateForTests?: Function,
+ * }} p
+ */
+export async function executeCloudDmOwnershipDecision({
+  facts,
+  userMessage,
+  conversationHistory = null,
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+} = {}) {
+  const userLine = String(userMessage ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+  const historyLine = String(conversationHistory ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1200);
+  const promptFacts = buildCloudDmOwnershipPromptFacts(facts);
+  const responseFormat = buildStrictJsonSchemaResponseFormat(
+    "cloud_dm_ownership_decision",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        turnScope: {
+          type: "string",
+          enum: [...POST_CONFIRM_TURN_SCOPES],
+        },
+        targetId: { type: ["string", "null"] },
+        mutationIntent: {
+          type: "string",
+          enum: [...POST_CONFIRM_MUTATION_INTENTS],
+        },
+        action: {
+          type: "string",
+          enum: [...POST_CONFIRM_ACTIONS],
+        },
+        factKind: {
+          anyOf: [
+            { type: "string", enum: [...POST_CONFIRM_FACT_KINDS] },
+            { type: "null" },
+          ],
+        },
+      },
+      required: [
+        "turnScope",
+        "targetId",
+        "mutationIntent",
+        "action",
+        "factKind",
+      ],
+    }
+  );
+
+  const system = [
+    "You classify Cloud DM transaction ownership only.",
+    "Return JSON with turnScope, targetId, mutationIntent, action, factKind.",
+    "Do not write customer wording. customerReply is not part of this schema.",
+    "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
+    `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
+    "ALLOWED turnScope: NEW_TRANSACTION | PENDING_AVAILABILITY_REFERENCE | OLD_BOOKING_REFERENCE | SOCIAL_GENERAL | UNCLEAR.",
+    "targetId rules:",
+    "- NEW_TRANSACTION, SOCIAL_GENERAL, UNCLEAR → targetId must be null.",
+    "- PENDING_AVAILABILITY_REFERENCE → exact requestId from pendingAvailabilityRequests.",
+    "- OLD_BOOKING_REFERENCE → exact id/bookingId from bookingCandidates.",
+    "Never invent an id.",
+    "UNIQUE historical match: if the customer asks about or mutates an existing booking, and exactly one historical_candidate matches that named item/service identity, use OLD_BOOKING_REFERENCE with that row's exact id. Other different-item historical rows do not make this UNCLEAR.",
+    "SAME-ITEM collision: if two or more historical_candidate rows share that same item identity, and the customer did not cite an exact bookingId or linked AVR id belonging to only one of them, use UNCLEAR, targetId=null, mutationIntent=none, action=reply. Never use list position, first, last, or sort order as evidence.",
+    "Independent new inventory request (named item and/or new date/duration that is NOT changing a listed historical booking) → turnScope=NEW_TRANSACTION, targetId=null, mutationIntent=none, action=reply, factKind=booking_fact.",
+    "Same named item with a new duration/date, framed as a separate request, is still NEW_TRANSACTION even when a historical candidate for that item exists.",
+    "A uniquely matched existing-booking question uses action=reply, mutationIntent=none, factKind=booking_fact. A uniquely matched existing-booking mutation uses action=request_booking_mutation and the matching mutationIntent.",
+    "A question, confirm, or decline about a listed pending availability offer → PENDING_AVAILABILITY_REFERENCE with that exact requestId. Confirm → action=confirm_pending_availability. Decline → action=decline_pending_availability. Factual pending questions (price, duration, item, status of the outstanding offer) → action=reply, mutationIntent=none, factKind=booking_fact. This is never SOCIAL_GENERAL.",
+    "Never use request_booking_mutation, cancel_booking, or any booking mutationIntent under PENDING_AVAILABILITY_REFERENCE. Rejecting/cancelling the outstanding offer is decline_pending_availability with mutationIntent=none.",
+    "If exactly one pendingAvailabilityRequests row is listed, a price/duration/item/status question or a clear confirm/decline of the outstanding offer uses that requestId unless the customer uniquely names a different listed historical booking.",
+    "Hello / thanks / chit-chat with no transaction referent → SOCIAL_GENERAL, targetId=null, mutationIntent=none, action=reply, factKind=non_business.",
+    "Ambiguous which listed candidate is meant → UNCLEAR, targetId=null, mutationIntent=none, action=reply, factKind=vague.",
+    "If multiple pending offers exist and the customer does not uniquely identify one, use UNCLEAR. Do not pick by list order.",
+    "Do not emit bookingSelectionMode, selectedBookingIndex, targetContext, or pendingAvailabilitySelectionIndex.",
+  ].join("\n");
+
+  const userPayload = [
+    `CLOUD_DM_OWNERSHIP_CANDIDATE_JSON:\n${JSON.stringify(promptFacts)}`,
+    `CUSTOMER_MESSAGE:\n${userLine || "(empty)"}`,
+    historyLine ? `RECENT_CONVERSATION:\n${historyLine}` : "",
+    "JSON only. Ownership fields only. One decision. No customerReply.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const completionFn =
+    typeof __chatCompletionsCreateForTests === "function"
+      ? __chatCompletionsCreateForTests
+      : (() => {
+          const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+          if (!apiKey) return null;
+          const client = new OpenAI({ apiKey });
+          return (args) => client.chat.completions.create(args);
+        })();
+
+  if (!completionFn) {
+    return cloudDmOwnershipUnusableResult({
+      reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+      retryable: true,
+      ownershipCompletionCount: 0,
+    });
+  }
+
+  try {
+    const createPromise = Promise.resolve(
+      completionFn({
+        model: resolveOpenAiChatModel(),
+        temperature: 0,
+        max_tokens: 400,
+        response_format: responseFormat,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: userPayload },
+        ],
+      })
+    );
+    const timed =
+      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Promise.race([
+            createPromise,
+            new Promise((_, reject) => {
+              setTimeout(
+                () =>
+                  reject(new Error("CLOUD_DM_OWNERSHIP_OPENAI_TIMEOUT")),
+                Math.floor(Number(timeoutMs))
+              );
+            }),
+          ])
+        : createPromise;
+    const resp = await timed;
+    const raw = resp?.choices?.[0]?.message?.content ?? "";
+    const parsed = parseCloudDmOwnershipDecision(raw);
+    if (!parsed) {
+      return cloudDmOwnershipUnusableResult({
+        reason: CLOUD_DM_OWNERSHIP_UNUSABLE_REASON,
+        retryable: true,
+        ownershipCompletionCount: 1,
+        usabilityClassification: "malformed_or_empty_ownership_json",
+      });
+    }
+    const decision = collapseIndistinguishableSameItemOwnership(
+      parsed,
+      facts,
+      userLine
+    );
+    console.log("[cloud_dm_ownership_decided]", {
+      turnScope: decision.turnScope,
+      targetId: decision.targetId,
+      mutationIntent: decision.mutationIntent,
+      action: decision.action,
+      factKind: decision.factKind,
+      ownershipCompletionCount: 1,
+    });
+    return {
+      ok: true,
+      source: "openai",
+      decision,
+      ownershipCompletionCount: 1,
+      retryable: false,
+    };
+  } catch (err) {
+    const reason = String(err?.message ?? err ?? "OPENAI_ERROR");
+    return cloudDmOwnershipUnusableResult({
+      reason: /TIMEOUT/i.test(reason)
+        ? "CLOUD_DM_OWNERSHIP_OPENAI_TIMEOUT"
+        : `CLOUD_DM_OWNERSHIP_OPENAI_ERROR:${reason.slice(0, 120)}`,
+      retryable: true,
+      ownershipCompletionCount: 1,
+    });
+  }
+}
+
+export async function resolveCloudDmCanonicalOwnership({
+  facts,
+  pendingRequest = null,
+  userMessage,
+  conversationHistory = null,
+  timeoutMs = 8000,
+  __chatCompletionsCreateForTests = null,
+  __executeCloudDmOwnershipDecisionFn = null,
+  __executePostConfirmPaLaneDecisionFn = null,
+} = {}) {
+  const neutralFacts = buildNeutralCloudDmOwnershipFacts(facts, pendingRequest);
+  const executeFn =
+    typeof __executeCloudDmOwnershipDecisionFn === "function"
+      ? __executeCloudDmOwnershipDecisionFn
+      : typeof __executePostConfirmPaLaneDecisionFn === "function"
+        ? __executePostConfirmPaLaneDecisionFn
+        : executeCloudDmOwnershipDecision;
+  const decided = await executeFn({
+    facts: neutralFacts,
+    userMessage,
+    conversationHistory,
+    timeoutMs,
+    __chatCompletionsCreateForTests,
+  });
+  const ownershipCompletionCount =
+    Number.isFinite(Number(decided?.ownershipCompletionCount))
+      ? Number(decided.ownershipCompletionCount)
+      : decided?.ok === true
+        ? 1
+        : 1;
+  if (decided?.ok !== true || decided?.source !== "openai") {
+    return {
+      ...decided,
+      ok: false,
+      retryable: decided?.retryable !== false,
+      ownershipCompletionCount,
+      facts: neutralFacts,
+    };
+  }
+  const decision = applyPostConfirmDerivedOwnershipMechanics(
+    collapseIndistinguishableSameItemOwnership(
+      decided.decision,
+      neutralFacts,
+      userMessage
+    ),
+    neutralFacts
+  );
+  decision.semanticDecisionVersion = CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION;
+  decision.customerReply = "";
+  const validation = validatePostConfirmSemanticOwnership(decision, neutralFacts);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      retryable: true,
+      source: decided.source,
+      reason: validation.reason || "SEMANTIC_OWNERSHIP_INVALID",
+      decision,
+      facts: neutralFacts,
+      ownershipCompletionCount,
+    };
+  }
+  return {
+    ...decided,
+    ok: true,
+    decision,
+    facts: neutralFacts,
+    ownershipCompletionCount,
+  };
+}
+
+/**
  * Post-confirm PA lane runner — single OpenAI decision path for this lane.
  * Prefer decideCustomerTurn({ lane: "post_confirm_pa", ... }) at call sites.
  *
@@ -3042,18 +3822,15 @@ export async function executePostConfirmPaLaneDecision({
   const factsJson = buildPostConfirmDecideFactsForPrompt(facts);
   const loopOn = missingInfoLoopFullyEnabled === true;
 
-  const hasActiveBooking = Boolean(
-    (facts?.booking && typeof facts.booking === "object" && facts.booking.id) ||
-      (Array.isArray(facts?.activeBookings) && facts.activeBookings.length > 0)
-  );
+  const hasHistoricalCandidates =
+    bookingCandidatesForFacts(facts).length > 0;
+  const hasPendingAvailabilityCandidates =
+    Array.isArray(facts?.pendingAvailabilityRequests) &&
+    facts.pendingAvailabilityRequests.some((row) =>
+      Boolean(pendingAvailabilityRequestId(row))
+    );
   const hasMultipleBookings =
-    Array.isArray(facts?.activeBookings) && facts.activeBookings.length > 1;
-  const hasTrustedBookingFocus =
-    facts?.bookingFocus?.source === "latest_confirmed_linked_avr" &&
-    facts?.bookingFocus?.confidence === "trusted" &&
-    positiveIntegerOrNull(facts?.bookingFocus?.selectedBookingIndex) != null;
-  const hasAmbiguousBookings =
-    hasMultipleBookings && !hasTrustedBookingFocus;
+    bookingCandidatesForFacts(facts).length > 1;
 
   const escalateGuidance = loopOn
     ? `- Set action="escalate_missing_info" ONLY when ALL are true:
@@ -3091,6 +3868,11 @@ export async function executePostConfirmPaLaneDecision({
       type: "object",
       additionalProperties: false,
       properties: {
+        turnScope: {
+          type: "string",
+          enum: [...POST_CONFIRM_TURN_SCOPES],
+        },
+        targetId: { type: ["string", "null"] },
         situation: { type: "string", enum: [...POST_CONFIRM_SITUATIONS] },
         conversationAct: {
           type: "string",
@@ -3170,13 +3952,6 @@ export async function executePostConfirmPaLaneDecision({
           enum: [...POST_CONFIRM_MUTATION_EXECUTION_STATUSES],
         },
         actionParameters: POST_CONFIRM_ACTION_PARAMETERS_SCHEMA,
-        bookingSelectionMode: {
-          type: "string",
-          enum: [...POST_CONFIRM_BOOKING_SELECTION_MODES],
-        },
-        selectedBookingIndex: {
-          type: ["integer", "null"],
-        },
         candidateGroundings: {
           type: "array",
           items: {
@@ -3232,9 +4007,6 @@ export async function executePostConfirmPaLaneDecision({
             required: ["selectionIndex", "replySegment", "groundedFacts"],
           },
         },
-        pendingAvailabilitySelectionIndex: {
-          type: ["integer", "null"],
-        },
         groundedFacts: {
           type: "object",
           additionalProperties: false,
@@ -3281,6 +4053,8 @@ export async function executePostConfirmPaLaneDecision({
         replySemantics: REPLY_SEMANTICS_SCHEMA,
       },
       required: [
+        "turnScope",
+        "targetId",
         "situation",
         "conversationAct",
         "customerIntent",
@@ -3297,10 +4071,7 @@ export async function executePostConfirmPaLaneDecision({
         "mutationExecutionRequested",
         "mutationExecutionStatus",
         "actionParameters",
-        "bookingSelectionMode",
-        "selectedBookingIndex",
         "candidateGroundings",
-        "pendingAvailabilitySelectionIndex",
         "groundedFacts",
         "replySemantics",
       ],
@@ -3309,10 +4080,19 @@ export async function executePostConfirmPaLaneDecision({
 
   const system = `${shared}
 
-LANE OBJECTIVE (post_confirm_pa):
+LANE OBJECTIVE (cloud_dm_ownership / historical name post_confirm_pa):
+SEMANTIC OWNERSHIP (decide before any transactional lane):
+- Always return turnScope and targetId. Runtime derives targetContext, bookingSelectionMode, selectedBookingIndex, and pendingAvailabilitySelectionIndex.
+- Candidate lists are facts only. Historical bookings and pending availability rows never own this turn by presence, recency, latest-confirmed ranking, or item-name overlap.
+- NEW_TRANSACTION = an independent new inventory/pricing/availability/booking request, including a same-item request with a new duration or date. targetId=null. No booking mutation.
+- PENDING_AVAILABILITY_REFERENCE = this message explicitly refers to one pendingAvailabilityRequests row. targetId must be that row's exact requestId.
+- OLD_BOOKING_REFERENCE = this message explicitly refers to one historical confirmed booking. targetId must be that booking's exact bookingId.
+- SOCIAL_GENERAL = greeting, thanks, farewell, or a general/non-transactional turn. targetId=null. No mutation. A price, duration, item, confirm, or decline question about a listed pendingAvailabilityRequests row is not SOCIAL_GENERAL.
+- UNCLEAR = scope/referent cannot be selected safely. targetId=null. No mutation. Never guess a historical booking or pending AVR.
+- A mutation intent is valid only with OLD_BOOKING_REFERENCE, except pending confirm/decline actions which require PENDING_AVAILABILITY_REFERENCE. Contradictory scope/target/action combinations fail closed in runtime.
 OUTPUT FORMAT (required):
-Return STRICT JSON (no markdown fences):
-{"situation":"conversation_closing","conversationAct":"chit_chat","customerIntent":"farewell","customerIsAskingQuestion":false,"requestedInfoType":null,"requestedInformation":null,"factKind":"non_business","capability":"social","evidenceNeeds":[],"shouldReply":false,"customerReply":"","action":"silence","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"bookingSelectionMode":"none","selectedBookingIndex":null,"candidateGroundings":[],"pendingAvailabilitySelectionIndex":null,"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+Return STRICT JSON (no markdown fences). The object below is SHAPE ONLY — do not copy its turnScope, targetId, action, or factKind. Choose those from this turn's message and listed candidates.
+{"turnScope":"UNCLEAR","targetId":null,"situation":"unclear","conversationAct":"unknown","customerIntent":"unclear","customerIsAskingQuestion":false,"requestedInfoType":null,"requestedInformation":null,"factKind":null,"capability":null,"evidenceNeeds":[],"shouldReply":true,"customerReply":"","action":"reply","mutationIntent":"none","mutationExecutionRequested":false,"mutationExecutionStatus":"not_executed","actionParameters":{"extensionDays":null,"startDate":null,"endDate":null,"durationDays":null,"itemId":null,"pickupDetails":null,"deliveryRequested":null,"deliveryAddress":null,"deliveryTime":null},"candidateGroundings":[],"groundedFacts":{"itemId":null,"durationDays":null,"bookingStatus":null,"bookingReference":null,"totalAmount":null,"dailyRate":null,"advanceAmount":null,"startDate":null,"endDate":null,"pickupTime":null,"deliveryTime":null,"policyClaims":[]},"replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 NEVER MIRROR THE CUSTOMER:
 - customerReply must NEVER copy/echo the customer message verbatim (or near-verbatim).
@@ -3338,14 +4118,15 @@ MEANING + TURN PLAN (critical):
 - vague = underspecified with no identifiable fact ("mujhe details chahiye")
 - non_business = social/general/time/weather/jokes/maths/politics/trivia/Emily personal — never owner escalation
 - action = mutation or pending AVR confirm/decline — keep mutationIntent/AVR fields; runtime does not map factKind to evidence stores
-- INDEPENDENT fresh inventory availability: a request for another inventory item/service and/or a new date/duration that is NOT changing, comparing, or substituting the focused booking. Examples of shape only: "Stonic kal ke liye chahiye", "Civic 5 din ke liye", "ek aur Civic weekend ke liye". Even when another booking is focused, return factKind=booking_fact, capability=availability_request, mutationIntent=none, action=reply, bookingSelectionMode=none, selectedBookingIndex=null. Never answer it from active booking fields.
-- BOOKING-RELATIVE comparison / substitution / change about the focused booking (asking whether another item can replace or stand in for the booked item, or otherwise changing that booking's item): do NOT use capability=availability_request. Prefer clarification_needed (soft compare/replace) or request_booking_mutation with mutationIntent=change_item when an executable item change is clear. Do not invent an independent fresh AVR from a booking-relative compare/replace ask.
-- Trusted booking focus applies only when the customer asks a question or requests a mutation about that existing booking. A clearly new independent request for the same named item (new date/duration, framed as a separate request) is still fresh availability.
+- INDEPENDENT fresh inventory availability: a request for another inventory item/service and/or a new date/duration that is NOT changing, comparing, or substituting a listed historical booking. Even when historical candidates exist, return turnScope=NEW_TRANSACTION, targetId=null, factKind=booking_fact, capability=availability_request, mutationIntent=none, action=reply. Never answer it from historical booking fields.
+- A question about the outstanding pending offer's quoted price, duration, or item uses turnScope=PENDING_AVAILABILITY_REFERENCE and that row's exact requestId. That is not SOCIAL_GENERAL.
+- BOOKING-RELATIVE comparison / substitution / change about one listed historical booking (asking whether another item can replace or stand in for that booked item, or otherwise changing that booking's item): do NOT use capability=availability_request. Prefer clarification_needed (soft compare/replace) or request_booking_mutation with mutationIntent=change_item when an executable item change is clear. Do not invent an independent fresh AVR from a booking-relative compare/replace ask.
+- A listed historical candidate applies only when the customer explicitly asks a question or requests a mutation about that existing booking. A clearly new independent request for the same named item (new date/duration, framed as a separate request) is still fresh availability.
 - New inventory availability without a named item ("koi gari available?") follows the same availability_request contract. Never omit factKind on factual asks.
 - Never invent dates, times, amounts, locations, statuses, policies, references, or items in this call.
 
 INFORMATIONAL VS MUTATION (delivery/pickup):
-- Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", bookingSelectionMode="focused" when a trusted booking is in scope.
+- Asking whether delivery or pickup is available/possible is informational: action="reply", mutationIntent="none", turnScope=OLD_BOOKING_REFERENCE with that booking's exact bookingId as targetId when the question is about the existing booking.
 - Use mutationIntent="update_delivery" / "update_pickup" ONLY when the customer asks to change, set, or add delivery/pickup details on the existing booking. A yes/no availability question is NOT a mutation.
 
 SOCIAL / END-OF-CHAT (critical):
@@ -3382,8 +4163,8 @@ Examples (meaning → factKind; leave customerReply="" for factual kinds):
 - general knowledge / time / weather / jokes / maths / politics / Emily personal / hello / thanks → factKind=non_business
 - extend/cancel/change pickup or delivery details / pending AVR confirm|decline → factKind=action with matching action/mutationIntent/AVR fields
 - "owner se confirm" without a concrete fact → factKind=vague
-- named item/service + new date or duration as an INDEPENDENT inventory ask (including "ek aur" or clearly framed same-item separate requests) → factKind=booking_fact, capability=availability_request, mutationIntent=none, bookingSelectionMode=none, selectedBookingIndex=null
-- booking-relative compare/substitute/replace of the focused booking's item → clarification_needed or request_booking_mutation + change_item; NEVER capability=availability_request
+- named item/service + new date or duration as an INDEPENDENT inventory ask → turnScope=NEW_TRANSACTION, targetId=null, factKind=booking_fact, capability=availability_request, mutationIntent=none
+- booking-relative compare/substitute/replace of a listed historical booking's item → clarification_needed or request_booking_mutation + change_item; NEVER capability=availability_request
 - "koi gari available?" (new inventory) → the same availability_request contract (not an omitted factKind; never invent booking field answers for inventory)
 - CLARIFICATION ANSWER CONTINUITY: When RECENT_CONVERSATION shows Emily's immediately preceding reply asked for a missing clarifying detail needed to interpret a prior unresolved customer ask, and the current message answers that clarification, set factKind from the COMBINED meaning of (1) the prior unresolved ask, (2) Emily's clarification question, and (3) this answer. Do NOT use factKind=vague merely because the current message is a short fragment answering that clarification. Still use factKind=vague when there is no such pending clarification, or when the current message does not answer it (ok/thanks/still underspecified/unrelated).
 - Never invent attribute names. requestedInfoType remains legacy escalate enum only when relevant: ${PA_MISSING_INFO_TYPES.join(", ")} (or null)
@@ -3396,22 +4177,14 @@ STEP 4 — action:
 - request_booking_mutation: the customer wants to extend/cancel/change dates, duration, item, or change/set pickup or delivery on the booking. Set the matching mutationIntent. Fill actionParameters with structured nullable details (never leave mutation meaning only in raw customer text). Set customerReply to "" (final wording is composed after deterministic execution). Do not claim execution succeeded.
   Examples: extend_booking → extensionDays; cancel_booking → all null; change_dates → startDate/endDate; change_duration → durationDays; change_item → itemId; update_pickup → pickupDetails when changing pickup; update_delivery → deliveryRequested/deliveryAddress/deliveryTime when changing/setting delivery.
   Do NOT use update_delivery/update_pickup for a plain availability/possibility question — that is action="reply".
-- confirm_pending_availability / decline_pending_availability: use only when the customer clearly intends that action for one listed pendingAvailabilityRequests entry. Set pendingAvailabilitySelectionIndex to that entry's selectionIndex. If intent or selection is unclear, ask a natural clarification with action="reply".
+- confirm_pending_availability / decline_pending_availability: when the customer intends to confirm or decline one listed pendingAvailabilityRequests row, set turnScope=PENDING_AVAILABILITY_REFERENCE, targetId to that exact requestId, and action to confirm_pending_availability or decline_pending_availability. customerReply must be "". Do not use action=reply for an acceptance/decline of the outstanding pending offer. If exactly one pending row is listed, a clear confirm/decline of the outstanding offer uses that requestId. If the referent is unclear, use UNCLEAR and ask a natural clarification with action="reply".
 - mutationExecutionRequested=true only with request_booking_mutation.
 - mutationExecutionStatus must reflect POST_CONFIRM_DECIDE_CONTEXT_JSON.mutationExecution.status; never promote not_executed/failed to succeeded.
 - For non-mutation actions, actionParameters must be all null.
-- bookingSelectionMode controls booking scope:
-  focused = use bookingFocus.selectedBookingIndex for a read-only informational question;
-  candidate = customer explicitly identified one bookingCandidates row, and selectedBookingIndex must be that row;
-  all_candidates = customer explicitly asked for facts about all listed bookingCandidates; read-only information only;
-  clarification_required = more than one booking could apply and the customer did not identify one;
-  none = no existing booking is relevant (for example social conversation or a fresh availability request). It prohibits booking selection: selectedBookingIndex and selectedBookingId remain null, and runtime must not default to trusted focus.
-- Existing-booking questions and mutations must explicitly use bookingSelectionMode=focused when trusted focus is intended. Never rely on none to recover focus.
-- For request_booking_mutation with multiple bookings: use bookingSelectionMode=focused to mutate the trusted CURRENT_BOOKING_IN_SCOPE booking; use candidate + selectedBookingIndex when the customer clearly named a different booking. If unclear, clarification_required with selectedBookingIndex=null. Never treat mode=none as focused for mutations.
-- For all_candidates, set selectedBookingIndex=null and provide exactly one candidateGroundings row for every bookingCandidates row. Each replySegment must be an exact non-overlapping substring of customerReply, name that booking using customer-safe facts, and contain only facts for its selectionIndex.
-- Never use all_candidates for a mutation or action request.
-- If two candidates have no customer-safe distinction, use clarification_required and naturally request a date, reference, or other safe distinguishing detail. Never guess an index.
-- For request_booking_mutation with multiple bookings: use focused for the trusted CURRENT_BOOKING_IN_SCOPE booking, or candidate + selectedBookingIndex when the customer clearly identified a different booking. If unclear, action="reply", bookingSelectionMode="clarification_required", selectedBookingIndex=null, and ask naturally which booking. Never use mode=none for multi-booking mutations.
+- Do not emit bookingSelectionMode, selectedBookingIndex, targetContext, or pendingAvailabilitySelectionIndex. Runtime derives them from turnScope and targetId.
+- Existing-booking questions and mutations must use turnScope=OLD_BOOKING_REFERENCE and the exact trusted bookingId as targetId. Never rely on a focused booking's mere presence.
+- For request_booking_mutation, targetId must be the exact booking being mutated. If the customer did not identify one booking, use UNCLEAR with mutationIntent=none and ask naturally which booking.
+- If two candidates have no customer-safe distinction, use UNCLEAR and naturally request a date, reference, or other safe distinguishing detail. Never guess an id.
 - bookingCandidates indexes apply only to this decision. Do not quote indexes or internal identifiers to the customer.
 - Never fall through to another conversational router.
 - When pendingAvailabilityExecution exists, report that verified outcome naturally with action="reply"; do not request the same action again.
@@ -3432,16 +4205,19 @@ LANE FACT RULES:
 - No Hindi "swagat", no CRM dump, no welcome speech for active bookings.
 - Use ONLY POST_CONFIRM_DECIDE_CONTEXT_JSON + RECENT_CONVERSATION for decide semantics (not for stating verified fact values).
 - ${
-    hasActiveBooking
-      ? "Active booking identity is BACKGROUND for selection. Do not onboard as a new visitor. Do not state booking field values here."
-      : "No active booking object."
+    hasHistoricalCandidates
+      ? "Historical bookingCandidates are optional referents only. Presence, recency, or same item name never owns this turn. Independent inventory/pricing/availability/booking requests, including same named item + new duration/date, use NEW_TRANSACTION and targetId=null."
+      : "No historical booking candidates are listed."
   }
 - ${
-    hasTrustedBookingFocus
-      ? "Multiple active bookings are present with a trusted latest-confirmed focus. bookingFocus and any CURRENT_BOOKING_IN_SCOPE row are the only booking identity for generic/read-only questions. Use bookingFocus.itemId and bookingFocus.itemLabel in groundedFacts when identifying that booking. Entries marked OUT_OF_SCOPE_CONTEXT_ONLY are context for clarification/mutation only — never put them in customerReply or groundedFacts.itemId unless the customer explicitly identified that booking (bookingSelectionMode=candidate with its selectionIndex). For generic read-only questions use bookingSelectionMode=focused and defer factual wording."
-      : hasAmbiguousBookings
-        ? "Multiple active bookings are present without trusted focus. Generic booking questions require bookingSelectionMode=clarification_required and a natural clarification. Do not guess or mutate one."
-        : "There is no multi-booking ambiguity."
+    hasPendingAvailabilityCandidates
+      ? "pendingAvailabilityRequests are listed as optional referents. Presence never owns a greeting or an independent new inventory/pricing/availability request. If this message confirms, declines, or asks about the outstanding pending offer (quoted price, duration, or item of that pending row), use PENDING_AVAILABILITY_REFERENCE and that row's exact requestId. If exactly one pending row is listed and the message is clearly about that outstanding offer, that is an explicit pending reference even when the item name is not repeated. A same item name on a historical booking does not convert that pending-offer question or confirm/decline into OLD_BOOKING_REFERENCE. If multiple pending rows are listed and the referent is not identified, use UNCLEAR."
+      : "No pending availability candidates are listed."
+  }
+- ${
+    hasMultipleBookings
+      ? "Multiple historical bookings may be listed as equal candidates. Generic booking questions that do not identify one referent require turnScope=UNCLEAR and a natural clarification. Do not guess or mutate one."
+      : "There is no multi-booking candidate list."
   }
 - replySemantics.claims must only list claims supported by verified facts / allowedClaims.
 - groundedFacts is internal validation metadata. For deferred factual Turn Plans leave groundedFacts null/empty. For social replies do not populate booking fact fields.
@@ -3497,9 +4273,7 @@ STRICT SAFETY:
     let clarificationContinuityCorrectionUsed = false;
     /** @type {string | null} */
     let lastUsabilityClassification = null;
-    const trustedFocusNonEmptyQuestion =
-      hasTrustedPostConfirmBookingFocus(facts) &&
-      Boolean(cleanCustomerReply(userLine));
+    const trustedFocusNonEmptyQuestion = false;
     for (let attempt = 1; ; attempt++) {
       const attemptLimit =
         MAX_CUSTOMER_REPLY_ATTEMPTS +
@@ -3609,13 +4383,16 @@ STRICT SAFETY:
       const raw = resp?.choices?.[0]?.message?.content ?? "";
       const decision = parsePostConfirmCustomerDmDecision(raw, {
         userMessage: userLine,
+        facts,
       });
       const hasSendableReply = Boolean(cleanCustomerReply(decision?.customerReply));
       const isSilence =
         decision?.action === "silence" || decision?.shouldReply === false;
       const isMutationSemanticDecision =
-        decision?.action === "request_booking_mutation" &&
-        cleanMutationIntent(decision?.mutationIntent) !== "none";
+        (decision?.action === "request_booking_mutation" &&
+          cleanMutationIntent(decision?.mutationIntent) !== "none") ||
+        decision?.action === "confirm_pending_availability" ||
+        decision?.action === "decline_pending_availability";
       const isDeferredInformationalDecision =
         isDeferredPostConfirmInformationalDecision(decision);
       const isFactualSemanticDecision =
@@ -3690,7 +4467,10 @@ STRICT SAFETY:
         decision.situation = "pending_owner_answer";
       }
 
-      const finalized = applyPostConfirmAntiEchoAndSilence(decision, userLine);
+      const finalized = applyPostConfirmDerivedOwnershipMechanics(
+        applyPostConfirmAntiEchoAndSilence(decision, userLine),
+        facts
+      );
       // Anti-echo can rewrite empty request_booking_mutation + shouldReply=false
       // into action=silence while mutationIntent/execution flags still show mutation.
       // Capture before normalization so required-reply extra recovery cannot fire.
@@ -3738,6 +4518,54 @@ STRICT SAFETY:
         bookingSelection.selectedBookingIndex;
       finalized.selectedBookingId = bookingSelection.booking?.id ?? null;
 
+      const semanticOwnership = validatePostConfirmSemanticOwnership(
+        finalized,
+        facts
+      );
+      if (!semanticOwnership.ok) {
+        lastReason = `SEMANTIC_OWNERSHIP_${semanticOwnership.reason}`;
+        console.warn("[post_confirm_semantic_ownership_rejected]", {
+          reason: semanticOwnership.reason,
+          turnScope: finalized.turnScope,
+          targetContext: finalized.targetContext,
+          targetId: finalized.targetId,
+          selectedBookingId: finalized.selectedBookingId,
+          action: finalized.action,
+          mutationIntent: finalized.mutationIntent,
+        });
+        if (attempt < attemptLimit) continue;
+        return {
+          ok: false,
+          decision: stripInternalReplySemantics(finalized),
+          source: "technical_fallback",
+          reason: lastReason,
+          retryable: false,
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      console.log("[post_confirm_semantic_ownership_decided]", {
+        turnScope: finalized.turnScope,
+        targetContext: finalized.targetContext,
+        targetId: finalized.targetId,
+        bookingCandidateIds: bookingCandidatesForFacts(facts)
+          .map((row) => clean(row?.id, 160))
+          .filter(Boolean),
+        pendingAvailabilityRequestIds: Array.isArray(
+          facts?.pendingAvailabilityRequests
+        )
+          ? facts.pendingAvailabilityRequests
+              .map((row) =>
+                clean(
+                  row?.requestId || row?.request?.requestId || row?.request?.id,
+                  160
+                )
+              )
+              .filter(Boolean)
+          : [],
+      });
+
       // Mutation semantic decisions stop here: final customer wording is composed
       // after deterministic validate/execute. Do not treat model customerReply as
       // the outbound message (and do not run reply-content guards on it).
@@ -3753,6 +4581,21 @@ STRICT SAFETY:
           finalized.actionParameters,
           finalized.mutationIntent
         );
+        return {
+          ok: true,
+          decision: stripInternalReplySemantics(finalized),
+          source: "openai",
+          silenceRecoveryAttempts,
+          contentSafetyAttempts: attempt,
+        };
+      }
+
+      if (
+        finalized.action === "confirm_pending_availability" ||
+        finalized.action === "decline_pending_availability"
+      ) {
+        finalized.customerReply = "";
+        finalized.shouldReply = true;
         return {
           ok: true,
           decision: stripInternalReplySemantics(finalized),
@@ -3860,7 +4703,7 @@ STRICT SAFETY:
 
       const replyText = cleanCustomerReply(finalized?.customerReply);
       const replyRequired =
-        hasAmbiguousBookings ||
+        hasMultipleBookings ||
         finalized.conversationAct === "information_request" ||
         finalized.conversationAct === "action_request" ||
         finalized.customerIntent === "ask_fact" ||
@@ -3871,14 +4714,6 @@ STRICT SAFETY:
         finalized.action === "confirm_pending_availability" ||
         finalized.action === "decline_pending_availability";
       const trustedFocusedBooking = resolveTrustedFocusedBookingRow(facts);
-      const trustedFocusIndex = positiveIntegerOrNull(
-        facts?.bookingFocus?.selectedBookingIndex
-      );
-      const resolvedTrustedFocus =
-        hasTrustedPostConfirmBookingFocus(facts) &&
-        Boolean(trustedFocusedBooking) &&
-        bookingSelection.mode === "focused" &&
-        bookingSelection.selectedBookingIndex === trustedFocusIndex;
 
       const pendingAvailabilitySelectionDeclared =
         Number.isInteger(Number(finalized.pendingAvailabilitySelectionIndex)) &&
@@ -3917,13 +4752,11 @@ STRICT SAFETY:
         return true;
       };
 
-      // A verified read-only booking question must not terminalize before the
-      // existing same-Brain silence correction gets one chance to answer.
+      // Same-lane usability recovery: non-empty customer text must not
+      // terminalize as acknowledgement/silence before one corrective pass.
+      // This does not treat historical booking presence as ownership.
       if (
         attempt === 1 &&
-        resolvedTrustedFocus &&
-        replyRequired &&
-        isPostConfirmReadOnlyInformationalDecision(finalized) &&
         !pendingAvailabilityAction &&
         finalized.action !== "request_booking_mutation" &&
         isSuspiciousPostConfirmSilenceOnNonEmptyCustomer(finalized, userLine)
@@ -3937,6 +4770,8 @@ STRICT SAFETY:
       if (
         finalized.shouldReply === true &&
         finalized.action !== "silence" &&
+        finalized.action !== "confirm_pending_availability" &&
+        finalized.action !== "decline_pending_availability" &&
         !replyText
       ) {
         lastReason = "customer_reply_required_but_empty";

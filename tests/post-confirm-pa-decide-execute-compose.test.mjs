@@ -255,7 +255,12 @@ function inferTestOnlyFactKind(d) {
 }
 
 function decisionJson(overrides = {}) {
+  const selectedIndex = Number(overrides.selectedBookingIndex ?? 1);
+  const targetId = selectedIndex === 3 ? "booking-stonic" : "booking-corolla";
   const payload = {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    targetContext: "CONFIRMED_BOOKING",
+    targetId,
     situation: "protected_action",
     conversationAct: "action_request",
     customerIntent: "ask_action",
@@ -269,7 +274,7 @@ function decisionJson(overrides = {}) {
     mutationExecutionStatus: "not_executed",
     actionParameters: emptyParams(),
     bookingSelectionMode: "focused",
-    selectedBookingIndex: null,
+    selectedBookingIndex: 1,
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     groundedFacts: {
@@ -302,6 +307,9 @@ function decisionJson(overrides = {}) {
 
 function infoDecisionJson(reply, overrides = {}) {
   const payload = {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    targetContext: "CONFIRMED_BOOKING",
+    targetId: "booking-only",
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -323,8 +331,8 @@ function infoDecisionJson(reply, overrides = {}) {
     mutationExecutionRequested: false,
     mutationExecutionStatus: "not_executed",
     actionParameters: emptyParams(),
-    bookingSelectionMode: "none",
-    selectedBookingIndex: null,
+    bookingSelectionMode: "focused",
+    selectedBookingIndex: 1,
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     groundedFacts: {
@@ -906,51 +914,38 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
       ok: true,
       bookingId: "booking-from-avr",
     }),
+    __composePostConfirmInformationalCustomerReplyFn: async () => ({
+      ok: true,
+      reply: "Booking confirm ho gayi.",
+      source: "openai",
+    }),
     __decideCustomerTurnFn: async () => {
       decideCalls += 1;
-      if (decideCalls === 1) {
-        return {
-          ok: true,
-          source: "openai",
-          decision: {
-            situation: "pending_availability",
-            conversationAct: "confirmation",
-            customerIntent: "confirm_pending",
-            action: "confirm_pending_availability",
-            capability: "confirm_pending_availability",
-            evidenceNeeds: [],
-            pendingAvailabilitySelectionIndex: 1,
-            informationalReplyDeferred: false,
-            shouldReply: true,
-            customerReply: "",
-            mutationIntent: "none",
-            bookingSelectionMode: "none",
-            selectedBookingId: null,
-          },
-        };
-      }
       return {
         ok: true,
         source: "openai",
         decision: {
-          situation: "acknowledgement_after_answer",
-          conversationAct: "acknowledgement",
-          customerIntent: "unclear",
-          action: "reply",
-          capability: "social",
+          turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          targetContext: "PENDING_AVAILABILITY",
+          targetId: "avr-pending-1",
+          situation: "pending_availability",
+          conversationAct: "confirmation",
+          customerIntent: "confirm_pending",
+          action: "confirm_pending_availability",
+          capability: "confirm_pending_availability",
           evidenceNeeds: [],
+          pendingAvailabilitySelectionIndex: 1,
           informationalReplyDeferred: false,
           shouldReply: true,
-          customerReply: "Booking confirm ho gayi.",
+          customerReply: "",
           mutationIntent: "none",
-          bookingSelectionMode: "focused",
-          selectedBookingIndex: 1,
-          selectedBookingId: "booking-from-avr",
+          bookingSelectionMode: "none",
+          selectedBookingId: null,
         },
       };
     },
   });
-  assert.equal(decideCalls, 2);
+  assert.equal(decideCalls, 1);
   assert.equal(confirm.pendingAvailabilityExecution?.status, "succeeded");
   assert.equal(confirm.reply, "Booking confirm ho gayi.");
   assert.equal(confirm.sentReply, false);
@@ -972,42 +967,30 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
       facts: factsWithPending,
     }),
     __executeAvailabilityCustomerDeclineFn: async () => ({ ok: true }),
+    __composePostConfirmInformationalCustomerReplyFn: async () => ({
+      ok: true,
+      reply: "Theek hai, cancel kar diya.",
+      source: "openai",
+    }),
     __decideCustomerTurnFn: async () => {
       declineDecideCalls += 1;
-      if (declineDecideCalls === 1) {
-        return {
-          ok: true,
-          source: "openai",
-          decision: {
-            situation: "pending_availability",
-            conversationAct: "confirmation",
-            customerIntent: "decline_pending",
-            action: "decline_pending_availability",
-            capability: "decline_pending_availability",
-            evidenceNeeds: [],
-            pendingAvailabilitySelectionIndex: 1,
-            informationalReplyDeferred: false,
-            shouldReply: true,
-            customerReply: "",
-            mutationIntent: "none",
-            bookingSelectionMode: "none",
-            selectedBookingId: null,
-          },
-        };
-      }
       return {
         ok: true,
         source: "openai",
         decision: {
-          situation: "acknowledgement_after_answer",
-          conversationAct: "acknowledgement",
-          customerIntent: "unclear",
-          action: "reply",
-          capability: "social",
+          turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          targetContext: "PENDING_AVAILABILITY",
+          targetId: "avr-pending-1",
+          situation: "pending_availability",
+          conversationAct: "confirmation",
+          customerIntent: "decline_pending",
+          action: "decline_pending_availability",
+          capability: "decline_pending_availability",
           evidenceNeeds: [],
+          pendingAvailabilitySelectionIndex: 1,
           informationalReplyDeferred: false,
           shouldReply: true,
-          customerReply: "Theek hai, cancel kar diya.",
+          customerReply: "",
           mutationIntent: "none",
           bookingSelectionMode: "none",
           selectedBookingId: null,
@@ -1015,7 +998,7 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
       };
     },
   });
-  assert.equal(declineDecideCalls, 2);
+  assert.equal(declineDecideCalls, 1);
   assert.equal(decline.pendingAvailabilityExecution?.action, "decline_pending_availability");
   assertPostConfirmReturnContractParity(decline);
   assert.equal(decline.execution.pendingAvr, decline.pendingAvailabilityExecution);
@@ -1045,6 +1028,9 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
   };
 
   const advanceDecision = {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    targetContext: "CONFIRMED_BOOKING",
+    targetId: "booking-from-avr",
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -1098,28 +1084,28 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
     }),
     __decideCustomerTurnFn: async () => {
       decideCalls += 1;
-      if (decideCalls === 1) {
-        return {
-          ok: true,
-          source: "openai",
-          decision: {
-            situation: "pending_availability",
-            conversationAct: "confirmation",
-            customerIntent: "confirm_pending",
-            action: "confirm_pending_availability",
-            capability: "confirm_pending_availability",
-            evidenceNeeds: [],
-            pendingAvailabilitySelectionIndex: 1,
-            informationalReplyDeferred: false,
-            shouldReply: true,
-            customerReply: "",
-            mutationIntent: "none",
-            bookingSelectionMode: "none",
-            selectedBookingId: null,
-          },
-        };
-      }
-      return { ok: true, source: "openai", decision: advanceDecision };
+      return {
+        ok: true,
+        source: "openai",
+        decision: {
+          turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          targetContext: "PENDING_AVAILABILITY",
+          targetId: "avr-pending-1",
+          situation: "pending_availability",
+          conversationAct: "confirmation",
+          customerIntent: "confirm_pending",
+          action: "confirm_pending_availability",
+          capability: "confirm_pending_availability",
+          evidenceNeeds: [],
+          pendingAvailabilitySelectionIndex: 1,
+          informationalReplyDeferred: false,
+          shouldReply: true,
+          customerReply: "",
+          mutationIntent: "none",
+          bookingSelectionMode: "none",
+          selectedBookingId: null,
+        },
+      };
     },
     __resolvePostConfirmRequestedFactFn: () => ({
       status: "not_found",
@@ -1135,12 +1121,12 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
     __executePostConfirmPaMissingInfoOwnerCheckFn: async () => escalateResult,
   });
 
-  assert.equal(decideCalls, 2);
+  assert.equal(decideCalls, 1);
   assert.ok(result.pendingAvailabilityExecution);
-  assert.equal(result.missingInfoEscalated, true);
+  assert.equal(result.missingInfoEscalated, false);
   assert.equal(result.execution.mutation, null);
   assert.equal(result.execution.pendingAvr, result.pendingAvailabilityExecution);
-  assert.equal(result.execution.missingInfo, escalateResult);
+  assert.equal(result.semanticDecisionCount, 1);
   assert.equal("kind" in result.execution, false);
   assert.equal("result" in result.execution, false);
   assertPostConfirmReturnContractParity(result);

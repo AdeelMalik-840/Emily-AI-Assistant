@@ -31,6 +31,48 @@ const SAFE_APOLOGY =
 /** @deprecated Prefer ONBOARDING_CLARIFICATION_REPLY — kept as alias for local call sites. */
 const SAFE_CLARIFICATION = ONBOARDING_CLARIFICATION_REPLY;
 
+const CANONICAL_RELEASED_SCOPES = new Set([
+  "NEW_TRANSACTION",
+  "SOCIAL_GENERAL",
+  "UNCLEAR",
+]);
+const CANONICAL_MUTATION_ACTION_TYPES = new Set([
+  "CREATE_BOOKING",
+  "AVAILABILITY_OWNER_CHECK_REQUIRED",
+  "NOTIFY_OWNER",
+]);
+
+function resolveFrozenCanonicalDecision(params) {
+  if (params?.isGroupInbound === true || params?.chatType === "group") {
+    return null;
+  }
+  const decision =
+    params?.canonicalSemanticDecision &&
+    typeof params.canonicalSemanticDecision === "object"
+      ? params.canonicalSemanticDecision
+      : null;
+  if (!decision) return null;
+  const status = String(decision.semanticDecisionStatus ?? "").trim();
+  if (status !== "released" && status !== "accepted") return null;
+  const turnScope = String(decision.turnScope ?? "").trim();
+  if (!CANONICAL_RELEASED_SCOPES.has(turnScope)) {
+    return { ...decision, turnScope, _ownershipBlockedForBrainV2: true };
+  }
+  return decision;
+}
+
+function constrainActionPlanToCanonicalScope(actionPlan, turnScope) {
+  const plan = actionPlan && typeof actionPlan === "object" ? { ...actionPlan } : {};
+  const actions = Array.isArray(plan.actions) ? plan.actions : [];
+  if (turnScope === "SOCIAL_GENERAL" || turnScope === "UNCLEAR") {
+    plan.actions = actions.filter(
+      (action) =>
+        !CANONICAL_MUTATION_ACTION_TYPES.has(String(action?.type ?? "").trim())
+    );
+  }
+  return plan;
+}
+
 /**
  * @typedef {Object} BrainV2LivePipelineResult
  * @property {boolean} handled
@@ -124,7 +166,7 @@ export async function runBrainV2LivePipeline(params) {
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
-    const continuation = buildContinuationContext({
+    let continuation = buildContinuationContext({
       channel,
       chatType,
       isGroupInbound: params.isGroupInbound === true || chatType === "group",
@@ -135,6 +177,28 @@ export async function runBrainV2LivePipeline(params) {
       availabilityRequest: params.preResolvedWaitingConfirmRequest ?? null,
       waitingConfirmCandidates: params.waitingConfirmCandidates ?? null,
     });
+    const canonicalReleased = resolveFrozenCanonicalDecision(params);
+    if (canonicalReleased?._ownershipBlockedForBrainV2 === true) {
+      return buildSilentPipelineResult({
+        traceId,
+        reason: "CANONICAL_OWNERSHIP_NOT_BRAIN_V2",
+      });
+    }
+    if (canonicalReleased) {
+      continuation = {
+        ...continuation,
+        active: false,
+        safeToOwn: false,
+        bypassGenericRouting: false,
+        canonicalTurnScope: canonicalReleased.turnScope,
+      };
+      console.log("[brain_v2_canonical_released_decision_bound]", {
+        traceId,
+        turnScope: canonicalReleased.turnScope,
+        targetId: canonicalReleased.targetId ?? null,
+        semanticDecisionStatus: canonicalReleased.semanticDecisionStatus,
+      });
+    }
 
     // Unsafe continuation: fail closed — no generic routing, no mutation.
     if (continuation.active && !continuation.safeToOwn) {
@@ -236,6 +300,9 @@ export async function runBrainV2LivePipeline(params) {
     });
 
     brainTurnContext.continuation = continuation;
+    if (canonicalReleased) {
+      brainTurnContext.canonicalSemanticDecision = canonicalReleased;
+    }
 
     if (turnContextInput.authoritativeItem?.id) {
       brainTurnContext.lastResolvedItemId = String(turnContextInput.authoritativeItem.id).trim();
@@ -366,8 +433,41 @@ export async function runBrainV2LivePipeline(params) {
       if (suppressedPlan) return suppressedPlan;
     }
 
+    const constrainedPlan = canonicalReleased
+      ? constrainActionPlanToCanonicalScope(
+          result.actionPlan,
+          canonicalReleased.turnScope
+        )
+      : result.actionPlan;
+    if (
+      canonicalReleased?.turnScope === "SOCIAL_GENERAL" &&
+      ["booking_request", "availability_inquiry", "contact_collection", "contact_request"].includes(
+        workflowType
+      )
+    ) {
+      console.log("[brain_v2_canonical_scope_blocks_transactional_workflow]", {
+        traceId,
+        turnScope: canonicalReleased.turnScope,
+        workflowType,
+      });
+      const socialActions = Array.isArray(constrainedPlan?.actions)
+        ? constrainedPlan.actions.filter(
+            (action) =>
+              !CANONICAL_MUTATION_ACTION_TYPES.has(
+                String(action?.type ?? "").trim()
+              )
+          )
+        : [];
+      if (socialActions.length === 0 && !String(constrainedPlan?.replyDraft ?? "").trim()) {
+        return buildSilentPipelineResult({
+          traceId,
+          reason: "CANONICAL_SOCIAL_GENERAL_SCOPE",
+        });
+      }
+    }
+
     const { sideEffectResults, bookingCreated, customerReplySuppressed, ...routed } =
-      await routeAndExecuteLiveActionPlan(result.actionPlan, flags, {
+      await routeAndExecuteLiveActionPlan(constrainedPlan, flags, {
         ...params.executionContext,
         businessId,
         userId: businessId,

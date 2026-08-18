@@ -177,17 +177,6 @@ function scanAvailabilityRequestsFromTestStore(connection, businessId) {
   return rows;
 }
 
-function isTimestampExpired(value, nowMs = Date.now()) {
-  if (value == null || value === "") return false;
-  const ms =
-    value instanceof Date
-      ? value.getTime()
-      : typeof value?.toDate === "function"
-        ? value.toDate().getTime()
-        : new Date(value).getTime();
-  return Number.isFinite(ms) && ms <= nowMs;
-}
-
 /**
  * When both sides have explicit requestedDates, they must match for semantic reuse.
  * Duration-only identity is unchanged; this is a post-match eligibility gate.
@@ -256,14 +245,22 @@ export function evaluateSemanticAvailabilityReuseEligibility(
   }
 
   if (status === "approved" && confirmStatus === "waiting_confirm") {
-    if (isTimestampExpired(row.confirmExpiresAt, nowMs)) {
+    const expiry = classifyOptionalExpiryTimestamp(row.confirmExpiresAt, nowMs);
+    if (expiry.state === "invalid") {
+      return { reusable: false, kind: null, reason: "CONFIRM_EXPIRY_INVALID" };
+    }
+    if (expiry.state === "expired") {
       return { reusable: false, kind: null, reason: "CONFIRM_EXPIRED" };
     }
     return { reusable: true, kind: "waiting_confirm", reason: null };
   }
 
   if (status === "waiting_confirm") {
-    if (isTimestampExpired(row.confirmExpiresAt, nowMs)) {
+    const expiry = classifyOptionalExpiryTimestamp(row.confirmExpiresAt, nowMs);
+    if (expiry.state === "invalid") {
+      return { reusable: false, kind: null, reason: "CONFIRM_EXPIRY_INVALID" };
+    }
+    if (expiry.state === "expired") {
       return { reusable: false, kind: null, reason: "CONFIRM_EXPIRED" };
     }
     return { reusable: true, kind: "waiting_confirm", reason: null };
@@ -1261,11 +1258,9 @@ export function isWaitingConfirmLifecycleActive(request, nowMs = Date.now()) {
   if (clean(request?.approvalCustomerNotificationStatus) !== "sent") return false;
   if (clean(request?.customerConfirmationStatus) !== "waiting_confirm") return false;
   if (clean(request?.linkedBookingId)) return false;
-  const expiresAt = request?.confirmExpiresAt ? new Date(request.confirmExpiresAt) : null;
-  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= nowMs) {
-    return false;
-  }
-  return true;
+  if (clean(request?.supersededByAvailabilityRequestId)) return false;
+  const expiry = classifyOptionalExpiryTimestamp(request?.confirmExpiresAt, nowMs);
+  return expiry.state === "missing" || expiry.state === "active";
 }
 
 /**
@@ -1294,9 +1289,28 @@ export function isTrustedWaitingConfirmBookingPromptCandidate(request, nowMs = D
 }
 
 /**
- * Trusted Cloud ownership precedence for an inbound received after the latest
- * successful booking-confirmation prompt. This is state-only routing evidence;
- * customer wording never participates in lane selection.
+ * Durable transaction ownership evidence. Unlike booking-prompt state, this
+ * survives informational Q&A while the approved AVR lifecycle remains active.
+ * The successful customer notification is still required and an explicit
+ * delivery failure revokes trust.
+ */
+export function isTrustedWaitingConfirmTransactionCandidate(
+  request,
+  nowMs = Date.now()
+) {
+  if (!isCloudWaitingConfirmAvailabilityRequestEligible(request, nowMs)) return false;
+  if (clean(request?.customerDeliveryStatus).toLowerCase() === "failed") return false;
+  return Number.isFinite(
+    normalizeTimestampToMs(request?.approvalCustomerNotificationAt) ??
+      normalizeTimestampToMs(request?.lastCustomerNotifyAt) ??
+      normalizeTimestampToMs(request?.customerDeliveryTimestamp)
+  );
+}
+
+/**
+ * Trusted Cloud ownership precedence for an inbound received after the
+ * successful notification that opened the still-active transaction. Later
+ * informational replies do not close or untrust that transaction.
  *
  * @param {Record<string, unknown>} request
  * @param {{ nowMs?: number, inboundReceivedAtMs?: number | null }} [opts]
@@ -1308,28 +1322,65 @@ export function isFreshTrustedWaitingConfirmCloudOwnershipCandidate(
   const nowMs = Number.isFinite(Number(opts.nowMs))
     ? Number(opts.nowMs)
     : Date.now();
-  if (!isTrustedWaitingConfirmBookingPromptCandidate(request, nowMs)) return false;
+  if (!isTrustedWaitingConfirmTransactionCandidate(request, nowMs)) return false;
 
-  const deliveryStatus = clean(request?.customerDeliveryStatus).toLowerCase();
-  // approvalCustomerNotificationStatus="sent" already proves a successful Cloud
-  // send. A later explicit delivery failure revokes that ownership evidence.
-  if (deliveryStatus === "failed") return false;
-
-  const promptAtMs =
-    normalizeTimestampToMs(request?.customerDeliveryTimestamp) ??
-    normalizeTimestampToMs(request?.lastCustomerDmPromptAt) ??
-    normalizeTimestampToMs(request?.lastCustomerDmOutboundAt) ??
-    normalizeTimestampToMs(request?.approvalCustomerNotificationAt) ??
-    normalizeTimestampToMs(request?.lastCustomerNotifyAt);
+  const transactionEvidenceTimes = [
+    request?.approvalCustomerNotificationAt,
+    request?.lastCustomerNotifyAt,
+    request?.customerDeliveryTimestamp,
+  ]
+    .map(normalizeTimestampToMs)
+    .filter(Number.isFinite);
+  const transactionOpenedAtMs =
+    transactionEvidenceTimes.length > 0
+      ? Math.max(...transactionEvidenceTimes)
+      : null;
   const inboundReceivedAtMs = Number(opts.inboundReceivedAtMs);
   if (
-    !Number.isFinite(promptAtMs) ||
+    !Number.isFinite(transactionOpenedAtMs) ||
     !Number.isFinite(inboundReceivedAtMs) ||
     inboundReceivedAtMs <= 0
   ) {
     return false;
   }
-  return inboundReceivedAtMs >= promptAtMs;
+  return inboundReceivedAtMs >= transactionOpenedAtMs;
+}
+
+/** Rank transactions by when the approved customer transaction opened.
+ * Conversational Q&A timestamps intentionally do not alter ownership order.
+ */
+export function compareWaitingConfirmTransactionRank(a, b) {
+  const keys = [
+    "approvalCustomerNotificationAt",
+    "lastCustomerNotifyAt",
+    "customerDeliveryTimestamp",
+    "createdAt",
+  ];
+  for (const key of keys) {
+    const aMs = normalizeTimestampToMs(a?.[key]) ?? -1;
+    const bMs = normalizeTimestampToMs(b?.[key]) ?? -1;
+    if (aMs !== bMs) return bMs - aMs;
+  }
+  return 0;
+}
+
+export function pickLatestWaitingConfirmTransactionRequest(
+  requests,
+  nowMs = Date.now()
+) {
+  const trusted = (Array.isArray(requests) ? requests : []).filter((row) =>
+    isTrustedWaitingConfirmTransactionCandidate(row, nowMs)
+  );
+  if (trusted.length === 0) return null;
+  if (trusted.length === 1) return trusted[0];
+  const sorted = [...trusted].sort(compareWaitingConfirmTransactionRank);
+  if (
+    sorted[1] &&
+    compareWaitingConfirmTransactionRank(sorted[0], sorted[1]) === 0
+  ) {
+    return null;
+  }
+  return sorted[0];
 }
 
 /**
@@ -1405,7 +1456,7 @@ export async function findWaitingConfirmCloudAvailabilityRequestsByPhone({
 }
 
 /**
- * Latest fresh trusted Cloud waiting-confirm prompt for one customer/business.
+ * Latest fresh trusted Cloud waiting-confirm transaction for one customer/business.
  *
  * @param {{
  *   db?: unknown,
@@ -1434,7 +1485,32 @@ export async function findFreshTrustedWaitingConfirmCloudOwnershipCandidate({
       inboundReceivedAtMs,
     })
   );
-  return pickLatestTrustedWaitingConfirmRequest(fresh, nowMs);
+  const selected = pickLatestWaitingConfirmTransactionRequest(fresh, nowMs);
+  console.log("[waiting_confirm_cloud_ownership_resolution]", {
+    businessId: clean(businessId) || null,
+    customerSuffix: phoneDigitsOnly(customerPhone).slice(-4) || null,
+    inboundReceivedAtMs:
+      Number.isFinite(Number(inboundReceivedAtMs))
+        ? Number(inboundReceivedAtMs)
+        : null,
+    candidates: waiting.map((row) => ({
+      requestId: clean(row?.requestId ?? row?.id) || null,
+      trustedTransaction: isTrustedWaitingConfirmTransactionCandidate(row, nowMs),
+      freshForInbound: isFreshTrustedWaitingConfirmCloudOwnershipCandidate(row, {
+        nowMs,
+        inboundReceivedAtMs,
+      }),
+      promptType: clean(row?.lastCustomerDmPromptType, 80) || null,
+      superseded: Boolean(clean(row?.supersededByAvailabilityRequestId)),
+    })),
+    selectedRequestId: clean(selected?.requestId ?? selected?.id) || null,
+    selectionReason: selected
+      ? "LATEST_ACTIVE_WAITING_CONFIRM_TRANSACTION"
+      : fresh.length > 1
+        ? "TRANSACTION_RANK_TIE"
+        : "NO_FRESH_TRUSTED_TRANSACTION",
+  });
+  return selected;
 }
 
 /**
@@ -1598,8 +1674,11 @@ export async function claimAvailabilityRequestCustomerConfirmProcessing({
   if (processing === "processing" || processing === "done") {
     return { ok: false, reason: "ALREADY_PROCESSING", request: { requestId, ...data } };
   }
-  const expiresAt = data.confirmExpiresAt ? new Date(data.confirmExpiresAt) : null;
-  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= Date.now()) {
+  const expiry = classifyOptionalExpiryTimestamp(data.confirmExpiresAt);
+  if (expiry.state === "invalid") {
+    return { ok: false, reason: "REQUEST_EXPIRY_INVALID", request: { requestId, ...data } };
+  }
+  if (expiry.state === "expired") {
     return { ok: false, reason: "REQUEST_EXPIRED", request: { requestId, ...data } };
   }
   const updated = await updateAvailabilityRequestFields({
@@ -1646,8 +1725,8 @@ export async function findWaitingConfirmAvailabilityRequestsByPhone({
     .map((doc) => ({ requestId: doc.id, ...(doc.data() || {}) }))
     .filter((row) => {
       if (clean(row.linkedBookingId)) return false;
-      const expiresAt = row.confirmExpiresAt ? new Date(row.confirmExpiresAt) : null;
-      if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() <= now) {
+      const expiry = classifyOptionalExpiryTimestamp(row.confirmExpiresAt, now);
+      if (expiry.state === "invalid" || expiry.state === "expired") {
         return false;
       }
       const targets = [
@@ -1829,15 +1908,45 @@ export function normalizeTimestampToMs(value) {
       null;
 
     const seconds = typeof secondsRaw === "number" ? secondsRaw : Number(secondsRaw);
-    const nanos = typeof nanosRaw === "number" ? nanosRaw : Number(nanosRaw);
+    const nanos =
+      nanosRaw == null
+        ? 0
+        : typeof nanosRaw === "number"
+          ? nanosRaw
+          : Number(nanosRaw);
 
     if (!Number.isFinite(seconds) || seconds <= 0) return null;
-    const safeNanos = Number.isFinite(nanos) && nanos > 0 ? nanos : 0;
-    const ms = seconds * 1000 + Math.floor(safeNanos / 1e6);
+    if (!Number.isFinite(nanos) || nanos < 0 || nanos >= 1e9) return null;
+    const ms = seconds * 1000 + Math.floor(nanos / 1e6);
     return Number.isFinite(ms) ? ms : null;
   }
 
   return null;
+}
+
+/**
+ * Classify an optional expiry without collapsing a malformed persisted value
+ * into the intentionally supported missing-expiry state.
+ *
+ * Missing confirmExpiresAt remains active under the existing lifecycle rule.
+ * Callers must treat "invalid" and "expired" as untrusted / inactive.
+ *
+ * @param {unknown} value
+ * @param {number} [nowMs]
+ * @returns {{ state: "missing" | "invalid" | "active" | "expired", timestampMs: number | null }}
+ */
+export function classifyOptionalExpiryTimestamp(value, nowMs = Date.now()) {
+  if (value == null || value === "") {
+    return { state: "missing", timestampMs: null };
+  }
+  const timestampMs = normalizeTimestampToMs(value);
+  const comparisonMs = Number(nowMs);
+  if (!Number.isFinite(timestampMs) || !Number.isFinite(comparisonMs)) {
+    return { state: "invalid", timestampMs: null };
+  }
+  return timestampMs <= comparisonMs
+    ? { state: "expired", timestampMs }
+    : { state: "active", timestampMs };
 }
 
 export function hashAvailabilityCustomerInboundDmText(text) {

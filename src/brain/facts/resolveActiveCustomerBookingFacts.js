@@ -6,6 +6,7 @@
 import {
   findWaitingConfirmCloudAvailabilityRequestsByPhone,
   getAvailabilityRequest,
+  isWaitingConfirmLifecycleActive,
 } from "../../services/availabilityRequestService.js";
 import {
   listClosedPaMissingInfoAnswersForBooking,
@@ -371,12 +372,7 @@ function isTrustedPendingAvailabilityRequest(request, businessId, customerPhone)
   const rowBusinessId = clean(request.businessId);
   if (rowBusinessId && rowBusinessId !== clean(businessId)) return false;
   if (!requestMatchesCustomerPhone(request, customerPhone)) return false;
-  if (clean(request.status) !== "approved") return false;
-  if (clean(request.customerConfirmationStatus) !== "waiting_confirm") return false;
-  if (clean(request.linkedBookingId)) return false;
-  if (clean(request.supersededByAvailabilityRequestId)) return false;
-  const expiresAt = timestampMs(request.confirmExpiresAt);
-  if (expiresAt != null && expiresAt <= Date.now()) return false;
+  if (!isWaitingConfirmLifecycleActive(request)) return false;
   return Boolean(clean(request.requestId ?? request.id));
 }
 

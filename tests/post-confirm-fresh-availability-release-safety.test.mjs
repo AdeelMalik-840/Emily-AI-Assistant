@@ -36,6 +36,9 @@ function corollaFacts(overrides = {}) {
 
 function pr100Shape(overrides = {}) {
   return {
+    turnScope: "NEW_TRANSACTION",
+    targetContext: "NEW_TRANSACTION",
+    targetId: null,
     factKind: "booking_fact",
     capability: "availability_request",
     action: "reply",
@@ -90,17 +93,24 @@ test("2) Civic fresh → release true", () => {
   );
 });
 
-test("3) Corolla+Civic compare → release false even with exact PR #100 shape", () => {
+test("3) Brain-owned old-booking compare scope → release false", () => {
   assert.equal(
-    release(pr100Shape(), "Corolla ki jagah Civic mil sakti hai?"),
+    release(
+      pr100Shape({
+        turnScope: "OLD_BOOKING_REFERENCE",
+        targetContext: "CONFIRMED_BOOKING",
+        targetId: "booking-corolla",
+      }),
+      "Corolla ki jagah Civic mil sakti hai?"
+    ),
     false
   );
 });
 
-test("4) multi-item fresh → release false", () => {
+test("4) Brain-owned multi-item fresh scope releases without text matching", () => {
   assert.equal(
     release(pr100Shape(), "Civic aur Stonic dono kal ke liye chahiye"),
-    false
+    true
   );
 });
 
@@ -111,14 +121,14 @@ test("5) same-item genuine fresh → release permitted when semantic shape valid
   );
 });
 
-test("6) catalog unavailable → release false", () => {
+test("6) catalog availability is not semantic ownership authority", () => {
   assert.equal(
     release(
       pr100Shape(),
       "Stonic kal ke liye chahiye",
       corollaFacts({ replyGuardFacts: {} })
     ),
-    false
+    true
   );
   assert.equal(
     release(
@@ -126,7 +136,7 @@ test("6) catalog unavailable → release false", () => {
       "Stonic kal ke liye chahiye",
       corollaFacts({ replyGuardFacts: { catalogItems: [] } })
     ),
-    false
+    true
   );
 });
 
@@ -174,10 +184,13 @@ test("9) pickup / genuine booking question shape → release false", () => {
   );
 });
 
-test("10) compare + stale focus still blocked by multi-item deny", () => {
+test("10) compare is blocked when Brain selects old-booking scope", () => {
   assert.equal(
     release(
       pr100Shape({
+        turnScope: "OLD_BOOKING_REFERENCE",
+        targetContext: "CONFIRMED_BOOKING",
+        targetId: "booking-corolla",
         bookingSelectionMode: "focused",
         selectedBookingIndex: 1,
       }),
@@ -205,17 +218,22 @@ test("11) change_item mutation → release false", () => {
   );
 });
 
-test("12) pending AVR selection → release false", () => {
+test("12) pending AVR semantic scope is not fresh-availability release", () => {
   assert.equal(
     release(
-      pr100Shape({ pendingAvailabilitySelectionIndex: 1 }),
+      pr100Shape({
+        turnScope: "PENDING_AVAILABILITY_REFERENCE",
+        targetContext: "PENDING_AVAILABILITY",
+        targetId: "avr-1",
+        pendingAvailabilitySelectionIndex: 1,
+      }),
       "Stonic kal ke liye chahiye"
     ),
     false
   );
 });
 
-test("13) same-item + stale focus → no stale-focus exception", () => {
+test("13) stale selection fields cannot override Brain new-transaction scope", () => {
   assert.equal(
     release(
       pr100Shape({
@@ -224,17 +242,17 @@ test("13) same-item + stale focus → no stale-focus exception", () => {
       }),
       "Corolla 5 din ke liye new request"
     ),
-    false
+    true
   );
 });
 
-test("missing messageText or booked itemId → release false", () => {
+test("message text and booked item ID are not semantic ownership inputs", () => {
   assert.equal(
     shouldReleasePostConfirmForFreshAvailability(pr100Shape(), {
       messageText: "",
       facts: corollaFacts(),
     }),
-    false
+    true
   );
   assert.equal(
     release(
@@ -245,6 +263,6 @@ test("missing messageText or booked itemId → release false", () => {
         bookingFocus: {},
       })
     ),
-    false
+    true
   );
 });
