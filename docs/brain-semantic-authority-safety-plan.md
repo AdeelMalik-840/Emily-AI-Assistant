@@ -20,6 +20,17 @@ This refactor changes semantic decision ownership only. Existing executors, book
 - No merge or deploy until targeted + regression tests are reviewed.
 - If a slice regresses behavior, revert that slice or reset the feature branch to the checkpoint; never rewrite `main`.
 
+### Current safe checkpoints
+
+- `checkpoint/brain-semantic-intent-shadow-v2` → `f77508f74cf402fc56770be7cf829734bf4c34fb`
+- `checkpoint/brain-semantic-shared-schema` → `5fc9121ab5cf5d030566aa26bffa1ed4311d7dc4`
+
+The shared-schema checkpoint is still shadow-only. It adds no workflow/executor consumption of `semanticIntent` and is the rollback point immediately before the existing Cloud DM ownership Brain schema is extended.
+
+## Next behavior-neutral core slice
+
+The existing `executeCloudDmOwnershipDecision()` completion will be extended to emit `semanticIntent` in the same strict JSON response. This must remain the same single OpenAI completion. The field is persisted/frozen for retry consistency, but no downstream workflow may consume it until shadow characterization is reviewed.
+
 ## Explicit non-goals
 
 - No new semantic service or mini-Brain.
