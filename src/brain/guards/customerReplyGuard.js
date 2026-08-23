@@ -454,6 +454,7 @@ function verifiedMoneyValues(facts) {
     .flatMap((row) => [
       row?.totalAmount,
       row?.dailyRate,
+      row?.monthlyRate,
       row?.advanceAmount,
     ])
     .map(finiteNumberOrNull)
@@ -698,7 +699,9 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
   const verifiedReferences = new Set(
     rows.map((row) => normalizeComparableText(row?.bookingReference)).filter(Boolean)
   );
-  const references = extractExplicitBookingReferences(text);
+  const references = facts.skipGenericBookingReferenceTextValidation === true
+    ? []
+    : extractExplicitBookingReferences(text);
   if (
     references.length > 0 &&
     (verifiedReferences.size === 0 ||

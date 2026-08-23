@@ -3,20 +3,6 @@ import { randomUUID } from "node:crypto";
 /** @typedef {import("../contracts/action.js").ActionPlan} ActionPlan */
 
 /**
- * @param {Record<string, unknown>} row
- * @returns {string}
- */
-function formatCatalogOptionLine(row) {
-  const label = String(row.displayLabel ?? row.name ?? "").trim();
-  if (!label) return "";
-  const daily = row?.pricing?.daily ?? row?.pricePerDay ?? row?.dailyRate;
-  if (daily != null && String(daily).trim() !== "") {
-    return `- ${label} - ${daily} PKR/day`;
-  }
-  return `- ${label}`;
-}
-
-/**
  * @param {unknown[]} catalogItems
  * @returns {Record<string, unknown>[]}
  */
@@ -100,52 +86,60 @@ export function resolveBrowseAvailableRows({
   };
 }
 
-/**
- * @param {{
- *   available: Record<string, unknown>[],
- *   conversationStyle?: string,
- * }} params
- * @returns {string}
- */
-function buildBrowseOptionsReplyDraftFromRows({
-  available,
-  conversationStyle = "casual_local",
-}) {
-  const listed = available.slice(0, 5);
-  if (listed.length === 0) {
-    return conversationStyle === "casual_local"
-      ? "Abhi koi aur available option nazar nahi aa raha. Aap koi specific option poochna chahenge?"
-      : "I don't see another available option right now. Would you like to ask about a specific option?";
-  }
-
-  const heading = "Available options:";
-  const ask =
-    conversationStyle === "casual_local"
-      ? "Konsa option dekhna chahenge?"
-      : "Which option would you like to check?";
-  const lines = listed
-    .map((row) => formatCatalogOptionLine(/** @type {Record<string, unknown>} */ (row)))
-    .filter(Boolean);
-  return `${heading}\n${lines.join("\n")}\n\n${ask}`;
+function finitePrice(value) {
+  if (value == null || String(value).trim() === "") return null;
+  const n = Number(String(value).replace(/,/g, "").trim());
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-/**
- * Candidate browse reply — lists available catalog options only.
- *
- * @param {{
- *   catalogItems?: unknown[],
- *   conversationStyle?: string,
- *   businessContext?: Record<string, unknown> | null,
- * }} params
- * @returns {string}
- */
-export function buildBrowseOptionsReplyDraft({
-  catalogItems = [],
-  conversationStyle = "casual_local",
-  businessContext = null,
-} = {}) {
-  const { available } = resolveBrowseAvailableRows({ catalogItems, businessContext });
-  return buildBrowseOptionsReplyDraftFromRows({ available, conversationStyle });
+/** @param {Record<string, unknown>} row */
+function toTrustedBrowseItem(row) {
+  const itemId = String(row.id ?? row.itemId ?? "").trim();
+  const displayLabel = String(row.displayLabel ?? row.name ?? "").trim();
+  if (!itemId || !displayLabel) return null;
+  const pricing =
+    row.pricing && typeof row.pricing === "object" && !Array.isArray(row.pricing)
+      ? row.pricing
+      : {};
+  const dailyRate = finitePrice(
+    pricing.daily ?? row.pricePerDay ?? row.dailyRate
+  );
+  const monthlyRate = finitePrice(
+    pricing.monthly ?? row.pricePerMonth ?? row.monthlyRate
+  );
+  const currency = String(pricing.currency ?? row.currency ?? "PKR").trim() || "PKR";
+  return Object.freeze({
+    itemId,
+    displayLabel,
+    dailyRate,
+    monthlyRate,
+    currency,
+    isAvailable: true,
+  });
+}
+
+/** @param {unknown[]} catalogItems */
+function toBrowseGuardCatalog(catalogItems) {
+  if (!Array.isArray(catalogItems)) return [];
+  return catalogItems
+    .map((row) => {
+      if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+      const id = String(row.id ?? row.itemId ?? "").trim();
+      const name = String(row.name ?? row.displayLabel ?? "").trim();
+      const displayLabel = String(row.displayLabel ?? row.name ?? "").trim();
+      if (!id || !displayLabel) return null;
+      return Object.freeze({
+        id,
+        name,
+        displayLabel,
+        aliases: Object.freeze(
+          Array.isArray(row.aliases)
+            ? row.aliases.map((v) => String(v ?? "").trim()).filter(Boolean)
+            : []
+        ),
+      });
+    })
+    .filter(Boolean);
 }
 
 /**
@@ -162,19 +156,41 @@ export function buildBrowseOptionsActionPlan({
   businessContext = null,
 }) {
   const { available, source } = resolveBrowseAvailableRows({ catalogItems, businessContext });
-  const replyDraft = buildBrowseOptionsReplyDraftFromRows({ available, conversationStyle });
+  const availableItems = available
+    .map((row) => toTrustedBrowseItem(row))
+    .filter(Boolean)
+    .slice(0, 5);
+  const business =
+    businessContext?.resolvedBusinessTurnContext?.business &&
+    typeof businessContext.resolvedBusinessTurnContext.business === "object"
+      ? businessContext.resolvedBusinessTurnContext.business
+      : null;
+  const trustedBrowseFacts = Object.freeze({
+    workflowType: "browse_options",
+    availableCount: available.length,
+    availableItems: Object.freeze(availableItems),
+    catalogItems: Object.freeze(toBrowseGuardCatalog(catalogItems)),
+    availabilityResolved: true,
+    source,
+    styleKey: conversationStyle,
+    businessCommunicationProfile: business
+      ? Object.freeze({ tone: String(business.tone ?? "").trim() || null })
+      : null,
+  });
 
   return Object.freeze({
     planId: randomUUID(),
-    replyDraft,
+    workflowType: "browse_options",
+    replyDraft: "",
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",
         payload: Object.freeze({
           channel: "whatsapp_web",
-          text: replyDraft,
+          text: "",
           field: "browse_options",
           source,
+          trustedBrowseFacts,
           execute: false,
         }),
       }),

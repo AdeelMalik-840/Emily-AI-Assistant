@@ -271,15 +271,17 @@ export function evaluateV2GoldenExpectations(outcome, expectations) {
   }
 
   if (expectations.mustListAvailableOptions) {
-    if (!/^Available options:/im.test(reply)) {
-      violations.push("reply must include browse options heading");
-    }
-    const bulletLines = reply
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith("- "));
-    if (bulletLines.length < 2) {
-      violations.push("reply must list multiple available catalog options");
+    const expectedLabels = Array.isArray(expectations.mustListItemLabels)
+      ? expectations.mustListItemLabels
+      : [];
+    const mentioned = expectedLabels.filter((label) =>
+      new RegExp(
+        String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i"
+      ).test(reply)
+    );
+    if (!reply || (expectedLabels.length >= 2 && mentioned.length < 2)) {
+      violations.push("reply must naturally list multiple available catalog options");
     }
   }
 

@@ -76,15 +76,16 @@ function assertAvailabilityOutcome(result, expectedItemId) {
  */
 function assertBrowseOutcome(result) {
   const outcome = v2OrchestratorResultToGoldenOutcome(result);
-  const reply = String(result.actionPlan?.replyDraft ?? outcome.reply ?? "");
+  const facts = result.actionPlan?.actions[0]?.payload?.trustedBrowseFacts;
+  const labels = facts.availableItems.map((row) => row.displayLabel).join(" ");
 
   assert.equal(result.workflowDecision.workflowType, "browse_options");
   assert.notEqual(result.workflowDecision.workflowType, "availability_inquiry");
   assert.notEqual(result.workflowDecision.workflowType, "noop");
-  assert.match(reply, /Available options:/i);
-  assert.match(reply, /Civic/i);
-  assert.match(reply, /Corolla/i);
-  assert.doesNotMatch(reply, /Stonic/i);
+  assert.equal(result.actionPlan?.replyDraft, "");
+  assert.match(labels, /Civic/i);
+  assert.match(labels, /Corolla/i);
+  assert.doesNotMatch(labels, /Stonic/i);
   assert.equal(outcome.bookingPlanned, false);
   assert.equal(outcome.ownerApprovalPlanned, false);
 }

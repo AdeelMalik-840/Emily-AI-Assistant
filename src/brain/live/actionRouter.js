@@ -241,7 +241,23 @@ export function assertLiveActionPlanIsSafe(actionPlan, flags) {
   const hasOwnerCheckNotExecuted = routed.actions.some(
     (a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED" && !a.allowed
   );
-  if (!routed.intentionallySilent && !routed.reply && !awaitsPostExecuteReply && !hasOwnerCheckNotExecuted) {
+  const awaitsBrowseCompose =
+    String(actionPlan?.workflowType ?? "").trim() === "browse_options" &&
+    routed.actions.some(
+      (a) =>
+      a.type === "REPLY" &&
+      String(a?.payload?.field ?? "").trim() === "browse_options" &&
+      a?.payload?.trustedBrowseFacts &&
+      typeof a.payload.trustedBrowseFacts === "object" &&
+      String(a.text ?? "").trim() === ""
+    );
+  if (
+    !routed.intentionallySilent &&
+    !routed.reply &&
+    !awaitsPostExecuteReply &&
+    !hasOwnerCheckNotExecuted &&
+    !awaitsBrowseCompose
+  ) {
     const hasReplyAction = routed.actions.some((a) => a.type === "REPLY" && a.text);
     if (!hasReplyAction) {
       throw new Error("live_action_plan_missing_reply");

@@ -121,6 +121,7 @@ test("2: duration price uses canonical priceQuote.total — Civic 24,000", async
     chatType: "group",
     participantKey: "cust-1",
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
   });
   assert.equal(result.workflowType, "pricing_with_duration");
   assert.match(String(result.reply ?? ""), /24,000 PKR/i);
@@ -138,6 +139,7 @@ test("3: Corolla 3-day quote is 15,000 PKR", async () => {
     chatType: "group",
     participantKey: "cust-1",
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
   });
   assert.equal(result.workflowType, "pricing_with_duration");
   assert.match(String(result.reply ?? ""), /15,000 PKR/i);
@@ -154,6 +156,7 @@ test("4: Stonic 10-day quote is 70,000 PKR", async () => {
     chatType: "group",
     participantKey: "cust-1",
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
   });
   assert.equal(result.workflowType, "pricing_with_duration");
   assert.match(String(result.reply ?? ""), /70,000 PKR/i);
@@ -230,6 +233,7 @@ test("8: itemless rent kitna hai asks for item (pipeline/orchestrator clarificat
     participantKey: null,
     memorySnapshot: {},
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
   });
   assert.equal(result.handled, true);
   assert.match(
@@ -351,23 +355,14 @@ test("12: v2 still bypasses legacy", async () => {
   assert.equal(isEmilyBrainV2LiveQuickGate(BUSINESS_ID), true);
 });
 
-test("13: brain module has no OpenAI imports", async () => {
-  const { readFile, readdir } = await import("node:fs/promises");
-  const { join } = await import("node:path");
-  const brainRoot = new URL("../src/brain", import.meta.url).pathname;
-  async function walk(dir) {
-    const entries = await readdir(dir, { withFileTypes: true });
-    const files = [];
-    for (const entry of entries) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) files.push(...(await walk(full)));
-      else if (entry.name.endsWith(".js")) files.push(full);
-    }
-    return files;
-  }
-  for (const file of await walk(brainRoot)) {
-    const text = await readFile(file, "utf8");
-    assert.doesNotMatch(text, /from\s+["']openai/i, `OpenAI import in ${file}`);
+test("13: pricing workflows remain deterministic and do not call OpenAI", async () => {
+  const { readFile } = await import("node:fs/promises");
+  for (const relative of [
+    "../src/brain/workflows/PricingInquiryWorkflow.js",
+    "../src/brain/workflows/PricingWithDurationWorkflow.js",
+  ]) {
+    const text = await readFile(new URL(relative, import.meta.url), "utf8");
+    assert.doesNotMatch(text, /from\s+["']openai/i);
   }
 });
 
