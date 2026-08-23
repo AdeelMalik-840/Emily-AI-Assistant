@@ -19,6 +19,7 @@ import {
   executeGroupPostExecuteLaneDecision,
   GROUP_POST_EXECUTE_LANE,
 } from "./groupPostExecuteLane.js";
+import { projectSemanticIntentFromBrainDecision } from "./projectSemanticIntentFromBrainDecision.js";
 
 export const CUSTOMER_TURN_LANES = Object.freeze([
   "post_confirm_pa",
@@ -257,8 +258,7 @@ export function normalizeTurnContext(raw = {}) {
 /**
  * Shared decision JSON — first contract is the post-confirm Phase A fields,
  * plus seed aliases for later lanes (conversationStage / actionType / …).
- * `semanticIntent` is the shared Brain-owned meaning slot for normal turns.
- * It is contract-only in this slice: existing workflows do not consume it yet.
+ * `semanticIntent` is shadow-only in this slice: existing workflows do not consume it.
  * @param {Record<string, unknown> | null | undefined} decision
  */
 export function enrichSharedCustomerTurnDecision(decision) {
@@ -304,7 +304,7 @@ export function enrichSharedCustomerTurnDecision(decision) {
     // Preserve Phase A fields, then seed shared aliases.
     ...d,
     turnScope: d.turnScope ?? "UNCLEAR",
-    semanticIntent: cleanCustomerSemanticIntent(d.semanticIntent),
+    semanticIntent: projectSemanticIntentFromBrainDecision(d),
     targetContext: d.targetContext ?? "NONE",
     targetId: d.targetId ?? null,
     conversationStage: d.conversationStage ?? d.situation ?? null,
