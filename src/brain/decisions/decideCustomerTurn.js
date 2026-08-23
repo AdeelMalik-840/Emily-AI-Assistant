@@ -234,6 +234,8 @@ export function normalizeTurnContext(raw = {}) {
 /**
  * Shared decision JSON — first contract is the post-confirm Phase A fields,
  * plus seed aliases for later lanes (conversationStage / actionType / …).
+ * `semanticIntent` is the shared Brain-owned meaning slot for normal turns.
+ * It is contract-only in this slice: existing workflows do not consume it yet.
  * @param {Record<string, unknown> | null | undefined} decision
  */
 export function enrichSharedCustomerTurnDecision(decision) {
@@ -279,6 +281,7 @@ export function enrichSharedCustomerTurnDecision(decision) {
     // Preserve Phase A fields, then seed shared aliases.
     ...d,
     turnScope: d.turnScope ?? "UNCLEAR",
+    semanticIntent: d.semanticIntent ?? null,
     targetContext: d.targetContext ?? "NONE",
     targetId: d.targetId ?? null,
     conversationStage: d.conversationStage ?? d.situation ?? null,
