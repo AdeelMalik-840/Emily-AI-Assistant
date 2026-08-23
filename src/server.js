@@ -63,6 +63,10 @@ import {
   startAvailabilityCustomerNotificationPollerScheduler,
   stopAvailabilityCustomerNotificationPollerScheduler,
 } from "./services/availabilityCustomerNotificationPollerScheduler.js";
+import {
+  startBookingCompletionScheduler,
+  stopBookingCompletionScheduler,
+} from "./services/bookingCompletionScheduler.js";
 
 console.log("WHATSAPP_MODE RAW:", process.env.WHATSAPP_MODE);
 console.log("[build_marker] whatsapp_cloud_token_fix_v1_loaded");
@@ -1034,6 +1038,14 @@ let stopPlaywrightListenerFn = null;
 async function gracefulPlaywrightShutdown(signal) {
   console.log(`[server] ${signal} — stopping Playwright listener`);
   try {
+    stopBookingCompletionScheduler();
+  } catch (err) {
+    console.warn(
+      "[server] booking completion scheduler stop error:",
+      err?.message || err
+    );
+  }
+  try {
     stopLocalAvailabilityCustomerConfirmPollerScheduler();
   } catch (err) {
     console.warn(
@@ -1093,3 +1105,7 @@ startLocalAvailabilityCustomerPhoneExtractionPollerScheduler();
 // Approved AVR customer Cloud notification poller — independent of Playwright.
 // Default off unless EMILY_BRAIN_V2_AVAILABILITY_CUSTOMER_DM_EXECUTE=true.
 startAvailabilityCustomerNotificationPollerScheduler();
+
+// Booking lifecycle reconciliation — defaults on; set
+// BOOKING_COMPLETION_SCHEDULER_ENABLED=false to disable.
+startBookingCompletionScheduler();
