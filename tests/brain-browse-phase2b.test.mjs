@@ -61,7 +61,12 @@ test("1: browse includes stale availability:false item when bookings say availab
     businessContext: canonicalBrowseContext(catalogBrowse),
   });
   assert.equal(plan.actions[0]?.payload?.source, "canonical_verified_catalog_browse");
-  assert.match(String(plan.replyDraft ?? ""), /Stonic/i);
+  assert.equal(plan.replyDraft, "");
+  assert.ok(
+    plan.actions[0]?.payload?.trustedBrowseFacts?.availableItems.some(
+      (row) => /Stonic/i.test(row.displayLabel)
+    )
+  );
 });
 
 test("2: browse excludes item with active blocking booking", async () => {
@@ -84,8 +89,11 @@ test("2: browse excludes item with active blocking booking", async () => {
     catalogItems: fixture.items,
     businessContext: canonicalBrowseContext(catalogBrowse),
   });
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Civic/i);
-  assert.match(String(plan.replyDraft ?? ""), /Corolla/i);
+  const labels = plan.actions[0]?.payload?.trustedBrowseFacts?.availableItems.map(
+    (row) => row.displayLabel
+  );
+  assert.equal(labels.some((label) => /Civic/i.test(label)), false);
+  assert.equal(labels.some((label) => /Corolla/i.test(label)), true);
 });
 
 test("3: browse uses canonical catalogBrowse source, not raw availability !== false", () => {
@@ -152,7 +160,12 @@ test("5: fallback works when canonical facts are absent", () => {
     businessContext: { catalogItems: fixture.items },
   });
   assert.equal(plan.actions[0]?.payload?.source, "verified_catalog");
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Stonic/i);
+  assert.equal(
+    plan.actions[0]?.payload?.trustedBrowseFacts?.availableItems.some(
+      (row) => /Stonic/i.test(row.displayLabel)
+    ),
+    false
+  );
 });
 
 test("6: catalogBrowse hydrated only on browse turns", async () => {
@@ -180,6 +193,7 @@ test("6: catalogBrowse hydrated only on browse turns", async () => {
     catalogItems: fixture.items,
     flags,
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
   });
   assert.equal(browseCtx.verified.catalogBrowse?.status, "resolved");
   assert.equal(browseCtx.verified.catalogBrowse?.availableCount, 3);
@@ -208,6 +222,7 @@ test("6: catalogBrowse hydrated only on browse turns", async () => {
     catalogItems: fixture.items,
     flags,
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
   });
   assert.equal(availCtx.verified.catalogBrowse, null);
 });
@@ -223,6 +238,23 @@ test("7: v2 live browse still bypasses legacy", async () => {
     chatType: "group",
     participantKey: "cust-1",
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
+    __browseComposeChatCreate: async () => ({
+      choices: [{ message: { content: JSON.stringify({
+        customerReply: "Honda Civic, Toyota Corolla aur Kia Stonic available hain. Aap kis option ko prefer karenge?",
+        mentionedAvailableItemIds: [
+          CIVIC_ID,
+          "toyota_corolla_metallic_grey_fixture",
+          STONIC_ID,
+        ],
+        replySemantics: {
+          claims: ["resource_availability_confirmed"],
+          languageStyle: "roman_urdu",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }) } }],
+    }),
   });
   assert.equal(result.handled, true);
   assert.equal(result.workflowType, "browse_options");
@@ -241,37 +273,43 @@ test("8: v2 live browse excludes blocked item", async () => {
     isGroupInbound: true,
     chatType: "group",
     participantKey: "cust-1",
+    __browseComposeChatCreate: async () => ({
+      choices: [{ message: { content: JSON.stringify({
+        customerReply: "Honda Civic aur Toyota Corolla available hain. Aap kis option ko prefer karenge?",
+        mentionedAvailableItemIds: [
+          CIVIC_ID,
+          "toyota_corolla_metallic_grey_fixture",
+        ],
+        replySemantics: {
+          claims: ["resource_availability_confirmed"],
+          languageStyle: "roman_urdu",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }) } }],
+    }),
     getBookingsForItemFn: async (_businessId, itemId) => {
       if (itemId === STONIC_ID) {
         return [{ id: "b-stonic", itemId: STONIC_ID, status: "approved" }];
       }
       return [];
     },
+    getBusinessProfileFn: async () => null,
   });
   assert.equal(result.workflowType, "browse_options");
   assert.match(String(result.reply ?? ""), /Civic/i);
   assert.doesNotMatch(String(result.reply ?? ""), /Stonic/i);
 });
 
-test("9: brain module has no OpenAI imports", async () => {
-  const { readFile, readdir } = await import("node:fs/promises");
-  const { join } = await import("node:path");
-  const brainRoot = new URL("../src/brain", import.meta.url).pathname;
-  async function walk(dir) {
-    const entries = await readdir(dir, { withFileTypes: true });
-    const files = [];
-    for (const entry of entries) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) files.push(...(await walk(full)));
-      else if (entry.name.endsWith(".js")) files.push(full);
-    }
-    return files;
-  }
-  const brainFiles = await walk(brainRoot);
-  for (const file of brainFiles) {
-    const text = await readFile(file, "utf8");
-    assert.doesNotMatch(text, /from\s+["']openai/i, `OpenAI import in ${file}`);
-  }
+test("9: browse workflow remains deterministic and does not call OpenAI", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const workflowFile = new URL(
+    "../src/brain/workflows/BrowseOptionsWorkflow.js",
+    import.meta.url
+  );
+  const text = await readFile(workflowFile, "utf8");
+  assert.doesNotMatch(text, /from\s+["']openai/i);
+  assert.doesNotMatch(text, /composeBrowseOptionsCustomerReply/);
 });
 
 test("10: booking/owner/DM execution remains disabled in flags", () => {
@@ -279,4 +317,45 @@ test("10: booking/owner/DM execution remains disabled in flags", () => {
   assert.equal(liveFlags.bookingExecute, false);
   assert.equal(liveFlags.ownerExecute, false);
   assert.equal(liveFlags.dmExecute, false);
+});
+
+test("11: canonical zero availability never falls back to raw catalog flags", () => {
+  const plan = buildBrowseOptionsActionPlan({
+    catalogItems: fixture.items.map((row) => ({ ...row, isAvailable: true })),
+    businessContext: canonicalBrowseContext({
+      status: "resolved",
+      items: fixture.items.map((row) => ({ itemId: row.id, isAvailable: false })),
+      availableCount: 0,
+      unavailableCount: fixture.items.length,
+      totalCatalogItems: fixture.items.length,
+    }),
+  });
+  const facts = plan.actions[0]?.payload?.trustedBrowseFacts;
+  assert.equal(facts?.availableCount, 0);
+  assert.deepEqual(facts?.availableItems, []);
+  assert.equal(plan.replyDraft, "");
+  assert.equal(plan.actions[0]?.payload?.text, "");
+});
+
+test("12: browse composer failure is structured silence in the live path", async () => {
+  enableV2LiveEnv();
+  const result = await runBrainV2LivePipeline({
+    traceId: "phase2b-browse-compose-failure",
+    businessId: BUSINESS_ID,
+    message: "konsi cars available hain?",
+    catalogItems: fixture.items,
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
+    __browseComposeChatCreate: async () => {
+      throw new Error("synthetic compose failure");
+    },
+  });
+  assert.equal(result.handled, true);
+  assert.equal(result.reply, "");
+  assert.equal(result.sendVia, "NONE");
+  assert.match(String(result.reason ?? ""), /^BROWSE_COMPOSE_FAIL_CLOSED:/);
+  assert.equal(result.legacyBypassed, true);
 });

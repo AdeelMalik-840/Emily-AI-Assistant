@@ -504,6 +504,33 @@ test("N: unsafe execute:true side-effect throws", () => {
   );
 });
 
+test("browse empty reply exception requires browse_options workflow type", () => {
+  enableV2LiveForSyntheticBusiness();
+  const flags = getEmilyBrainV2LiveFlagSnapshot();
+  const action = {
+    type: "REPLY",
+    payload: {
+      text: "",
+      field: "browse_options",
+      trustedBrowseFacts: { availableCount: 1, availableItems: [] },
+    },
+  };
+  assert.doesNotThrow(() =>
+    assertLiveActionPlanIsSafe(
+      { planId: "browse-compose", workflowType: "browse_options", actions: [action] },
+      flags
+    )
+  );
+  assert.throws(
+    () =>
+      assertLiveActionPlanIsSafe(
+        { planId: "not-browse", workflowType: "pricing_inquiry", actions: [action] },
+        flags
+      ),
+    /live_action_plan_missing_reply/
+  );
+});
+
 test("O/P: v2 live path does not invoke legacy fuzzy or memory resolver", async () => {
   enableV2LiveForSyntheticBusiness();
   const fixture = loadSyntheticCarRentalCatalogFixture();

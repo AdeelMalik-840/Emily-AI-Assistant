@@ -133,6 +133,39 @@ test("wrong duration, status, and reference each fail their generic fact guard",
   assert.equal(reference.reason, "verified_booking_reference_mismatch");
 });
 
+test("bare supported booking-reference forms remain guarded", () => {
+  for (const reply of ["number WRONG-9", "no. WRONG-9"]) {
+    const result = validateCustomerReplyAgainstContract(
+      reply,
+      contract(),
+      semantics(),
+      grounded()
+    );
+    assert.equal(result.reason, "verified_booking_reference_mismatch", reply);
+  }
+});
+
+test("browse-scoped reference-text exemption permits ordinary no-option wording", () => {
+  const result = validateCustomerReplyAgainstContract(
+    "No options are available right now.",
+    contract(
+      verifiedFacts({
+        bookingExecutionVerified: false,
+        itemId: null,
+        itemLabel: null,
+        bookingReference: null,
+        activeBookings: [],
+        catalogItems: [],
+        skipGenericBookingReferenceTextValidation: true,
+      }),
+      { customerLanguageStyle: "english" }
+    ),
+    semantics({ languageStyle: "english" }),
+    grounded()
+  );
+  assert.deepEqual(result, { ok: true });
+});
+
 test("wrong dates and pickup or delivery times fail the shared guard", () => {
   const date = validateCustomerReplyAgainstContract(
     "Kia Stonic ki date 2026-08-02 hai.",

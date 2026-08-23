@@ -35,7 +35,7 @@ export function extractJsonObjectText(raw) {
 /**
  * Parse wording-only compose JSON: { customerReply, replySemantics }.
  * @param {unknown} raw
- * @returns {{ customerReply: string, semantics: ReturnType<typeof normalizeReplySemantics> | null }}
+ * @returns {{ customerReply: string, semantics: ReturnType<typeof normalizeReplySemantics> | null, parsed: Record<string, unknown> | null }}
  */
 export function parseCustomerReplyComposeJson(raw) {
   try {
@@ -46,9 +46,13 @@ export function parseCustomerReplyComposeJson(raw) {
     return {
       customerReply,
       semantics: normalizeReplySemantics(parsed?.replySemantics),
+      parsed:
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed
+          : null,
     };
   } catch {
-    return { customerReply: "", semantics: null };
+    return { customerReply: "", semantics: null, parsed: null };
   }
 }
 
@@ -63,7 +67,8 @@ export function parseCustomerReplyComposeJson(raw) {
  *   resolveSemantics?: (
  *     semantics: ReturnType<typeof normalizeReplySemantics> | null
  *   ) => unknown,
- *   extraReject?: (customerReply: string) => string | null,
+ *   extraReject?: (customerReply: string, parsed: Record<string, unknown> | null) => string | null,
+ *   responseFormat?: Record<string, unknown> | null,
  *   fallbackReply?: string,
  *   timeoutMs?: number,
  *   timeoutErrorMessage?: string,
@@ -82,6 +87,7 @@ export async function composeGuardedCustomerReply({
   enrichGuardContract = null,
   resolveSemantics = null,
   extraReject = null,
+  responseFormat = null,
   fallbackReply = "",
   timeoutMs = 8000,
   timeoutErrorMessage = "COMPOSE_OPENAI_TIMEOUT",
@@ -103,7 +109,10 @@ export async function composeGuardedCustomerReply({
     };
   }
 
-  const responseFormat = buildCustomerReplyOnlyResponseFormat(responseFormatName);
+  const resolvedResponseFormat =
+    responseFormat && typeof responseFormat === "object"
+      ? responseFormat
+      : buildCustomerReplyOnlyResponseFormat(responseFormatName);
   const fallback = String(fallbackReply ?? "");
 
   try {
@@ -119,7 +128,7 @@ export async function composeGuardedCustomerReply({
           model: resolveOpenAiChatModel(),
           temperature,
           max_tokens: maxTokens,
-          response_format: responseFormat,
+          response_format: resolvedResponseFormat,
           messages: [
             { role: "system", content: system },
             { role: "user", content: userContent },
@@ -140,7 +149,7 @@ export async function composeGuardedCustomerReply({
           : createPromise;
 
       const resp = await timed;
-      const { customerReply, semantics } = parseCustomerReplyComposeJson(
+      const { customerReply, semantics, parsed } = parseCustomerReplyComposeJson(
         resp?.choices?.[0]?.message?.content
       );
 
@@ -151,7 +160,7 @@ export async function composeGuardedCustomerReply({
       }
 
       if (typeof extraReject === "function") {
-        const rejected = extraReject(customerReply);
+        const rejected = extraReject(customerReply, parsed);
         if (rejected) {
           lastReason = rejected;
           if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;

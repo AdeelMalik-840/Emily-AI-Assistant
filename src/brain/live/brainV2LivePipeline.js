@@ -25,6 +25,7 @@ import {
   shouldSuppressPostConfirmOnboardingClarification,
 } from "./shouldSuppressPostConfirmOnboardingClarification.js";
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
+import { composeBrowseOptionsCustomerReply } from "../openai/composeBrowseOptionsCustomerReply.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -509,6 +510,43 @@ export async function runBrainV2LivePipeline(params) {
     let finalReply = routed.reply;
     let finalReplySource = "BRAIN_V2_LIVE";
     let postExecuteBrainDecision = null;
+
+    if (workflowType === "browse_options") {
+      const browseReplyAction = (Array.isArray(constrainedPlan?.actions)
+        ? constrainedPlan.actions
+        : []
+      ).find(
+        (action) =>
+          String(action?.type ?? "").trim() === "REPLY" &&
+          String(action?.payload?.field ?? "").trim() === "browse_options"
+      );
+      const trustedBrowseFacts = browseReplyAction?.payload?.trustedBrowseFacts;
+      const composedBrowse = await composeBrowseOptionsCustomerReply({
+        trustedBrowseFacts,
+        customerMessage: message,
+        channel: chatType,
+        timeoutMs: params.__browseComposeTimeoutMs ?? 8000,
+        __chatCompletionsCreateForTests:
+          params.__browseComposeChatCreate ?? null,
+      });
+      assertBrainV2ExecutionActive(params);
+      if (!composedBrowse.ok || !String(composedBrowse.reply ?? "").trim()) {
+        const emilySessionKeyBrowse = String(
+          turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
+        ).trim();
+        applyInfoLiveSessionMemoryPatch({
+          sessionKey: emilySessionKeyBrowse,
+          actionPlan: constrainedPlan,
+          authoritativeItem: turnContextInput.authoritativeItem,
+        });
+        return buildSilentPipelineResult({
+          traceId,
+          reason: `BROWSE_COMPOSE_FAIL_CLOSED:${composedBrowse.reason ?? "no_reply"}`,
+        });
+      }
+      finalReply = composedBrowse.reply;
+      finalReplySource = "BRAIN_V2_BROWSE_OPENAI_COMPOSE";
+    }
 
     if (routed.awaitsPostExecuteBrainReply === true) {
       const postExecResult =

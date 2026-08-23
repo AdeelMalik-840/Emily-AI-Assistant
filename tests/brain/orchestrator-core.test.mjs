@@ -184,7 +184,14 @@ test("orchestrator: browse_options yields browse-only reply plan", () => {
 
   assert.equal(result.workflowDecision.workflowType, "browse_options");
   assertReplyOnlyPlan(result.actionPlan);
-  assert.match(String(result.actionPlan?.replyDraft ?? ""), /available options/i);
+  assert.equal(result.actionPlan?.replyDraft, "");
+  assert.equal(
+    result.actionPlan?.actions[0]?.payload?.trustedBrowseFacts?.workflowType,
+    "browse_options"
+  );
+  assert.ok(
+    result.actionPlan?.actions[0]?.payload?.trustedBrowseFacts?.availableItems.length > 0
+  );
 });
 
 test("orchestrator: unlisted_item yields unlisted fallback reply plan", () => {

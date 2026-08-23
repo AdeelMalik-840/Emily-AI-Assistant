@@ -227,6 +227,22 @@ async function runLive(message, overrides = {}) {
     resolveTrustedSessionItem: overrides.resolveTrustedSessionItem ?? trustedMemoryResolver,
     getBookingsForItemFn: async () => [],
     getBusinessProfileFn: async () => null,
+    __browseComposeChatCreate: async () => ({
+      choices: [{ message: { content: JSON.stringify({
+        customerReply: "Honda Civic, Toyota Corolla aur Kia Stonic available hain. Aap kis option ko prefer karenge?",
+        mentionedAvailableItemIds: [
+          "honda_civic_2026_oriel_white_7e961e31",
+          "toyota_corolla_metallic_grey_fixture",
+          "kia_stonic_ex_plus_2021_white_fixture",
+        ],
+        replySemantics: {
+          claims: ["resource_availability_confirmed"],
+          languageStyle: "roman_urdu",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }) } }],
+    }),
   });
 }
 

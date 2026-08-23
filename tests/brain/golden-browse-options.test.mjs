@@ -42,6 +42,23 @@ test("golden browse: v2 live pipeline lists booking-aware available options", as
     chatType: "group",
     participantKey: fixture.participantKey,
     getBookingsForItemFn: async () => [],
+    getBusinessProfileFn: async () => null,
+    __browseComposeChatCreate: async () => ({
+      choices: [{ message: { content: JSON.stringify({
+        customerReply: "Honda Civic, Toyota Corolla aur Kia Stonic available hain. Aap kis option ko prefer karenge?",
+        mentionedAvailableItemIds: [
+          "honda_civic_2026_oriel_white_7e961e31",
+          "toyota_corolla_metallic_grey_fixture",
+          "kia_stonic_ex_plus_2021_white_fixture",
+        ],
+        replySemantics: {
+          claims: ["resource_availability_confirmed"],
+          languageStyle: "roman_urdu",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }) } }],
+    }),
   });
 
   const outcome = {
@@ -58,14 +75,19 @@ test("golden browse: v2 live pipeline lists booking-aware available options", as
     `golden browse v2 failed: ${evaluation.violations.join("; ")}`
   );
   assert.equal(outcome.workflowType, "browse_options");
-  assert.match(String(outcome.reply ?? ""), /Available options:/i);
+  assert.match(String(outcome.reply ?? ""), /Civic/i);
+  assert.match(String(outcome.reply ?? ""), /Corolla/i);
+  assert.match(String(outcome.reply ?? ""), /Stonic/i);
 });
 
 test("golden browse: orchestrator fallback still excludes stale catalog:false without canonical", () => {
   const result = runV2GoldenScenarioSingleTurn(scenario, fixture);
-  const outcome = v2OrchestratorResultToGoldenOutcome(result);
-  assert.equal(outcome.workflowType, "browse_options");
-  assert.doesNotMatch(String(outcome.reply ?? ""), /Stonic/i);
+  const facts = result.actionPlan?.actions[0]?.payload?.trustedBrowseFacts;
+  assert.equal(result.workflowDecision.workflowType, "browse_options");
+  assert.equal(
+    facts.availableItems.some((row) => /Stonic/i.test(row.displayLabel)),
+    false
+  );
 });
 
 test("golden browse: Civic availability message is not browse", () => {
