@@ -6,9 +6,25 @@ const {
   cleanCustomerSemanticIntent,
   enrichSharedCustomerTurnDecision,
 } = await import("../src/brain/decisions/decideCustomerTurn.js");
+const {
+  CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA,
+} = await import("../src/brain/contracts/customerSemanticIntent.js");
 const { projectSemanticIntentFromBrainDecision } = await import(
   "../src/brain/decisions/projectSemanticIntentFromBrainDecision.js"
 );
+
+test("shared semantic-intent JSON schema stays synchronized with the one vocabulary", () => {
+  const enumValues = CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA.anyOf?.find(
+    (entry) => entry?.type === "string"
+  )?.enum;
+  assert.deepEqual(enumValues, [...CUSTOMER_SEMANTIC_INTENTS]);
+  assert.equal(
+    CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA.anyOf?.some(
+      (entry) => entry?.type === "null"
+    ),
+    true
+  );
+});
 
 test("shared Brain contract preserves explicit Brain-owned semanticIntent", () => {
   const decision = enrichSharedCustomerTurnDecision({
