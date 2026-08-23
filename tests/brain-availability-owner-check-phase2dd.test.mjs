@@ -195,8 +195,14 @@ test("availability approval parser is strict and does not collide with booking a
   });
   assert.equal(parseAvailabilityApprovalMessage("APPROVE booking123"), null);
   assert.equal(parseAvailabilityApprovalMessage("please approve avr_123"), null);
+  assert.equal(parseAvailabilityApprovalMessage("yes"), null);
+  assert.equal(parseAvailabilityApprovalMessage("no"), null);
   assert.deepEqual(parseAvailabilityApprovalButtonId("approve:avr_123"), {
     action: "approve",
+    requestId: "avr_123",
+  });
+  assert.deepEqual(parseAvailabilityApprovalButtonId("reject:avr_123"), {
+    action: "reject",
     requestId: "avr_123",
   });
   assert.equal(parseAvailabilityApprovalButtonId("approve:booking123"), null);
@@ -204,6 +210,27 @@ test("availability approval parser is strict and does not collide with booking a
     action: "approve",
     bookingId: "booking123",
   });
+});
+
+test("button payload updates only its bound availability request", async () => {
+  const fakeDb = new FakeDb();
+  await seedBusiness(fakeDb);
+  const firstRequestId = "avr_first_pending";
+  const secondRequestId = "avr_second_pending";
+  await seedAvailabilityRequest(fakeDb, firstRequestId);
+  await seedAvailabilityRequest(fakeDb, secondRequestId);
+
+  const result = await handleAvailabilityRequestApproval({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    senderPhone: OWNER_PHONE,
+    buttonId: `approve:${secondRequestId}`,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.requestId, secondRequestId);
+  assert.equal(getAvailabilityDoc(fakeDb, firstRequestId).status, "pending");
+  assert.equal(getAvailabilityDoc(fakeDb, secondRequestId).status, "approved");
 });
 
 test("owner approve updates availability request status and keeps booking flow untouched", async () => {
@@ -635,4 +662,3 @@ test("customer DM copy stays natural", () => {
   assert.doesNotMatch(approved.message, /\b(action plan|ledger|system|pipeline|execution flag)\b/i);
   assert.doesNotMatch(rejected.message, /\b(action plan|ledger|system|pipeline|execution flag)\b/i);
 });
-
