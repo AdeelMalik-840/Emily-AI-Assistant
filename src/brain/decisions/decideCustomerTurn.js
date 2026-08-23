@@ -20,28 +20,16 @@ import {
   GROUP_POST_EXECUTE_LANE,
 } from "./groupPostExecuteLane.js";
 import { projectSemanticIntentFromBrainDecision } from "./projectSemanticIntentFromBrainDecision.js";
+export {
+  CUSTOMER_SEMANTIC_INTENTS,
+  cleanCustomerSemanticIntent,
+} from "../contracts/customerSemanticIntent.js";
 
 export const CUSTOMER_TURN_LANES = Object.freeze([
   "post_confirm_pa",
   WAITING_CONFIRM_DM_LANE,
   GROUP_POST_EXECUTE_LANE,
 ]);
-
-export const CUSTOMER_SEMANTIC_INTENTS = Object.freeze([
-  "availability_inquiry",
-  "pricing_inquiry",
-  "pricing_with_duration",
-  "booking_request",
-  "browse_options",
-  "details_inquiry",
-  "image_catalog_request",
-  "general_business_question",
-  "clarification",
-  "social",
-  "unclear",
-]);
-
-const CUSTOMER_SEMANTIC_INTENT_SET = new Set(CUSTOMER_SEMANTIC_INTENTS);
 
 /**
  * @typedef {object} TurnContext
@@ -78,13 +66,6 @@ function cleanLane(value) {
     .trim()
     .toLowerCase();
   return lane || null;
-}
-
-export function cleanCustomerSemanticIntent(value) {
-  const intent = String(value ?? "")
-    .trim()
-    .toLowerCase();
-  return CUSTOMER_SEMANTIC_INTENT_SET.has(intent) ? intent : null;
 }
 
 /**
