@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { enrichSharedCustomerTurnDecision } = await import(
-  "../src/brain/decisions/decideCustomerTurn.js"
-);
+const {
+  CUSTOMER_SEMANTIC_INTENTS,
+  cleanCustomerSemanticIntent,
+  enrichSharedCustomerTurnDecision,
+} = await import("../src/brain/decisions/decideCustomerTurn.js");
 
 test("shared Brain contract preserves Brain-owned semanticIntent", () => {
   const decision = enrichSharedCustomerTurnDecision({
@@ -24,6 +26,22 @@ test("shared Brain contract defaults semanticIntent to null for existing lanes",
     action: "reply",
     shouldReply: true,
     customerReply: "Hi",
+  });
+
+  assert.equal(decision.semanticIntent, null);
+});
+
+test("shared Brain contract rejects unknown semantic intent instead of routing it", () => {
+  assert.ok(CUSTOMER_SEMANTIC_INTENTS.includes("availability_inquiry"));
+  assert.equal(cleanCustomerSemanticIntent(" availability_inquiry "), "availability_inquiry");
+  assert.equal(cleanCustomerSemanticIntent("regex_guessed_price"), null);
+
+  const decision = enrichSharedCustomerTurnDecision({
+    turnScope: "NEW_TRANSACTION",
+    semanticIntent: "regex_guessed_price",
+    action: "reply",
+    shouldReply: true,
+    customerReply: "",
   });
 
   assert.equal(decision.semanticIntent, null);
