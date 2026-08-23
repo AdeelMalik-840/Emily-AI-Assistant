@@ -757,7 +757,7 @@ function bookingBlocksWindow(booking, itemId, windowStart, windowEnd, opts = {})
  * Conservative mode blocks on any blocking booking when user did not provide dates.
  * @param {Array<Record<string, unknown>>} bookings
  * @param {string} itemId
- * @param {{ requestedStart?: unknown, requestedEnd?: unknown } | null} [opts]
+ * @param {{ requestedStart?: unknown, requestedEnd?: unknown, evaluationTime?: unknown } | null} [opts]
  * @returns {{ isAvailable: boolean, nextAvailableAt?: number, blockingStatusesSeen?: string[] }}
  */
 export function computeUserFacingAvailability(bookings, itemId, opts = null) {
@@ -774,6 +774,7 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
     !(typeof requestedEnd === "string" && requestedEnd.trim() === "");
   const reqStart = toValidDate(requestedStart);
   const reqEnd = toValidDate(requestedEnd);
+  const evaluationTime = toValidDate(opts?.evaluationTime) ?? new Date();
   let blockingEnd = null;
 
   if (!normalizedItemId) {
@@ -794,12 +795,18 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
   );
 
   if (!hasRequestedStart && !hasRequestedEnd) {
-    const blockingBookings = relevantBookings.filter((b) =>
-      isBlockingBookingStatus(String(b?.status ?? "").trim().toLowerCase(), {
-        itemId: normalizedItemId,
-        bookingId: b?.id ?? b?.bookingId,
-      })
-    );
+    const blockingBookings = relevantBookings.filter((b) => {
+      if (
+        !isBlockingBookingStatus(String(b?.status ?? "").trim().toLowerCase(), {
+          itemId: normalizedItemId,
+          bookingId: b?.id ?? b?.bookingId,
+        })
+      ) {
+        return false;
+      }
+      const endAt = toValidDate(b?.endAt ?? null);
+      return !endAt || endAt.getTime() > evaluationTime.getTime();
+    });
     for (const b of blockingBookings) {
       const bEnd = toValidDate(b?.endDate ?? b?.endAt ?? null);
       if (bEnd && (blockingEnd == null || bEnd.getTime() > blockingEnd)) {
@@ -832,6 +839,7 @@ export function computeUserFacingAvailability(bookings, itemId, opts = null) {
       result,
       blocking: blockingBookings.length > 0,
       mode: NO_DATE_BLOCK_MODE,
+      evaluationTime: evaluationTime.toISOString(),
     });
     console.log("[availability_check]", {
       itemId: normalizedItemId,
