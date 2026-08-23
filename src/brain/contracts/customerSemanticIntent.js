@@ -19,6 +19,18 @@ export const CUSTOMER_SEMANTIC_INTENTS = Object.freeze([
 
 const CUSTOMER_SEMANTIC_INTENT_SET = new Set(CUSTOMER_SEMANTIC_INTENTS);
 
+/**
+ * Shared strict-JSON schema fragment for Brain-owned semanticIntent.
+ * Nullable during the shadow migration so protected existing-request scopes can
+ * preserve their current contract until they explicitly emit semanticIntent.
+ */
+export const CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA = Object.freeze({
+  anyOf: [
+    { type: "string", enum: [...CUSTOMER_SEMANTIC_INTENTS] },
+    { type: "null" },
+  ],
+});
+
 export function cleanCustomerSemanticIntent(value) {
   const intent = String(value ?? "").trim().toLowerCase();
   return CUSTOMER_SEMANTIC_INTENT_SET.has(intent) ? intent : null;
