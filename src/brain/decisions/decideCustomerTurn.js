@@ -26,6 +26,22 @@ export const CUSTOMER_TURN_LANES = Object.freeze([
   GROUP_POST_EXECUTE_LANE,
 ]);
 
+export const CUSTOMER_SEMANTIC_INTENTS = Object.freeze([
+  "availability_inquiry",
+  "pricing_inquiry",
+  "pricing_with_duration",
+  "booking_request",
+  "browse_options",
+  "details_inquiry",
+  "image_catalog_request",
+  "general_business_question",
+  "clarification",
+  "social",
+  "unclear",
+]);
+
+const CUSTOMER_SEMANTIC_INTENT_SET = new Set(CUSTOMER_SEMANTIC_INTENTS);
+
 /**
  * @typedef {object} TurnContext
  * @property {string | null} [lane]
@@ -61,6 +77,13 @@ function cleanLane(value) {
     .trim()
     .toLowerCase();
   return lane || null;
+}
+
+export function cleanCustomerSemanticIntent(value) {
+  const intent = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return CUSTOMER_SEMANTIC_INTENT_SET.has(intent) ? intent : null;
 }
 
 /**
@@ -281,7 +304,7 @@ export function enrichSharedCustomerTurnDecision(decision) {
     // Preserve Phase A fields, then seed shared aliases.
     ...d,
     turnScope: d.turnScope ?? "UNCLEAR",
-    semanticIntent: d.semanticIntent ?? null,
+    semanticIntent: cleanCustomerSemanticIntent(d.semanticIntent),
     targetContext: d.targetContext ?? "NONE",
     targetId: d.targetId ?? null,
     conversationStage: d.conversationStage ?? d.situation ?? null,
