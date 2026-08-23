@@ -1,5 +1,5 @@
 import db from "../config/firebase.js";
-import { sendWhatsAppMessage } from "./whatsappCloud.js";
+import { sendWhatsAppInteractiveButtons } from "./whatsappCloud.js";
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import {
   findExistingAvailabilityRequestForTurn,
@@ -40,8 +40,7 @@ function formatDuration(request) {
 export function buildAvailabilityOwnerNotificationMessage(request) {
   const itemLabel = clean(request?.itemLabel) || "Unknown item";
   const durationText = formatDuration(request);
-  const requestId = clean(request?.requestId) || "unknown_request";
-  return `Availability check: ${itemLabel}, ${durationText}. Available hai? Reply APPROVE ${requestId} ya REJECT ${requestId}.`;
+  return `Customer ko ${itemLabel} ${durationText} chahiye. Available hai?`;
 }
 
 async function resolveOwnerTarget({ db: connection, businessId, request, executionContext = {} }) {
@@ -110,7 +109,8 @@ async function resolveAvailabilityRequest({
  *   requestId?: string,
  *   request?: Record<string, unknown> | null,
  *   executionContext?: Record<string, unknown>,
- *   sendWhatsAppMessageFn?: typeof sendWhatsAppMessage,
+ *   sendWhatsAppInteractiveButtonsFn?: typeof sendWhatsAppInteractiveButtons,
+ *   sendWhatsAppMessageFn?: typeof sendWhatsAppInteractiveButtons,
  * }} params
  * @returns {Promise<{ ok: boolean, sent?: boolean, skipped?: boolean, reason?: string, requestId?: string | null, ownerTarget?: string | null }>}
  */
@@ -120,7 +120,8 @@ export async function sendAvailabilityOwnerNotification({
   requestId,
   request = null,
   executionContext = {},
-  sendWhatsAppMessageFn = sendWhatsAppMessage,
+  sendWhatsAppInteractiveButtonsFn = null,
+  sendWhatsAppMessageFn = null,
 }) {
   assertExecutionOwnership(executionContext);
   const firestore = connection ?? db;
@@ -202,11 +203,19 @@ export async function sendAvailabilityOwnerNotification({
   let sendFailureDetail = null;
 
   try {
-    const result = await sendWhatsAppMessageFn(
+    const sendInteractive =
+      sendWhatsAppInteractiveButtonsFn ??
+      sendWhatsAppMessageFn ??
+      sendWhatsAppInteractiveButtons;
+    const result = await sendInteractive(
       ownerTarget,
       message,
+      [
+        { id: `approve:${rid}`, title: "Yes" },
+        { id: `reject:${rid}`, title: "No" },
+      ],
       sendCredentials ?? undefined,
-      { recipientType: "individual", signal: executionContext?.abortSignal }
+      { signal: executionContext?.abortSignal }
     );
     assertExecutionOwnership(executionContext);
 

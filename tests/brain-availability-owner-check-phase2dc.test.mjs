@@ -289,7 +289,7 @@ test("1: notify flag off keeps availability ledger only and does not send owner 
   assert.equal([...fakeDb.docs.keys()].some((key) => key.includes("/bookings/")), false);
 });
 
-test("2: notify flag on queues and sends owner notification with approval command", async () => {
+test("2: notify flag sends a natural owner prompt with request-bound Yes/No buttons", async () => {
   const plan = buildAvailabilityPlan(true);
   const fakeDb = new FakeDb();
   await seedBusiness(fakeDb);
@@ -334,21 +334,26 @@ test("2: notify flag on queues and sends owner notification with approval comman
   });
 
   assert.equal(sendCalls.length, 1);
-  const [to, text, credentials, opts] = sendCalls[0];
+  const [to, text, buttons, credentials, opts] = sendCalls[0];
   assert.equal(to, OWNER_PHONE);
   assert.equal(credentials, undefined);
-  assert.deepEqual(opts, { recipientType: "individual" });
-  assert.match(text, /Availability check:/);
-  assert.match(text, /Honda Civic 2026 Oriel \(White\)/);
-  assert.match(text, /3 din ke liye/);
-  assert.match(text, /Reply APPROVE avr_/);
-  assert.match(text, /ya REJECT avr_/);
+  assert.deepEqual(opts, { signal: undefined });
 
   assert.ok(result.sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION);
   assert.equal(result.sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION.ok, true);
   assert.equal(result.sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION.sent, true);
 
   const requestId = result.sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED.requestId;
+  assert.equal(
+    text,
+    "Customer ko Honda Civic 2026 Oriel (White) 3 din ke liye chahiye. Available hai?"
+  );
+  assert.equal(text.includes(requestId), false);
+  assert.doesNotMatch(text, /APPROVE|REJECT/i);
+  assert.deepEqual(buttons, [
+    { id: `approve:${requestId}`, title: "Yes" },
+    { id: `reject:${requestId}`, title: "No" },
+  ]);
   const stored = getAvailabilityDoc(fakeDb, requestId);
   assert.ok(stored);
   assert.equal(stored.ownerNotificationStatus, "sent");
@@ -359,6 +364,54 @@ test("2: notify flag on queues and sends owner notification with approval comman
   assert.equal(stored.customerDmTarget, "923001234567");
   assert.equal(result.bookingCreated, null);
   assert.equal([...fakeDb.docs.keys()].some((key) => key.includes("/bookings/")), false);
+});
+
+test("2b: interactive send failure records failure and does not claim notification", async () => {
+  const plan = buildAvailabilityPlan(true);
+  const fakeDb = new FakeDb();
+  await seedBusiness(fakeDb);
+  const flags = {
+    bookingExecute: false,
+    ownerExecute: false,
+    availabilityOwnerCheckExecute: true,
+    availabilityOwnerNotifyExecute: true,
+    dmExecute: false,
+  };
+
+  const result = await executeLiveSideEffects({
+    actionPlan: plan,
+    routed: routeLiveActionPlan(plan, flags),
+    flags,
+    executionContext: {
+      db: fakeDb,
+      businessId: BUSINESS_ID,
+      userId: BUSINESS_ID,
+      traceId: "phase2dc-send-failure",
+      sessionKey: "session-001",
+      participantKey: "cust-1",
+      participantPhoneForDm: "923001234567",
+      messageId: "msg-failure",
+      sourceRowKey: "row-failure",
+      guaranteeKey: "car-rental-queries::cust-1::msg-failure",
+      chatId: "car-rental-queries",
+      chatType: "group",
+      sendWhatsAppMessageFn: async () => ({
+        ok: false,
+        httpStatus: 400,
+        error: { message: "outside customer service window" },
+      }),
+    },
+  });
+
+  const notification = result.sideEffectResults.AVAILABILITY_OWNER_NOTIFICATION;
+  assert.equal(notification.ok, false);
+  assert.match(notification.reason, /outside customer service window/);
+  const requestId = result.sideEffectResults.AVAILABILITY_OWNER_CHECK_REQUIRED.requestId;
+  const stored = getAvailabilityDoc(fakeDb, requestId);
+  assert.equal(stored.ownerNotificationStatus, "failed");
+  assert.match(stored.ownerNotificationError, /outside customer service window/);
+  assert.equal(stored.ownerNotificationAt instanceof Date, true);
+  assert.equal(stored.ownerNotificationProviderMessageId ?? null, null);
 });
 
 test("3: repeated execution does not duplicate owner notification", async () => {

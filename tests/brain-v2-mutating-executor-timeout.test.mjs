@@ -113,7 +113,7 @@ test("timeout aborts an in-flight owner send and never marks it sent", async () 
       requestId: "avr-1",
       request: state,
       executionContext: { abortSignal: signal, executionGuard },
-      sendWhatsAppMessageFn: async (_to, _text, _credentials, opts) => {
+      sendWhatsAppMessageFn: async (_to, _text, _buttons, _credentials, opts) => {
         sendAttempts += 1;
         receivedSignal = opts.signal;
         await new Promise((resolve, reject) => {
