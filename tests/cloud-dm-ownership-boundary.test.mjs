@@ -412,6 +412,7 @@ test("E18 timeout after acceptance does not call ownership again", async () => {
       openaiSource: "openai",
       decision: {
         turnScope: "NEW_TRANSACTION",
+        semanticIntent: "availability_inquiry",
         targetId: null,
         action: "reply",
         mutationIntent: "none",
@@ -503,6 +504,7 @@ test("accepted retry / outbound_locked recovery keep ownership completions at 0 
       openaiSource: "openai",
       decision: {
         turnScope: "NEW_TRANSACTION",
+        semanticIntent: "availability_inquiry",
         targetId: null,
         action: "reply",
         mutationIntent: "none",
