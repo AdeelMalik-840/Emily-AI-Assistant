@@ -280,6 +280,11 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
       { entity: "active_booking", concept: "price", attributes: ["total"] },
     ],
   } = turnPlan;
+  const coveredEvidenceKeys = evidenceNeeds.flatMap((need) =>
+    (Array.isArray(need?.attributes) ? need.attributes : []).map(
+      (attribute) => `${need.entity}.${need.concept}.${attribute}`
+    )
+  );
   return async (args) => {
     call += 1;
     const schema = String(args?.response_format?.json_schema?.name || "");
@@ -293,6 +298,7 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
             message: {
               content: JSON.stringify({
                 customerReply: reply,
+                coveredEvidenceKeys,
                 customerInputRequested: false,
                 requestedCustomerAction: "none",
                 replySemantics: {
