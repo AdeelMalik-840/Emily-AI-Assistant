@@ -49,8 +49,22 @@ function historicalStonicFacts() {
 }
 
 function decision(overrides = {}) {
+  const turnScope = overrides.turnScope ?? "NEW_TRANSACTION";
+  const semanticIntent = Object.prototype.hasOwnProperty.call(
+    overrides,
+    "semanticIntent"
+  )
+    ? overrides.semanticIntent
+    : turnScope === "SOCIAL_GENERAL"
+      ? "social"
+      : turnScope === "UNCLEAR"
+        ? "unclear"
+        : turnScope === "NEW_TRANSACTION"
+          ? "availability_inquiry"
+          : null;
   return {
     turnScope: "NEW_TRANSACTION",
+    semanticIntent,
     targetContext: "NEW_TRANSACTION",
     targetId: null,
     situation: "new_question",

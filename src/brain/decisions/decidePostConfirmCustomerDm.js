@@ -40,6 +40,10 @@ import {
   cleanRequestedInformation,
   REQUESTED_INFORMATION_TO_MISSING_INFO_TYPE,
 } from "../facts/resolvePostConfirmRequestedFact.js";
+import {
+  CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA,
+  cleanCustomerSemanticIntent,
+} from "../contracts/customerSemanticIntent.js";
 
 export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
   "information_request",
@@ -2583,6 +2587,7 @@ export function isPaMissingInfoOwnerNotifyAlreadyPending(row) {
 function defaultDecision(overrides = {}) {
   return {
     turnScope: "UNCLEAR",
+    semanticIntent: null,
     targetContext: "NONE",
     targetId: null,
     conversationAct: "unknown",
@@ -3280,6 +3285,30 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
   );
 
   const invalid = (reason) => ({ ok: false, reason, scope, context, targetId });
+  const hasSemanticIntent = Object.prototype.hasOwnProperty.call(
+    decision ?? {},
+    "semanticIntent"
+  );
+  const rawSemanticIntent = decision?.semanticIntent;
+  const semanticIntent =
+    rawSemanticIntent === null
+      ? null
+      : cleanCustomerSemanticIntent(rawSemanticIntent);
+  if (!hasSemanticIntent) {
+    return invalid("SEMANTIC_INTENT_REQUIRED");
+  }
+  if (rawSemanticIntent !== null && semanticIntent == null) {
+    return invalid("SEMANTIC_INTENT_INVALID");
+  }
+  if (scope === "NEW_TRANSACTION" && semanticIntent == null) {
+    return invalid("NEW_TRANSACTION_SEMANTIC_INTENT_REQUIRED");
+  }
+  if (scope === "SOCIAL_GENERAL" && semanticIntent !== "social") {
+    return invalid("SOCIAL_GENERAL_SEMANTIC_INTENT_CONTRADICTION");
+  }
+  if (scope === "UNCLEAR" && semanticIntent !== "unclear") {
+    return invalid("UNCLEAR_SEMANTIC_INTENT_CONTRADICTION");
+  }
   const mutationDeclared =
     mutation !== "none" || action === "request_booking_mutation";
 
@@ -3431,6 +3460,7 @@ export function collapseIndistinguishableSameItemOwnership(
   }
   return defaultDecision({
     turnScope: "UNCLEAR",
+    semanticIntent: "unclear",
     targetId: null,
     mutationIntent: "none",
     action: "reply",
@@ -3478,8 +3508,27 @@ export function parseCloudDmOwnershipDecision(raw) {
   const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
   const action = cleanAction(parsed.action);
   const factKind = cleanPostConfirmFactKind(parsed.factKind);
+  const hasSemanticIntent = Object.prototype.hasOwnProperty.call(
+    parsed,
+    "semanticIntent"
+  );
+  const rawSemanticIntent = parsed.semanticIntent;
+  const semanticIntent =
+    rawSemanticIntent === null
+      ? null
+      : cleanCustomerSemanticIntent(rawSemanticIntent);
+  if (
+    !hasSemanticIntent ||
+    (rawSemanticIntent !== null && semanticIntent == null) ||
+    (turnScope === "NEW_TRANSACTION" && semanticIntent == null) ||
+    (turnScope === "SOCIAL_GENERAL" && semanticIntent !== "social") ||
+    (turnScope === "UNCLEAR" && semanticIntent !== "unclear")
+  ) {
+    return null;
+  }
   return defaultDecision({
     turnScope,
+    semanticIntent,
     targetId,
     mutationIntent,
     action,
@@ -3561,6 +3610,7 @@ export async function executeCloudDmOwnershipDecision({
           type: "string",
           enum: [...POST_CONFIRM_TURN_SCOPES],
         },
+        semanticIntent: CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA,
         targetId: { type: ["string", "null"] },
         mutationIntent: {
           type: "string",
@@ -3579,6 +3629,7 @@ export async function executeCloudDmOwnershipDecision({
       },
       required: [
         "turnScope",
+        "semanticIntent",
         "targetId",
         "mutationIntent",
         "action",
@@ -3589,11 +3640,18 @@ export async function executeCloudDmOwnershipDecision({
 
   const system = [
     "You classify Cloud DM transaction ownership only.",
-    "Return JSON with turnScope, targetId, mutationIntent, action, factKind.",
+    "Return JSON with turnScope, semanticIntent, targetId, mutationIntent, action, factKind.",
     "Do not write customer wording. customerReply is not part of this schema.",
     "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
     `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
     "ALLOWED turnScope: NEW_TRANSACTION | PENDING_AVAILABILITY_REFERENCE | OLD_BOOKING_REFERENCE | SOCIAL_GENERAL | UNCLEAR.",
+    "semanticIntent is customer meaning only, never an executor/action.",
+    "For NEW_TRANSACTION choose the best semanticIntent: availability_inquiry | pricing_inquiry | pricing_with_duration | booking_request | browse_options | details_inquiry | image_catalog_request | general_business_question | clarification | unclear.",
+    "Use availability_inquiry for a fresh item/date/duration availability need, including weak need/want/chahiye wording that is not a clear final book/reserve/confirm command.",
+    "Use booking_request only for clear final booking/reserve/confirm commitment. Do not treat weak need/want/chahiye by itself as final booking commitment.",
+    "Use pricing_inquiry for price/rate asks without a requested duration total; pricing_with_duration for a requested duration/total quote; browse_options for broad option discovery; image_catalog_request for photos/images; details_inquiry for item/service details; general_business_question for other business facts; clarification when the intended transaction meaning is underspecified.",
+    "SOCIAL_GENERAL should use semanticIntent=social. UNCLEAR should use semanticIntent=unclear.",
+    "For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE semanticIntent may be null in this shadow migration; turnScope/action/factKind remain the existing protected semantics.",
     "targetId rules:",
     "- NEW_TRANSACTION, SOCIAL_GENERAL, UNCLEAR → targetId must be null.",
     "- PENDING_AVAILABILITY_REFERENCE → exact requestId from pendingAvailabilityRequests.",
@@ -3684,6 +3742,7 @@ export async function executeCloudDmOwnershipDecision({
     );
     console.log("[cloud_dm_ownership_decided]", {
       turnScope: decision.turnScope,
+      semanticIntent: decision.semanticIntent ?? null,
       targetId: decision.targetId,
       mutationIntent: decision.mutationIntent,
       action: decision.action,
