@@ -62,8 +62,13 @@ text = replaceOnceIn(
 const ownershipStartMarker = "export async function executeCloudDmOwnershipDecision({";
 const ownershipStart = text.indexOf(ownershipStartMarker);
 if (ownershipStart < 0) fail("ownership function start missing");
-const ownershipEndMarker = "\nexport function";
-const ownershipEnd = text.indexOf(ownershipEndMarker, ownershipStart + ownershipStartMarker.length);
+const searchFrom = ownershipStart + ownershipStartMarker.length;
+const candidateEnds = [
+  text.indexOf("\nexport async function ", searchFrom),
+  text.indexOf("\nexport function ", searchFrom),
+  text.indexOf("\nexport const ", searchFrom),
+].filter((index) => index >= 0);
+const ownershipEnd = candidateEnds.length ? Math.min(...candidateEnds) : -1;
 if (ownershipEnd < 0) fail("ownership function end boundary missing");
 let ownership = text.slice(ownershipStart, ownershipEnd);
 
