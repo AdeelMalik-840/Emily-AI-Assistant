@@ -46,8 +46,36 @@ jobs:
             echo "$output" | grep -F "unexpected changed files after patch: src/brain/decisions/decidePostConfirmCustomerDm.js"
           fi
           test -f tests/cloud-dm-semantic-intent-shadow.test.mjs
+
+          node <<'NODE'
+          const fs = require('fs');
+          const path = 'tests/cloud-dm-ownership-boundary.test.mjs';
+          let source = fs.readFileSync(path, 'utf8');
+          const oldText = `[
+          "turnScope",
+          "targetId",
+          "mutationIntent",
+          "action",
+          "factKind",
+        ]`;
+          const newText = `[
+          "turnScope",
+          "semanticIntent",
+          "targetId",
+          "mutationIntent",
+          "action",
+          "factKind",
+        ]`;
+          const count = source.split(oldText).length - 1;
+          if (count !== 1) {
+            throw new Error(`ownership schema characterization anchor count=${count}; refusing edit`);
+          }
+          source = source.replace(oldText, newText);
+          fs.writeFileSync(path, source, 'utf8');
+          NODE
+
           changed="$(git status --porcelain | sed -E 's/^.. //' | sort)"
-          test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
+          test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-ownership-boundary.test.mjs\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
           git diff --check
 
       - name: Install repository dependencies
@@ -81,7 +109,7 @@ jobs:
           set -euo pipefail
           cd /tmp/emily-semantic-core
           changed="$(git status --porcelain | sed -E 's/^.. //' | sort)"
-          test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
+          test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-ownership-boundary.test.mjs\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
           test -z "$(printf '%s\n' "$changed" | grep -E 'WorkflowEngine|UnderstandingEngine|whatsappInboundBuffer|inboundTurnLedger|executors|workflows/' || true)"
           git diff --stat
 
@@ -93,7 +121,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$(cat /tmp/emily-semantic-base-sha)"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/brain/decisions/decidePostConfirmCustomerDm.js tests/cloud-dm-semantic-intent-shadow.test.mjs
+          git add src/brain/decisions/decidePostConfirmCustomerDm.js tests/cloud-dm-ownership-boundary.test.mjs tests/cloud-dm-semantic-intent-shadow.test.mjs
           git diff --cached --check
           git commit -m "refactor(brain): emit semantic intent in existing cloud ownership decision"
           git push --force-with-lease origin HEAD:refs/heads/candidate/semantic-intent-core-tested
