@@ -126,6 +126,7 @@ test("fresh Civic independent ask validates as NEW_TRANSACTION with null targetI
   const decision = applyPostConfirmDerivedOwnershipMechanics(
     {
       turnScope: "NEW_TRANSACTION",
+      semanticIntent: "availability_inquiry",
       targetId: null,
       action: "reply",
       mutationIntent: "none",

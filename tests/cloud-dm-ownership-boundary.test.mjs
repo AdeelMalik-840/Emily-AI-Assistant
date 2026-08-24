@@ -73,8 +73,16 @@ function countingCreate(handler) {
 }
 
 async function resolveWithDecision(decision, facts, message, extra = {}) {
+  const semanticIntent =
+    decision?.turnScope === "SOCIAL_GENERAL"
+      ? "social"
+      : decision?.turnScope === "UNCLEAR"
+        ? "unclear"
+        : decision?.turnScope === "NEW_TRANSACTION"
+          ? "availability_inquiry"
+          : null;
   const { create, state } = countingCreate(async () =>
-    chatCompletionFromDecision(decision)
+    chatCompletionFromDecision({ semanticIntent, ...decision })
   );
   const result = await resolveCloudDmCanonicalOwnership({
     facts,
@@ -160,6 +168,7 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
   assert.equal(schema?.properties?.customerReply, undefined);
   assert.deepEqual(schema?.required, [
     "turnScope",
+    "semanticIntent",
     "targetId",
     "mutationIntent",
     "action",
@@ -432,6 +441,7 @@ test("E20 reply-guard-style rejection cannot regenerate ownership in the same at
       calls += 1;
       return chatCompletionFromDecision({
         turnScope: "NEW_TRANSACTION",
+        semanticIntent: "availability_inquiry",
         targetId: null,
         action: "reply",
         factKind: "booking_fact",
@@ -744,6 +754,7 @@ test("parseCloudDmOwnershipDecision never requires customerReply", () => {
   const parsed = parseCloudDmOwnershipDecision(
     JSON.stringify({
       turnScope: "NEW_TRANSACTION",
+      semanticIntent: "availability_inquiry",
       targetId: PROD_CIVIC_BOOKING_ID,
       mutationIntent: "none",
       action: "reply",
@@ -788,6 +799,7 @@ test("neutral facts keep candidate identifying data without pre-own language", (
     applyPostConfirmDerivedOwnershipMechanics(
       {
         turnScope: "NEW_TRANSACTION",
+        semanticIntent: "availability_inquiry",
         targetId: null,
         action: "reply",
         mutationIntent: "none",
