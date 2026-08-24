@@ -8,3 +8,4 @@ Rerun after installing repository dependencies before tests.
 Rerun with ephemeral CI-only Firebase credentials for import-time initialization.
 Rerun after updating the existing ownership schema characterization for semanticIntent.
 Retrigger after the base workflow update was visible.
+Final retrigger for tested candidate creation.
