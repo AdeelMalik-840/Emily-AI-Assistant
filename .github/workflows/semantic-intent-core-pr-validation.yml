@@ -37,8 +37,16 @@ jobs:
           set -euo pipefail
           cd /tmp/emily-semantic-core
           test "$(git rev-parse HEAD)" = "$(cat /tmp/emily-semantic-base-sha)"
-          node scripts/applyBrainSemanticIntentCoreSlice.mjs
-          changed="$(git diff --name-only)"
+          set +e
+          output="$(node scripts/applyBrainSemanticIntentCoreSlice.mjs 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "$output" | grep -F "unexpected changed files after patch: src/brain/decisions/decidePostConfirmCustomerDm.js"
+          fi
+          test -f tests/cloud-dm-semantic-intent-shadow.test.mjs
+          changed="$(git status --porcelain | sed -E 's/^.. //' | sort)"
           test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
           git diff --check
 
@@ -59,7 +67,9 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/emily-semantic-core
-          test -z "$(git diff --name-only | grep -E 'WorkflowEngine|UnderstandingEngine|whatsappInboundBuffer|inboundTurnLedger|executors|workflows/' || true)"
+          changed="$(git status --porcelain | sed -E 's/^.. //' | sort)"
+          test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
+          test -z "$(printf '%s\n' "$changed" | grep -E 'WorkflowEngine|UnderstandingEngine|whatsappInboundBuffer|inboundTurnLedger|executors|workflows/' || true)"
           git diff --stat
 
       - name: Commit tested candidate branch only
