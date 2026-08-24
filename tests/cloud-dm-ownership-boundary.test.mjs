@@ -173,6 +173,8 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
     "mutationIntent",
     "action",
     "factKind",
+    "capability",
+    "evidenceNeeds",
   ]);
 });
 
@@ -267,6 +269,10 @@ test("C9-C12 historical booking factual/mutation/explicit reference", async () =
       targetId: PROD_STONIC_BOOKING_ID,
       action: "reply",
       factKind: "booking_fact",
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "price", attributes: ["total"] },
+      ],
     },
     productionRichCivicStonicFacts(),
     "Meri Stonic booking ka total rent kitna hai?"
@@ -300,6 +306,11 @@ test("C9-C12 historical booking factual/mutation/explicit reference", async () =
       turnScope: "OLD_BOOKING_REFERENCE",
       targetId: PROD_CIVIC_BOOKING_ID,
       action: "reply",
+      factKind: "booking_fact",
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "status", attributes: ["value"] },
+      ],
     },
     civicFacts,
     `Meri booking ${PROD_CIVIC_BOOKING_ID} ka status kya hai?`
@@ -527,6 +538,10 @@ test("PA frozen OLD_BOOKING cannot re-decide ownership after empty compose", asy
       action: "reply",
       mutationIntent: "none",
       factKind: "booking_fact",
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "price", attributes: ["total"] },
+      ],
       openaiSource: "openai",
     },
     __resolveActiveCustomerBookingFactsFn: async () => ({
@@ -759,6 +774,8 @@ test("parseCloudDmOwnershipDecision never requires customerReply", () => {
       mutationIntent: "none",
       action: "reply",
       factKind: "booking_fact",
+      capability: "availability_request",
+      evidenceNeeds: [],
     })
   );
   assert.equal(parsed.turnScope, "NEW_TRANSACTION");
@@ -774,6 +791,11 @@ test("structurally invalid OLD_BOOKING is not accepted after the single completi
       turnScope: "OLD_BOOKING_REFERENCE",
       targetId: "not-a-trusted-id",
       action: "reply",
+      factKind: "booking_fact",
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "status", attributes: ["value"] },
+      ],
     },
     productionRichCivicStonicFacts(),
     "booking?"
@@ -818,6 +840,10 @@ test("unique Stonic factual stays OLD_BOOKING with exact Stonic id", async () =>
       targetId: PROD_STONIC_BOOKING_ID,
       action: "reply",
       factKind: "booking_fact",
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "price", attributes: ["total"] },
+      ],
     },
     productionRichCivicStonicFacts(),
     "Meri Stonic booking ka total rent kitna hai?"
@@ -827,6 +853,148 @@ test("unique Stonic factual stays OLD_BOOKING with exact Stonic id", async () =>
   assert.equal(result.decision.turnScope, "OLD_BOOKING_REFERENCE");
   assert.equal(result.decision.targetId, PROD_STONIC_BOOKING_ID);
   assert.equal(result.decision.mutationIntent, "none");
+});
+
+test("canonical ownership snapshot preserves exact booking fact plan through PA resolution", async () => {
+  const cases = [
+    {
+      name: "status",
+      concept: "status",
+      attributes: ["value"],
+      expected: "approved",
+      expectedSource: "booking.status",
+    },
+    {
+      name: "total",
+      concept: "price",
+      attributes: ["total"],
+      expected: 27500,
+      expectedSource: "booking.totalAmount",
+    },
+    {
+      name: "duration",
+      concept: "duration",
+      attributes: ["days"],
+      expected: 5,
+      expectedSource: "booking.durationDays",
+    },
+    {
+      name: "dates",
+      concept: "dates",
+      attributes: ["start", "end"],
+      expected: {
+        start: "2026-08-09T09:00:00.000Z",
+        end: "2026-08-14T09:00:00.000Z",
+      },
+      expectedSource: "booking.startDate,booking.endDate",
+    },
+  ];
+
+  const dir = mkdtempSync(path.join(os.tmpdir(), "emily-booking-plan-"));
+  __setInboundTurnLedgerPathForTests(path.join(dir, "ledger.json"));
+  __clearInboundTurnLedgerForTests();
+  try {
+    for (const row of cases) {
+      const facts = productionRichCivicStonicFacts();
+      for (const booking of facts.bookingCandidates) {
+        booking.startDate = booking.startAt;
+        booking.endDate = booking.endAt;
+      }
+      facts.booking.startDate = facts.booking.startAt;
+      facts.booking.endDate = facts.booking.endAt;
+      const evidenceNeeds = [
+        {
+          entity: "active_booking",
+          concept: row.concept,
+          attributes: row.attributes,
+        },
+      ];
+      const ownership = await resolveWithDecision(
+        {
+          turnScope: "OLD_BOOKING_REFERENCE",
+          targetId: PROD_STONIC_BOOKING_ID,
+          action: "reply",
+          factKind: "booking_fact",
+          capability: "answer_from_active_booking",
+          evidenceNeeds,
+        },
+        facts,
+        `structured-${row.name}-ask`
+      );
+      assert.equal(ownership.result.ok, true, row.name);
+      assert.equal(
+        ownership.result.decision.capability,
+        "answer_from_active_booking",
+        row.name
+      );
+      assert.deepEqual(ownership.result.decision.evidenceNeeds, evidenceNeeds, row.name);
+
+      const identity = buildCloudInboundLifecycleIdentity({
+        businessId: "biz-structured-plan",
+        customerPhone: "923001234567",
+        messageId: `wamid.structured-${row.name}`,
+      });
+      const persisted = persistCloudInboundSemanticDecision({
+        identity,
+        decision: ownership.result.decision,
+        messageId: `wamid.structured-${row.name}`,
+        semanticDecisionStatus: "accepted",
+        ownershipLane: "post_confirm_pa",
+        openaiSource: "openai",
+      });
+      assert.equal(persisted.ok, true, row.name);
+      const snapshot = getCloudInboundSemanticDecision({ identity });
+      assert.equal(snapshot.capability, "answer_from_active_booking", row.name);
+      assert.deepEqual(snapshot.evidenceNeeds, evidenceNeeds, row.name);
+      const contradictoryRewrite = persistCloudInboundSemanticDecision({
+        identity,
+        decision: {
+          ...ownership.result.decision,
+          evidenceNeeds: [
+            { entity: "active_booking", concept: "identity", attributes: ["label"] },
+          ],
+        },
+        messageId: `wamid.structured-${row.name}`,
+        semanticDecisionStatus: "accepted",
+        ownershipLane: "post_confirm_pa",
+        openaiSource: "openai",
+      });
+      assert.equal(contradictoryRewrite.ok, false, row.name);
+      assert.equal(
+        contradictoryRewrite.reason,
+        "SEMANTIC_DECISION_REWRITE_CONTRADICTION",
+        row.name
+      );
+
+      const result = await handleCustomerBusinessPaInbound({
+        db: {},
+        businessId: "biz-structured-plan",
+        customerPhone: "923001234567",
+        messageText: `structured-${row.name}-ask`,
+        messageId: `wamid.structured-${row.name}`,
+        canonicalSemanticDecision: snapshot,
+        preResolvedBookingFacts: { ok: true, facts },
+        __composePostConfirmInformationalCustomerReplyFn: async (input) => {
+          assert.equal(input.frozenDecision.capability, "answer_from_active_booking", row.name);
+          assert.deepEqual(input.frozenDecision.evidenceNeeds, evidenceNeeds, row.name);
+          assert.equal(input.factResolution.status, "found", row.name);
+          assert.deepEqual(input.factResolution.verifiedValue, row.expected, row.name);
+          assert.equal(input.factResolution.source, row.expectedSource, row.name);
+          return { ok: true, reply: `Verified ${row.name} fact.`, source: "openai" };
+        },
+      });
+      assert.equal(result.factResolution.status, "found", row.name);
+      assert.deepEqual(result.factResolution.verifiedValue, row.expected, row.name);
+      assert.equal(
+        result.finalReplySource,
+        "openai_post_confirm_pa_informational_compose",
+        row.name
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    __clearInboundTurnLedgerForTests();
+  }
 });
 
 test("unique Stonic mutation stays OLD_BOOKING with exact Stonic id", async () => {
@@ -935,6 +1103,10 @@ test("model pick of packed candidate #1 vs #2 is UNCLEAR unless a unique id is c
       action: "reply",
       mutationIntent: "none",
       factKind: "booking_fact",
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "status", attributes: ["value"] },
+      ],
     },
     facts,
     `Meri Civic ${PROD_CIVIC_AVR_ID} ka status?`
@@ -1039,6 +1211,11 @@ test("explicit distinguishing Civic id selects that exact booking", async () => 
       turnScope: "OLD_BOOKING_REFERENCE",
       targetId: PROD_CIVIC_BOOKING_ID,
       action: "reply",
+      factKind: "booking_fact",
+      capability: "answer_from_active_booking",
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "status", attributes: ["value"] },
+      ],
     },
     productionRichTwoCivicFacts(),
     `Meri booking ${PROD_CIVIC_BOOKING_ID} ka status kya hai?`

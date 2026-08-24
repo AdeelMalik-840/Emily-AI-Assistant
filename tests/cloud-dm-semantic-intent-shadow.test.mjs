@@ -19,6 +19,8 @@ const base = {
   mutationIntent: "none",
   action: "reply",
   factKind: "booking_fact",
+  capability: "availability_request",
+  evidenceNeeds: [],
 };
 
 function parse(overrides = {}, omitted = []) {
@@ -73,7 +75,16 @@ test("UNCLEAR requires exactly unclear", () => {
 
 test("protected existing-request scopes accept explicit null but reject invalid non-null intent", () => {
   for (const turnScope of ["PENDING_AVAILABILITY_REFERENCE", "OLD_BOOKING_REFERENCE"]) {
-    assert.equal(parse({ turnScope, semanticIntent: null })?.semanticIntent, null);
+    const factPlan =
+      turnScope === "OLD_BOOKING_REFERENCE"
+        ? {
+            capability: "answer_from_active_booking",
+            evidenceNeeds: [
+              { entity: "active_booking", concept: "status", attributes: ["value"] },
+            ],
+          }
+        : {};
+    assert.equal(parse({ turnScope, semanticIntent: null, ...factPlan })?.semanticIntent, null);
     assert.equal(parse({ turnScope, semanticIntent: "regex_guessed_price" }), null);
   }
 });
