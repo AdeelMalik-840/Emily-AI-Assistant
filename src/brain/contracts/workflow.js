@@ -34,6 +34,7 @@
  * @property {string} [pendingActionType]
  * @property {Record<string, unknown>} [pendingActionPayload]
  * @property {string} [unlistedMentionLabel]
+ * @property {string} [authoritativeSemanticIntent]
  */
 
 /**

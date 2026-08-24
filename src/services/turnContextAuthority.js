@@ -273,7 +273,12 @@ export function resolveTurnContext(opts = {}) {
   const itemlessPriceDurationFollowup =
     itemlessPriceDurationFollowupRaw && !hasExplicitItem;
   const requestedField = String(detectAskedField(message) ?? "").trim().toLowerCase();
-  const browseAsk = Boolean(extractTurnSignals({ message }).browseAsk);
+  const authoritativeSemanticIntent = String(
+    opts.authoritativeSemanticIntent ?? ""
+  ).trim();
+  const browseAsk =
+    authoritativeSemanticIntent === "browse_options" ||
+    Boolean(extractTurnSignals({ message }).browseAsk);
   const broadBrowseAsk = browseAsk || isGenericBrowseListAsk(message);
   const itemlessTrustedContextFollowup =
     !hasExplicitItem &&

@@ -6,6 +6,7 @@ import { parseUserDuration } from "../../duration/parseDuration.js";
 import { resolveTurnContext } from "../../services/turnContextAuthority.js";
 import { resolveGroupParticipantContextKey } from "../../services/groupParticipantContext.js";
 import { chatSessionKey } from "../../services/memory.js";
+import { requestedFieldForCustomerSemanticIntent } from "../decisions/projectSemanticIntentFromBrainDecision.js";
 
 /**
  * @param {{
@@ -24,6 +25,7 @@ import { chatSessionKey } from "../../services/memory.js";
  *   sourceRowKey?: string | null,
  *   guaranteeKey?: string | null,
  *   traceId?: string | null,
+ *   authoritativeSemanticIntent?: string | null,
  *   resolveTrustedSessionItem?: (p: {
  *     memory: Record<string, unknown> | null,
  *     catalogItems: unknown[],
@@ -60,6 +62,7 @@ export function buildTurnContextInput(p) {
     isGroupInbound,
     memory,
     traceId: p.traceId,
+    authoritativeSemanticIntent: p.authoritativeSemanticIntent,
     resolveTrustedSessionItem:
       typeof p.resolveTrustedSessionItem === "function"
         ? (inner) =>
@@ -85,6 +88,14 @@ export function buildTurnContextInput(p) {
 
   const memContact = memory?.contactPhone ?? memory?.customerPhone ?? null;
 
+  const detectedRequestedField = String(detectAskedField(messageText) ?? "").trim() || null;
+  const requestedField = p.authoritativeSemanticIntent
+    ? requestedFieldForCustomerSemanticIntent(
+        p.authoritativeSemanticIntent,
+        detectedRequestedField
+      )
+    : detectedRequestedField;
+
   return {
     channel: p.channel,
     chatType: p.chatType,
@@ -98,7 +109,7 @@ export function buildTurnContextInput(p) {
     explicitItem: authority.explicitItem,
     trustedSessionItem: authority.trustedSessionItem,
     authoritativeItem: authority.authoritativeItem,
-    requestedField: String(detectAskedField(messageText) ?? "").trim() || null,
+    requestedField,
     duration,
     contact: memContact != null ? String(memContact).trim() || null : null,
     sourceMessageId: String(p.sourceMessageId ?? "").trim() || null,
@@ -107,6 +118,8 @@ export function buildTurnContextInput(p) {
     shouldClarifyItem: authority.shouldClarifyItem,
     clarificationReply: authority.clarificationReply,
     suppressFuzzyCatalog: authority.suppressFuzzyCatalog,
+    authoritativeSemanticIntent:
+      String(p.authoritativeSemanticIntent ?? "").trim() || null,
     /** @internal bridge */
     _emilySessionKey: emilySessionKey,
     /** @internal bridge */

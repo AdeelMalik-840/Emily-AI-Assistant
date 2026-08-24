@@ -46,6 +46,7 @@
  * @property {boolean} shouldClarifyItem
  * @property {string | null} clarificationReply
  * @property {boolean} suppressFuzzyCatalog
+ * @property {string | null} [authoritativeSemanticIntent]
  */
 
 /**
