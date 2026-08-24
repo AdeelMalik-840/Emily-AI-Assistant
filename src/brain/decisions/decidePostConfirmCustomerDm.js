@@ -3666,6 +3666,8 @@ export async function executeCloudDmOwnershipDecision({
         evidenceNeeds: {
           type: "array",
           maxItems: 8,
+          description:
+            "Minimal semantic fact projection for this customer ask, not a summary of available candidate fields. For OLD_BOOKING_REFERENCE + booking_fact, include exactly the active_booking concept(s) explicitly requested: one requested fact means one evidence need; multiple needs are allowed only when the customer asks for multiple distinct facts. Candidate fields used to identify targetId must not be copied here unless the customer also asks for those fields.",
           items: {
             type: "object",
             additionalProperties: false,
@@ -3728,7 +3730,11 @@ export async function executeCloudDmOwnershipDecision({
     "Independent new inventory request (named item and/or new date/duration that is NOT changing a listed historical booking) → turnScope=NEW_TRANSACTION, targetId=null, mutationIntent=none, action=reply, factKind=booking_fact.",
     "Same named item with a new duration/date, framed as a separate request, is still NEW_TRANSACTION even when a historical candidate for that item exists.",
     "A uniquely matched existing-booking question uses action=reply, mutationIntent=none, factKind=booking_fact. A uniquely matched existing-booking mutation uses action=request_booking_mutation and the matching mutationIntent.",
-    "For an existing-booking booking_fact question, emit capability=answer_from_active_booking and the exact active_booking evidenceNeeds for the requested field: status/value, price/total|daily, duration/days, dates/start|end, identity/label|id, reference/value, pickup/location|time, or delivery/location|time. Preserve only the facts the customer requested.",
+    "For an existing-booking booking_fact question, emit capability=answer_from_active_booking and a MINIMAL fact plan containing only the active_booking evidenceNeeds the customer actually requested.",
+    "evidenceNeeds is a requested-fact projection, never a summary of fields present in bookingCandidates. Candidate status, price, duration, dates, identity, and reference exist to resolve the referent and must not be copied into evidenceNeeds merely because they are available.",
+    "One requested booking fact must produce exactly one evidence need. Multiple evidence needs are valid only when the customer explicitly requests multiple distinct booking facts.",
+    "Use these semantic slots: booking confirmation/status → status/value; total or daily amount → price/total or price/daily as requested; duration → duration/days; booking dates → dates/start,end; booking identity → identity/label,id; booking reference → reference/value; pickup → pickup/location,time as requested; delivery → delivery/location,time as requested.",
+    "Examples of exact fact-plan cardinality: a status-only ask emits only active_booking/status/value; a total-only ask emits only active_booking/price/total; a duration-only ask emits only active_booking/duration/days; a dates-only ask emits only active_booking/dates/start,end; a combined dates-and-total ask emits exactly dates/start,end plus price/total. Never add identity as supporting evidence: targetId already identifies the selected booking.",
     "A question, confirm, or decline about a listed pending availability offer → PENDING_AVAILABILITY_REFERENCE with that exact requestId. Confirm → action=confirm_pending_availability. Decline → action=decline_pending_availability. Factual pending questions (price, duration, item, status of the outstanding offer) → action=reply, mutationIntent=none, factKind=booking_fact. This is never SOCIAL_GENERAL.",
     "Never use request_booking_mutation, cancel_booking, or any booking mutationIntent under PENDING_AVAILABILITY_REFERENCE. Rejecting/cancelling the outstanding offer is decline_pending_availability with mutationIntent=none.",
     "If exactly one pendingAvailabilityRequests row is listed, a price/duration/item/status question or a clear confirm/decline of the outstanding offer uses that requestId unless the customer uniquely names a different listed historical booking.",
