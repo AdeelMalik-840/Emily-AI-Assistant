@@ -949,6 +949,224 @@ test("16. ownerCheckStarted rejects unavailable wording then accepts checking re
   assert.doesNotMatch(composed.reply, /available nahi|maloomat available nahi/i);
 });
 
+function multiFactResolution() {
+  return {
+    status: "found",
+    capability: "answer_from_active_booking",
+    factAvailable: true,
+    verifiedValue: {
+      total: 22000,
+      start: "2026-09-10T00:00:00.000Z",
+      end: "2026-09-14T00:00:00.000Z",
+    },
+    source: "booking.totalAmount,booking.startDate,booking.endDate",
+    items: [
+      {
+        entity: "active_booking",
+        concept: "price",
+        attribute: "total",
+        status: "found",
+        verifiedValue: 22000,
+        source: "booking.totalAmount",
+      },
+      {
+        entity: "active_booking",
+        concept: "dates",
+        attribute: "start",
+        status: "found",
+        verifiedValue: "2026-09-10T00:00:00.000Z",
+        source: "booking.startDate",
+      },
+      {
+        entity: "active_booking",
+        concept: "dates",
+        attribute: "end",
+        status: "found",
+        verifiedValue: "2026-09-14T00:00:00.000Z",
+        source: "booking.endDate",
+      },
+    ],
+  };
+}
+
+function informationalComposePayload(customerReply, coveredEvidenceKeys) {
+  return {
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            customerReply,
+            coveredEvidenceKeys,
+            customerInputRequested: false,
+            requestedCustomerAction: "none",
+            replySemantics: {
+              claims: [],
+              languageStyle: "roman_urdu",
+              containsTimingPromise: false,
+              exposesInternalProcess: false,
+            },
+          }),
+        },
+      },
+    ],
+  };
+}
+
+function multiFactComposeInput(create) {
+  const b = booking({
+    startDate: "2026-09-10T00:00:00.000Z",
+    endDate: "2026-09-14T00:00:00.000Z",
+  });
+  return {
+    facts: factsFor(b),
+    userMessage: "total aur dates bata dein",
+    frozenDecision: frozenAnswerFrom({
+      evidenceNeeds: [
+        { entity: "active_booking", concept: "price", attributes: ["total"] },
+        { entity: "active_booking", concept: "dates", attributes: ["start", "end"] },
+      ],
+    }),
+    factResolution: multiFactResolution(),
+    selectedBooking: b,
+    __chatCompletionsCreateForTests: create,
+  };
+}
+
+test("17. complete multi-fact first attempt is accepted", async () => {
+  let attempts = 0;
+  const composed = await composePostConfirmInformationalCustomerReply(
+    multiFactComposeInput(async () => {
+      attempts += 1;
+      return informationalComposePayload(
+        "Total 22,000 PKR hai aur booking 10 September se 14 September tak hai.",
+        [
+          "active_booking.price.total",
+          "active_booking.dates.start",
+          "active_booking.dates.end",
+        ]
+      );
+    })
+  );
+  assert.equal(composed.ok, true);
+  assert.equal(composed.source, "openai");
+  assert.equal(attempts, 1);
+});
+
+test("18. incomplete first attempt retries and accepts complete retry", async () => {
+  let attempts = 0;
+  const prompts = [];
+  const composed = await composePostConfirmInformationalCustomerReply(
+    multiFactComposeInput(async (args) => {
+      attempts += 1;
+      prompts.push(args);
+      return attempts === 1
+        ? informationalComposePayload(
+            "Booking 10 September se 14 September tak hai.",
+            ["active_booking.dates.start", "active_booking.dates.end"]
+          )
+        : informationalComposePayload(
+            "Total 22,000 PKR hai aur booking 10 September se 14 September tak hai.",
+            [
+              "active_booking.price.total",
+              "active_booking.dates.start",
+              "active_booking.dates.end",
+            ]
+          );
+    })
+  );
+  assert.equal(composed.ok, true);
+  assert.equal(composed.source, "openai");
+  assert.equal(attempts, 2);
+  assert.match(
+    String(prompts[1]?.messages?.[1]?.content ?? ""),
+    /missing_requested_evidence:active_booking\.price\.total/
+  );
+});
+
+test("19. factually valid incomplete retry sends best partial without rewriting", async () => {
+  let attempts = 0;
+  const exactPartial = "Booking 10 September se 14 September tak hai.";
+  const composed = await composePostConfirmInformationalCustomerReply(
+    multiFactComposeInput(async () => {
+      attempts += 1;
+      return informationalComposePayload(exactPartial, [
+        "active_booking.dates.start",
+        "active_booking.dates.end",
+      ]);
+    })
+  );
+  assert.equal(composed.ok, true);
+  assert.equal(composed.source, "openai_partial");
+  assert.equal(composed.reply, exactPartial);
+  assert.equal(attempts, 2);
+  assert.deepEqual(composed.composeFailure?.missingEvidenceKeys, [
+    "active_booking.price.total",
+  ]);
+});
+
+test("20. complete coverage metadata cannot authorize an invented price", async () => {
+  let attempts = 0;
+  const composed = await composePostConfirmInformationalCustomerReply(
+    multiFactComposeInput(async () => {
+      attempts += 1;
+      return informationalComposePayload(
+        "Total 99,999 PKR hai aur booking 10 September se 14 September tak hai.",
+        [
+          "active_booking.price.total",
+          "active_booking.dates.start",
+          "active_booking.dates.end",
+        ]
+      );
+    })
+  );
+  assert.equal(composed.ok, true);
+  assert.equal(attempts, 2);
+  assert.notEqual(composed.source, "openai");
+  assert.doesNotMatch(composed.reply, /99[,.]?999/);
+});
+
+test("21. single-fact status total duration and dates retain exact coverage", async () => {
+  const cases = [
+    ["status", "value", "approved", "Booking approved hai."],
+    ["price", "total", 22000, "Total 22,000 PKR hai."],
+    ["duration", "days", 4, "Booking 4 din ki hai."],
+    ["dates", "start", "2026-09-10T00:00:00.000Z", "Start date 10 September hai."],
+  ];
+  for (const [concept, attribute, value, reply] of cases) {
+    const b = booking({ startDate: "2026-09-10T00:00:00.000Z" });
+    const key = `active_booking.${concept}.${attribute}`;
+    const composed = await composePostConfirmInformationalCustomerReply({
+      facts: factsFor(b),
+      userMessage: "structured fact ask",
+      frozenDecision: frozenAnswerFrom({
+        evidenceNeeds: [
+          { entity: "active_booking", concept, attributes: [attribute] },
+        ],
+      }),
+      factResolution: {
+        status: "found",
+        capability: "answer_from_active_booking",
+        factAvailable: true,
+        verifiedValue: value,
+        items: [
+          {
+            entity: "active_booking",
+            concept,
+            attribute,
+            status: "found",
+            verifiedValue: value,
+          },
+        ],
+      },
+      selectedBooking: b,
+      __chatCompletionsCreateForTests: async () =>
+        informationalComposePayload(reply, [key]),
+    });
+    assert.equal(composed.ok, true, concept);
+    assert.equal(composed.source, "openai", concept);
+  }
+});
+
 test("17. ownerCheckReplyContradictionReason truth boundary", async () => {
   const { ownerCheckReplyContradictionReason } = await import(
     "../src/services/customerBusinessPaAiReply.js"

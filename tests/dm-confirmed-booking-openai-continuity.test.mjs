@@ -346,6 +346,7 @@ async function runOwnedTurn({
   executors = {},
 }) {
   let responseIndex = 0;
+  let requiredCoverageKeys = [];
   return handleCustomerBusinessPaInbound({
     db: {},
     businessId: BUSINESS_ID,
@@ -387,8 +388,27 @@ async function runOwnedTurn({
       counters.lastOpenAiArgs = args;
       counters.openaiPrompts = counters.openaiPrompts || [];
       counters.openaiPrompts.push(String(args?.messages?.[1]?.content ?? ""));
-      const next = responses[Math.min(responseIndex, responses.length - 1)];
+      let next = responses[Math.min(responseIndex, responses.length - 1)];
       responseIndex += 1;
+      try {
+        const parsed = JSON.parse(next);
+        if (Array.isArray(parsed?.evidenceNeeds)) {
+          requiredCoverageKeys = parsed.evidenceNeeds.flatMap((need) =>
+            (Array.isArray(need?.attributes) ? need.attributes : []).map(
+              (attribute) => `${need.entity}.${need.concept}.${attribute}`
+            )
+          );
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(parsed ?? {}, "customerInputRequested") &&
+          !Object.prototype.hasOwnProperty.call(parsed ?? {}, "coveredEvidenceKeys")
+        ) {
+          parsed.coveredEvidenceKeys = [...requiredCoverageKeys];
+          next = JSON.stringify(parsed);
+        }
+      } catch {
+        // Intentionally malformed fixture remains malformed.
+      }
       return completion(next);
     },
   });

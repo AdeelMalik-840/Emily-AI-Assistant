@@ -250,6 +250,39 @@ export function buildInformationalComposeFactResolutionForPrompt(resolution) {
   };
 }
 
+function informationalEvidenceKey(item) {
+  const entity = String(item?.entity ?? "").trim();
+  const concept = String(item?.concept ?? "").trim();
+  const attribute = String(item?.attribute ?? "").trim();
+  return entity && concept && attribute
+    ? `${entity}.${concept}.${attribute}`
+    : null;
+}
+
+export function requiredInformationalEvidenceKeys(resolution) {
+  const items = Array.isArray(resolution?.items) ? resolution.items : [];
+  return [
+    ...new Set(
+      items
+        .filter((item) => item?.status === "found")
+        .map(informationalEvidenceKey)
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function normalizeCoveredEvidenceKeys(value, requiredKeys) {
+  const required = new Set(requiredKeys);
+  const covered = Array.isArray(value)
+    ? [...new Set(value.map((key) => String(key ?? "").trim()).filter(Boolean))]
+    : null;
+  if (!covered) return { ok: false, covered: [], reason: "coverage_metadata_missing" };
+  if (covered.some((key) => !required.has(key))) {
+    return { ok: false, covered, reason: "unrequested_evidence_coverage" };
+  }
+  return { ok: true, covered, reason: null };
+}
+
 /** Apply a found evidence item onto reply-guard seed facts. */
 function applyFoundEvidenceItemToGuardFacts(guardFacts, item) {
   const concept = String(item?.concept || "");
@@ -1664,6 +1697,9 @@ export async function composePostConfirmInformationalCustomerReply({
     ownerCheckStarted: verifiedResolution.ownerCheckStarted === true,
     ownerCheckPending: verifiedResolution.ownerCheckPending === true,
   };
+  const requiredEvidenceKeys = requiredInformationalEvidenceKeys(
+    promptFactResolution
+  );
 
   const frozen = {
     action: decision.action ?? "reply",
@@ -1849,14 +1885,15 @@ export async function composePostConfirmInformationalCustomerReply({
 
 LANE OBJECTIVE (post_confirm_pa informational reply composer — NOT a decision Brain):
 OUTPUT STRICT JSON only:
-{"customerReply":"<short WhatsApp reply>","customerInputRequested":false,"requestedCustomerAction":"none","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"customerReply":"<short WhatsApp reply>","coveredEvidenceKeys":["<entity.concept.attribute>"],"customerInputRequested":false,"requestedCustomerAction":"none","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 FROZEN_DECISION_JSON is authoritative and immutable. You may ONLY write customerReply.
 You MUST NOT change action, mutationIntent, bookingSelectionMode, selectedBookingIndex, selectedBookingId, conversationAct, customerIntent, situation, capability, or evidenceNeeds.
 You MUST NOT reinterpret the customer message into a different intent, workflow, mutation, or booking.
 
 FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
-- status "found": answer using verifiedValue / found items only. Do not add other facts. customerReply MUST be non-empty.
+- status "found": answer using verifiedValue / found items only. Naturally cover EVERY requested found item, including every item listed in REQUIRED_EVIDENCE_KEYS_JSON. Do not add other facts. customerReply MUST be non-empty.
+- coveredEvidenceKeys is factual coverage metadata, not customer wording. Include a key only when customerReply actually communicates that exact found item. It must contain every REQUIRED_EVIDENCE_KEYS_JSON key and no other key.
 - ownerCheckStarted=true OR ownerCheckPending=true: the requested fact is not yet confirmed; a verified owner-check/pending state exists. Say naturally that you are checking/confirming and will update the customer (style example only — never hardcode): "Refund policy ki detail abhi confirm nahi hai. Main check karke aapko bata deta hun." Do NOT invent the missing value. Do NOT apologize by default. Do NOT name owner/staff/admin/system or mention escalation/token/request ID/workflow. Do NOT promise timing ("soon", "shortly", "jald hi", "a few minutes", or any deadline). Do NOT ask the customer to supply the missing business fact. Do NOT claim the answer is permanently unavailable. Match the customer's language with natural Roman Urdu/English grammar. customerReply MUST be non-empty.
 - customerInputRequired=true: you MAY ask one useful clarification for customer preference/input that the Turn Plan/Result already marked as required. Do NOT invent facts. customerReply MUST be non-empty.
 - customerInputRequired=false AND ownerCheckStarted=false AND ownerCheckPending=false AND status is "not_found", "unsupported", or "conflicting": state naturally that the business/booking detail is not confirmed, unavailable, or unclear. Do NOT ask the customer to supply that business-owned fact. Do NOT invent a substitute. Do NOT claim owner contact. Do NOT promise a later answer. customerReply MUST be non-empty.
@@ -1877,6 +1914,7 @@ STRICT SAFETY:
     `CONVERSATION_CONTEXT_JSON:\n${factsJson}\n\n` +
     `FROZEN_DECISION_JSON:\n${JSON.stringify(frozen)}\n\n` +
     `FACT_RESOLUTION_JSON:\n${JSON.stringify(promptFactResolution)}\n\n` +
+    `REQUIRED_EVIDENCE_KEYS_JSON:\n${JSON.stringify(requiredEvidenceKeys)}\n\n` +
     `RECENT_DIALOGUE (continuity/tone only — NEVER a factual answer source):\n${recentDialogue || "(none)"}\n\n` +
     `CURRENT_CUSTOMER_MESSAGE (tone/context only — do not reinterpret intent):\n${customerMessage || "(none)"}\n\n` +
     `CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
@@ -1895,6 +1933,14 @@ STRICT SAFETY:
       additionalProperties: false,
       properties: {
         customerReply: { type: "string" },
+        coveredEvidenceKeys: {
+          type: "array",
+          maxItems: Math.max(requiredEvidenceKeys.length, 1),
+          items:
+            requiredEvidenceKeys.length > 0
+              ? { type: "string", enum: requiredEvidenceKeys }
+              : { type: "string", enum: ["none"] },
+        },
         customerInputRequested:
           lifecycleConstraint.bookingConfirmationSolicitationAllowed === false
             ? { type: "boolean", enum: [false] }
@@ -1916,12 +1962,15 @@ STRICT SAFETY:
       },
       required: [
         "customerReply",
+        "coveredEvidenceKeys",
         "customerInputRequested",
         "requestedCustomerAction",
         "replySemantics",
       ],
     }
   );
+
+  const partialCandidates = [];
 
   const composed = await composeGuardedCustomerReply({
     system,
@@ -1943,15 +1992,38 @@ STRICT SAFETY:
         verifiedValueForTiming: verifiedResolution.verifiedValue,
       }),
     // Truth-bound owner-check: reject unavailable/"don't know" wording; same-lane retry once.
-    extraReject: (customerReply, parsed) =>
-      postConfirmInformationalLifecycleRejectionReason({
+    extraReject: (customerReply, parsed) => {
+      const safetyReason =
+        postConfirmInformationalLifecycleRejectionReason({
         customerReply,
         parsed,
         lifecycleConstraint,
-      }) ||
-      (ownerCheckAuthorized
-        ? ownerCheckReplyContradictionReason(customerReply)
-        : null),
+        }) ||
+        (ownerCheckAuthorized
+          ? ownerCheckReplyContradictionReason(customerReply)
+          : null);
+      if (safetyReason) return safetyReason;
+
+      if (requiredEvidenceKeys.length === 0) return null;
+
+      const coverage = normalizeCoveredEvidenceKeys(
+        parsed?.coveredEvidenceKeys,
+        requiredEvidenceKeys
+      );
+      if (!coverage.ok) return coverage.reason;
+      const covered = new Set(coverage.covered);
+      const missing = requiredEvidenceKeys.filter((key) => !covered.has(key));
+      if (missing.length > 0) {
+        partialCandidates.push({
+          reply: customerReply,
+          parsed,
+          coveredCount: coverage.covered.length,
+          missing,
+        });
+        return `missing_requested_evidence:${missing.join(",")}`;
+      }
+      return null;
+    },
     fallbackReply: "",
     timeoutMs,
     timeoutErrorMessage: "POST_CONFIRM_INFORMATIONAL_COMPOSE_OPENAI_TIMEOUT",
@@ -1963,6 +2035,54 @@ STRICT SAFETY:
   if (!String(composed?.reply ?? "").trim()) {
     const openaiReason =
       String(composed?.reason ?? "").trim() || "EMPTY_OR_INVALID_OPENAI_REPLY";
+    const enrichedPartialContract = enrichInformationalComposeGuardContract(
+      replyContract,
+      {
+        seededGuardFacts,
+        hasVerifiedClock,
+        verifiedValueForTiming: verifiedResolution.verifiedValue,
+      }
+    );
+    const validPartial = partialCandidates
+      .map((candidate, index) => ({ ...candidate, index }))
+      .sort(
+        (a, b) =>
+          b.coveredCount - a.coveredCount || b.index - a.index
+      )
+      .find((candidate) => {
+        const lifecycleReason =
+          postConfirmInformationalLifecycleRejectionReason({
+            customerReply: candidate.reply,
+            parsed: candidate.parsed,
+            lifecycleConstraint,
+          }) ||
+          (ownerCheckAuthorized
+            ? ownerCheckReplyContradictionReason(candidate.reply)
+            : null);
+        if (lifecycleReason) return false;
+        const guard = validateCustomerReplyAgainstContract(
+          candidate.reply,
+          enrichedPartialContract,
+          normalizeReplySemantics(candidate.parsed?.replySemantics)
+        );
+        return guard.ok === true;
+      });
+    if (validPartial) {
+      return {
+        ok: true,
+        reply: validPartial.reply,
+        source: "openai_partial",
+        reason: null,
+        frozenDecision: frozen,
+        factResolution: verifiedResolution,
+        composeFailure: {
+          openaiReason,
+          deterministicReason: "valid_partial_requested_fact_coverage",
+          finalClass: null,
+          missingEvidenceKeys: validPartial.missing,
+        },
+      };
+    }
     const foundValue = formatInformationalVerifiedValueForReply(
       verifiedResolution.verifiedValue
     );

@@ -67,7 +67,8 @@ function composeResponse(
   customerInputRequested,
   requestedCustomerAction = customerInputRequested
     ? "booking_confirmation"
-    : "none"
+    : "none",
+  coveredEvidenceKeys = ["active_booking.price.total"]
 ) {
   return {
     choices: [
@@ -75,6 +76,7 @@ function composeResponse(
         message: {
           content: JSON.stringify({
             customerReply,
+            coveredEvidenceKeys,
             customerInputRequested,
             requestedCustomerAction,
             replySemantics: {
@@ -167,7 +169,12 @@ test("confirmed booking another factual field remains natural and has no next-st
     },
     selectedBooking: selected,
     __chatCompletionsCreateForTests: async () =>
-      composeResponse("Aapki Corolla booking 3 din ki hai.", false),
+      composeResponse(
+        "Aapki Corolla booking 3 din ki hai.",
+        false,
+        "none",
+        ["active_booking.duration.days"]
+      ),
   });
 
   assert.equal(result.ok, true);
