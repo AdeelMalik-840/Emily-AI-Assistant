@@ -530,6 +530,82 @@ function nonNegativeInteger(value) {
   return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
 }
 
+function sanitizePostConfirmFactTraceValue(value, depth = 0) {
+  if (value == null || typeof value === "boolean" || typeof value === "number") {
+    return value ?? null;
+  }
+  if (typeof value === "string") return value.slice(0, 240);
+  if (depth >= 3) return null;
+  if (Array.isArray(value)) {
+    return value.slice(0, 16).map((entry) =>
+      sanitizePostConfirmFactTraceValue(entry, depth + 1)
+    );
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .slice(0, 16)
+        .map(([key, entry]) => [
+          String(key).slice(0, 80),
+          sanitizePostConfirmFactTraceValue(entry, depth + 1),
+        ])
+    );
+  }
+  return null;
+}
+
+function logPostConfirmFactEvidenceTrace({
+  traceId,
+  canonicalDecision,
+  frozenDecision,
+  factResolution,
+  composerSource,
+}) {
+  if (
+    frozenDecision?.turnScope !== "OLD_BOOKING_REFERENCE" ||
+    frozenDecision?.factKind !== "booking_fact" ||
+    frozenDecision?.action !== "reply"
+  ) {
+    return;
+  }
+  const items = Array.isArray(factResolution?.items)
+    ? factResolution.items.slice(0, 16).map((item) => ({
+        entity: clean(item?.entity, 80) || null,
+        concept: clean(item?.concept, 80) || null,
+        attribute: clean(item?.attribute, 80) || null,
+        status: clean(item?.status, 40) || null,
+        verifiedValue: sanitizePostConfirmFactTraceValue(item?.verifiedValue),
+        source: clean(item?.source, 160) || null,
+      }))
+    : [];
+  console.log("[post_confirm_fact_evidence_trace]", {
+    traceId: clean(traceId, 160) || null,
+    turnScope: frozenDecision.turnScope,
+    targetId: clean(frozenDecision.targetId, 160) || null,
+    factKind: frozenDecision.factKind,
+    capability: clean(frozenDecision.capability, 80) || null,
+    canonicalEvidenceNeeds: sanitizePostConfirmFactTraceValue(
+      canonicalDecision?.evidenceNeeds
+    ),
+    frozenEvidenceNeeds: sanitizePostConfirmFactTraceValue(
+      frozenDecision.evidenceNeeds
+    ),
+    factResolutionStatus: clean(factResolution?.status, 40) || null,
+    factResolutionItems: items,
+    resolvedConcepts: [...new Set(items.map((item) => item.concept).filter(Boolean))],
+    resolvedAttributes: [
+      ...new Set(items.map((item) => item.attribute).filter(Boolean)),
+    ],
+    verifiedSources: [
+      ...new Set(items.map((item) => item.source).filter(Boolean)),
+    ],
+    verifiedValue: sanitizePostConfirmFactTraceValue(
+      factResolution?.verifiedValue
+    ),
+    composerSource: clean(composerSource, 120) || null,
+  });
+}
+
 function logPostConfirmTerminalDiagnostic(decided) {
   const diagnostic = {
     failureReason:
@@ -552,6 +628,7 @@ function logPostConfirmTerminalDiagnostic(decided) {
  *   customerPhone: string,
  *   messageText: string,
  *   messageId?: string | null,
+ *   traceId?: string | null,
  *   inboundReceivedAtMs?: number | null,
  *   conversationHistory?: string | null,
  *   sendCredentials?: unknown,
@@ -577,6 +654,7 @@ export async function handleCustomerBusinessPaInbound({
   customerPhone,
   messageText,
   messageId = null,
+  traceId = null,
   inboundReceivedAtMs = null,
   conversationHistory = null,
   sendCredentials = null,
@@ -1254,6 +1332,13 @@ export async function handleCustomerBusinessPaInbound({
       __chatCompletionsCreateForTests,
     });
     composeCalls += 1;
+    logPostConfirmFactEvidenceTrace({
+      traceId,
+      canonicalDecision: canonicalSemanticDecision,
+      frozenDecision,
+      factResolution,
+      composerSource: composed?.source,
+    });
 
     if (composed?.ok !== true || !cleanCustomerReply(composed?.reply)) {
       const composeFailure =
