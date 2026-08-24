@@ -16,6 +16,8 @@ test("shadow semantic projection never inspects customer text or imports legacy 
   assert.doesNotMatch(projectorSource, /answerComposer|intentShapeResolver|conversationRouter/);
 });
 
-test("slice remains shadow-only: WorkflowEngine does not consume semanticIntent yet", () => {
-  assert.doesNotMatch(workflowSource, /semanticIntent/);
+test("WorkflowEngine consumes only the preprojected canonical decision for semantic authority", () => {
+  assert.match(workflowSource, /authoritativeSemanticIntent/);
+  assert.match(workflowSource, /resolvedBusinessTurnContext\?\.decision/);
+  assert.doesNotMatch(workflowSource, /workflowTypeForCustomerSemanticIntent/);
 });

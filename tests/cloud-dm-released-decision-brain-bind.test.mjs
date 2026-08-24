@@ -11,7 +11,7 @@ const { runBrainV2LivePipeline } = await import(
   "../src/brain/live/brainV2LivePipeline.js"
 );
 
-function releasedDecision(turnScope) {
+function releasedDecision(turnScope, semanticIntent = null) {
   return {
     turnScope,
     targetId: null,
@@ -19,6 +19,13 @@ function releasedDecision(turnScope) {
     mutationIntent: "none",
     action: "reply",
     factKind: turnScope === "SOCIAL_GENERAL" ? "non_business" : "booking_fact",
+    semanticIntent:
+      semanticIntent ??
+      (turnScope === "SOCIAL_GENERAL"
+        ? "social"
+        : turnScope === "UNCLEAR"
+          ? "unclear"
+          : "availability_inquiry"),
     semanticDecisionStatus: "released",
     semanticDecisionVersion: 1,
     ownershipLane: "normal_routing",

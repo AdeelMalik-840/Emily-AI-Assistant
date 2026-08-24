@@ -29,6 +29,12 @@ import { isAvailabilityDurationPendingAction } from "../availability/availabilit
 import { decideEmilyPendingFollowUp } from "../availability/decideEmilyPendingFollowUp.js";
 import { readEmilyPendingFromMemory } from "../availability/emilyPendingContext.js";
 import { composeUnavailableCustomerReplyFromFacts } from "../workflows/AvailabilityInquiryWorkflow.js";
+import {
+  applyCustomerSemanticIntentToSignals,
+  requestedFieldForCustomerSemanticIntent,
+  workflowTypeForCustomerSemanticIntent,
+} from "../decisions/projectSemanticIntentFromBrainDecision.js";
+import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 
 /**
  * @param {unknown} message
@@ -408,6 +414,69 @@ function resolveBusinessDecision(p) {
   let reason = "no_matching_business_decision";
   let sideEffectsAllowed = [];
 
+  const authoritativeSemanticIntent = cleanCustomerSemanticIntent(
+    p.authoritativeSemanticIntent ?? understanding?.authoritativeSemanticIntent
+  );
+  if (authoritativeSemanticIntent) {
+    const canonicalWorkflowType = workflowTypeForCustomerSemanticIntent(
+      authoritativeSemanticIntent
+    );
+    const canonicalRequestedField = requestedFieldForCustomerSemanticIntent(
+      authoritativeSemanticIntent,
+      requestedField
+    );
+    const unlistedCompatible = new Set([
+      "availability_inquiry",
+      "pricing_inquiry",
+      "pricing_with_duration",
+      "booking_request",
+      "details_inquiry",
+      "image_catalog_request",
+    ]);
+    const useUnlistedItem =
+      !hasResolvedItem &&
+      Boolean(unlistedMentionLabel) &&
+      unlistedCompatible.has(authoritativeSemanticIntent);
+    return Object.freeze({
+      primaryIntent: authoritativeSemanticIntent,
+      secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
+      workflowType: useUnlistedItem
+        ? "unlisted_item"
+        : canonicalWorkflowType ?? "clarification",
+      replyType: useUnlistedItem
+        ? "unlisted_item_clarification"
+        : canonicalWorkflowType === "browse_options"
+          ? "browse_options"
+          : canonicalWorkflowType === "availability_inquiry"
+            ? "availability_answer"
+            : canonicalWorkflowType === "pricing_inquiry" ||
+                canonicalWorkflowType === "pricing_with_duration"
+              ? "price_answer"
+              : canonicalWorkflowType === "booking_request"
+                ? "booking_ack"
+                : "clarification",
+      requestedField: canonicalRequestedField,
+      resolvedItemId,
+      durationDays,
+      strongBookingCommand: authoritativeSemanticIntent === "booking_request",
+      weakContextSignals: Object.freeze(weakContextSignals),
+      sideEffectsAllowed: Object.freeze(
+        authoritativeSemanticIntent === "booking_request"
+          ? ["booking_request"]
+          : []
+      ),
+      contextToPersist: buildContextToPersist({
+        memoryAllowed,
+        resolvedItemId,
+        durationDays,
+      }),
+      confidence: "high",
+      reason: useUnlistedItem
+        ? "canonical_semantic_intent_explicit_unlisted_item"
+        : "canonical_semantic_intent_authoritative",
+    });
+  }
+
   if (signals.photoAsk && hasResolvedItem) {
     primaryIntent = "image_catalog_request";
     workflowType = "image_catalog_request";
@@ -594,6 +663,10 @@ export async function resolveBusinessTurnContext(params) {
         }
       : null);
 
+  const authoritativeSemanticIntent = cleanCustomerSemanticIntent(
+    turnContextInput?.authoritativeSemanticIntent ??
+      params.turnContext?.authoritativeSemanticIntent
+  );
   const understanding =
     admittedTurn && params.turnContext
       ? understandTurn({
@@ -620,11 +693,15 @@ export async function resolveBusinessTurnContext(params) {
         : null;
 
   const itemMentioned = understanding?.itemSource === "explicit";
-  const signals = extractTurnSignals({
+  const rawSignals = extractTurnSignals({
     message: rawMessage,
     hasDuration: understanding?.durationDays != null,
     itemMentioned,
   });
+  const signals = applyCustomerSemanticIntentToSignals(
+    rawSignals,
+    authoritativeSemanticIntent
+  );
 
   const itemFacts = resolveCatalogItemFacts({
     understanding,
@@ -970,7 +1047,7 @@ export async function resolveBusinessTurnContext(params) {
     isGroup,
 
     turn: {
-      intent: understanding?.intentsRanked?.[0] ?? null,
+      intent: authoritativeSemanticIntent ?? understanding?.intentsRanked?.[0] ?? null,
       turnShape: turnContextInput?.turnShape ?? null,
       requestedField:
         understanding?.askedField ?? turnContextInput?.requestedField ?? null,
@@ -1089,6 +1166,7 @@ export async function resolveBusinessTurnContext(params) {
     memoryPendingAction,
     canonicalDurationDays: rentalDurationDays,
     turnShape: turnContextInput?.turnShape ?? null,
+    authoritativeSemanticIntent,
   });
 
   resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);
@@ -1114,6 +1192,7 @@ export async function resolveBusinessTurnContext(params) {
     .trim()
     .slice(0, 80);
   if (
+    !authoritativeSemanticIntent &&
     pendingHint &&
     pendingHint !== "unknown_clarification" &&
     (resolved.decision.workflowType === "unknown_clarification" ||

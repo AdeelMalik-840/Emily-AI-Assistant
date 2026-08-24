@@ -10,6 +10,11 @@ import {
 import { hasExplicitNewItemMention } from "../../services/currentTurnAuthority.js";
 import { detectUnlistedMentionLabel } from "./unlistedMention.js";
 import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
+import {
+  applyCustomerSemanticIntentToSignals,
+  requestedFieldForCustomerSemanticIntent,
+} from "../decisions/projectSemanticIntentFromBrainDecision.js";
+import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnContext} TurnContext */
@@ -61,6 +66,9 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     memory.pendingAction && typeof memory.pendingAction === "object"
       ? /** @type {Record<string, unknown>} */ (memory.pendingAction)
       : null;
+  const authoritativeSemanticIntent = cleanCustomerSemanticIntent(
+    turnContext?.authoritativeSemanticIntent
+  );
 
   const lockedItemId =
     String(turnContext?.lastResolvedItemId ?? pendingAction?.itemId ?? "").trim() || null;
@@ -73,16 +81,22 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
       : undefined;
 
   const itemMentioned = Boolean(explicitMention.found);
-  const signals = extractTurnSignals({
+  const rawSignals = extractTurnSignals({
     message,
     hasDuration: durationDays != null,
     itemMentioned,
   });
-  const intentShape = resolveTurnIntentShape({
-    message,
-    hasDuration: durationDays != null,
-    itemMentioned,
-  });
+  const signals = applyCustomerSemanticIntentToSignals(
+    rawSignals,
+    authoritativeSemanticIntent
+  );
+  const intentShape = authoritativeSemanticIntent
+    ? { primaryIntent: authoritativeSemanticIntent }
+    : resolveTurnIntentShape({
+        message,
+        hasDuration: durationDays != null,
+        itemMentioned,
+      });
 
   /** @type {"explicit" | "memory" | "none"} */
   let itemSource = "none";
@@ -125,11 +139,13 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
   }
 
   let unlistedMentionLabel =
-    detectUnlistedMentionLabel(
-      message,
-      items,
-      explicitMention.found ? resolvedItemId : null
-    ) ?? undefined;
+    authoritativeSemanticIntent === "browse_options"
+      ? undefined
+      : detectUnlistedMentionLabel(
+          message,
+          items,
+          explicitMention.found ? resolvedItemId : null
+        ) ?? undefined;
   if (unlistedMentionLabel && !explicitMention.found) {
     resolvedItemId = null;
     resolvedItemLabel = null;
@@ -138,10 +154,16 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     ambiguities.push(`unlisted:${unlistedMentionLabel}`);
   }
 
-  const askedField =
+  const rawAskedField =
     signals.askedFieldRaw && signals.askedFieldRaw !== "unknown"
       ? signals.askedFieldRaw
       : detectAskedField(message);
+  const askedField = authoritativeSemanticIntent
+    ? requestedFieldForCustomerSemanticIntent(
+        authoritativeSemanticIntent,
+        rawAskedField
+      )
+    : rawAskedField;
 
   return Object.freeze({
     resolvedItemId: resolvedItemId ?? undefined,
@@ -153,6 +175,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     durationDays,
     ambiguities: ambiguities.length ? ambiguities : undefined,
     unlistedMentionLabel,
+    authoritativeSemanticIntent: authoritativeSemanticIntent ?? undefined,
     signals: {
       priceAsk: Boolean(signals.priceAsk),
       bookingCommitment: Boolean(signals.bookingCommitment),

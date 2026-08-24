@@ -155,10 +155,21 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
       ? /** @type {Record<string, unknown>} */ (resolvedBusinessTurnContext.decision)
       : null;
   const decisionWorkflowType = String(decision?.workflowType ?? "").trim();
+  const authoritativeSemanticIntent = String(
+    understanding?.authoritativeSemanticIntent ?? ""
+  ).trim();
+  const canonicalSemanticAuthorityActive = Boolean(
+    authoritativeSemanticIntent &&
+      decisionWorkflowType &&
+      String(decision?.primaryIntent ?? "").trim() === authoritativeSemanticIntent
+  );
 
   // PR1: trusted continuation / pending ownership before generic resolved decisions.
   // Contact and availability-duration must not be stolen by unlisted/browse/clarify.
-  if (isAwaitingBookingContact(turnContext)) {
+  if (
+    isAwaitingBookingContact(turnContext) &&
+    (!canonicalSemanticAuthorityActive || decisionWorkflowType === "booking_request")
+  ) {
     const phone = extractContactPhoneFromText(inboundText);
     if (phone) {
       return {
@@ -174,7 +185,10 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
     };
   }
 
-  if (hasOpenAvailabilityDurationPending(turnContext)) {
+  if (
+    hasOpenAvailabilityDurationPending(turnContext) &&
+    (!canonicalSemanticAuthorityActive || decisionWorkflowType === "availability_inquiry")
+  ) {
     if (isPricingWithDurationInterrupt(understanding)) {
       return {
         workflowType: "pricing_with_duration",

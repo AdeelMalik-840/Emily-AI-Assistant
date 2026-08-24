@@ -26,6 +26,7 @@ import {
 } from "./shouldSuppressPostConfirmOnboardingClarification.js";
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
 import { composeBrowseOptionsCustomerReply } from "../openai/composeBrowseOptionsCustomerReply.js";
+import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -141,6 +142,26 @@ export async function runBrainV2LivePipeline(params) {
 
   try {
     assertBrainV2ExecutionActive(params);
+    const canonicalReleased = resolveFrozenCanonicalDecision(params);
+    if (canonicalReleased?._ownershipBlockedForBrainV2 === true) {
+      return buildSilentPipelineResult({
+        traceId,
+        reason: "CANONICAL_OWNERSHIP_NOT_BRAIN_V2",
+      });
+    }
+    const authoritativeSemanticIntent =
+      canonicalReleased?.turnScope === "NEW_TRANSACTION"
+        ? cleanCustomerSemanticIntent(canonicalReleased.semanticIntent)
+        : null;
+    if (
+      canonicalReleased?.turnScope === "NEW_TRANSACTION" &&
+      !authoritativeSemanticIntent
+    ) {
+      return buildSilentPipelineResult({
+        traceId,
+        reason: "CANONICAL_SEMANTIC_INTENT_INVALID",
+      });
+    }
     let catalogItems = Array.isArray(params.catalogItems) ? params.catalogItems : [];
     if (catalogItems.length === 0) {
       const catalogMod = await import("../../services/inventoryService.js");
@@ -164,6 +185,7 @@ export async function runBrainV2LivePipeline(params) {
       sourceRowKey: params.sourceRowKey,
       guaranteeKey: params.guaranteeKey,
       traceId,
+      authoritativeSemanticIntent,
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
@@ -178,13 +200,6 @@ export async function runBrainV2LivePipeline(params) {
       availabilityRequest: params.preResolvedWaitingConfirmRequest ?? null,
       waitingConfirmCandidates: params.waitingConfirmCandidates ?? null,
     });
-    const canonicalReleased = resolveFrozenCanonicalDecision(params);
-    if (canonicalReleased?._ownershipBlockedForBrainV2 === true) {
-      return buildSilentPipelineResult({
-        traceId,
-        reason: "CANONICAL_OWNERSHIP_NOT_BRAIN_V2",
-      });
-    }
     if (canonicalReleased) {
       continuation = {
         ...continuation,
@@ -303,6 +318,9 @@ export async function runBrainV2LivePipeline(params) {
     brainTurnContext.continuation = continuation;
     if (canonicalReleased) {
       brainTurnContext.canonicalSemanticDecision = canonicalReleased;
+    }
+    if (authoritativeSemanticIntent) {
+      brainTurnContext.authoritativeSemanticIntent = authoritativeSemanticIntent;
     }
 
     if (turnContextInput.authoritativeItem?.id) {
