@@ -17,25 +17,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create isolated temp checkout from exact feature base
+      - name: Create isolated temp checkout from frozen remote feature head
         shell: bash
-        env:
-          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           git fetch origin fix/brain-semantic-authority
-          test "$(git rev-parse origin/fix/brain-semantic-authority)" = "$EXPECTED_BASE_SHA"
+          EXPECTED_BASE_SHA="$(git rev-parse origin/fix/brain-semantic-authority)"
+          test -n "$EXPECTED_BASE_SHA"
           git worktree add /tmp/emily-semantic-core fix/brain-semantic-authority
           cd /tmp/emily-semantic-core
           test "$(git branch --show-current)" = "fix/brain-semantic-authority"
           test "$(git rev-parse HEAD)" = "$EXPECTED_BASE_SHA"
           test -z "$(git status --porcelain)"
+          printf '%s\n' "$EXPECTED_BASE_SHA" > /tmp/emily-semantic-base-sha
 
       - name: Apply guarded existing-Brain patch in temp checkout
         shell: bash
         run: |
           set -euo pipefail
           cd /tmp/emily-semantic-core
+          test "$(git rev-parse HEAD)" = "$(cat /tmp/emily-semantic-base-sha)"
           node scripts/applyBrainSemanticIntentCoreSlice.mjs
           changed="$(git diff --name-only)"
           test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
@@ -66,6 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/emily-semantic-core
+          test "$(git rev-parse HEAD)" = "$(cat /tmp/emily-semantic-base-sha)"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/brain/decisions/decidePostConfirmCustomerDm.js tests/cloud-dm-semantic-intent-shadow.test.mjs
