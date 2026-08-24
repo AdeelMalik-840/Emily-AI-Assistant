@@ -50,6 +50,17 @@ jobs:
           test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
           git diff --check
 
+      - name: Install repository dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/emily-semantic-core
+          if [ -f package-lock.json ]; then
+            npm ci --ignore-scripts
+          else
+            npm install --ignore-scripts
+          fi
+
       - name: Run targeted semantic-authority tests
         shell: bash
         run: |
