@@ -53,6 +53,7 @@ export function buildPostConfirmInformationalComposeContextForPrompt({
   facts = null,
   selectedBooking = null,
   selectedBookingId = null,
+  lifecycleConstraint = null,
 } = {}) {
   const f = facts && typeof facts === "object" ? facts : {};
   const business =
@@ -80,6 +81,10 @@ export function buildPostConfirmInformationalComposeContextForPrompt({
           itemLabel: booking.itemLabel ?? booking.itemName ?? null,
         }
       : null,
+    bookingLifecycleConstraint:
+      lifecycleConstraint && typeof lifecycleConstraint === "object"
+        ? lifecycleConstraint
+        : null,
     // Explicit structural denial — never pass these answerable stores to the model.
     known: null,
     knownPolicies: null,
@@ -93,6 +98,64 @@ export function buildPostConfirmInformationalComposeContextForPrompt({
     availabilityRequest: null,
     replyGuardFacts: null,
   };
+}
+
+const EXISTING_CONFIRMED_BOOKING_STATUSES = new Set([
+  "approved",
+  "confirmed",
+  "completed",
+]);
+
+/**
+ * Derive a wording constraint from trusted ownership/lifecycle state only.
+ * This never inspects the customer message and never changes routing.
+ */
+export function derivePostConfirmInformationalLifecycleConstraint({
+  frozenDecision = null,
+  selectedBooking = null,
+  customerInputRequired = false,
+} = {}) {
+  const decision =
+    frozenDecision && typeof frozenDecision === "object" ? frozenDecision : {};
+  const booking =
+    selectedBooking && typeof selectedBooking === "object" ? selectedBooking : {};
+  const bookingStatus = String(booking.status ?? "").trim().toLowerCase();
+  const readOnlyExistingBooking =
+    decision.turnScope === "OLD_BOOKING_REFERENCE" &&
+    decision.action === "reply" &&
+    String(decision.mutationIntent ?? "none").trim() === "none" &&
+    customerInputRequired !== true &&
+    EXISTING_CONFIRMED_BOOKING_STATUSES.has(bookingStatus);
+
+  return {
+    bookingExists: readOnlyExistingBooking,
+    bookingStatus: bookingStatus || null,
+    turnMode: readOnlyExistingBooking ? "read_only_fact" : "other",
+    customerInputRequired: customerInputRequired === true,
+    bookingConfirmationSolicitationAllowed: !readOnlyExistingBooking,
+  };
+}
+
+/**
+ * Existing-booking informational replies may not solicit another customer step.
+ * Enforcement uses trusted state + structured model metadata only; it never
+ * inspects customer or generated wording.
+ */
+export function postConfirmInformationalLifecycleRejectionReason({
+  customerReply = "",
+  parsed = null,
+  lifecycleConstraint = null,
+} = {}) {
+  if (lifecycleConstraint?.bookingConfirmationSolicitationAllowed !== false) {
+    return null;
+  }
+  if (parsed?.customerInputRequested !== false) {
+    return "existing_booking_read_only_customer_input_requested";
+  }
+  if (parsed?.requestedCustomerAction !== "none") {
+    return "existing_booking_read_only_customer_action_requested";
+  }
+  return null;
 }
 
 /**
@@ -1586,6 +1649,12 @@ export async function composePostConfirmInformationalCustomerReply({
       selectionStatus: verifiedResolution.selectionStatus,
     },
   });
+  const lifecycleConstraint =
+    derivePostConfirmInformationalLifecycleConstraint({
+      frozenDecision: decision,
+      selectedBooking: booking,
+      customerInputRequired,
+    });
 
   // Model prompt Result: sole factual authority (values stripped unless found).
   const promptFactResolution = {
@@ -1642,6 +1711,11 @@ export async function composePostConfirmInformationalCustomerReply({
   const seededGuardFacts = {
     ...bookingReplyGuardFacts(booking, catalogItems, knownForGuard),
     bookingExecutionVerified: Boolean(booking),
+    existingBookingReadOnly:
+      lifecycleConstraint.bookingConfirmationSolicitationAllowed === false,
+    bookingConfirmationSolicitationAllowed:
+      lifecycleConstraint.bookingConfirmationSolicitationAllowed,
+    customerInputRequired,
   };
 
   if (verifiedResolution.status === "found" && verifiedResolution.verifiedValue != null) {
@@ -1748,6 +1822,7 @@ export async function composePostConfirmInformationalCustomerReply({
     facts: factsObj,
     selectedBooking: booking,
     selectedBookingId: decision.selectedBookingId,
+    lifecycleConstraint,
   });
   const factsJson = JSON.stringify(promptContext);
   const replyContract = buildPostConfirmPaReplyContract({
@@ -1774,7 +1849,7 @@ export async function composePostConfirmInformationalCustomerReply({
 
 LANE OBJECTIVE (post_confirm_pa informational reply composer — NOT a decision Brain):
 OUTPUT STRICT JSON only:
-{"customerReply":"<short WhatsApp reply>","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
+{"customerReply":"<short WhatsApp reply>","customerInputRequested":false,"requestedCustomerAction":"none","replySemantics":{"claims":[],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 FROZEN_DECISION_JSON is authoritative and immutable. You may ONLY write customerReply.
 You MUST NOT change action, mutationIntent, bookingSelectionMode, selectedBookingIndex, selectedBookingId, conversationAct, customerIntent, situation, capability, or evidenceNeeds.
@@ -1789,6 +1864,9 @@ FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
 - RECENT_DIALOGUE is continuity/tone only. It is NEVER a factual answer source. Ignore any numbers, times, places, policies, or references stated there unless the same value is also present in FACT_RESOLUTION_JSON.
 - When stating a found booking reference/code, put the exact verifiedValue immediately after a colon with no filler words in between (example shape: "booking reference: STONIC-PROD"). Do not write patterns like "reference hai: …".
 - Match the customer's language (English vs Roman Urdu).
+- customerInputRequested MUST truthfully indicate whether customerReply asks the customer for any response, choice, confirmation, reconfirmation, reservation, booking, or next step.
+- requestedCustomerAction MUST be one of: none | clarification | booking_confirmation | reservation | continuation. Report the customer action requested by customerReply; use none when no response/action is requested.
+- When bookingLifecycleConstraint.bookingConfirmationSolicitationAllowed=false, the selected booking already exists and this is a read-only factual turn. Answer only the requested verified fact naturally. Do NOT solicit booking/reservation/confirmation/reconfirmation, do NOT append an unrelated next-step CTA, set customerInputRequested=false, and set requestedCustomerAction=none.
 
 STRICT SAFETY:
 - Never invent dates, times, amounts, locations, items, statuses, references, or policies.
@@ -1810,6 +1888,40 @@ STRICT SAFETY:
   const ownerCheckAuthorized =
     verifiedResolution.ownerCheckStarted === true ||
     verifiedResolution.ownerCheckPending === true;
+  const informationalResponseFormat = buildStrictJsonSchemaResponseFormat(
+    "post_confirm_informational_reply_compose",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        customerReply: { type: "string" },
+        customerInputRequested:
+          lifecycleConstraint.bookingConfirmationSolicitationAllowed === false
+            ? { type: "boolean", enum: [false] }
+            : { type: "boolean" },
+        requestedCustomerAction:
+          lifecycleConstraint.bookingConfirmationSolicitationAllowed === false
+            ? { type: "string", enum: ["none"] }
+            : {
+                type: "string",
+                enum: [
+                  "none",
+                  "clarification",
+                  "booking_confirmation",
+                  "reservation",
+                  "continuation",
+                ],
+              },
+        replySemantics: REPLY_SEMANTICS_SCHEMA,
+      },
+      required: [
+        "customerReply",
+        "customerInputRequested",
+        "requestedCustomerAction",
+        "replySemantics",
+      ],
+    }
+  );
 
   const composed = await composeGuardedCustomerReply({
     system,
@@ -1818,8 +1930,11 @@ STRICT SAFETY:
       ? "Remember: JSON only; ownerCheckStarted/ownerCheckPending verified — fact not yet confirmed; say naturally you are checking/confirming and will update the customer; do NOT say information is unavailable / we don’t know / maloomat available nahi; no apology by default; no owner/staff/admin/token/request; no timing promises (soon/shortly/jald hi/minutes/deadline); do not ask the customer for the business fact; never invent the value; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
       : customerInputRequired
         ? "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=true so one useful clarification is allowed; never invent facts; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
-        : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision.",
+        : lifecycleConstraint.bookingConfirmationSolicitationAllowed === false
+          ? "Remember: JSON only; this trusted booking already exists and the turn is read-only; answer ONLY the requested verified fact; do not ask for booking, reservation, confirmation, reconfirmation, or any unrelated next step; customerInputRequested=false; requestedCustomerAction=none; never invent; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision."
+          : "Remember: JSON only; wording ONLY from FACT_RESOLUTION_JSON; customerInputRequired=false — for not_found/unsupported/conflicting say unconfirmed/unavailable/unclear without asking the customer to supply the business/booking fact; never invent; never promise owner follow-up; never use RECENT_DIALOGUE as facts; customerReply must be non-empty; never change frozen decision.",
     responseFormatName: "post_confirm_informational_reply_compose",
+    responseFormat: informationalResponseFormat,
     replyContract,
     enrichGuardContract: (contract) =>
       enrichInformationalComposeGuardContract(contract, {
@@ -1828,9 +1943,15 @@ STRICT SAFETY:
         verifiedValueForTiming: verifiedResolution.verifiedValue,
       }),
     // Truth-bound owner-check: reject unavailable/"don't know" wording; same-lane retry once.
-    extraReject: ownerCheckAuthorized
-      ? (customerReply) => ownerCheckReplyContradictionReason(customerReply)
-      : null,
+    extraReject: (customerReply, parsed) =>
+      postConfirmInformationalLifecycleRejectionReason({
+        customerReply,
+        parsed,
+        lifecycleConstraint,
+      }) ||
+      (ownerCheckAuthorized
+        ? ownerCheckReplyContradictionReason(customerReply)
+        : null),
     fallbackReply: "",
     timeoutMs,
     timeoutErrorMessage: "POST_CONFIRM_INFORMATIONAL_COMPOSE_OPENAI_TIMEOUT",
