@@ -880,13 +880,40 @@ test("canonical ownership snapshot preserves exact booking fact plan through PA 
     },
     {
       name: "dates",
-      concept: "dates",
-      attributes: ["start", "end"],
+      evidenceNeeds: [
+        {
+          entity: "active_booking",
+          concept: "dates",
+          attributes: ["start", "end"],
+        },
+      ],
       expected: {
         start: "2026-08-09T09:00:00.000Z",
         end: "2026-08-14T09:00:00.000Z",
       },
       expectedSource: "booking.startDate,booking.endDate",
+    },
+    {
+      name: "dates-and-total",
+      evidenceNeeds: [
+        {
+          entity: "active_booking",
+          concept: "dates",
+          attributes: ["start", "end"],
+        },
+        {
+          entity: "active_booking",
+          concept: "price",
+          attributes: ["total"],
+        },
+      ],
+      expected: {
+        start: "2026-08-09T09:00:00.000Z",
+        end: "2026-08-14T09:00:00.000Z",
+        total: 27500,
+      },
+      expectedSource:
+        "booking.startDate,booking.endDate,booking.totalAmount",
     },
   ];
 
@@ -902,7 +929,7 @@ test("canonical ownership snapshot preserves exact booking fact plan through PA 
       }
       facts.booking.startDate = facts.booking.startAt;
       facts.booking.endDate = facts.booking.endAt;
-      const evidenceNeeds = [
+      const evidenceNeeds = row.evidenceNeeds ?? [
         {
           entity: "active_booking",
           concept: row.concept,
@@ -995,6 +1022,45 @@ test("canonical ownership snapshot preserves exact booking fact plan through PA 
     rmSync(dir, { recursive: true, force: true });
     __clearInboundTurnLedgerForTests();
   }
+});
+
+test("ownership completion contract requires a minimal requested booking fact projection", async () => {
+  let capturedArgs = null;
+  const exactEvidenceNeeds = [
+    {
+      entity: "active_booking",
+      concept: "status",
+      attributes: ["value"],
+    },
+  ];
+  const result = await executeCloudDmOwnershipDecision({
+    facts: productionRichCivicStonicFacts(),
+    userMessage: "structured status ask",
+    __chatCompletionsCreateForTests: async (args) => {
+      capturedArgs = args;
+      return chatCompletionFromDecision({
+        turnScope: "OLD_BOOKING_REFERENCE",
+        semanticIntent: null,
+        targetId: PROD_STONIC_BOOKING_ID,
+        mutationIntent: "none",
+        action: "reply",
+        factKind: "booking_fact",
+        capability: "answer_from_active_booking",
+        evidenceNeeds: exactEvidenceNeeds,
+      });
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.decision.evidenceNeeds, exactEvidenceNeeds);
+  const system = String(capturedArgs?.messages?.[0]?.content ?? "");
+  const schema = JSON.stringify(capturedArgs?.response_format ?? {});
+  assert.match(system, /MINIMAL fact plan/);
+  assert.match(system, /One requested booking fact must produce exactly one evidence need/);
+  assert.match(system, /Multiple evidence needs are valid only when the customer explicitly requests multiple distinct booking facts/);
+  assert.match(system, /Never add identity as supporting evidence/);
+  assert.match(schema, /Minimal semantic fact projection/);
+  assert.match(schema, /Candidate fields used to identify targetId must not be copied/);
 });
 
 test("unique Stonic mutation stays OLD_BOOKING with exact Stonic id", async () => {
