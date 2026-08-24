@@ -24,12 +24,15 @@ This refactor changes semantic decision ownership only. Existing executors, book
 
 - `checkpoint/brain-semantic-intent-shadow-v2` → `f77508f74cf402fc56770be7cf829734bf4c34fb`
 - `checkpoint/brain-semantic-shared-schema` → `5fc9121ab5cf5d030566aa26bffa1ed4311d7dc4`
+- `checkpoint/brain-semantic-pre-core` → `5b25e5016249908baaad27ad8e234b8604d1db5d`
 
-The shared-schema checkpoint is still shadow-only. It adds no workflow/executor consumption of `semanticIntent` and is the rollback point immediately before the existing Cloud DM ownership Brain schema is extended.
+The pre-core checkpoint is shadow-only. It adds no workflow/executor consumption of `semanticIntent` and is the rollback point immediately before the existing Cloud DM ownership Brain schema is extended.
 
 ## Next behavior-neutral core slice
 
-The existing `executeCloudDmOwnershipDecision()` completion will be extended to emit `semanticIntent` in the same strict JSON response. This must remain the same single OpenAI completion. The field is persisted/frozen for retry consistency, but no downstream workflow may consume it until shadow characterization is reviewed.
+The existing `executeCloudDmOwnershipDecision()` completion will be extended to emit `semanticIntent` in the same strict JSON response. This must remain the same single OpenAI completion. No downstream workflow may consume it until shadow characterization is reviewed.
+
+Because the connected GitHub editor replaces whole files, the core slice is applied by a branch-scoped GitHub Actions guard that performs exact-anchor surgical edits to the existing file, verifies only the intended production file + test changed, runs targeted regressions, and commits the core change only after all tests pass. Anchor mismatch or test failure stops without committing the production patch.
 
 ## Explicit non-goals
 
