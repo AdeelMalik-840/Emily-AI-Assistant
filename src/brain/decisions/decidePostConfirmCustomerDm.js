@@ -3518,6 +3518,17 @@ export function parseCloudDmOwnershipDecision(raw) {
   const mutationIntent = cleanMutationIntent(parsed.mutationIntent);
   const action = cleanAction(parsed.action);
   const factKind = cleanPostConfirmFactKind(parsed.factKind);
+  const brainCapability = cleanPostConfirmCapability(parsed.capability);
+  const brainEvidenceNeeds = normalizeEvidenceNeeds(parsed.evidenceNeeds);
+  const factKindPlan = mapFactKindToTurnPlan(
+    factKind,
+    brainCapability,
+    brainEvidenceNeeds
+  );
+  const capability = factKindPlan?.capability ?? brainCapability;
+  const evidenceNeeds = normalizeEvidenceNeeds(
+    factKindPlan?.evidenceNeeds ?? brainEvidenceNeeds
+  );
   const hasSemanticIntent = Object.prototype.hasOwnProperty.call(
     parsed,
     "semanticIntent"
@@ -3536,6 +3547,14 @@ export function parseCloudDmOwnershipDecision(raw) {
   ) {
     return null;
   }
+  if (
+    turnScope === "OLD_BOOKING_REFERENCE" &&
+    factKind === "booking_fact" &&
+    (capability !== "answer_from_active_booking" ||
+      !evidenceNeeds.some((need) => need.entity === "active_booking"))
+  ) {
+    return null;
+  }
   return defaultDecision({
     turnScope,
     semanticIntent,
@@ -3543,6 +3562,8 @@ export function parseCloudDmOwnershipDecision(raw) {
     mutationIntent,
     action,
     factKind,
+    capability,
+    evidenceNeeds,
     customerReply: "",
     shouldReply: action !== "silence",
     semanticDecisionVersion: CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION,
@@ -3636,6 +3657,39 @@ export async function executeCloudDmOwnershipDecision({
             { type: "null" },
           ],
         },
+        capability: {
+          anyOf: [
+            { type: "string", enum: [...POST_CONFIRM_CAPABILITIES] },
+            { type: "null" },
+          ],
+        },
+        evidenceNeeds: {
+          type: "array",
+          maxItems: 8,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              entity: {
+                type: "string",
+                enum: [...POST_CONFIRM_EVIDENCE_ENTITIES],
+              },
+              concept: {
+                type: "string",
+                enum: [...POST_CONFIRM_EVIDENCE_CONCEPTS],
+              },
+              attributes: {
+                type: "array",
+                maxItems: 8,
+                items: {
+                  type: "string",
+                  enum: [...POST_CONFIRM_EVIDENCE_ATTRIBUTES],
+                },
+              },
+            },
+            required: ["entity", "concept", "attributes"],
+          },
+        },
       },
       required: [
         "turnScope",
@@ -3644,13 +3698,15 @@ export async function executeCloudDmOwnershipDecision({
         "mutationIntent",
         "action",
         "factKind",
+        "capability",
+        "evidenceNeeds",
       ],
     }
   );
 
   const system = [
     "You classify Cloud DM transaction ownership only.",
-    "Return JSON with turnScope, semanticIntent, targetId, mutationIntent, action, factKind.",
+    "Return JSON with turnScope, semanticIntent, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
     "Do not write customer wording. customerReply is not part of this schema.",
     "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
     `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
@@ -3672,6 +3728,7 @@ export async function executeCloudDmOwnershipDecision({
     "Independent new inventory request (named item and/or new date/duration that is NOT changing a listed historical booking) → turnScope=NEW_TRANSACTION, targetId=null, mutationIntent=none, action=reply, factKind=booking_fact.",
     "Same named item with a new duration/date, framed as a separate request, is still NEW_TRANSACTION even when a historical candidate for that item exists.",
     "A uniquely matched existing-booking question uses action=reply, mutationIntent=none, factKind=booking_fact. A uniquely matched existing-booking mutation uses action=request_booking_mutation and the matching mutationIntent.",
+    "For an existing-booking booking_fact question, emit capability=answer_from_active_booking and the exact active_booking evidenceNeeds for the requested field: status/value, price/total|daily, duration/days, dates/start|end, identity/label|id, reference/value, pickup/location|time, or delivery/location|time. Preserve only the facts the customer requested.",
     "A question, confirm, or decline about a listed pending availability offer → PENDING_AVAILABILITY_REFERENCE with that exact requestId. Confirm → action=confirm_pending_availability. Decline → action=decline_pending_availability. Factual pending questions (price, duration, item, status of the outstanding offer) → action=reply, mutationIntent=none, factKind=booking_fact. This is never SOCIAL_GENERAL.",
     "Never use request_booking_mutation, cancel_booking, or any booking mutationIntent under PENDING_AVAILABILITY_REFERENCE. Rejecting/cancelling the outstanding offer is decline_pending_availability with mutationIntent=none.",
     "If exactly one pendingAvailabilityRequests row is listed, a price/duration/item/status question or a clear confirm/decline of the outstanding offer uses that requestId unless the customer uniquely names a different listed historical booking.",
@@ -3685,7 +3742,7 @@ export async function executeCloudDmOwnershipDecision({
     `CLOUD_DM_OWNERSHIP_CANDIDATE_JSON:\n${JSON.stringify(promptFacts)}`,
     `CUSTOMER_MESSAGE:\n${userLine || "(empty)"}`,
     historyLine ? `RECENT_CONVERSATION:\n${historyLine}` : "",
-    "JSON only. Ownership fields only. One decision. No customerReply.",
+    "JSON only. Ownership and structured fact-plan fields only. One decision. No customerReply.",
   ]
     .filter(Boolean)
     .join("\n\n");

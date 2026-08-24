@@ -177,6 +177,8 @@ export function ownershipDecisionPayload(overrides = {}) {
     mutationIntent: "none",
     action: "reply",
     factKind: "booking_fact",
+    capability: null,
+    evidenceNeeds: [],
     ...overrides,
   };
 }

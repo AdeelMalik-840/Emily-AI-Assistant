@@ -1531,6 +1531,8 @@ function cleanSemanticField(value, max = 160) {
 }
 
 function sameSemanticMeaning(left, right) {
+  const normalizedEvidence = (value) =>
+    JSON.stringify(sanitizeSemanticEvidenceNeeds(value));
   return (
     cleanSemanticField(left?.turnScope) === cleanSemanticField(right?.turnScope) &&
     cleanSemanticField(left?.targetId) === cleanSemanticField(right?.targetId) &&
@@ -1543,7 +1545,10 @@ function sameSemanticMeaning(left, right) {
     cleanSemanticField(left?.mutationIntent) ===
       cleanSemanticField(right?.mutationIntent) &&
     cleanSemanticField(left?.action) === cleanSemanticField(right?.action) &&
-    cleanSemanticField(left?.factKind) === cleanSemanticField(right?.factKind)
+    cleanSemanticField(left?.factKind) === cleanSemanticField(right?.factKind) &&
+    cleanSemanticField(left?.capability) === cleanSemanticField(right?.capability) &&
+    normalizedEvidence(left?.evidenceNeeds) ===
+      normalizedEvidence(right?.evidenceNeeds)
   );
 }
 
