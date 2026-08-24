@@ -1,0 +1,214 @@
+name: semantic-intent-core-slice
+
+on:
+  push:
+    branches:
+      - fix/brain-semantic-authority
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/brain-semantic-authority
+          fetch-depth: 0
+
+      - name: Guard starting branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "fix/brain-semantic-authority"
+
+      - name: Apply surgical semanticIntent patch with exact anchors
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/brain/decisions/decidePostConfirmCustomerDm.js')
+          text = path.read_text()
+
+          if 'CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA' in text:
+              raise SystemExit('core file already contains semantic intent schema; refusing duplicate patch')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly 1 anchor, found {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              '} from "../facts/resolvePostConfirmRequestedFact.js";\n',
+              '} from "../facts/resolvePostConfirmRequestedFact.js";\nimport {\n  CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA,\n  cleanCustomerSemanticIntent,\n} from "../contracts/customerSemanticIntent.js";\n',
+              'shared semantic intent import',
+          )
+
+          replace_once(
+              '    turnScope: "UNCLEAR",\n    targetContext: "NONE",\n',
+              '    turnScope: "UNCLEAR",\n    semanticIntent: null,\n    targetContext: "NONE",\n',
+              'default decision semantic intent',
+          )
+
+          replace_once(
+              '  const action = cleanAction(parsed.action);\n  const factKind = cleanPostConfirmFactKind(parsed.factKind);\n  return defaultDecision({\n    turnScope,\n',
+              '  const action = cleanAction(parsed.action);\n  const factKind = cleanPostConfirmFactKind(parsed.factKind);\n  const semanticIntent = cleanCustomerSemanticIntent(parsed.semanticIntent);\n  return defaultDecision({\n    turnScope,\n    semanticIntent,\n',
+              'ownership parser semantic intent',
+          )
+
+          replace_once(
+              '        turnScope: {\n          type: "string",\n          enum: [...POST_CONFIRM_TURN_SCOPES],\n        },\n        targetId: { type: ["string", "null"] },\n',
+              '        turnScope: {\n          type: "string",\n          enum: [...POST_CONFIRM_TURN_SCOPES],\n        },\n        semanticIntent: CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA,\n        targetId: { type: ["string", "null"] },\n',
+              'ownership response schema property',
+          )
+
+          replace_once(
+              '      required: [\n        "turnScope",\n        "targetId",\n',
+              '      required: [\n        "turnScope",\n        "semanticIntent",\n        "targetId",\n',
+              'ownership response schema required',
+          )
+
+          replace_once(
+              '    "Return JSON with turnScope, targetId, mutationIntent, action, factKind.",\n',
+              '    "Return JSON with turnScope, semanticIntent, targetId, mutationIntent, action, factKind.",\n',
+              'ownership prompt output contract',
+          )
+
+          replace_once(
+              '    "ALLOWED turnScope: NEW_TRANSACTION | PENDING_AVAILABILITY_REFERENCE | OLD_BOOKING_REFERENCE | SOCIAL_GENERAL | UNCLEAR.",\n',
+              '    "ALLOWED turnScope: NEW_TRANSACTION | PENDING_AVAILABILITY_REFERENCE | OLD_BOOKING_REFERENCE | SOCIAL_GENERAL | UNCLEAR.",\n    "semanticIntent is customer meaning only, never an executor/action.",\n    "For NEW_TRANSACTION choose the best semanticIntent: availability_inquiry | pricing_inquiry | pricing_with_duration | booking_request | browse_options | details_inquiry | image_catalog_request | general_business_question | clarification | unclear.",\n    "Use availability_inquiry for a fresh item/date/duration availability need, including weak need/want/chahiye wording that is not a clear final book/reserve/confirm command.",\n    "Use booking_request only for clear final booking/reserve/confirm commitment. Do not treat weak need/want/chahiye by itself as final booking commitment.",\n    "Use pricing_inquiry for price/rate asks without a requested duration total; pricing_with_duration for a requested duration/total quote; browse_options for broad option discovery; image_catalog_request for photos/images; details_inquiry for item/service details; general_business_question for other business facts; clarification when the intended transaction meaning is underspecified.",\n    "SOCIAL_GENERAL should use semanticIntent=social. UNCLEAR should use semanticIntent=unclear.",\n    "For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE semanticIntent may be null in this shadow migration; turnScope/action/factKind remain the existing protected semantics.",\n',
+              'ownership prompt semantic meaning rules',
+          )
+
+          replace_once(
+              '      turnScope: decision.turnScope,\n      targetId: decision.targetId,\n',
+              '      turnScope: decision.turnScope,\n      semanticIntent: decision.semanticIntent ?? null,\n      targetId: decision.targetId,\n',
+              'ownership decision log',
+          )
+
+          path.write_text(text)
+
+          test_path = Path('tests/cloud-dm-semantic-intent-shadow.test.mjs')
+          if test_path.exists():
+              raise SystemExit('shadow core test already exists; refusing overwrite')
+          test_path.write_text(r'''import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const {
+  executeCloudDmOwnershipDecision,
+  parseCloudDmOwnershipDecision,
+} = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+
+function completion(content) {
+  return { choices: [{ message: { content: JSON.stringify(content) } }] };
+}
+
+const base = {
+  turnScope: "NEW_TRANSACTION",
+  semanticIntent: "availability_inquiry",
+  targetId: null,
+  mutationIntent: "none",
+  action: "reply",
+  factKind: "booking_fact",
+};
+
+test("existing Cloud DM ownership completion carries semanticIntent in the same one completion", async () => {
+  let calls = 0;
+  let capturedArgs = null;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: {},
+    userMessage: "coroola rent p mil jye ge?",
+    __chatCompletionsCreateForTests: async (args) => {
+      calls += 1;
+      capturedArgs = args;
+      return completion(base);
+    },
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.ownershipCompletionCount, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai");
+  assert.equal(result.decision.semanticIntent, "availability_inquiry");
+
+  const responseFormat = JSON.stringify(capturedArgs?.response_format ?? {});
+  assert.match(responseFormat, /semanticIntent/);
+  assert.match(responseFormat, /availability_inquiry/);
+  assert.doesNotMatch(responseFormat, /customerReply/);
+});
+
+test("ownership parser preserves valid semantic intent and fails closed on unknown value", () => {
+  const valid = parseCloudDmOwnershipDecision(JSON.stringify({
+    ...base,
+    semanticIntent: "pricing_with_duration",
+  }));
+  assert.equal(valid?.semanticIntent, "pricing_with_duration");
+
+  const invalid = parseCloudDmOwnershipDecision(JSON.stringify({
+    ...base,
+    semanticIntent: "regex_guessed_price",
+  }));
+  assert.equal(invalid?.semanticIntent, null);
+});
+
+test("protected existing-request ownership can remain nullable during shadow migration", () => {
+  const parsed = parseCloudDmOwnershipDecision(JSON.stringify({
+    turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
+    targetId: "booking-1",
+    mutationIntent: "none",
+    action: "reply",
+    factKind: "booking_fact",
+  }));
+  assert.equal(parsed?.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(parsed?.semanticIntent, null);
+});
+
+test("core semantic slice adds no typo/phrase-specific classifier", () => {
+  const source = readFileSync(
+    new URL("../src/brain/decisions/decidePostConfirmCustomerDm.js", import.meta.url),
+    "utf8"
+  );
+  assert.doesNotMatch(source, /coroola rent p mil jye ge/i);
+  assert.doesNotMatch(source, /regex_guessed_price/);
+});
+''')
+          PY
+
+      - name: Verify only intended production core file plus test changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
+
+      - name: Run targeted semantic authority regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test \
+            tests/shared-brain-semantic-intent-contract.test.mjs \
+            tests/semantic-intent-shadow-boundary.test.mjs \
+            tests/brain-semantic-authority-safety-boundary.test.mjs \
+            tests/cloud-dm-semantic-intent-shadow.test.mjs \
+            tests/cloud-dm-ownership-boundary.test.mjs
+
+      - name: Commit only after all tests pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/brain/decisions/decidePostConfirmCustomerDm.js tests/cloud-dm-semantic-intent-shadow.test.mjs
+          git diff --cached --check
+          git commit -m "refactor(brain): emit semantic intent in existing cloud ownership decision"
+          git push origin HEAD:fix/brain-semantic-authority
