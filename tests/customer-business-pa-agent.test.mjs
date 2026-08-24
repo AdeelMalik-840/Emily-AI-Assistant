@@ -244,6 +244,7 @@ function mockOpenAiReply(text) {
         message: {
           content: JSON.stringify({
             turnScope: "OLD_BOOKING_REFERENCE",
+            semanticIntent: null,
             targetId: BOOKING_ID,
             situation: "new_question",
             conversationAct: "information_request",
@@ -253,6 +254,10 @@ function mockOpenAiReply(text) {
             shouldReply: true,
             customerReply: text,
             action: "reply",
+            mutationIntent: "none",
+            bookingSelectionMode: "focused",
+            selectedBookingIndex: 1,
+            selectedBookingId: BOOKING_ID,
             replySemantics: {
               claims: [],
               languageStyle: "roman_urdu",
@@ -288,6 +293,8 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
             message: {
               content: JSON.stringify({
                 customerReply: reply,
+                customerInputRequested: false,
+                requestedCustomerAction: "none",
                 replySemantics: {
                   claims: [],
                   languageStyle: "roman_urdu",
@@ -306,6 +313,7 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
           message: {
             content: JSON.stringify({
               turnScope: "OLD_BOOKING_REFERENCE",
+              semanticIntent: null,
               targetId: BOOKING_ID,
               situation: "new_question",
               conversationAct: "information_request",
@@ -322,7 +330,8 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
               mutationExecutionRequested: false,
               mutationExecutionStatus: "not_executed",
               bookingSelectionMode: "focused",
-              selectedBookingIndex: null,
+              selectedBookingIndex: 1,
+              selectedBookingId: BOOKING_ID,
               candidateGroundings: [],
               groundedFacts: {
                 itemId: null,
@@ -359,6 +368,7 @@ function mockOpenAiSocialReply(text) {
         message: {
             content: JSON.stringify({
             turnScope: "SOCIAL_GENERAL",
+            semanticIntent: "social",
             targetId: null,
             situation: "acknowledgement_after_answer",
             conversationAct: "chit_chat",
@@ -376,6 +386,25 @@ function mockOpenAiSocialReply(text) {
               containsTimingPromise: false,
               exposesInternalProcess: false,
             },
+          }),
+        },
+      },
+    ],
+  });
+}
+
+function mockOpenAiUnclearOwnershipDecision() {
+  return async () => ({
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            turnScope: "UNCLEAR",
+            semanticIntent: "unclear",
+            targetId: null,
+            mutationIntent: "none",
+            action: "reply",
+            factKind: "vague",
           }),
         },
       },
@@ -405,9 +434,9 @@ test("flag off → confirmed-booking continuity still uses OpenAI", async () => 
       customerPhone: CUSTOMER_PHONE,
       messageText: "Advance kitna?",
       sendWhatsAppMessageFn: async () => ({ ok: true }),
-      __chatCompletionsCreateForTests: async () => {
+      __chatCompletionsCreateForTests: async (...args) => {
         openaiCalls += 1;
-        return { choices: [{ message: { content: "should not run" } }] };
+        return mockOpenAiUnclearOwnershipDecision()(...args);
       },
     });
     assert.equal(result.handled, false);
@@ -491,6 +520,7 @@ test("fresh availability decision releases post-confirm ownership before every P
         source: "openai",
         decision: {
           turnScope: "NEW_TRANSACTION",
+          semanticIntent: "availability_inquiry",
           targetId: null,
           situation: "new_question",
           conversationAct: "information_request",
@@ -1340,9 +1370,9 @@ test("post-confirm action meaning is not pre-classified before OpenAI", async ()
             ...p,
             getBusinessProfileFn: async () => ({}),
           }),
-        __chatCompletionsCreateForTests: async () => {
+        __chatCompletionsCreateForTests: async (...args) => {
           openaiCalls += 1;
-          return { choices: [{ message: { content: "nope" } }] };
+          return mockOpenAiUnclearOwnershipDecision()(...args);
         },
       });
       assert.equal(result.handled, false);
@@ -1500,6 +1530,7 @@ test("buffer: PA reply skips general Brain and uses normal Cloud outbound", asyn
         },
         decision: {
           turnScope: "OLD_BOOKING_REFERENCE",
+          semanticIntent: null,
           targetId: BOOKING_ID,
           action: "reply",
           mutationIntent: "none",
@@ -1623,6 +1654,7 @@ test("buffer: waiting_confirm kar do still confirm before PA", async () => {
         },
         decision: {
           turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          semanticIntent: null,
           targetId: AVR_ID,
           action: "confirm_pending_availability",
           mutationIntent: "none",

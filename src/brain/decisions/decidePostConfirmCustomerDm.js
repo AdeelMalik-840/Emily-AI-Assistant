@@ -2655,6 +2655,15 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
   const turnScope = POST_CONFIRM_TURN_SCOPES.includes(parsed.turnScope)
     ? parsed.turnScope
     : "UNCLEAR";
+  const hasSemanticIntent = Object.prototype.hasOwnProperty.call(
+    parsed,
+    "semanticIntent"
+  );
+  const rawSemanticIntent = parsed.semanticIntent;
+  const semanticIntent =
+    rawSemanticIntent === null
+      ? null
+      : cleanCustomerSemanticIntent(rawSemanticIntent) ?? rawSemanticIntent;
   const targetId = clean(parsed.targetId, 160) || null;
 
   let customerReply = String(parsed.customerReply ?? parsed.reply ?? "")
@@ -2968,6 +2977,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     applyPostConfirmAntiEchoAndSilence(
     {
       turnScope,
+      ...(hasSemanticIntent ? { semanticIntent } : {}),
       targetId,
       conversationAct,
       customerIntent,

@@ -128,6 +128,15 @@ function baseFacts(bookingOverrides = {}) {
   };
 }
 
+function confirmedBookingOwnership(targetId) {
+  return {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
+    targetContext: "CONFIRMED_BOOKING",
+    targetId,
+  };
+}
+
 test("pickup location absent: resolve not_found → compose reply → no terminal failure", async () => {
   let resolveCalls = 0;
   let composeCalls = 0;
@@ -143,6 +152,7 @@ test("pickup location absent: resolve not_found → compose reply → no termina
       ok: true,
       source: "openai",
       decision: {
+        ...confirmedBookingOwnership("NYwhJnkhY9alSuuj9Wz1"),
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",
@@ -235,6 +245,7 @@ test("pickup location present: found value reaches compose", async () => {
       ok: true,
       source: "openai",
       decision: {
+        ...confirmedBookingOwnership("NYwhJnkhY9alSuuj9Wz1"),
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",
@@ -281,7 +292,7 @@ test("pickup location present: found value reaches compose", async () => {
   assert.equal(result.evidence.verifiedValue, "Johar Town office");
 });
 
-test("social hello does not enter fact resolution compose", async () => {
+test("social hello releases post-confirm ownership without fact resolution", async () => {
   let resolveCalls = 0;
   const result = await handleCustomerBusinessPaInbound({
     db: {},
@@ -294,6 +305,10 @@ test("social hello does not enter fact resolution compose", async () => {
       ok: true,
       source: "openai",
       decision: {
+        turnScope: "SOCIAL_GENERAL",
+        semanticIntent: "social",
+        targetContext: "NONE",
+        targetId: null,
         situation: "unclear",
         conversationAct: "chit_chat",
         customerIntent: "unclear",
@@ -308,9 +323,9 @@ test("social hello does not enter fact resolution compose", async () => {
         mutationIntent: "none",
         mutationExecutionRequested: false,
         mutationExecutionStatus: "not_executed",
-        bookingSelectionMode: "focused",
-        selectedBookingIndex: 1,
-        selectedBookingId: "NYwhJnkhY9alSuuj9Wz1",
+        bookingSelectionMode: "none",
+        selectedBookingIndex: null,
+        selectedBookingId: null,
       },
     }),
     __resolvePostConfirmRequestedFactFn: () => {
@@ -320,8 +335,10 @@ test("social hello does not enter fact resolution compose", async () => {
   });
 
   assert.equal(resolveCalls, 0);
-  assert.equal(result.reply, "Ji, bataiye?");
-  assert.equal(result.finalReplySource, "openai_post_confirm_pa");
+  assert.equal(result.handled, false);
+  assert.equal(result.ownershipReleased, true);
+  assert.equal(result.releaseReason, "SEMANTIC_SCOPE_SOCIAL_GENERAL");
+  assert.equal(result.reply, "");
   assert.equal(result.composeCalls, 0);
   assert.equal(result.sentReply, false);
   assertPostConfirmReturnContractParity(result, {
@@ -370,6 +387,7 @@ test("multiple bookings: selected booking only — no cross leakage", async () =
       ok: true,
       source: "openai",
       decision: {
+        ...confirmedBookingOwnership("bk-a"),
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",
@@ -430,6 +448,7 @@ test("not_found is not classified as technical decide failure", async () => {
       ok: true,
       source: "openai",
       decision: {
+        ...confirmedBookingOwnership("NYwhJnkhY9alSuuj9Wz1"),
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",
@@ -480,17 +499,9 @@ test("agent: explicit missing selectedBookingId does not answer from facts.booki
     customerSafeReference: "REF-A",
     pickupTime: "10:00 AM",
   };
-  const bookingB = {
-    id: "bk-b",
-    selectionIndex: 2,
-    status: "approved",
-    itemLabel: "Honda Civic",
-    pickupLocation: "Location B",
-    durationDays: 5,
-    totalAmount: 40000,
-    customerSafeReference: "REF-B",
-  };
   let resolveArgs = null;
+  let composeCalls = 0;
+  let mutationCalls = 0;
   const result = await handleCustomerBusinessPaInbound({
     db: {},
     businessId: "biz-1",
@@ -514,6 +525,7 @@ test("agent: explicit missing selectedBookingId does not answer from facts.booki
       ok: true,
       source: "openai",
       decision: {
+        ...confirmedBookingOwnership("bk-b"),
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",
@@ -544,33 +556,30 @@ test("agent: explicit missing selectedBookingId does not answer from facts.booki
       return resolvePostConfirmRequestedFact(p);
     },
     __composePostConfirmInformationalCustomerReplyFn: async (p) => {
-      assert.equal(p.factResolution?.status, "unsupported");
-      assert.equal(p.selectedBooking, null);
-      assert.doesNotMatch(
-        JSON.stringify(p.factResolution),
-        /Location A SECRET|REF-A|12000|10:00/
-      );
-      return {
-        ok: true,
-        reply: "Yeh booking detail abhi clear nahi hai. Kaunsi booking?",
-        source: "openai",
-      };
+      composeCalls += 1;
+      assert.fail(`compose must not run for untrusted target: ${JSON.stringify(p)}`);
+    },
+    __executePostConfirmBookingMutationFn: () => {
+      mutationCalls += 1;
+      assert.fail("mutation must not run for untrusted target");
     },
   });
 
-  assert.equal(resolveArgs?.selectedBookingId, "bk-b");
-  assert.equal(resolveArgs?.selectedBooking, null);
-  assert.equal(result.factResolution?.status, "unsupported");
-  assert.equal(result.factResolution?.selectionStatus, "explicit_unresolved");
+  assert.equal(resolveArgs, null);
+  assert.equal(composeCalls, 0);
+  assert.equal(mutationCalls, 0);
+  assert.equal(result.handled, true);
+  assert.equal(result.terminalFailure, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.action, "business_pa_terminal_semantic_target_failure");
+  assert.equal(result.failureReason, "SEMANTIC_OWNERSHIP_TARGET_INVALID");
+  assert.equal(result.reason, "SEMANTIC_OWNERSHIP_TARGET_INVALID");
+  assert.equal(result.reply, "");
   assert.doesNotMatch(result.reply, /Location A SECRET|REF-A|12000/);
-  assert.equal(result.action, "business_pa_reply");
-  assert.ok(result.reply);
   assertPostConfirmReturnContractParity(result, {
     expectEmptyExecution: true,
     decisionAction: "reply",
   });
-  assert.equal(result.evidence.status, "unsupported");
-  assert.equal(result.evidence.selectionStatus, "explicit_unresolved");
 });
 
 test("agent: selected booking differing from facts.booking wins end-to-end", async () => {
@@ -608,6 +617,7 @@ test("agent: selected booking differing from facts.booking wins end-to-end", asy
       ok: true,
       source: "openai",
       decision: {
+        ...confirmedBookingOwnership("bk-b"),
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",
@@ -679,6 +689,10 @@ test("return contract: silence, terminal, and early defaults preserve flat alias
       ok: true,
       source: "openai",
       decision: {
+        turnScope: "SOCIAL_GENERAL",
+        semanticIntent: "social",
+        targetContext: "NONE",
+        targetId: null,
         situation: "acknowledgement_after_answer",
         conversationAct: "acknowledgement",
         customerIntent: "unclear",
@@ -689,13 +703,16 @@ test("return contract: silence, terminal, and early defaults preserve flat alias
         customerReply: "",
         action: "silence",
         mutationIntent: "none",
-        bookingSelectionMode: "focused",
-        selectedBookingIndex: 1,
-        selectedBookingId: "NYwhJnkhY9alSuuj9Wz1",
+        bookingSelectionMode: "none",
+        selectedBookingIndex: null,
+        selectedBookingId: null,
       },
     }),
   });
-  assert.equal(silence.action, "business_pa_silence");
+  assert.equal(silence.action, "business_pa_release");
+  assert.equal(silence.handled, false);
+  assert.equal(silence.ownershipReleased, true);
+  assert.equal(silence.releaseReason, "SEMANTIC_SCOPE_SOCIAL_GENERAL");
   assert.equal(silence.reply, "");
   assert.equal(silence.sentReply, false);
   assertPostConfirmReturnContractParity(silence, {
@@ -761,6 +778,7 @@ test("return contract: conflicting factResolution mirrors evidence slice", async
       ok: true,
       source: "openai",
       decision: {
+        ...confirmedBookingOwnership("NYwhJnkhY9alSuuj9Wz1"),
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",

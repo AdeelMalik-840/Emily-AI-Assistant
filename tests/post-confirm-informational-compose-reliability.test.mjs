@@ -52,6 +52,10 @@ function factsFor(b) {
 
 function frozenAnswerFrom(partial = {}) {
   return {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
+    targetContext: "CONFIRMED_BOOKING",
+    targetId: "bk-1",
     action: "reply",
     mutationIntent: "none",
     bookingSelectionMode: "focused",
@@ -737,6 +741,8 @@ test("14. ownerCheckStarted compose contract: AI wording, no timing/owner/token"
                 content: JSON.stringify({
                   customerReply:
                     "Mujhe afsos hai, lekin refund policy ki maloomat abhi confirm nahi hui. Iski detail confirm karne ka koshish kar raha hun, jald hi bata dunga.",
+                  customerInputRequested: false,
+                  requestedCustomerAction: "none",
                   replySemantics: {
                     claims: [],
                     languageStyle: "roman_urdu",
@@ -756,6 +762,8 @@ test("14. ownerCheckStarted compose contract: AI wording, no timing/owner/token"
               content: JSON.stringify({
                 customerReply:
                   "Refund policy ki detail abhi confirm nahi hai. Main check karke aapko bata deta hun.",
+                customerInputRequested: false,
+                requestedCustomerAction: "none",
                 replySemantics: {
                   claims: [],
                   languageStyle: "roman_urdu",
@@ -821,6 +829,8 @@ test("15. ownerCheckStarted false: no checking/pending promise in compose contra
             message: {
               content: JSON.stringify({
                 customerReply: "Yeh detail abhi confirm nahi hui.",
+                customerInputRequested: false,
+                requestedCustomerAction: "none",
                 replySemantics: {
                   claims: [],
                   languageStyle: "roman_urdu",
@@ -847,7 +857,7 @@ test("15. ownerCheckStarted false: no checking/pending promise in compose contra
   assert.match(user, /"ownerCheckPending":false/);
   assert.match(
     user,
-    /customerInputRequired=false — for not_found\/unsupported\/conflicting say unconfirmed/
+    /customerInputRequested=false; requestedCustomerAction=none/
   );
 });
 
@@ -895,6 +905,8 @@ test("16. ownerCheckStarted rejects unavailable wording then accepts checking re
               message: {
                 content: JSON.stringify({
                   customerReply: "Is ki maloomat available nahi hai.",
+                  customerInputRequested: false,
+                  requestedCustomerAction: "none",
                   replySemantics: {
                     claims: [],
                     languageStyle: "roman_urdu",
@@ -914,6 +926,8 @@ test("16. ownerCheckStarted rejects unavailable wording then accepts checking re
               content: JSON.stringify({
                 customerReply:
                   "Fuel average abhi confirm nahi hai. Main check karke aapko bata deta hun.",
+                customerInputRequested: false,
+                requestedCustomerAction: "none",
                 replySemantics: {
                   claims: [],
                   languageStyle: "roman_urdu",

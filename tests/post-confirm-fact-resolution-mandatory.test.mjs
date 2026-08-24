@@ -75,6 +75,9 @@ function factsWithIncompleteGuard(b) {
 
 function decisionJson(overrides = {}) {
   return JSON.stringify({
+    turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
+    targetId: "bk-1",
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -471,6 +474,10 @@ test("agent booking_status path uses resolver compose not direct guard path", as
       ok: true,
       source: "openai",
       decision: {
+        turnScope: "OLD_BOOKING_REFERENCE",
+        semanticIntent: null,
+        targetContext: "CONFIRMED_BOOKING",
+        targetId: b.id,
         situation: "new_question",
         conversationAct: "information_request",
         customerIntent: "ask_fact",

@@ -130,6 +130,12 @@ function inferTestOwnership(overrides = {}) {
   if (overrides.turnScope) {
     return {
       turnScope: overrides.turnScope,
+      semanticIntent:
+        overrides.turnScope === "SOCIAL_GENERAL"
+          ? "social"
+          : overrides.turnScope === "UNCLEAR"
+            ? "unclear"
+            : null,
       targetId: Object.prototype.hasOwnProperty.call(overrides, "targetId")
         ? overrides.targetId
         : overrides.turnScope === "OLD_BOOKING_REFERENCE"
@@ -145,6 +151,7 @@ function inferTestOwnership(overrides = {}) {
   ) {
     return {
       turnScope: "PENDING_AVAILABILITY_REFERENCE",
+      semanticIntent: null,
       targetId: "avr-pending-stonic",
     };
   }
@@ -152,17 +159,22 @@ function inferTestOwnership(overrides = {}) {
     overrides.capability === "clarification_needed" ||
     overrides.bookingSelectionMode === "clarification_required"
   ) {
-    return { turnScope: "UNCLEAR", targetId: null };
+    return { turnScope: "UNCLEAR", semanticIntent: "unclear", targetId: null };
   }
   if (
     (action === "silence" || overrides.capability === "social") &&
     overrides.customerIsAskingQuestion !== true &&
     overrides.customerIntent !== "ask_fact"
   ) {
-    return { turnScope: "SOCIAL_GENERAL", targetId: null };
+    return {
+      turnScope: "SOCIAL_GENERAL",
+      semanticIntent: "social",
+      targetId: null,
+    };
   }
   return {
     turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
     targetId: Object.prototype.hasOwnProperty.call(overrides, "targetId")
       ? overrides.targetId
       : inferOldBookingTargetId(overrides),
@@ -273,6 +285,8 @@ function decisionJson(reply, overrides = {}) {
 function composeJson(reply, overrides = {}) {
   return JSON.stringify({
     customerReply: reply,
+    customerInputRequested: false,
+    requestedCustomerAction: "none",
     replySemantics: {
       claims: [],
       languageStyle: "roman_urdu",
@@ -548,7 +562,18 @@ test("varied post-booking questions all use the same OpenAI lane without side ef
             }),
             composeJson(reply),
           ]
-        : [
+        : meta.capability === "clarification_needed"
+          ? [
+              decisionJson(reply, {
+                turnScope: "UNCLEAR",
+                semanticIntent: "unclear",
+                capability: "clarification_needed",
+                evidenceNeeds: [],
+                bookingSelectionMode: "none",
+                factKind: "vague",
+              }),
+            ]
+          : [
             factualDecision({
               capability: meta.capability,
               concept: meta.concept,

@@ -259,6 +259,7 @@ function decisionJson(overrides = {}) {
   const targetId = selectedIndex === 3 ? "booking-stonic" : "booking-corolla";
   const payload = {
     turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
     targetContext: "CONFIRMED_BOOKING",
     targetId,
     situation: "protected_action",
@@ -308,6 +309,7 @@ function decisionJson(overrides = {}) {
 function infoDecisionJson(reply, overrides = {}) {
   const payload = {
     turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
     targetContext: "CONFIRMED_BOOKING",
     targetId: "booking-only",
     situation: "new_question",
@@ -926,6 +928,7 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
         source: "openai",
         decision: {
           turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          semanticIntent: null,
           targetContext: "PENDING_AVAILABILITY",
           targetId: "avr-pending-1",
           situation: "pending_availability",
@@ -979,6 +982,7 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
         source: "openai",
         decision: {
           turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          semanticIntent: null,
           targetContext: "PENDING_AVAILABILITY",
           targetId: "avr-pending-1",
           situation: "pending_availability",
@@ -1029,6 +1033,7 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
 
   const advanceDecision = {
     turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
     targetContext: "CONFIRMED_BOOKING",
     targetId: "booking-from-avr",
     situation: "new_question",
@@ -1089,6 +1094,7 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
         source: "openai",
         decision: {
           turnScope: "PENDING_AVAILABILITY_REFERENCE",
+          semanticIntent: null,
           targetContext: "PENDING_AVAILABILITY",
           targetId: "avr-pending-1",
           situation: "pending_availability",
