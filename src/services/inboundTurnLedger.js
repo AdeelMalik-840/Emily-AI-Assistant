@@ -10,6 +10,9 @@ import path from "node:path";
 import { setMessageState } from "./messageState.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
 import { normalizePhoneE164 } from "./connections.js";
+import {
+  cleanCustomerSemanticIntent,
+} from "../brain/contracts/customerSemanticIntent.js";
 
 /** @typedef {"received" | "processing" | "done" | "failed" | "baseline_absorbed" | "outbound_locked"} InboundTurnLedgerState */
 
@@ -1535,6 +1538,8 @@ function sameSemanticMeaning(left, right) {
     JSON.stringify(sanitizeSemanticEvidenceNeeds(value));
   return (
     cleanSemanticField(left?.turnScope) === cleanSemanticField(right?.turnScope) &&
+    cleanCustomerSemanticIntent(left?.semanticIntent) ===
+      cleanCustomerSemanticIntent(right?.semanticIntent) &&
     cleanSemanticField(left?.targetId) === cleanSemanticField(right?.targetId) &&
     cleanSemanticField(left?.targetContext) ===
       cleanSemanticField(right?.targetContext) &&
@@ -1572,6 +1577,17 @@ function sanitizeSemanticEvidenceNeeds(raw) {
 function sanitizeCloudSemanticDecision(p = {}) {
   const turnScope = cleanSemanticField(p.turnScope, 80);
   if (!CLOUD_SEMANTIC_TURN_SCOPES.has(turnScope)) return null;
+  const hasSemanticIntent = Object.prototype.hasOwnProperty.call(
+    p,
+    "semanticIntent"
+  );
+  const semanticIntent = cleanCustomerSemanticIntent(p.semanticIntent);
+  const hasInvalidNonNullSemanticIntent =
+    hasSemanticIntent && p.semanticIntent !== null && !semanticIntent;
+  if (hasInvalidNonNullSemanticIntent) return null;
+  if (turnScope === "NEW_TRANSACTION" && !semanticIntent) return null;
+  if (turnScope === "SOCIAL_GENERAL" && semanticIntent !== "social") return null;
+  if (turnScope === "UNCLEAR" && semanticIntent !== "unclear") return null;
   const status = cleanSemanticField(p.semanticDecisionStatus, 40);
   if (!CLOUD_SEMANTIC_DECISION_STATUSES.has(status)) return null;
   const ownershipLane =
@@ -1582,6 +1598,7 @@ function sanitizeCloudSemanticDecision(p = {}) {
     messageId: cleanSemanticField(p.messageId, 300),
     guaranteeKey: cleanSemanticField(p.guaranteeKey, 300),
     turnScope,
+    semanticIntent,
     targetId: cleanSemanticField(p.targetId, 160),
     targetContext: cleanSemanticField(p.targetContext, 80),
     selectedBookingId: cleanSemanticField(p.selectedBookingId, 160),

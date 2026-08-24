@@ -242,6 +242,7 @@ test("accepted retry does not rewrite a frozen NEW_TRANSACTION snapshot", async 
       openaiSource: "openai",
       decision: {
         turnScope: "NEW_TRANSACTION",
+        semanticIntent: "availability_inquiry",
         targetId: null,
         action: "reply",
         mutationIntent: "none",
