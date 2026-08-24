@@ -1,0 +1,74 @@
+name: semantic-intent-core-pr-validation
+
+on:
+  pull_request:
+    branches:
+      - fix/brain-semantic-authority
+
+permissions:
+  contents: write
+
+jobs:
+  validate-core-slice:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head for workflow context
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create isolated temp checkout from exact feature base
+        shell: bash
+        env:
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin fix/brain-semantic-authority
+          test "$(git rev-parse origin/fix/brain-semantic-authority)" = "$EXPECTED_BASE_SHA"
+          git worktree add /tmp/emily-semantic-core fix/brain-semantic-authority
+          cd /tmp/emily-semantic-core
+          test "$(git branch --show-current)" = "fix/brain-semantic-authority"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE_SHA"
+          test -z "$(git status --porcelain)"
+
+      - name: Apply guarded existing-Brain patch in temp checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/emily-semantic-core
+          node scripts/applyBrainSemanticIntentCoreSlice.mjs
+          changed="$(git diff --name-only)"
+          test "$changed" = $'src/brain/decisions/decidePostConfirmCustomerDm.js\ntests/cloud-dm-semantic-intent-shadow.test.mjs'
+          git diff --check
+
+      - name: Run targeted semantic-authority tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/emily-semantic-core
+          node --test \
+            tests/shared-brain-semantic-intent-contract.test.mjs \
+            tests/semantic-intent-shadow-boundary.test.mjs \
+            tests/brain-semantic-authority-safety-boundary.test.mjs \
+            tests/cloud-dm-semantic-intent-shadow.test.mjs \
+            tests/cloud-dm-ownership-boundary.test.mjs
+
+      - name: Verify no routing/executor files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/emily-semantic-core
+          test -z "$(git diff --name-only | grep -E 'WorkflowEngine|UnderstandingEngine|whatsappInboundBuffer|inboundTurnLedger|executors|workflows/' || true)"
+          git diff --stat
+
+      - name: Commit tested candidate branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/emily-semantic-core
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/brain/decisions/decidePostConfirmCustomerDm.js tests/cloud-dm-semantic-intent-shadow.test.mjs
+          git diff --cached --check
+          git commit -m "refactor(brain): emit semantic intent in existing cloud ownership decision"
+          git push --force-with-lease origin HEAD:refs/heads/candidate/semantic-intent-core-tested
