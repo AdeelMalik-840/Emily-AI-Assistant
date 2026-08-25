@@ -112,19 +112,55 @@ const CLOUD_DM_ITEM_REFERENT_SOURCES = Object.freeze([
   "trusted_fresh_focus",
 ]);
 
-function cleanCloudDmItemReferents(raw, {
+function inspectCloudDmItemReferents(raw, {
   customerMessage = null,
   trustedFreshItemFocus = null,
 } = {}) {
-  if (!Array.isArray(raw) || raw.length > 8) return null;
+  const customerMessageLength = String(customerMessage ?? "").length;
+  const metadata = {
+    referentCount: Array.isArray(raw) ? raw.length : null,
+    customerMessageLength,
+    referents: Array.isArray(raw)
+      ? raw.slice(0, 8).map((value) => {
+          const surfaceText = value?.surfaceText == null
+            ? null
+            : String(value.surfaceText);
+          const start = value?.start == null ? null : Number(value.start);
+          const end = value?.end == null ? null : Number(value.end);
+          return {
+            source: CLOUD_DM_ITEM_REFERENT_SOURCES.includes(value?.source)
+              ? value.source
+              : null,
+            start: Number.isInteger(start) ? start : null,
+            end: Number.isInteger(end) ? end : null,
+            surfaceTextLength: surfaceText == null ? null : surfaceText.length,
+            spanMatches:
+              surfaceText != null && Number.isInteger(start) && Number.isInteger(end) &&
+              start >= 0 && end > start && end <= customerMessageLength
+                ? String(customerMessage ?? "").slice(start, end) === surfaceText
+                : false,
+          };
+        })
+      : [],
+  };
+  if (raw === undefined) {
+    return { value: null, rejectionCode: "ITEM_REFERENTS_MISSING", metadata };
+  }
+  if (!Array.isArray(raw) || raw.length > 8) {
+    return { value: null, rejectionCode: "ITEM_REFERENTS_INVALID", metadata };
+  }
   const message = String(customerMessage ?? "");
   const freshId = clean(trustedFreshItemFocus?.itemId, 160) || null;
   const freshTurnId = clean(trustedFreshItemFocus?.sourceTurnId, 320) || null;
   const result = [];
   for (const value of raw) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { value: null, rejectionCode: "ITEM_REFERENTS_INVALID", metadata };
+    }
     const source = clean(value.source, 60);
-    if (!CLOUD_DM_ITEM_REFERENT_SOURCES.includes(source)) return null;
+    if (!CLOUD_DM_ITEM_REFERENT_SOURCES.includes(source)) {
+      return { value: null, rejectionCode: "ITEM_REFERENT_SOURCE_INVALID", metadata };
+    }
     const surfaceText = value.surfaceText == null ? null : String(value.surfaceText);
     const start = value.start == null ? null : Number(value.start);
     const end = value.end == null ? null : Number(value.end);
@@ -132,17 +168,26 @@ function cleanCloudDmItemReferents(raw, {
     const sourceTurnId = clean(value.sourceTurnId, 320) || null;
     if (source === "current_turn") {
       if (!surfaceText || !Number.isInteger(start) || !Number.isInteger(end) ||
-          start < 0 || end <= start || end > message.length ||
-          message.slice(start, end) !== surfaceText || trustedItemId || sourceTurnId) {
-        return null;
+          start < 0 || end <= start || end > message.length) {
+        return { value: null, rejectionCode: "ITEM_REFERENT_SPAN_INVALID", metadata };
+      }
+      if (message.slice(start, end) !== surfaceText) {
+        return { value: null, rejectionCode: "ITEM_REFERENT_SURFACE_MISMATCH", metadata };
+      }
+      if (trustedItemId || sourceTurnId) {
+        return { value: null, rejectionCode: "ITEM_REFERENT_TRUSTED_FIELDS_INVALID", metadata };
       }
     } else if (surfaceText !== null || start !== null || end !== null ||
         !trustedItemId || !sourceTurnId || trustedItemId !== freshId || sourceTurnId !== freshTurnId) {
-      return null;
+      return { value: null, rejectionCode: "ITEM_REFERENT_TRUSTED_FIELDS_INVALID", metadata };
     }
     result.push({ source, surfaceText, start, end, trustedItemId, sourceTurnId });
   }
-  return result;
+  return { value: result, rejectionCode: null, metadata };
+}
+
+function cleanCloudDmItemReferents(raw, opts = {}) {
+  return inspectCloudDmItemReferents(raw, opts).value;
 }
 
 function isCloudDmItemReferentContractConsistent(turnScope, itemScope, itemReferents) {
@@ -3706,9 +3751,16 @@ export function collapseIndistinguishableSameItemOwnership(
  * @param {unknown} raw
  * @returns {Record<string, unknown> | null}
  */
+function rejectCloudDmOwnershipParse(opts, rejectionCode, metadata = {}) {
+  if (typeof opts?.onStructuralRejection === "function") {
+    opts.onStructuralRejection({ rejectionCode, ...metadata });
+  }
+  return null;
+}
+
 export function parseCloudDmOwnershipDecision(raw, opts = {}) {
   let text = String(raw ?? "").trim();
-  if (!text) return null;
+  if (!text) return rejectCloudDmOwnershipParse(opts, "OWNERSHIP_JSON_EMPTY");
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) text = fence[1].trim();
   const start = text.indexOf("{");
@@ -3720,10 +3772,14 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
   try {
     parsed = JSON.parse(text);
   } catch {
-    return null;
+    return rejectCloudDmOwnershipParse(opts, "OWNERSHIP_JSON_MALFORMED");
   }
-  if (!parsed || typeof parsed !== "object") return null;
-  if (!POST_CONFIRM_TURN_SCOPES.includes(parsed.turnScope)) return null;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return rejectCloudDmOwnershipParse(opts, "OWNERSHIP_OBJECT_INVALID");
+  }
+  if (!POST_CONFIRM_TURN_SCOPES.includes(parsed.turnScope)) {
+    return rejectCloudDmOwnershipParse(opts, "TURN_SCOPE_INVALID");
+  }
 
   const turnScope = parsed.turnScope;
   let targetId = clean(parsed.targetId, 160) || null;
@@ -3759,29 +3815,45 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
       : cleanCustomerSemanticIntent(rawSemanticIntent);
   const hasItemScope = Object.prototype.hasOwnProperty.call(parsed, "itemScope");
   const itemScope = cleanCloudDmItemScope(parsed.itemScope);
-  const itemReferents = cleanCloudDmItemReferents(parsed.itemReferents, {
+  const itemReferentInspection = inspectCloudDmItemReferents(parsed.itemReferents, {
     customerMessage: opts.customerMessage,
     trustedFreshItemFocus: opts.trustedFreshItemFocus,
   });
+  const itemReferents = itemReferentInspection.value;
   const targetReference =
     cleanCloudDmTargetReference(parsed.targetReference) ||
     (turnScope !== "OLD_BOOKING_REFERENCE"
       ? { source: "none", sourceTurnId: null, targetType: "none", targetId: null }
       : null);
-  if (
-    !hasSemanticIntent ||
-    (rawSemanticIntent !== null && semanticIntent == null) ||
-    (turnScope === "NEW_TRANSACTION" && semanticIntent == null) ||
-    (turnScope === "SOCIAL_GENERAL" && semanticIntent !== "social") ||
-    (turnScope === "UNCLEAR" && semanticIntent !== "unclear") ||
-    !hasItemScope ||
-    !itemScope ||
-    !itemReferents ||
-    !targetReference ||
-    !isCloudDmItemScopeConsistent(turnScope, semanticIntent, itemScope) ||
-    !isCloudDmItemReferentContractConsistent(turnScope, itemScope, itemReferents)
-  ) {
-    return null;
+  if (!hasSemanticIntent ||
+      (rawSemanticIntent !== null && semanticIntent == null) ||
+      (turnScope === "NEW_TRANSACTION" && semanticIntent == null) ||
+      (turnScope === "SOCIAL_GENERAL" && semanticIntent !== "social") ||
+      (turnScope === "UNCLEAR" && semanticIntent !== "unclear")) {
+    return rejectCloudDmOwnershipParse(opts, "SEMANTIC_INTENT_INVALID");
+  }
+  if (!hasItemScope || !itemScope) {
+    return rejectCloudDmOwnershipParse(opts, "ITEM_SCOPE_INVALID");
+  }
+  if (!isCloudDmItemScopeConsistent(turnScope, semanticIntent, itemScope)) {
+    return rejectCloudDmOwnershipParse(opts, "ITEM_SCOPE_INTENT_CONTRADICTION");
+  }
+  if (!itemReferents) {
+    return rejectCloudDmOwnershipParse(
+      opts,
+      itemReferentInspection.rejectionCode || "ITEM_REFERENTS_INVALID",
+      itemReferentInspection.metadata
+    );
+  }
+  if (!isCloudDmItemReferentContractConsistent(turnScope, itemScope, itemReferents)) {
+    return rejectCloudDmOwnershipParse(
+      opts,
+      "ITEM_REFERENTS_SCOPE_CONTRADICTION",
+      itemReferentInspection.metadata
+    );
+  }
+  if (!targetReference) {
+    return rejectCloudDmOwnershipParse(opts, "TARGET_REFERENCE_INVALID");
   }
   if (
     turnScope === "OLD_BOOKING_REFERENCE" &&
@@ -3789,7 +3861,7 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
     (capability !== "answer_from_active_booking" ||
       !evidenceNeeds.some((need) => need.entity === "active_booking"))
   ) {
-    return null;
+    return rejectCloudDmOwnershipParse(opts, "OLD_BOOKING_FACT_PLAN_INVALID");
   }
   return defaultDecision({
     turnScope,
@@ -4092,9 +4164,13 @@ export async function executeCloudDmOwnershipDecision({
         : createPromise;
     const resp = await timed;
     const raw = resp?.choices?.[0]?.message?.content ?? "";
+    let parseRejection = null;
     const parsed = parseCloudDmOwnershipDecision(raw, {
       customerMessage: userLine,
       trustedFreshItemFocus: facts?.trustedFreshItemFocus,
+      onStructuralRejection: (details) => {
+        parseRejection = details;
+      },
     });
     if (!parsed) {
       let diagnostic;
@@ -4104,14 +4180,24 @@ export async function executeCloudDmOwnershipDecision({
           turnScope: clean(candidate?.turnScope, 80) || null,
           semanticIntent: clean(candidate?.semanticIntent, 80) || null,
           itemScope: clean(candidate?.itemScope, 40) || null,
-          structuralRejectionReason: "OWNERSHIP_SCHEMA_OR_CONSISTENCY_REJECTED",
+          structuralRejectionReason:
+            parseRejection?.rejectionCode || "OWNERSHIP_SCHEMA_OR_CONSISTENCY_REJECTED",
+          referentCount: parseRejection?.referentCount ?? null,
+          customerMessageLength: parseRejection?.customerMessageLength ?? userLine.length,
+          referents: Array.isArray(parseRejection?.referents)
+            ? parseRejection.referents
+            : [],
         };
       } catch {
         diagnostic = {
           turnScope: null,
           semanticIntent: null,
           itemScope: null,
-          structuralRejectionReason: "OWNERSHIP_JSON_MALFORMED",
+          structuralRejectionReason:
+            parseRejection?.rejectionCode || "OWNERSHIP_JSON_MALFORMED",
+          referentCount: null,
+          customerMessageLength: userLine.length,
+          referents: [],
         };
       }
       console.warn("[cloud_dm_ownership_structural_rejected]", diagnostic);
