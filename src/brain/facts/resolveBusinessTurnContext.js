@@ -430,18 +430,13 @@ function resolveBusinessDecision(p) {
       authoritativeSemanticIntent,
       requestedField
     );
-    const unlistedCompatible = new Set([
-      "availability_inquiry",
-      "pricing_inquiry",
-      "pricing_with_duration",
-      "booking_request",
-      "details_inquiry",
-      "image_catalog_request",
-    ]);
+    const canonicalItemReferents = Array.isArray(understanding?.canonicalItemReferents)
+      ? understanding.canonicalItemReferents
+      : [];
     const boundedExplicitItemIds = Array.isArray(understanding?.resolvedItemIds)
       ? understanding.resolvedItemIds.map((id) => String(id ?? "").trim()).filter(Boolean)
       : [];
-    if (authoritativeItemScope === "specific" && boundedExplicitItemIds.length > 1) {
+    if (authoritativeItemScope === "specific" && canonicalItemReferents.length > 1) {
       return Object.freeze({
         primaryIntent: authoritativeSemanticIntent,
         secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
@@ -459,20 +454,11 @@ function resolveBusinessDecision(p) {
         reason: "bounded_explicit_item_set_requires_clarification",
       });
     }
-    const useUnlistedItem =
-      authoritativeItemScope === "specific" &&
-      !hasResolvedItem &&
-      Boolean(unlistedMentionLabel) &&
-      unlistedCompatible.has(authoritativeSemanticIntent);
     return Object.freeze({
       primaryIntent: authoritativeSemanticIntent,
       secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
-      workflowType: useUnlistedItem
-        ? "unlisted_item"
-        : canonicalWorkflowType ?? "clarification",
-      replyType: useUnlistedItem
-        ? "unlisted_item_clarification"
-        : canonicalWorkflowType === "browse_options"
+      workflowType: canonicalWorkflowType ?? "clarification",
+      replyType: canonicalWorkflowType === "browse_options"
           ? "browse_options"
           : canonicalWorkflowType === "availability_inquiry"
             ? "availability_answer"
@@ -498,9 +484,7 @@ function resolveBusinessDecision(p) {
         durationDays,
       }),
       confidence: "high",
-      reason: useUnlistedItem
-        ? "canonical_semantic_intent_explicit_unlisted_item"
-        : "canonical_semantic_intent_authoritative",
+      reason: "canonical_semantic_intent_authoritative",
     });
   }
 

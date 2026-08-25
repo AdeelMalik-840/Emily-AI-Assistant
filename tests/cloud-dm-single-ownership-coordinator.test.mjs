@@ -122,12 +122,14 @@ test("ownership prompt packing is identity-sorted and never pre-owns", () => {
 });
 
 test("fresh Civic independent ask validates as NEW_TRANSACTION with null targetId", () => {
-  const facts = buildNeutralCloudDmOwnershipFacts(historyFacts());
+  const message = "Honda Civic available hai?";
+  const facts = { ...buildNeutralCloudDmOwnershipFacts(historyFacts()), currentCustomerMessage: message };
   const decision = applyPostConfirmDerivedOwnershipMechanics(
     {
       turnScope: "NEW_TRANSACTION",
       semanticIntent: "availability_inquiry",
       itemScope: "specific",
+      itemReferents: [{ source: "current_turn", surfaceText: "Honda Civic", start: 0, end: 11, trustedItemId: null, sourceTurnId: null }],
       targetId: null,
       action: "reply",
       mutationIntent: "none",
@@ -245,6 +247,7 @@ test("accepted retry does not rewrite a frozen NEW_TRANSACTION snapshot", async 
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
         itemScope: "specific",
+        itemReferents: [{ source: "current_turn", surfaceText: "item", start: 0, end: 4, trustedItemId: null, sourceTurnId: null }],
         targetId: null,
         action: "reply",
         mutationIntent: "none",
@@ -259,6 +262,7 @@ test("accepted retry does not rewrite a frozen NEW_TRANSACTION snapshot", async 
       openaiSource: "openai",
       decision: {
         turnScope: "OLD_BOOKING_REFERENCE",
+        itemReferents: [],
         targetReference: {
           source: "current_turn",
           sourceTurnId: "user:rewrite",

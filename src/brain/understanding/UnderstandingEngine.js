@@ -72,14 +72,27 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
   const authoritativeSemanticIntent = cleanCustomerSemanticIntent(
     turnContext?.authoritativeSemanticIntent
   );
+  const canonicalItemReferents = Array.isArray(turnContext?.canonicalItemReferents)
+    ? turnContext.canonicalItemReferents
+    : null;
+  const canonicalAuthorityActive = Boolean(authoritativeSemanticIntent) && canonicalItemReferents !== null;
+  const canonicalItemResolutions = Array.isArray(turnContext?.canonicalItemResolutions)
+    ? turnContext.canonicalItemResolutions
+    : [];
 
   const lockedItemId =
     String(turnContext?.lastResolvedItemId ?? pendingAction?.itemId ?? "").trim() || null;
 
-  const explicitMention = hasExplicitNewItemMention(message, items, lockedItemId);
-  const explicitItemIds = listExplicitCatalogItemIds(message, items);
+  const explicitMention = canonicalAuthorityActive
+    ? { found: false, itemId: null, itemLabel: null }
+    : hasExplicitNewItemMention(message, items, lockedItemId);
+  const explicitItemIds = canonicalAuthorityActive
+    ? canonicalItemResolutions
+        .filter((row) => row?.status === "MATCHED" && row?.itemId)
+        .map((row) => String(row.itemId))
+    : listExplicitCatalogItemIds(message, items);
   const boundedExplicitSet =
-    Boolean(authoritativeSemanticIntent) && explicitItemIds.length > 1;
+    Boolean(authoritativeSemanticIntent) && canonicalItemReferents?.length > 1;
   const durationParsed = parseUserDuration(message);
   const durationDays =
     durationParsed != null && Number.isFinite(Number(durationParsed.normalizedDays))
@@ -111,14 +124,23 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
   /** @type {"high" | "medium" | "low"} */
   let itemConfidence = "low";
 
-  if (!boundedExplicitSet && explicitMention.found && explicitMention.itemId) {
+  const singleCanonicalResolution =
+    canonicalAuthorityActive && canonicalItemResolutions.length === 1
+      ? canonicalItemResolutions[0]
+      : null;
+  if (!boundedExplicitSet && singleCanonicalResolution?.status === "MATCHED") {
+    resolvedItemId = String(singleCanonicalResolution.itemId ?? "").trim() || null;
+    resolvedItemLabel = String(singleCanonicalResolution.itemLabel ?? "").trim() || null;
+    itemSource = "explicit";
+    itemConfidence = "high";
+  } else if (!boundedExplicitSet && explicitMention.found && explicitMention.itemId) {
     const row = findCatalogItemById(items, explicitMention.itemId);
     resolvedItemId = explicitMention.itemId;
     resolvedItemLabel =
       explicitMention.itemLabel || (row ? catalogItemLabel(row) : null) || null;
     itemSource = "explicit";
     itemConfidence = "high";
-  } else if (!signals.browseAsk && !isGenericBrowseListAsk(message)) {
+  } else if (!canonicalAuthorityActive && !signals.browseAsk && !isGenericBrowseListAsk(message)) {
     const memoryItemId = String(
       turnContext?.lastResolvedItemId ??
         pendingAction?.itemId ??
@@ -138,6 +160,9 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
 
   const ambiguities = [];
   if (boundedExplicitSet) ambiguities.push("bounded_explicit_item_set");
+  if (singleCanonicalResolution?.status === "AMBIGUOUS") {
+    ambiguities.push("canonical_item_referent_ambiguous");
+  }
   if (!resolvedItemId && (signals.priceAsk || signals.bookingCommitment)) {
     ambiguities.push("missing_resolved_item");
   }
@@ -146,7 +171,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
   }
 
   let unlistedMentionLabel =
-    authoritativeSemanticIntent === "browse_options" || boundedExplicitSet
+    canonicalAuthorityActive || authoritativeSemanticIntent === "browse_options" || boundedExplicitSet
       ? undefined
       : detectUnlistedMentionLabel(
           message,
@@ -183,6 +208,10 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     durationDays,
     ambiguities: ambiguities.length ? ambiguities : undefined,
     unlistedMentionLabel,
+    canonicalItemReferents: canonicalItemReferents ?? undefined,
+    canonicalItemResolutions: canonicalItemResolutions.length
+      ? Object.freeze([...canonicalItemResolutions])
+      : undefined,
     authoritativeSemanticIntent: authoritativeSemanticIntent ?? undefined,
     signals: {
       priceAsk: Boolean(signals.priceAsk),

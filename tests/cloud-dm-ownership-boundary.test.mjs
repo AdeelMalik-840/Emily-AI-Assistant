@@ -90,8 +90,15 @@ async function resolveWithDecision(decision, facts, message, extra = {}) {
           targetId: decision.targetId,
         }
       : undefined;
+  const resolvedTurnScope = decision?.turnScope ?? "NEW_TRANSACTION";
+  const resolvedItemScope = decision?.itemScope ??
+    (resolvedTurnScope === "NEW_TRANSACTION" ? "specific" : "none");
+  const itemReferents = decision?.itemReferents ??
+    (resolvedTurnScope === "NEW_TRANSACTION" && resolvedItemScope === "specific"
+      ? [{ source: "current_turn", surfaceText: message, start: 0, end: String(message).length, trustedItemId: null, sourceTurnId: null }]
+      : []);
   const { create, state } = countingCreate(async () =>
-    chatCompletionFromDecision({ semanticIntent, targetReference, ...decision })
+    chatCompletionFromDecision({ semanticIntent, targetReference, itemReferents, ...decision })
   );
   const result = await resolveCloudDmCanonicalOwnership({
     facts: { ...facts, currentOwnershipTurnId: "user:test-current" },
@@ -179,6 +186,7 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
     "turnScope",
     "semanticIntent",
     "itemScope",
+    "itemReferents",
     "targetReference",
     "targetId",
     "mutationIntent",
@@ -425,6 +433,7 @@ test("E18 timeout after acceptance does not call ownership again", async () => {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
         itemScope: "specific",
+        itemReferents: [{ source: "current_turn", surfaceText: "item", start: 0, end: 4, trustedItemId: null, sourceTurnId: null }],
         targetId: null,
         action: "reply",
         mutationIntent: "none",
@@ -467,6 +476,7 @@ test("E20 reply-guard-style rejection cannot regenerate ownership in the same at
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
         itemScope: "specific",
+        itemReferents: [{ source: "current_turn", surfaceText: "Honda Civic", start: 0, end: 11, trustedItemId: null, sourceTurnId: null }],
         targetId: null,
         action: "reply",
         factKind: "booking_fact",
@@ -502,6 +512,7 @@ test("accepted retry / outbound_locked recovery keep ownership completions at 0 
       openaiSource: "openai",
       decision: {
         turnScope: "OLD_BOOKING_REFERENCE",
+        itemReferents: [],
         targetId: PROD_STONIC_BOOKING_ID,
         selectedBookingId: PROD_STONIC_BOOKING_ID,
         targetReference: {
@@ -525,6 +536,7 @@ test("accepted retry / outbound_locked recovery keep ownership completions at 0 
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
         itemScope: "specific",
+        itemReferents: [{ source: "current_turn", surfaceText: "item", start: 0, end: 4, trustedItemId: null, sourceTurnId: null }],
         targetId: null,
         action: "reply",
         mutationIntent: "none",
@@ -788,18 +800,21 @@ test("duplicate webhook after accepted ownership does not call ownership AI", as
 });
 
 test("parseCloudDmOwnershipDecision never requires customerReply", () => {
+  const message = "Honda Civic available hai?";
   const parsed = parseCloudDmOwnershipDecision(
     JSON.stringify({
       turnScope: "NEW_TRANSACTION",
       semanticIntent: "availability_inquiry",
       itemScope: "specific",
+      itemReferents: [{ source: "current_turn", surfaceText: "Honda Civic", start: 0, end: 11, trustedItemId: null, sourceTurnId: null }],
       targetId: PROD_CIVIC_BOOKING_ID,
       mutationIntent: "none",
       action: "reply",
       factKind: "booking_fact",
       capability: "availability_request",
       evidenceNeeds: [],
-    })
+    }),
+    { customerMessage: message }
   );
   assert.equal(parsed.turnScope, "NEW_TRANSACTION");
   assert.equal(parsed.targetId, null);
@@ -830,9 +845,11 @@ test("structurally invalid OLD_BOOKING is not accepted after the single completi
 });
 
 test("neutral facts keep candidate identifying data without pre-own language", () => {
-  const neutral = buildNeutralCloudDmOwnershipFacts(
-    productionRichCivicStonicFacts()
-  );
+  const currentCustomerMessage = "Honda Civic available hai?";
+  const neutral = {
+    ...buildNeutralCloudDmOwnershipFacts(productionRichCivicStonicFacts()),
+    currentCustomerMessage,
+  };
   const civic = neutral.bookingCandidates[0];
   assert.equal(civic.id, PROD_CIVIC_BOOKING_ID);
   assert.equal(civic.durationDays, 5);
@@ -846,6 +863,7 @@ test("neutral facts keep candidate identifying data without pre-own language", (
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
         itemScope: "specific",
+        itemReferents: [{ source: "current_turn", surfaceText: "Honda Civic", start: 0, end: 11, trustedItemId: null, sourceTurnId: null }],
         targetId: null,
         action: "reply",
         mutationIntent: "none",

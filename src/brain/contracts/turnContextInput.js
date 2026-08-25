@@ -47,6 +47,8 @@
  * @property {string | null} clarificationReply
  * @property {boolean} suppressFuzzyCatalog
  * @property {string | null} [authoritativeSemanticIntent]
+ * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemReferents]
+ * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemResolutions]
  */
 
 /**

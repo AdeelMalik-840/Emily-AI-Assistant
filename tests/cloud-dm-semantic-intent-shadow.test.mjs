@@ -16,6 +16,7 @@ const base = {
   turnScope: "NEW_TRANSACTION",
   semanticIntent: "availability_inquiry",
   itemScope: "specific",
+  itemReferents: [{ source: "current_turn", surfaceText: "item", start: 0, end: 4, trustedItemId: null, sourceTurnId: null }],
   targetId: null,
   mutationIntent: "none",
   action: "reply",
@@ -26,8 +27,19 @@ const base = {
 
 function parse(overrides = {}, omitted = []) {
   const payload = { ...base, ...overrides };
+  if (payload.turnScope !== "NEW_TRANSACTION" || payload.itemScope !== "specific") {
+    payload.itemReferents = [];
+  }
   for (const key of omitted) delete payload[key];
-  return parseCloudDmOwnershipDecision(JSON.stringify(payload));
+  return parseCloudDmOwnershipDecision(JSON.stringify(payload), { customerMessage: "item" });
+}
+
+function forMessage(message, overrides = {}) {
+  const payload = { ...base, ...overrides };
+  payload.itemReferents = payload.turnScope === "NEW_TRANSACTION" && payload.itemScope === "specific"
+    ? [{ source: "current_turn", surfaceText: message, start: 0, end: message.length, trustedItemId: null, sourceTurnId: null }]
+    : [];
+  return payload;
 }
 
 test("existing Cloud DM ownership completion carries semanticIntent in the same one completion", async () => {
@@ -39,7 +51,7 @@ test("existing Cloud DM ownership completion carries semanticIntent in the same 
     __chatCompletionsCreateForTests: async (args) => {
       calls += 1;
       capturedArgs = args;
-      return completion(base);
+      return completion(forMessage("fresh availability question"));
     },
   });
 
@@ -66,7 +78,7 @@ test("same ownership completion emits broad discovery and contextual singular it
       facts: {},
       userMessage,
       __chatCompletionsCreateForTests: async () =>
-        completion({ ...base, semanticIntent, itemScope }),
+        completion(forMessage(userMessage, { semanticIntent, itemScope })),
     });
     assert.equal(result.ok, true, userMessage);
     assert.equal(result.ownershipCompletionCount, 1, userMessage);

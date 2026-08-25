@@ -35,6 +35,14 @@ function catalogItemColor(row) {
 export function resolveCatalogItemFacts(p) {
   const understanding = p.understanding ?? null;
   const authorityItem = p.turnContextInput?.authoritativeItem ?? null;
+  const canonicalResolutions = Array.isArray(understanding?.canonicalItemResolutions)
+    ? understanding.canonicalItemResolutions
+    : Array.isArray(p.turnContextInput?.canonicalItemResolutions)
+      ? p.turnContextInput.canonicalItemResolutions
+      : [];
+  const canonicalSingle = canonicalResolutions.length === 1
+    ? canonicalResolutions[0]
+    : null;
   const itemId =
     String(understanding?.resolvedItemId ?? authorityItem?.id ?? authorityItem?.itemId ?? "").trim() ||
     null;
@@ -44,9 +52,13 @@ export function resolveCatalogItemFacts(p) {
     ? understanding.ambiguities
     : [];
 
-  /** @type {"resolved" | "missing" | "ambiguous" | "error"} */
+  /** @type {"resolved" | "not_matched" | "missing" | "ambiguous" | "error"} */
   let status = "missing";
-  if (ambiguities.some((a) => String(a).startsWith("unlisted:"))) {
+  if (canonicalSingle?.status === "NOT_MATCHED") {
+    status = "not_matched";
+  } else if (canonicalSingle?.status === "AMBIGUOUS" || canonicalResolutions.length > 1) {
+    status = "ambiguous";
+  } else if (ambiguities.some((a) => String(a).startsWith("unlisted:"))) {
     status = "ambiguous";
   } else if (itemId && row) {
     status = "resolved";
@@ -60,6 +72,8 @@ export function resolveCatalogItemFacts(p) {
   const displayLabel =
     String(
       understanding?.resolvedItemLabel ??
+        canonicalSingle?.itemLabel ??
+        canonicalSingle?.referent?.surfaceText ??
         row?.displayLabel ??
         authorityItem?.displayLabel ??
         ""
@@ -81,6 +95,7 @@ export function resolveCatalogItemFacts(p) {
       itemSource: understanding?.itemSource ?? null,
       authoritativeItemId: String(authorityItem?.id ?? "").trim() || null,
       catalogRowFound: Boolean(row),
+      canonicalResolutionStatus: canonicalSingle?.status ?? null,
     },
   };
 }
