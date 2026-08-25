@@ -15,6 +15,7 @@ function completion(content) {
 const base = {
   turnScope: "NEW_TRANSACTION",
   semanticIntent: "availability_inquiry",
+  itemScope: "specific",
   targetId: null,
   mutationIntent: "none",
   action: "reply",
@@ -50,8 +51,28 @@ test("existing Cloud DM ownership completion carries semanticIntent in the same 
 
   const responseFormat = JSON.stringify(capturedArgs?.response_format ?? {});
   assert.match(responseFormat, /semanticIntent/);
+  assert.match(responseFormat, /itemScope/);
   assert.match(responseFormat, /availability_inquiry/);
   assert.doesNotMatch(responseFormat, /customerReply/);
+});
+
+test("same ownership completion emits broad discovery and contextual singular item scope", async () => {
+  const cases = [
+    ["discover available inventory", "browse_options", "broad"],
+    ["contextual follow-up about the one selected referent", "availability_inquiry", "specific"],
+  ];
+  for (const [userMessage, semanticIntent, itemScope] of cases) {
+    const result = await executeCloudDmOwnershipDecision({
+      facts: {},
+      userMessage,
+      __chatCompletionsCreateForTests: async () =>
+        completion({ ...base, semanticIntent, itemScope }),
+    });
+    assert.equal(result.ok, true, userMessage);
+    assert.equal(result.ownershipCompletionCount, 1, userMessage);
+    assert.equal(result.decision.semanticIntent, semanticIntent, userMessage);
+    assert.equal(result.decision.itemScope, itemScope, userMessage);
+  }
 });
 
 test("NEW_TRANSACTION requires an explicit valid non-null semantic intent", () => {
@@ -62,15 +83,15 @@ test("NEW_TRANSACTION requires an explicit valid non-null semantic intent", () =
 });
 
 test("SOCIAL_GENERAL requires exactly social", () => {
-  assert.equal(parse({ turnScope: "SOCIAL_GENERAL", semanticIntent: "social" })?.semanticIntent, "social");
-  assert.equal(parse({ turnScope: "SOCIAL_GENERAL", semanticIntent: null }), null);
-  assert.equal(parse({ turnScope: "SOCIAL_GENERAL", semanticIntent: "pricing_inquiry" }), null);
+  assert.equal(parse({ turnScope: "SOCIAL_GENERAL", semanticIntent: "social", itemScope: "none" })?.semanticIntent, "social");
+  assert.equal(parse({ turnScope: "SOCIAL_GENERAL", semanticIntent: null, itemScope: "none" }), null);
+  assert.equal(parse({ turnScope: "SOCIAL_GENERAL", semanticIntent: "pricing_inquiry", itemScope: "none" }), null);
 });
 
 test("UNCLEAR requires exactly unclear", () => {
-  assert.equal(parse({ turnScope: "UNCLEAR", semanticIntent: "unclear" })?.semanticIntent, "unclear");
-  assert.equal(parse({ turnScope: "UNCLEAR", semanticIntent: null }), null);
-  assert.equal(parse({ turnScope: "UNCLEAR", semanticIntent: "pricing_inquiry" }), null);
+  assert.equal(parse({ turnScope: "UNCLEAR", semanticIntent: "unclear", itemScope: "none" })?.semanticIntent, "unclear");
+  assert.equal(parse({ turnScope: "UNCLEAR", semanticIntent: null, itemScope: "none" }), null);
+  assert.equal(parse({ turnScope: "UNCLEAR", semanticIntent: "pricing_inquiry", itemScope: "none" }), null);
 });
 
 test("protected existing-request scopes accept explicit null but reject invalid non-null intent", () => {
@@ -86,6 +107,57 @@ test("protected existing-request scopes accept explicit null but reject invalid 
         : {};
     assert.equal(parse({ turnScope, semanticIntent: null, ...factPlan })?.semanticIntent, null);
     assert.equal(parse({ turnScope, semanticIntent: "regex_guessed_price" }), null);
+  }
+});
+
+test("itemScope is required and structurally consistent with semantic intent", () => {
+  assert.equal(parse({ semanticIntent: "availability_inquiry", itemScope: "specific" })?.itemScope, "specific");
+  assert.equal(parse({ semanticIntent: "browse_options", itemScope: "broad" })?.itemScope, "broad");
+  assert.equal(parse({ semanticIntent: "general_business_question", itemScope: "specific" })?.itemScope, "specific");
+  assert.equal(parse({ semanticIntent: "general_business_question", itemScope: "none" })?.itemScope, "none");
+  assert.equal(parse({}, ["itemScope"]), null);
+  assert.equal(parse({ itemScope: "invented" }), null);
+  assert.equal(parse({ semanticIntent: "browse_options", itemScope: "specific" }), null);
+  assert.equal(parse({ semanticIntent: "availability_inquiry", itemScope: "broad" }), null);
+  for (const semanticIntent of [
+    "pricing_inquiry",
+    "pricing_with_duration",
+    "booking_request",
+    "details_inquiry",
+    "image_catalog_request",
+  ]) {
+    assert.equal(parse({ semanticIntent, itemScope: "none" }), null, semanticIntent);
+  }
+});
+
+test("all supported NEW_TRANSACTION intent and item-scope combinations parse structurally", () => {
+  for (const semanticIntent of [
+    "availability_inquiry",
+    "pricing_inquiry",
+    "pricing_with_duration",
+    "booking_request",
+    "details_inquiry",
+    "image_catalog_request",
+  ]) {
+    assert.equal(
+      parse({ semanticIntent, itemScope: "specific" })?.itemScope,
+      "specific",
+      semanticIntent
+    );
+  }
+  assert.equal(parse({ semanticIntent: "browse_options", itemScope: "broad" })?.itemScope, "broad");
+  for (const semanticIntent of [
+    "general_business_question",
+    "clarification",
+    "unclear",
+  ]) {
+    for (const itemScope of ["specific", "broad", "none"]) {
+      assert.equal(
+        parse({ semanticIntent, itemScope })?.itemScope,
+        itemScope,
+        `${semanticIntent}:${itemScope}`
+      );
+    }
   }
 });
 

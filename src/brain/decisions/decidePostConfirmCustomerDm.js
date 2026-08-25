@@ -71,6 +71,39 @@ export const CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION = 1;
  */
 export const CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER = "stable_id_asc";
 
+export const CLOUD_DM_ITEM_SCOPES = Object.freeze([
+  "specific",
+  "broad",
+  "none",
+]);
+
+const CLOUD_DM_SPECIFIC_ITEM_INTENTS = new Set([
+  "availability_inquiry",
+  "pricing_inquiry",
+  "pricing_with_duration",
+  "booking_request",
+  "details_inquiry",
+  "image_catalog_request",
+]);
+
+function cleanCloudDmItemScope(value) {
+  const scope = String(value ?? "").trim();
+  return CLOUD_DM_ITEM_SCOPES.includes(scope) ? scope : null;
+}
+
+function isCloudDmItemScopeConsistent(turnScope, semanticIntent, itemScope) {
+  if (!itemScope) return false;
+  if (turnScope === "SOCIAL_GENERAL" || turnScope === "UNCLEAR") {
+    return itemScope === "none";
+  }
+  if (turnScope !== "NEW_TRANSACTION") return true;
+  if (semanticIntent === "browse_options") return itemScope === "broad";
+  if (CLOUD_DM_SPECIFIC_ITEM_INTENTS.has(semanticIntent)) {
+    return itemScope === "specific";
+  }
+  return true;
+}
+
 export const POST_CONFIRM_TARGET_CONTEXTS = Object.freeze([
   "NEW_TRANSACTION",
   "PENDING_AVAILABILITY",
@@ -2588,6 +2621,7 @@ function defaultDecision(overrides = {}) {
   return {
     turnScope: "UNCLEAR",
     semanticIntent: null,
+    itemScope: null,
     targetContext: "NONE",
     targetId: null,
     conversationAct: "unknown",
@@ -3319,6 +3353,24 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
   if (scope === "UNCLEAR" && semanticIntent !== "unclear") {
     return invalid("UNCLEAR_SEMANTIC_INTENT_CONTRADICTION");
   }
+  const hasItemScope = Object.prototype.hasOwnProperty.call(
+    decision ?? {},
+    "itemScope"
+  );
+  const rawItemScope = decision?.itemScope;
+  const itemScope = cleanCloudDmItemScope(rawItemScope);
+  if (hasItemScope && rawItemScope != null && !itemScope) {
+    return invalid("ITEM_SCOPE_REQUIRED_OR_INVALID");
+  }
+  if (scope === "NEW_TRANSACTION" && !itemScope) {
+    return invalid("NEW_TRANSACTION_ITEM_SCOPE_REQUIRED");
+  }
+  if (
+    itemScope &&
+    !isCloudDmItemScopeConsistent(scope, semanticIntent, itemScope)
+  ) {
+    return invalid("ITEM_SCOPE_SEMANTIC_CONTRADICTION");
+  }
   const mutationDeclared =
     mutation !== "none" || action === "request_booking_mutation";
 
@@ -3471,6 +3523,7 @@ export function collapseIndistinguishableSameItemOwnership(
   return defaultDecision({
     turnScope: "UNCLEAR",
     semanticIntent: "unclear",
+    itemScope: "none",
     targetId: null,
     mutationIntent: "none",
     action: "reply",
@@ -3538,12 +3591,17 @@ export function parseCloudDmOwnershipDecision(raw) {
     rawSemanticIntent === null
       ? null
       : cleanCustomerSemanticIntent(rawSemanticIntent);
+  const hasItemScope = Object.prototype.hasOwnProperty.call(parsed, "itemScope");
+  const itemScope = cleanCloudDmItemScope(parsed.itemScope);
   if (
     !hasSemanticIntent ||
     (rawSemanticIntent !== null && semanticIntent == null) ||
     (turnScope === "NEW_TRANSACTION" && semanticIntent == null) ||
     (turnScope === "SOCIAL_GENERAL" && semanticIntent !== "social") ||
-    (turnScope === "UNCLEAR" && semanticIntent !== "unclear")
+    (turnScope === "UNCLEAR" && semanticIntent !== "unclear") ||
+    !hasItemScope ||
+    !itemScope ||
+    !isCloudDmItemScopeConsistent(turnScope, semanticIntent, itemScope)
   ) {
     return null;
   }
@@ -3558,6 +3616,7 @@ export function parseCloudDmOwnershipDecision(raw) {
   return defaultDecision({
     turnScope,
     semanticIntent,
+    itemScope,
     targetId,
     mutationIntent,
     action,
@@ -3642,6 +3701,12 @@ export async function executeCloudDmOwnershipDecision({
           enum: [...POST_CONFIRM_TURN_SCOPES],
         },
         semanticIntent: CUSTOMER_SEMANTIC_INTENT_JSON_SCHEMA,
+        itemScope: {
+          type: "string",
+          enum: [...CLOUD_DM_ITEM_SCOPES],
+          description:
+            "specific = one named or contextually singular inventory item/service/referent; broad = discovery/list/enumeration of multiple possible items/options; none = no inventory-item referent.",
+        },
         targetId: { type: ["string", "null"] },
         mutationIntent: {
           type: "string",
@@ -3696,6 +3761,7 @@ export async function executeCloudDmOwnershipDecision({
       required: [
         "turnScope",
         "semanticIntent",
+        "itemScope",
         "targetId",
         "mutationIntent",
         "action",
@@ -3708,14 +3774,19 @@ export async function executeCloudDmOwnershipDecision({
 
   const system = [
     "You classify Cloud DM transaction ownership only.",
-    "Return JSON with turnScope, semanticIntent, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
+    "Return JSON with turnScope, semanticIntent, itemScope, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
     "Do not write customer wording. customerReply is not part of this schema.",
     "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
     `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
     "ALLOWED turnScope: NEW_TRANSACTION | PENDING_AVAILABILITY_REFERENCE | OLD_BOOKING_REFERENCE | SOCIAL_GENERAL | UNCLEAR.",
     "semanticIntent is customer meaning only, never an executor/action.",
     "For NEW_TRANSACTION choose the best semanticIntent: availability_inquiry | pricing_inquiry | pricing_with_duration | booking_request | browse_options | details_inquiry | image_catalog_request | general_business_question | clarification | unclear.",
-    "Use availability_inquiry for a fresh item/date/duration availability need, including weak need/want/chahiye wording that is not a clear final book/reserve/confirm command.",
+    "itemScope is semantic referent cardinality from this same decision: specific = one named or trusted-context singular inventory item/service/referent; broad = discovery/list/enumeration of multiple possible items/options; none = no inventory-item referent.",
+    "A specific referent may come from trusted conversation context and need not be named again in the current sentence.",
+    "For NEW_TRANSACTION: browse_options requires itemScope=broad. availability_inquiry, pricing_inquiry, pricing_with_duration, booking_request, details_inquiry, and image_catalog_request require itemScope=specific. general_business_question, clarification, and unclear use the truthful specific, broad, or none scope of the turn.",
+    "SOCIAL_GENERAL and UNCLEAR turn scopes require itemScope=none. For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE, preserve the truthful item scope without changing their protected ownership semantics.",
+    "Use availability_inquiry only for availability of one specifically identified named or trusted-context singular item/service/referent. Asking to discover, list, or enumerate which options are available is browse_options, not availability_inquiry.",
+    "For that one specific referent, weak need/want/chahiye wording that is not a clear final book/reserve/confirm command remains availability_inquiry.",
     "Use booking_request only for clear final booking/reserve/confirm commitment. Do not treat weak need/want/chahiye by itself as final booking commitment.",
     "Use pricing_inquiry for price/rate asks without a requested duration total; pricing_with_duration for a requested duration/total quote; browse_options for broad option discovery; image_catalog_request for photos/images; details_inquiry for item/service details; general_business_question for other business facts; clarification when the intended transaction meaning is underspecified.",
     "SOCIAL_GENERAL should use semanticIntent=social. UNCLEAR should use semanticIntent=unclear.",
@@ -3816,6 +3887,7 @@ export async function executeCloudDmOwnershipDecision({
     console.log("[cloud_dm_ownership_decided]", {
       turnScope: decision.turnScope,
       semanticIntent: decision.semanticIntent ?? null,
+      itemScope: decision.itemScope ?? null,
       targetId: decision.targetId,
       mutationIntent: decision.mutationIntent,
       action: decision.action,

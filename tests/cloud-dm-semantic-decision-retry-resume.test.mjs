@@ -129,6 +129,7 @@ test("timeout before accepted decision may decide on retry", async () => {
           decision: {
             turnScope: "NEW_TRANSACTION",
             semanticIntent: "availability_inquiry",
+            itemScope: "specific",
             targetId: null,
             action: "reply",
             mutationIntent: "none",
@@ -180,6 +181,7 @@ test("retry after accepted decision reuses snapshot and does not call semantic O
           decision: {
             turnScope: "NEW_TRANSACTION",
             semanticIntent: "availability_inquiry",
+            itemScope: "specific",
             targetId: null,
             action: "reply",
             mutationIntent: "none",
@@ -225,6 +227,7 @@ test("write-once semantic snapshot rejects contradictory rewrite", async () => {
       decision: {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
+        itemScope: "specific",
         targetId: null,
         action: "reply",
         mutationIntent: "none",

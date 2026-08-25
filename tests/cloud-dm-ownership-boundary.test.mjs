@@ -169,6 +169,7 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
   assert.deepEqual(schema?.required, [
     "turnScope",
     "semanticIntent",
+    "itemScope",
     "targetId",
     "mutationIntent",
     "action",
@@ -413,6 +414,7 @@ test("E18 timeout after acceptance does not call ownership again", async () => {
       decision: {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
+        itemScope: "specific",
         targetId: null,
         action: "reply",
         mutationIntent: "none",
@@ -454,6 +456,7 @@ test("E20 reply-guard-style rejection cannot regenerate ownership in the same at
       return chatCompletionFromDecision({
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
+        itemScope: "specific",
         targetId: null,
         action: "reply",
         factKind: "booking_fact",
@@ -505,6 +508,7 @@ test("accepted retry / outbound_locked recovery keep ownership completions at 0 
       decision: {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
+        itemScope: "specific",
         targetId: null,
         action: "reply",
         mutationIntent: "none",
@@ -772,6 +776,7 @@ test("parseCloudDmOwnershipDecision never requires customerReply", () => {
     JSON.stringify({
       turnScope: "NEW_TRANSACTION",
       semanticIntent: "availability_inquiry",
+      itemScope: "specific",
       targetId: PROD_CIVIC_BOOKING_ID,
       mutationIntent: "none",
       action: "reply",
@@ -824,6 +829,7 @@ test("neutral facts keep candidate identifying data without pre-own language", (
       {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
+        itemScope: "specific",
         targetId: null,
         action: "reply",
         mutationIntent: "none",

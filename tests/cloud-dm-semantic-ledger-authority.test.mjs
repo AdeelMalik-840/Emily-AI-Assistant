@@ -47,6 +47,10 @@ function identityFor(suffix) {
 }
 
 function persistReleased(identity, semanticIntent) {
+  const itemScope = semanticIntent === "browse_options" ? "broad" :
+    ["clarification", "unclear", "general_business_question"].includes(semanticIntent)
+      ? "none"
+      : "specific";
   return persistCloudInboundSemanticDecision({
     identity,
     messageId: identity.stableId,
@@ -56,6 +60,7 @@ function persistReleased(identity, semanticIntent) {
     decision: {
       turnScope: "NEW_TRANSACTION",
       semanticIntent,
+      itemScope,
       targetId: null,
       targetContext: "NEW_TRANSACTION",
       mutationIntent: "none",
@@ -98,6 +103,37 @@ test("ledger semantic identity is idempotent and rejects semantic-intent rewrite
   });
 });
 
+test("ledger preserves item scope and rejects scope mutation", async () => {
+  await withLedger(() => {
+    const identity = identityFor("item-scope-write-once");
+    const first = persistReleased(identity, "availability_inquiry");
+    assert.equal(first.ok, true);
+    assert.equal(first.decision.itemScope, "specific");
+    assert.equal(getCloudInboundSemanticDecision({ identity }).itemScope, "specific");
+    const same = persistReleased(identity, "availability_inquiry");
+    assert.equal(same.ok, true);
+    assert.equal(same.reason, "already_accepted");
+    const changed = persistCloudInboundSemanticDecision({
+      identity,
+      semanticDecisionStatus: "released",
+      ownershipLane: "normal_routing",
+      openaiSource: "openai",
+      decision: {
+        turnScope: "NEW_TRANSACTION",
+        semanticIntent: "browse_options",
+        itemScope: "broad",
+        targetId: null,
+        mutationIntent: "none",
+        action: "reply",
+        factKind: "booking_fact",
+      },
+    });
+    assert.equal(changed.ok, false);
+    assert.equal(changed.reason, "SEMANTIC_DECISION_REWRITE_CONTRADICTION");
+    assert.equal(getCloudInboundSemanticDecision({ identity }).itemScope, "specific");
+  });
+});
+
 test("ledger enforces scope-aware semantic-intent validation without reconstruction", async () => {
   await withLedger(() => {
     const persistScope = (suffix, turnScope, semanticIntent, include = true) => {
@@ -110,6 +146,9 @@ test("ledger enforces scope-aware semantic-intent validation without reconstruct
         factKind: "booking_fact",
       };
       if (include) decision.semanticIntent = semanticIntent;
+      if (turnScope === "NEW_TRANSACTION") {
+        decision.itemScope = semanticIntent === "browse_options" ? "broad" : "specific";
+      }
       return persistCloudInboundSemanticDecision({
         identity,
         decision,
@@ -169,6 +208,13 @@ test("ledger enforces scope-aware semantic-intent validation without reconstruct
       persistScope("historical-new", "NEW_TRANSACTION", null, false).reason,
       "INVALID_SEMANTIC_DECISION"
     );
+    const historicalProtected = persistScope(
+      "historical-old-no-scope",
+      "OLD_BOOKING_REFERENCE",
+      null
+    );
+    assert.equal(historicalProtected.ok, true);
+    assert.equal(historicalProtected.decision.itemScope, null);
   });
 });
 

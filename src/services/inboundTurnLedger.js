@@ -1500,6 +1500,35 @@ export function markCloudInboundTurnPostConfirmOwned({ identity } = {}) {
 }
 
 const CLOUD_SEMANTIC_DECISION_VERSION = 1;
+const CLOUD_SEMANTIC_ITEM_SCOPES = new Set(["specific", "broad", "none"]);
+const CLOUD_SEMANTIC_SPECIFIC_ITEM_INTENTS = new Set([
+  "availability_inquiry",
+  "pricing_inquiry",
+  "pricing_with_duration",
+  "booking_request",
+  "details_inquiry",
+  "image_catalog_request",
+]);
+
+function cleanCloudSemanticItemScope(value) {
+  const scope = cleanSemanticField(value, 20);
+  return CLOUD_SEMANTIC_ITEM_SCOPES.has(scope) ? scope : null;
+}
+
+function isCloudSemanticItemScopeConsistent(turnScope, semanticIntent, itemScope) {
+  if (turnScope === "NEW_TRANSACTION") {
+    if (!itemScope) return false;
+    if (semanticIntent === "browse_options") return itemScope === "broad";
+    if (CLOUD_SEMANTIC_SPECIFIC_ITEM_INTENTS.has(semanticIntent)) {
+      return itemScope === "specific";
+    }
+    return true;
+  }
+  if (turnScope === "SOCIAL_GENERAL" || turnScope === "UNCLEAR") {
+    return itemScope == null || itemScope === "none";
+  }
+  return itemScope == null || CLOUD_SEMANTIC_ITEM_SCOPES.has(itemScope);
+}
 const CLOUD_SEMANTIC_DECISION_STATUSES = new Set(["accepted", "released"]);
 const CLOUD_SEMANTIC_OWNERSHIP_LANES = new Set([
   "post_confirm_pa",
@@ -1540,6 +1569,8 @@ function sameSemanticMeaning(left, right) {
     cleanSemanticField(left?.turnScope) === cleanSemanticField(right?.turnScope) &&
     cleanCustomerSemanticIntent(left?.semanticIntent) ===
       cleanCustomerSemanticIntent(right?.semanticIntent) &&
+    cleanCloudSemanticItemScope(left?.itemScope) ===
+      cleanCloudSemanticItemScope(right?.itemScope) &&
     cleanSemanticField(left?.targetId) === cleanSemanticField(right?.targetId) &&
     cleanSemanticField(left?.targetContext) ===
       cleanSemanticField(right?.targetContext) &&
@@ -1588,6 +1619,13 @@ function sanitizeCloudSemanticDecision(p = {}) {
   if (turnScope === "NEW_TRANSACTION" && !semanticIntent) return null;
   if (turnScope === "SOCIAL_GENERAL" && semanticIntent !== "social") return null;
   if (turnScope === "UNCLEAR" && semanticIntent !== "unclear") return null;
+  const hasItemScope = Object.prototype.hasOwnProperty.call(p, "itemScope");
+  const rawItemScope = p.itemScope;
+  const itemScope = cleanCloudSemanticItemScope(rawItemScope);
+  if (hasItemScope && rawItemScope != null && !itemScope) return null;
+  if (!isCloudSemanticItemScopeConsistent(turnScope, semanticIntent, itemScope)) {
+    return null;
+  }
   const status = cleanSemanticField(p.semanticDecisionStatus, 40);
   if (!CLOUD_SEMANTIC_DECISION_STATUSES.has(status)) return null;
   const ownershipLane =
@@ -1599,6 +1637,7 @@ function sanitizeCloudSemanticDecision(p = {}) {
     guaranteeKey: cleanSemanticField(p.guaranteeKey, 300),
     turnScope,
     semanticIntent,
+    itemScope,
     targetId: cleanSemanticField(p.targetId, 160),
     targetContext: cleanSemanticField(p.targetContext, 80),
     selectedBookingId: cleanSemanticField(p.selectedBookingId, 160),
