@@ -83,6 +83,7 @@ function confirmedFacts(overrides = {}) {
   };
   return {
     businessId: BUSINESS_ID,
+    currentOwnershipTurnId: "user:test",
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Rentals", tone: "friendly" },
     booking,
@@ -128,6 +129,13 @@ function confirmedFacts(overrides = {}) {
 function inferTestOwnership(overrides = {}) {
   const action = overrides.action ?? "reply";
   if (overrides.turnScope) {
+    const targetId = Object.prototype.hasOwnProperty.call(overrides, "targetId")
+      ? overrides.targetId
+      : overrides.turnScope === "OLD_BOOKING_REFERENCE"
+        ? inferOldBookingTargetId(overrides)
+        : overrides.turnScope === "PENDING_AVAILABILITY_REFERENCE"
+          ? "avr-pending-stonic"
+          : null;
     return {
       turnScope: overrides.turnScope,
       semanticIntent:
@@ -136,13 +144,18 @@ function inferTestOwnership(overrides = {}) {
           : overrides.turnScope === "UNCLEAR"
             ? "unclear"
             : null,
-      targetId: Object.prototype.hasOwnProperty.call(overrides, "targetId")
-        ? overrides.targetId
-        : overrides.turnScope === "OLD_BOOKING_REFERENCE"
-          ? inferOldBookingTargetId(overrides)
-          : overrides.turnScope === "PENDING_AVAILABILITY_REFERENCE"
-            ? "avr-pending-stonic"
-            : null,
+      targetId,
+      ...(overrides.turnScope === "OLD_BOOKING_REFERENCE"
+        ? {
+            itemScope: "specific",
+            targetReference: {
+              source: "current_turn",
+              sourceTurnId: "user:test",
+              targetType: "historical_booking",
+              targetId,
+            },
+          }
+        : {}),
     };
   }
   if (
@@ -172,12 +185,20 @@ function inferTestOwnership(overrides = {}) {
       targetId: null,
     };
   }
+  const targetId = Object.prototype.hasOwnProperty.call(overrides, "targetId")
+    ? overrides.targetId
+    : inferOldBookingTargetId(overrides);
   return {
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
-    targetId: Object.prototype.hasOwnProperty.call(overrides, "targetId")
-      ? overrides.targetId
-      : inferOldBookingTargetId(overrides),
+    itemScope: "specific",
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: "user:test",
+      targetType: "historical_booking",
+      targetId,
+    },
+    targetId,
   };
 }
 
@@ -1082,6 +1103,7 @@ test("two unsupported OpenAI replies fail closed and become terminal (not Cloud-
 test("multiple active bookings stay in the same OpenAI lane and expose only safe candidate facts", async () => {
   const counters = {};
   const facts = {
+    currentOwnershipTurnId: "user:test",
     business: { name: "Emily Rentals" },
     booking: null,
     activeBookings: [
@@ -1162,6 +1184,7 @@ function trustedMultiBookingFacts({ withFocus = true } = {}) {
   };
   return {
     businessId: BUSINESS_ID,
+    currentOwnershipTurnId: "user:test",
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Rentals", tone: "friendly" },
     booking: withFocus ? corolla : null,
@@ -1958,6 +1981,7 @@ function trustedStonicFocusFacts() {
   };
   return {
     businessId: BUSINESS_ID,
+    currentOwnershipTurnId: "user:test",
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Rentals", tone: "friendly" },
     booking: stonic,
@@ -2230,6 +2254,7 @@ test("valid single-booking trusted focus index 1 still resolves facts.booking ca
   };
   const facts = {
     businessId: BUSINESS_ID,
+    currentOwnershipTurnId: "user:test",
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Rentals", tone: "friendly" },
     booking,

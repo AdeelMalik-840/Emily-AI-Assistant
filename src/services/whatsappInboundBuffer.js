@@ -14,7 +14,12 @@ import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js
 import {
   appendConversationMessage,
   getRecentConversationForPrompt,
+  getRecentConversationReferenceContext,
 } from "./conversationStore.js";
+import {
+  applySessionMemoryFromActionPlan,
+  readTrustedFreshItemFocus,
+} from "./executors/sessionMemoryExecutor.js";
 import {
   sendWhatsAppInteractiveButtons,
   sendWhatsAppMessage,
@@ -2162,13 +2167,12 @@ export async function executeWhatsAppAiPipeline(p) {
     }
 
   let conversationHistory = "";
+  let conversationReferenceContext = [];
   try {
-    conversationHistory = await getRecentConversationForPrompt(
-      db,
-      ownerUserId,
-      conversationCustomerNumber,
-      20
-    );
+    [conversationHistory, conversationReferenceContext] = await Promise.all([
+      getRecentConversationForPrompt(db, ownerUserId, conversationCustomerNumber, 20),
+      getRecentConversationReferenceContext(db, ownerUserId, conversationCustomerNumber, 20),
+    ]);
   } catch (e) {
     console.error("[whatsappInboundBuffer] load conversation:", e);
   }
@@ -2192,6 +2196,25 @@ export async function executeWhatsAppAiPipeline(p) {
     v2LiveMemoryNeeded || shadowEligible
       ? await loadBrainV2SessionMemorySnapshot(memorySnapshotParams)
       : null;
+  if (!isGroupInbound && shadowPreTurnMemorySnapshot?.lastFreshItemFocus) {
+    const trustedFreshFocus = readTrustedFreshItemFocus(shadowPreTurnMemorySnapshot);
+    const staleFocusItemId = String(
+      shadowPreTurnMemorySnapshot.lastFreshItemFocus?.itemId ?? ""
+    ).trim();
+    if (
+      !trustedFreshFocus &&
+      staleFocusItemId &&
+      String(shadowPreTurnMemorySnapshot.lastResolvedItemId ?? "").trim() ===
+        staleFocusItemId
+    ) {
+      shadowPreTurnMemorySnapshot = {
+        ...shadowPreTurnMemorySnapshot,
+        lastItem: null,
+        lastResolvedItemId: null,
+        lastFreshItemFocus: null,
+      };
+    }
+  }
   const dmHandoffBookingItem =
     !isGroupInbound && p?.bookingHint
       ? await loadDmHandoffBookingItem({
@@ -2425,16 +2448,26 @@ export async function executeWhatsAppAiPipeline(p) {
           semanticDecisionStatus: snapshot?.semanticDecisionStatus ?? null,
         });
       } else {
+        const currentOwnershipTurnId = `user:${String(messageId ?? "").trim()}`;
+        const trustedFreshItemFocus = readTrustedFreshItemFocus(
+          shadowPreTurnMemorySnapshot
+        );
+        const baseOwnershipFacts = {
+          ...(preResolvedPostConfirmBookingFacts?.facts ?? {}),
+          ownershipReferenceContext: conversationReferenceContext,
+          currentOwnershipTurnId,
+          trustedFreshItemFocus,
+        };
         const decided =
           typeof p.__executeCloudDmOwnershipDecisionFn === "function"
             ? await p.__executeCloudDmOwnershipDecisionFn({
-                facts: preResolvedPostConfirmBookingFacts?.facts ?? {},
+                facts: baseOwnershipFacts,
                 pendingRequest: preResolvedFreshWaitingConfirmRequest,
                 userMessage: latestMessage,
                 conversationHistory,
               })
             : await resolveCloudDmCanonicalOwnership({
-                facts: preResolvedPostConfirmBookingFacts?.facts ?? {},
+                facts: baseOwnershipFacts,
                 pendingRequest: preResolvedFreshWaitingConfirmRequest,
                 userMessage: latestMessage,
                 conversationHistory,
@@ -2454,7 +2487,7 @@ export async function executeWhatsAppAiPipeline(p) {
         const ownershipFacts = buildNeutralCloudDmOwnershipFacts(
           decided.facts && typeof decided.facts === "object"
             ? decided.facts
-            : preResolvedPostConfirmBookingFacts?.facts ?? {},
+            : baseOwnershipFacts,
           preResolvedFreshWaitingConfirmRequest
         );
         const canonicalDecision = applyPostConfirmDerivedOwnershipMechanics(
@@ -3395,11 +3428,70 @@ export async function executeWhatsAppAiPipeline(p) {
 
       if (outboundReplyDelivered) {
         try {
+          const actionPlan = messageMeta?.actionPlan;
+          const persistence = actionPlan?.persistenceIntent;
+          const presentedItemId =
+            persistence?.rememberPresentedItemFocus === true
+              ? String(persistence?.presentedItemId ?? "").trim()
+              : "";
+          const verifiedAlternativeIds = new Set(
+            (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
+              .flatMap((action) =>
+                Array.isArray(action?.payload?.verifiedAlternatives)
+                  ? action.payload.verifiedAlternatives
+                  : []
+              )
+              .map((row) => String(row?.itemId ?? "").trim())
+              .filter(Boolean)
+          );
+          const declaredPresentedIds = new Set(
+            (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
+              .flatMap((action) =>
+                Array.isArray(action?.payload?.presentedItemIds)
+                  ? action.payload.presentedItemIds
+                  : []
+              )
+              .map((id) => String(id ?? "").trim())
+              .filter(Boolean)
+          );
+          const verifiedReferences =
+            presentedItemId &&
+            declaredPresentedIds.size === 1 &&
+            declaredPresentedIds.has(presentedItemId) &&
+            verifiedAlternativeIds.has(presentedItemId)
+              ? [{
+                  kind: "catalog_item",
+                  targetId: presentedItemId,
+                  provenance: "verified_assistant_presented_item",
+                  expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+                }]
+              : [];
+          const postConfirmBookingId =
+            messageMeta?.customerBusinessPaHandled === true
+              ? String(messageMeta?.bookingId ?? "").trim()
+              : "";
+          if (postConfirmBookingId) {
+            verifiedReferences.push({
+              kind: "historical_booking",
+              targetId: postConfirmBookingId,
+              provenance: "verified_post_confirm_reply",
+              expiresAt: null,
+            });
+          }
+          if (actionPlan?.persistenceIntent?.rememberPresentedItemFocus === true) {
+            applySessionMemoryFromActionPlan({
+              sessionKey,
+              actionPlan,
+              sourceTurnId: `assistant:${String(messageId ?? "").trim()}`,
+              outboundDelivered: true,
+            });
+          }
           await appendConversationMessage(db, {
             ownerUserId,
             customerNumber: conversationCustomerNumber,
             role: "assistant",
             text: replyText,
+            verifiedReferences,
             ...(persistCloudDmConversationIdentity
               ? {
                   sourceMessageId: messageId || null,

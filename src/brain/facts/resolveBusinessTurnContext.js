@@ -438,6 +438,27 @@ function resolveBusinessDecision(p) {
       "details_inquiry",
       "image_catalog_request",
     ]);
+    const boundedExplicitItemIds = Array.isArray(understanding?.resolvedItemIds)
+      ? understanding.resolvedItemIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+      : [];
+    if (authoritativeItemScope === "specific" && boundedExplicitItemIds.length > 1) {
+      return Object.freeze({
+        primaryIntent: authoritativeSemanticIntent,
+        secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
+        workflowType: "clarification",
+        replyType: "clarification",
+        requestedField: canonicalRequestedField,
+        resolvedItemId: null,
+        boundedExplicitItemIds: Object.freeze([...boundedExplicitItemIds]),
+        durationDays,
+        strongBookingCommand: authoritativeSemanticIntent === "booking_request",
+        weakContextSignals: Object.freeze(weakContextSignals),
+        sideEffectsAllowed: Object.freeze([]),
+        contextToPersist: Object.freeze({}),
+        confidence: "high",
+        reason: "bounded_explicit_item_set_requires_clarification",
+      });
+    }
     const useUnlistedItem =
       authoritativeItemScope === "specific" &&
       !hasResolvedItem &&
@@ -937,6 +958,7 @@ export async function resolveBusinessTurnContext(params) {
   };
 
   let unavailableCustomerReply = null;
+  let presentedAlternativeItemIds = [];
   if (
     isConfidentInventoryUnavailable(availabilityFacts.availability) &&
     lastAvailabilityAssist == null
@@ -961,10 +983,11 @@ export async function resolveBusinessTurnContext(params) {
       )
     );
     try {
-      unavailableCustomerReply = await composeUnavailableCustomerReplyFromFacts({
+      const composedUnavailable = await composeUnavailableCustomerReplyFromFacts({
         conversationalLabel,
         durationDays: durationForReply,
         alternatives: verifiedAlternatives,
+        returnPresentationMetadata: true,
         chatCompletionsCreate:
           typeof params.__unavailableReplyChatCreate === "function"
             ? null
@@ -977,9 +1000,17 @@ export async function resolveBusinessTurnContext(params) {
           typeof params.__unavailableReplyForTests === "string"
             ? params.__unavailableReplyForTests
             : null,
+        __presentedItemIdsForTests: Array.isArray(params.__presentedItemIdsForTests)
+          ? params.__presentedItemIdsForTests
+          : null,
       });
+      unavailableCustomerReply = String(composedUnavailable?.reply ?? "").trim() || null;
+      presentedAlternativeItemIds = Array.isArray(composedUnavailable?.presentedItemIds)
+        ? composedUnavailable.presentedItemIds
+        : [];
     } catch {
       unavailableCustomerReply = null;
+      presentedAlternativeItemIds = [];
     }
   }
 
@@ -1100,6 +1131,7 @@ export async function resolveBusinessTurnContext(params) {
     lastAvailabilityAssist,
     availabilityAssistFollowUp,
     unavailableCustomerReply,
+    presentedAlternativeItemIds: Object.freeze([...presentedAlternativeItemIds]),
 
     resolvedItem: {
       status: itemFacts.status,

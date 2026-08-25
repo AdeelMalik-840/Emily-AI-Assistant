@@ -259,6 +259,12 @@ test("accepted retry does not rewrite a frozen NEW_TRANSACTION snapshot", async 
       openaiSource: "openai",
       decision: {
         turnScope: "OLD_BOOKING_REFERENCE",
+        targetReference: {
+          source: "current_turn",
+          sourceTurnId: "user:rewrite",
+          targetType: "historical_booking",
+          targetId: CIVIC_OLD_ID,
+        },
         targetId: CIVIC_OLD_ID,
         action: "reply",
         mutationIntent: "none",

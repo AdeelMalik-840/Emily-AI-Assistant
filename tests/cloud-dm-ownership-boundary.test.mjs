@@ -81,11 +81,20 @@ async function resolveWithDecision(decision, facts, message, extra = {}) {
         : decision?.turnScope === "NEW_TRANSACTION"
           ? "availability_inquiry"
           : null;
+  const targetReference =
+    decision?.turnScope === "OLD_BOOKING_REFERENCE"
+      ? {
+          source: "current_turn",
+          sourceTurnId: "user:test-current",
+          targetType: "historical_booking",
+          targetId: decision.targetId,
+        }
+      : undefined;
   const { create, state } = countingCreate(async () =>
-    chatCompletionFromDecision({ semanticIntent, ...decision })
+    chatCompletionFromDecision({ semanticIntent, targetReference, ...decision })
   );
   const result = await resolveCloudDmCanonicalOwnership({
-    facts,
+    facts: { ...facts, currentOwnershipTurnId: "user:test-current" },
     userMessage: message,
     __chatCompletionsCreateForTests: create,
     ...extra,
@@ -170,6 +179,7 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
     "turnScope",
     "semanticIntent",
     "itemScope",
+    "targetReference",
     "targetId",
     "mutationIntent",
     "action",
@@ -494,6 +504,12 @@ test("accepted retry / outbound_locked recovery keep ownership completions at 0 
         turnScope: "OLD_BOOKING_REFERENCE",
         targetId: PROD_STONIC_BOOKING_ID,
         selectedBookingId: PROD_STONIC_BOOKING_ID,
+        targetReference: {
+          source: "current_turn",
+          sourceTurnId: "user:wamid.own-resume",
+          targetType: "historical_booking",
+          targetId: PROD_STONIC_BOOKING_ID,
+        },
         action: "reply",
         mutationIntent: "none",
       },

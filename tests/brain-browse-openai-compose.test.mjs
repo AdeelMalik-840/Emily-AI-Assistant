@@ -79,6 +79,7 @@ test("zero verified options composes without repopulating catalog items", async 
   assert.match(prompt, /"availableCount":0/);
   assert.match(prompt, /"availableItems":\[\]/);
   assert.doesNotMatch(prompt, /Alpha Plan|Beta Plan|Gamma Plan/);
+  assert.deepEqual(out.mentionedAvailableItemIds, []);
 });
 
 test("one verified option is presented without a false choice question", async () => {
@@ -94,6 +95,7 @@ test("one verified option is presented without a false choice question", async (
   assert.equal(out.ok, true);
   assert.match(out.reply, /Alpha Plan/);
   assert.doesNotMatch(out.reply, /which|choose|select|pick/i);
+  assert.deepEqual(out.mentionedAvailableItemIds, ["alpha"]);
 });
 
 test("multiple verified options may ask preference", async () => {
@@ -108,6 +110,7 @@ test("multiple verified options may ask preference", async () => {
   assert.equal(out.ok, true);
   assert.match(out.reply, /Alpha Plan/);
   assert.match(out.reply, /Beta Plan/);
+  assert.deepEqual(out.mentionedAvailableItemIds, ["alpha", "beta"]);
 });
 
 test("known but unavailable catalog item is rejected", async () => {

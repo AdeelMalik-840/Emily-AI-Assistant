@@ -7,7 +7,10 @@ import {
   extractTurnSignals,
   resolveTurnIntentShape,
 } from "../../services/intentShapeResolver.js";
-import { hasExplicitNewItemMention } from "../../services/currentTurnAuthority.js";
+import {
+  hasExplicitNewItemMention,
+  listExplicitCatalogItemIds,
+} from "../../services/currentTurnAuthority.js";
 import { detectUnlistedMentionLabel } from "./unlistedMention.js";
 import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
 import {
@@ -74,6 +77,9 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     String(turnContext?.lastResolvedItemId ?? pendingAction?.itemId ?? "").trim() || null;
 
   const explicitMention = hasExplicitNewItemMention(message, items, lockedItemId);
+  const explicitItemIds = listExplicitCatalogItemIds(message, items);
+  const boundedExplicitSet =
+    Boolean(authoritativeSemanticIntent) && explicitItemIds.length > 1;
   const durationParsed = parseUserDuration(message);
   const durationDays =
     durationParsed != null && Number.isFinite(Number(durationParsed.normalizedDays))
@@ -105,7 +111,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
   /** @type {"high" | "medium" | "low"} */
   let itemConfidence = "low";
 
-  if (explicitMention.found && explicitMention.itemId) {
+  if (!boundedExplicitSet && explicitMention.found && explicitMention.itemId) {
     const row = findCatalogItemById(items, explicitMention.itemId);
     resolvedItemId = explicitMention.itemId;
     resolvedItemLabel =
@@ -131,6 +137,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
   }
 
   const ambiguities = [];
+  if (boundedExplicitSet) ambiguities.push("bounded_explicit_item_set");
   if (!resolvedItemId && (signals.priceAsk || signals.bookingCommitment)) {
     ambiguities.push("missing_resolved_item");
   }
@@ -139,7 +146,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
   }
 
   let unlistedMentionLabel =
-    authoritativeSemanticIntent === "browse_options"
+    authoritativeSemanticIntent === "browse_options" || boundedExplicitSet
       ? undefined
       : detectUnlistedMentionLabel(
           message,
@@ -167,6 +174,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
 
   return Object.freeze({
     resolvedItemId: resolvedItemId ?? undefined,
+    resolvedItemIds: explicitItemIds.length ? Object.freeze([...explicitItemIds]) : undefined,
     resolvedItemLabel: resolvedItemLabel ?? undefined,
     itemSource,
     itemConfidence,

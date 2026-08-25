@@ -1562,6 +1562,25 @@ function cleanSemanticField(value, max = 160) {
   return text ? text.slice(0, max) : null;
 }
 
+function sanitizeSemanticTargetReference(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const source = cleanSemanticField(raw.source, 60);
+  const targetType = cleanSemanticField(raw.targetType, 60);
+  if (![
+    "current_turn",
+    "conversation_turn",
+    "trusted_fresh_focus",
+    "none",
+  ].includes(source)) return null;
+  if (!["historical_booking", "pending_availability", "catalog_item", "none"].includes(targetType)) return null;
+  return {
+    source,
+    sourceTurnId: cleanSemanticField(raw.sourceTurnId, 320),
+    targetType,
+    targetId: cleanSemanticField(raw.targetId, 160),
+  };
+}
+
 function sameSemanticMeaning(left, right) {
   const normalizedEvidence = (value) =>
     JSON.stringify(sanitizeSemanticEvidenceNeeds(value));
@@ -1571,6 +1590,8 @@ function sameSemanticMeaning(left, right) {
       cleanCustomerSemanticIntent(right?.semanticIntent) &&
     cleanCloudSemanticItemScope(left?.itemScope) ===
       cleanCloudSemanticItemScope(right?.itemScope) &&
+    JSON.stringify(sanitizeSemanticTargetReference(left?.targetReference)) ===
+      JSON.stringify(sanitizeSemanticTargetReference(right?.targetReference)) &&
     cleanSemanticField(left?.targetId) === cleanSemanticField(right?.targetId) &&
     cleanSemanticField(left?.targetContext) ===
       cleanSemanticField(right?.targetContext) &&
@@ -1622,6 +1643,12 @@ function sanitizeCloudSemanticDecision(p = {}) {
   const hasItemScope = Object.prototype.hasOwnProperty.call(p, "itemScope");
   const rawItemScope = p.itemScope;
   const itemScope = cleanCloudSemanticItemScope(rawItemScope);
+  const targetReference =
+    sanitizeSemanticTargetReference(p.targetReference) ||
+    (turnScope !== "OLD_BOOKING_REFERENCE"
+      ? { source: "none", sourceTurnId: null, targetType: "none", targetId: null }
+      : null);
+  if (!targetReference) return null;
   if (hasItemScope && rawItemScope != null && !itemScope) return null;
   if (!isCloudSemanticItemScopeConsistent(turnScope, semanticIntent, itemScope)) {
     return null;
@@ -1638,6 +1665,7 @@ function sanitizeCloudSemanticDecision(p = {}) {
     turnScope,
     semanticIntent,
     itemScope,
+    targetReference,
     targetId: cleanSemanticField(p.targetId, 160),
     targetContext: cleanSemanticField(p.targetContext, 80),
     selectedBookingId: cleanSemanticField(p.selectedBookingId, 160),

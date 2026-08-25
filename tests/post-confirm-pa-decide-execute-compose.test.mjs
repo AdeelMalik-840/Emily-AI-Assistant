@@ -140,6 +140,7 @@ function multiFacts({ withFocus = true } = {}) {
   };
   return {
     businessId: BUSINESS_ID,
+    currentOwnershipTurnId: "user:test",
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Rentals", tone: "friendly" },
     booking: withFocus ? corolla : null,
@@ -185,6 +186,7 @@ function singleBookingFacts() {
   };
   return {
     businessId: BUSINESS_ID,
+    currentOwnershipTurnId: "user:test",
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Rentals", tone: "friendly" },
     booking,
@@ -257,9 +259,17 @@ function inferTestOnlyFactKind(d) {
 function decisionJson(overrides = {}) {
   const selectedIndex = Number(overrides.selectedBookingIndex ?? 1);
   const targetId = selectedIndex === 3 ? "booking-stonic" : "booking-corolla";
+  const referencedTargetId = String(overrides.targetId ?? targetId);
   const payload = {
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
+    itemScope: "specific",
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: "user:test",
+      targetType: "historical_booking",
+      targetId: referencedTargetId,
+    },
     targetContext: "CONFIRMED_BOOKING",
     targetId,
     situation: "protected_action",
@@ -307,9 +317,17 @@ function decisionJson(overrides = {}) {
 }
 
 function infoDecisionJson(reply, overrides = {}) {
+  const referencedTargetId = String(overrides.targetId ?? "booking-only");
   const payload = {
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
+    itemScope: "specific",
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: "user:test",
+      targetType: "historical_booking",
+      targetId: referencedTargetId,
+    },
     targetContext: "CONFIRMED_BOOKING",
     targetId: "booking-only",
     situation: "new_question",
