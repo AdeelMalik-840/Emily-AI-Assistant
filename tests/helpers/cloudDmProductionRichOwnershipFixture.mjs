@@ -171,8 +171,18 @@ export function productionRichThreeCivicFacts() {
 }
 
 export function ownershipDecisionPayload(overrides = {}) {
+  const semanticIntent = overrides.semanticIntent ?? null;
+  const turnScope = overrides.turnScope ?? "NEW_TRANSACTION";
+  const itemScope =
+    overrides.itemScope ??
+    (turnScope === "SOCIAL_GENERAL" || turnScope === "UNCLEAR"
+      ? "none"
+      : semanticIntent === "browse_options"
+        ? "broad"
+        : "specific");
   return {
     turnScope: "NEW_TRANSACTION",
+    itemScope,
     targetId: null,
     mutationIntent: "none",
     action: "reply",

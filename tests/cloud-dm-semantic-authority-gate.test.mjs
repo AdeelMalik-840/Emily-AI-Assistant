@@ -61,6 +61,10 @@ function canonicalDecision(semanticIntent) {
     action: "reply",
     factKind: "booking_fact",
     semanticIntent,
+    itemScope: semanticIntent === "browse_options" ? "broad" :
+      ["general_business_question", "clarification", "social", "unclear"].includes(semanticIntent)
+        ? "none"
+        : "specific",
     semanticDecisionStatus: "released",
     semanticDecisionVersion: 1,
     ownershipLane: "normal_routing",
@@ -389,6 +393,7 @@ test("genuine explicit unlisted item remains unlisted within a compatible canoni
     memorySnapshot: {},
   });
   turnContext.authoritativeSemanticIntent = "availability_inquiry";
+  turnContext.canonicalSemanticDecision = canonicalDecision("availability_inquiry");
   const facts = await resolveBusinessTurnContext({
     traceId: "unlisted-compatible",
     businessId: "semantic-authority-biz",
@@ -402,6 +407,188 @@ test("genuine explicit unlisted item remains unlisted within a compatible canoni
   });
   assert.equal(facts.decision.workflowType, "unlisted_item");
   assert.equal(facts.decision.reason, "canonical_semantic_intent_explicit_unlisted_item");
+});
+
+test("Cloud DM itemScope gates unlisted routing without changing shared extraction", async () => {
+  const cases = [
+    {
+      name: "roman urdu broad discovery",
+      message: "abi kon kon c gariyan available hain?",
+      intent: "browse_options",
+      itemScope: "broad",
+      expected: "browse_options",
+    },
+    {
+      name: "english car discovery",
+      message: "Which cars are available?",
+      intent: "browse_options",
+      itemScope: "broad",
+      expected: "browse_options",
+    },
+    {
+      name: "english option discovery",
+      message: "What options are available?",
+      intent: "browse_options",
+      itemScope: "broad",
+      expected: "browse_options",
+    },
+    {
+      name: "itemless discovery",
+      message: "Anything available today?",
+      intent: "browse_options",
+      itemScope: "broad",
+      expected: "browse_options",
+    },
+    {
+      name: "hotel discovery",
+      message: "Which rooms are available?",
+      intent: "browse_options",
+      itemScope: "broad",
+      expected: "browse_options",
+    },
+    {
+      name: "salon discovery",
+      message: "Which salon services are available?",
+      intent: "browse_options",
+      itemScope: "broad",
+      expected: "browse_options",
+    },
+    {
+      name: "unknown availability",
+      message: "Revo available hai?",
+      intent: "availability_inquiry",
+      itemScope: "specific",
+      expected: "unlisted_item",
+    },
+    {
+      name: "unknown availability multiword",
+      message: "Spaceship Premium available hai?",
+      intent: "availability_inquiry",
+      itemScope: "specific",
+      expected: "unlisted_item",
+    },
+    {
+      name: "unknown pricing",
+      message: "Revo ka price?",
+      intent: "pricing_inquiry",
+      itemScope: "specific",
+      expected: "unlisted_item",
+    },
+    {
+      name: "unknown media",
+      message: "Revo ki pictures?",
+      intent: "image_catalog_request",
+      itemScope: "specific",
+      expected: "unlisted_item",
+    },
+    {
+      name: "unknown booking",
+      message: "Kia Sportage 3 din ke liye book kar do",
+      intent: "booking_request",
+      itemScope: "specific",
+      expected: "unlisted_item",
+    },
+  ];
+
+  for (const entry of cases) {
+    const input = buildTurnContextInput({
+      channel: "whatsapp_cloud",
+      chatType: "dm",
+      businessId: "semantic-authority-biz",
+      chatId: `scope-${entry.name}`,
+      messageText: entry.message,
+      participantKey: "scope-customer",
+      sessionKey: `scope-${entry.name}`,
+      catalogItems,
+      authoritativeSemanticIntent: entry.intent,
+    });
+    const turnContext = buildShadowTurnContext({
+      businessId: "semantic-authority-biz",
+      sessionKey: `scope-${entry.name}`,
+      participantKey: "scope-customer",
+      memorySnapshot: {},
+    });
+    turnContext.authoritativeSemanticIntent = entry.intent;
+    turnContext.canonicalSemanticDecision = {
+      ...canonicalDecision(entry.intent),
+      itemScope: entry.itemScope,
+    };
+    const facts = await resolveBusinessTurnContext({
+      traceId: `scope-${entry.name}`,
+      businessId: "semantic-authority-biz",
+      rawMessage: entry.message,
+      turnContextInput: input,
+      turnContext,
+      catalogItems,
+      getBookingsForItemFn: async () => [],
+      getBusinessProfileFn: async () => ({}),
+      log: false,
+    });
+    assert.equal(facts.decision.workflowType, entry.expected, entry.name);
+  }
+});
+
+test("known item stays normal and historical missing itemScope cannot gain unlisted permission", async () => {
+  const cases = [
+    {
+      name: "known Corolla",
+      message: "Corolla available hai?",
+      itemScope: "specific",
+      expected: "availability_inquiry",
+      expectedItem: "corolla",
+    },
+    {
+      name: "historical new transaction snapshot",
+      message: "Revo available hai?",
+      itemScope: undefined,
+      expected: "availability_inquiry",
+      expectedItem: null,
+    },
+    {
+      name: "none scope cannot consume a label",
+      message: "Revo available hai?",
+      itemScope: "none",
+      expected: "availability_inquiry",
+      expectedItem: null,
+    },
+  ];
+  for (const entry of cases) {
+    const input = buildTurnContextInput({
+      channel: "whatsapp_cloud",
+      chatType: "dm",
+      businessId: "semantic-authority-biz",
+      chatId: `safe-${entry.name}`,
+      messageText: entry.message,
+      participantKey: "safe-customer",
+      sessionKey: `safe-${entry.name}`,
+      catalogItems,
+      authoritativeSemanticIntent: "availability_inquiry",
+    });
+    const turnContext = buildShadowTurnContext({
+      businessId: "semantic-authority-biz",
+      sessionKey: `safe-${entry.name}`,
+      participantKey: "safe-customer",
+      memorySnapshot: {},
+    });
+    turnContext.authoritativeSemanticIntent = "availability_inquiry";
+    turnContext.canonicalSemanticDecision = {
+      ...canonicalDecision("availability_inquiry"),
+      itemScope: entry.itemScope,
+    };
+    const facts = await resolveBusinessTurnContext({
+      traceId: `safe-${entry.name}`,
+      businessId: "semantic-authority-biz",
+      rawMessage: entry.message,
+      turnContextInput: input,
+      turnContext,
+      catalogItems,
+      getBookingsForItemFn: async () => [],
+      getBusinessProfileFn: async () => ({}),
+      log: false,
+    });
+    assert.equal(facts.decision.workflowType, entry.expected, entry.name);
+    assert.equal(facts.resolvedItem.id, entry.expectedItem, entry.name);
+  }
 });
 
 test("authority gate is not applied to Group turns", async () => {

@@ -417,6 +417,11 @@ function resolveBusinessDecision(p) {
   const authoritativeSemanticIntent = cleanCustomerSemanticIntent(
     p.authoritativeSemanticIntent ?? understanding?.authoritativeSemanticIntent
   );
+  const authoritativeItemScope = ["specific", "broad", "none"].includes(
+    p.authoritativeItemScope
+  )
+    ? p.authoritativeItemScope
+    : null;
   if (authoritativeSemanticIntent) {
     const canonicalWorkflowType = workflowTypeForCustomerSemanticIntent(
       authoritativeSemanticIntent
@@ -434,6 +439,7 @@ function resolveBusinessDecision(p) {
       "image_catalog_request",
     ]);
     const useUnlistedItem =
+      authoritativeItemScope === "specific" &&
       !hasResolvedItem &&
       Boolean(unlistedMentionLabel) &&
       unlistedCompatible.has(authoritativeSemanticIntent);
@@ -667,6 +673,11 @@ export async function resolveBusinessTurnContext(params) {
     turnContextInput?.authoritativeSemanticIntent ??
       params.turnContext?.authoritativeSemanticIntent
   );
+  const authoritativeItemScope = ["specific", "broad", "none"].includes(
+    params.turnContext?.canonicalSemanticDecision?.itemScope
+  )
+    ? params.turnContext.canonicalSemanticDecision.itemScope
+    : null;
   const understanding =
     admittedTurn && params.turnContext
       ? understandTurn({
@@ -1167,6 +1178,7 @@ export async function resolveBusinessTurnContext(params) {
     canonicalDurationDays: rentalDurationDays,
     turnShape: turnContextInput?.turnShape ?? null,
     authoritativeSemanticIntent,
+    authoritativeItemScope,
   });
 
   resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);

@@ -127,6 +127,7 @@ test("fresh Civic independent ask validates as NEW_TRANSACTION with null targetI
     {
       turnScope: "NEW_TRANSACTION",
       semanticIntent: "availability_inquiry",
+      itemScope: "specific",
       targetId: null,
       action: "reply",
       mutationIntent: "none",
@@ -243,6 +244,7 @@ test("accepted retry does not rewrite a frozen NEW_TRANSACTION snapshot", async 
       decision: {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
+        itemScope: "specific",
         targetId: null,
         action: "reply",
         mutationIntent: "none",
