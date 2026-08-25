@@ -373,8 +373,16 @@ test("canonical availability and media intents retain date-window and verified-m
   }
 });
 
-test("genuine explicit unlisted item remains unlisted within a compatible canonical family", async () => {
+test("canonical unknown item remains in its semantic family", async () => {
   const message = "Spaceship Premium available hai?";
+  const itemReferents = [{
+    source: "current_turn",
+    surfaceText: "Spaceship Premium",
+    start: 0,
+    end: 17,
+    trustedItemId: null,
+    sourceTurnId: null,
+  }];
   const input = buildTurnContextInput({
     channel: "whatsapp_cloud",
     chatType: "dm",
@@ -385,6 +393,7 @@ test("genuine explicit unlisted item remains unlisted within a compatible canoni
     sessionKey: "session-3",
     catalogItems,
     authoritativeSemanticIntent: "availability_inquiry",
+    canonicalItemReferents: itemReferents,
   });
   const turnContext = buildShadowTurnContext({
     businessId: "semantic-authority-biz",
@@ -393,7 +402,12 @@ test("genuine explicit unlisted item remains unlisted within a compatible canoni
     memorySnapshot: {},
   });
   turnContext.authoritativeSemanticIntent = "availability_inquiry";
-  turnContext.canonicalSemanticDecision = canonicalDecision("availability_inquiry");
+  turnContext.canonicalSemanticDecision = {
+    ...canonicalDecision("availability_inquiry"),
+    itemReferents,
+  };
+  turnContext.canonicalItemReferents = itemReferents;
+  turnContext.canonicalItemResolutions = input.canonicalItemResolutions;
   const facts = await resolveBusinessTurnContext({
     traceId: "unlisted-compatible",
     businessId: "semantic-authority-biz",
@@ -405,8 +419,9 @@ test("genuine explicit unlisted item remains unlisted within a compatible canoni
     getBusinessProfileFn: async () => ({}),
     log: false,
   });
-  assert.equal(facts.decision.workflowType, "unlisted_item");
-  assert.equal(facts.decision.reason, "canonical_semantic_intent_explicit_unlisted_item");
+  assert.equal(facts.resolvedItem.status, "not_matched");
+  assert.equal(facts.decision.workflowType, "availability_inquiry");
+  assert.equal(facts.decision.reason, "canonical_semantic_intent_authoritative");
 });
 
 test("Cloud DM itemScope gates unlisted routing without changing shared extraction", async () => {
@@ -458,39 +473,54 @@ test("Cloud DM itemScope gates unlisted routing without changing shared extracti
       message: "Revo available hai?",
       intent: "availability_inquiry",
       itemScope: "specific",
-      expected: "unlisted_item",
+      referent: "Revo",
+      expected: "availability_inquiry",
     },
     {
       name: "unknown availability multiword",
       message: "Spaceship Premium available hai?",
       intent: "availability_inquiry",
       itemScope: "specific",
-      expected: "unlisted_item",
+      referent: "Spaceship Premium",
+      expected: "availability_inquiry",
     },
     {
       name: "unknown pricing",
       message: "Revo ka price?",
       intent: "pricing_inquiry",
       itemScope: "specific",
-      expected: "unlisted_item",
+      referent: "Revo",
+      expected: "pricing_inquiry",
     },
     {
       name: "unknown media",
       message: "Revo ki pictures?",
       intent: "image_catalog_request",
       itemScope: "specific",
-      expected: "unlisted_item",
+      referent: "Revo",
+      expected: "clarification",
     },
     {
       name: "unknown booking",
       message: "Kia Sportage 3 din ke liye book kar do",
       intent: "booking_request",
       itemScope: "specific",
-      expected: "unlisted_item",
+      referent: "Kia Sportage",
+      expected: "booking_request",
     },
   ];
 
   for (const entry of cases) {
+    const itemReferents = entry.itemScope === "specific"
+      ? [{
+          source: "current_turn",
+          surfaceText: entry.referent,
+          start: entry.message.indexOf(entry.referent),
+          end: entry.message.indexOf(entry.referent) + entry.referent.length,
+          trustedItemId: null,
+          sourceTurnId: null,
+        }]
+      : [];
     const input = buildTurnContextInput({
       channel: "whatsapp_cloud",
       chatType: "dm",
@@ -501,6 +531,7 @@ test("Cloud DM itemScope gates unlisted routing without changing shared extracti
       sessionKey: `scope-${entry.name}`,
       catalogItems,
       authoritativeSemanticIntent: entry.intent,
+      canonicalItemReferents: itemReferents,
     });
     const turnContext = buildShadowTurnContext({
       businessId: "semantic-authority-biz",
@@ -512,7 +543,10 @@ test("Cloud DM itemScope gates unlisted routing without changing shared extracti
     turnContext.canonicalSemanticDecision = {
       ...canonicalDecision(entry.intent),
       itemScope: entry.itemScope,
+      itemReferents,
     };
+    turnContext.canonicalItemReferents = itemReferents;
+    turnContext.canonicalItemResolutions = input.canonicalItemResolutions;
     const facts = await resolveBusinessTurnContext({
       traceId: `scope-${entry.name}`,
       businessId: "semantic-authority-biz",

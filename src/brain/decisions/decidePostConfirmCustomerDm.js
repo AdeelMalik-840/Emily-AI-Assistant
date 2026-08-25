@@ -64,7 +64,7 @@ export const POST_CONFIRM_TURN_SCOPES = Object.freeze([
 ]);
 
 /** Durable ownership schema version. Independent of PA wording schema. */
-export const CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION = 1;
+export const CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION = 2;
 /**
  * Neutral candidate order: ascending bookingId / requestId.
  * Stable for reproducibility only. Does not mean preferred, current, latest, or selected.
@@ -106,6 +106,51 @@ const CLOUD_DM_SPECIFIC_ITEM_INTENTS = new Set([
   "details_inquiry",
   "image_catalog_request",
 ]);
+
+const CLOUD_DM_ITEM_REFERENT_SOURCES = Object.freeze([
+  "current_turn",
+  "trusted_fresh_focus",
+]);
+
+function cleanCloudDmItemReferents(raw, {
+  customerMessage = null,
+  trustedFreshItemFocus = null,
+} = {}) {
+  if (!Array.isArray(raw) || raw.length > 8) return null;
+  const message = String(customerMessage ?? "");
+  const freshId = clean(trustedFreshItemFocus?.itemId, 160) || null;
+  const freshTurnId = clean(trustedFreshItemFocus?.sourceTurnId, 320) || null;
+  const result = [];
+  for (const value of raw) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const source = clean(value.source, 60);
+    if (!CLOUD_DM_ITEM_REFERENT_SOURCES.includes(source)) return null;
+    const surfaceText = value.surfaceText == null ? null : String(value.surfaceText);
+    const start = value.start == null ? null : Number(value.start);
+    const end = value.end == null ? null : Number(value.end);
+    const trustedItemId = clean(value.trustedItemId, 160) || null;
+    const sourceTurnId = clean(value.sourceTurnId, 320) || null;
+    if (source === "current_turn") {
+      if (!surfaceText || !Number.isInteger(start) || !Number.isInteger(end) ||
+          start < 0 || end <= start || end > message.length ||
+          message.slice(start, end) !== surfaceText || trustedItemId || sourceTurnId) {
+        return null;
+      }
+    } else if (surfaceText !== null || start !== null || end !== null ||
+        !trustedItemId || !sourceTurnId || trustedItemId !== freshId || sourceTurnId !== freshTurnId) {
+      return null;
+    }
+    result.push({ source, surfaceText, start, end, trustedItemId, sourceTurnId });
+  }
+  return result;
+}
+
+function isCloudDmItemReferentContractConsistent(turnScope, itemScope, itemReferents) {
+  if (!Array.isArray(itemReferents)) return false;
+  if (turnScope !== "NEW_TRANSACTION") return itemReferents.length === 0;
+  if (itemScope === "specific") return itemReferents.length > 0;
+  return itemReferents.length === 0;
+}
 
 function cleanCloudDmItemScope(value) {
   const scope = String(value ?? "").trim();
@@ -2674,6 +2719,7 @@ function defaultDecision(overrides = {}) {
     turnScope: "UNCLEAR",
     semanticIntent: null,
     itemScope: null,
+    itemReferents: [],
     targetReference: null,
     targetContext: "NONE",
     targetId: null,
@@ -3431,6 +3477,19 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
   ) {
     return invalid("ITEM_SCOPE_SEMANTIC_CONTRADICTION");
   }
+  const itemReferentInput = Object.prototype.hasOwnProperty.call(decision ?? {}, "itemReferents")
+    ? decision.itemReferents
+    : scope === "NEW_TRANSACTION"
+      ? undefined
+      : [];
+  const itemReferents = cleanCloudDmItemReferents(itemReferentInput, {
+    customerMessage: facts?.currentCustomerMessage,
+    trustedFreshItemFocus: facts?.trustedFreshItemFocus,
+  });
+  if (!itemReferents) return invalid("ITEM_REFERENTS_INVALID");
+  if (!isCloudDmItemReferentContractConsistent(scope, itemScope, itemReferents)) {
+    return invalid("ITEM_REFERENTS_SCOPE_CONTRADICTION");
+  }
   const mutationDeclared =
     mutation !== "none" || action === "request_booking_mutation";
 
@@ -3647,7 +3706,7 @@ export function collapseIndistinguishableSameItemOwnership(
  * @param {unknown} raw
  * @returns {Record<string, unknown> | null}
  */
-export function parseCloudDmOwnershipDecision(raw) {
+export function parseCloudDmOwnershipDecision(raw, opts = {}) {
   let text = String(raw ?? "").trim();
   if (!text) return null;
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -3700,6 +3759,10 @@ export function parseCloudDmOwnershipDecision(raw) {
       : cleanCustomerSemanticIntent(rawSemanticIntent);
   const hasItemScope = Object.prototype.hasOwnProperty.call(parsed, "itemScope");
   const itemScope = cleanCloudDmItemScope(parsed.itemScope);
+  const itemReferents = cleanCloudDmItemReferents(parsed.itemReferents, {
+    customerMessage: opts.customerMessage,
+    trustedFreshItemFocus: opts.trustedFreshItemFocus,
+  });
   const targetReference =
     cleanCloudDmTargetReference(parsed.targetReference) ||
     (turnScope !== "OLD_BOOKING_REFERENCE"
@@ -3713,8 +3776,10 @@ export function parseCloudDmOwnershipDecision(raw) {
     (turnScope === "UNCLEAR" && semanticIntent !== "unclear") ||
     !hasItemScope ||
     !itemScope ||
+    !itemReferents ||
     !targetReference ||
-    !isCloudDmItemScopeConsistent(turnScope, semanticIntent, itemScope)
+    !isCloudDmItemScopeConsistent(turnScope, semanticIntent, itemScope) ||
+    !isCloudDmItemReferentContractConsistent(turnScope, itemScope, itemReferents)
   ) {
     return null;
   }
@@ -3730,6 +3795,7 @@ export function parseCloudDmOwnershipDecision(raw) {
     turnScope,
     semanticIntent,
     itemScope,
+    itemReferents,
     targetReference,
     targetId,
     mutationIntent,
@@ -3821,6 +3887,25 @@ export async function executeCloudDmOwnershipDecision({
           description:
             "specific = a bounded identified set of one or more inventory item/service referents; broad = open-ended discovery whose item set is not identified; none = no inventory-item referent.",
         },
+        itemReferents: {
+          type: "array",
+          maxItems: 8,
+          description:
+            "Canonical bounded item/service referents. Current-turn referents use exact message spans; trusted fresh focus uses its supplied trusted ID and turn ID. Empty for broad/none.",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              source: { type: "string", enum: [...CLOUD_DM_ITEM_REFERENT_SOURCES] },
+              surfaceText: { type: ["string", "null"] },
+              start: { type: ["integer", "null"] },
+              end: { type: ["integer", "null"] },
+              trustedItemId: { type: ["string", "null"] },
+              sourceTurnId: { type: ["string", "null"] },
+            },
+            required: ["source", "surfaceText", "start", "end", "trustedItemId", "sourceTurnId"],
+          },
+        },
         targetReference: {
           type: "object",
           additionalProperties: false,
@@ -3890,6 +3975,7 @@ export async function executeCloudDmOwnershipDecision({
         "turnScope",
         "semanticIntent",
         "itemScope",
+        "itemReferents",
         "targetReference",
         "targetId",
         "mutationIntent",
@@ -3903,7 +3989,7 @@ export async function executeCloudDmOwnershipDecision({
 
   const system = [
     "You classify Cloud DM transaction ownership only.",
-    "Return JSON with turnScope, semanticIntent, itemScope, targetReference, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
+    "Return JSON with turnScope, semanticIntent, itemScope, itemReferents, targetReference, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
     "Do not write customer wording. customerReply is not part of this schema.",
     "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
     `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
@@ -3912,6 +3998,10 @@ export async function executeCloudDmOwnershipDecision({
     "For NEW_TRANSACTION choose the best semanticIntent: availability_inquiry | pricing_inquiry | pricing_with_duration | booking_request | browse_options | details_inquiry | image_catalog_request | general_business_question | clarification | unclear.",
     "itemScope is semantic boundedness from this same decision: specific = a bounded set of one or more explicitly or contextually identified item/service referents; broad = open-ended discovery whose requested item set is not identified; none = no inventory-item referent. Plurality alone is not broad.",
     "A specific referent may come from trusted conversation context and need not be named again in the current sentence.",
+    "Catalog membership never changes semantic meaning: an unknown, unrecognized, misspelled, or absent named item/service is still itemScope=specific, never browse_options merely because it is not in the catalog.",
+    "For NEW_TRANSACTION + itemScope=specific, itemReferents must contain every bounded referent. A current-turn referent uses source=current_turn and an exact end-exclusive surfaceText/start/end span from CUSTOMER_MESSAGE, with trustedItemId=null and sourceTurnId=null.",
+    "A referent grounded only by TRUSTED_FRESH_ITEM_FOCUS uses source=trusted_fresh_focus, surfaceText/start/end=null, and copies its exact trustedItemId and sourceTurnId. Never invent or infer a trusted ID.",
+    "For broad or none itemScope, itemReferents must be empty. For protected/non-NEW scopes itemReferents must be empty in this slice.",
     "For NEW_TRANSACTION: browse_options requires itemScope=broad. availability_inquiry, pricing_inquiry, pricing_with_duration, booking_request, details_inquiry, and image_catalog_request require itemScope=specific. general_business_question, clarification, and unclear use the truthful specific, broad, or none scope of the turn.",
     "SOCIAL_GENERAL and UNCLEAR turn scopes require itemScope=none. For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE, preserve the truthful item scope without changing their protected ownership semantics.",
     "Use availability_inquiry only for availability of one specifically identified named or trusted-context singular item/service/referent. Asking to discover, list, or enumerate which options are available is browse_options, not availability_inquiry.",
@@ -3979,7 +4069,7 @@ export async function executeCloudDmOwnershipDecision({
       completionFn({
         model: resolveOpenAiChatModel(),
         temperature: 0,
-        max_tokens: 400,
+        max_tokens: 600,
         response_format: responseFormat,
         messages: [
           { role: "system", content: system },
@@ -4002,7 +4092,10 @@ export async function executeCloudDmOwnershipDecision({
         : createPromise;
     const resp = await timed;
     const raw = resp?.choices?.[0]?.message?.content ?? "";
-    const parsed = parseCloudDmOwnershipDecision(raw);
+    const parsed = parseCloudDmOwnershipDecision(raw, {
+      customerMessage: userLine,
+      trustedFreshItemFocus: facts?.trustedFreshItemFocus,
+    });
     if (!parsed) {
       let diagnostic;
       try {
@@ -4038,6 +4131,9 @@ export async function executeCloudDmOwnershipDecision({
       turnScope: decision.turnScope,
       semanticIntent: decision.semanticIntent ?? null,
       itemScope: decision.itemScope ?? null,
+      itemReferentCount: Array.isArray(decision.itemReferents)
+        ? decision.itemReferents.length
+        : 0,
       targetReference: decision.targetReference ?? null,
       targetId: decision.targetId,
       mutationIntent: decision.mutationIntent,
@@ -4074,7 +4170,10 @@ export async function resolveCloudDmCanonicalOwnership({
   __executeCloudDmOwnershipDecisionFn = null,
   __executePostConfirmPaLaneDecisionFn = null,
 } = {}) {
-  const neutralFacts = buildNeutralCloudDmOwnershipFacts(facts, pendingRequest);
+  const neutralFacts = {
+    ...buildNeutralCloudDmOwnershipFacts(facts, pendingRequest),
+    currentCustomerMessage: String(userMessage ?? ""),
+  };
   const executeFn =
     typeof __executeCloudDmOwnershipDecisionFn === "function"
       ? __executeCloudDmOwnershipDecisionFn

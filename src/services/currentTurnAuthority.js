@@ -225,6 +225,39 @@ export function findConservativeFuzzyCatalogMention(message, catalogItems = []) 
   return { found: false, ambiguous: false, itemId: null, itemLabel: null, candidates: [] };
 }
 
+/**
+ * Resolve only canonical Brain-produced item referents against trusted catalog
+ * facts. This does not inspect the full customer message or decide intent.
+ */
+export function resolveCanonicalItemReferents(itemReferents, catalogItems = []) {
+  const refs = Array.isArray(itemReferents) ? itemReferents : [];
+  const items = Array.isArray(catalogItems) ? catalogItems : [];
+  return refs.map((ref) => {
+    const trustedItemId = normalizeId(ref?.trustedItemId);
+    if (trustedItemId) {
+      const row = catalogRowById(items, trustedItemId);
+      return row
+        ? { status: "MATCHED", referent: ref, itemId: trustedItemId, itemLabel: buildDisplayLabel(row), catalogRow: row, matchSource: "trusted_item_id" }
+        : { status: "NOT_MATCHED", referent: ref, itemId: null, itemLabel: null, catalogRow: null, matchSource: "trusted_item_id" };
+    }
+    const surfaceText = String(ref?.surfaceText ?? "").trim();
+    const explicit = hasExplicitNewItemMention(surfaceText, items, null);
+    if (explicit.found && explicit.itemId) {
+      const row = catalogRowById(items, explicit.itemId);
+      return { status: "MATCHED", referent: ref, itemId: explicit.itemId, itemLabel: explicit.itemLabel, catalogRow: row, matchSource: "canonical_surface_exact" };
+    }
+    const fuzzy = findConservativeFuzzyCatalogMention(surfaceText, items);
+    if (fuzzy.found && fuzzy.ambiguous) {
+      return { status: "AMBIGUOUS", referent: ref, itemId: null, itemLabel: null, catalogRow: null, candidates: fuzzy.candidates, matchSource: "canonical_surface_fuzzy" };
+    }
+    if (fuzzy.found && fuzzy.itemId) {
+      const row = catalogRowById(items, fuzzy.itemId);
+      return { status: "MATCHED", referent: ref, itemId: fuzzy.itemId, itemLabel: fuzzy.itemLabel, catalogRow: row, matchSource: "canonical_surface_fuzzy" };
+    }
+    return { status: "NOT_MATCHED", referent: ref, itemId: null, itemLabel: surfaceText || null, catalogRow: null, matchSource: "canonical_surface" };
+  });
+}
+
 function catalogRowById(catalogItems, id) {
   const nid = normalizeId(id);
   if (!nid) return null;

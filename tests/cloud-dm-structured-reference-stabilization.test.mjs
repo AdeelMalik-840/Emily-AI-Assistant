@@ -11,6 +11,7 @@ const {
   validatePostConfirmSemanticOwnership,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
 const { understandTurn } = await import("../src/brain/understanding/UnderstandingEngine.js");
+const { resolveCanonicalItemReferents } = await import("../src/services/currentTurnAuthority.js");
 const { composeUnavailableCustomerReplyFromFacts } = await import(
   "../src/brain/workflows/AvailabilityInquiryWorkflow.js"
 );
@@ -36,6 +37,7 @@ function canonicalJson(overrides = {}) {
     turnScope: "NEW_TRANSACTION",
     semanticIntent: "availability_inquiry",
     itemScope: "specific",
+    itemReferents: [],
     targetReference: {
       source: "none",
       sourceTurnId: null,
@@ -53,14 +55,21 @@ function canonicalJson(overrides = {}) {
 }
 
 test("bounded known item set is valid specific semantics and never collapses to one item", async () => {
-  const parsed = parseCloudDmOwnershipDecision(canonicalJson());
+  const message = "Corolla or Stonic available hain?";
+  const itemReferents = [
+    { source: "current_turn", surfaceText: "Corolla", start: 0, end: 7, trustedItemId: null, sourceTurnId: null },
+    { source: "current_turn", surfaceText: "Stonic", start: 11, end: 17, trustedItemId: null, sourceTurnId: null },
+  ];
+  const parsed = parseCloudDmOwnershipDecision(canonicalJson({ itemReferents }), { customerMessage: message });
   assert.equal(parsed?.semanticIntent, "availability_inquiry");
   assert.equal(parsed?.itemScope, "specific");
 
-  const admittedTurn = { turn: { text: "Corolla or Stonic available hain?" } };
+  const admittedTurn = { turn: { text: message } };
   const turnContext = {
     authoritativeSemanticIntent: "availability_inquiry",
     canonicalSemanticDecision: parsed,
+    canonicalItemReferents: itemReferents,
+    canonicalItemResolutions: resolveCanonicalItemReferents(itemReferents, catalog),
     memorySnapshot: {},
   };
   const understanding = understandTurn({ admittedTurn, turnContext, catalogItems: catalog });
@@ -76,6 +85,8 @@ test("bounded known item set is valid specific semantics and never collapses to 
       chatType: "dm",
       channel: "whatsapp_cloud",
       authoritativeSemanticIntent: "availability_inquiry",
+      canonicalItemReferents: itemReferents,
+      canonicalItemResolutions: resolveCanonicalItemReferents(itemReferents, catalog),
       canonicalSemanticDecision: parsed,
       memorySnapshot: {},
     },
@@ -96,11 +107,18 @@ test("bounded catalog sets remain generic across hotel inventory", async () => {
     { id: "deluxe", name: "Deluxe Room", displayLabel: "Deluxe Room" },
     { id: "suite", name: "Executive Suite", displayLabel: "Executive Suite" },
   ];
-  const parsed = parseCloudDmOwnershipDecision(canonicalJson());
-  const admittedTurn = { turn: { text: "Deluxe Room ya Executive Suite available hain?" } };
+  const message = "Deluxe Room ya Executive Suite available hain?";
+  const itemReferents = [
+    { source: "current_turn", surfaceText: "Deluxe Room", start: 0, end: 11, trustedItemId: null, sourceTurnId: null },
+    { source: "current_turn", surfaceText: "Executive Suite", start: 15, end: 30, trustedItemId: null, sourceTurnId: null },
+  ];
+  const parsed = parseCloudDmOwnershipDecision(canonicalJson({ itemReferents }), { customerMessage: message });
+  const admittedTurn = { turn: { text: message } };
   const turnContext = {
     authoritativeSemanticIntent: "availability_inquiry",
     canonicalSemanticDecision: parsed,
+    canonicalItemReferents: itemReferents,
+    canonicalItemResolutions: resolveCanonicalItemReferents(itemReferents, hotelCatalog),
     memorySnapshot: {},
   };
   const understanding = understandTurn({ admittedTurn, turnContext, catalogItems: hotelCatalog });
@@ -113,6 +131,8 @@ test("bounded catalog sets remain generic across hotel inventory", async () => {
       chatType: "dm",
       channel: "whatsapp_cloud",
       authoritativeSemanticIntent: "availability_inquiry",
+      canonicalItemReferents: itemReferents,
+      canonicalItemResolutions: resolveCanonicalItemReferents(itemReferents, hotelCatalog),
       canonicalSemanticDecision: parsed,
       memorySnapshot: {},
     },
@@ -137,6 +157,7 @@ test("OLD booking requires grounded structured reference provenance", () => {
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
     itemScope: "specific",
+    itemReferents: [],
     targetContext: "CONFIRMED_BOOKING",
     targetId: booking.id,
     mutationIntent: "none",
@@ -320,6 +341,7 @@ test("conversation-turn booking provenance must match a verified structured refe
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
     itemScope: "specific",
+    itemReferents: [],
     targetContext: "CONFIRMED_BOOKING",
     targetId: booking.id,
     targetReference: {

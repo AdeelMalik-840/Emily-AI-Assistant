@@ -51,6 +51,9 @@ function persistReleased(identity, semanticIntent) {
     ["clarification", "unclear", "general_business_question"].includes(semanticIntent)
       ? "none"
       : "specific";
+  const itemReferents = itemScope === "specific"
+    ? [{ source: "current_turn", surfaceText: "item", start: 0, end: 4, trustedItemId: null, sourceTurnId: null }]
+    : [];
   return persistCloudInboundSemanticDecision({
     identity,
     messageId: identity.stableId,
@@ -61,6 +64,7 @@ function persistReleased(identity, semanticIntent) {
       turnScope: "NEW_TRANSACTION",
       semanticIntent,
       itemScope,
+      itemReferents,
       targetId: null,
       targetContext: "NEW_TRANSACTION",
       mutationIntent: "none",
@@ -122,6 +126,7 @@ test("ledger preserves item scope and rejects scope mutation", async () => {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "browse_options",
         itemScope: "broad",
+        itemReferents: [],
         targetId: null,
         mutationIntent: "none",
         action: "reply",
@@ -140,6 +145,7 @@ test("ledger enforces scope-aware semantic-intent validation without reconstruct
       const identity = identityFor(suffix);
       const decision = {
         turnScope,
+        itemReferents: [],
         targetId: null,
         mutationIntent: "none",
         action: "reply",

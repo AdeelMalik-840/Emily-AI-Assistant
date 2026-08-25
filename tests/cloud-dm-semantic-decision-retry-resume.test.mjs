@@ -130,6 +130,7 @@ test("timeout before accepted decision may decide on retry", async () => {
             turnScope: "NEW_TRANSACTION",
             semanticIntent: "availability_inquiry",
             itemScope: "specific",
+            itemReferents: [{ source: "current_turn", surfaceText: "Honda Civic", start: 0, end: 11, trustedItemId: null, sourceTurnId: null }],
             targetId: null,
             action: "reply",
             mutationIntent: "none",
@@ -182,6 +183,7 @@ test("retry after accepted decision reuses snapshot and does not call semantic O
             turnScope: "NEW_TRANSACTION",
             semanticIntent: "availability_inquiry",
             itemScope: "specific",
+            itemReferents: [{ source: "current_turn", surfaceText: "Honda Civic", start: 0, end: 11, trustedItemId: null, sourceTurnId: null }],
             targetId: null,
             action: "reply",
             mutationIntent: "none",
@@ -228,6 +230,7 @@ test("write-once semantic snapshot rejects contradictory rewrite", async () => {
         turnScope: "NEW_TRANSACTION",
         semanticIntent: "availability_inquiry",
         itemScope: "specific",
+        itemReferents: [{ source: "current_turn", surfaceText: "item", start: 0, end: 4, trustedItemId: null, sourceTurnId: null }],
         targetId: null,
         action: "reply",
         mutationIntent: "none",
@@ -243,6 +246,7 @@ test("write-once semantic snapshot rejects contradictory rewrite", async () => {
       openaiSource: "openai",
       decision: {
         turnScope: "OLD_BOOKING_REFERENCE",
+        itemReferents: [],
         targetId: "E55qPBHJUW1NsUvNLAhH",
         targetReference: {
           source: "current_turn",

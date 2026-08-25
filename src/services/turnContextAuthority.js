@@ -8,6 +8,7 @@ import { parseUserDuration } from "../duration/parseDuration.js";
 import {
   findConservativeFuzzyCatalogMention,
   hasExplicitNewItemMention,
+  resolveCanonicalItemReferents,
 } from "./currentTurnAuthority.js";
 import { hasStrongBookingCommitPhrase } from "./conversationRouter.js";
 import { extractTurnSignals } from "./intentShapeResolver.js";
@@ -250,20 +251,41 @@ export function resolveTurnContext(opts = {}) {
   const participantIdentity = participantKey ? "stable" : "unresolved";
   const memoryAllowed = !isGroupInbound || participantIdentity === "stable";
 
-  const explicitMention = hasExplicitNewItemMention(message, catalogItems, null);
+  const canonicalItemReferents = Array.isArray(opts.canonicalItemReferents)
+    ? opts.canonicalItemReferents
+    : null;
+  const canonicalAuthorityActive =
+    !isGroupInbound &&
+    Boolean(String(opts.authoritativeSemanticIntent ?? "").trim()) &&
+    canonicalItemReferents !== null;
+  const canonicalItemResolutions = canonicalAuthorityActive
+    ? resolveCanonicalItemReferents(canonicalItemReferents, catalogItems)
+    : [];
+  const canonicalMatched = canonicalItemResolutions.filter(
+    (row) => row.status === "MATCHED"
+  );
+  const canonicalAmbiguous = canonicalItemResolutions.some(
+    (row) => row.status === "AMBIGUOUS"
+  );
+
+  const explicitMention = canonicalAuthorityActive
+    ? { found: false, itemId: null, itemLabel: null }
+    : hasExplicitNewItemMention(message, catalogItems, null);
   const explicitItem = explicitMention.found
     ? normalizeAuthorityItem(catalogRowById(catalogItems, explicitMention.itemId))
-    : null;
-  const fuzzyMention = !explicitItem
+    : canonicalMatched.length === 1
+      ? normalizeAuthorityItem(canonicalMatched[0].catalogRow)
+      : null;
+  const fuzzyMention = !canonicalAuthorityActive && !explicitItem
     ? findConservativeFuzzyCatalogMention(message, catalogItems)
     : { found: false, ambiguous: false, itemId: null };
   const fuzzyItem =
     !explicitItem && fuzzyMention.found && !fuzzyMention.ambiguous && fuzzyMention.itemId
       ? normalizeAuthorityItem(catalogRowById(catalogItems, fuzzyMention.itemId))
       : null;
-  const fuzzyAmbiguous = Boolean(
-    !explicitItem && fuzzyMention.found && fuzzyMention.ambiguous
-  );
+  const fuzzyAmbiguous = canonicalAuthorityActive
+    ? canonicalAmbiguous || canonicalMatched.length > 1
+    : Boolean(!explicitItem && fuzzyMention.found && fuzzyMention.ambiguous);
   const hasExplicitItem = Boolean(explicitItem || fuzzyItem);
 
   const itemlessPriceDurationFollowupRaw = isItemlessPriceDurationFollowup(
@@ -281,6 +303,7 @@ export function resolveTurnContext(opts = {}) {
     Boolean(extractTurnSignals({ message }).browseAsk);
   const broadBrowseAsk = browseAsk || isGenericBrowseListAsk(message);
   const itemlessTrustedContextFollowup =
+    !canonicalAuthorityActive &&
     !hasExplicitItem &&
     !fuzzyAmbiguous &&
     !broadBrowseAsk &&
@@ -373,6 +396,9 @@ export function resolveTurnContext(opts = {}) {
     hasExplicitItem,
     trustedSessionProofSource,
     trustedSessionRejectReason,
+    canonicalItemReferents: canonicalItemReferents ?? [],
+    canonicalItemResolutions,
+    canonicalAuthorityActive,
   };
 
   console.log("[turn_context_resolved]", {

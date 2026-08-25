@@ -26,6 +26,7 @@ import {
 } from "./shouldSuppressPostConfirmOnboardingClarification.js";
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
 import { composeBrowseOptionsCustomerReply } from "../openai/composeBrowseOptionsCustomerReply.js";
+import { composeUnknownItemCustomerReply } from "../openai/composeUnknownItemCustomerReply.js";
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 
 const SAFE_APOLOGY =
@@ -186,6 +187,7 @@ export async function runBrainV2LivePipeline(params) {
       guaranteeKey: params.guaranteeKey,
       traceId,
       authoritativeSemanticIntent,
+      canonicalItemReferents: canonicalReleased?.itemReferents ?? null,
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
@@ -321,6 +323,12 @@ export async function runBrainV2LivePipeline(params) {
     }
     if (authoritativeSemanticIntent) {
       brainTurnContext.authoritativeSemanticIntent = authoritativeSemanticIntent;
+      brainTurnContext.canonicalItemReferents = Object.freeze([
+        ...(canonicalReleased?.itemReferents ?? []),
+      ]);
+      brainTurnContext.canonicalItemResolutions = Object.freeze([
+        ...(turnContextInput.canonicalItemResolutions ?? []),
+      ]);
     }
 
     if (turnContextInput.authoritativeItem?.id) {
@@ -529,6 +537,37 @@ export async function runBrainV2LivePipeline(params) {
     let finalActionPlan = constrainedPlan;
     let finalReplySource = "BRAIN_V2_LIVE";
     let postExecuteBrainDecision = null;
+
+    const canonicalUnknownItem =
+      canonicalReleased?.turnScope === "NEW_TRANSACTION" &&
+      canonicalReleased?.itemScope === "specific" &&
+      Array.isArray(canonicalReleased?.itemReferents) &&
+      canonicalReleased.itemReferents.length === 1 &&
+      resolvedBusinessTurnContext?.resolvedItem?.status === "not_matched";
+    if (canonicalUnknownItem) {
+      const itemLabel = String(
+        resolvedBusinessTurnContext?.resolvedItem?.displayLabel ??
+          canonicalReleased.itemReferents[0]?.surfaceText ??
+          ""
+      ).trim();
+      const composedUnknown = await composeUnknownItemCustomerReply({
+        semanticIntent: authoritativeSemanticIntent,
+        itemLabel,
+        customerMessage: message,
+        timeoutMs: params.__unknownItemComposeTimeoutMs ?? 8000,
+        __chatCompletionsCreateForTests:
+          params.__unknownItemComposeChatCreate ?? null,
+      });
+      assertBrainV2ExecutionActive(params);
+      if (!composedUnknown.ok || !String(composedUnknown.reply ?? "").trim()) {
+        return buildSilentPipelineResult({
+          traceId,
+          reason: `UNKNOWN_ITEM_COMPOSE_FAIL_CLOSED:${composedUnknown.reason ?? "no_reply"}`,
+        });
+      }
+      finalReply = composedUnknown.reply;
+      finalReplySource = "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE";
+    }
 
     if (workflowType === "browse_options") {
       const browseReplyAction = (Array.isArray(constrainedPlan?.actions)

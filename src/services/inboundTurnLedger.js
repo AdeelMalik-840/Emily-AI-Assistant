@@ -1499,7 +1499,7 @@ export function markCloudInboundTurnPostConfirmOwned({ identity } = {}) {
   );
 }
 
-const CLOUD_SEMANTIC_DECISION_VERSION = 1;
+const CLOUD_SEMANTIC_DECISION_VERSION = 2;
 const CLOUD_SEMANTIC_ITEM_SCOPES = new Set(["specific", "broad", "none"]);
 const CLOUD_SEMANTIC_SPECIFIC_ITEM_INTENTS = new Set([
   "availability_inquiry",
@@ -1513,6 +1513,30 @@ const CLOUD_SEMANTIC_SPECIFIC_ITEM_INTENTS = new Set([
 function cleanCloudSemanticItemScope(value) {
   const scope = cleanSemanticField(value, 20);
   return CLOUD_SEMANTIC_ITEM_SCOPES.has(scope) ? scope : null;
+}
+
+function sanitizeCloudSemanticItemReferents(raw) {
+  if (!Array.isArray(raw) || raw.length > 8) return null;
+  const result = [];
+  for (const value of raw) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const source = cleanSemanticField(value.source, 60);
+    if (!["current_turn", "trusted_fresh_focus"].includes(source)) return null;
+    const surfaceText = value.surfaceText == null ? null : String(value.surfaceText);
+    const start = value.start == null ? null : Number(value.start);
+    const end = value.end == null ? null : Number(value.end);
+    const trustedItemId = cleanSemanticField(value.trustedItemId, 160);
+    const sourceTurnId = cleanSemanticField(value.sourceTurnId, 320);
+    if (source === "current_turn") {
+      if (!surfaceText || !Number.isInteger(start) || !Number.isInteger(end) ||
+          start < 0 || end <= start || trustedItemId || sourceTurnId) return null;
+    } else if (surfaceText !== null || start !== null || end !== null ||
+        !trustedItemId || !sourceTurnId) {
+      return null;
+    }
+    result.push({ source, surfaceText, start, end, trustedItemId, sourceTurnId });
+  }
+  return result;
 }
 
 function isCloudSemanticItemScopeConsistent(turnScope, semanticIntent, itemScope) {
@@ -1590,6 +1614,8 @@ function sameSemanticMeaning(left, right) {
       cleanCustomerSemanticIntent(right?.semanticIntent) &&
     cleanCloudSemanticItemScope(left?.itemScope) ===
       cleanCloudSemanticItemScope(right?.itemScope) &&
+    JSON.stringify(sanitizeCloudSemanticItemReferents(left?.itemReferents)) ===
+      JSON.stringify(sanitizeCloudSemanticItemReferents(right?.itemReferents)) &&
     JSON.stringify(sanitizeSemanticTargetReference(left?.targetReference)) ===
       JSON.stringify(sanitizeSemanticTargetReference(right?.targetReference)) &&
     cleanSemanticField(left?.targetId) === cleanSemanticField(right?.targetId) &&
@@ -1653,6 +1679,17 @@ function sanitizeCloudSemanticDecision(p = {}) {
   if (!isCloudSemanticItemScopeConsistent(turnScope, semanticIntent, itemScope)) {
     return null;
   }
+  const itemReferentInput = Object.prototype.hasOwnProperty.call(p, "itemReferents")
+    ? p.itemReferents
+    : turnScope === "NEW_TRANSACTION"
+      ? undefined
+      : [];
+  const itemReferents = sanitizeCloudSemanticItemReferents(itemReferentInput);
+  if (!itemReferents) return null;
+  if (
+    (turnScope === "NEW_TRANSACTION" && itemScope === "specific" && itemReferents.length === 0) ||
+    ((turnScope !== "NEW_TRANSACTION" || itemScope !== "specific") && itemReferents.length > 0)
+  ) return null;
   const status = cleanSemanticField(p.semanticDecisionStatus, 40);
   if (!CLOUD_SEMANTIC_DECISION_STATUSES.has(status)) return null;
   const ownershipLane =
@@ -1665,6 +1702,7 @@ function sanitizeCloudSemanticDecision(p = {}) {
     turnScope,
     semanticIntent,
     itemScope,
+    itemReferents,
     targetReference,
     targetId: cleanSemanticField(p.targetId, 160),
     targetContext: cleanSemanticField(p.targetContext, 80),

@@ -14,6 +14,8 @@
  * @property {string} [lastResolvedItemId]
  * @property {string} [catalogSnapshotRef]
  * @property {string} [conversationHistoryBlock]
+ * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemReferents]
+ * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemResolutions]
  */
 
 /**
@@ -35,6 +37,8 @@
  * @property {Record<string, unknown>} [pendingActionPayload]
  * @property {string} [unlistedMentionLabel]
  * @property {string} [authoritativeSemanticIntent]
+ * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemReferents]
+ * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemResolutions]
  */
 
 /**

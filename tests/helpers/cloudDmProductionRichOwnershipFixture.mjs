@@ -183,6 +183,7 @@ export function ownershipDecisionPayload(overrides = {}) {
   return {
     turnScope: "NEW_TRANSACTION",
     itemScope,
+    itemReferents: [],
     targetReference: {
       source: "none",
       sourceTurnId: null,
