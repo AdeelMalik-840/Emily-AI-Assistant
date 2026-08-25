@@ -776,6 +776,11 @@ export async function handleCustomerBusinessPaInbound({
   }
 
   const facts = resolved.facts;
+  const ownershipFacts = {
+    ...facts,
+    currentOwnershipTurnId:
+      clean(facts.currentOwnershipTurnId) || `user:${clean(messageId) || "direct"}`,
+  };
   const identity =
     cloudLifecycleIdentity && typeof cloudLifecycleIdentity === "object"
       ? cloudLifecycleIdentity
@@ -810,15 +815,15 @@ export async function handleCustomerBusinessPaInbound({
       messageId,
       recentDialogue: conversationHistory,
       ownershipLane: "post_confirm_pa",
-      activeBooking: facts.booking ?? null,
-      activeAvailabilityRequest: facts.availabilityRequest ?? null,
-      knownPolicies: facts.known ?? null,
-      openMissingInfoRequests: facts.openMissingInfoRequests ?? null,
+      activeBooking: ownershipFacts.booking ?? null,
+      activeAvailabilityRequest: ownershipFacts.availabilityRequest ?? null,
+      knownPolicies: ownershipFacts.known ?? null,
+      openMissingInfoRequests: ownershipFacts.openMissingInfoRequests ?? null,
       latestClosedMissingInfoAnswers:
-        facts.latestClosedMissingInfoAnswers ?? null,
-      safetyPolicy: facts.policy ?? null,
+        ownershipFacts.latestClosedMissingInfoAnswers ?? null,
+      safetyPolicy: ownershipFacts.policy ?? null,
       allowedExecutors: ["whatsapp_cloud_dm"],
-      facts,
+      facts: ownershipFacts,
       styleKey: "casual_local",
       missingInfoLoopFullyEnabled: false,
       __chatCompletionsCreateForTests,

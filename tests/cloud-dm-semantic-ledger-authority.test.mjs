@@ -149,6 +149,14 @@ test("ledger enforces scope-aware semantic-intent validation without reconstruct
       if (turnScope === "NEW_TRANSACTION") {
         decision.itemScope = semanticIntent === "browse_options" ? "broad" : "specific";
       }
+      if (turnScope === "OLD_BOOKING_REFERENCE") {
+        decision.targetReference = {
+          source: "current_turn",
+          sourceTurnId: `user:${suffix}`,
+          targetType: "historical_booking",
+          targetId: null,
+        };
+      }
       return persistCloudInboundSemanticDecision({
         identity,
         decision,

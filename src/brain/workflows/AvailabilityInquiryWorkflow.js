@@ -293,9 +293,11 @@ function validateUnavailableCustomerReply(reply, alternatives, failsafe) {
  *   chatCompletionsCreate?: Function | null,
  *   __chatCompletionsCreateForTests?: Function | null,
  *   __replyForTests?: string | null,
+ *   __presentedItemIdsForTests?: string[] | null,
+ *   returnPresentationMetadata?: boolean,
  *   timeoutMs?: number,
  * }} p
- * @returns {Promise<string>}
+ * @returns {Promise<string | { reply: string, presentedItemIds: string[] }>}
  */
 export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
   const label = String(p.conversationalLabel ?? "").trim() || "item";
@@ -304,9 +306,25 @@ export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
     Number.isFinite(durationDays) && durationDays >= 1 ? Math.floor(durationDays) : 1;
   const alternatives = Array.isArray(p.alternatives) ? p.alternatives : [];
   const failsafe = buildUnavailableAvailabilityFailsafeReply(label, durationN, alternatives);
+  const trustedAlternativeIds = new Set(
+    alternatives.map((row) => String(row?.itemId ?? "").trim()).filter(Boolean)
+  );
+  const withPresentationMetadata = (reply, proposedIds = []) => {
+    const presentedItemIds = [...new Set(
+      (Array.isArray(proposedIds) ? proposedIds : [])
+        .map((id) => String(id ?? "").trim())
+        .filter((id) => id && trustedAlternativeIds.has(id))
+    )];
+    return p.returnPresentationMetadata === true
+      ? Object.freeze({ reply: String(reply ?? "").trim(), presentedItemIds: Object.freeze(presentedItemIds) })
+      : String(reply ?? "").trim();
+  };
 
   if (typeof p.__replyForTests === "string" && p.__replyForTests.trim()) {
-    return validateUnavailableCustomerReply(p.__replyForTests.trim(), alternatives, failsafe);
+    return withPresentationMetadata(
+      validateUnavailableCustomerReply(p.__replyForTests.trim(), alternatives, failsafe),
+      p.__presentedItemIdsForTests
+    );
   }
 
   const create =
@@ -320,7 +338,7 @@ export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
             const client = new OpenAI({ apiKey });
             return (args) => client.chat.completions.create(args);
           })();
-  if (!create) return failsafe;
+  if (!create) return withPresentationMetadata(failsafe);
 
   const altLabels = alternatives
     .map((row) => String(row?.itemLabel ?? "").trim())
@@ -332,6 +350,10 @@ export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
     durationDays: durationN,
     itemAvailable: false,
     verifiedAlternativeLabels: altLabels,
+    verifiedAlternatives: alternatives.slice(0, 5).map((row) => ({
+      itemId: String(row?.itemId ?? "").trim() || null,
+      itemLabel: String(row?.itemLabel ?? "").trim() || null,
+    })),
     verifiedAlternativesCount: altLabels.length,
     customerMessageText: String(p.customerMessageText ?? "").trim() || null,
     styleKey: p.styleKey ?? null,
@@ -344,9 +366,13 @@ export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
       additionalProperties: false,
       properties: {
         reply: { type: "string" },
+        presentedItemIds: {
+          type: "array",
+          items: { type: "string" },
+        },
         replySemantics: REPLY_SEMANTICS_SCHEMA,
       },
-      required: ["reply", "replySemantics"],
+      required: ["reply", "presentedItemIds", "replySemantics"],
     }
   );
 
@@ -357,7 +383,9 @@ Write ONE short customer reply from VERIFIED FACTS only.
 Do not invent cars, prices, or availability.
 If verifiedAlternatives is empty, you MUST NOT ask to show other options.
 If verifiedAlternatives is non-empty, you may offer to show other options (do not list them unless facts say to list).
-Return STRICT JSON: {"reply":"...","replySemantics":{"claims":["resource_unavailable"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}`;
+If you present a verified alternative as the next conversational target, include its exact itemId in presentedItemIds.
+Never include an ID that is not in verifiedAlternatives. If you present no alternative, return an empty array.
+Return STRICT JSON: {"reply":"...","presentedItemIds":[],"replySemantics":{"claims":["resource_unavailable"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}`;
 
   const userBase = `FACTS_JSON: ${JSON.stringify(verifiedFacts)}
 CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
@@ -393,10 +421,14 @@ CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
       ]);
       const raw = String(completion?.choices?.[0]?.message?.content ?? "").trim();
       let reply = "";
+      let presentedItemIds = [];
       let semantics = null;
       try {
         const parsed = JSON.parse(raw);
         reply = String(parsed?.reply ?? "").trim();
+        presentedItemIds = Array.isArray(parsed?.presentedItemIds)
+          ? parsed.presentedItemIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+          : [];
         semantics = normalizeReplySemantics(parsed?.replySemantics);
       } catch {
         reply = "";
@@ -404,7 +436,12 @@ CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
       if (!reply) {
         lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
         if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return ""; // fail closed — no canned fallback after guarded attempts
+        return withPresentationMetadata(""); // fail closed — no canned fallback after guarded attempts
+      }
+      if (presentedItemIds.some((id) => !trustedAlternativeIds.has(id))) {
+        lastReason = "untrusted_presented_item_id";
+        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
+        return withPresentationMetadata("");
       }
       const guard = validateCustomerReplyAgainstContract(
         reply,
@@ -414,20 +451,20 @@ CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
       if (!guard.ok) {
         lastReason = guard.reason || "customer_reply_guard_failed";
         if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return "";
+        return withPresentationMetadata("");
       }
       // Keep existing length/alts sanity checks; empty alternatives still forbid "other option".
       const validated = validateUnavailableCustomerReply(reply, alternatives, "");
       if (!validated) {
         lastReason = "unavailable_reply_failed_local_validation";
         if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return "";
+        return withPresentationMetadata("");
       }
-      return validated;
+      return withPresentationMetadata(validated, presentedItemIds);
     }
-    return "";
+    return withPresentationMetadata("");
   } catch {
-    return failsafe;
+    return withPresentationMetadata(failsafe);
   }
 }
 
@@ -937,6 +974,13 @@ export function resolveOwnerCheckWindowForPlan(p = {}) {
 function buildUnavailableOfferActionPlan(p) {
   const alternatives = readVerifiedAlternatives(p.availability);
   const hasAlternatives = alternatives.length > 0;
+  const presentedItemIds = [...new Set(
+    (Array.isArray(p.canonical?.presentedAlternativeItemIds)
+      ? p.canonical.presentedAlternativeItemIds
+      : [])
+      .map((id) => String(id ?? "").trim())
+      .filter((id) => alternatives.some((row) => row.itemId === id))
+  )];
   const composed = String(p.canonical?.unavailableCustomerReply ?? "").trim();
   const failsafe = buildUnavailableAvailabilityFailsafeReply(
     p.conversationalLabel,
@@ -1007,6 +1051,10 @@ function buildUnavailableOfferActionPlan(p) {
           source: hasAlternatives
             ? "canonical_unavailable_alternative_offer"
             : "canonical_unavailable_no_alternatives",
+          verifiedAlternatives: Object.freeze(
+            alternatives.map((row) => Object.freeze({ ...row }))
+          ),
+          presentedItemIds: Object.freeze([...presentedItemIds]),
           execute: false,
         }),
       }),
@@ -1014,6 +1062,14 @@ function buildUnavailableOfferActionPlan(p) {
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
       itemId: p.itemId,
+      rememberPresentedItemFocus: presentedItemIds.length === 1,
+      presentedItemId: presentedItemIds.length === 1 ? presentedItemIds[0] : null,
+      presentedItemLabel:
+        presentedItemIds.length === 1
+          ? alternatives.find((row) => row.itemId === presentedItemIds[0])?.itemLabel ?? null
+          : null,
+      sourceTurnId: presentedItemIds.length === 1 ? sourceTurnKey : null,
+      clearPresentedItemFocus: presentedItemIds.length !== 1,
       rememberDuration: true,
       durationDays: p.durationN,
       rememberLastAvailabilityAssist: Boolean(assist),

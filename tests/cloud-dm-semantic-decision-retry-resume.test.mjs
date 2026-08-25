@@ -244,6 +244,12 @@ test("write-once semantic snapshot rejects contradictory rewrite", async () => {
       decision: {
         turnScope: "OLD_BOOKING_REFERENCE",
         targetId: "E55qPBHJUW1NsUvNLAhH",
+        targetReference: {
+          source: "current_turn",
+          sourceTurnId: `user:${MESSAGE_ID}`,
+          targetType: "historical_booking",
+          targetId: "E55qPBHJUW1NsUvNLAhH",
+        },
         action: "reply",
         mutationIntent: "none",
         factKind: "booking_fact",

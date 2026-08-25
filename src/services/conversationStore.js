@@ -9,6 +9,32 @@ const FieldValue = admin.firestore.FieldValue;
 const MAX_MESSAGES = 200;
 const DEFAULT_PROMPT_LIMIT = 20;
 
+function clean(value, max = 320) {
+  const text = String(value ?? "").trim();
+  return text ? text.slice(0, max) : "";
+}
+
+function conversationTurnId(message, index = 0) {
+  const role = message?.role === "assistant" ? "assistant" : "user";
+  const stored = clean(message?.turnId);
+  if (stored) return stored;
+  const identity = clean(message?.sourceMessageId) || clean(message?.providerMessageId);
+  return identity ? `${role}:${identity}` : `${role}:legacy:${index}`;
+}
+
+function sanitizeVerifiedReferences(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .slice(0, 8)
+    .map((row) => ({
+      kind: clean(row?.kind, 60),
+      targetId: clean(row?.targetId, 160),
+      provenance: clean(row?.provenance, 80),
+      expiresAt: clean(row?.expiresAt, 80) || null,
+    }))
+    .filter((row) => row.kind && row.targetId && row.provenance);
+}
+
 function conversationDocId(ownerUserId, customerNumber) {
   const owner = String(ownerUserId ?? "").trim();
   const raw = String(customerNumber ?? "").trim();
@@ -30,6 +56,7 @@ function conversationDocId(ownerUserId, customerNumber) {
  * @param {string} p.text
  * @param {string | null} [p.sourceMessageId] - inbound provider id that caused this entry
  * @param {string | null} [p.providerMessageId] - provider id for this exact message
+ * @param {Array<Record<string, unknown>>} [p.verifiedReferences]
  */
 export async function appendConversationMessage(db, p) {
   const docId = conversationDocId(p.ownerUserId, p.customerNumber);
@@ -43,12 +70,16 @@ export async function appendConversationMessage(db, p) {
   const providerMessageId = String(p.providerMessageId ?? "")
     .trim()
     .slice(0, 320);
+  const turnIdentity = sourceMessageId || providerMessageId;
+  const verifiedReferences = sanitizeVerifiedReferences(p.verifiedReferences);
 
   const entry = {
     role,
     text,
+    ...(turnIdentity ? { turnId: `${role}:${turnIdentity}` } : {}),
     ...(sourceMessageId ? { sourceMessageId } : {}),
     ...(providerMessageId ? { providerMessageId } : {}),
+    ...(verifiedReferences.length > 0 ? { verifiedReferences } : {}),
     // Firestore forbids FieldValue.serverTimestamp() inside array elements
     timestamp: new Date(),
   };
@@ -93,6 +124,29 @@ export async function appendConversationMessage(db, p) {
     );
   });
   return appended;
+}
+
+/**
+ * Structured identity/reference companion to the natural prompt history.
+ * It intentionally excludes message text; natural history remains supplied separately.
+ */
+export async function getRecentConversationReferenceContext(
+  db,
+  ownerUserId,
+  customerNumber,
+  limit = DEFAULT_PROMPT_LIMIT
+) {
+  const docId = conversationDocId(ownerUserId, customerNumber);
+  if (!docId) return [];
+  const snap = await db.collection("conversations").doc(docId).get();
+  const messages = Array.isArray(snap.data()?.messages)
+    ? snap.data().messages
+    : [];
+  return messages.slice(-limit).map((message, index) => ({
+    turnId: conversationTurnId(message, Math.max(0, messages.length - limit) + index),
+    role: message?.role === "assistant" ? "assistant" : "user",
+    verifiedReferences: sanitizeVerifiedReferences(message?.verifiedReferences),
+  }));
 }
 
 /**

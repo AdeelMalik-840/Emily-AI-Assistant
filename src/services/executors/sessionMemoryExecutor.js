@@ -3,11 +3,37 @@
  */
 import { patchEmilySessionState } from "../conversationIntelligence.js";
 
+const FRESH_ITEM_FOCUS_TTL_MS = 15 * 60 * 1000;
+
+export function readTrustedFreshItemFocus(memory, nowMs = Date.now()) {
+  const row = memory?.lastFreshItemFocus;
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const itemId = String(row.itemId ?? "").trim();
+  const expiresAtMs = Date.parse(String(row.expiresAt ?? ""));
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+  if (
+    !itemId ||
+    row.provenance !== "verified_assistant_presented_item" ||
+    !Number.isFinite(expiresAtMs) ||
+    expiresAtMs <= now
+  ) return null;
+  return {
+    itemId,
+    itemLabel: String(row.itemLabel ?? "").trim() || null,
+    provenance: row.provenance,
+    sourceTurnId: String(row.sourceTurnId ?? "").trim() || null,
+    createdAt: String(row.createdAt ?? "").trim() || null,
+    expiresAt: new Date(expiresAtMs).toISOString(),
+  };
+}
+
 /**
  * @param {{
  *   sessionKey: string,
  *   actionPlan: import("../../brain/contracts/action.js").ActionPlan | null | undefined,
  *   authoritativeItem?: Record<string, unknown> | null,
+ *   sourceTurnId?: string | null,
+ *   outboundDelivered?: boolean,
  * }} p
  */
 export function applySessionMemoryFromActionPlan(p) {
@@ -35,7 +61,61 @@ export function applySessionMemoryFromActionPlan(p) {
           : { id: itemId, itemId };
       patch.lastItem = { ...item, id: itemId, itemId };
       patch.lastResolvedItemId = itemId;
+      patch.lastFreshItemFocus = null;
     }
+  }
+
+  if (
+    persistence?.rememberPresentedItemFocus === true &&
+    p.outboundDelivered === true
+  ) {
+    const itemId = String(persistence.presentedItemId ?? "").trim();
+    const verifiedAlternativeIds = new Set(
+      (Array.isArray(plan?.actions) ? plan.actions : [])
+        .flatMap((action) =>
+          Array.isArray(action?.payload?.verifiedAlternatives)
+            ? action.payload.verifiedAlternatives
+            : []
+        )
+        .map((row) => String(row?.itemId ?? "").trim())
+        .filter(Boolean)
+    );
+    const declaredPresentedIds = new Set(
+      (Array.isArray(plan?.actions) ? plan.actions : [])
+        .flatMap((action) =>
+          Array.isArray(action?.payload?.presentedItemIds)
+            ? action.payload.presentedItemIds
+            : []
+        )
+        .map((id) => String(id ?? "").trim())
+        .filter(Boolean)
+    );
+    const sourceTurnId =
+      String(p.sourceTurnId ?? persistence.sourceTurnId ?? "").trim() || null;
+    if (
+      itemId &&
+      declaredPresentedIds.size === 1 &&
+      declaredPresentedIds.has(itemId) &&
+      verifiedAlternativeIds.has(itemId)
+    ) {
+      const nowMs = Date.now();
+      patch.lastItem = {
+        id: itemId,
+        itemId,
+        displayLabel: String(persistence.presentedItemLabel ?? "").trim() || null,
+      };
+      patch.lastResolvedItemId = itemId;
+      patch.lastFreshItemFocus = {
+        itemId,
+        itemLabel: String(persistence.presentedItemLabel ?? "").trim() || null,
+        provenance: "verified_assistant_presented_item",
+        sourceTurnId,
+        createdAt: new Date(nowMs).toISOString(),
+        expiresAt: new Date(nowMs + FRESH_ITEM_FOCUS_TTL_MS).toISOString(),
+      };
+    }
+  } else if (persistence?.clearPresentedItemFocus === true) {
+    patch.lastFreshItemFocus = null;
   }
 
   if (persistence?.rememberContactPhone === true) {

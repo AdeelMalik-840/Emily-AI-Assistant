@@ -105,7 +105,18 @@ test("protected existing-request scopes accept explicit null but reject invalid 
             ],
           }
         : {};
-    assert.equal(parse({ turnScope, semanticIntent: null, ...factPlan })?.semanticIntent, null);
+    const oldReference = turnScope === "OLD_BOOKING_REFERENCE"
+      ? {
+          targetId: "booking-1",
+          targetReference: {
+            source: "current_turn",
+            sourceTurnId: "user:test",
+            targetType: "historical_booking",
+            targetId: "booking-1",
+          },
+        }
+      : {};
+    assert.equal(parse({ turnScope, semanticIntent: null, ...factPlan, ...oldReference })?.semanticIntent, null);
     assert.equal(parse({ turnScope, semanticIntent: "regex_guessed_price" }), null);
   }
 });

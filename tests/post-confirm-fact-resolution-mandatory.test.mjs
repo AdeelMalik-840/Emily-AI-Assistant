@@ -46,6 +46,7 @@ function booking(overrides = {}) {
 /** Incomplete replyGuardFacts — reproduces live harness empty-compose defect. */
 function factsWithIncompleteGuard(b) {
   return {
+    currentOwnershipTurnId: "user:test",
     businessId: "biz",
     business: {},
     booking: b,
@@ -77,6 +78,13 @@ function decisionJson(overrides = {}) {
   return JSON.stringify({
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
+    itemScope: "specific",
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: "user:test",
+      targetType: "historical_booking",
+      targetId: "bk-1",
+    },
     targetId: "bk-1",
     situation: "new_question",
     conversationAct: "information_request",

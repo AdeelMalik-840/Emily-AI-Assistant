@@ -77,6 +77,27 @@ export const CLOUD_DM_ITEM_SCOPES = Object.freeze([
   "none",
 ]);
 
+export const CLOUD_DM_REFERENCE_SOURCES = Object.freeze([
+  "current_turn",
+  "conversation_turn",
+  "trusted_fresh_focus",
+  "none",
+]);
+
+function cleanCloudDmTargetReference(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = clean(value.source, 60);
+  const targetType = clean(value.targetType, 60) || "none";
+  if (!CLOUD_DM_REFERENCE_SOURCES.includes(source)) return null;
+  if (!["historical_booking", "pending_availability", "catalog_item", "none"].includes(targetType)) return null;
+  return {
+    source,
+    sourceTurnId: clean(value.sourceTurnId, 320) || null,
+    targetType,
+    targetId: clean(value.targetId, 160) || null,
+  };
+}
+
 const CLOUD_DM_SPECIFIC_ITEM_INTENTS = new Set([
   "availability_inquiry",
   "pricing_inquiry",
@@ -1827,6 +1848,31 @@ export function buildNeutralCloudDmOwnershipFacts(
     facts.business && typeof facts.business === "object" ? facts.business : {};
   const name = clean(business.name ?? business.businessName, 120) || null;
   const tone = clean(business.tone, 200) || null;
+  const ownershipReferenceContext = Array.isArray(facts.ownershipReferenceContext)
+    ? facts.ownershipReferenceContext.slice(-20).map((row) => ({
+        turnId: clean(row?.turnId, 320) || null,
+        role: row?.role === "assistant" ? "assistant" : "user",
+        verifiedReferences: Array.isArray(row?.verifiedReferences)
+          ? row.verifiedReferences.slice(0, 8).map((ref) => ({
+              kind: clean(ref?.kind, 60) || null,
+              targetId: clean(ref?.targetId, 160) || null,
+              provenance: clean(ref?.provenance, 80) || null,
+              expiresAt: clean(ref?.expiresAt, 80) || null,
+            }))
+          : [],
+      })).filter((row) => row.turnId)
+    : [];
+  const fresh = facts.trustedFreshItemFocus;
+  const trustedFreshItemFocus =
+    fresh && typeof fresh === "object" && clean(fresh.itemId, 160)
+      ? {
+          itemId: clean(fresh.itemId, 160),
+          itemLabel: clean(fresh.itemLabel, 200) || null,
+          sourceTurnId: clean(fresh.sourceTurnId, 320) || null,
+          provenance: clean(fresh.provenance, 80) || null,
+          expiresAt: clean(fresh.expiresAt, 80) || null,
+        }
+      : null;
   return {
     business: {
       ...(name ? { name } : {}),
@@ -1845,6 +1891,9 @@ export function buildNeutralCloudDmOwnershipFacts(
     latestClosedMissingInfoAnswers: [],
     bookingCandidates: historical,
     pendingAvailabilityRequests: pending,
+    ownershipReferenceContext,
+    currentOwnershipTurnId: clean(facts.currentOwnershipTurnId, 320) || null,
+    trustedFreshItemFocus,
     candidateOrder: CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER,
     policy: {
       readOnly: true,
@@ -1887,6 +1936,9 @@ export function buildCloudDmOwnershipPromptFacts(facts) {
     pendingAvailabilityRequests: f.pendingAvailabilityRequests.map(
       omitOwnershipPromptPosition
     ),
+    ownershipReferenceContext: f.ownershipReferenceContext,
+    currentOwnershipTurnId: f.currentOwnershipTurnId,
+    trustedFreshItemFocus: f.trustedFreshItemFocus,
     policy: f.policy,
   };
 }
@@ -2622,6 +2674,7 @@ function defaultDecision(overrides = {}) {
     turnScope: "UNCLEAR",
     semanticIntent: null,
     itemScope: null,
+    targetReference: null,
     targetContext: "NONE",
     targetId: null,
     conversationAct: "unknown",
@@ -2698,6 +2751,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     rawSemanticIntent === null
       ? null
       : cleanCustomerSemanticIntent(rawSemanticIntent) ?? rawSemanticIntent;
+  const targetReference = cleanCloudDmTargetReference(parsed.targetReference);
   const targetId = clean(parsed.targetId, 160) || null;
 
   let customerReply = String(parsed.customerReply ?? parsed.reply ?? "")
@@ -3012,6 +3066,7 @@ export function parsePostConfirmCustomerDmDecision(raw, opts = {}) {
     {
       turnScope,
       ...(hasSemanticIntent ? { semanticIntent } : {}),
+      ...(targetReference ? { targetReference } : {}),
       targetId,
       conversationAct,
       customerIntent,
@@ -3327,6 +3382,11 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
   const bookingMode = cleanBookingSelectionMode(
     decision?.bookingSelectionMode
   );
+  const targetReference =
+    cleanCloudDmTargetReference(decision?.targetReference) ||
+    (scope !== "OLD_BOOKING_REFERENCE"
+      ? { source: "none", sourceTurnId: null, targetType: "none", targetId: null }
+      : null);
 
   const invalid = (reason) => ({ ok: false, reason, scope, context, targetId });
   const hasSemanticIntent = Object.prototype.hasOwnProperty.call(
@@ -3394,6 +3454,37 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
       return invalid("OLD_BOOKING_TARGET_UNTRUSTED");
     }
     if (
+      !targetReference ||
+      targetReference.targetType !== "historical_booking" ||
+      targetReference.targetId !== targetId ||
+      !["current_turn", "conversation_turn"].includes(targetReference.source)
+    ) {
+      return invalid("OLD_BOOKING_REFERENCE_PROVENANCE_REQUIRED");
+    }
+    const currentTurnId = clean(facts?.currentOwnershipTurnId, 320) || null;
+    const referenceRows = Array.isArray(facts?.ownershipReferenceContext)
+      ? facts.ownershipReferenceContext
+      : [];
+    const trustedHistoryTurn = referenceRows.find(
+      (row) => clean(row?.turnId, 320) === targetReference.sourceTurnId
+    );
+    const trustedHistoryTarget = Array.isArray(trustedHistoryTurn?.verifiedReferences)
+      ? trustedHistoryTurn.verifiedReferences.some(
+          (ref) =>
+            clean(ref?.kind, 60) === "historical_booking" &&
+            clean(ref?.targetId, 160) === targetId
+        )
+      : false;
+    if (
+      (targetReference.source === "current_turn" &&
+        (!currentTurnId || targetReference.sourceTurnId !== currentTurnId)) ||
+      (targetReference.source === "conversation_turn" &&
+        (!targetReference.sourceTurnId ||
+          !trustedHistoryTarget))
+    ) {
+      return invalid("OLD_BOOKING_REFERENCE_SOURCE_UNTRUSTED");
+    }
+    if (
       action === "confirm_pending_availability" ||
       action === "decline_pending_availability"
     ) {
@@ -3438,6 +3529,22 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
       action === "decline_pending_availability"
     ) {
       return invalid("NEW_TRANSACTION_CONTRADICTION");
+    }
+    if (targetReference?.source === "trusted_fresh_focus") {
+      const fresh = facts?.trustedFreshItemFocus;
+      if (
+        targetReference.targetType !== "catalog_item" ||
+        !fresh ||
+        targetReference.targetId !== clean(fresh?.itemId, 160) ||
+        targetReference.sourceTurnId !== clean(fresh?.sourceTurnId, 320)
+      ) {
+        return invalid("FRESH_ITEM_REFERENCE_UNTRUSTED");
+      }
+    } else if (
+      !targetReference ||
+      !["current_turn", "none"].includes(targetReference.source)
+    ) {
+      return invalid("NEW_TRANSACTION_REFERENCE_INVALID");
     }
     return { ok: true, scope, context, targetId: null };
   }
@@ -3593,6 +3700,11 @@ export function parseCloudDmOwnershipDecision(raw) {
       : cleanCustomerSemanticIntent(rawSemanticIntent);
   const hasItemScope = Object.prototype.hasOwnProperty.call(parsed, "itemScope");
   const itemScope = cleanCloudDmItemScope(parsed.itemScope);
+  const targetReference =
+    cleanCloudDmTargetReference(parsed.targetReference) ||
+    (turnScope !== "OLD_BOOKING_REFERENCE"
+      ? { source: "none", sourceTurnId: null, targetType: "none", targetId: null }
+      : null);
   if (
     !hasSemanticIntent ||
     (rawSemanticIntent !== null && semanticIntent == null) ||
@@ -3601,6 +3713,7 @@ export function parseCloudDmOwnershipDecision(raw) {
     (turnScope === "UNCLEAR" && semanticIntent !== "unclear") ||
     !hasItemScope ||
     !itemScope ||
+    !targetReference ||
     !isCloudDmItemScopeConsistent(turnScope, semanticIntent, itemScope)
   ) {
     return null;
@@ -3617,6 +3730,7 @@ export function parseCloudDmOwnershipDecision(raw) {
     turnScope,
     semanticIntent,
     itemScope,
+    targetReference,
     targetId,
     mutationIntent,
     action,
@@ -3705,7 +3819,21 @@ export async function executeCloudDmOwnershipDecision({
           type: "string",
           enum: [...CLOUD_DM_ITEM_SCOPES],
           description:
-            "specific = one named or contextually singular inventory item/service/referent; broad = discovery/list/enumeration of multiple possible items/options; none = no inventory-item referent.",
+            "specific = a bounded identified set of one or more inventory item/service referents; broad = open-ended discovery whose item set is not identified; none = no inventory-item referent.",
+        },
+        targetReference: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            source: { type: "string", enum: [...CLOUD_DM_REFERENCE_SOURCES] },
+            sourceTurnId: { type: ["string", "null"] },
+            targetType: {
+              type: "string",
+              enum: ["historical_booking", "pending_availability", "catalog_item", "none"],
+            },
+            targetId: { type: ["string", "null"] },
+          },
+          required: ["source", "sourceTurnId", "targetType", "targetId"],
         },
         targetId: { type: ["string", "null"] },
         mutationIntent: {
@@ -3762,6 +3890,7 @@ export async function executeCloudDmOwnershipDecision({
         "turnScope",
         "semanticIntent",
         "itemScope",
+        "targetReference",
         "targetId",
         "mutationIntent",
         "action",
@@ -3774,14 +3903,14 @@ export async function executeCloudDmOwnershipDecision({
 
   const system = [
     "You classify Cloud DM transaction ownership only.",
-    "Return JSON with turnScope, semanticIntent, itemScope, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
+    "Return JSON with turnScope, semanticIntent, itemScope, targetReference, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
     "Do not write customer wording. customerReply is not part of this schema.",
     "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
     `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
     "ALLOWED turnScope: NEW_TRANSACTION | PENDING_AVAILABILITY_REFERENCE | OLD_BOOKING_REFERENCE | SOCIAL_GENERAL | UNCLEAR.",
     "semanticIntent is customer meaning only, never an executor/action.",
     "For NEW_TRANSACTION choose the best semanticIntent: availability_inquiry | pricing_inquiry | pricing_with_duration | booking_request | browse_options | details_inquiry | image_catalog_request | general_business_question | clarification | unclear.",
-    "itemScope is semantic referent cardinality from this same decision: specific = one named or trusted-context singular inventory item/service/referent; broad = discovery/list/enumeration of multiple possible items/options; none = no inventory-item referent.",
+    "itemScope is semantic boundedness from this same decision: specific = a bounded set of one or more explicitly or contextually identified item/service referents; broad = open-ended discovery whose requested item set is not identified; none = no inventory-item referent. Plurality alone is not broad.",
     "A specific referent may come from trusted conversation context and need not be named again in the current sentence.",
     "For NEW_TRANSACTION: browse_options requires itemScope=broad. availability_inquiry, pricing_inquiry, pricing_with_duration, booking_request, details_inquiry, and image_catalog_request require itemScope=specific. general_business_question, clarification, and unclear use the truthful specific, broad, or none scope of the turn.",
     "SOCIAL_GENERAL and UNCLEAR turn scopes require itemScope=none. For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE, preserve the truthful item scope without changing their protected ownership semantics.",
@@ -3796,6 +3925,9 @@ export async function executeCloudDmOwnershipDecision({
     "- PENDING_AVAILABILITY_REFERENCE → exact requestId from pendingAvailabilityRequests.",
     "- OLD_BOOKING_REFERENCE → exact id/bookingId from bookingCandidates.",
     "Never invent an id.",
+    "targetReference is mandatory provenance. OLD_BOOKING_REFERENCE requires targetType=historical_booking, targetId equal to the selected bookingId, and source=current_turn or conversation_turn with an exact supplied turnId. Candidate presence alone is never provenance.",
+    "A fresh pronoun/continuation grounded by trustedFreshItemFocus uses source=trusted_fresh_focus, targetType=catalog_item, targetId equal to that verified itemId, and its sourceTurnId. NEW_TRANSACTION still has targetId=null.",
+    "When no protected or fresh target is referenced use source=none, sourceTurnId=null, targetType=none, targetId=null.",
     "UNIQUE historical match: if the customer asks about or mutates an existing booking, and exactly one historical_candidate matches that named item/service identity, use OLD_BOOKING_REFERENCE with that row's exact id. Other different-item historical rows do not make this UNCLEAR.",
     "SAME-ITEM collision: if two or more historical_candidate rows share that same item identity, and the customer did not cite an exact bookingId or linked AVR id belonging to only one of them, use UNCLEAR, targetId=null, mutationIntent=none, action=reply. Never use list position, first, last, or sort order as evidence.",
     "Independent new inventory request (named item and/or new date/duration that is NOT changing a listed historical booking) → turnScope=NEW_TRANSACTION, targetId=null, mutationIntent=none, action=reply, factKind=booking_fact.",
@@ -3872,6 +4004,24 @@ export async function executeCloudDmOwnershipDecision({
     const raw = resp?.choices?.[0]?.message?.content ?? "";
     const parsed = parseCloudDmOwnershipDecision(raw);
     if (!parsed) {
+      let diagnostic;
+      try {
+        const candidate = JSON.parse(String(raw ?? ""));
+        diagnostic = {
+          turnScope: clean(candidate?.turnScope, 80) || null,
+          semanticIntent: clean(candidate?.semanticIntent, 80) || null,
+          itemScope: clean(candidate?.itemScope, 40) || null,
+          structuralRejectionReason: "OWNERSHIP_SCHEMA_OR_CONSISTENCY_REJECTED",
+        };
+      } catch {
+        diagnostic = {
+          turnScope: null,
+          semanticIntent: null,
+          itemScope: null,
+          structuralRejectionReason: "OWNERSHIP_JSON_MALFORMED",
+        };
+      }
+      console.warn("[cloud_dm_ownership_structural_rejected]", diagnostic);
       return cloudDmOwnershipUnusableResult({
         reason: CLOUD_DM_OWNERSHIP_UNUSABLE_REASON,
         retryable: true,
@@ -3888,6 +4038,7 @@ export async function executeCloudDmOwnershipDecision({
       turnScope: decision.turnScope,
       semanticIntent: decision.semanticIntent ?? null,
       itemScope: decision.itemScope ?? null,
+      targetReference: decision.targetReference ?? null,
       targetId: decision.targetId,
       mutationIntent: decision.mutationIntent,
       action: decision.action,
@@ -3964,6 +4115,13 @@ export async function resolveCloudDmCanonicalOwnership({
   decision.customerReply = "";
   const validation = validatePostConfirmSemanticOwnership(decision, neutralFacts);
   if (!validation.ok) {
+    console.warn("[cloud_dm_ownership_structural_rejected]", {
+      turnScope: decision.turnScope ?? null,
+      semanticIntent: decision.semanticIntent ?? null,
+      itemScope: decision.itemScope ?? null,
+      structuralRejectionReason:
+        String(validation.reason ?? "SEMANTIC_OWNERSHIP_INVALID").slice(0, 120),
+    });
     return {
       ok: false,
       retryable: true,

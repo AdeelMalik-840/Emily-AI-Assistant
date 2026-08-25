@@ -210,6 +210,7 @@ export async function composeBrowseOptionsCustomerReply(p = {}) {
       isAvailable: true,
     })),
   };
+  let mentionedAvailableItemIds = [];
   const system = `${policy}
 
 WORDING-ONLY BROWSE COMPOSER:
@@ -230,12 +231,19 @@ WORDING-ONLY BROWSE COMPOSER:
       facts.availableItems.map((row) => row.itemId)
     ),
     replyContract,
-    extraReject: (reply, parsed) =>
-      validateBrowseOptionsCustomerReply(
+    extraReject: (reply, parsed) => {
+      const rejected = validateBrowseOptionsCustomerReply(
         reply,
         facts,
         parsed?.mentionedAvailableItemIds
-      ),
+      );
+      if (!rejected) {
+        mentionedAvailableItemIds = Array.isArray(parsed?.mentionedAvailableItemIds)
+          ? parsed.mentionedAvailableItemIds.map((id) => clean(id, 120)).filter(Boolean)
+          : [];
+      }
+      return rejected;
+    },
     fallbackReply: "",
     timeoutMs: p.timeoutMs ?? 8000,
     timeoutErrorMessage: "BROWSE_OPTIONS_COMPOSE_TIMEOUT",
@@ -249,6 +257,7 @@ WORDING-ONLY BROWSE COMPOSER:
       reply: "",
       source: "browse_options_compose_fail_closed",
       reason: composed.reason || "compose_failed",
+      mentionedAvailableItemIds: [],
     };
   }
   return {
@@ -256,5 +265,6 @@ WORDING-ONLY BROWSE COMPOSER:
     reply: composed.reply,
     source: composed.source || "openai",
     reason: null,
+    mentionedAvailableItemIds: Object.freeze([...mentionedAvailableItemIds]),
   };
 }

@@ -526,6 +526,7 @@ export async function runBrainV2LivePipeline(params) {
     // When actionRouter signals awaitsPostExecuteBrainReply, call the existing
     // Emily Brain with lane=group_post_execute. Reply only — actionsAllowed: false.
     let finalReply = routed.reply;
+    let finalActionPlan = constrainedPlan;
     let finalReplySource = "BRAIN_V2_LIVE";
     let postExecuteBrainDecision = null;
 
@@ -564,6 +565,51 @@ export async function runBrainV2LivePipeline(params) {
       }
       finalReply = composedBrowse.reply;
       finalReplySource = "BRAIN_V2_BROWSE_OPENAI_COMPOSE";
+      const presentedItemIds = Array.isArray(composedBrowse.mentionedAvailableItemIds)
+        ? [...new Set(composedBrowse.mentionedAvailableItemIds.map((id) => String(id ?? "").trim()).filter(Boolean))]
+        : [];
+      const trustedAvailableItems = Array.isArray(trustedBrowseFacts?.availableItems)
+        ? trustedBrowseFacts.availableItems
+        : [];
+      const verifiedPresentedItems = presentedItemIds
+        .map((itemId) => trustedAvailableItems.find(
+          (row) => String(row?.itemId ?? "").trim() === itemId && row?.isAvailable === true
+        ))
+        .filter(Boolean)
+        .map((row) => ({
+          itemId: String(row.itemId).trim(),
+          itemLabel: String(row.displayLabel ?? "").trim() || null,
+        }));
+      const presentedOne =
+        presentedItemIds.length === 1 && verifiedPresentedItems.length === 1;
+      finalActionPlan = Object.freeze({
+        ...constrainedPlan,
+        actions: Object.freeze((Array.isArray(constrainedPlan?.actions)
+          ? constrainedPlan.actions
+          : []).map((action) =>
+          action === browseReplyAction
+            ? Object.freeze({
+                ...action,
+                payload: Object.freeze({
+                  ...action.payload,
+                  presentedItemIds: Object.freeze([...presentedItemIds]),
+                  verifiedAlternatives: Object.freeze(
+                    verifiedPresentedItems.map((row) => Object.freeze({ ...row }))
+                  ),
+                }),
+              })
+            : action
+        )),
+        persistenceIntent: Object.freeze({
+          ...(constrainedPlan?.persistenceIntent ?? {}),
+          clearItemFocus: !presentedOne,
+          rememberPresentedItemFocus: presentedOne,
+          presentedItemId: presentedOne ? verifiedPresentedItems[0].itemId : null,
+          presentedItemLabel: presentedOne ? verifiedPresentedItems[0].itemLabel : null,
+          clearPresentedItemFocus: !presentedOne,
+          execute: false,
+        }),
+      });
     }
 
     if (routed.awaitsPostExecuteBrainReply === true) {
@@ -667,8 +713,9 @@ export async function runBrainV2LivePipeline(params) {
     const emilySessionKey = String(turnContextInput._emilySessionKey ?? params.sessionKey ?? "").trim();
     applyInfoLiveSessionMemoryPatch({
       sessionKey: emilySessionKey,
-      actionPlan: result.actionPlan,
+      actionPlan: finalActionPlan,
       authoritativeItem: turnContextInput.authoritativeItem,
+      sourceTurnId: `assistant:${String(params.messageId ?? traceId).trim()}`,
     });
 
     console.log("[brain_v2_live_handled]", {
@@ -688,7 +735,7 @@ export async function runBrainV2LivePipeline(params) {
       workflowType,
       reply: finalReply,
       finalReplySource,
-      actionPlan: result.actionPlan,
+      actionPlan: finalActionPlan,
       flags,
       routed: {
         ...routed,

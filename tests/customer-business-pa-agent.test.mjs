@@ -238,13 +238,26 @@ function seedTrustedConfirmedBooking(fake, {
 }
 
 function mockOpenAiReply(text) {
-  return async () => ({
+  return async (args) => {
+    const prompt = String(args?.messages?.find((row) => row?.role === "user")?.content ?? "");
+    const promptFacts = JSON.parse(
+      prompt.split("CLOUD_DM_OWNERSHIP_CANDIDATE_JSON:\n")[1]?.split("\n\nCUSTOMER_MESSAGE:")[0] || "{}"
+    );
+    const sourceTurnId = promptFacts.currentOwnershipTurnId || "user:direct";
+    return ({
     choices: [
       {
         message: {
           content: JSON.stringify({
             turnScope: "OLD_BOOKING_REFERENCE",
             semanticIntent: null,
+            itemScope: "specific",
+            targetReference: {
+              source: "current_turn",
+              sourceTurnId,
+              targetType: "historical_booking",
+              targetId: BOOKING_ID,
+            },
             targetId: BOOKING_ID,
             situation: "new_question",
             conversationAct: "information_request",
@@ -268,7 +281,8 @@ function mockOpenAiReply(text) {
         },
       },
     ],
-  });
+    });
+  };
 }
 
 /** Decide Turn Plan then informational compose for factual asks. */
@@ -313,6 +327,10 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
         ],
       };
     }
+    const prompt = String(args?.messages?.find((row) => row?.role === "user")?.content ?? "");
+    const promptFacts = JSON.parse(
+      prompt.split("CLOUD_DM_OWNERSHIP_CANDIDATE_JSON:\n")[1]?.split("\n\nCUSTOMER_MESSAGE:")[0] || "{}"
+    );
     return {
       choices: [
         {
@@ -320,6 +338,13 @@ function mockOpenAiFactualDecideThenCompose(reply, turnPlan = {}) {
             content: JSON.stringify({
               turnScope: "OLD_BOOKING_REFERENCE",
               semanticIntent: null,
+              itemScope: "specific",
+              targetReference: {
+                source: "current_turn",
+                sourceTurnId: promptFacts.currentOwnershipTurnId || "user:direct",
+                targetType: "historical_booking",
+                targetId: BOOKING_ID,
+              },
               targetId: BOOKING_ID,
               situation: "new_question",
               conversationAct: "information_request",
@@ -1423,6 +1448,7 @@ test("OpenAI failure → one technical fallback; handled true", async () => {
 test("OpenAI helper compact facts include booking total + linked AVR", async () => {
   const facts = {
     businessId: BUSINESS_ID,
+    currentOwnershipTurnId: "user:direct",
     customerPhoneDigits: CUSTOMER_PHONE,
     business: { name: "Emily Cars", category: "rental", tone: null, instructions: "hi" },
     booking: {
@@ -1527,16 +1553,24 @@ test("buffer: PA reply skips general Brain and uses normal Cloud outbound", asyn
           },
         };
       },
-      __executeCloudDmOwnershipDecisionFn: async () => ({
+      __executeCloudDmOwnershipDecisionFn: async ({ facts }) => ({
         ok: true,
         source: "openai",
         facts: {
+          ...facts,
           booking: { id: BOOKING_ID, selectionIndex: 1 },
           bookingCandidates: [{ id: BOOKING_ID, selectionIndex: 1 }],
         },
         decision: {
           turnScope: "OLD_BOOKING_REFERENCE",
           semanticIntent: null,
+          itemScope: "specific",
+          targetReference: {
+            source: "current_turn",
+            sourceTurnId: facts.currentOwnershipTurnId,
+            targetType: "historical_booking",
+            targetId: BOOKING_ID,
+          },
           targetId: BOOKING_ID,
           action: "reply",
           mutationIntent: "none",
