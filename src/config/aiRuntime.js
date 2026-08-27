@@ -22,6 +22,16 @@ export function resolveOpenAiChatModel() {
   return m || "gpt-4o-mini";
 }
 
+/**
+ * Canonical Cloud ownership / semantic-decision model.
+ * OPENAI_OWNERSHIP_MODEL if set; otherwise the existing chat-model resolver.
+ * @returns {string}
+ */
+export function resolveOpenAiOwnershipModel() {
+  const m = String(process.env.OPENAI_OWNERSHIP_MODEL ?? "").trim();
+  return m || resolveOpenAiChatModel();
+}
+
 function readUtf8IfExists(filePath) {
   try {
     return fs.readFileSync(filePath, "utf8").trim();

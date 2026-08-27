@@ -7,7 +7,10 @@
  */
 
 import OpenAI from "openai";
-import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
+import {
+  resolveOpenAiChatModel,
+  resolveOpenAiOwnershipModel,
+} from "../../config/aiRuntime.js";
 import { listExplicitCatalogItemIds, resolveCanonicalItemReferents } from "../../services/currentTurnAuthority.js";
 import {
   isAllowedPaMissingInfoType,
@@ -4418,7 +4421,7 @@ export async function executeCloudDmOwnershipDecision({
     }
     const createPromise = Promise.resolve(
       completionFn({
-        model: resolveOpenAiChatModel(),
+        model: resolveOpenAiOwnershipModel(),
         temperature: 0,
         max_tokens: 600,
         response_format: responseFormat,
@@ -4465,7 +4468,7 @@ export async function executeCloudDmOwnershipDecision({
       raw = retried.raw;
       ownershipCompletionCount = 2;
     }
-    const resolvedModel = resolveOpenAiChatModel();
+    const resolvedModel = resolveOpenAiOwnershipModel();
     const trustedFocusId =
       clean(facts?.trustedFreshItemFocus?.itemId, 160) || null;
     if (!parsed) {
@@ -4599,7 +4602,7 @@ export async function resolveCloudDmCanonicalOwnership({
     facts: neutralFacts,
     ownershipCompletionCount,
     customerTurnOutcome: "TECHNICAL_RECOVERY",
-    resolvedModel: sourceDecision?.resolvedModel ?? resolveOpenAiChatModel(),
+    resolvedModel: sourceDecision?.resolvedModel ?? resolveOpenAiOwnershipModel(),
     rawOwnershipJson: sourceDecision?.rawOwnershipJson ?? null,
     ownershipCorrectionReason:
       sourceDecision?.ownershipCorrectionReason ?? reason ?? null,
