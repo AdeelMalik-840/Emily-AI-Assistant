@@ -4,6 +4,7 @@
  */
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 import {
+  ALL_CUSTOMER_CLAIMS,
   CUSTOMER_CLAIMS,
   buildCustomerReplyContract,
 } from "../contracts/customerReplyContract.js";
@@ -13,6 +14,20 @@ import {
   REPLY_SEMANTICS_SCHEMA,
 } from "./strictJsonSchema.js";
 import { CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY } from "../contracts/cloudCanonicalSemantic.js";
+
+const CLOUD_CANONICAL_REPLY_SEMANTICS_SCHEMA = {
+  ...REPLY_SEMANTICS_SCHEMA,
+  properties: {
+    ...REPLY_SEMANTICS_SCHEMA.properties,
+    claims: {
+      type: "array",
+      items: {
+        type: "string",
+        enum: [...ALL_CUSTOMER_CLAIMS],
+      },
+    },
+  },
+};
 
 const KINDS = new Set([
   "pricing",
@@ -120,7 +135,7 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
       additionalProperties: false,
       properties: {
         customerReply: { type: "string" },
-        replySemantics: REPLY_SEMANTICS_SCHEMA,
+        replySemantics: CLOUD_CANONICAL_REPLY_SEMANTICS_SCHEMA,
       },
       required: ["customerReply", "replySemantics"],
     }

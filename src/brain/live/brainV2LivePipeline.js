@@ -1250,7 +1250,7 @@ function cloudCanonicalComposeKind(p) {
   return null;
 }
 
-function trustedFactsForCloudCompose(p) {
+export function trustedFactsForCloudCompose(p) {
   const composeKind =
     String(p.composeKind ?? "").trim() ||
     cloudCanonicalComposeKind(p) ||
@@ -1282,6 +1282,15 @@ function trustedFactsForCloudCompose(p) {
     dailyRate: positiveNumber(pricing.daily ?? quote.dailyRate),
     monthlyRate: positiveNumber(pricing.monthly ?? quote.monthlyRate),
     totalAmount: positiveNumber(quote.total ?? pricing.total),
+    ...(composeKind === "pricing_with_duration"
+      ? {
+          durationDays:
+            Number.isFinite(Number(quote.durationDays)) &&
+            Number(quote.durationDays) >= 1
+              ? Math.floor(Number(quote.durationDays))
+              : null,
+        }
+      : {}),
     currency: String(pricing.currency ?? quote.currency ?? "PKR").trim() || "PKR",
     availabilityStatus: String(verified.availability?.status ?? "").trim() || null,
     availabilityConfirmed: verified.availability?.isAvailable === true,
