@@ -210,6 +210,9 @@ test("social composer rejects transactional leaks and keeps AI wording only", as
       composeJson("Civic available nahi hai, rent 8000 hai."),
   });
   assert.equal(leaked.ok, false);
+  assert.equal(leaked.source, "technical_fallback");
+  assert.equal(leaked.reason, "SOCIAL_TRANSACTIONAL_LEAK");
+  assert.equal(leaked.attemptCount, 2);
 
   const ok = await composeCloudCanonicalCustomerReply({
     kind: "social",
@@ -221,7 +224,43 @@ test("social composer rejects transactional leaks and keeps AI wording only", as
       composeJson("Salam, kya madad karun?"),
   });
   assert.equal(ok.ok, true);
+  assert.equal(ok.reason, null);
+  assert.equal(ok.attemptCount, 1);
   assert.equal(transactionalLeak(ok.reply), false);
+});
+
+test("cloud canonical compose log includes model, reason, and attempt count", async () => {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => {
+    if (args[0] === "[cloud_canonical_compose]") logs.push(args[1]);
+    originalLog.apply(console, args);
+  };
+  try {
+    await runBrainV2LivePipeline({
+      traceId: "compose-log-reason",
+      businessId: "biz",
+      message: "Hi",
+      channel: "whatsapp_cloud",
+      chatType: "dm",
+      catalogItems: catalog,
+      canonicalSemanticDecision: socialDecision(),
+      getBookingsForItemFn: async () => [],
+      getBusinessProfileFn: async () => ({}),
+      __cloudComposeChatCreate: async () =>
+        composeJson("Civic available nahi hai, rent 8000 hai."),
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].composeKind, "social");
+  assert.equal(logs[0].composeSource, "technical_fallback");
+  assert.equal(logs[0].composeReason, "SOCIAL_TRANSACTIONAL_LEAK");
+  assert.equal(logs[0].composeAttemptCount, 2);
+  assert.equal(typeof logs[0].composeModel, "string");
+  assert.ok(String(logs[0].composeModel).trim());
+  assert.equal(logs[0].composeOk, false);
 });
 
 test("delivered single Civic pricing reply persists trusted fresh item focus", () => {

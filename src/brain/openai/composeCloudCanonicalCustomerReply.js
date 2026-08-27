@@ -54,6 +54,7 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
       reply: clean(p.fallbackReply, 500),
       source: "cloud_canonical_compose_skip",
       reason: "UNSUPPORTED_KIND",
+      attemptCount: 0,
     };
   }
   const facts = factsObject(p.trustedFacts);

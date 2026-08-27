@@ -40,6 +40,7 @@ import {
 } from "../../services/customerBusinessPaAgentService.js";
 import { missingInfoTypeForCloudCanonicalAsk } from "../../services/paMissingInfoRequestService.js";
 import { stampRememberPresentedItemFocusForSingleVerifiedItem } from "../../services/executors/sessionMemoryExecutor.js";
+import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -864,7 +865,13 @@ export async function runBrainV2LivePipeline(params) {
           semanticIntent: authoritativeSemanticIntent ?? null,
           turnScope: canonicalReleased?.turnScope ?? null,
           composeOk: composedLaunch.ok === true,
+          composeModel: resolveOpenAiChatModel(),
           composeSource: composedLaunch.source ?? null,
+          composeReason: String(composedLaunch.reason ?? "").slice(0, 160) || null,
+          composeAttemptCount:
+            Number.isFinite(Number(composedLaunch.attemptCount))
+              ? Number(composedLaunch.attemptCount)
+              : null,
           trustedFreshItemFocusPresent: Boolean(
             params.memorySnapshot?.lastFreshItemFocus?.itemId
           ),
