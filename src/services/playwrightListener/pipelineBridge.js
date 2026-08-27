@@ -190,9 +190,10 @@ async function buildPlaywrightSchedulePayload(adapted) {
   });
   const participantPhoneForDm = participantIdentity.participantPhone || "";
   const identityParticipantKey = String(participantIdentity.participantKey ?? "").trim();
-  // Group follow-ups rely on participant-scoped memory. An unresolved identity
-  // must not inherit name-based or group-wide memory.
-  const participantKey = senderScope ? `scope::${senderScope}` : identityParticipantKey;
+  // Reusable Group identity requires trusted sender evidence on this turn
+  // (DOM/JID senderAnchor or verified phone → senderScope). Extracted
+  // first-seen / display-name keys are not durable and must not be preserved.
+  const participantKey = senderScope ? `scope::${senderScope}` : "";
   if (participantKey) {
     console.log("[participant_identity_stable_key_selected]", {
       groupChatKey: String(normalizedGroupChatKey ?? "").trim() || null,

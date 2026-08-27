@@ -21,8 +21,11 @@ import {
 import {
   __clearWhatsAppInboundBufferForTests,
   executeWhatsAppAiPipeline,
-  isIntentionalSilentInboundResult,
 } from "../src/services/whatsappInboundBuffer.js";
+import {
+  canonicalNewTransactionOwnership,
+  canonicalPendingAvailabilityOwnership,
+} from "./helpers/canonicalPostConfirmFixture.mjs";
 
 function shouldProcessChat({ chatTitle, targetGroups, activeDmChatKeys }) {
   const title = String(chatTitle ?? "").trim();
@@ -822,6 +825,39 @@ function dedupeSafePipelineMessage(text) {
   return `${base} [test:${randomUUID()}]`;
 }
 
+function pendingCloudOwnershipInject() {
+  return async ({ facts } = {}) => {
+    const sourceTurnId =
+      String(facts?.currentOwnershipTurnId ?? "").trim() || "user:direct";
+    return {
+      ok: true,
+      source: "openai",
+      facts: {
+        ...(facts && typeof facts === "object" ? facts : {}),
+        currentOwnershipTurnId: sourceTurnId,
+        pendingAvailabilityRequests: [
+          {
+            selectionIndex: 1,
+            requestId: OWNERSHIP_REQUEST_ID,
+            itemLabel: "Toyota corolla",
+            request: { requestId: OWNERSHIP_REQUEST_ID },
+          },
+        ],
+      },
+      decision: {
+        ...canonicalPendingAvailabilityOwnership({
+          requestId: OWNERSHIP_REQUEST_ID,
+          sourceTurnId,
+        }),
+        pendingAvailabilitySelectionIndex: 1,
+        action: "reply",
+        mutationIntent: "none",
+        factKind: "booking_fact",
+      },
+    };
+  };
+}
+
 async function runOwnershipPipeline({
   availabilityRequestData = waitingConfirmRequest(),
   pipelineParams = {},
@@ -865,7 +901,13 @@ async function runOwnershipPipeline({
     combinedMessage: pipelineMessage,
     latestMessage: pipelineMessage,
     messageId: `inbound-ownership-${randomUUID()}`,
-    __tryHandleAvailabilityCustomerCloudInboundFn: async () => null,
+    __tryHandleAvailabilityCustomerCloudInboundFn:
+      typeof pipelineParams.__tryHandleAvailabilityCustomerCloudInboundFn ===
+      "function"
+        ? pipelineParams.__tryHandleAvailabilityCustomerCloudInboundFn
+        : async () => null,
+    __executeCloudDmOwnershipDecisionFn:
+      pipelineParams.__executeCloudDmOwnershipDecisionFn,
     __tryBrainV2LiveBeforeLegacyFn: async (...args) => {
       brainV2Calls += 1;
       return brainV2Spy(...args);
@@ -978,17 +1020,27 @@ test("C: group availability question is not ownership-silenced when waiting_conf
 test("3B guard C2: blocked path must not call legacy processMessage", async () => {
   enableV2LiveForOwnershipBusiness();
   try {
-    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline();
+    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline({
+      pipelineParams: {
+        __executeCloudDmOwnershipDecisionFn: pendingCloudOwnershipInject(),
+        __tryHandleAvailabilityCustomerCloudInboundFn: async () => ({
+          handled: true,
+          requestId: OWNERSHIP_REQUEST_ID,
+          action: "waiting",
+        }),
+      },
+    });
     assert.equal(brainV2Calls, 0);
     assert.equal(processCalls, 0);
-    assert.equal(outcome?.intentionalSilent, true);
+    assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, true);
     assert.equal(
       outcome?.messageMeta?.outboundTrace?.finalReplySource,
-      "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+      "AVAILABILITY_CUSTOMER_CLOUD_CONFIRM"
     );
-    assert.equal(isIntentionalSilentInboundResult(outcome), true);
-    assert.equal(outcome?.sendVia, "NONE");
-    assert.equal(outcome?.reply, "");
+    assert.notEqual(
+      outcome?.messageMeta?.outboundTrace?.finalReplySource,
+      "BRAIN_V2_LIVE"
+    );
   } finally {
     restoreV2LiveEnv();
   }
@@ -999,11 +1051,19 @@ test("3B guard A: Brain V2 live UnlistedItemWorkflow is not invoked when ownersh
   try {
     const source = executeWhatsAppAiPipeline.toString();
     const skipIdx = source.indexOf("skipGeneralBrainForWaitingConfirmOwnership");
-    const v2Idx = source.indexOf("tryBrainV2LiveFn(sharedBrainParams)");
-    const pmIdx = source.indexOf("await processMessageFn({");
-    assert.ok(skipIdx > 0 && v2Idx > skipIdx && pmIdx > skipIdx);
+    const v2Idx = source.indexOf("tryBrainV2LiveFn({");
+    assert.ok(skipIdx > 0 && v2Idx > skipIdx);
 
-    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline();
+    const { brainV2Calls, processCalls, outcome } = await runOwnershipPipeline({
+      pipelineParams: {
+        __executeCloudDmOwnershipDecisionFn: pendingCloudOwnershipInject(),
+        __tryHandleAvailabilityCustomerCloudInboundFn: async () => ({
+          handled: true,
+          requestId: OWNERSHIP_REQUEST_ID,
+          action: "waiting",
+        }),
+      },
+    });
     assert.equal(brainV2Calls, 0);
     assert.equal(processCalls, 0);
     assert.notEqual(
@@ -1012,7 +1072,7 @@ test("3B guard A: Brain V2 live UnlistedItemWorkflow is not invoked when ownersh
     );
     assert.equal(
       outcome?.messageMeta?.outboundTrace?.finalReplySource,
-      "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+      "AVAILABILITY_CUSTOMER_CLOUD_CONFIRM"
     );
   } finally {
     restoreV2LiveEnv();
@@ -1073,6 +1133,41 @@ test("3B guard C: other customer is not blocked by waiting_confirm ownership gua
         dmChatTitle: "Other Customer",
         combinedMessage: "Civic available?",
         latestMessage: "Civic available?",
+        __executeCloudDmOwnershipDecisionFn: async ({ facts, userMessage } = {}) => {
+          const text = String(userMessage ?? "Civic available?");
+          const surface = "Civic";
+          const start = Math.max(0, text.indexOf(surface));
+          const sourceTurnId =
+            String(facts?.currentOwnershipTurnId ?? "").trim() || "user:direct";
+          return {
+            ok: true,
+            source: "openai",
+            decision: {
+              ...canonicalNewTransactionOwnership({
+                semanticIntent: "availability_inquiry",
+                itemScope: "specific",
+                itemReferents: [
+                  {
+                    source: "current_turn",
+                    surfaceText: surface,
+                    start,
+                    end: start + surface.length,
+                    trustedItemId: null,
+                    sourceTurnId: null,
+                  },
+                ],
+              }),
+              action: "reply",
+              mutationIntent: "none",
+              factKind: "booking_fact",
+            },
+            facts: {
+              ...facts,
+              currentOwnershipTurnId: sourceTurnId,
+              currentCustomerMessage: text,
+            },
+          };
+        },
       },
       brainV2Spy: async () => ({
         handled: true,

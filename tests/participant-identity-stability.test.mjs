@@ -25,7 +25,7 @@ test("B) later phone discovered does not upgrade participantKey", () => {
   assert.equal(out.participantPhone, "923185163172");
 });
 
-test("C) no senderScope fallback: same normalized group + same name yields same name-anchor key", () => {
+test("C) no senderScope: display name does not mint a reusable first-seen key", () => {
   const a = resolveParticipantIdentity({
     groupChatKey: "Car Rental Queries",
     participantName: "Adeel Malik",
@@ -38,11 +38,14 @@ test("C) no senderScope fallback: same normalized group + same name yields same 
     senderScope: "",
     participantPhone: null,
   });
-  assert.ok(String(a.participantKey || "").includes("adeel-malik::first-seen-"));
-  assert.equal(a.participantKey, b.participantKey);
+  assert.equal(a.participantKey, null);
+  assert.equal(b.participantKey, null);
+  assert.equal(a.source, "unresolved");
+  assert.equal(b.source, "unresolved");
+  assert.doesNotMatch(String(a.participantKey ?? ""), /first-seen/);
 });
 
-test("D) groupName/playwrightChatKey normalization does not create two identities", () => {
+test("D) groupName normalization still does not mint display-name identity", () => {
   const a = resolveParticipantIdentity({
     groupChatKey: "Car Rental Queries",
     participantName: "Adeel Malik",
@@ -53,6 +56,8 @@ test("D) groupName/playwrightChatKey normalization does not create two identitie
     participantName: "Adeel Malik",
     senderScope: "",
   });
-  assert.equal(a.participantKey, b.participantKey);
+  assert.equal(a.participantKey, null);
+  assert.equal(b.participantKey, null);
+  assert.equal(a.source, "unresolved");
 });
 

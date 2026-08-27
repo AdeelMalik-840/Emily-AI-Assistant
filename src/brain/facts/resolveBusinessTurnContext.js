@@ -467,7 +467,9 @@ function resolveBusinessDecision(p) {
               ? "price_answer"
               : canonicalWorkflowType === "booking_request"
                 ? "booking_ack"
-                : "clarification",
+                : canonicalWorkflowType === "image_catalog_request"
+                  ? "image_catalog"
+                  : "clarification",
       requestedField: canonicalRequestedField,
       resolvedItemId,
       durationDays,
@@ -709,11 +711,22 @@ export async function resolveBusinessTurnContext(params) {
         : null;
 
   const itemMentioned = understanding?.itemSource === "explicit";
-  const rawSignals = extractTurnSignals({
-    message: rawMessage,
-    hasDuration: understanding?.durationDays != null,
-    itemMentioned,
-  });
+  const rawSignals = authoritativeSemanticIntent
+    ? {
+        priceAsk: false,
+        availabilityAsk: false,
+        bookingCommitment: false,
+        browseAsk: false,
+        photoAsk: false,
+        detailsAsk: false,
+        durationMentioned: understanding?.durationDays != null,
+        rentAvailabilityCompound: false,
+      }
+    : extractTurnSignals({
+        message: rawMessage,
+        hasDuration: understanding?.durationDays != null,
+        itemMentioned,
+      });
   const signals = applyCustomerSemanticIntentToSignals(
     rawSignals,
     authoritativeSemanticIntent
@@ -999,7 +1012,13 @@ export async function resolveBusinessTurnContext(params) {
   }
 
   let availabilityAssistFollowUp = null;
-  if (lastAvailabilityAssist) {
+  const canonicalCloudDm =
+    String(turnContextInput?.channel ?? params.turnContext?.channel ?? "") ===
+      "whatsapp_cloud" &&
+    String(turnContextInput?.chatType ?? params.turnContext?.chatType ?? "") !==
+      "group" &&
+    Boolean(authoritativeSemanticIntent);
+  if (lastAvailabilityAssist && !canonicalCloudDm) {
     try {
       availabilityAssistFollowUp = await decideAvailabilityAssistFollowUp({
         customerText: rawMessage,

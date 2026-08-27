@@ -45,6 +45,8 @@ function historicalStonicFacts() {
     pendingAvailabilityRequests: [],
     known: {},
     policy: { readOnly: true },
+    currentOwnershipTurnId: "user:direct",
+    currentCustomerMessage: "Honda Civic 3 din k liye chahiye",
   };
 }
 
@@ -62,9 +64,42 @@ function decision(overrides = {}) {
         : turnScope === "NEW_TRANSACTION"
           ? "availability_inquiry"
           : null;
+  const civicMessage = "Honda Civic 3 din k liye chahiye";
+  const civicStart = civicMessage.indexOf("Honda Civic");
   return {
     turnScope: "NEW_TRANSACTION",
     semanticIntent,
+    itemScope:
+      turnScope === "NEW_TRANSACTION"
+        ? "specific"
+        : "none",
+    itemReferents:
+      turnScope === "NEW_TRANSACTION"
+        ? [
+            {
+              source: "current_turn",
+              surfaceText: "Honda Civic",
+              start: civicStart,
+              end: civicStart + "Honda Civic".length,
+              trustedItemId: null,
+              sourceTurnId: null,
+            },
+          ]
+        : [],
+    targetReference:
+      turnScope === "OLD_BOOKING_REFERENCE"
+        ? {
+            source: "current_turn",
+            sourceTurnId: "user:direct",
+            targetType: "historical_booking",
+            targetId: overrides.targetId || STONIC_BOOKING_ID,
+          }
+        : {
+            source: "none",
+            sourceTurnId: null,
+            targetType: "none",
+            targetId: null,
+          },
     targetContext: "NEW_TRANSACTION",
     targetId: null,
     situation: "new_question",

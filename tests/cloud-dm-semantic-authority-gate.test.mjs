@@ -124,7 +124,7 @@ test("every semantic intent has a structural workflow family and canonical signa
     ["booking_request", "booking_request"],
     ["browse_options", "browse_options"],
     ["details_inquiry", "clarification"],
-    ["image_catalog_request", "clarification"],
+    ["image_catalog_request", "image_catalog_request"],
     ["general_business_question", "clarification"],
     ["clarification", "clarification"],
     ["social", "clarification"],
@@ -161,7 +161,7 @@ test("canonical semantic-intent matrix wins through understanding, facts, and wo
     ["booking_request", "booking_request"],
     ["browse_options", "browse_options"],
     ["details_inquiry", "clarification"],
-    ["image_catalog_request", "clarification"],
+    ["image_catalog_request", "image_catalog_request"],
     ["general_business_question", "clarification"],
     ["clarification", "clarification"],
     ["unclear", "clarification"],
@@ -498,7 +498,7 @@ test("Cloud DM itemScope gates unlisted routing without changing shared extracti
       intent: "image_catalog_request",
       itemScope: "specific",
       referent: "Revo",
-      expected: "clarification",
+      expected: "image_catalog_request",
     },
     {
       name: "unknown booking",
@@ -680,7 +680,9 @@ test("released NEW_TRANSACTION without a valid canonical semantic intent fails c
   });
   assert.equal(result.handled, true);
   assert.equal(result.reason, "CANONICAL_SEMANTIC_INTENT_INVALID");
-  assert.equal(result.sendVia, "NONE");
+  assert.equal(result.sendVia, "CLOUD_API");
+  assert.notEqual(String(result.reply ?? "").trim(), "");
+  assert.equal(result.customerTurnOutcome, "TECHNICAL_RECOVERY");
   assert.equal(orchestratorCalls, 0);
 });
 
@@ -873,7 +875,7 @@ test("SOCIAL_GENERAL and UNCLEAR retain scoped safety without entering NEW_TRANS
         };
       },
     });
-    assert.equal(captured.turnContext.authoritativeSemanticIntent, undefined);
+    assert.equal(captured.turnContext.authoritativeSemanticIntent, semanticIntent);
     assert.equal(captured.turnContext.canonicalSemanticDecision.turnScope, turnScope);
     assert.equal(result.messageMeta?.actionRouter?.actions?.some(
       (action) => action.type === "CREATE_BOOKING"

@@ -222,6 +222,20 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
     }
   }
 
+  // Frozen Cloud meaning must not be reinterpreted by greeting/browse/assist regexes.
+  // Workflow family is preprojected onto understanding — this engine must not
+  // import the projector or re-read customer text.
+  if (authoritativeSemanticIntent) {
+    const canonicalWorkflowType = String(
+      understanding?.authoritativeWorkflowType ?? ""
+    ).trim();
+    return {
+      workflowType: canonicalWorkflowType || "clarification",
+      reason: "canonical_semantic_authority",
+      priority: 100,
+    };
+  }
+
   if (isGreeting(normalized)) {
     return {
       workflowType: "greeting",
@@ -362,7 +376,11 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
     };
   }
 
-  if (isExplicitBookingRequest(understanding, inboundText) && understanding.resolvedItemId) {
+  if (
+    !canonicalSemanticAuthorityActive &&
+    isExplicitBookingRequest(understanding, inboundText) &&
+    understanding.resolvedItemId
+  ) {
     return {
       workflowType: "booking_request",
       reason: understanding.signals?.bookingCommitment

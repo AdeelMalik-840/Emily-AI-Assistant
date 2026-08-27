@@ -1,5 +1,4 @@
 const INVISIBLE_CHARS_RE = /[\u200B-\u200D\uFEFF]/g;
-const firstSeenSenderAnchors = new Map();
 
 export function normalizeParticipantIdentityValue(value) {
   return String(value ?? "")
@@ -40,16 +39,20 @@ function stableAnchorValue(...values) {
   return "";
 }
 
-function fallbackAnchorFor(groupChatKey, normalizedName) {
-  const group = normalizeGroupChatKey(groupChatKey);
-  const name = keyFromName(normalizedName);
-  if (!group || !name) return "";
-  const cacheKey = `${group}::${name}`;
-  const existing = firstSeenSenderAnchors.get(cacheKey);
-  if (existing) return existing;
-  const anchor = `first-seen-${firstSeenSenderAnchors.size + 1}`;
-  firstSeenSenderAnchors.set(cacheKey, anchor);
-  return anchor;
+/** Leftover display-name first-seen keys are not durable Group identity. */
+export function isSyntheticFirstSeenParticipantKey(value) {
+  return /(?:^|::)first-seen-\d+$/i.test(String(value ?? "").trim());
+}
+
+/**
+ * Reusable Group participantKey must be scope-backed (JID / DOM sender / verified phone).
+ * Name slugs and first-seen keys are not trusted.
+ */
+export function isTrustedReusableGroupParticipantKey(value) {
+  const key = String(value ?? "").trim();
+  if (!key) return false;
+  if (isSyntheticFirstSeenParticipantKey(key)) return false;
+  return /^scope::/i.test(key);
 }
 
 export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) {
@@ -158,19 +161,18 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
     };
   }
 
-  const fallbackAnchor = realAnchor
-    ? ""
-    : fallbackAnchorFor(normalizedGroupChatKey, normalizedName);
-  const stableAnchor = realAnchor || fallbackAnchor;
+  // Group: never mint display-name identity. Trusted evidence is senderScope
+  // (above) or a real WhatsApp/DOM sender anchor.
+  const stableAnchor = realAnchor;
 
   if (normalizedName && stableAnchor) {
     const participantKey = `${normalizedName}::${stableAnchor}`;
     console.log("[participant_identity_resolved]", {
-      source: realAnchor ? "real_anchor" : "first_seen_anchor",
+      source: "real_anchor",
       hasParticipantPhone: Boolean(participantPhone),
       participantKey,
       participantName,
-      anchorSource: realAnchor ? "real" : "fallback",
+      anchorSource: "real",
     });
     if (participantPhone) {
       console.log("[participant_identity_key_not_upgraded_to_phone]", {
@@ -189,15 +191,30 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
         participantName: participantName || null,
         participantKey,
         participantPhonePresent: false,
-        keySource: realAnchor ? "real_anchor" : "first_seen_anchor",
+        keySource: "real_anchor",
       });
     }
     return {
       participantKey,
       participantName,
       participantPhone: participantPhone || null,
-      confidence: realAnchor ? "high" : "medium",
-      source: realAnchor ? "real_anchor" : "first_seen_anchor",
+      confidence: "high",
+      source: "real_anchor",
+    };
+  }
+
+  if (isGroupContext) {
+    console.warn("[participant_identity_unresolved_fail_closed]", {
+      participantName: participantName || null,
+      groupChatKey: normalizedGroupChatKey || null,
+      reason: "NO_TRUSTED_SENDER_EVIDENCE",
+    });
+    return {
+      participantKey: null,
+      participantName: participantName || null,
+      participantPhone: participantPhone || null,
+      confidence: "none",
+      source: "unresolved",
     };
   }
 

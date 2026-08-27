@@ -1703,6 +1703,7 @@ function sanitizeCloudSemanticDecision(p = {}) {
     semanticIntent,
     itemScope,
     itemReferents,
+    itemReferenceMode: cleanSemanticField(p.itemReferenceMode, 40),
     targetReference,
     targetId: cleanSemanticField(p.targetId, 160),
     targetContext: cleanSemanticField(p.targetContext, 80),

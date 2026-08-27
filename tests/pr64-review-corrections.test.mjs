@@ -190,15 +190,33 @@ test("anti-echo never blanks OpenAI text; near-echo regenerates once", async () 
           {
             message: {
               content: JSON.stringify({
+                turnScope: "SOCIAL_GENERAL",
+                semanticIntent: "social",
+                itemScope: "none",
+                itemReferents: [],
+                targetContext: "NONE",
+                targetId: null,
+                selectedBookingId: null,
+                targetReference: {
+                  source: "none",
+                  sourceTurnId: null,
+                  targetType: "none",
+                  targetId: null,
+                },
                 situation: "conversation_closing",
                 conversationAct: "chit_chat",
                 customerIntent: "farewell",
                 customerIsAskingQuestion: false,
                 requestedInfoType: null,
+                factKind: "non_business",
+                capability: "social",
+                evidenceNeeds: [],
                 shouldReply: true,
                 customerReply: reply,
                 action: "reply",
                 mutationIntent: "none",
+                bookingSelectionMode: "none",
+                selectedBookingIndex: null,
                 replySemantics: {
                   claims: [],
                   languageStyle: "english",
@@ -241,15 +259,33 @@ test("model-declared silence remains supported for genuine social closes", async
         {
           message: {
             content: JSON.stringify({
+              turnScope: "SOCIAL_GENERAL",
+              semanticIntent: "social",
+              itemScope: "none",
+              itemReferents: [],
+              targetContext: "NONE",
+              targetId: null,
+              selectedBookingId: null,
+              targetReference: {
+                source: "none",
+                sourceTurnId: null,
+                targetType: "none",
+                targetId: null,
+              },
               situation: "acknowledgement_after_answer",
               conversationAct: "thanks",
               customerIntent: "thanks",
               customerIsAskingQuestion: false,
               requestedInfoType: null,
+              factKind: "non_business",
+              capability: "social",
+              evidenceNeeds: [],
               shouldReply: false,
               customerReply: "",
               action: "silence",
               mutationIntent: "none",
+              bookingSelectionMode: "none",
+              selectedBookingIndex: null,
               replySemantics: {
                 claims: [],
                 languageStyle: "english",
@@ -407,7 +443,8 @@ test("same-owner resume can reclaim; recovery without same owner cannot while li
     },
   });
   assert.equal(first.claimed, true);
-  assert.equal(sameOwnerResume.claimed, true);
+  assert.equal(sameOwnerResume.claimed, false);
+  assert.equal(sameOwnerResume.reason, "processing_lease_held");
   assert.equal(recovery.claimed, false);
   assert.equal(recovery.reason, "processing_lease_held");
 });

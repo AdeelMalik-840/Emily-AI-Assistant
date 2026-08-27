@@ -212,7 +212,8 @@ test("A: overlapping approved Stonic + kal → facts windowApplied + unavailable
     bookings: [EXISTING_STONIC_BOOKING],
   });
   const av = canonical.verified.availability;
-  assert.equal(canonical.turn.durationDays, 1);
+  assert.equal(canonical.turn.durationDays ?? null, null);
+  assert.equal(canonical.duration.calendarRelative, "tomorrow");
   assert.equal(av.windowApplied, true);
   assert.equal(av.dateWindowConfidence, "calendar_relative");
   assert.equal(av.requestedStartAt, "2026-08-07T19:00:00.000Z");
@@ -235,7 +236,8 @@ test("B: no overlapping booking → owner-check still planned", async () => {
     message: MESSAGE_KAL,
     bookings: [],
   });
-  assert.equal(canonical.turn.durationDays, 1);
+  assert.equal(canonical.turn.durationDays ?? null, null);
+  assert.equal(canonical.duration.calendarRelative, "tomorrow");
   assert.equal(canonical.verified.availability.windowApplied, true);
   assert.equal(canonical.verified.availability.dateWindowConfidence, "calendar_relative");
   assert.equal(canonical.verified.availability.isAvailable, true);
@@ -284,6 +286,8 @@ test("B+: no-conflict owner-check still creates a pending AVR ledger entry", asy
 
 test("C: PR #100 fresh-release predicate still true for Stonic kal shape", () => {
   const decision = {
+    turnScope: "NEW_TRANSACTION",
+    semanticIntent: "availability_inquiry",
     factKind: "booking_fact",
     capability: "availability_request",
     action: "reply",

@@ -169,10 +169,21 @@ export async function resolveItemBookingAwareAvailability(p) {
     };
   }
 
-  const avOpts = window
-    ? { requestedStart: window.startAt, requestedEnd: window.endAt }
-    : null;
-  const av = computeUserFacingAvailability(bookings, itemId, avOpts);
+  const avOpts = {
+    ...(window
+      ? { requestedStart: window.startAt, requestedEnd: window.endAt }
+      : {}),
+    ...(Number.isFinite(Number(p.nowMs))
+      ? { evaluationTime: new Date(Number(p.nowMs)) }
+      : {}),
+  };
+  const av = computeUserFacingAvailability(
+    bookings,
+    itemId,
+    avOpts.requestedStart || avOpts.requestedEnd || avOpts.evaluationTime
+      ? avOpts
+      : null
+  );
   const blockingBookings = bookings.filter((b) =>
     isBlockingBookingStatus(String(b?.status ?? "").trim().toLowerCase(), {
       itemId,

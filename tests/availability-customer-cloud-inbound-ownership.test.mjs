@@ -28,6 +28,11 @@ const {
   decideWaitingConfirmFromLegacyClassifierForTests,
   composeWaitingConfirmExecutionReplyForTests,
 } = await import("./helpers/waitingConfirmBrainTestDouble.mjs");
+const {
+  canonicalOldBookingOwnership,
+  canonicalNewTransactionOwnership,
+  canonicalPendingAvailabilityOwnership,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 const BUSINESS_ID = "owner-cloud-confirm-1";
 const REQUEST_ID = "avr_cloud_own_001";
@@ -643,54 +648,14 @@ async function runCloudOwnershipPipeline({
       messageId: `wamid.pipeline-${randomUUID()}`,
       __executeCloudDmOwnershipDecisionFn:
         pipelineParams.__executeCloudDmOwnershipDecisionFn ||
-        (async () =>
+        (async ({ facts } = {}) =>
           availabilityRequestData
-            ? {
-                ok: true,
-                source: "openai",
-                facts: {
-                  pendingAvailabilityRequests: [
-                    {
-                      selectionIndex: 1,
-                      requestId: REQUEST_ID,
-                      itemLabel: "Honda Civic",
-                      request: { requestId: REQUEST_ID },
-                    },
-                  ],
-                },
-                decision: {
-                  turnScope: "PENDING_AVAILABILITY_REFERENCE",
-                  targetId: REQUEST_ID,
-                  action: /kar\s*do|haan|han/i.test(pipelineMessage)
-                    ? "confirm_pending_availability"
-                    : "reply",
-                  mutationIntent: "none",
-                  factKind: "booking_fact",
-                },
-              }
-            : {
-                ok: true,
-                source: "openai",
-                facts: {
-                  booking: {
-                    id: "booking-existing-civic",
-                    selectionIndex: 1,
-                  },
-                  bookingCandidates: [
-                    {
-                      id: "booking-existing-civic",
-                      selectionIndex: 1,
-                    },
-                  ],
-                },
-                decision: {
-                  turnScope: "OLD_BOOKING_REFERENCE",
-                  targetId: "booking-existing-civic",
-                  action: "reply",
-                  mutationIntent: "none",
-                  factKind: "booking_fact",
-                },
-              }),
+            ? pendingAvailabilityOwnershipDecision(facts, {
+                action: /kar\s*do|haan|han/i.test(pipelineMessage)
+                  ? "confirm_pending_availability"
+                  : "reply",
+              })
+            : civicOldBookingOwnershipDecision(facts)),
       __tryHandleAvailabilityCustomerCloudInboundFn:
         cloudConfirmSpy ||
         (async (params) => {
@@ -773,25 +738,69 @@ async function runCloudOwnershipPipeline({
   };
 }
 
-function civicOldBookingOwnershipDecision() {
+function mergeOwnershipFacts(callFacts, extra = {}) {
+  return {
+    ...(callFacts && typeof callFacts === "object" ? callFacts : {}),
+    ...extra,
+  };
+}
+
+function pendingAvailabilityOwnershipDecision(callFacts, { action } = {}) {
   return {
     ok: true,
     source: "openai",
-    facts: {
-      booking: {
-        id: "booking-existing-civic",
-        selectionIndex: 1,
-      },
-      bookingCandidates: [
+    facts: mergeOwnershipFacts(callFacts, {
+      pendingAvailabilityRequests: [
         {
-          id: "booking-existing-civic",
           selectionIndex: 1,
+          requestId: REQUEST_ID,
+          itemLabel: "Honda Civic",
+          request: { requestId: REQUEST_ID },
         },
       ],
-    },
+    }),
     decision: {
-      turnScope: "OLD_BOOKING_REFERENCE",
-      targetId: "booking-existing-civic",
+      ...canonicalPendingAvailabilityOwnership({
+        requestId: REQUEST_ID,
+        sourceTurnId: callFacts?.currentOwnershipTurnId,
+      }),
+      pendingAvailabilitySelectionIndex: 1,
+      action: action || "reply",
+      mutationIntent: "none",
+      factKind: action === "confirm_pending_availability" ? "action" : "booking_fact",
+    },
+  };
+}
+
+function civicOldBookingOwnershipDecision(callFacts) {
+  const bookingId = "booking-existing-civic";
+  const booking = {
+    id: bookingId,
+    selectionIndex: 1,
+    itemId: "civic-1",
+    itemLabel: "Honda Civic 2026",
+    status: "approved",
+  };
+  return {
+    ok: true,
+    source: "openai",
+    facts: mergeOwnershipFacts(callFacts, {
+      booking,
+      bookingCandidates: [booking],
+      bookingFocus: {
+        source: "latest_confirmed_linked_avr",
+        confidence: "trusted",
+        selectedBookingIndex: 1,
+        selectedBookingId: bookingId,
+      },
+    }),
+    decision: {
+      ...canonicalOldBookingOwnership({
+        bookingId,
+        sourceTurnId: callFacts?.currentOwnershipTurnId,
+      }),
+      bookingSelectionMode: "focused",
+      selectedBookingIndex: 1,
       action: "reply",
       mutationIntent: "none",
       factKind: "booking_fact",
@@ -941,17 +950,8 @@ test("Corolla focus release continues once into fresh Civic availability routing
         ok: true,
         providerMessageId: "wamid.fresh-civic-release",
       }),
-      __executeCloudDmOwnershipDecisionFn: async () => ({
-        ok: true,
-        source: "openai",
-        decision: {
-          turnScope: "NEW_TRANSACTION",
-          targetId: null,
-          action: "reply",
-          mutationIntent: "none",
-          factKind: "booking_fact",
-        },
-      }),
+      __executeCloudDmOwnershipDecisionFn: async ({ userMessage }) =>
+        civicAvailabilityNewTransactionDecision(userMessage),
       __resolveActiveCustomerBookingFactsFn: async () => ({
         ok: true,
         reason: "MATCHED_TRUSTED_FOCUS",
@@ -974,7 +974,11 @@ test("Corolla focus release continues once into fresh Civic availability routing
           releaseReason: "SEMANTIC_SCOPE_NEW_TRANSACTION",
           bookingId: "booking-old-corolla",
           decision: {
-            turnScope: "NEW_TRANSACTION",
+            ...canonicalNewTransactionOwnership({
+              semanticIntent: "availability_inquiry",
+              itemScope: "specific",
+              itemReferents: [],
+            }),
             targetContext: "NEW_TRANSACTION",
             targetId: null,
             mutationIntent: "none",
@@ -1055,29 +1059,11 @@ test("full pipeline retries a failed confirmed-booking reply as send-only recove
     latestMessage: inboundText,
     messageId: providerMessageId,
     messageTimestamp: Math.floor(Date.now() / 1000),
-    __executeCloudDmOwnershipDecisionFn: async () => {
+    __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) => {
       ownershipCalls += 1;
-      return {
-        ok: true,
-        source: "openai",
-        facts: {
-          pendingAvailabilityRequests: [
-            {
-              selectionIndex: 1,
-              requestId: REQUEST_ID,
-              itemLabel: "Toyota Corolla",
-              request: { requestId: REQUEST_ID },
-            },
-          ],
-        },
-        decision: {
-          turnScope: "PENDING_AVAILABILITY_REFERENCE",
-          targetId: REQUEST_ID,
-          action: "confirm_pending_availability",
-          mutationIntent: "none",
-          factKind: "action",
-        },
-      };
+      return pendingAvailabilityOwnershipDecision(facts, {
+        action: "confirm_pending_availability",
+      });
     },
     __resolveActiveCustomerBookingFactsFn: async () =>
       activeCivicPostConfirmFacts(),
@@ -1288,8 +1274,8 @@ test("without eligible waiting-confirm, existing Civic post-confirm behavior is 
     availabilityRequestData: null,
     inboundText: "Pickup details?",
     pipelineParams: {
-      __executeCloudDmOwnershipDecisionFn: async () =>
-        civicOldBookingOwnershipDecision(),
+      __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+        civicOldBookingOwnershipDecision(facts),
       __resolveActiveCustomerBookingFactsFn: async () =>
         activeCivicPostConfirmFacts(),
       __tryHandleCustomerBusinessPaInboundFn: async ({ preResolvedBookingFacts }) => {
@@ -1320,8 +1306,8 @@ for (const [label, requestPatch] of [
       availabilityRequestData: baseCloudWaitingRequest(requestPatch),
       inboundText: "Pickup details?",
       pipelineParams: {
-        __executeCloudDmOwnershipDecisionFn: async () =>
-          civicOldBookingOwnershipDecision(),
+      __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+        civicOldBookingOwnershipDecision(facts),
         __resolveActiveCustomerBookingFactsFn: async () =>
           activeCivicPostConfirmFacts(),
         __tryHandleCustomerBusinessPaInboundFn: async () => {
@@ -1348,8 +1334,8 @@ test("frozen Civic booking ownership does not fall through from pending executor
     inboundText: "Pickup details?",
     pipelineParams: {
       messageTimestamp: Math.floor(Date.now() / 1000),
-      __executeCloudDmOwnershipDecisionFn: async () =>
-        civicOldBookingOwnershipDecision(),
+      __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+        civicOldBookingOwnershipDecision(facts),
       __resolveActiveCustomerBookingFactsFn: async () =>
         activeCivicPostConfirmFacts(),
       __tryHandleCustomerBusinessPaInboundFn: async () => {
@@ -1448,16 +1434,49 @@ test("buffer does not send a second reply when confirm service handled", async (
   assert.equal(outcome?.messageMeta?.availabilityCloudConfirmHandled, true);
 });
 
+function civicAvailabilityNewTransactionDecision(userMessage) {
+  const text = String(userMessage ?? "");
+  const surface = "Honda Civic";
+  const start = Math.max(0, text.indexOf(surface));
+  const end = start + surface.length;
+  return {
+    ok: true,
+    source: "openai",
+    decision: {
+      ...canonicalNewTransactionOwnership({
+        semanticIntent: "availability_inquiry",
+        itemScope: "specific",
+        itemReferents: [
+          {
+            source: "current_turn",
+            surfaceText: surface,
+            start,
+            end,
+            trustedItemId: null,
+            sourceTurnId: null,
+          },
+        ],
+      }),
+      action: "reply",
+      mutationIntent: "none",
+      factKind: "booking_fact",
+    },
+  };
+}
+
 function newTransactionOwnershipDecision() {
   return {
     ok: true,
     source: "openai",
     decision: {
-      turnScope: "NEW_TRANSACTION",
-      targetId: null,
+      ...canonicalNewTransactionOwnership({
+        semanticIntent: "general_business_question",
+        itemScope: "none",
+        itemReferents: [],
+      }),
       action: "reply",
       mutationIntent: "none",
-      factKind: "booking_fact",
+      factKind: "non_business",
     },
   };
 }

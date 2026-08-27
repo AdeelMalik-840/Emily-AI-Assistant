@@ -79,6 +79,8 @@ function decisionJson(overrides = {}) {
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
     itemScope: "specific",
+    itemReferents: [],
+    selectedBookingId: "bk-1",
     targetReference: {
       source: "current_turn",
       sourceTurnId: "user:test",

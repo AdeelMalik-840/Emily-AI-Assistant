@@ -104,6 +104,7 @@ export const LIVE_ALLOWED_WORKFLOW_TYPES = new Set([
   "booking_request",
   "contact_collection",
   "contact_request",
+  "image_catalog_request",
 ]);
 
 const SIDE_EFFECT_ACTION_TYPES = [

@@ -18,6 +18,7 @@ import {
   buildUnlistedItemActionPlan,
   buildGreetingActionPlan,
   buildClarificationActionPlan,
+  buildImageCatalogActionPlan,
   buildContactCollectionActionPlan,
   buildContactRequestActionPlan,
 } from "../workflows/index.js";
@@ -186,6 +187,13 @@ export function runConversationTurn({
   } else if (wf === "clarification") {
     actionPlan = buildClarificationActionPlan({
       reason: workflowDecision.reason ?? "collect_duration_pending",
+    });
+  } else if (wf === "image_catalog_request") {
+    actionPlan = buildImageCatalogActionPlan({
+      admittedTurn,
+      understanding,
+      catalogItems,
+      businessContext,
     });
   } else if (wf === "contact_collection") {
     const phone = extractContactPhoneFromText(String(admittedTurn?.turn?.text ?? ""));

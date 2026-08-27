@@ -20,6 +20,10 @@ const { handleCustomerBusinessPaInbound } = await import(
 const { validateCustomerReplyAgainstContract } = await import(
   "../src/brain/guards/customerReplyGuard.js"
 );
+const {
+  canonicalOldBookingOwnership,
+  CANONICAL_OWNERSHIP_TURN_ID,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const STONIC_ITEM_ID = "test-stonic-item";
@@ -102,6 +106,7 @@ function focusedFacts(known = {}, bookingOverrides = {}) {
       doNotInventPolicies: true,
       doNotMutateBooking: true,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
   };
 }
 
@@ -165,6 +170,7 @@ function multiBookingFacts() {
       readOnly: true,
       doNotMutateBooking: true,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
   };
 }
 
@@ -212,6 +218,7 @@ function inferTestOnlyFactKind(d) {
 
 function decision(overrides = {}) {
   const payload = {
+    ...canonicalOldBookingOwnership({ bookingId: "test-booking-stonic" }),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -670,6 +677,7 @@ test("8a. all_candidates: visible duration text still defers with selection safe
   const { result, calls } = await runDecide(
     [
       decision({
+        ...canonicalOldBookingOwnership({ bookingId: "booking-corolla" }),
         requestedInformation: "booking_duration",
         capability: "answer_from_active_booking",
         evidenceNeeds: [
@@ -680,15 +688,16 @@ test("8a. all_candidates: visible duration text still defers with selection safe
           },
         ],
         customerReply: wrong,
-        bookingSelectionMode: "all_candidates",
-        selectedBookingIndex: null,
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
         candidateGroundings: grounding(4, 5, wrong, "10am"),
         groundedFacts: groundedFacts({ pickupTime: "10am" }),
       }),
       decision({
+        ...canonicalOldBookingOwnership({ bookingId: "booking-corolla" }),
         customerReply: corrected,
-        bookingSelectionMode: "all_candidates",
-        selectedBookingIndex: null,
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
         candidateGroundings: grounding(5, 4, corrected, "10am"),
         groundedFacts: groundedFacts({ pickupTime: "10am" }),
       }),
@@ -701,7 +710,8 @@ test("8a. all_candidates: visible duration text still defers with selection safe
   assert.equal(result.ok, true);
   assert.equal(result.decision.customerReply, "");
   assert.equal(result.decision.informationalReplyDeferred, true);
-  assert.equal(result.decision.bookingSelectionMode, "all_candidates");
+  assert.equal(result.decision.bookingSelectionMode, "focused");
+  assert.equal(result.decision.selectedBookingId, "booking-corolla");
   assert.equal(calls.length, 1);
 });
 
@@ -711,9 +721,10 @@ test("8b. all_candidates: hidden junk groundedFacts still preserve deferred Turn
   const { result } = await runDecide(
     [
       decision({
+        ...canonicalOldBookingOwnership({ bookingId: "booking-corolla" }),
         customerReply: reply,
-        bookingSelectionMode: "all_candidates",
-        selectedBookingIndex: null,
+        bookingSelectionMode: "focused",
+        selectedBookingIndex: 2,
         candidateGroundings: [
           {
             selectionIndex: 1,
@@ -753,7 +764,8 @@ test("8b. all_candidates: hidden junk groundedFacts still preserve deferred Turn
   assert.equal(result.ok, true);
   assert.equal(result.decision.customerReply, "");
   assert.equal(result.decision.informationalReplyDeferred, true);
-  assert.equal(result.decision.bookingSelectionMode, "all_candidates");
+  assert.equal(result.decision.bookingSelectionMode, "focused");
+  assert.equal(result.decision.selectedBookingId, "booking-corolla");
 });
 
 test("claim-level guard still rejects hidden-unrelated cases when 4th arg is used directly", () => {

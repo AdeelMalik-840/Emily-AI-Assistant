@@ -154,6 +154,7 @@ test("8-9: active blocking booking unavailable with reliable end date", async ()
         endAt,
       },
     ],
+    nowMs: Date.parse("2026-08-10T12:00:00.000Z"),
   });
   assert.equal(facts.verified.availability.isAvailable, false);
   assert.equal(facts.verified.availability.status, "unavailable");

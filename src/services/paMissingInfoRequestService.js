@@ -14,6 +14,12 @@ export const PA_MISSING_INFO_TYPES = Object.freeze([
   "other",
 ]);
 
+export const PA_MISSING_INFO_SCOPE_KINDS = Object.freeze([
+  "booking",
+  "catalog_item",
+  "business_general",
+]);
+
 export const PA_MISSING_INFO_OPEN_STATUSES = Object.freeze([
   "open",
   "owner_notified",
@@ -74,6 +80,10 @@ function isExpiredRequest(data, nowMs = Date.now()) {
         ? new Date(expiresAt).getTime()
         : null;
   return Number.isFinite(expiresMs) && expiresMs < nowMs;
+}
+
+export function isPaMissingInfoRequestExpired(data, nowMs = Date.now()) {
+  return isExpiredRequest(data, nowMs);
 }
 
 function clean(value, max = 500) {
@@ -154,6 +164,32 @@ export function isPaMissingInfoFactMissing(facts, missingInfoType) {
 }
 
 /**
+ * Map frozen Cloud meaning to the existing missing-info type enum.
+ * Catalog-stage asks without a booking still use this ledger.
+ */
+export function missingInfoTypeForCloudCanonicalAsk({
+  semanticIntent = null,
+  factKind = null,
+} = {}) {
+  const kind = clean(factKind, 40);
+  if (kind === "driver_policy") return "driver";
+  if (kind === "delivery_policy") return "delivery";
+  if (kind === "documents_checklist") return "documents";
+  if (kind === "payment_method") return "payment";
+  if (kind === "advance") return "advance";
+  const intent = clean(semanticIntent, 80);
+  if (intent === "details_inquiry" || intent === "general_business_question") {
+    return "other";
+  }
+  return "other";
+}
+
+export function isCatalogLaunchMissingInfoScope(row) {
+  const scope = clean(row?.scopeKind, 40);
+  return scope === "catalog_item" || scope === "business_general";
+}
+
+/**
  * Phase 1 freeform (`other`): open-row match only by inbound message identity
  * or exact customer question text — never by type alone.
  * @param {Record<string, unknown>} data
@@ -227,6 +263,87 @@ export async function findOpenPaMissingInfoRequest({
 }
 
 /**
+ * Source-turn dedupe: one inbound customer message creates at most one open request.
+ * Identity is business + customer + sourceTurnId/customerMessageId.
+ */
+export async function findOpenPaMissingInfoRequestBySourceTurn({
+  db: connection,
+  businessId,
+  customerPhone,
+  customerMessageId,
+  sourceTurnId = null,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  const phone = phoneDigitsOnly(customerPhone);
+  const messageId = clean(customerMessageId, 160);
+  const turnId = clean(sourceTurnId, 320);
+  if (!col || !phone || (!messageId && !turnId)) return null;
+  const snap = await col.limit(120).get().catch(() => null);
+  const now = Date.now();
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data() || {};
+    const status = clean(data.status, 40);
+    if (!PA_MISSING_INFO_OPEN_STATUSES.includes(status)) continue;
+    if (isExpiredRequest(data, now)) continue;
+    if (!phoneMatchesCustomer(data.customerPhone, phone)) continue;
+    if (messageId && clean(data.customerMessageId, 160) === messageId) {
+      return { id: doc.id, ...(data || {}) };
+    }
+    if (turnId && clean(data.sourceTurnId, 320) === turnId) {
+      return { id: doc.id, ...(data || {}) };
+    }
+  }
+  return null;
+}
+
+async function findOpenCatalogOrBusinessPaMissingInfoRequest({
+  db: connection,
+  businessId,
+  customerPhone,
+  missingInfoType,
+  itemId = null,
+  customerQuestion = null,
+  customerMessageId = null,
+} = {}) {
+  const col = collectionRef(connection, businessId);
+  const phone = phoneDigitsOnly(customerPhone);
+  const type = clean(missingInfoType, 40);
+  if (!col || !phone || !isAllowedPaMissingInfoType(type)) return null;
+  const snap = await col.limit(120).get().catch(() => null);
+  const now = Date.now();
+  const wantedItem = clean(itemId, 160);
+  const question = clean(customerQuestion, 800);
+  const messageId = clean(customerMessageId, 160);
+  for (const doc of snap?.docs ?? []) {
+    const data = doc.data() || {};
+    const status = clean(data.status, 40);
+    if (!PA_MISSING_INFO_OPEN_STATUSES.includes(status)) continue;
+    if (isExpiredRequest(data, now)) continue;
+    if (clean(data.bookingId, 120)) continue;
+    if (clean(data.missingInfoType, 40) !== type) continue;
+    if (!phoneMatchesCustomer(data.customerPhone, phone)) continue;
+    const rowItem = clean(data.itemId, 160);
+    if (wantedItem) {
+      if (rowItem !== wantedItem) continue;
+    } else if (rowItem) {
+      continue;
+    }
+    if (type === "other") {
+      if (
+        !openOtherRequestMatchesScope(data, {
+          customerQuestion: question,
+          customerMessageId: messageId,
+        })
+      ) {
+        continue;
+      }
+    }
+    return { id: doc.id, ...(data || {}) };
+  }
+  return null;
+}
+
+/**
  * Create a new open missing-info request, or return existing open duplicate.
  * @param {{
  *   db: unknown,
@@ -242,16 +359,23 @@ export async function findOpenPaMissingInfoRequest({
  */
 export async function createOrGetOpenPaMissingInfoRequest(p) {
   const uid = clean(p.businessId, 120);
-  const bookingId = clean(p.bookingId, 120);
+  const bookingId = clean(p.bookingId, 120) || null;
+  const itemId = clean(p.itemId, 160) || null;
+  const itemLabel = clean(p.itemLabel, 200) || null;
+  const sourceTurnId = clean(p.sourceTurnId, 320) || null;
   const missingInfoType = clean(p.missingInfoType, 40);
   const customerPhone = phoneDigitsOnly(p.customerPhone);
   const customerQuestion = clean(p.customerQuestion, 800);
   const col = collectionRef(p.db, uid);
+  const scopeKind = bookingId
+    ? "booking"
+    : itemId
+      ? "catalog_item"
+      : "business_general";
 
   if (
     !col ||
     !uid ||
-    !bookingId ||
     !customerPhone ||
     !customerQuestion ||
     !isAllowedPaMissingInfoType(missingInfoType)
@@ -265,17 +389,44 @@ export async function createOrGetOpenPaMissingInfoRequest(p) {
   }
 
   const customerMessageId = clean(p.customerMessageId, 160) || null;
-  const existing = await findOpenPaMissingInfoRequest({
+  const existingByTurn = await findOpenPaMissingInfoRequestBySourceTurn({
     db: p.db,
     businessId: uid,
-    bookingId,
-    missingInfoType,
-    // Freeform other scopes dedupe to exact question / same inbound message.
-    customerQuestion:
-      missingInfoType === "other" ? customerQuestion : null,
-    customerMessageId:
-      missingInfoType === "other" ? customerMessageId : null,
+    customerPhone,
+    customerMessageId,
+    sourceTurnId,
   });
+  if (existingByTurn) {
+    return {
+      ok: true,
+      reason: "DEDUPED_SOURCE_TURN",
+      created: false,
+      request: existingByTurn,
+    };
+  }
+
+  const existing = bookingId
+    ? await findOpenPaMissingInfoRequest({
+        db: p.db,
+        businessId: uid,
+        bookingId,
+        missingInfoType,
+        customerQuestion:
+          missingInfoType === "other" ? customerQuestion : null,
+        customerMessageId:
+          missingInfoType === "other" ? customerMessageId : null,
+      })
+    : await findOpenCatalogOrBusinessPaMissingInfoRequest({
+        db: p.db,
+        businessId: uid,
+        customerPhone,
+        missingInfoType,
+        itemId,
+        customerQuestion:
+          missingInfoType === "other" ? customerQuestion : null,
+        customerMessageId:
+          missingInfoType === "other" ? customerMessageId : null,
+      });
   if (existing) {
     return {
       ok: true,
@@ -297,6 +448,10 @@ export async function createOrGetOpenPaMissingInfoRequest(p) {
     customerPhone,
     bookingId,
     availabilityRequestId: clean(p.availabilityRequestId, 120) || null,
+    itemId,
+    itemLabel,
+    sourceTurnId,
+    scopeKind,
     missingInfoType,
     customerQuestion,
     customerMessageId,

@@ -94,7 +94,7 @@ test("different group participants never share final participant memory", async 
   assert.notEqual(userA.conversationCustomerNumber, userB.conversationCustomerNumber);
 });
 
-test("missing sender scope preserves extracted participant identity without group-wide fallback", async () => {
+test("missing sender scope does not preserve first-seen keys; name-only rows stay unresolved", async () => {
   const first = await captureGroupPayload({
     messageId: "unresolved-1",
     sourceRowKey: "unresolved-row-1",
@@ -107,16 +107,43 @@ test("missing sender scope preserves extracted participant identity without grou
     sourceRowKey: "unresolved-row-2",
     sourceMessageIndex: 2,
     senderAnchor: "",
-    participantKey: "adeel-malik::first-seen-2",
-    senderName: "Adeel Malik",
+    participantKey: "adeel::first-seen-1",
+    senderName: "Adeel",
   });
 
-  assert.equal(first.participantKey, "adeel::first-seen-1");
-  assert.equal(second.participantKey, "adeel-malik::first-seen-2");
-  assert.equal(first.sourceParticipantKey, "adeel::first-seen-1");
-  assert.equal(second.sourceParticipantKey, "adeel-malik::first-seen-2");
+  assert.equal(first.participantKey, "");
+  assert.equal(second.participantKey, "");
+  assert.match(first.sessionKey, /::participant::unresolved::/);
+  assert.match(second.sessionKey, /::participant::unresolved::/);
   assert.notEqual(first.sessionKey, second.sessionKey);
-  assert.equal(first.conversationCustomerNumber, second.conversationCustomerNumber);
+  assert.notEqual(first.conversationCustomerNumber, second.conversationCustomerNumber);
+});
+
+test("name-only row cannot inherit another participant's pending item memory", async () => {
+  const fixture = loadSyntheticCarRentalCatalogFixture();
+  const civic = resolveCatalogItemFromMessage(fixture, "Civic available?");
+  const identified = await captureGroupPayload({
+    messageId: "identified-civic",
+    senderName: "Adeel k",
+  });
+  patchEmilySessionState(identified.sessionKey, {
+    lastItem: { id: civic.itemId, name: civic.itemLabel },
+    pendingAvailabilitySelectionIndex: 1,
+  });
+  const nameOnly = await captureGroupPayload({
+    messageId: "name-only-follow",
+    sourceRowKey: "name-only-follow-row",
+    sourceMessageIndex: 2,
+    senderAnchor: "",
+    senderName: "Adeel k",
+  });
+  assert.notEqual(nameOnly.sessionKey, identified.sessionKey);
+  assert.match(nameOnly.sessionKey, /::participant::unresolved::/);
+  const nameOnlyState = getEmilySessionState(nameOnly.sessionKey);
+  assert.equal(Boolean(nameOnlyState?.lastItem), false);
+  assert.equal(Boolean(nameOnlyState?.pendingAvailabilitySelectionIndex), false);
+  const identifiedState = getEmilySessionState(identified.sessionKey);
+  assert.equal(identifiedState?.lastItem?.id, civic.itemId);
 });
 
 test("Civic availability then 10-day price retains Civic across display-name variation", async () => {

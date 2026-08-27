@@ -38,8 +38,8 @@ const { initPlaywrightGuaranteeMaps } = await import(
 const { setMessageState } = await import("../src/services/messageState.js");
 
 const CHAT_KEY = "car rental queries";
-const PARTICIPANT_KEY = "customer-alpha::first-seen-1";
-const CURSOR_KEY = "car-rental-queries::participant::customer-alpha::first-seen-1";
+const PARTICIPANT_KEY = "scope::customer-alpha";
+const CURSOR_KEY = "car-rental-queries::participant::scope::customer-alpha";
 
 test("ledger tests use temp path, not runtime .cursor ledger file", () => {
   const ledgerPath = __getInboundTurnLedgerPathForTests();

@@ -20,6 +20,10 @@ const {
   shouldPauseCloudPostConfirmModelContractAutoRetry,
   isCloudPostConfirmAutoRetryEnabled,
 } = await import("../src/services/whatsappInboundBuffer.js");
+const {
+  canonicalOldBookingOwnership,
+  CANONICAL_OWNERSHIP_TURN_ID,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const STONIC_ITEM_ID = "test-stonic-item";
@@ -79,6 +83,7 @@ function focusedFacts(known = {}) {
       doNotInventPolicies: true,
       doNotMutateBooking: true,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
   };
 }
 
@@ -144,6 +149,7 @@ function inferTestOnlyFactKind(d) {
 
 function decision(overrides = {}) {
   const payload = {
+    ...canonicalOldBookingOwnership({ bookingId: "test-booking-stonic" }),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -416,14 +422,12 @@ test("6. truncation simulation → deferred factual recovery stays retryable", a
     ],
     { facts: focusedFacts({}), userMessage: "Delivery ho skti hai?" }
   );
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(result.ok, false);
   assert.equal(result.source, "technical_fallback");
   assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
-  assert.equal(result.retryable, true);
-  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
-  const recoveryPrompt = String(calls[2]?.messages?.[1]?.content || "");
-  assert.match(recoveryPrompt, /empty\/invalid output recovery/i);
+  assert.equal(result.retryable, false);
+  assert.equal(result.usabilityClassification, "malformed_json");
 });
 
 test("temporary auto-retry pause gate for model-contract failures", () => {

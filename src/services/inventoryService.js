@@ -4,6 +4,7 @@ import admin from "firebase-admin";
 import { logBookingEvent } from "../utils/bookingLogger.js";
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import { bookingOverlapsRequestedWindow } from "./bookingIntervalOverlap.js";
+import { isSyntheticFirstSeenParticipantKey } from "./participantIdentity.js";
 
 const Timestamp = admin.firestore.Timestamp;
 const FieldValue = admin.firestore.FieldValue;
@@ -1091,12 +1092,23 @@ export async function createBooking(
     sourceParticipantDisplayName ?? sourceParticipantNameClean ?? participantName ?? ""
   ).trim();
   const sourceParticipantPhoneClean = String(sourceParticipantPhone ?? "").trim();
-  const sourceParticipantKeyClean =
-    String(sourceParticipantKey ?? "").trim() ||
-    sourceParticipantPhoneClean ||
-    sourceParticipantNameClean.toLowerCase().replace(/\s+/g, "-") ||
-    sourceParticipantDisplayNameClean.toLowerCase().replace(/\s+/g, "-") ||
-    String(sourceSenderScope ?? senderScope ?? "").trim();
+  const isPlaywrightGroupSource = Boolean(
+    String(source ?? "").trim().toLowerCase() === "playwright" &&
+      (String(groupName ?? sourceGroupName ?? "").trim() ||
+        String(playwrightChatKey ?? sourcePlaywrightChatKey ?? "").trim())
+  );
+  const sourceParticipantKeyRaw = String(sourceParticipantKey ?? "").trim();
+  const sourceParticipantKeyClean = isSyntheticFirstSeenParticipantKey(
+    sourceParticipantKeyRaw
+  )
+    ? ""
+    : sourceParticipantKeyRaw ||
+      sourceParticipantPhoneClean ||
+      (isPlaywrightGroupSource
+        ? String(sourceSenderScope ?? senderScope ?? "").trim()
+        : sourceParticipantNameClean.toLowerCase().replace(/\s+/g, "-") ||
+          sourceParticipantDisplayNameClean.toLowerCase().replace(/\s+/g, "-") ||
+          String(sourceSenderScope ?? senderScope ?? "").trim());
 
   // Guard: never persist internal key fragments like "scope" as a participant display name.
   if (sourceParticipantNameClean && /^scope$/i.test(sourceParticipantNameClean)) {
@@ -1147,11 +1159,6 @@ export async function createBooking(
     sourceMessageId: String(sourceMessageId ?? messageId ?? "").trim(),
     sourceRowKey,
   });
-  const isPlaywrightGroupSource = Boolean(
-    String(source ?? "").trim().toLowerCase() === "playwright" &&
-      (String(groupName ?? sourceGroupName ?? "").trim() ||
-        String(playwrightChatKey ?? sourcePlaywrightChatKey ?? "").trim())
-  );
   const sourceIdentity =
     isPlaywrightGroupSource
       ? {

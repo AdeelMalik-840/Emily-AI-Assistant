@@ -78,14 +78,15 @@ test("3. orolla pice? → item + price", () => {
   assert.equal(f.requestedFieldCandidate, "price");
 });
 
-test("4. stonic 3 dys rent? → price_with_duration", () => {
+test("4. stonic 3 dys rent? → price_with_duration field, rental-need shape", () => {
   const f = fuzzy("stonic 3 dys rent?");
   assert.match(f.normalizedText, /3 days/);
   assert.equal(f.catalogCandidate?.id, "stonic-1");
   assert.equal(f.requestedFieldCandidate, "price_with_duration");
   assert.equal(f.durationCandidate?.normalizedDays, 3);
   const s = shapeFromFuzzy(f);
-  assert.equal(s.primaryIntent, "pricing_question");
+  assert.equal(s.primaryIntent, "booking_request");
+  assert.equal(s.responsePolicy, "start_or_continue_booking");
 });
 
 test("5. civic avalable? → availability", () => {
@@ -321,17 +322,19 @@ test("9. unclear field token p? → no price guess", () => {
   assert.equal(s.primaryIntent, "casual_or_unclear");
 });
 
-test("10 regression: Corolla rent k lye chahiye → pricing", () => {
+test("10 regression: Corolla rent k lye chahiye → rental need, not pricing", () => {
   const f = fuzzy("Corolla rent k lye chahiye");
   const s = shapeFromFuzzy(f);
-  assert.equal(s.primaryIntent, "pricing_question");
+  assert.equal(s.primaryIntent, "booking_request");
+  assert.equal(s.signals.priceAsk, false);
 });
 
-test("11 regression: Corolla rent? → pricing", () => {
+test("11 regression: Corolla rent? is not a price question from field detection alone", () => {
   const f = fuzzy("Corolla rent?");
   const s = shapeFromFuzzy(f);
-  assert.equal(s.primaryIntent, "pricing_question");
-  assert.equal(detectBookingEvent(f.normalizedText).bookingIntent, false);
+  assert.equal(s.primaryIntent, "casual_or_unclear");
+  assert.notEqual(s.responsePolicy, "answer_requested_field");
+  assert.equal(s.signals.priceAsk, false);
 });
 
 test("12 regression: ok → ack only, no forced catalog", () => {

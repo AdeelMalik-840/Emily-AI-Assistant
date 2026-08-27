@@ -566,7 +566,7 @@ test("10. Static: buildContinuationContext has no LLM / reply / executor imports
     join(ROOT, "src/services/availabilityCustomerConfirmService.js"),
     "utf8"
   );
-  assert.match(confirmSrc, /waiting_confirm meaning always uses decideCustomerTurn/);
+  assert.match(confirmSrc, /Meaning authority: decideCustomerTurn/);
   const cloudStart = confirmSrc.indexOf(
     "export async function handleAvailabilityCustomerCloudInbound"
   );

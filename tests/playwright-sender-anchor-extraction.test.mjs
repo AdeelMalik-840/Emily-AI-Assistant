@@ -9,6 +9,8 @@ import {
   participantAnchorFromWhatsAppDataId,
   __mapExtractedIncomingMessageForTests,
 } from "../src/services/playwrightListener/listener.js";
+import { resolveParticipantIdentity } from "../src/services/participantIdentity.js";
+import { verifyOpenedDmMatchesSource } from "../src/services/playwrightReplyPrivatelyBridge.js";
 import {
   loadSyntheticCarRentalCatalogFixture,
   resolveCatalogItemFromMessage,
@@ -173,4 +175,105 @@ test("G: Civic then 3-day duration retains same participant session memory", asy
   assert.equal(followup.sessionKey, first.sessionKey);
   const remembered = getEmilySessionState(followup.sessionKey).lastItem;
   assert.equal(remembered?.id, civic.itemId);
+});
+
+test("H: display-name-only extract does not mint first-seen participantKey", async () => {
+  const payload = await capturePayload({
+    messageId: "name-only-1",
+    sourceRowKey: "name-only-row-1",
+    senderAnchor: "",
+    senderName: "Adeel",
+  });
+  assert.equal(payload.participantKey, "");
+  assert.doesNotMatch(String(payload.participantKey), /first-seen/);
+  assert.match(payload.sessionKey, /::participant::unresolved::/);
+});
+
+test("I: two name-only rows with the same display name are not one durable participant", async () => {
+  const first = await capturePayload({
+    messageId: "same-name-a",
+    sourceRowKey: "same-name-row-a",
+    senderAnchor: "",
+    senderName: "Adeel",
+  });
+  const second = await capturePayload({
+    messageId: "same-name-b",
+    sourceRowKey: "same-name-row-b",
+    sourceMessageIndex: 2,
+    senderAnchor: "",
+    senderName: "Adeel",
+  });
+  assert.equal(first.participantKey, "");
+  assert.equal(second.participantKey, "");
+  assert.notEqual(first.sessionKey, second.sessionKey);
+});
+
+test("J: two people sharing a display name cannot share session through synthetic identity", async () => {
+  const userA = await capturePayload({
+    messageId: "adeel-person-a",
+    sourceRowKey: "adeel-person-a-row",
+    senderAnchor: "",
+    senderName: "Adeel",
+  });
+  const userB = await capturePayload({
+    messageId: "adeel-person-b",
+    sourceRowKey: "adeel-person-b-row",
+    sourceMessageIndex: 2,
+    senderAnchor: "",
+    senderName: "Adeel",
+  });
+  assert.notEqual(userA.sessionKey, userB.sessionKey);
+  assert.notEqual(userA.conversationCustomerNumber, userB.conversationCustomerNumber);
+});
+
+test("K: name-only row cannot become a trusted DM handoff target", () => {
+  const result = verifyOpenedDmMatchesSource({
+    sourceMessage: {
+      sourceParticipantName: "Adeel",
+      sourceParticipantKey: "",
+      senderAnchor: "",
+    },
+    dmChatTitle: "Adeel",
+    dmPlaywrightChatKey: "adeel",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_DM_TARGET_MISMATCH");
+});
+
+test("L: identified JID row remains a trusted DM handoff target", () => {
+  const result = verifyOpenedDmMatchesSource({
+    sourceMessage: {
+      sourceParticipantName: "Adeel k",
+      sourceParticipantKey: "scope::jid-a",
+      sourceSenderScope: "jid-a",
+      senderAnchor: JID_A,
+    },
+    dmChatTitle: "Adeel k",
+    dmPlaywrightChatKey: "adeel-k",
+  });
+  assert.equal(result.ok, true);
+});
+
+test("M: listener-equivalent identity for name-only Group rows is unresolved", () => {
+  const identity = resolveParticipantIdentity({
+    participantName: "Adeel",
+    senderAnchor: "",
+    groupChatKey: "car-rental-queries",
+    senderScope: "",
+  });
+  assert.equal(identity.participantKey, null);
+  assert.equal(identity.source, "unresolved");
+  assert.doesNotMatch(String(identity.participantKey ?? ""), /first-seen/);
+});
+
+test("N: listener-equivalent identity for JID/data-id rows is durable scope key", () => {
+  const senderScope = "abc123jid";
+  const identity = resolveParticipantIdentity({
+    participantName: "Adeel k",
+    senderAnchor: JID_A,
+    groupChatKey: "car-rental-queries",
+    senderScope,
+  });
+  assert.equal(identity.participantKey, `scope::${senderScope}`);
+  assert.equal(identity.source, "sender_scope");
 });

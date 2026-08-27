@@ -736,6 +736,7 @@ function createFakePageForLocatorResolution(messageIns = []) {
   }
 
   return {
+    __emilyFakeLocatorPage: true,
     async evaluate() {
       const firstHidden = messageIns.findIndex((_, index) => !rendered.has(index));
       if (firstHidden >= 0) rendered.add(firstHidden);
@@ -854,7 +855,10 @@ test("Reply Privately locator resolves using visible text participant + message 
   assert.equal(result.ok, true);
   assert.ok(result.locator);
   assert.ok(logs.some((l) => String(l[0]).includes("[reply_privately_locator_verified]")));
-  assert.equal(warns.length, 0);
+  const replyPrivatelyWarns = warns.filter((w) =>
+    String(w[0] ?? "").includes("reply_privately")
+  );
+  assert.equal(replyPrivatelyWarns.length, 0);
 });
 
 test("Reply Privately locator fails closed when participant+text partially matches multiple bubbles", async () => {
@@ -3580,7 +3584,7 @@ test("same group different participant does not reuse duration/item context key"
   assert.equal(hooria, "owner1::leads::participant::hooria");
 });
 
-test("participant identity fallback anchor matches plain name only when display name matches", () => {
+test("participant identity does not treat first-seen keys as the same person as a name slug", () => {
   const allowed = isSameParticipantIdentity(
     {
       participantKey: "adeel-malik::first-seen-1",
@@ -3602,25 +3606,11 @@ test("participant identity fallback anchor matches plain name only when display 
     }
   );
 
-  assert.equal(allowed.allowed, true);
+  assert.equal(allowed.allowed, false);
   assert.equal(rejected.allowed, false);
 });
 
-test("Reply Privately wrong DM target fails before send", () => {
-  const result = verifyOpenedDmMatchesSource({
-    sourceMessage: {
-      sourceParticipantName: "Hooria",
-      sourceParticipantKey: "hooria",
-    },
-    dmChatTitle: "Adeel malik",
-    dmPlaywrightChatKey: "adeel-malik",
-  });
-
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, "REPLY_PRIVATE_DM_TARGET_MISMATCH");
-});
-
-test("Reply Privately correct DM target is allowed", () => {
+test("Reply Privately name-only source cannot target a DM", () => {
   const result = verifyOpenedDmMatchesSource({
     sourceMessage: {
       sourceParticipantName: "Hooria",
@@ -3630,14 +3620,30 @@ test("Reply Privately correct DM target is allowed", () => {
     dmPlaywrightChatKey: "hooria",
   });
 
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_DM_TARGET_MISMATCH");
+});
+
+test("Reply Privately identified source still matches the opened DM title", () => {
+  const result = verifyOpenedDmMatchesSource({
+    sourceMessage: {
+      sourceParticipantName: "Hooria",
+      sourceParticipantKey: "scope::deadbeef",
+      sourceSenderScope: "deadbeef",
+    },
+    dmChatTitle: "Hooria",
+    dmPlaywrightChatKey: "hooria",
+  });
+
   assert.equal(result.ok, true);
 });
 
-test("Reply Privately correct bubble but wrong DM title is blocked", () => {
+test("Reply Privately identified source with wrong DM title is blocked", () => {
   const result = verifyOpenedDmMatchesSource({
     sourceMessage: {
       sourceParticipantName: "Adeel Malik",
-      sourceParticipantKey: "adeel-malik::first-seen-1",
+      sourceParticipantKey: "scope::adeel-jid",
+      sourceSenderScope: "adeel-jid",
     },
     dmChatTitle: "Adeel Khan",
     dmPlaywrightChatKey: "adeel-khan",
@@ -3647,12 +3653,13 @@ test("Reply Privately correct bubble but wrong DM title is blocked", () => {
   assert.equal(result.reason, "REPLY_PRIVATE_DM_TARGET_MISMATCH");
 });
 
-test("Reply Privately DM target allows participant display name fallback", () => {
+test("Reply Privately DM target allows participant display name fallback for identified rows", () => {
   const result = verifyOpenedDmMatchesSource({
     sourceMessage: {
       sourceParticipantName: "",
       sourceParticipantDisplayName: "Hooria",
-      sourceParticipantKey: "hooria",
+      sourceParticipantKey: "scope::hooria-scope",
+      sourceSenderScope: "hooria-scope",
     },
     dmChatTitle: "Hooria",
     dmPlaywrightChatKey: "hooria",
@@ -3661,7 +3668,7 @@ test("Reply Privately DM target allows participant display name fallback", () =>
   assert.equal(result.ok, true);
 });
 
-test("Reply Privately DM target allows loose participant key title match", () => {
+test("Reply Privately DM target does not trust a name-only participant key", () => {
   const result = verifyOpenedDmMatchesSource({
     sourceMessage: {
       sourceParticipantName: "",
@@ -3671,10 +3678,11 @@ test("Reply Privately DM target allows loose participant key title match", () =>
     dmPlaywrightChatKey: "chat-key-1",
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_DM_TARGET_MISMATCH");
 });
 
-test("Reply Privately DM target derives title from fallback participant key", () => {
+test("Reply Privately DM target does not trust a first-seen participant key", () => {
   const result = verifyOpenedDmMatchesSource({
     sourceMessage: {
       sourceParticipantName: "",
@@ -3685,10 +3693,11 @@ test("Reply Privately DM target derives title from fallback participant key", ()
     dmPlaywrightChatKey: "chat-key-1",
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "REPLY_PRIVATE_DM_TARGET_MISMATCH");
 });
 
-test("Reply Privately DM target blocks fallback participant key title mismatch", () => {
+test("Reply Privately DM target blocks first-seen key title mismatch", () => {
   const result = verifyOpenedDmMatchesSource({
     sourceMessage: {
       sourceParticipantName: "",

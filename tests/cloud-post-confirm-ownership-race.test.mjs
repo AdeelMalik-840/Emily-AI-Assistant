@@ -36,6 +36,10 @@ const {
 const {
   scheduleCloudInboundRecoverySweep,
 } = await import("../src/services/cloudInboundRecovery.js");
+const {
+  canonicalOldBookingOwnership,
+  canonicalNewTransactionOwnership,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 const ledgerDir = mkdtempSync(path.join(tmpdir(), "emily-cloud-race-"));
 __setInboundTurnLedgerPathForTests(path.join(ledgerDir, "ledger.json"));
@@ -43,10 +47,10 @@ __setInboundTurnLedgerPathForTests(path.join(ledgerDir, "ledger.json"));
 const BUSINESS_ID = "biz-cloud-race";
 const CUSTOMER_PHONE = "923001234567";
 const OLD_BOOKING_DECISION = Object.freeze({
-  turnScope: "OLD_BOOKING_REFERENCE",
-  targetContext: "CONFIRMED_BOOKING",
-  targetId: "booking-cloud-race",
-  selectedBookingId: "booking-cloud-race",
+  ...canonicalOldBookingOwnership({ bookingId: "booking-cloud-race" }),
+  action: "reply",
+  mutationIntent: "none",
+  factKind: "booking_fact",
 });
 
 function createFakeDb() {
@@ -166,31 +170,9 @@ function basePipelineParams({
     __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) => {
       const bookingId = String(facts?.booking?.id ?? "").trim();
       if (bookingId) {
-        return {
-          ok: true,
-          source: "openai",
-          facts,
-          decision: {
-            turnScope: "OLD_BOOKING_REFERENCE",
-            targetId: bookingId,
-            action: "reply",
-            mutationIntent: "none",
-            factKind: "booking_fact",
-          },
-        };
+        return oldBookingOwnershipDecision(facts, bookingId);
       }
-      return {
-        ok: true,
-        source: "openai",
-        facts: facts && typeof facts === "object" ? facts : {},
-        decision: {
-          turnScope: "NEW_TRANSACTION",
-          targetId: null,
-          action: "reply",
-          mutationIntent: "none",
-          factKind: "booking_fact",
-        },
-      };
+      return newTransactionOwnershipDecision(facts);
     },
     __tryHandleCustomerBusinessPaInboundFn: async (params) => onPa?.(params) ?? null,
     __tryBrainV2LiveBeforeLegacyFn: async () => {
@@ -210,6 +192,63 @@ function basePipelineParams({
         providerMessageId: `wamid.out-${randomUUID()}`,
       },
     __capturePipelineOutcomeForTests: onOutcome,
+  };
+}
+
+function oldBookingOwnershipDecision(callFacts, bookingId = "booking-cloud-race") {
+  const booking = {
+    id: bookingId,
+    selectionIndex: 1,
+    ...(callFacts?.booking && typeof callFacts.booking === "object"
+      ? callFacts.booking
+      : {}),
+  };
+  return {
+    ok: true,
+    source: "openai",
+    facts: {
+      ...(callFacts && typeof callFacts === "object" ? callFacts : {}),
+      booking,
+      bookingCandidates: Array.isArray(callFacts?.bookingCandidates) &&
+        callFacts.bookingCandidates.length
+        ? callFacts.bookingCandidates
+        : [booking],
+      bookingFocus: {
+        source: "latest_confirmed_linked_avr",
+        confidence: "trusted",
+        selectedBookingIndex: 1,
+        selectedBookingId: bookingId,
+      },
+    },
+    decision: {
+      ...canonicalOldBookingOwnership({
+        bookingId,
+        sourceTurnId: callFacts?.currentOwnershipTurnId,
+      }),
+      bookingSelectionMode: "focused",
+      selectedBookingIndex: 1,
+      action: "reply",
+      mutationIntent: "none",
+      factKind: "booking_fact",
+    },
+  };
+}
+
+function newTransactionOwnershipDecision(callFacts) {
+  return {
+    ok: true,
+    source: "openai",
+    facts: callFacts && typeof callFacts === "object" ? callFacts : {},
+    decision: {
+      ...canonicalNewTransactionOwnership({
+        semanticIntent: "general_business_question",
+        itemScope: "none",
+        itemReferents: [],
+      }),
+      action: "reply",
+      mutationIntent: "none",
+      factKind: "non_business",
+    },
   };
 }
 
@@ -630,23 +669,8 @@ test("startup recovery immediately resumes an explicitly queued Cloud ownership 
           return null;
         },
         __tryHandlePaMissingInfoOwnerAnswerFn: async () => null,
-        __executeCloudDmOwnershipDecisionFn: async () => ({
-          ok: true,
-          source: "openai",
-          facts: {
-            booking: { id: "booking-cloud-race", selectionIndex: 1 },
-            bookingCandidates: [
-              { id: "booking-cloud-race", selectionIndex: 1 },
-            ],
-          },
-          decision: {
-            turnScope: "OLD_BOOKING_REFERENCE",
-            targetId: "booking-cloud-race",
-            action: "reply",
-            mutationIntent: "none",
-            factKind: "booking_fact",
-          },
-        }),
+        __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+          oldBookingOwnershipDecision(facts),
         __tryHandleCustomerBusinessPaInboundFn: async (received) => {
           paCalls += 1;
           assert.equal(received.preResolvedBookingFacts?.reason, "MATCHED");
@@ -784,17 +808,8 @@ test("startup recovery releases queued ownership only after final no-booking rec
         },
         __tryHandleAvailabilityCustomerCloudInboundFn: async () => null,
         __tryHandlePaMissingInfoOwnerAnswerFn: async () => null,
-        __executeCloudDmOwnershipDecisionFn: async () => ({
-          ok: true,
-          source: "openai",
-          decision: {
-            turnScope: "NEW_TRANSACTION",
-            targetId: null,
-            action: "reply",
-            mutationIntent: "none",
-            factKind: "booking_fact",
-          },
-        }),
+        __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+          newTransactionOwnershipDecision(facts),
         __tryHandleCustomerBusinessPaInboundFn: async () => {
           paCalls += 1;
           return null;
@@ -1253,23 +1268,8 @@ test("startup recovery runs retryCount 5 final attempt with the original identit
         __resolveActiveCustomerBookingFactsFn: async () => activeFacts(),
         __tryHandleAvailabilityCustomerCloudInboundFn: async () => null,
         __tryHandlePaMissingInfoOwnerAnswerFn: async () => null,
-        __executeCloudDmOwnershipDecisionFn: async () => ({
-          ok: true,
-          source: "openai",
-          facts: {
-            booking: { id: "booking-cloud-race", selectionIndex: 1 },
-            bookingCandidates: [
-              { id: "booking-cloud-race", selectionIndex: 1 },
-            ],
-          },
-          decision: {
-            turnScope: "OLD_BOOKING_REFERENCE",
-            targetId: "booking-cloud-race",
-            action: "reply",
-            mutationIntent: "none",
-            factKind: "booking_fact",
-          },
-        }),
+        __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+          oldBookingOwnershipDecision(facts),
         __tryHandleCustomerBusinessPaInboundFn: async () => {
           paCalls += 1;
           return {
@@ -1354,23 +1354,8 @@ test("concurrent delayed resuming sweeps permit only one expired-lease claim", a
         },
         __tryHandleAvailabilityCustomerCloudInboundFn: async () => null,
         __tryHandlePaMissingInfoOwnerAnswerFn: async () => null,
-        __executeCloudDmOwnershipDecisionFn: async () => ({
-          ok: true,
-          source: "openai",
-          facts: {
-            booking: { id: "booking-cloud-race", selectionIndex: 1 },
-            bookingCandidates: [
-              { id: "booking-cloud-race", selectionIndex: 1 },
-            ],
-          },
-          decision: {
-            turnScope: "OLD_BOOKING_REFERENCE",
-            targetId: "booking-cloud-race",
-            action: "reply",
-            mutationIntent: "none",
-            factKind: "booking_fact",
-          },
-        }),
+        __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+          oldBookingOwnershipDecision(facts),
         __tryHandleCustomerBusinessPaInboundFn: async () => {
           paCalls += 1;
           return {
@@ -1517,23 +1502,8 @@ test("fresh resuming entry is deferred until stale and then recovered", async ()
         __resolveActiveCustomerBookingFactsFn: async () => activeFacts(),
         __tryHandleAvailabilityCustomerCloudInboundFn: async () => null,
         __tryHandlePaMissingInfoOwnerAnswerFn: async () => null,
-        __executeCloudDmOwnershipDecisionFn: async () => ({
-          ok: true,
-          source: "openai",
-          facts: {
-            booking: { id: "booking-cloud-race", selectionIndex: 1 },
-            bookingCandidates: [
-              { id: "booking-cloud-race", selectionIndex: 1 },
-            ],
-          },
-          decision: {
-            turnScope: "OLD_BOOKING_REFERENCE",
-            targetId: "booking-cloud-race",
-            action: "reply",
-            mutationIntent: "none",
-            factKind: "booking_fact",
-          },
-        }),
+        __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+          oldBookingOwnershipDecision(facts),
         __tryHandleCustomerBusinessPaInboundFn: async () => ({
           handled: true,
           action: "business_pa_reply",
@@ -1668,23 +1638,8 @@ test("retryable startup recovery respects timing and original claim owner", asyn
         },
         __tryHandleAvailabilityCustomerCloudInboundFn: async () => null,
         __tryHandlePaMissingInfoOwnerAnswerFn: async () => null,
-        __executeCloudDmOwnershipDecisionFn: async () => ({
-          ok: true,
-          source: "openai",
-          facts: {
-            booking: { id: "booking-cloud-race", selectionIndex: 1 },
-            bookingCandidates: [
-              { id: "booking-cloud-race", selectionIndex: 1 },
-            ],
-          },
-          decision: {
-            turnScope: "OLD_BOOKING_REFERENCE",
-            targetId: "booking-cloud-race",
-            action: "reply",
-            mutationIntent: "none",
-            factKind: "booking_fact",
-          },
-        }),
+        __executeCloudDmOwnershipDecisionFn: async ({ facts } = {}) =>
+          oldBookingOwnershipDecision(facts),
         __tryHandleCustomerBusinessPaInboundFn: async () => ({
           handled: true,
           action: "business_pa_reply",

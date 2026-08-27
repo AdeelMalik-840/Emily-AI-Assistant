@@ -78,9 +78,11 @@ import { tryRecoverCloudOutboundLockedTurn } from "./cloudInboundRecovery.js";
 import {
   applyPostConfirmDerivedOwnershipMechanics,
   buildNeutralCloudDmOwnershipFacts,
+  POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
   resolveCloudDmCanonicalOwnership,
   validatePostConfirmSemanticOwnership,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
+import { readFreshLastAvailabilityAssist } from "../brain/availability/availabilityAssistContext.js";
 import { setMessageState } from "./messageState.js";
 import {
   normalizePlaywrightOutboundTrace,
@@ -2452,11 +2454,15 @@ export async function executeWhatsAppAiPipeline(p) {
         const trustedFreshItemFocus = readTrustedFreshItemFocus(
           shadowPreTurnMemorySnapshot
         );
+        const lastAvailabilityAssist = readFreshLastAvailabilityAssist(
+          shadowPreTurnMemorySnapshot?.lastAvailabilityAssist
+        );
         const baseOwnershipFacts = {
           ...(preResolvedPostConfirmBookingFacts?.facts ?? {}),
           ownershipReferenceContext: conversationReferenceContext,
           currentOwnershipTurnId,
           trustedFreshItemFocus,
+          lastAvailabilityAssist,
         };
         const decided =
           typeof p.__executeCloudDmOwnershipDecisionFn === "function"
@@ -2475,21 +2481,50 @@ export async function executeWhatsAppAiPipeline(p) {
                   p.__chatCompletionsCreateForTests,
               });
         if (decided?.ok !== true || decided?.source !== "openai") {
-          cloudLifecycleClaimed = Boolean(cloudLifecycleIdentity?.guaranteeKey);
-          throw new Error(
+          if (
+            decided?.retryable === false ||
+            Number(decided?.ownershipCompletionCount ?? 0) >= 2 ||
+            decided?.customerTurnOutcome === "TECHNICAL_RECOVERY"
+          ) {
+            skipGeneralBrainForWaitingConfirmOwnership = true;
+            cloudLifecycleClaimed = Boolean(cloudLifecycleIdentity?.guaranteeKey);
+            reply = POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK;
+            sendVia = "CLOUD_API";
+            messageMeta = {
+              customerTurnOutcome: "TECHNICAL_RECOVERY",
+              handledWithoutOutbound: false,
+              outboundTrace: {
+                kind: "cloud_semantic_technical_recovery",
+                finalReplySource: "CLOUD_SEMANTIC_TECHNICAL_RECOVERY",
+                reason: String(decided?.reason ?? "CLOUD_DM_OWNERSHIP_UNUSABLE").slice(0, 160),
+              },
+            };
+          } else {
+            cloudLifecycleClaimed = Boolean(cloudLifecycleIdentity?.guaranteeKey);
+            throw new Error(
+              String(
+                decided?.reason ??
+                  decided?.failureReason ??
+                  "CLOUD_DM_OWNERSHIP_OPENAI_FAILED"
+              )
+            );
+          }
+        } else {
+        const ownershipFacts = {
+          ...buildNeutralCloudDmOwnershipFacts(
+            decided.facts && typeof decided.facts === "object"
+              ? decided.facts
+              : baseOwnershipFacts,
+            preResolvedFreshWaitingConfirmRequest
+          ),
+          currentOwnershipTurnId:
             String(
-              decided?.reason ??
-                decided?.failureReason ??
-                "CLOUD_DM_OWNERSHIP_OPENAI_FAILED"
-            )
-          );
-        }
-        const ownershipFacts = buildNeutralCloudDmOwnershipFacts(
-          decided.facts && typeof decided.facts === "object"
-            ? decided.facts
-            : baseOwnershipFacts,
-          preResolvedFreshWaitingConfirmRequest
-        );
+              (decided.facts && decided.facts.currentOwnershipTurnId) ||
+                baseOwnershipFacts.currentOwnershipTurnId ||
+                ""
+            ).trim() || `user:${String(messageId ?? "").trim()}`,
+          currentCustomerMessage: String(latestMessage ?? ""),
+        };
         const canonicalDecision = applyPostConfirmDerivedOwnershipMechanics(
           decided.decision,
           ownershipFacts
@@ -2528,9 +2563,10 @@ export async function executeWhatsAppAiPipeline(p) {
         if (!snapshot) {
           throw new Error("CANONICAL_SEMANTIC_DECISION_MISSING");
         }
+        }
       }
 
-      if (snapshot.turnScope === "PENDING_AVAILABILITY_REFERENCE") {
+      if (snapshot?.turnScope === "PENDING_AVAILABILITY_REFERENCE") {
         const handleCloudConfirmFn =
           typeof p.__tryHandleAvailabilityCustomerCloudInboundFn === "function"
             ? p.__tryHandleAvailabilityCustomerCloudInboundFn
@@ -2596,7 +2632,7 @@ export async function executeWhatsAppAiPipeline(p) {
               "CANONICAL_PENDING_EXECUTOR_UNHANDLED"
           );
         }
-      } else if (snapshot.turnScope === "OLD_BOOKING_REFERENCE") {
+      } else if (snapshot?.turnScope === "OLD_BOOKING_REFERENCE") {
         const tryBusinessPaFn =
           typeof p.__tryHandleCustomerBusinessPaInboundFn === "function"
             ? p.__tryHandleCustomerBusinessPaInboundFn
@@ -2695,7 +2731,7 @@ export async function executeWhatsAppAiPipeline(p) {
             finalReplySource: paFinalReplySource,
           },
         };
-      } else {
+      } else if (snapshot) {
         if (!cloudNormalRoutingClaimed) {
           markCloudInboundTurnNormalRouting({
             identity: cloudLifecycleIdentity,

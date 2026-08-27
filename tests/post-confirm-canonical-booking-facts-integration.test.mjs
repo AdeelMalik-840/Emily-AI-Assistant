@@ -9,6 +9,10 @@ const { compactBookingFacts } = await import(
 const { executePostConfirmPaLaneDecision } = await import(
   "../src/brain/decisions/decidePostConfirmCustomerDm.js"
 );
+const {
+  canonicalOldBookingOwnership,
+  CANONICAL_OWNERSHIP_TURN_ID,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 function grounded(overrides = {}) {
   return {
@@ -72,6 +76,7 @@ function inferTestOnlyFactKind(d) {
 
 function modelDecision(overrides = {}) {
   const payload = {
+    ...canonicalOldBookingOwnership({ bookingId: "booking-stonic" }),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -198,6 +203,7 @@ test("trusted AVR-filled canonical booking facts are identical for prompt and fi
       doNotMutateBooking: true,
       ambiguousBookingSelection: false,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
   };
 
   const calls = [];

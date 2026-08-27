@@ -18,6 +18,7 @@ import { executeOutboundReply } from "../../services/executors/outboundReplyExec
 import { decideCustomerTurn } from "../decisions/decideCustomerTurn.js";
 import { GROUP_POST_EXECUTE_LANE } from "../decisions/groupPostExecuteLane.js";
 import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
+import { POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK } from "../decisions/decidePostConfirmCustomerDm.js";
 import { buildContinuationContext } from "../continuation/buildContinuationContext.js";
 import {
   ONBOARDING_CLARIFICATION_REPLY,
@@ -27,7 +28,17 @@ import {
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
 import { composeBrowseOptionsCustomerReply } from "../openai/composeBrowseOptionsCustomerReply.js";
 import { composeUnknownItemCustomerReply } from "../openai/composeUnknownItemCustomerReply.js";
+import { composeCloudCanonicalCustomerReply } from "../openai/composeCloudCanonicalCustomerReply.js";
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
+import {
+  CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY,
+  isCloudMissingBusinessFactIntent,
+} from "../contracts/cloudCanonicalSemantic.js";
+import {
+  executeCloudMissingBusinessFactOwnerCheck,
+  isCloudMissingFactHoldingAuthorized,
+} from "../../services/customerBusinessPaAgentService.js";
+import { missingInfoTypeForCloudCanonicalAsk } from "../../services/paMissingInfoRequestService.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -145,22 +156,27 @@ export async function runBrainV2LivePipeline(params) {
     assertBrainV2ExecutionActive(params);
     const canonicalReleased = resolveFrozenCanonicalDecision(params);
     if (canonicalReleased?._ownershipBlockedForBrainV2 === true) {
-      return buildSilentPipelineResult({
-        traceId,
-        reason: "CANONICAL_OWNERSHIP_NOT_BRAIN_V2",
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: "CANONICAL_OWNERSHIP_NOT_BRAIN_V2",
       });
     }
-    const authoritativeSemanticIntent =
-      canonicalReleased?.turnScope === "NEW_TRANSACTION"
-        ? cleanCustomerSemanticIntent(canonicalReleased.semanticIntent)
-        : null;
+    const authoritativeSemanticIntent = canonicalReleased
+      ? cleanCustomerSemanticIntent(canonicalReleased.semanticIntent)
+      : null;
     if (
       canonicalReleased?.turnScope === "NEW_TRANSACTION" &&
       !authoritativeSemanticIntent
     ) {
-      return buildSilentPipelineResult({
-        traceId,
-        reason: "CANONICAL_SEMANTIC_INTENT_INVALID",
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: "CANONICAL_SEMANTIC_INTENT_INVALID",
       });
     }
     let catalogItems = Array.isArray(params.catalogItems) ? params.catalogItems : [];
@@ -188,6 +204,7 @@ export async function runBrainV2LivePipeline(params) {
       traceId,
       authoritativeSemanticIntent,
       canonicalItemReferents: canonicalReleased?.itemReferents ?? null,
+      authoritativeItemScope: canonicalReleased?.itemScope ?? null,
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
@@ -227,9 +244,12 @@ export async function runBrainV2LivePipeline(params) {
         rejectReason: continuation.rejectReason,
         stale: continuation.stale,
       });
-      return buildSilentPipelineResult({
-        traceId,
-        reason: continuation.rejectReason || "CONTINUATION_UNSAFE",
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: continuation.rejectReason || "CONTINUATION_UNSAFE",
       });
     }
 
@@ -329,6 +349,9 @@ export async function runBrainV2LivePipeline(params) {
       brainTurnContext.canonicalItemResolutions = Object.freeze([
         ...(turnContextInput.canonicalItemResolutions ?? []),
       ]);
+      if (turnContextInput.itemReferenceMode) {
+        brainTurnContext.itemReferenceMode = turnContextInput.itemReferenceMode;
+      }
     }
 
     if (turnContextInput.authoritativeItem?.id) {
@@ -371,6 +394,17 @@ export async function runBrainV2LivePipeline(params) {
 
     const workflowType = String(result.workflowDecision?.workflowType ?? "").trim();
 
+    const missingFactOwnerCheck = await maybeCloudMissingFactOwnerCheckResult({
+      params,
+      turnContextInput,
+      channel,
+      chatType,
+      workflowType,
+      actionPlan: result.actionPlan,
+      authoritativeSemanticIntent,
+    });
+    if (missingFactOwnerCheck) return missingFactOwnerCheck;
+
     if (!isLiveWorkflowType(workflowType)) {
       return buildClarificationResult({
         params,
@@ -390,7 +424,7 @@ export async function runBrainV2LivePipeline(params) {
           params.memorySnapshot?.lastAvailabilityAssist
       );
       // Active availability-assist context: never map empty plan → onboarding clarify.
-      if (freshAssist) {
+      if (freshAssist && !authoritativeSemanticIntent) {
         assertBrainV2ExecutionActive(params);
         const emilySessionKey = String(
           turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
@@ -405,9 +439,12 @@ export async function runBrainV2LivePipeline(params) {
           },
           authoritativeItem: turnContextInput.authoritativeItem,
         });
-        return buildSilentPipelineResult({
-          traceId,
-          reason: "ASSIST_CONTEXT_NO_REPLY",
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: "ASSIST_CONTEXT_NO_REPLY",
         });
       }
       return buildClarificationResult({
@@ -422,7 +459,10 @@ export async function runBrainV2LivePipeline(params) {
     }
 
     // Explicit assist no-reply (NO_OP) — handled silence, never outbound / clarify.
-    if (isAvailabilityAssistContextNoReplyPlan(result.actionPlan)) {
+    if (
+      isAvailabilityAssistContextNoReplyPlan(result.actionPlan) &&
+      !authoritativeSemanticIntent
+    ) {
       assertBrainV2ExecutionActive(params);
       const emilySessionKey = String(
         turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
@@ -432,9 +472,12 @@ export async function runBrainV2LivePipeline(params) {
         actionPlan: result.actionPlan,
         authoritativeItem: turnContextInput.authoritativeItem,
       });
-      return buildSilentPipelineResult({
-        traceId,
-        reason: "ASSIST_CONTEXT_NO_REPLY",
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: "ASSIST_CONTEXT_NO_REPLY",
       });
     }
 
@@ -486,9 +529,12 @@ export async function runBrainV2LivePipeline(params) {
           )
         : [];
       if (socialActions.length === 0 && !String(constrainedPlan?.replyDraft ?? "").trim()) {
-        return buildSilentPipelineResult({
-          traceId,
-          reason: "CANONICAL_SOCIAL_GENERAL_SCOPE",
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: "CANONICAL_SOCIAL_GENERAL_SCOPE",
         });
       }
     }
@@ -560,9 +606,12 @@ export async function runBrainV2LivePipeline(params) {
       });
       assertBrainV2ExecutionActive(params);
       if (!composedUnknown.ok || !String(composedUnknown.reply ?? "").trim()) {
-        return buildSilentPipelineResult({
-          traceId,
-          reason: `UNKNOWN_ITEM_COMPOSE_FAIL_CLOSED:${composedUnknown.reason ?? "no_reply"}`,
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: `UNKNOWN_ITEM_COMPOSE_FAIL_CLOSED:${composedUnknown.reason ?? "no_reply"}`,
         });
       }
       finalReply = composedUnknown.reply;
@@ -597,9 +646,12 @@ export async function runBrainV2LivePipeline(params) {
           actionPlan: constrainedPlan,
           authoritativeItem: turnContextInput.authoritativeItem,
         });
-        return buildSilentPipelineResult({
-          traceId,
-          reason: `BROWSE_COMPOSE_FAIL_CLOSED:${composedBrowse.reason ?? "no_reply"}`,
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: `BROWSE_COMPOSE_FAIL_CLOSED:${composedBrowse.reason ?? "no_reply"}`,
         });
       }
       finalReply = composedBrowse.reply;
@@ -652,6 +704,13 @@ export async function runBrainV2LivePipeline(params) {
     }
 
     if (routed.awaitsPostExecuteBrainReply === true) {
+      if (isCloudDmChannel({ channel, chatType, params })) {
+        const deferral =
+          plannedActionReplyText(constrainedPlan) ||
+          CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY;
+        finalReply = deferral;
+        finalReplySource = "BRAIN_V2_LIVE";
+      } else {
       const postExecResult =
         sideEffectResults?.OWNER_CHECK_POST_EXECUTE_RESULT &&
         typeof sideEffectResults.OWNER_CHECK_POST_EXECUTE_RESULT === "object"
@@ -718,15 +777,25 @@ export async function runBrainV2LivePipeline(params) {
           actionPlan: result.actionPlan,
           authoritativeItem: turnContextInput.authoritativeItem,
         });
-        return buildSilentPipelineResult({
-          traceId,
-          reason: `GROUP_POST_EXECUTE_BRAIN_EMPTY:${brainResult?.reason ?? "no_reply"}`,
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: `GROUP_POST_EXECUTE_BRAIN_EMPTY:${brainResult?.reason ?? "no_reply"}`,
         });
+      }
       }
     }
     // ── End post-execute Brain reply ────────────────────────────────────────
 
     if (customerReplySuppressed === true) {
+      if (isCloudDmChannel({ channel, chatType, params })) {
+        finalReply =
+          plannedActionReplyText(constrainedPlan) ||
+          CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY;
+        finalReplySource = "CLOUD_SEMANTIC_OWNER_CHECK";
+      } else {
       assertBrainV2ExecutionActive(params);
       const emilySessionKeySilent = String(
         turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
@@ -742,13 +811,52 @@ export async function runBrainV2LivePipeline(params) {
           sideEffectResults?.AVAILABILITY_OWNER_CHECK_REQUIRED?.lifecycleKind ??
           "OWNER_CHECK_REPLY_SUPPRESSED"
       ).trim();
-      return buildSilentPipelineResult({
-        traceId,
-        reason: disposition || "OWNER_CHECK_REPLY_SUPPRESSED",
+    return buildSilentPipelineResult({
+      traceId,
+      channel,
+      chatType,
+      isGroupInbound: params.isGroupInbound,
+      reason: disposition || "OWNER_CHECK_REPLY_SUPPRESSED",
       });
+      }
     }
 
     assertBrainV2ExecutionActive(params);
+    if (
+      isCloudDmChannel({ channel, chatType, params }) &&
+      shouldComposeCloudCanonicalLaunchReply(params) &&
+      finalReplySource !== "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE" &&
+      finalReplySource !== "BRAIN_V2_BROWSE_OPENAI_COMPOSE" &&
+      finalReplySource !== "BRAIN_V2_GROUP_POST_EXECUTE"
+    ) {
+      const composeKind = cloudCanonicalComposeKind({
+        workflowType,
+        actionPlan: finalActionPlan,
+        semanticIntent: authoritativeSemanticIntent,
+      });
+      if (composeKind) {
+        const composedLaunch = await composeCloudCanonicalCustomerReply({
+          kind: composeKind,
+          semanticIntent: authoritativeSemanticIntent,
+          customerMessage: message,
+          trustedFacts: trustedFactsForCloudCompose({
+            resolvedBusinessTurnContext,
+            actionPlan: finalActionPlan,
+            bookingCreated,
+          }),
+          fallbackReply: finalReply,
+          timeoutMs: params.__cloudComposeTimeoutMs ?? 8000,
+          __chatCompletionsCreateForTests: params.__cloudComposeChatCreate ?? null,
+        });
+        assertBrainV2ExecutionActive(params);
+        if (composedLaunch.ok && String(composedLaunch.reply ?? "").trim()) {
+          finalReply = composedLaunch.reply;
+          if (composedLaunch.source === "openai_cloud_canonical_compose") {
+            finalReplySource = "CLOUD_CANONICAL_OPENAI_COMPOSE";
+          }
+        }
+      }
+    }
     const emilySessionKey = String(turnContextInput._emilySessionKey ?? params.sessionKey ?? "").trim();
     applyInfoLiveSessionMemoryPatch({
       sessionKey: emilySessionKey,
@@ -756,6 +864,23 @@ export async function runBrainV2LivePipeline(params) {
       authoritativeItem: turnContextInput.authoritativeItem,
       sourceTurnId: `assistant:${String(params.messageId ?? traceId).trim()}`,
     });
+
+    if (!String(finalReply ?? "").trim() && routed.intentionallySilent === true) {
+      const silentReason = String(
+        (Array.isArray(finalActionPlan?.actions) ? finalActionPlan.actions : []).find(
+          (action) =>
+            String(action?.type ?? "").trim() === "NO_OP" &&
+            action?.payload?.intentionallySilent === true
+        )?.payload?.reason ?? "INTENTIONAL_SILENT"
+      ).trim();
+      return buildSilentPipelineResult({
+        traceId,
+        channel,
+        chatType,
+        isGroupInbound: params.isGroupInbound,
+        reason: silentReason || "INTENTIONAL_SILENT",
+      });
+    }
 
     console.log("[brain_v2_live_handled]", {
       traceId,
@@ -820,8 +945,291 @@ export async function runBrainV2LivePipeline(params) {
       dmRecipientPhone: null,
       reason: "TECHNICAL_ERROR",
       legacyBypassed: true,
+      ...(channel === "whatsapp_cloud" && chatType !== "group" && params.isGroupInbound !== true
+        ? { customerTurnOutcome: "TECHNICAL_RECOVERY" }
+        : {}),
     };
   }
+}
+
+function plannedActionReplyText(actionPlan) {
+  const plan = actionPlan && typeof actionPlan === "object" ? actionPlan : null;
+  if (!plan) return "";
+  const draft = String(plan.replyDraft ?? "").trim();
+  if (draft) return draft;
+  const actions = Array.isArray(plan.actions) ? plan.actions : [];
+  for (const action of actions) {
+    const text = String(action?.payload?.text ?? "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function isCloudDmChannel(p) {
+  return (
+    p.channel === "whatsapp_cloud" &&
+    p.chatType !== "group" &&
+    p.params?.isGroupInbound !== true
+  );
+}
+
+/**
+ * Understood Cloud details/business questions must not become "I didn't understand".
+ * Canned clarification here means trusted facts were missing, not that meaning was unknown.
+ */
+async function maybeCloudMissingFactOwnerCheckResult(p) {
+  if (!isCloudDmChannel(p)) return null;
+  const missingMedia = p.actionPlan?.missingTrustedMedia === true;
+  if (
+    !missingMedia &&
+    !isCloudMissingBusinessFactIntent(p.authoritativeSemanticIntent)
+  ) {
+    return null;
+  }
+  if (!missingMedia) {
+    const planned = plannedActionReplyText(p.actionPlan);
+    if (planned && !isOnboardingStyleClarificationReply(planned)) return null;
+  }
+
+  const params = p.params && typeof p.params === "object" ? p.params : {};
+  const db = params.executionContext?.db ?? params.db ?? null;
+  const customerPhone = String(params.participantPhoneForDm ?? "").trim() || null;
+  const item = p.turnContextInput?.authoritativeItem;
+  const itemId = String(item?.id ?? item?.itemId ?? "").trim() || null;
+  const itemLabel =
+    String(item?.displayLabel ?? item?.name ?? item?.label ?? "").trim() || null;
+  const missingInfoType = missingInfoTypeForCloudCanonicalAsk({
+    semanticIntent: p.authoritativeSemanticIntent,
+    factKind: params.canonicalSemanticDecision?.factKind,
+  });
+  let execution = null;
+  if (db && customerPhone && params.businessId) {
+    execution = await executeCloudMissingBusinessFactOwnerCheck({
+      db,
+      businessId: params.businessId,
+      customerPhone,
+      messageText: params.message,
+      messageId: params.messageId,
+      sourceTurnId: params.messageId || params.guaranteeKey || null,
+      itemId,
+      itemLabel,
+      missingInfoType,
+      sendCredentials: params.executionContext?.sendCredentials ?? null,
+      executionContext: params.executionContext ?? {},
+      __createOrGetOpenPaMissingInfoRequestFn:
+        params.__createOrGetOpenPaMissingInfoRequestFn,
+      __sendPaMissingInfoOwnerNotificationFn:
+        params.__sendPaMissingInfoOwnerNotificationFn,
+      __sendWhatsAppMessageFn:
+        params.executionContext?.sendWhatsAppMessageFn ??
+        params.__sendWhatsAppMessageFn,
+    });
+  }
+
+  const holdingAuthorized = isCloudMissingFactHoldingAuthorized(execution);
+  const missingInfoRequest = execution
+    ? {
+        requestId: execution.missingInfoRequestId,
+        missingInfoType: execution.missingInfoType,
+        ownerNotifyStatus: execution.ownerNotifyStatus,
+        itemId,
+        itemLabel,
+        reason: execution.reason,
+      }
+    : null;
+  const actionPlan = {
+    ...(p.actionPlan && typeof p.actionPlan === "object" ? p.actionPlan : {}),
+    missingInfoRequestId: execution?.missingInfoRequestId ?? null,
+    missingInfoType: execution?.missingInfoType ?? missingInfoType,
+    ownerNotifyStatus: execution?.ownerNotifyStatus ?? null,
+    itemId,
+    itemLabel,
+  };
+
+  if (!holdingAuthorized) {
+    return finalizeLivePipelineResult({
+      params,
+      turnContextInput: p.turnContextInput,
+      workflowType: p.workflowType || "clarification",
+      reply: POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
+      finalReplySource: "CLOUD_SEMANTIC_TECHNICAL_RECOVERY",
+      actionPlan,
+      flags: getEmilyBrainV2LiveFlagSnapshot(),
+      routed: null,
+      bookingCreated: null,
+      customerTurnOutcome: "TECHNICAL_RECOVERY",
+      reason:
+        execution?.reason ||
+        (!db ? "DB_UNAVAILABLE" : "OWNER_CHECK_NOT_AUTHORIZED"),
+      missingInfoRequest,
+    });
+  }
+
+  let reply = CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY;
+  if (shouldComposeCloudCanonicalLaunchReply(params)) {
+    const composed = await composeCloudCanonicalCustomerReply({
+      kind: "owner_check_holding",
+      semanticIntent: p.authoritativeSemanticIntent,
+      customerMessage: params.message,
+      trustedFacts: {
+        itemId,
+        itemLabel,
+        answerKnown: false,
+        ownerCheckPending: true,
+      },
+      fallbackReply: CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY,
+      timeoutMs: params.__cloudComposeTimeoutMs ?? 8000,
+      __chatCompletionsCreateForTests: params.__cloudComposeChatCreate ?? null,
+    });
+    if (composed.ok && String(composed.reply ?? "").trim()) {
+      reply = composed.reply;
+    }
+  }
+
+  return finalizeLivePipelineResult({
+    params,
+    turnContextInput: p.turnContextInput,
+    workflowType: p.workflowType || "clarification",
+    reply,
+    finalReplySource: "CLOUD_SEMANTIC_OWNER_CHECK",
+    actionPlan,
+    flags: getEmilyBrainV2LiveFlagSnapshot(),
+    routed: null,
+    bookingCreated: null,
+    customerTurnOutcome: "OWNER_CHECK",
+    missingInfoRequest,
+  });
+}
+
+function shouldComposeCloudCanonicalLaunchReply(params) {
+  if (typeof params?.__cloudComposeChatCreate === "function") return true;
+  return String(process.env.NODE_ENV ?? "").trim() !== "test";
+}
+
+function cloudCanonicalComposeKind(p) {
+  const workflowType = String(p.workflowType ?? "").trim();
+  const intent = String(p.semanticIntent ?? "").trim();
+  if (workflowType === "image_catalog_request" || intent === "image_catalog_request") {
+    return "image_intro";
+  }
+  if (workflowType === "pricing_with_duration" || intent === "pricing_with_duration") {
+    return "pricing_with_duration";
+  }
+  if (workflowType === "pricing_inquiry" || intent === "pricing_inquiry") {
+    return "pricing";
+  }
+  if (workflowType === "availability_inquiry" || intent === "availability_inquiry") {
+    const actions = Array.isArray(p.actionPlan?.actions) ? p.actionPlan.actions : [];
+    const asksDuration = actions.some(
+      (action) =>
+        String(action?.payload?.pendingStage ?? "").includes("duration") ||
+        /kitne din/i.test(String(action?.payload?.text ?? p.actionPlan?.replyDraft ?? ""))
+    );
+    return asksDuration ? "duration_ask" : "availability";
+  }
+  if (workflowType === "booking_request" || intent === "booking_request") {
+    return "booking_status";
+  }
+  if (
+    workflowType === "clarification" ||
+    workflowType === "unknown_clarification" ||
+    intent === "clarification" ||
+    intent === "unclear"
+  ) {
+    return "clarification";
+  }
+  return null;
+}
+
+function trustedFactsForCloudCompose(p) {
+  const verified =
+    p.resolvedBusinessTurnContext?.verified &&
+    typeof p.resolvedBusinessTurnContext.verified === "object"
+      ? p.resolvedBusinessTurnContext.verified
+      : {};
+  const item = p.resolvedBusinessTurnContext?.resolvedItem ?? null;
+  const actions = Array.isArray(p.actionPlan?.actions) ? p.actionPlan.actions : [];
+  const imageUrls = extractTrustedImageUrlsFromActionPlan(p.actionPlan);
+  const pricing =
+    verified.pricing && typeof verified.pricing === "object" ? verified.pricing : {};
+  const quote =
+    verified.priceQuote && typeof verified.priceQuote === "object"
+      ? verified.priceQuote
+      : {};
+  const positiveNumber = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  return {
+    itemId: String(item?.id ?? "").trim() || null,
+    itemLabel: String(item?.displayLabel ?? item?.name ?? "").trim() || null,
+    dailyRate: positiveNumber(pricing.daily ?? quote.dailyRate),
+    monthlyRate: positiveNumber(pricing.monthly ?? quote.monthlyRate),
+    totalAmount: positiveNumber(quote.total ?? pricing.total),
+    currency: String(pricing.currency ?? quote.currency ?? "PKR").trim() || "PKR",
+    availabilityStatus: String(verified.availability?.status ?? "").trim() || null,
+    availabilityConfirmed: verified.availability?.isAvailable === true,
+    bookingCreated: Boolean(p.bookingCreated),
+    bookingId: p.bookingCreated?.id ?? null,
+    imageCount: imageUrls.length,
+    hasTrustedImages: imageUrls.length > 0,
+    ownerCheckPlanned: actions.some(
+      (action) =>
+        String(action?.type ?? "").trim() === "AVAILABILITY_OWNER_CHECK_REQUIRED"
+    ),
+  };
+}
+
+function extractTrustedImageUrlsFromActionPlan(actionPlan) {
+  const actions = Array.isArray(actionPlan?.actions) ? actionPlan.actions : [];
+  const urls = [];
+  for (const action of actions) {
+    const raw = action?.payload?.whatsappImageUrls;
+    if (!Array.isArray(raw)) continue;
+    for (const entry of raw) {
+      const url = String(entry ?? "").trim();
+      if (url) urls.push(url);
+    }
+  }
+  return [...new Set(urls)];
+}
+
+/**
+ * @param {Record<string, unknown>} p
+ */
+function deriveCloudCustomerTurnOutcome(p) {
+  if (p.customerTurnOutcome) return p.customerTurnOutcome;
+  const source = String(p.finalReplySource ?? "");
+  if (source.includes("OWNER_CHECK")) return "OWNER_CHECK";
+  if (source.includes("TECHNICAL") || p.workflowType === "error_apology") {
+    return "TECHNICAL_RECOVERY";
+  }
+  const actions = Array.isArray(p.actionPlan?.actions) ? p.actionPlan.actions : [];
+  const actionTypes = actions.map((action) => String(action?.type ?? "").trim());
+  if (
+    actionTypes.includes("NOTIFY_OWNER") ||
+    actionTypes.includes("AVAILABILITY_OWNER_CHECK_REQUIRED")
+  ) {
+    return "OWNER_CHECK";
+  }
+  if (p.bookingCreated || actionTypes.includes("CREATE_BOOKING")) {
+    return "SAFE_ACTION";
+  }
+  const frozen = p.params?.canonicalSemanticDecision;
+  const scope = String(frozen?.turnScope ?? "").trim();
+  const intent = String(
+    p.turnContextInput?.authoritativeSemanticIntent ?? frozen?.semanticIntent ?? ""
+  ).trim();
+  if (
+    scope === "UNCLEAR" ||
+    intent === "unclear" ||
+    intent === "clarification" ||
+    p.workflowType === "clarification" ||
+    p.workflowType === "unknown_clarification"
+  ) {
+    return "CUSTOMER_CLARIFICATION";
+  }
+  return "ANSWER";
 }
 
 /**
@@ -855,6 +1263,7 @@ function finalizeLivePipelineResult(p) {
     routed: p.routed,
     bookingCreated: p.bookingCreated,
     decisionTrace: p.decisionTrace,
+    missingInfoRequest: p.missingInfoRequest ?? null,
   });
 
   const outbound = executeOutboundReply({
@@ -863,6 +1272,12 @@ function finalizeLivePipelineResult(p) {
     routingCtx,
   });
 
+  const cloudDm =
+    String(p.params?.channel ?? p.turnContextInput?.channel ?? "") === "whatsapp_cloud" &&
+    String(p.params?.chatType ?? p.turnContextInput?.chatType ?? "") !== "group" &&
+    p.params?.isGroupInbound !== true;
+  const customerTurnOutcome = cloudDm ? deriveCloudCustomerTurnOutcome(p) : null;
+
   return {
     handled: true,
     reply: outbound.reply,
@@ -870,8 +1285,9 @@ function finalizeLivePipelineResult(p) {
     dmRecipientPhone: outbound.dmRecipientPhone ?? null,
     messageMeta: outbound.messageMeta,
     workflowType: p.workflowType,
-    reason: "V2_LIVE_OK",
+    reason: p.reason || "V2_LIVE_OK",
     legacyBypassed: true,
+    ...(customerTurnOutcome ? { customerTurnOutcome } : {}),
   };
 }
 
@@ -918,6 +1334,9 @@ async function maybeSilentInsteadOfOnboardingClarify(p) {
   });
   return buildSilentPipelineResult({
     traceId: String(params.traceId ?? "").trim(),
+    channel: p.channel ?? params.channel,
+    chatType: p.chatType ?? params.chatType,
+    isGroupInbound: params.isGroupInbound,
     reason: p.reason || "POST_CONFIRM_ONBOARDING_CLARIFY_SUPPRESSED",
   });
 }
@@ -974,6 +1393,40 @@ function isAvailabilityAssistContextNoReplyPlan(actionPlan) {
  * @param {{ traceId: string, reason: string }} p
  */
 function buildSilentPipelineResult(p) {
+  const reason = String(p.reason ?? "");
+  const cloudDm =
+    p.channel === "whatsapp_cloud" &&
+    p.chatType !== "group" &&
+    p.isGroupInbound !== true;
+  const keepSilent =
+    reason === "EMPTY_MESSAGE" ||
+    reason === "CANONICAL_OWNERSHIP_NOT_BRAIN_V2" ||
+    (reason === "ASSIST_CONTEXT_NO_REPLY" && !cloudDm);
+  if (cloudDm && !keepSilent) {
+    const ownerCheck = reason.includes("OWNER_CHECK");
+    return {
+      handled: true,
+      reply: ownerCheck
+        ? CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY
+        : POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
+      sendVia: "CLOUD_API",
+      dmRecipientPhone: null,
+      customerTurnOutcome: ownerCheck ? "OWNER_CHECK" : "TECHNICAL_RECOVERY",
+      messageMeta: {
+        routeType: "BRAIN_V2_LIVE",
+        outboundTrace: {
+          finalReplySource: ownerCheck
+            ? "CLOUD_SEMANTIC_OWNER_CHECK"
+            : "CLOUD_SEMANTIC_TECHNICAL_RECOVERY",
+          reason,
+        },
+        brainV2Live: true,
+        traceId: p.traceId,
+      },
+      reason,
+      legacyBypassed: true,
+    };
+  }
   return {
     handled: true,
     reply: "",
@@ -981,11 +1434,11 @@ function buildSilentPipelineResult(p) {
     dmRecipientPhone: null,
     messageMeta: {
       routeType: "BRAIN_V2_LIVE_SILENT",
-      outboundTrace: { finalReplySource: "BRAIN_V2_LIVE_SILENT", reason: p.reason },
+      outboundTrace: { finalReplySource: "BRAIN_V2_LIVE_SILENT", reason },
       brainV2Live: true,
       traceId: p.traceId,
     },
-    reason: p.reason,
+    reason,
     legacyBypassed: true,
   };
 }
@@ -994,6 +1447,7 @@ function buildSilentPipelineResult(p) {
  * @param {Record<string, unknown>} p
  */
 function buildLiveMessageMeta(p) {
+  const imageUrls = extractTrustedImageUrlsFromActionPlan(p.actionPlan);
   return {
     routeType: "BRAIN_V2_LIVE",
     outboundTrace: {
@@ -1015,5 +1469,14 @@ function buildLiveMessageMeta(p) {
     bookingCreated: p.bookingCreated ?? undefined,
     decisionTrace: p.decisionTrace ?? undefined,
     traceId: p.traceId,
+    ...(imageUrls.length
+      ? {
+          whatsappImageUrls: imageUrls,
+          deliveryIntent: "show_images",
+        }
+      : {}),
+    ...(p.missingInfoRequest
+      ? { missingInfoRequest: p.missingInfoRequest }
+      : {}),
   };
 }

@@ -10,6 +10,7 @@ import {
   isLikelyAssistantOutboundCopy,
   __resolvePlaywrightMessageRowSenderForTests,
   __resolvePlaywrightForwardIdentityForTests,
+  __freshAdmittedStableIdsForTests,
 } from "../src/services/playwrightListener/listener.js";
 import {
   clearOldStates,
@@ -158,6 +159,7 @@ test("16: different participants keep separate forward candidates", () => {
     extractedMessages: sorted,
     sorted,
     normalizedGroupChatKeyForCompare: CHAT,
+    currentFreshAdmittedStableIds: __freshAdmittedStableIdsForTests(sorted),
   });
   const candB = buildParticipantForwardCandidate({
     participantMessages: [userB],
@@ -166,6 +168,7 @@ test("16: different participants keep separate forward candidates", () => {
     extractedMessages: sorted,
     sorted,
     normalizedGroupChatKeyForCompare: CHAT,
+    currentFreshAdmittedStableIds: __freshAdmittedStableIdsForTests(sorted),
   });
   assert.match(candA.text, /Civic/i);
   assert.match(candB.text, /Corolla/i);

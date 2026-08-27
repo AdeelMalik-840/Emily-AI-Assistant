@@ -361,7 +361,7 @@ function resolveBrainEnabledOutboundReply(decision) {
 /**
  * @param {Record<string, unknown> | null | undefined} turnResult
  */
-function mapFrozenPendingOwnershipToWaitingConfirmDecision(frozen, requestId) {
+export function mapFrozenPendingOwnershipToWaitingConfirmDecision(frozen, requestId) {
   const rawAction = clean(frozen?.action, 40);
   let action = "reply";
   if (rawAction === "confirm_pending_availability") action = "confirm_booking";

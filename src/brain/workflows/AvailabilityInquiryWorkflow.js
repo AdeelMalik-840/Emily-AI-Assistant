@@ -1181,7 +1181,12 @@ export function buildAvailabilityInquiryActionPlan({
 }) {
   const message = String(admittedTurn?.turn?.text ?? "");
   const canonical = readResolvedBusinessTurnContext(businessContext);
-  const assist = readFreshLastAvailabilityAssist(canonical?.lastAvailabilityAssist);
+  const canonicalAuthorityActive = Boolean(
+    String(understanding?.authoritativeSemanticIntent ?? "").trim()
+  );
+  const assist = canonicalAuthorityActive
+    ? null
+    : readFreshLastAvailabilityAssist(canonical?.lastAvailabilityAssist);
   const brainDecision =
     (businessContext?.__availabilityAssistFollowUpDecision &&
     typeof businessContext.__availabilityAssistFollowUpDecision === "object"

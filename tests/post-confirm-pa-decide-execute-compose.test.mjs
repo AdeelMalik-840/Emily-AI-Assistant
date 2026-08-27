@@ -263,7 +263,8 @@ function decisionJson(overrides = {}) {
   const payload = {
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
-    itemScope: "specific",
+    itemScope: "none",
+    itemReferents: [],
     targetReference: {
       source: "current_turn",
       sourceTurnId: "user:test",
@@ -272,6 +273,7 @@ function decisionJson(overrides = {}) {
     },
     targetContext: "CONFIRMED_BOOKING",
     targetId,
+    selectedBookingId: referencedTargetId,
     situation: "protected_action",
     conversationAct: "action_request",
     customerIntent: "ask_action",
@@ -321,7 +323,8 @@ function infoDecisionJson(reply, overrides = {}) {
   const payload = {
     turnScope: "OLD_BOOKING_REFERENCE",
     semanticIntent: null,
-    itemScope: "specific",
+    itemScope: "none",
+    itemReferents: [],
     targetReference: {
       source: "current_turn",
       sourceTurnId: "user:test",
@@ -330,6 +333,7 @@ function infoDecisionJson(reply, overrides = {}) {
     },
     targetContext: "CONFIRMED_BOOKING",
     targetId: "booking-only",
+    selectedBookingId: referencedTargetId,
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -947,6 +951,8 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
         decision: {
           turnScope: "PENDING_AVAILABILITY_REFERENCE",
           semanticIntent: null,
+          itemScope: "none",
+          itemReferents: [],
           targetContext: "PENDING_AVAILABILITY",
           targetId: "avr-pending-1",
           situation: "pending_availability",
@@ -1001,6 +1007,8 @@ test("return contract: pending AVR confirm/decline populate execution.pendingAvr
         decision: {
           turnScope: "PENDING_AVAILABILITY_REFERENCE",
           semanticIntent: null,
+          itemScope: "none",
+          itemReferents: [],
           targetContext: "PENDING_AVAILABILITY",
           targetId: "avr-pending-1",
           situation: "pending_availability",
@@ -1113,6 +1121,8 @@ test("return contract: pending AVR + missing-info coexistence exposes both slots
         decision: {
           turnScope: "PENDING_AVAILABILITY_REFERENCE",
           semanticIntent: null,
+          itemScope: "none",
+          itemReferents: [],
           targetContext: "PENDING_AVAILABILITY",
           targetId: "avr-pending-1",
           situation: "pending_availability",

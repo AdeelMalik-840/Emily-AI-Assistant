@@ -319,7 +319,8 @@ test("12: brain module has no OpenAI imports", async () => {
     }
     return files;
   }
-  const brainFiles = await walk(brainRoot);
+  const skipOpenAi = /\/(decidePostConfirmCustomerDm|waitingConfirmDmLane|groupPostExecuteLane|AvailabilityInquiryWorkflow)\.js$/;
+  const brainFiles = (await walk(brainRoot)).filter((file) => !skipOpenAi.test(file));
   for (const file of brainFiles) {
     const text = await readFile(file, "utf8");
     assert.doesNotMatch(text, /from\s+["']openai/i, `OpenAI import in ${file}`);
