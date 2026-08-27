@@ -8,6 +8,7 @@
 
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
+import { listExplicitCatalogItemIds, resolveCanonicalItemReferents } from "../../services/currentTurnAuthority.js";
 import {
   isAllowedPaMissingInfoType,
   PA_MISSING_INFO_TYPES,
@@ -1954,6 +1955,83 @@ function assignStableOwnershipSelectionIndexes(rows, idKey) {
     }));
 }
 
+function compactCatalogItemsForOwnershipFacts(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const row of raw) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const id = clean(row.id ?? row.itemId, 160);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      name: clean(row.name, 200) || null,
+      displayLabel: clean(row.displayLabel ?? row.name, 200) || null,
+    });
+    if (out.length >= 80) break;
+  }
+  return out;
+}
+
+function countRecentConversationTurns(conversationHistory) {
+  const parsed = parsePostConfirmDialogueTurns(conversationHistory);
+  if (parsed.length > 0) return parsed.length;
+  const text = String(conversationHistory ?? "").trim();
+  if (!text) return 0;
+  return text.split(/\n+/).filter(Boolean).length;
+}
+
+function knownCatalogSpanLacksCurrentTurnReferent(
+  customerMessage,
+  catalogItems,
+  itemReferents
+) {
+  const items = Array.isArray(catalogItems) ? catalogItems : [];
+  if (items.length === 0) return false;
+  const knownIds = listExplicitCatalogItemIds(customerMessage, items);
+  if (knownIds.length === 0) return false;
+  const currentTurn = (Array.isArray(itemReferents) ? itemReferents : []).filter(
+    (row) => row?.source === "current_turn"
+  );
+  if (currentTurn.length === 0) return true;
+  const matched = new Set(
+    resolveCanonicalItemReferents(currentTurn, items)
+      .filter((row) => row?.status === "MATCHED" && row?.itemId)
+      .map((row) => row.itemId)
+  );
+  return !knownIds.some((id) => matched.has(id));
+}
+
+function namedCatalogSpanConsistencyRejection(turnScope, customerMessage, catalogItems, itemReferents) {
+  if (
+    turnScope !== "NEW_TRANSACTION" &&
+    turnScope !== "SOCIAL_GENERAL" &&
+    turnScope !== "UNCLEAR"
+  ) {
+    return null;
+  }
+  if (
+    !knownCatalogSpanLacksCurrentTurnReferent(
+      customerMessage,
+      catalogItems,
+      itemReferents
+    )
+  ) {
+    return null;
+  }
+  return turnScope === "UNCLEAR"
+    ? "UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN"
+    : "NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN";
+}
+
+function unclearContradictsKnownCatalogSpan(turnScope, customerMessage, catalogItems) {
+  if (turnScope !== "UNCLEAR") return false;
+  const items = Array.isArray(catalogItems) ? catalogItems : [];
+  if (items.length === 0) return false;
+  return listExplicitCatalogItemIds(customerMessage, items).length > 0;
+}
+
 /**
  * Strip PA pre-own fields. Candidates are equal facts, ordered stable_id_asc.
  *
@@ -2029,7 +2107,7 @@ export function buildNeutralCloudDmOwnershipFacts(
     knownPolicies: null,
     replyGuardFacts: null,
     availabilityRequest: null,
-    catalogItems: null,
+    catalogItems: compactCatalogItemsForOwnershipFacts(facts.catalogItems),
     sourceEvidence: null,
     openMissingInfoRequests: [],
     latestClosedMissingInfoAnswers: [],
@@ -3742,6 +3820,13 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
     ) {
       return invalid("NEW_TRANSACTION_REFERENCE_INVALID");
     }
+    const namedSpanReason = namedCatalogSpanConsistencyRejection(
+      scope,
+      facts?.currentCustomerMessage,
+      facts?.catalogItems,
+      itemReferents
+    );
+    if (namedSpanReason) return invalid(namedSpanReason);
     return { ok: true, scope, context, targetId: null };
   }
 
@@ -3757,6 +3842,22 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
     ) {
       return invalid(`${scope}_CONTRADICTION`);
     }
+    if (
+      unclearContradictsKnownCatalogSpan(
+        scope,
+        facts?.currentCustomerMessage,
+        facts?.catalogItems
+      )
+    ) {
+      return invalid("UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN");
+    }
+    const namedSpanReason = namedCatalogSpanConsistencyRejection(
+      scope,
+      facts?.currentCustomerMessage,
+      facts?.catalogItems,
+      itemReferents
+    );
+    if (namedSpanReason) return invalid(namedSpanReason);
     return { ok: true, scope, context, targetId: null };
   }
 
@@ -3982,6 +4083,19 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
   ) {
     return rejectCloudDmOwnershipParse(opts, "OLD_BOOKING_FACT_PLAN_INVALID");
   }
+  const namedSpanReason = namedCatalogSpanConsistencyRejection(
+    turnScope,
+    opts.customerMessage,
+    opts.catalogItems,
+    itemReferents
+  );
+  if (namedSpanReason) {
+    return rejectCloudDmOwnershipParse(
+      opts,
+      namedSpanReason,
+      itemReferentInspection.metadata
+    );
+  }
   return defaultDecision({
     turnScope,
     semanticIntent,
@@ -4025,6 +4139,9 @@ function cloudDmOwnershipUnusableResult({
   ownershipCompletionCount = 1,
   usabilityClassification = null,
   customerTurnOutcome = null,
+  resolvedModel = null,
+  rawOwnershipJson = null,
+  ownershipCorrectionReason = null,
 } = {}) {
   return {
     ok: false,
@@ -4035,6 +4152,9 @@ function cloudDmOwnershipUnusableResult({
     ownershipCompletionCount,
     usabilityClassification,
     customerTurnOutcome,
+    resolvedModel,
+    rawOwnershipJson,
+    ownershipCorrectionReason,
   };
 }
 
@@ -4207,16 +4327,20 @@ export async function executeCloudDmOwnershipDecision({
     "itemReferents is the ONLY catalog/item meaning contract. targetReference is ONLY for protected historical_booking or pending_availability provenance.",
     "itemReferenceMode: CURRENT_TURN = one explicit named item in CUSTOMER_MESSAGE; MULTIPLE_CURRENT = two or more explicit named items; CONTEXTUAL = pronoun/continuation of TRUSTED_FRESH_ITEM_FOCUS; NONE = no catalog item referent.",
     "For NEW_TRANSACTION + itemScope=specific, itemReferents must contain every bounded referent. A current-turn referent uses source=current_turn and an exact end-exclusive surfaceText/start/end span from CUSTOMER_MESSAGE, with trustedItemId=null and sourceTurnId=null.",
+    "current_turn surfaceText is the named item/service token in CUSTOMER_MESSAGE, copied exactly. Do not span asked attributes, accessories, or other phrases as the item referent.",
     "A contextual continuation (available hai? / iska / ye) uses source=trusted_fresh_focus, surfaceText/start/end=null, trustedItemId=null, sourceTurnId=null. Runtime binds TRUSTED_FRESH_ITEM_FOCUS. Never copy or invent IDs.",
     "If the customer explicitly names an item in THIS message, that is CURRENT_TURN even when TRUSTED_FRESH_ITEM_FOCUS exists. Never use trusted_fresh_focus for a named current item.",
     "For broad or none itemScope, itemReferents must be empty. For protected/non-NEW scopes itemReferents must be empty in this slice.",
     "For NEW_TRANSACTION: browse_options requires itemScope=broad. availability_inquiry, pricing_inquiry, pricing_with_duration, booking_request, details_inquiry, and image_catalog_request require itemScope=specific. general_business_question, clarification, and unclear use the truthful specific, broad, or none scope of the turn.",
     "SOCIAL_GENERAL and UNCLEAR turn scopes require itemScope=none. For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE, preserve the truthful item scope without changing their protected ownership semantics.",
-    "Use availability_inquiry only for availability of one specifically identified named or trusted-context singular item/service/referent. Asking to discover, list, or enumerate which options are available is browse_options, not availability_inquiry.",
-    "For that one specific referent, weak need/want/chahiye wording that is not a clear final book/reserve/confirm command remains availability_inquiry.",
-    "Use booking_request only for clear final booking/reserve/confirm commitment. Do not treat weak need/want/chahiye by itself as final booking commitment.",
-    "Use pricing_inquiry for price/rate asks without a requested duration total; pricing_with_duration for a requested duration/total quote; browse_options for broad option discovery; image_catalog_request for photos/images; details_inquiry for item/service details; general_business_question for other business facts; clarification when the intended transaction meaning is underspecified.",
+    "semanticIntent families are mutually exclusive:",
+    "pricing_inquiry: a price/rate ask without a requested-duration total.",
+    "pricing_with_duration: an explicit price/rent/cost ask for a stated duration/total.",
+    "availability_inquiry: an availability ask OR a weak need/want/chahiye for a specific item/date/duration when the customer is not explicitly asking price and is not giving a final book/reserve/confirm command. Asking to discover, list, or enumerate which options are available is browse_options, not availability_inquiry.",
+    "booking_request: only an explicit final booking/reserve/confirm commitment. Weak need/want/chahiye is never booking_request.",
+    "browse_options: broad option discovery. image_catalog_request: photos/images. details_inquiry: item/service details. general_business_question: other business facts. clarification: underspecified transaction meaning.",
     "SOCIAL_GENERAL should use semanticIntent=social. UNCLEAR should use semanticIntent=unclear.",
+    "Do not emit UNCLEAR when CUSTOMER_MESSAGE contains an explicit named catalog item unless the named item is an ambiguous candidate collision. Unknown asked facts still use details_inquiry or general_business_question with that CURRENT_TURN referent.",
     "For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE semanticIntent may be null in this shadow migration; turnScope/action/factKind remain the existing protected semantics.",
     "targetId rules:",
     "- NEW_TRANSACTION, SOCIAL_GENERAL, UNCLEAR → targetId must be null.",
@@ -4287,6 +4411,8 @@ export async function executeCloudDmOwnershipDecision({
           "Named items in CUSTOMER_MESSAGE use source=current_turn spans with null IDs.",
           "Contextual continuation uses source=trusted_fresh_focus with null IDs.",
           "NEW_TRANSACTION targetReference must be source=none.",
+          "UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN and NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN mean CUSTOMER_MESSAGE names a catalog item: emit NEW_TRANSACTION with a current_turn span of that named item. Do not use trusted_fresh_focus and do not span a non-catalog phrase. Runtime will not pick the intent.",
+          "ITEM_REFERENT_SURFACE_MISMATCH means start/end must be the exact end-exclusive offsets of surfaceText in CUSTOMER_MESSAGE.",
         ].join(" "),
       });
     }
@@ -4317,6 +4443,7 @@ export async function executeCloudDmOwnershipDecision({
     const parsed = parseCloudDmOwnershipDecision(raw, {
       customerMessage: userLine,
       trustedFreshItemFocus: facts?.trustedFreshItemFocus,
+      catalogItems: facts?.catalogItems,
       onStructuralRejection: (details) => {
         parseRejection = details;
       },
@@ -4327,6 +4454,8 @@ export async function executeCloudDmOwnershipDecision({
   try {
     let { parsed, parseRejection, raw } = await completeOnce(correctionFeedback);
     let ownershipCompletionCount = 1;
+    const firstParseRejectionCode =
+      parseRejection?.rejectionCode || null;
     if (!parsed && !correctionFeedback) {
       const code =
         parseRejection?.rejectionCode || "OWNERSHIP_SCHEMA_OR_CONSISTENCY_REJECTED";
@@ -4336,6 +4465,9 @@ export async function executeCloudDmOwnershipDecision({
       raw = retried.raw;
       ownershipCompletionCount = 2;
     }
+    const resolvedModel = resolveOpenAiChatModel();
+    const trustedFocusId =
+      clean(facts?.trustedFreshItemFocus?.itemId, 160) || null;
     if (!parsed) {
       let diagnostic;
       try {
@@ -4371,6 +4503,9 @@ export async function executeCloudDmOwnershipDecision({
         ownershipCompletionCount,
         usabilityClassification: "malformed_or_empty_ownership_json",
         customerTurnOutcome: "TECHNICAL_RECOVERY",
+        resolvedModel,
+        rawOwnershipJson: raw,
+        ownershipCorrectionReason: firstParseRejectionCode,
       });
     }
     const decision = collapseIndistinguishableSameItemOwnership(
@@ -4379,6 +4514,10 @@ export async function executeCloudDmOwnershipDecision({
       userLine
     );
     console.log("[cloud_dm_ownership_decided]", {
+      model: resolvedModel,
+      ownershipCompletionCount,
+      parseRejectionReason: parseRejection?.rejectionCode ?? null,
+      ownershipCorrectionReason: firstParseRejectionCode,
       turnScope: decision.turnScope,
       semanticIntent: decision.semanticIntent ?? null,
       itemScope: decision.itemScope ?? null,
@@ -4386,12 +4525,13 @@ export async function executeCloudDmOwnershipDecision({
         ? decision.itemReferents.length
         : 0,
       itemReferenceMode: decision.itemReferenceMode ?? null,
-      targetReference: decision.targetReference ?? null,
       targetId: decision.targetId,
       mutationIntent: decision.mutationIntent,
       action: decision.action,
       factKind: decision.factKind,
-      ownershipCompletionCount,
+      trustedFreshItemFocusPresent: Boolean(trustedFocusId),
+      trustedFreshItemFocusId: trustedFocusId,
+      recentConversationCount: countRecentConversationTurns(conversationHistory),
     });
     return {
       ok: true,
@@ -4399,6 +4539,9 @@ export async function executeCloudDmOwnershipDecision({
       decision,
       ownershipCompletionCount,
       retryable: false,
+      resolvedModel,
+      rawOwnershipJson: raw,
+      ownershipCorrectionReason: firstParseRejectionCode,
     };
   } catch (err) {
     const reason = String(err?.message ?? err ?? "OPENAI_ERROR");
@@ -4456,6 +4599,10 @@ export async function resolveCloudDmCanonicalOwnership({
     facts: neutralFacts,
     ownershipCompletionCount,
     customerTurnOutcome: "TECHNICAL_RECOVERY",
+    resolvedModel: sourceDecision?.resolvedModel ?? resolveOpenAiChatModel(),
+    rawOwnershipJson: sourceDecision?.rawOwnershipJson ?? null,
+    ownershipCorrectionReason:
+      sourceDecision?.ownershipCorrectionReason ?? reason ?? null,
   });
   if (decided?.ok !== true || decided?.source !== "openai") {
     const timedOut = /TIMEOUT/i.test(String(decided?.reason ?? ""));

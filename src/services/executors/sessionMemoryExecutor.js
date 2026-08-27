@@ -27,6 +27,189 @@ export function readTrustedFreshItemFocus(memory, nowMs = Date.now()) {
   };
 }
 
+function uniqueTrimmedIds(values) {
+  const ids = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const id = String(value ?? "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+function replyPresentedCatalogItemIds(actionPlan) {
+  return uniqueTrimmedIds(
+    (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
+      .filter((action) => String(action?.type ?? "").trim() === "REPLY")
+      .map((action) => action?.payload?.itemId)
+  );
+}
+
+function verifiedAlternativeItemIds(actionPlan) {
+  return uniqueTrimmedIds(
+    (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
+      .flatMap((action) =>
+        Array.isArray(action?.payload?.verifiedAlternatives)
+          ? action.payload.verifiedAlternatives.map((row) => row?.itemId)
+          : []
+      )
+  );
+}
+
+function declaredPresentedItemIds(actionPlan) {
+  return uniqueTrimmedIds(
+    (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
+      .flatMap((action) =>
+        Array.isArray(action?.payload?.presentedItemIds)
+          ? action.payload.presentedItemIds
+          : []
+      )
+  );
+}
+
+function catalogItemIdSet(catalogItems) {
+  const ids = new Set();
+  for (const row of Array.isArray(catalogItems) ? catalogItems : []) {
+    const id = String(row?.id ?? row?.itemId ?? "").trim();
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+
+function catalogItemLabel(catalogItems, itemId) {
+  const id = String(itemId ?? "").trim();
+  if (!id) return null;
+  const row = (Array.isArray(catalogItems) ? catalogItems : []).find(
+    (item) => String(item?.id ?? item?.itemId ?? "").trim() === id
+  );
+  const label = String(row?.displayLabel ?? row?.name ?? "").trim();
+  return label || null;
+}
+
+/**
+ * Existing trusted-focus eligibility: exactly one presented catalog item that is
+ * either a verified alternative or the single runtime REPLY catalog itemId.
+ */
+export function readVerifiedSinglePresentedItemFromActionPlan(actionPlan) {
+  const plan = actionPlan && typeof actionPlan === "object" ? actionPlan : null;
+  const persistence =
+    plan?.persistenceIntent && typeof plan.persistenceIntent === "object"
+      ? plan.persistenceIntent
+      : null;
+  if (persistence?.rememberPresentedItemFocus !== true) return null;
+  const presentedItemId = String(persistence.presentedItemId ?? "").trim();
+  if (!presentedItemId) return null;
+  const declaredIds = declaredPresentedItemIds(plan);
+  if (declaredIds.length !== 1 || declaredIds[0] !== presentedItemId) return null;
+  const alternativeIds = new Set(verifiedAlternativeItemIds(plan));
+  const replyIds = replyPresentedCatalogItemIds(plan);
+  const verifiedByAlternative = alternativeIds.has(presentedItemId);
+  const verifiedBySingleReplyItem =
+    replyIds.length === 1 && replyIds[0] === presentedItemId;
+  if (!verifiedByAlternative && !verifiedBySingleReplyItem) return null;
+  const replyLabel = String(
+    (Array.isArray(plan.actions) ? plan.actions : []).find(
+      (action) =>
+        String(action?.type ?? "").trim() === "REPLY" &&
+        String(action?.payload?.itemId ?? "").trim() === presentedItemId
+    )?.payload?.itemLabel ?? ""
+  ).trim();
+  return {
+    itemId: presentedItemId,
+    itemLabel:
+      String(persistence.presentedItemLabel ?? "").trim() || replyLabel || null,
+  };
+}
+
+/**
+ * Stamp the existing presented-focus flags when a Cloud reply presents exactly
+ * one runtime-verified catalog item. Does not write session memory itself.
+ */
+export function stampRememberPresentedItemFocusForSingleVerifiedItem(
+  actionPlan,
+  { catalogItems = [], allow = true } = {}
+) {
+  if (allow !== true) return actionPlan;
+  const plan = actionPlan && typeof actionPlan === "object" ? actionPlan : null;
+  if (!plan) return actionPlan;
+  const persistence =
+    plan.persistenceIntent && typeof plan.persistenceIntent === "object"
+      ? { ...plan.persistenceIntent }
+      : {};
+  if (persistence.execute === true) return actionPlan;
+  if (persistence.rememberPresentedItemFocus === true) return actionPlan;
+  if (persistence.clearPresentedItemFocus === true) return actionPlan;
+
+  const catalogIds = catalogItemIdSet(catalogItems);
+  if (catalogIds.size === 0) return actionPlan;
+
+  const replyIds = replyPresentedCatalogItemIds(plan);
+  const persistenceItemId = String(persistence.itemId ?? "").trim();
+  let candidate = "";
+  if (replyIds.length === 1) candidate = replyIds[0];
+  else if (replyIds.length === 0 && persistenceItemId) candidate = persistenceItemId;
+  if (!candidate || !catalogIds.has(candidate)) return actionPlan;
+  if (replyIds.length > 1) return actionPlan;
+
+  const itemLabel =
+    String(persistence.presentedItemLabel ?? persistence.itemLabel ?? "").trim() ||
+    String(
+      (Array.isArray(plan.actions) ? plan.actions : []).find(
+        (action) => String(action?.payload?.itemId ?? "").trim() === candidate
+      )?.payload?.itemLabel ?? ""
+    ).trim() ||
+    catalogItemLabel(catalogItems, candidate);
+
+  const mappedActions = (Array.isArray(plan.actions) ? plan.actions : []).map((action) => {
+    if (!action || typeof action !== "object" || Array.isArray(action)) return action;
+    if (String(action.type ?? "").trim() !== "REPLY") return action;
+    const payload =
+      action.payload && typeof action.payload === "object" && !Array.isArray(action.payload)
+        ? action.payload
+        : {};
+    const existingPresented = uniqueTrimmedIds(payload.presentedItemIds);
+    if (existingPresented.length > 1) return action;
+    return {
+      ...action,
+      payload: {
+        ...payload,
+        itemId: String(payload.itemId ?? "").trim() || candidate,
+        presentedItemIds: [candidate],
+      },
+    };
+  });
+  const actions =
+    mappedActions.length > 0
+      ? mappedActions
+      : [
+          {
+            type: "REPLY",
+            payload: {
+              itemId: candidate,
+              itemLabel: itemLabel || null,
+              presentedItemIds: [candidate],
+            },
+          },
+        ];
+
+  return {
+    ...plan,
+    actions,
+    persistenceIntent: {
+      ...persistence,
+      rememberResolvedItem: persistence.rememberResolvedItem === true || Boolean(candidate),
+      itemId: persistenceItemId || candidate,
+      rememberPresentedItemFocus: true,
+      presentedItemId: candidate,
+      presentedItemLabel: itemLabel || null,
+      clearPresentedItemFocus: false,
+      execute: false,
+    },
+  };
+}
+
 /**
  * @param {{
  *   sessionKey: string,
@@ -61,7 +244,11 @@ export function applySessionMemoryFromActionPlan(p) {
           : { id: itemId, itemId };
       patch.lastItem = { ...item, id: itemId, itemId };
       patch.lastResolvedItemId = itemId;
-      patch.lastFreshItemFocus = null;
+      // Delivery-gated presented focus owns lastFreshItemFocus. Clearing here
+      // would drop a still-valid prior focus before outbound succeeds.
+      if (persistence?.rememberPresentedItemFocus !== true) {
+        patch.lastFreshItemFocus = null;
+      }
     }
   }
 
@@ -69,45 +256,20 @@ export function applySessionMemoryFromActionPlan(p) {
     persistence?.rememberPresentedItemFocus === true &&
     p.outboundDelivered === true
   ) {
-    const itemId = String(persistence.presentedItemId ?? "").trim();
-    const verifiedAlternativeIds = new Set(
-      (Array.isArray(plan?.actions) ? plan.actions : [])
-        .flatMap((action) =>
-          Array.isArray(action?.payload?.verifiedAlternatives)
-            ? action.payload.verifiedAlternatives
-            : []
-        )
-        .map((row) => String(row?.itemId ?? "").trim())
-        .filter(Boolean)
-    );
-    const declaredPresentedIds = new Set(
-      (Array.isArray(plan?.actions) ? plan.actions : [])
-        .flatMap((action) =>
-          Array.isArray(action?.payload?.presentedItemIds)
-            ? action.payload.presentedItemIds
-            : []
-        )
-        .map((id) => String(id ?? "").trim())
-        .filter(Boolean)
-    );
+    const presented = readVerifiedSinglePresentedItemFromActionPlan(plan);
     const sourceTurnId =
       String(p.sourceTurnId ?? persistence.sourceTurnId ?? "").trim() || null;
-    if (
-      itemId &&
-      declaredPresentedIds.size === 1 &&
-      declaredPresentedIds.has(itemId) &&
-      verifiedAlternativeIds.has(itemId)
-    ) {
+    if (presented?.itemId) {
       const nowMs = Date.now();
       patch.lastItem = {
-        id: itemId,
-        itemId,
-        displayLabel: String(persistence.presentedItemLabel ?? "").trim() || null,
+        id: presented.itemId,
+        itemId: presented.itemId,
+        displayLabel: presented.itemLabel,
       };
-      patch.lastResolvedItemId = itemId;
+      patch.lastResolvedItemId = presented.itemId;
       patch.lastFreshItemFocus = {
-        itemId,
-        itemLabel: String(persistence.presentedItemLabel ?? "").trim() || null,
+        itemId: presented.itemId,
+        itemLabel: presented.itemLabel,
         provenance: "verified_assistant_presented_item",
         sourceTurnId,
         createdAt: new Date(nowMs).toISOString(),

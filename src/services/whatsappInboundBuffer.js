@@ -19,6 +19,7 @@ import {
 import {
   applySessionMemoryFromActionPlan,
   readTrustedFreshItemFocus,
+  readVerifiedSinglePresentedItemFromActionPlan,
 } from "./executors/sessionMemoryExecutor.js";
 import {
   sendWhatsAppInteractiveButtons,
@@ -2457,12 +2458,28 @@ export async function executeWhatsAppAiPipeline(p) {
         const lastAvailabilityAssist = readFreshLastAvailabilityAssist(
           shadowPreTurnMemorySnapshot?.lastAvailabilityAssist
         );
+        let catalogItemsForOwnership = Array.isArray(
+          preResolvedPostConfirmBookingFacts?.facts?.catalogItems
+        )
+          ? preResolvedPostConfirmBookingFacts.facts.catalogItems
+          : [];
+        if (catalogItemsForOwnership.length === 0 && ownerUserId) {
+          try {
+            const inventoryMod = await import("./inventoryService.js");
+            catalogItemsForOwnership = await inventoryMod.getCachedItemsForUser(
+              ownerUserId
+            );
+          } catch {
+            catalogItemsForOwnership = [];
+          }
+        }
         const baseOwnershipFacts = {
           ...(preResolvedPostConfirmBookingFacts?.facts ?? {}),
           ownershipReferenceContext: conversationReferenceContext,
           currentOwnershipTurnId,
           trustedFreshItemFocus,
           lastAvailabilityAssist,
+          catalogItems: catalogItemsForOwnership,
         };
         const decided =
           typeof p.__executeCloudDmOwnershipDecisionFn === "function"
@@ -3465,39 +3482,12 @@ export async function executeWhatsAppAiPipeline(p) {
       if (outboundReplyDelivered) {
         try {
           const actionPlan = messageMeta?.actionPlan;
-          const persistence = actionPlan?.persistenceIntent;
-          const presentedItemId =
-            persistence?.rememberPresentedItemFocus === true
-              ? String(persistence?.presentedItemId ?? "").trim()
-              : "";
-          const verifiedAlternativeIds = new Set(
-            (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
-              .flatMap((action) =>
-                Array.isArray(action?.payload?.verifiedAlternatives)
-                  ? action.payload.verifiedAlternatives
-                  : []
-              )
-              .map((row) => String(row?.itemId ?? "").trim())
-              .filter(Boolean)
-          );
-          const declaredPresentedIds = new Set(
-            (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
-              .flatMap((action) =>
-                Array.isArray(action?.payload?.presentedItemIds)
-                  ? action.payload.presentedItemIds
-                  : []
-              )
-              .map((id) => String(id ?? "").trim())
-              .filter(Boolean)
-          );
+          const presented = readVerifiedSinglePresentedItemFromActionPlan(actionPlan);
           const verifiedReferences =
-            presentedItemId &&
-            declaredPresentedIds.size === 1 &&
-            declaredPresentedIds.has(presentedItemId) &&
-            verifiedAlternativeIds.has(presentedItemId)
+            presented?.itemId
               ? [{
                   kind: "catalog_item",
-                  targetId: presentedItemId,
+                  targetId: presented.itemId,
                   provenance: "verified_assistant_presented_item",
                   expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
                 }]

@@ -23,6 +23,7 @@ const KINDS = new Set([
   "booking_status",
   "clarification",
   "image_intro",
+  "social",
 ]);
 
 function clean(value, max = 400) {
@@ -63,7 +64,12 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
     CUSTOMER_CLAIMS.INTERNAL_PROCESS_DISCLOSED,
     CUSTOMER_CLAIMS.PAYMENT_RECEIVED,
   ];
-  if (kind === "owner_check_holding" || kind === "clarification" || kind === "duration_ask") {
+  if (
+    kind === "owner_check_holding" ||
+    kind === "clarification" ||
+    kind === "duration_ask" ||
+    kind === "social"
+  ) {
     forbidden.push(
       CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_CONFIRMED,
       CUSTOMER_CLAIMS.QUOTATION_VERIFIED,
@@ -93,6 +99,8 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
     conversationalGoal:
       kind === "owner_check_holding"
         ? "Write a short natural holding reply. Do not mention owner, staff, PA, internal process, or that anyone is being asked."
+        : kind === "social"
+          ? "Write a short natural greeting, thanks, or goodbye. Do not mention availability, booking, price, rent, or owner-check unless TRUSTED_FACTS_JSON actually contains those facts because the customer asked about that transaction."
         : kind === "clarification" || kind === "duration_ask"
           ? "Ask one short useful clarification from trusted facts only. Do not invent answers."
           : kind === "image_intro"
@@ -102,6 +110,7 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
     allowedClaims: allowed,
     forbiddenClaims: forbidden,
     customerMessageText: clean(p.customerMessage, 300) || null,
+    ...(kind === "social" ? { customerLanguageStyle: "mixed" } : {}),
   });
   const responseFormat = buildStrictJsonSchemaResponseFormat(
     "cloud_canonical_customer_reply",
@@ -122,6 +131,7 @@ WORDING-ONLY CLOUD COMPOSER:
 - Use only TRUSTED_FACTS_JSON and KIND. Do not reinterpret meaning.
 - Do not mention owner, staff, PA, internal checking process, or that a person is being asked.
 - Do not invent prices, availability, bookings, or image URLs.
+- If KIND=social, greet or acknowledge naturally. Do not mention availability, booking, price, rent, or owner-check unless those facts are present because the customer asked about that transaction.
 - KIND=${kind}
 - Return strict JSON only.`,
     userBase: `KIND: ${kind}
@@ -134,6 +144,14 @@ TRUSTED_FACTS_JSON: ${JSON.stringify(facts)}`,
     extraReject: (customerReply) => {
       if (/\b(owner|staff|pa\b|internal|backend)\b/i.test(customerReply)) {
         return "INTERNAL_PROCESS_DISCLOSED";
+      }
+      if (
+        kind === "social" &&
+        /\b(available|availability|booking|booked|rent|price|owner[- ]?check)\b/i.test(
+          customerReply
+        )
+      ) {
+        return "SOCIAL_TRANSACTIONAL_LEAK";
       }
       return null;
     },

@@ -39,6 +39,7 @@ import {
   isCloudMissingFactHoldingAuthorized,
 } from "../../services/customerBusinessPaAgentService.js";
 import { missingInfoTypeForCloudCanonicalAsk } from "../../services/paMissingInfoRequestService.js";
+import { stampRememberPresentedItemFocusForSingleVerifiedItem } from "../../services/executors/sessionMemoryExecutor.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -402,6 +403,7 @@ export async function runBrainV2LivePipeline(params) {
       workflowType,
       actionPlan: result.actionPlan,
       authoritativeSemanticIntent,
+      catalogItems,
     });
     if (missingFactOwnerCheck) return missingFactOwnerCheck;
 
@@ -488,6 +490,7 @@ export async function runBrainV2LivePipeline(params) {
         ""
     ).trim();
     if (
+      canonicalReleased?.turnScope !== "SOCIAL_GENERAL" &&
       (workflowType === "clarification" ||
         workflowType === "unknown_clarification" ||
         workflowType === "noop") &&
@@ -833,29 +836,66 @@ export async function runBrainV2LivePipeline(params) {
         workflowType,
         actionPlan: finalActionPlan,
         semanticIntent: authoritativeSemanticIntent,
+        turnScope: canonicalReleased?.turnScope,
       });
       if (composeKind) {
+        const socialCompose = composeKind === "social";
         const composedLaunch = await composeCloudCanonicalCustomerReply({
           kind: composeKind,
           semanticIntent: authoritativeSemanticIntent,
           customerMessage: message,
           trustedFacts: trustedFactsForCloudCompose({
-            resolvedBusinessTurnContext,
+            composeKind,
+            workflowType,
             actionPlan: finalActionPlan,
+            semanticIntent: authoritativeSemanticIntent,
+            turnScope: canonicalReleased?.turnScope,
+            resolvedBusinessTurnContext,
             bookingCreated,
           }),
-          fallbackReply: finalReply,
+          fallbackReply: socialCompose ? "" : finalReply,
           timeoutMs: params.__cloudComposeTimeoutMs ?? 8000,
           __chatCompletionsCreateForTests: params.__cloudComposeChatCreate ?? null,
         });
         assertBrainV2ExecutionActive(params);
+        console.log("[cloud_canonical_compose]", {
+          traceId,
+          composeKind,
+          semanticIntent: authoritativeSemanticIntent ?? null,
+          turnScope: canonicalReleased?.turnScope ?? null,
+          composeOk: composedLaunch.ok === true,
+          composeSource: composedLaunch.source ?? null,
+          trustedFreshItemFocusPresent: Boolean(
+            params.memorySnapshot?.lastFreshItemFocus?.itemId
+          ),
+          trustedFreshItemFocusId:
+            String(params.memorySnapshot?.lastFreshItemFocus?.itemId ?? "").trim() ||
+            null,
+        });
         if (composedLaunch.ok && String(composedLaunch.reply ?? "").trim()) {
           finalReply = composedLaunch.reply;
           if (composedLaunch.source === "openai_cloud_canonical_compose") {
             finalReplySource = "CLOUD_CANONICAL_OPENAI_COMPOSE";
           }
+        } else if (socialCompose) {
+          finalReply = POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK;
+          finalReplySource = "CLOUD_SEMANTIC_TECHNICAL_RECOVERY";
         }
       }
+    }
+    if (
+      isCloudDmChannel({ channel, chatType, params }) &&
+      shouldStampCloudPresentedItemFocus({
+        turnScope: canonicalReleased?.turnScope,
+        semanticIntent: authoritativeSemanticIntent,
+        workflowType,
+        finalReplySource,
+      })
+    ) {
+      finalActionPlan = stampRememberPresentedItemFocusForSingleVerifiedItem(
+        finalActionPlan,
+        { catalogItems, allow: true }
+      );
     }
     const emilySessionKey = String(turnContextInput._emilySessionKey ?? params.sessionKey ?? "").trim();
     applyInfoLiveSessionMemoryPatch({
@@ -973,6 +1013,33 @@ function isCloudDmChannel(p) {
   );
 }
 
+function shouldStampCloudPresentedItemFocus(p) {
+  const turnScope = String(p.turnScope ?? "").trim();
+  const semanticIntent = String(p.semanticIntent ?? "").trim();
+  const workflowType = String(p.workflowType ?? "").trim();
+  const source = String(p.finalReplySource ?? "");
+  if (turnScope === "SOCIAL_GENERAL" || turnScope === "UNCLEAR") return false;
+  if (
+    semanticIntent === "social" ||
+    semanticIntent === "unclear" ||
+    semanticIntent === "clarification" ||
+    semanticIntent === "browse_options"
+  ) {
+    return false;
+  }
+  if (
+    workflowType === "clarification" ||
+    workflowType === "unknown_clarification" ||
+    workflowType === "greeting" ||
+    workflowType === "browse_options" ||
+    workflowType === "unlisted_item"
+  ) {
+    return false;
+  }
+  if (source.includes("TECHNICAL")) return false;
+  return true;
+}
+
 /**
  * Understood Cloud details/business questions must not become "I didn't understand".
  * Canned clarification here means trusted facts were missing, not that meaning was unknown.
@@ -1037,7 +1104,7 @@ async function maybeCloudMissingFactOwnerCheckResult(p) {
         reason: execution.reason,
       }
     : null;
-  const actionPlan = {
+  let actionPlan = {
     ...(p.actionPlan && typeof p.actionPlan === "object" ? p.actionPlan : {}),
     missingInfoRequestId: execution?.missingInfoRequestId ?? null,
     missingInfoType: execution?.missingInfoType ?? missingInfoType,
@@ -1086,6 +1153,37 @@ async function maybeCloudMissingFactOwnerCheckResult(p) {
     }
   }
 
+  if (holdingAuthorized && itemId) {
+    actionPlan = stampRememberPresentedItemFocusForSingleVerifiedItem(
+      {
+        ...actionPlan,
+        actions:
+          Array.isArray(actionPlan.actions) && actionPlan.actions.length
+            ? actionPlan.actions
+            : [
+                {
+                  type: "REPLY",
+                  payload: {
+                    text: reply,
+                    itemId,
+                    itemLabel,
+                    presentedItemIds: [itemId],
+                  },
+                },
+              ],
+        persistenceIntent: {
+          ...(actionPlan.persistenceIntent && typeof actionPlan.persistenceIntent === "object"
+            ? actionPlan.persistenceIntent
+            : {}),
+          rememberResolvedItem: true,
+          itemId,
+          execute: false,
+        },
+      },
+      { catalogItems: Array.isArray(p.catalogItems) ? p.catalogItems : [], allow: true }
+    );
+  }
+
   return finalizeLivePipelineResult({
     params,
     turnContextInput: p.turnContextInput,
@@ -1109,6 +1207,10 @@ function shouldComposeCloudCanonicalLaunchReply(params) {
 function cloudCanonicalComposeKind(p) {
   const workflowType = String(p.workflowType ?? "").trim();
   const intent = String(p.semanticIntent ?? "").trim();
+  const turnScope = String(p.turnScope ?? "").trim();
+  if (intent === "social" || turnScope === "SOCIAL_GENERAL") {
+    return "social";
+  }
   if (workflowType === "image_catalog_request" || intent === "image_catalog_request") {
     return "image_intro";
   }
@@ -1142,6 +1244,13 @@ function cloudCanonicalComposeKind(p) {
 }
 
 function trustedFactsForCloudCompose(p) {
+  const composeKind =
+    String(p.composeKind ?? "").trim() ||
+    cloudCanonicalComposeKind(p) ||
+    "";
+  if (composeKind === "social") {
+    return {};
+  }
   const verified =
     p.resolvedBusinessTurnContext?.verified &&
     typeof p.resolvedBusinessTurnContext.verified === "object"
@@ -1220,6 +1329,9 @@ function deriveCloudCustomerTurnOutcome(p) {
   const intent = String(
     p.turnContextInput?.authoritativeSemanticIntent ?? frozen?.semanticIntent ?? ""
   ).trim();
+  if (scope === "SOCIAL_GENERAL" || intent === "social") {
+    return "ANSWER";
+  }
   if (
     scope === "UNCLEAR" ||
     intent === "unclear" ||

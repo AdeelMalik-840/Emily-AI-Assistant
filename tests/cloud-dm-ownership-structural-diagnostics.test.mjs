@@ -115,6 +115,35 @@ test("ownership parser reports precise safe structural rejection codes", () => {
     rejectionFor(oldBooking).rejectionCode,
     "TARGET_REFERENCE_INVALID"
   );
+  assert.equal(
+    rejectionFor(
+      {
+        turnScope: "UNCLEAR",
+        semanticIntent: "unclear",
+        itemScope: "none",
+        itemReferents: [],
+        targetReference: {
+          source: "none",
+          sourceTurnId: null,
+          targetType: "none",
+          targetId: null,
+        },
+        targetId: null,
+        mutationIntent: "none",
+        action: "reply",
+        factKind: "vague",
+        capability: null,
+        evidenceNeeds: [],
+      },
+      {
+        customerMessage: "Civic mein child seat hai?",
+        catalogItems: [
+          { id: "honda-civic", name: "Honda Civic", displayLabel: "Honda Civic" },
+        ],
+      }
+    ).rejectionCode,
+    "UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN"
+  );
 });
 
 test("ownership rejection log contains structural metadata but no raw text", async () => {
