@@ -176,7 +176,7 @@ WORDING-ONLY CLOUD COMPOSER:
 - Do not invent prices, availability, bookings, or image URLs.
 - If KIND=social, greet or acknowledge naturally. Do not mention availability, booking, price, rent, or owner-check unless those facts are present because the customer asked about that transaction.
 - If KIND=availability_approved, availability is already confirmed in TRUSTED_FACTS_JSON. Do not treat catalog/DB availability as confirmation.
-- If KIND=duration_ask, ask for the missing rental period before any availability check. This overrides the general unconfirmed-availability guidance: do not say a check will happen until the customer supplies the period. Set customerInputRequested=true, requestedInput=rental_period, and availabilityCheckStarted=false.
+- If KIND=duration_ask, ask for the missing rental period before any availability check. This overrides the general unconfirmed-availability guidance: do not say a check will happen until the customer supplies the period. Set customerInputRequested=true, requestedInput=rental_period, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu leads with the item then the duration question, e.g. "Corolla kitne din ke liye chahiye?" or "Civic kitne din ke liye chahiye aapko?" — avoid a stiff "[Item] ke liye kitne din chahiye aapko?" translated-English structure.
 - KIND=${kind}
 - Return strict JSON only.`,
     userBase: `KIND: ${kind}
