@@ -3510,15 +3510,18 @@ export async function executeWhatsAppAiPipeline(p) {
                   expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
                 }]
               : [];
-          const postConfirmBookingId =
-            messageMeta?.customerBusinessPaHandled === true
+          const verifiedBookingId =
+            bookingIdMeta ||
+            (messageMeta?.customerBusinessPaHandled === true
               ? String(messageMeta?.bookingId ?? "").trim()
-              : "";
-          if (postConfirmBookingId) {
+              : "");
+          if (verifiedBookingId) {
             verifiedReferences.push({
               kind: "historical_booking",
-              targetId: postConfirmBookingId,
-              provenance: "verified_post_confirm_reply",
+              targetId: verifiedBookingId,
+              provenance: bookingIdMeta
+                ? "verified_booking_created_reply"
+                : "verified_post_confirm_reply",
               expiresAt: null,
             });
           }

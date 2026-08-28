@@ -1481,6 +1481,98 @@ function newTransactionOwnershipDecision() {
   };
 }
 
+test("delivered normal Cloud booking reply persists the exact created booking reference", async () => {
+  const bookingId = "booking-created-cloud-1";
+  const { fake } = await runCloudOwnershipPipeline({
+    availabilityRequestData: null,
+    inboundText: "book kar do",
+    pipelineParams: {
+      __executeCloudDmOwnershipDecisionFn: async () =>
+        newTransactionOwnershipDecision(),
+      __resolveActiveCustomerBookingFactsFn: async () => ({
+        ok: true,
+        facts: { catalogItems: [{ id: "civic-1", name: "Honda Civic 2026" }] },
+      }),
+      __sendOutboundMessageFn: async () => ({
+        ok: true,
+        providerMessageId: "wamid.booking-created-out",
+      }),
+    },
+    brainV2Spy: async () => ({
+      handled: true,
+      legacyBypassed: true,
+      workflowType: "BookingWorkflow",
+      reply: "Your booking has been created.",
+      sendVia: "CLOUD_API",
+      messageMeta: {
+        bookingCreated: {
+          id: bookingId,
+          itemId: "civic-1",
+          durationDays: 2,
+          status: "approved",
+        },
+        outboundTrace: { finalReplySource: "TEST_BOOKING_CREATED" },
+      },
+    }),
+  });
+
+  const assistant = fake
+    .getConversationMessages()
+    .find((row) => row.role === "assistant");
+  assert.ok(assistant);
+  assert.deepEqual(assistant.verifiedReferences, [
+    {
+      kind: "historical_booking",
+      targetId: bookingId,
+      provenance: "verified_booking_created_reply",
+      expiresAt: null,
+    },
+  ]);
+});
+
+test("failed normal Cloud booking reply creates no delivered booking provenance", async () => {
+  const { fake } = await runCloudOwnershipPipeline({
+    availabilityRequestData: null,
+    inboundText: "book kar do",
+    pipelineParams: {
+      __executeCloudDmOwnershipDecisionFn: async () =>
+        newTransactionOwnershipDecision(),
+      __resolveActiveCustomerBookingFactsFn: async () => ({
+        ok: true,
+        facts: { catalogItems: [{ id: "civic-1", name: "Honda Civic 2026" }] },
+      }),
+      __sendOutboundMessageFn: async () => ({ ok: false }),
+    },
+    brainV2Spy: async () => ({
+      handled: true,
+      legacyBypassed: true,
+      workflowType: "BookingWorkflow",
+      reply: "Your booking has been created.",
+      sendVia: "CLOUD_API",
+      messageMeta: {
+        bookingCreated: {
+          id: "booking-undelivered-cloud-1",
+          itemId: "civic-1",
+          durationDays: 2,
+          status: "approved",
+        },
+        outboundTrace: { finalReplySource: "TEST_BOOKING_CREATED" },
+      },
+    }),
+  });
+
+  assert.equal(
+    fake
+      .getConversationMessages()
+      .some((row) =>
+        row.verifiedReferences?.some(
+          (ref) => ref.kind === "historical_booking"
+        )
+      ),
+    false
+  );
+});
+
 test("no active AVR falls back to Brain unchanged", async () => {
   const { brainV2Calls, processCalls, cloudConfirmCalls, outcome } =
     await runCloudOwnershipPipeline({

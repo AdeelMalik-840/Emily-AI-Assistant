@@ -324,8 +324,9 @@ test("fresh focus resolves a contextual price turn while an explicit current ite
 
 test("conversation-turn booking provenance must match a verified structured reference", () => {
   const booking = { id: "booking-stonic", itemId: "stonic", itemLabel: "Kia Stonic" };
+  const olderBooking = { id: "booking-corolla-old", itemId: "corolla", itemLabel: "Toyota Corolla" };
   const facts = buildNeutralCloudDmOwnershipFacts({
-    bookingCandidates: [booking],
+    bookingCandidates: [olderBooking, booking],
     currentOwnershipTurnId: "user:current",
     ownershipReferenceContext: [{
       turnId: "assistant:booking-summary",
@@ -354,8 +355,20 @@ test("conversation-turn booking provenance must match a verified structured refe
     evidenceNeeds: [{ entity: "active_booking", concept: "dates", attributes: ["end"] }],
   })), facts);
   assert.equal(validatePostConfirmSemanticOwnership(parsed, facts).ok, true);
+  assert.equal(parsed.targetId, booking.id);
+  assert.equal(parsed.action, "reply");
+  assert.equal(parsed.mutationIntent, "none");
   assert.equal(validatePostConfirmSemanticOwnership({
     ...parsed,
     targetReference: { ...parsed.targetReference, sourceTurnId: "assistant:other" },
   }, facts).reason, "OLD_BOOKING_REFERENCE_SOURCE_UNTRUSTED");
+  assert.equal(validatePostConfirmSemanticOwnership({
+    ...parsed,
+    targetId: "booking-fabricated",
+    selectedBookingId: "booking-fabricated",
+    targetReference: {
+      ...parsed.targetReference,
+      targetId: "booking-fabricated",
+    },
+  }, facts).reason, "OLD_BOOKING_TARGET_UNTRUSTED");
 });
