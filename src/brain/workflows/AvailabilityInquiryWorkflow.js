@@ -170,6 +170,28 @@ function hasCanonicalOwnerCheckContext(canonical) {
 }
 
 /**
+ * Trusted, resolver-proven signal only: hasActiveBlockingBookingNow is set by
+ * resolveItemBookingAwareAvailability() from real start/end dates
+ * (isBookingActiveAt: start <= evaluationTime && (no end || end > evaluationTime))
+ * — never inferred here from isAvailable/status, which cannot distinguish a
+ * booking active today from one that merely exists but starts in the future
+ * or has an unknown start. A booking not yet started, or with an unproven
+ * start, must fall through to the ordinary duration-collection flow instead —
+ * see buildAvailabilityInquiryActionPlan's caller.
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {boolean}
+ */
+function hasActiveBlockingBookingNowWithNoRequestedWindow(availability) {
+  if (!availability || typeof availability !== "object" || Array.isArray(availability)) {
+    return false;
+  }
+  if (availability.windowApplied === true) return false;
+  if (availability.bookingAware !== true) return false;
+  if (availability.source !== "computeUserFacingAvailability") return false;
+  return availability.hasActiveBlockingBookingNow === true;
+}
+
+/**
  * @param {number | null | undefined} durationDays
  * @returns {boolean}
  */
@@ -562,6 +584,21 @@ export function logAvailabilityOwnerCheckPlanned(p) {
 export function buildAskDurationAvailabilityReply(conversationalLabel) {
   const label = String(conversationalLabel ?? "").trim() || "item";
   return `${label} ka mai check kar leta hun. Kitne din ke liye chahiye?`;
+}
+
+/**
+ * Present-tense acknowledgement that the item is occupied right now — used
+ * only when hasActiveBlockingBookingNow has been proven true by the resolver
+ * from real start/end dates (start <= evaluationTime && (no end || end >
+ * evaluationTime)). Says nothing about any specific future window — that
+ * remains governed by isConfidentInventoryUnavailable() once a duration/date
+ * is actually supplied.
+ * @param {string} conversationalLabel
+ * @returns {string}
+ */
+export function buildCurrentlyBlockedNoDurationReply(conversationalLabel) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  return `${label} abhi kisi booking mein hai.`;
 }
 
 /**
@@ -1311,6 +1348,38 @@ export function buildAvailabilityInquiryActionPlan({
     const execute = canonical.actions?.availabilityOwnerCheckExecute === true;
 
     if (!ownerCheckTiming.ready) {
+      // Only a resolver-proven active-now blocking booking (real start/end
+      // dates, not mere existence of a blocking-status row) short-circuits
+      // the blind duration ask. A booking that starts in the future, or
+      // whose start is unknown, must fall through to the ordinary
+      // duration-collection flow below — the customer's requested period is
+      // still needed before window-aware availability can decide anything.
+      if (hasActiveBlockingBookingNowWithNoRequestedWindow(canonicalAvailability)) {
+        const activeNowReplyDraft = buildCurrentlyBlockedNoDurationReply(conversationalLabel);
+        return Object.freeze({
+          planId: randomUUID(),
+          replyDraft: activeNowReplyDraft,
+          actions: Object.freeze([
+            Object.freeze({
+              type: "REPLY",
+              payload: Object.freeze({
+                channel: "whatsapp_web",
+                text: activeNowReplyDraft,
+                field: "availability",
+                itemId,
+                itemLabel,
+                source: "canonical_owner_check_active_blocking_now",
+                execute: false,
+              }),
+            }),
+          ]),
+          persistenceIntent: Object.freeze({
+            rememberResolvedItem: true,
+            itemId,
+            execute: false,
+          }),
+        });
+      }
       const replyDraft = buildAskDurationAvailabilityReply(conversationalLabel);
       const emilyPending = buildEmilyPending({
         stage: EMILY_PENDING_STAGE_AVAILABILITY_DURATION,

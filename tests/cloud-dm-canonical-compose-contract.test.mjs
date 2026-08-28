@@ -144,6 +144,125 @@ test("3. duration pricing can mention the verified duration from priceQuote", as
   assert.match(composed.reply, /3 din/);
 });
 
+test("3b. trustedFactsForCloudCompose exposes availabilityWindowRequested and hasActiveBlockingBookingNow distinctly from availabilityStatus", () => {
+  const noWindow = trustedFactsForCloudCompose({
+    composeKind: "availability",
+    resolvedBusinessTurnContext: verifiedQuoteContext({
+      verified: {
+        availability: {
+          status: "unavailable",
+          isAvailable: false,
+          windowApplied: false,
+          hasActiveBlockingBookingNow: false,
+        },
+      },
+    }),
+  });
+  assert.equal(noWindow.availabilityStatus, "unavailable");
+  assert.equal(noWindow.availabilityWindowRequested, false);
+  assert.equal(noWindow.hasActiveBlockingBookingNow, false);
+
+  const activeNow = trustedFactsForCloudCompose({
+    composeKind: "availability",
+    resolvedBusinessTurnContext: verifiedQuoteContext({
+      verified: {
+        availability: {
+          status: "unavailable",
+          isAvailable: false,
+          windowApplied: false,
+          hasActiveBlockingBookingNow: true,
+        },
+      },
+    }),
+  });
+  assert.equal(activeNow.availabilityWindowRequested, false);
+  assert.equal(activeNow.hasActiveBlockingBookingNow, true);
+
+  const withWindow = trustedFactsForCloudCompose({
+    composeKind: "availability",
+    resolvedBusinessTurnContext: verifiedQuoteContext({
+      verified: {
+        availability: {
+          status: "unavailable",
+          isAvailable: false,
+          windowApplied: true,
+          hasActiveBlockingBookingNow: false,
+        },
+      },
+    }),
+  });
+  assert.equal(withWindow.availabilityStatus, "unavailable");
+  assert.equal(withWindow.availabilityWindowRequested, true);
+});
+
+test("3c. availability compose prompt carries the no-window, non-active-now distinction to the model", async () => {
+  let captured = null;
+  const composed = await composeCloudCanonicalCustomerReply({
+    kind: "availability",
+    semanticIntent: "availability_inquiry",
+    customerMessage: "Civic available hai?",
+    trustedFacts: {
+      itemId: "item-1",
+      itemLabel: "Honda Civic",
+      availabilityStatus: "unavailable",
+      availabilityWindowRequested: false,
+      hasActiveBlockingBookingNow: false,
+      availabilityConfirmed: false,
+    },
+    fallbackReply: "",
+    __chatCompletionsCreateForTests: async (args) => {
+      captured = args;
+      return composeJson("Honda Civic ke liye pehle se ek booking hai.", []);
+    },
+  });
+  assert.equal(composed.ok, true);
+  assert.match(
+    captured.messages[0].content,
+    /hasActiveBlockingBookingNow=true/i
+  );
+  assert.match(
+    captured.messages[0].content,
+    /say only that the item already has an existing booking against it/i
+  );
+  assert.match(
+    captured.messages[0].content,
+    /Do not say or imply it is occupied at this exact moment/i
+  );
+  assert.match(
+    captured.messages[0].content,
+    /do not say or imply it is unavailable for any other or future dates/i
+  );
+});
+
+test("3d. availability compose prompt permits currently-unavailable/booked wording only when hasActiveBlockingBookingNow=true", async () => {
+  let captured = null;
+  const composed = await composeCloudCanonicalCustomerReply({
+    kind: "availability",
+    semanticIntent: "availability_inquiry",
+    customerMessage: "Civic available hai?",
+    trustedFacts: {
+      itemId: "item-1",
+      itemLabel: "Honda Civic",
+      availabilityStatus: "unavailable",
+      availabilityWindowRequested: false,
+      hasActiveBlockingBookingNow: true,
+      availabilityConfirmed: false,
+    },
+    fallbackReply: "",
+    __chatCompletionsCreateForTests: async (args) => {
+      captured = args;
+      return composeJson("Honda Civic abhi kisi booking mein hai.", []);
+    },
+  });
+  assert.equal(composed.ok, true);
+  assert.match(captured.messages[1].content, /"hasActiveBlockingBookingNow":true/);
+  assert.match(
+    captured.messages[0].content,
+    /say it is currently unavailable\/booked right now ONLY if hasActiveBlockingBookingNow=true/i
+  );
+  assert.match(composed.reply, /abhi/i);
+});
+
 test("4. verified total can be mentioned", async () => {
   const composed = await composeCloudCanonicalCustomerReply({
     kind: "pricing_with_duration",

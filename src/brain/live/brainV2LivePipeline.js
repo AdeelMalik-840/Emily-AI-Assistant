@@ -907,6 +907,35 @@ export async function runBrainV2LivePipeline(params) {
             String(params.memorySnapshot?.lastFreshItemFocus?.itemId ?? "").trim() ||
             null,
         });
+        // Active-now blocking-booking wording must come from OpenAI only —
+        // never fall open to finalReply's deterministic draft (routed.reply)
+        // on compose failure. Fail closed the same way unknown-item/browse
+        // compose failures already do, scoped to this one action source only.
+        const isActiveBlockingNowLaunch =
+          Array.isArray(finalActionPlan?.actions) &&
+          finalActionPlan.actions.some(
+            (action) =>
+              String(action?.payload?.source ?? "").trim() ===
+              "canonical_owner_check_active_blocking_now"
+          );
+        if (
+          isActiveBlockingNowLaunch &&
+          composedLaunch.source !== "openai_cloud_canonical_compose"
+        ) {
+          // composedLaunch.ok/reply are not reliable failure signals here:
+          // composeCloudCanonicalCustomerReply() falls back to fallbackReply
+          // (which we set to finalReply — the deterministic draft — for
+          // non-social kinds) and reports ok:true/reply:<fallback> whenever
+          // that fallback is non-empty. Only source === the real-compose
+          // marker proves OpenAI actually generated the wording.
+          return buildSilentPipelineResult({
+            traceId,
+            channel,
+            chatType,
+            isGroupInbound: params.isGroupInbound,
+            reason: `ACTIVE_BLOCKING_NOW_COMPOSE_FAIL_CLOSED:${composedLaunch.reason ?? "no_reply"}`,
+          });
+        }
         if (composedLaunch.ok && String(composedLaunch.reply ?? "").trim()) {
           finalReply = composedLaunch.reply;
           if (composedLaunch.source === "openai_cloud_canonical_compose") {
@@ -1469,6 +1498,18 @@ export function trustedFactsForCloudCompose(p) {
       : {}),
     currency: String(pricing.currency ?? quote.currency ?? "PKR").trim() || "PKR",
     availabilityStatus: String(verified.availability?.status ?? "").trim() || null,
+    // Distinguishes "a blocking-status booking exists, no specific dates
+    // requested yet" (booking may not have even started) from a per-window
+    // confirmed check — without this, availabilityStatus=unavailable alone
+    // cannot tell the composer whether the customer's actual requested period
+    // was ever evaluated, or whether the booking is even active yet.
+    availabilityWindowRequested: Boolean(verified.availability?.windowApplied),
+    // Resolver-proven from real start/end dates (never inferred here): the
+    // item has a blocking booking that has already started and not yet
+    // ended, as of now. Only this fact licenses a present-moment ("abhi"/
+    // "currently") occupancy claim — a merely-existing future or
+    // unknown-start booking must not.
+    hasActiveBlockingBookingNow: Boolean(verified.availability?.hasActiveBlockingBookingNow),
     // DB/catalog isAvailable is internal evidence only. Confirmed availability
     // is reserved for the approved-lifecycle composer, not this launch path.
     availabilityConfirmed: false,

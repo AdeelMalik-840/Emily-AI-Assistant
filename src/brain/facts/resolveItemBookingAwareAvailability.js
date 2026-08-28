@@ -6,7 +6,7 @@ import {
   getBookingsForItem,
   isBlockingBookingStatus,
 } from "../../services/inventoryService.js";
-import { latestBlockingBookingEnd } from "./bookingDateUtils.js";
+import { latestBlockingBookingEnd, isBookingActiveAt } from "./bookingDateUtils.js";
 import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
 import { resolveCalendarDateWindow } from "./resolveCalendarDateWindow.js";
 
@@ -162,6 +162,8 @@ export async function resolveItemBookingAwareAvailability(p) {
         requestedStartAt: null,
         requestedEndAt: null,
         verifiedAlternatives: [],
+        hasActiveBlockingBookingNow: false,
+        activeBlockingBookingCount: 0,
       },
       sourceEvidence: {
         availability: { error: bookingQueryError, itemId },
@@ -196,6 +198,19 @@ export async function resolveItemBookingAwareAvailability(p) {
 
   const { latestEnd, dateSource } = latestBlockingBookingEnd(blockingBookings);
   const hasReliableEnd = latestEnd != null;
+
+  // Precise, resolver-owned "active now" fact — proven from real start/end
+  // dates, never inferred from isAvailable/status alone. A blocking-status
+  // booking that starts in the future, or whose start is unknown, must not
+  // count here: only start <= evaluationTime && (no end || end > evaluationTime)
+  // qualifies. Independent of whether a requested window was supplied.
+  const evaluationTime = Number.isFinite(Number(p.nowMs))
+    ? new Date(Number(p.nowMs))
+    : new Date();
+  const activeBlockingBookingCount = blockingBookings.filter((b) =>
+    isBookingActiveAt(b, evaluationTime)
+  ).length;
+  const hasActiveBlockingBookingNow = activeBlockingBookingCount > 0;
 
   /** @type {"available" | "unavailable" | "unknown" | "error"} */
   let status = av.isAvailable ? "available" : "unavailable";
@@ -249,6 +264,8 @@ export async function resolveItemBookingAwareAvailability(p) {
       requestedStartAt: window ? window.startAt.toISOString() : null,
       requestedEndAt: window ? window.endAt.toISOString() : null,
       verifiedAlternatives: [],
+      hasActiveBlockingBookingNow,
+      activeBlockingBookingCount,
     },
     sourceEvidence: {
       availability: {
@@ -259,6 +276,8 @@ export async function resolveItemBookingAwareAvailability(p) {
         staleCatalogAvailability,
         blockingStatusesSeen: av.blockingStatusesSeen ?? [],
         windowApplied: Boolean(window),
+        hasActiveBlockingBookingNow,
+        activeBlockingBookingCount,
       },
     },
   };
