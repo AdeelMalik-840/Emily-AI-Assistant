@@ -33,6 +33,7 @@ const KINDS = new Set([
   "pricing",
   "pricing_with_duration",
   "availability",
+  "availability_approved",
   "duration_ask",
   "owner_check_holding",
   "booking_status",
@@ -103,8 +104,14 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
   if (kind === "pricing" || kind === "pricing_with_duration") {
     allowed.push(CUSTOMER_CLAIMS.QUOTATION_VERIFIED);
   }
-  if (kind === "availability" && facts.availabilityConfirmed === true) {
+  if (
+    (kind === "availability" || kind === "availability_approved") &&
+    facts.availabilityConfirmed === true
+  ) {
     allowed.push(CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_CONFIRMED);
+  }
+  if (kind === "availability_approved" && Number(facts.totalAmount) > 0) {
+    allowed.push(CUSTOMER_CLAIMS.QUOTATION_VERIFIED);
   }
   if (kind === "booking_status" && facts.bookingCreated === true) {
     allowed.push(CUSTOMER_CLAIMS.RESERVATION_CREATED);
@@ -115,9 +122,11 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
     conversationalGoal:
       kind === "owner_check_holding"
         ? "Write a short natural holding reply. Do not mention owner, staff, PA, internal process, or that anyone is being asked."
+        : kind === "availability_approved"
+          ? "Availability is already confirmed. Write a short natural reply from TRUSTED_FACTS_JSON only: state the trusted item, duration, and total when present, and invite the customer to book. Do not mention staff, PA, internal process, or that anyone was asked."
         : kind === "social"
           ? "Write a short natural greeting, thanks, or goodbye. Do not mention availability, booking, price, rent, or owner-check unless TRUSTED_FACTS_JSON actually contains those facts because the customer asked about that transaction."
-        : kind === "clarification" || kind === "duration_ask"
+          : kind === "clarification" || kind === "duration_ask"
           ? "Ask one short useful clarification from trusted facts only. Do not invent answers."
           : kind === "image_intro"
             ? "Write a short intro for sending trusted catalog pictures. Do not invent URLs or extra facts."
@@ -148,6 +157,7 @@ WORDING-ONLY CLOUD COMPOSER:
 - Do not mention owner, staff, PA, internal checking process, or that a person is being asked.
 - Do not invent prices, availability, bookings, or image URLs.
 - If KIND=social, greet or acknowledge naturally. Do not mention availability, booking, price, rent, or owner-check unless those facts are present because the customer asked about that transaction.
+- If KIND=availability_approved, availability is already confirmed in TRUSTED_FACTS_JSON. Do not treat catalog/DB availability as confirmation.
 - KIND=${kind}
 - Return strict JSON only.`,
     userBase: `KIND: ${kind}

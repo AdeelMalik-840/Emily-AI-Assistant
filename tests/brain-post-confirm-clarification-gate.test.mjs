@@ -122,7 +122,7 @@ test("suppress helper: Playwright inbound does not suppress", async () => {
   assert.equal(decision.reason, "PLAYWRIGHT_INBOUND");
 });
 
-test("live pipeline: post-confirm Cloud DM recovers SAFE_CLARIFICATION instead of silence", async () => {
+test("live pipeline: post-confirm Cloud DM suppresses onboarding clarify as silence, not detail fallback", async () => {
   const result = await runBrainV2LivePipeline({
     traceId: "step3-suppress-1",
     businessId: BUSINESS_ID,
@@ -149,11 +149,12 @@ test("live pipeline: post-confirm Cloud DM recovers SAFE_CLARIFICATION instead o
   });
 
   assert.equal(result.handled, true);
-  assert.notEqual(String(result.reply ?? "").trim(), "");
-  assert.equal(result.sendVia, "CLOUD_API");
   assert.equal(result.reason, "ONBOARDING_CLARIFY_PLAN_SUPPRESSED");
-  assert.equal(result.customerTurnOutcome, "TECHNICAL_RECOVERY");
+  assert.equal(result.sendVia, "NONE");
+  assert.equal(String(result.reply ?? "").trim(), "");
+  assert.notEqual(result.customerTurnOutcome, "TECHNICAL_RECOVERY");
   assert.doesNotMatch(String(result.reply ?? ""), /Main samajh nahi paaya/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /Abhi ye detail confirm nahi hai/i);
 });
 
 test("live pipeline: no-booking Cloud DM still allows onboarding clarification", async () => {

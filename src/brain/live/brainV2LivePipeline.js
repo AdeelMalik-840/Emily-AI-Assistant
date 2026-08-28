@@ -41,6 +41,10 @@ import {
 import { missingInfoTypeForCloudCanonicalAsk } from "../../services/paMissingInfoRequestService.js";
 import { stampRememberPresentedItemFocusForSingleVerifiedItem } from "../../services/executors/sessionMemoryExecutor.js";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
+import {
+  isTrustedVerifiedFactResolution,
+  resolvePostConfirmRequestedFact,
+} from "../facts/resolvePostConfirmRequestedFact.js";
 
 const SAFE_APOLOGY =
   "Sorry, main abhi reply nahi bhej pa rahi. Thori der baad dobara try karein please.";
@@ -405,6 +409,7 @@ export async function runBrainV2LivePipeline(params) {
       actionPlan: result.actionPlan,
       authoritativeSemanticIntent,
       catalogItems,
+      resolvedBusinessTurnContext,
     });
     if (missingFactOwnerCheck) return missingFactOwnerCheck;
 
@@ -709,11 +714,22 @@ export async function runBrainV2LivePipeline(params) {
 
     if (routed.awaitsPostExecuteBrainReply === true) {
       if (isCloudDmChannel({ channel, chatType, params })) {
-        const deferral =
-          plannedActionReplyText(constrainedPlan) ||
-          CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY;
-        finalReply = deferral;
-        finalReplySource = "BRAIN_V2_LIVE";
+        return finalizeCloudOwnerCheckLaunchHolding({
+          params,
+          turnContextInput,
+          channel,
+          chatType,
+          workflowType,
+          constrainedPlan,
+          canonicalReleased,
+          authoritativeSemanticIntent,
+          catalogItems,
+          flags,
+          routed,
+          sideEffectResults,
+          bookingCreated,
+          decisionTrace: result.trace,
+        });
       } else {
       const postExecResult =
         sideEffectResults?.OWNER_CHECK_POST_EXECUTE_RESULT &&
@@ -795,10 +811,22 @@ export async function runBrainV2LivePipeline(params) {
 
     if (customerReplySuppressed === true) {
       if (isCloudDmChannel({ channel, chatType, params })) {
-        finalReply =
-          plannedActionReplyText(constrainedPlan) ||
-          CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY;
-        finalReplySource = "CLOUD_SEMANTIC_OWNER_CHECK";
+        return finalizeCloudOwnerCheckLaunchHolding({
+          params,
+          turnContextInput,
+          channel,
+          chatType,
+          workflowType,
+          constrainedPlan,
+          canonicalReleased,
+          authoritativeSemanticIntent,
+          catalogItems,
+          flags,
+          routed,
+          sideEffectResults,
+          bookingCreated,
+          decisionTrace: result.trace,
+        });
       } else {
       assertBrainV2ExecutionActive(params);
       const emilySessionKeySilent = String(
@@ -885,8 +913,8 @@ export async function runBrainV2LivePipeline(params) {
             finalReplySource = "CLOUD_CANONICAL_OPENAI_COMPOSE";
           }
         } else if (socialCompose) {
-          finalReply = POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK;
-          finalReplySource = "CLOUD_SEMANTIC_TECHNICAL_RECOVERY";
+          // Social wording failure is not a missing-detail technical recovery.
+          finalReply = "";
         }
       }
     }
@@ -1012,6 +1040,90 @@ function plannedActionReplyText(actionPlan) {
   return "";
 }
 
+/**
+ * Owner-check was planned: customer gets holding only. Never fall through
+ * into the launch availability composer or DB-isAvailable confirmation.
+ */
+async function finalizeCloudOwnerCheckLaunchHolding(p) {
+  const {
+    params,
+    turnContextInput,
+    workflowType,
+    constrainedPlan,
+    canonicalReleased,
+    authoritativeSemanticIntent,
+    catalogItems,
+    flags,
+    routed,
+    sideEffectResults,
+    bookingCreated,
+    decisionTrace,
+  } = p;
+  let reply = CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY;
+  if (shouldComposeCloudCanonicalLaunchReply(params)) {
+    const composed = await composeCloudCanonicalCustomerReply({
+      kind: "owner_check_holding",
+      semanticIntent: authoritativeSemanticIntent,
+      customerMessage: params.message,
+      trustedFacts: {
+        itemId: String(turnContextInput?.authoritativeItem?.id ?? "").trim() || null,
+        itemLabel:
+          String(
+            turnContextInput?.authoritativeItem?.displayLabel ??
+              turnContextInput?.authoritativeItem?.name ??
+              ""
+          ).trim() || null,
+        answerKnown: false,
+        ownerCheckPending: true,
+      },
+      fallbackReply: CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY,
+      timeoutMs: params.__cloudComposeTimeoutMs ?? 8000,
+      __chatCompletionsCreateForTests: params.__cloudComposeChatCreate ?? null,
+    });
+    if (composed.ok && String(composed.reply ?? "").trim()) {
+      reply = composed.reply;
+    }
+  }
+  let finalActionPlan = constrainedPlan;
+  if (
+    shouldStampCloudPresentedItemFocus({
+      turnScope: canonicalReleased?.turnScope,
+      semanticIntent: authoritativeSemanticIntent,
+      workflowType,
+      finalReplySource: "CLOUD_SEMANTIC_OWNER_CHECK",
+    })
+  ) {
+    finalActionPlan = stampRememberPresentedItemFocusForSingleVerifiedItem(
+      finalActionPlan,
+      { catalogItems, allow: true }
+    );
+  }
+  const emilySessionKey = String(
+    turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
+  ).trim();
+  applyInfoLiveSessionMemoryPatch({
+    sessionKey: emilySessionKey,
+    actionPlan: finalActionPlan,
+    authoritativeItem: turnContextInput.authoritativeItem,
+    sourceTurnId: `assistant:${String(params.messageId ?? params.traceId).trim()}`,
+  });
+  return finalizeLivePipelineResult({
+    params,
+    turnContextInput,
+    workflowType,
+    reply,
+    finalReplySource: "CLOUD_SEMANTIC_OWNER_CHECK",
+    actionPlan: finalActionPlan,
+    flags,
+    routed: {
+      ...routed,
+      sideEffectResults,
+    },
+    bookingCreated,
+    decisionTrace,
+  });
+}
+
 function isCloudDmChannel(p) {
   return (
     p.channel === "whatsapp_cloud" &&
@@ -1048,21 +1160,27 @@ function shouldStampCloudPresentedItemFocus(p) {
 }
 
 /**
- * Understood Cloud details/business questions must not become "I didn't understand".
- * Canned clarification here means trusted facts were missing, not that meaning was unknown.
+ * Cloud details/business questions with a genuinely missing trusted fact
+ * escalate to the existing missing-info owner-check. UNCLEAR/social/clarification
+ * ownership never qualifies, and canned onboarding copy is not the qualifier.
  */
 async function maybeCloudMissingFactOwnerCheckResult(p) {
   if (!isCloudDmChannel(p)) return null;
+  if (isCloudUnclearOrSocialOwnership(p)) return null;
+
   const missingMedia = p.actionPlan?.missingTrustedMedia === true;
-  if (
-    !missingMedia &&
-    !isCloudMissingBusinessFactIntent(p.authoritativeSemanticIntent)
-  ) {
+  const factualAsk = isCloudMissingBusinessFactIntent(p.authoritativeSemanticIntent);
+  if (!missingMedia && !factualAsk) return null;
+
+  if (!missingMedia && !canRepresentCloudMissingBusinessFact(p)) {
     return null;
   }
+
   if (!missingMedia) {
-    const planned = plannedActionReplyText(p.actionPlan);
-    if (planned && !isOnboardingStyleClarificationReply(planned)) return null;
+    const trustedFound = resolveCloudLaunchMissingFactResolution(p);
+    if (isTrustedVerifiedFactResolution(trustedFound)) {
+      return null;
+    }
   }
 
   const params = p.params && typeof p.params === "object" ? p.params : {};
@@ -1206,6 +1324,64 @@ async function maybeCloudMissingFactOwnerCheckResult(p) {
   });
 }
 
+function isCloudUnclearOrSocialOwnership(p) {
+  const intent = String(p.authoritativeSemanticIntent ?? "").trim();
+  const turnScope = String(
+    p.params?.canonicalSemanticDecision?.turnScope ?? p.turnScope ?? ""
+  ).trim();
+  return (
+    intent === "unclear" ||
+    intent === "social" ||
+    intent === "clarification" ||
+    turnScope === "UNCLEAR" ||
+    turnScope === "SOCIAL_GENERAL"
+  );
+}
+
+function canRepresentCloudMissingBusinessFact(p) {
+  if (isCloudUnclearOrSocialOwnership(p)) return false;
+  if (!isCloudMissingBusinessFactIntent(p.authoritativeSemanticIntent)) {
+    return false;
+  }
+  const decision =
+    p.params?.canonicalSemanticDecision &&
+    typeof p.params.canonicalSemanticDecision === "object"
+      ? p.params.canonicalSemanticDecision
+      : {};
+  const factKind = String(decision.factKind ?? "").trim();
+  if (factKind === "vague" || factKind === "non_business") {
+    return false;
+  }
+  const item = p.turnContextInput?.authoritativeItem;
+  const itemId = String(item?.id ?? item?.itemId ?? "").trim();
+  if (String(p.authoritativeSemanticIntent ?? "").trim() === "details_inquiry" && !itemId) {
+    return false;
+  }
+  return true;
+}
+
+function resolveCloudLaunchMissingFactResolution(p) {
+  const decision =
+    p.params?.canonicalSemanticDecision &&
+    typeof p.params.canonicalSemanticDecision === "object"
+      ? p.params.canonicalSemanticDecision
+      : {};
+  const business =
+    p.resolvedBusinessTurnContext?.business &&
+    typeof p.resolvedBusinessTurnContext.business === "object"
+      ? p.resolvedBusinessTurnContext.business
+      : {};
+  return resolvePostConfirmRequestedFact({
+    capability: decision.capability,
+    evidenceNeeds: decision.evidenceNeeds,
+    facts: {
+      business,
+      known: business,
+      catalogItems: Array.isArray(p.catalogItems) ? p.catalogItems : [],
+    },
+  });
+}
+
 function shouldComposeCloudCanonicalLaunchReply(params) {
   if (typeof params?.__cloudComposeChatCreate === "function") return true;
   return String(process.env.NODE_ENV ?? "").trim() !== "test";
@@ -1293,7 +1469,9 @@ export function trustedFactsForCloudCompose(p) {
       : {}),
     currency: String(pricing.currency ?? quote.currency ?? "PKR").trim() || "PKR",
     availabilityStatus: String(verified.availability?.status ?? "").trim() || null,
-    availabilityConfirmed: verified.availability?.isAvailable === true,
+    // DB/catalog isAvailable is internal evidence only. Confirmed availability
+    // is reserved for the approved-lifecycle composer, not this launch path.
+    availabilityConfirmed: false,
     bookingCreated: Boolean(p.bookingCreated),
     bookingId: p.bookingCreated?.id ?? null,
     imageCount: imageUrls.length,
@@ -1439,6 +1617,17 @@ function assertBrainV2ExecutionActive(params) {
  */
 async function maybeSilentInsteadOfOnboardingClarify(p) {
   const params = p.params && typeof p.params === "object" ? p.params : {};
+  const turnScope = String(
+    p.turnScope ?? params.canonicalSemanticDecision?.turnScope ?? ""
+  ).trim();
+  const intent = String(
+    p.authoritativeSemanticIntent ??
+      params.canonicalSemanticDecision?.semanticIntent ??
+      ""
+  ).trim();
+  if (turnScope === "UNCLEAR" || intent === "unclear") {
+    return null;
+  }
   const decision = await shouldSuppressPostConfirmOnboardingClarification({
     channel: p.channel ?? params.channel,
     chatType: p.chatType ?? params.chatType,
@@ -1526,26 +1715,41 @@ function buildSilentPipelineResult(p) {
     p.channel === "whatsapp_cloud" &&
     p.chatType !== "group" &&
     p.isGroupInbound !== true;
-  const keepSilent =
-    reason === "EMPTY_MESSAGE" ||
-    reason === "CANONICAL_OWNERSHIP_NOT_BRAIN_V2" ||
-    (reason === "ASSIST_CONTEXT_NO_REPLY" && !cloudDm);
-  if (cloudDm && !keepSilent) {
-    const ownerCheck = reason.includes("OWNER_CHECK");
+  if (cloudDm && reason.includes("OWNER_CHECK")) {
     return {
       handled: true,
-      reply: ownerCheck
-        ? CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY
-        : POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
+      reply: CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY,
       sendVia: "CLOUD_API",
       dmRecipientPhone: null,
-      customerTurnOutcome: ownerCheck ? "OWNER_CHECK" : "TECHNICAL_RECOVERY",
+      customerTurnOutcome: "OWNER_CHECK",
       messageMeta: {
         routeType: "BRAIN_V2_LIVE",
         outboundTrace: {
-          finalReplySource: ownerCheck
-            ? "CLOUD_SEMANTIC_OWNER_CHECK"
-            : "CLOUD_SEMANTIC_TECHNICAL_RECOVERY",
+          finalReplySource: "CLOUD_SEMANTIC_OWNER_CHECK",
+          reason,
+        },
+        brainV2Live: true,
+        traceId: p.traceId,
+      },
+      reason,
+      legacyBypassed: true,
+    };
+  }
+  if (
+    cloudDm &&
+    (reason === "CANONICAL_SEMANTIC_INTENT_INVALID" ||
+      reason.includes("FAIL_CLOSED"))
+  ) {
+    return {
+      handled: true,
+      reply: POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
+      sendVia: "CLOUD_API",
+      dmRecipientPhone: null,
+      customerTurnOutcome: "TECHNICAL_RECOVERY",
+      messageMeta: {
+        routeType: "BRAIN_V2_LIVE",
+        outboundTrace: {
+          finalReplySource: "CLOUD_SEMANTIC_TECHNICAL_RECOVERY",
           reason,
         },
         brainV2Live: true,

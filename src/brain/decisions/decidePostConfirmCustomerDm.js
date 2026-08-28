@@ -52,6 +52,7 @@ import {
   deriveCloudItemReferenceMode,
   hydrateCloudDmContextualItemReferents,
   reconcileCloudDmItemAndTargetReference,
+  resolveCloudDmContextualBindIdentity,
 } from "../contracts/cloudCanonicalSemantic.js";
 
 export const POST_CONFIRM_CONVERSATION_ACTS = Object.freeze([
@@ -124,6 +125,7 @@ const CLOUD_DM_ITEM_REFERENT_SOURCES = Object.freeze([
 function inspectCloudDmItemReferents(raw, {
   customerMessage = null,
   trustedFreshItemFocus = null,
+  pendingOwnerCheckRequests = null,
 } = {}) {
   const customerMessageLength = String(customerMessage ?? "").length;
   const metadata = {
@@ -159,8 +161,10 @@ function inspectCloudDmItemReferents(raw, {
     return { value: null, rejectionCode: "ITEM_REFERENTS_INVALID", metadata };
   }
   const message = String(customerMessage ?? "");
-  const freshId = clean(trustedFreshItemFocus?.itemId, 160) || null;
-  const freshTurnId = clean(trustedFreshItemFocus?.sourceTurnId, 320) || null;
+  const contextualBind = resolveCloudDmContextualBindIdentity({
+    trustedFreshItemFocus,
+    pendingOwnerCheckRequests,
+  });
   const result = [];
   for (const value of raw) {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -198,13 +202,17 @@ function inspectCloudDmItemReferents(raw, {
       if (surfaceText !== null || start !== null || end !== null) {
         return { value: null, rejectionCode: "ITEM_REFERENT_TRUSTED_FIELDS_INVALID", metadata };
       }
-      if (!freshId || !freshTurnId) {
-        return { value: null, rejectionCode: "CONTEXTUAL_FRESH_FOCUS_MISSING", metadata };
+      if (!contextualBind.ok) {
+        return {
+          value: null,
+          rejectionCode: contextualBind.reason || "CONTEXTUAL_FRESH_FOCUS_MISSING",
+          metadata,
+        };
       }
-      if (trustedItemId && trustedItemId !== freshId) {
+      if (trustedItemId && trustedItemId !== contextualBind.itemId) {
         return { value: null, rejectionCode: "ITEM_REFERENT_TRUSTED_FIELDS_INVALID", metadata };
       }
-      if (sourceTurnId && sourceTurnId !== freshTurnId) {
+      if (sourceTurnId && sourceTurnId !== contextualBind.sourceTurnId) {
         return { value: null, rejectionCode: "ITEM_REFERENT_TRUSTED_FIELDS_INVALID", metadata };
       }
       result.push({
@@ -1918,6 +1926,42 @@ function compactHistoricalOwnershipCandidate(row) {
   };
 }
 
+function compactPendingOwnerCheckBindRows(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const row of raw) {
+    const requestId = pendingAvailabilityRequestId(row);
+    const nested =
+      row?.request && typeof row.request === "object" ? row.request : row;
+    const itemId = clean(nested?.itemId || row?.itemId, 160) || null;
+    if (!requestId || !itemId || seen.has(requestId)) continue;
+    seen.add(requestId);
+    out.push({
+      requestId,
+      itemId,
+      itemLabel:
+        clean(row?.itemLabel || nested?.itemLabel || nested?.itemName, 200) ||
+        null,
+      status: clean(nested?.status || row?.status, 60) || "pending",
+      customerConfirmationStatus:
+        clean(
+          nested?.customerConfirmationStatus || row?.customerConfirmationStatus,
+          60
+        ) || null,
+      supersededByAvailabilityRequestId:
+        clean(
+          nested?.supersededByAvailabilityRequestId ||
+            row?.supersededByAvailabilityRequestId,
+          160
+        ) || null,
+      linkedBookingId:
+        clean(nested?.linkedBookingId || row?.linkedBookingId, 160) || null,
+    });
+  }
+  return out;
+}
+
 function compactPendingOwnershipCandidate(row) {
   const requestId = pendingAvailabilityRequestId(row);
   if (!requestId) return null;
@@ -2035,6 +2079,48 @@ function unclearContradictsKnownCatalogSpan(turnScope, customerMessage, catalogI
   return listExplicitCatalogItemIds(customerMessage, items).length > 0;
 }
 
+const INFORMATIONAL_ITEM_SEMANTIC_INTENTS = new Set([
+  "details_inquiry",
+  "general_business_question",
+]);
+
+/**
+ * Explicit current-turn catalog identity beats stale historical booking
+ * ownership for a new informational item/business fact ask, unless the
+ * customer actually references that historical booking.
+ */
+function staleHistoricalNamedCatalogRejection({
+  turnScope,
+  semanticIntent,
+  factKind,
+  mutationIntent,
+  action,
+  customerMessage,
+  catalogItems,
+  targetReference,
+} = {}) {
+  if (turnScope !== "OLD_BOOKING_REFERENCE") return null;
+  if (cleanMutationIntent(mutationIntent) !== "none") return null;
+  if (action !== "reply" && action !== "escalate_missing_info") return null;
+  if (cleanPostConfirmFactKind(factKind) === "booking_fact") return null;
+  const intent = cleanCustomerSemanticIntent(semanticIntent);
+  if (!INFORMATIONAL_ITEM_SEMANTIC_INTENTS.has(intent)) return null;
+  if (listExplicitCatalogItemIds(customerMessage, catalogItems).length === 0) {
+    return null;
+  }
+  const target = targetReference && typeof targetReference === "object"
+    ? targetReference
+    : null;
+  if (
+    target?.source === "conversation_turn" &&
+    target?.targetType === "historical_booking" &&
+    String(target?.targetId ?? "").trim()
+  ) {
+    return null;
+  }
+  return "OLD_BOOKING_EXPLICIT_CURRENT_CATALOG_SPAN";
+}
+
 /**
  * Strip PA pre-own fields. Candidates are equal facts, ordered stable_id_asc.
  *
@@ -2116,6 +2202,9 @@ export function buildNeutralCloudDmOwnershipFacts(
     latestClosedMissingInfoAnswers: [],
     bookingCandidates: historical,
     pendingAvailabilityRequests: pending,
+    pendingOwnerCheckRequests: compactPendingOwnerCheckBindRows(
+      facts.pendingOwnerCheckRequests
+    ),
     ownershipReferenceContext,
     currentOwnershipTurnId: clean(facts.currentOwnershipTurnId, 320) || null,
     trustedFreshItemFocus,
@@ -3454,9 +3543,12 @@ export function canEscalatePostConfirmMissingInfo({
   let type = "";
   if (
     resolution &&
-    (resolutionStatus === "missing" || resolutionStatus === "not_found")
+    (resolutionStatus === "missing" ||
+      resolutionStatus === "not_found" ||
+      resolutionStatus === "unsupported")
   ) {
-    // Primary: trusted missing Result from resolvePostConfirmRequestedFact.
+    // Primary: trusted missing/unsupported Result from resolvePostConfirmRequestedFact.
+    // unsupported is representable missing-info only when missingInfoType is present.
     if (action !== "reply" && action !== "escalate_missing_info") {
       return deny("ACTION");
     }
@@ -3695,11 +3787,13 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
   const cleanedReferents = cleanCloudDmItemReferents(itemReferentInput, {
     customerMessage: facts?.currentCustomerMessage,
     trustedFreshItemFocus: facts?.trustedFreshItemFocus,
+    pendingOwnerCheckRequests: facts?.pendingOwnerCheckRequests,
   });
   if (!cleanedReferents) return invalid("ITEM_REFERENTS_INVALID");
   const hydratedReferents = hydrateCloudDmContextualItemReferents(
     cleanedReferents,
-    facts?.trustedFreshItemFocus
+    facts?.trustedFreshItemFocus,
+    facts?.pendingOwnerCheckRequests
   );
   if (!hydratedReferents.ok) return invalid(hydratedReferents.reason);
   const itemReferents = hydratedReferents.itemReferents;
@@ -3765,6 +3859,17 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
     ) {
       return invalid("OLD_BOOKING_PENDING_ACTION_CONTRADICTION");
     }
+    const staleHistoricalReason = staleHistoricalNamedCatalogRejection({
+      turnScope: scope,
+      semanticIntent,
+      factKind: decision?.factKind,
+      mutationIntent: mutation,
+      action,
+      customerMessage: facts?.currentCustomerMessage,
+      catalogItems: facts?.catalogItems,
+      targetReference,
+    });
+    if (staleHistoricalReason) return invalid(staleHistoricalReason);
     return { ok: true, scope, context, targetId };
   }
 
@@ -4014,6 +4119,7 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
   const itemReferentInspection = inspectCloudDmItemReferents(parsed.itemReferents, {
     customerMessage: opts.customerMessage,
     trustedFreshItemFocus: opts.trustedFreshItemFocus,
+    pendingOwnerCheckRequests: opts.pendingOwnerCheckRequests,
   });
   if (!itemReferentInspection.value) {
     return rejectCloudDmOwnershipParse(
@@ -4027,7 +4133,8 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
   }
   const hydratedReferents = hydrateCloudDmContextualItemReferents(
     itemReferentInspection.value,
-    opts.trustedFreshItemFocus
+    opts.trustedFreshItemFocus,
+    opts.pendingOwnerCheckRequests
   );
   if (!hydratedReferents.ok) {
     return rejectCloudDmOwnershipParse(
@@ -4096,6 +4203,23 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
     return rejectCloudDmOwnershipParse(
       opts,
       namedSpanReason,
+      itemReferentInspection.metadata
+    );
+  }
+  const staleHistoricalReason = staleHistoricalNamedCatalogRejection({
+    turnScope,
+    semanticIntent,
+    factKind,
+    mutationIntent,
+    action,
+    customerMessage: opts.customerMessage,
+    catalogItems: opts.catalogItems,
+    targetReference,
+  });
+  if (staleHistoricalReason) {
+    return rejectCloudDmOwnershipParse(
+      opts,
+      staleHistoricalReason,
       itemReferentInspection.metadata
     );
   }
@@ -4414,8 +4538,9 @@ export async function executeCloudDmOwnershipDecision({
           "Named items in CUSTOMER_MESSAGE use source=current_turn spans with null IDs.",
           "Contextual continuation uses source=trusted_fresh_focus with null IDs.",
           "NEW_TRANSACTION targetReference must be source=none.",
-          "UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN and NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN mean CUSTOMER_MESSAGE names a catalog item: emit NEW_TRANSACTION with a current_turn span of that named item. Do not use trusted_fresh_focus and do not span a non-catalog phrase. Runtime will not pick the intent.",
+          "UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN, NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN, and OLD_BOOKING_EXPLICIT_CURRENT_CATALOG_SPAN mean CUSTOMER_MESSAGE names a catalog item for a new informational ask: emit NEW_TRANSACTION with a current_turn span of that named item. Do not keep OLD_BOOKING_REFERENCE unless the customer refers to an existing booking's booking facts (conversation_turn historical provenance or booking_fact). Do not use trusted_fresh_focus and do not span a non-catalog phrase. Runtime will not pick the intent.",
           "ITEM_REFERENT_SURFACE_MISMATCH means start/end must be the exact end-exclusive offsets of surfaceText in CUSTOMER_MESSAGE.",
+          "CONTEXTUAL_FRESH_FOCUS_MISSING means no trusted presented item and no unique pending owner-check request. CONTEXTUAL_PENDING_AVR_AMBIGUOUS means more than one pending owner-check could bind: do not guess; use UNCLEAR unless CUSTOMER_MESSAGE names a catalog item (then NEW_TRANSACTION current_turn).",
         ].join(" "),
       });
     }
@@ -4447,6 +4572,7 @@ export async function executeCloudDmOwnershipDecision({
       customerMessage: userLine,
       trustedFreshItemFocus: facts?.trustedFreshItemFocus,
       catalogItems: facts?.catalogItems,
+      pendingOwnerCheckRequests: facts?.pendingOwnerCheckRequests,
       onStructuralRejection: (details) => {
         parseRejection = details;
       },

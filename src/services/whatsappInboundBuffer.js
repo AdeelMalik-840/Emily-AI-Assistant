@@ -13,6 +13,7 @@ import { validateBrainV2PipelineResult } from "../brain/live/brainV2ResultContra
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import {
   appendConversationMessage,
+  conversationHistoryFieldsForOutbound,
   getRecentConversationForPrompt,
   getRecentConversationReferenceContext,
 } from "./conversationStore.js";
@@ -30,7 +31,10 @@ import {
   handleAvailabilityRequestApproval,
   parseAvailabilityApprovalMessage,
 } from "./availabilityApprovalService.js";
-import { evaluateAvailabilityWaitingConfirmOwnershipGuard } from "./availabilityRequestService.js";
+import {
+  evaluateAvailabilityWaitingConfirmOwnershipGuard,
+  findOpenOwnerCheckCloudAvailabilityRequestsByPhone,
+} from "./availabilityRequestService.js";
 import {
   handleBookingApproval,
   parseApprovalMessage,
@@ -2473,6 +2477,19 @@ export async function executeWhatsAppAiPipeline(p) {
             catalogItemsForOwnership = [];
           }
         }
+        let pendingOwnerCheckRequests = [];
+        if (db && ownerUserId && cloudConfirmPhone) {
+          try {
+            pendingOwnerCheckRequests =
+              await findOpenOwnerCheckCloudAvailabilityRequestsByPhone({
+                db,
+                businessId: ownerUserId,
+                customerPhone: cloudConfirmPhone,
+              });
+          } catch {
+            pendingOwnerCheckRequests = [];
+          }
+        }
         const baseOwnershipFacts = {
           ...(preResolvedPostConfirmBookingFacts?.facts ?? {}),
           ownershipReferenceContext: conversationReferenceContext,
@@ -2480,6 +2497,7 @@ export async function executeWhatsAppAiPipeline(p) {
           trustedFreshItemFocus,
           lastAvailabilityAssist,
           catalogItems: catalogItemsForOwnership,
+          pendingOwnerCheckRequests,
         };
         const decided =
           typeof p.__executeCloudDmOwnershipDecisionFn === "function"
@@ -3512,12 +3530,18 @@ export async function executeWhatsAppAiPipeline(p) {
               outboundDelivered: true,
             });
           }
+          const recoveryHistory = conversationHistoryFieldsForOutbound(
+            messageMeta?.outboundTrace?.finalReplySource
+          );
           await appendConversationMessage(db, {
             ownerUserId,
             customerNumber: conversationCustomerNumber,
             role: "assistant",
             text: replyText,
-            verifiedReferences,
+            verifiedReferences: recoveryHistory.excludeFromSemanticHistory
+              ? []
+              : verifiedReferences,
+            ...recoveryHistory,
             ...(persistCloudDmConversationIdentity
               ? {
                   sourceMessageId: messageId || null,

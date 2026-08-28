@@ -32,6 +32,123 @@ function cleanId(value, max = 160) {
   return text ? text.slice(0, max) : null;
 }
 
+const PENDING_OWNER_CHECK_STATUSES = new Set(["pending", "processing"]);
+const PENDING_OWNER_CHECK_BLOCKING_CONFIRM = new Set([
+  "waiting_confirm",
+  "confirmed",
+  "declined",
+  "superseded",
+]);
+
+function pendingOwnerCheckRequestId(row) {
+  return (
+    cleanId(row?.requestId, 160) ||
+    cleanId(row?.request?.requestId, 160) ||
+    cleanId(row?.request?.id, 160) ||
+    cleanId(row?.id, 160)
+  );
+}
+
+function pendingOwnerCheckItemId(row) {
+  return (
+    cleanId(row?.itemId, 160) ||
+    cleanId(row?.request?.itemId, 160)
+  );
+}
+
+function pendingOwnerCheckStatus(row) {
+  return (
+    String(row?.status ?? row?.request?.status ?? "pending").trim() || "pending"
+  );
+}
+
+function pendingOwnerCheckConfirmStatus(row) {
+  return String(
+    row?.customerConfirmationStatus ??
+      row?.request?.customerConfirmationStatus ??
+      ""
+  ).trim();
+}
+
+/**
+ * Eligible open owner-check AVR for contextual continuation bind.
+ * Waiting-confirm / booked / superseded rows are not pending owner-checks.
+ */
+export function isEligiblePendingOwnerCheckBind(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+  if (!pendingOwnerCheckRequestId(row) || !pendingOwnerCheckItemId(row)) {
+    return false;
+  }
+  const status = pendingOwnerCheckStatus(row);
+  if (!PENDING_OWNER_CHECK_STATUSES.has(status)) return false;
+  const confirm = pendingOwnerCheckConfirmStatus(row);
+  if (PENDING_OWNER_CHECK_BLOCKING_CONFIRM.has(confirm)) return false;
+  if (
+    cleanId(row?.supersededByAvailabilityRequestId, 160) ||
+    cleanId(row?.request?.supersededByAvailabilityRequestId, 160)
+  ) {
+    return false;
+  }
+  if (cleanId(row?.linkedBookingId, 160) || cleanId(row?.request?.linkedBookingId, 160)) {
+    return false;
+  }
+  return true;
+}
+
+function listEligiblePendingOwnerCheckBinds(rows) {
+  const seen = new Set();
+  const out = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!isEligiblePendingOwnerCheckBind(row)) continue;
+    const requestId = pendingOwnerCheckRequestId(row);
+    if (seen.has(requestId)) continue;
+    seen.add(requestId);
+    out.push({
+      requestId,
+      itemId: pendingOwnerCheckItemId(row),
+      sourceTurnId: requestId,
+    });
+  }
+  return out;
+}
+
+/**
+ * Bind identity for trusted_fresh_focus referents.
+ * Fresh presented focus wins. Otherwise exactly one eligible pending
+ * owner-check AVR may supply item + request provenance. Multiple eligible
+ * AVRs are ambiguous and must not be guessed.
+ *
+ * @returns {{ ok: true, itemId: string, sourceTurnId: string, bindSource: string } | { ok: false, reason: string }}
+ */
+export function resolveCloudDmContextualBindIdentity({
+  trustedFreshItemFocus = null,
+  pendingOwnerCheckRequests = null,
+} = {}) {
+  const freshId = cleanId(trustedFreshItemFocus?.itemId, 160);
+  const freshTurnId = cleanId(trustedFreshItemFocus?.sourceTurnId, 320);
+  if (freshId && freshTurnId) {
+    return {
+      ok: true,
+      itemId: freshId,
+      sourceTurnId: freshTurnId,
+      bindSource: "fresh_focus",
+    };
+  }
+  const eligible = listEligiblePendingOwnerCheckBinds(pendingOwnerCheckRequests);
+  if (eligible.length === 1) {
+    return {
+      ok: true,
+      itemId: eligible[0].itemId,
+      sourceTurnId: eligible[0].sourceTurnId,
+      bindSource: "pending_avr",
+    };
+  }
+  if (eligible.length > 1) {
+    return { ok: false, reason: "CONTEXTUAL_PENDING_AVR_AMBIGUOUS" };
+  }
+  return { ok: false, reason: "CONTEXTUAL_FRESH_FOCUS_MISSING" };
+}
+
 export function cleanCloudItemReferenceMode(value) {
   const mode = String(value ?? "").trim().toUpperCase();
   return CLOUD_ITEM_REFERENCE_MODES.includes(mode) ? mode : null;
@@ -57,11 +174,14 @@ export function deriveCloudItemReferenceMode(itemReferents, itemScope) {
  */
 export function hydrateCloudDmContextualItemReferents(
   itemReferents,
-  trustedFreshItemFocus
+  trustedFreshItemFocus,
+  pendingOwnerCheckRequests = null
 ) {
   const refs = Array.isArray(itemReferents) ? itemReferents : [];
-  const freshId = cleanId(trustedFreshItemFocus?.itemId, 160);
-  const freshTurnId = cleanId(trustedFreshItemFocus?.sourceTurnId, 320);
+  const bind = resolveCloudDmContextualBindIdentity({
+    trustedFreshItemFocus,
+    pendingOwnerCheckRequests,
+  });
   const next = [];
   for (const ref of refs) {
     if (!ref || typeof ref !== "object") {
@@ -71,15 +191,15 @@ export function hydrateCloudDmContextualItemReferents(
       next.push({ ...ref });
       continue;
     }
-    if (!freshId || !freshTurnId) {
-      return { ok: false, reason: "CONTEXTUAL_FRESH_FOCUS_MISSING" };
+    if (!bind.ok) {
+      return { ok: false, reason: bind.reason || "CONTEXTUAL_FRESH_FOCUS_MISSING" };
     }
     const modelItemId = cleanId(ref.trustedItemId, 160);
     const modelTurnId = cleanId(ref.sourceTurnId, 320);
-    if (modelItemId && modelItemId !== freshId) {
+    if (modelItemId && modelItemId !== bind.itemId) {
       return { ok: false, reason: "ITEM_REFERENT_TRUSTED_FIELDS_INVALID" };
     }
-    if (modelTurnId && modelTurnId !== freshTurnId) {
+    if (modelTurnId && modelTurnId !== bind.sourceTurnId) {
       return { ok: false, reason: "ITEM_REFERENT_TRUSTED_FIELDS_INVALID" };
     }
     next.push({
@@ -87,8 +207,8 @@ export function hydrateCloudDmContextualItemReferents(
       surfaceText: null,
       start: null,
       end: null,
-      trustedItemId: freshId,
-      sourceTurnId: freshTurnId,
+      trustedItemId: bind.itemId,
+      sourceTurnId: bind.sourceTurnId,
     });
   }
   return { ok: true, itemReferents: next };

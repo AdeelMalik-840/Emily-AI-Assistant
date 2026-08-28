@@ -9,6 +9,7 @@ process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || "test-key";
 const {
   composePostConfirmInformationalCustomerReply,
   isPostConfirmInformationalCustomerInputRequired,
+  isTrustedPendingAvailabilityPostExecutionWording,
 } = await import("../src/services/customerBusinessPaAiReply.js");
 const { handleCustomerBusinessPaInbound } = await import(
   "../src/services/customerBusinessPaAgentService.js"
@@ -154,15 +155,10 @@ test("1. pickup location missing: non-empty reply does not ask customer for loca
       };
     },
   });
-  assert.equal(composed.ok, true);
-  assert.ok(composed.reply);
-  assert.doesNotMatch(composed.reply, /\?/);
-  assert.doesNotMatch(composed.reply, /bata|bataiye|batayen|detail de|location.*kya|kahan se/i);
-  assert.doesNotMatch(composed.reply, /DHA|Johar|Gulberg|office/i);
-  const system = String(prompts[0]?.messages?.[0]?.content || "");
-  assert.match(system, /customerInputRequired=false/i);
-  assert.match(system, /Do NOT ask the customer to supply that business-owned fact/i);
-  assert.doesNotMatch(system, /OR ask one useful clarification/);
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(composed.reply, "");
+  assert.equal(prompts.length, 0);
 });
 
 test("2. delivery policy missing: truthful reply, no invention, no irrelevant ask", async () => {
@@ -214,10 +210,9 @@ test("2. delivery policy missing: truthful reply, no invention, no irrelevant as
       ],
     }),
   });
-  assert.equal(composed.ok, true);
-  assert.ok(composed.reply);
-  assert.doesNotMatch(composed.reply, /\?/);
-  assert.doesNotMatch(composed.reply, /Lahore|available hai|ho sakti hai\./i);
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(composed.reply, "");
 });
 
 test("3. clarification_needed may ask one useful customer question", async () => {
@@ -285,13 +280,10 @@ test("4. OpenAI empty twice: deterministic recovery + provenance retained", asyn
       return { choices: [{ message: { content: "" } }] };
     },
   });
-  assert.ok(calls >= 1);
-  assert.equal(composed.ok, true);
-  assert.equal(composed.source, "deterministic_informational_fallback");
-  assert.ok(composed.reply);
-  assert.doesNotMatch(composed.reply, /\?/);
-  assert.equal(composed.composeFailure?.openaiReason, "EMPTY_OR_INVALID_OPENAI_REPLY");
-  assert.equal(composed.composeFailure?.deterministicReason, null);
+  assert.equal(calls, 0);
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(composed.reply, "");
 });
 
 test("5. English customer + empty OpenAI still gets one non-empty guarded reply", async () => {
@@ -331,12 +323,9 @@ test("5. English customer + empty OpenAI still gets one non-empty guarded reply"
       choices: [{ message: { content: "" } }],
     }),
   });
-  assert.equal(composed.ok, true);
-  assert.ok(String(composed.reply || "").trim());
-  assert.equal(composed.source, "deterministic_informational_fallback");
-  assert.match(composed.reply, /not confirmed|unclear/i);
-  assert.doesNotMatch(composed.reply, /Yeh detail/i);
-  assert.equal(composed.composeFailure?.finalClass, null);
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(composed.reply, "");
 });
 
 test("5b. agent still surfaces injected compose empty as terminal (defensive)", async () => {
@@ -562,11 +551,17 @@ test("10. empty OpenAI: found/missing/conflicting/unsupported each get one non-e
       selectedBooking: b,
       __chatCompletionsCreateForTests: emptyAi,
     });
-    assert.equal(composed.ok, true, row.name);
-    assert.ok(String(composed.reply || "").trim(), row.name);
-    assert.match(composed.reply, row.expect, row.name);
-    assert.equal(composed.source, "deterministic_informational_fallback", row.name);
-    assert.notEqual(composed.composeFailure?.finalClass, "INFORMATIONAL_COMPOSE_EMPTY_REPLY");
+    if (row.name === "found" || row.name === "unsupported") {
+      assert.equal(composed.ok, true, row.name);
+      assert.ok(String(composed.reply || "").trim(), row.name);
+      assert.match(composed.reply, row.expect, row.name);
+      assert.equal(composed.source, "deterministic_informational_fallback", row.name);
+      assert.notEqual(composed.composeFailure?.finalClass, "INFORMATIONAL_COMPOSE_EMPTY_REPLY");
+    } else {
+      assert.equal(composed.ok, false, row.name);
+      assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED", row.name);
+      assert.equal(composed.reply, "", row.name);
+    }
   }
 });
 
@@ -609,21 +604,10 @@ test("11. conversationHistory is passed for continuity but not as factual author
       };
     },
   });
-  assert.equal(composed.ok, true);
-  assert.doesNotMatch(composed.reply, /DHA Phase 5/i);
-  const system = String(prompts[0]?.messages?.[0]?.content || "");
-  const user = String(prompts[0]?.messages?.[1]?.content || "");
-  assert.match(system, /RECENT_DIALOGUE is continuity\/tone only/i);
-  assert.match(system, /NEVER a factual answer source/i);
-  assert.match(user, /RECENT_DIALOGUE \(continuity\/tone only/);
-  assert.match(user, /kal raat 10 baje/);
-  assert.match(user, /FACT_RESOLUTION_JSON/);
-  // History must not leak into FACT_RESOLUTION_JSON verified values.
-  const factBlock = user.slice(
-    user.indexOf("FACT_RESOLUTION_JSON:"),
-    user.indexOf("RECENT_DIALOGUE")
-  );
-  assert.doesNotMatch(factBlock, /DHA Phase 5|kal raat 10 baje/i);
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(composed.reply, "");
+  assert.equal(prompts.length, 0);
 });
 
 test("12. agent forwards conversationHistory into informational compose", async () => {
@@ -844,21 +828,10 @@ test("15. ownerCheckStarted false: no checking/pending promise in compose contra
       };
     },
   });
-  assert.equal(composed.ok, true);
-  assert.ok(composed.reply);
-  assert.doesNotMatch(
-    composed.reply,
-    /check karke|confirm karke|bata deta|bata dunga|jald|soon|shortly/i
-  );
-  const system = String(prompts[0]?.messages?.[0]?.content || "");
-  const user = String(prompts[0]?.messages?.[1]?.content || "");
-  assert.match(system, /Do NOT promise a later answer/i);
-  assert.match(user, /"ownerCheckStarted":false/);
-  assert.match(user, /"ownerCheckPending":false/);
-  assert.match(
-    user,
-    /customerInputRequested=false; requestedCustomerAction=none/
-  );
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(composed.reply, "");
+  assert.equal(prompts.length, 0);
 });
 
 test("16. ownerCheckStarted rejects unavailable wording then accepts checking reply", async () => {
@@ -1185,4 +1158,164 @@ test("17. ownerCheckReplyContradictionReason truth boundary", async () => {
     ),
     null
   );
+});
+
+function composeJsonReply(reply) {
+  return {
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            customerReply: reply,
+            coveredEvidenceKeys: ["none"],
+            customerInputRequested: false,
+            requestedCustomerAction: "none",
+            replySemantics: {
+              claims: [],
+              languageStyle: "roman_urdu",
+              containsTimingPromise: false,
+              exposesInternalProcess: false,
+            },
+          }),
+        },
+      },
+    ],
+  };
+}
+
+test("trusted waiting-confirm post-exec wording may compose; factual unsupported still cannot", async () => {
+  const execution = {
+    action: "confirm_pending_availability",
+    status: "succeeded",
+    itemLabel: "Kia Stonic EX Plus 2021 White",
+    durationDays: 3,
+    failureReason: null,
+  };
+  const postExecDecision = {
+    action: "reply",
+    mutationIntent: "none",
+    capability: "availability_request",
+    evidenceNeeds: [],
+    informationalReplyDeferred: true,
+    factKind: "booking_fact",
+  };
+  assert.equal(
+    isTrustedPendingAvailabilityPostExecutionWording({
+      frozenDecision: postExecDecision,
+      facts: { pendingAvailabilityExecution: execution },
+    }),
+    true
+  );
+  assert.equal(
+    isTrustedPendingAvailabilityPostExecutionWording({
+      frozenDecision: postExecDecision,
+      facts: {},
+    }),
+    false
+  );
+  assert.equal(
+    isTrustedPendingAvailabilityPostExecutionWording({
+      frozenDecision: {
+        ...postExecDecision,
+        capability: "answer_from_saved_owner_answer",
+        evidenceNeeds: [
+          { entity: "saved_owner_answer", concept: "other", attributes: ["answer"] },
+        ],
+      },
+      facts: { pendingAvailabilityExecution: execution },
+    }),
+    false
+  );
+
+  let postExecCalls = 0;
+  const postExec = await composePostConfirmInformationalCustomerReply({
+    facts: {
+      business: { name: "Emily Rentals" },
+      pendingAvailabilityExecution: execution,
+    },
+    userMessage: "Stonic wali request confirm kar do",
+    frozenDecision: postExecDecision,
+    factResolution: {
+      capability: "availability_request",
+      status: "unsupported",
+      factAvailable: false,
+      verifiedValue: null,
+      source: null,
+      items: [],
+    },
+    __chatCompletionsCreateForTests: async (args) => {
+      postExecCalls += 1;
+      const user = String(args?.messages?.[1]?.content ?? "");
+      assert.match(user, /pendingAvailabilityExecution/);
+      assert.match(user, /confirm_pending_availability/);
+      assert.doesNotMatch(user, /child seat|GPS|insurance|fuel policy/i);
+      return composeJsonReply("Ji, samajh aa gaya.");
+    },
+  });
+  assert.ok(postExecCalls >= 1);
+  assert.equal(postExec.ok, true);
+  assert.equal(postExec.reply, "Ji, samajh aa gaya.");
+
+  let childSeatCalls = 0;
+  const childSeat = await composePostConfirmInformationalCustomerReply({
+    facts: {
+      business: { name: "Emily Rentals" },
+      pendingAvailabilityExecution: execution,
+    },
+    userMessage: "Civic mein child seat hai?",
+    frozenDecision: {
+      action: "reply",
+      mutationIntent: "none",
+      capability: "answer_from_saved_owner_answer",
+      evidenceNeeds: [
+        { entity: "saved_owner_answer", concept: "other", attributes: ["answer"] },
+      ],
+      informationalReplyDeferred: true,
+    },
+    factResolution: {
+      status: "unsupported",
+      factAvailable: false,
+      verifiedValue: null,
+      source: null,
+      items: [
+        {
+          entity: "saved_owner_answer",
+          concept: "other",
+          attribute: "answer",
+          status: "unsupported",
+          verifiedValue: null,
+          source: null,
+        },
+      ],
+    },
+    __chatCompletionsCreateForTests: async () => {
+      childSeatCalls += 1;
+      return composeJsonReply("Honda Civic mein child seat nahi hai.");
+    },
+  });
+  assert.equal(childSeatCalls, 0);
+  assert.equal(childSeat.ok, false);
+  assert.equal(childSeat.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(childSeat.reply, "");
+
+  let availOnlyCalls = 0;
+  const availOnly = await composePostConfirmInformationalCustomerReply({
+    facts: { business: { name: "Emily Rentals" } },
+    userMessage: "Civic available hai?",
+    frozenDecision: postExecDecision,
+    factResolution: {
+      capability: "availability_request",
+      status: "unsupported",
+      verifiedValue: null,
+      source: null,
+      items: [],
+    },
+    __chatCompletionsCreateForTests: async () => {
+      availOnlyCalls += 1;
+      return composeJsonReply("Civic available hai.");
+    },
+  });
+  assert.equal(availOnlyCalls, 0);
+  assert.equal(availOnly.ok, false);
+  assert.equal(availOnly.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
 });

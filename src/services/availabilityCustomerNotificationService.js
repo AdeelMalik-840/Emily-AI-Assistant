@@ -40,6 +40,8 @@ import {
   normalizeCustomerPhoneDigits,
 } from "./availabilityCustomerPhone.js";
 import { appendConversationMessage } from "./conversationStore.js";
+import { composeCloudCanonicalCustomerReply } from "../brain/openai/composeCloudCanonicalCustomerReply.js";
+import { resolveOpenAiChatModel } from "../config/aiRuntime.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -298,6 +300,83 @@ export function buildAvailabilityCustomerNotificationMessage(request, options = 
     };
   }
   return { ok: false, reason: "UNSUPPORTED_STATUS", message: "" };
+}
+
+function isApprovedAvailabilityRequest(request) {
+  return clean(request?.status).toLowerCase() === "approved";
+}
+
+/**
+ * Post-approval facts only. Catalog/DB availability is never confirmation.
+ * @returns {Record<string, unknown> | null}
+ */
+function trustedFactsForApprovedAvailabilityCompletion(request, built) {
+  if (!isApprovedAvailabilityRequest(request)) return null;
+  const durationRaw = Number(
+    request?.requestedDuration ??
+      request?.durationDays ??
+      built?.priceQuote?.durationDays
+  );
+  const durationDays =
+    Number.isFinite(durationRaw) && durationRaw > 0
+      ? Math.floor(durationRaw)
+      : null;
+  const total = Number(built?.priceQuote?.total ?? request?.priceQuote?.total);
+  const hasTotal = Number.isFinite(total) && total > 0;
+  const currency =
+    clean(built?.priceQuote?.currency ?? request?.priceQuote?.currency, 12) ||
+    "PKR";
+  return {
+    itemId: clean(request?.itemId, 160) || null,
+    itemLabel: clean(request?.itemLabel, 200) || null,
+    durationDays,
+    totalAmount: hasTotal ? total : null,
+    currency: hasTotal ? currency : null,
+    availabilityConfirmed: true,
+    availabilityStatus: "approved",
+    lifecycle: "availability_approved",
+  };
+}
+
+/**
+ * Wording-only Cloud session compose after trusted owner approval.
+ * Template `built.message` remains the technical fallback.
+ */
+async function applyApprovedCloudSessionCompose(built, p) {
+  const fallback = String(built?.message ?? "").trim();
+  if (!built || !fallback) return built;
+  const facts = trustedFactsForApprovedAvailabilityCompletion(p.request, built);
+  if (!facts) return built;
+  const injector = p.__cloudComposeChatCreate;
+  if (
+    typeof injector !== "function" &&
+    String(process.env.NODE_ENV ?? "").trim() === "test"
+  ) {
+    return built;
+  }
+  const composed = await composeCloudCanonicalCustomerReply({
+    kind: "availability_approved",
+    semanticIntent: "availability_inquiry",
+    trustedFacts: facts,
+    fallbackReply: fallback,
+    timeoutMs: p.timeoutMs ?? 8000,
+    __chatCompletionsCreateForTests: injector ?? null,
+  });
+  const usedTechnicalFallback =
+    String(composed.source ?? "") !== "openai_cloud_canonical_compose";
+  console.log("[availability_customer_cloud_completion_compose]", {
+    requestId: p.requestId || null,
+    businessId: p.businessId || null,
+    composeModel: resolveOpenAiChatModel(),
+    composeSource: composed.source ?? null,
+    composeReason: String(composed.reason ?? "").slice(0, 160) || null,
+    composeAttemptCount: Number.isFinite(Number(composed.attemptCount))
+      ? Number(composed.attemptCount)
+      : null,
+    usedTechnicalFallback,
+  });
+  const reply = String(composed.reply ?? "").trim() || fallback;
+  return { ...built, message: reply };
 }
 
 async function sendCloudAvailabilityMessage({
@@ -565,6 +644,8 @@ async function sendAvailabilityViaReplyPrivately({
  *   replyPrivatelyFn?: typeof replyPrivatelyToLatestUserMessage,
  *   extractDmContactPhoneFn?: typeof extractDmContactPhoneFromOpenChat,
  *   refocusGroupFn?: typeof refocusChatRowForTitle,
+ *   __cloudComposeChatCreate?: Function | null,
+ *   __cloudComposeTimeoutMs?: number,
  * }} params
  */
 export async function sendAvailabilityCustomerNotification({
@@ -579,6 +660,8 @@ export async function sendAvailabilityCustomerNotification({
   extractDmContactPhoneFn = extractDmContactPhoneFromOpenChat,
   refocusGroupFn = refocusChatRowForTitle,
   getBookingsForItemFn = null,
+  __cloudComposeChatCreate = null,
+  __cloudComposeTimeoutMs,
 }) {
   const firestore = connection ?? db;
   const uid = clean(businessId ?? executionContext.businessId ?? executionContext.userId);
@@ -900,6 +983,14 @@ export async function sendAvailabilityCustomerNotification({
         };
       }
 
+      built = await applyApprovedCloudSessionCompose(built, {
+        request: current,
+        requestId: rid,
+        businessId: uid,
+        timeoutMs: __cloudComposeTimeoutMs,
+        __cloudComposeChatCreate,
+      });
+
       const cloudSend = await sendCloudAvailabilityMessage({
         phone: phase4Phone,
         message: built.message,
@@ -1106,6 +1197,14 @@ export async function sendAvailabilityCustomerNotification({
       message: built.message,
     };
   }
+
+  built = await applyApprovedCloudSessionCompose(built, {
+    request: current,
+    requestId: rid,
+    businessId: uid,
+    timeoutMs: __cloudComposeTimeoutMs,
+    __cloudComposeChatCreate,
+  });
 
   const cloudSend = await sendCloudAvailabilityMessage({
     phone: legacyPhone,

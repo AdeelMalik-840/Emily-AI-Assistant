@@ -350,6 +350,9 @@ function factualDecision(overrides = {}) {
       (capability === "clarification_needed"
         ? []
         : [evidenceNeed(concept, attributes, entity)]),
+    // concept is consumed above; pass it through so factKind maps documents/payment
+    // to the trusted profile stores already in the fixture, not a default advance plan.
+    factKind: inferTestFactKind({ capability, concept, ...rest }),
     ...rest,
   });
 }

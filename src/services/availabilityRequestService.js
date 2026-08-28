@@ -1456,6 +1456,86 @@ export async function findWaitingConfirmCloudAvailabilityRequestsByPhone({
 }
 
 /**
+ * Open owner-check AVR (pending/processing), not waiting_confirm / booked.
+ * Used as continuation provenance, not as a confirm/decline target.
+ */
+export function isOpenOwnerCheckAvailabilityRequest(request) {
+  const req = request && typeof request === "object" ? request : null;
+  if (!req) return false;
+  const status = clean(req.status) || "pending";
+  if (FINAL_AVAILABILITY_REQUEST_STATUSES.has(status)) return false;
+  const confirmStatus = clean(req.customerConfirmationStatus);
+  if (
+    confirmStatus === "superseded" ||
+    confirmStatus === "confirmed" ||
+    confirmStatus === "declined" ||
+    confirmStatus === "waiting_confirm"
+  ) {
+    return false;
+  }
+  if (clean(req.supersededByAvailabilityRequestId)) return false;
+  if (clean(req.linkedBookingId)) return false;
+  return status === "pending" || status === "processing";
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ * }} params
+ */
+export async function findOpenOwnerCheckCloudAvailabilityRequestsByPhone({
+  db: connection,
+  businessId,
+  customerPhone,
+} = {}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!uid || !phone) return [];
+
+  const seen = new Set();
+  const collected = [];
+  const addRow = (row) => {
+    const requestId = clean(row?.requestId ?? row?.id);
+    if (!requestId || seen.has(requestId)) return;
+    seen.add(requestId);
+    collected.push({ ...row, requestId });
+  };
+
+  if (firestore) {
+    const collection = availabilityRequestCollectionRef(connection, uid);
+    for (const status of ["pending", "processing"]) {
+      const snap = await collection
+        .where("status", "==", status)
+        .limit(20)
+        .get()
+        .catch(() => null);
+      for (const doc of snap?.docs ?? []) {
+        addRow({ requestId: doc.id, ...(doc.data() || {}) });
+      }
+    }
+  }
+  for (const row of scanAvailabilityRequestsFromTestStore(connection, uid)) {
+    addRow(row);
+  }
+
+  return collected
+    .filter((row) => isOpenOwnerCheckAvailabilityRequest(row))
+    .filter((row) => availabilityRequestMatchesCloudCustomerPhone(row, phone))
+    .map((row) => ({
+      requestId: clean(row.requestId ?? row.id),
+      itemId: clean(row.itemId) || null,
+      itemLabel: clean(row.itemLabel) || null,
+      status: clean(row.status) || "pending",
+      requestedDuration: row.requestedDuration ?? null,
+      customerConfirmationStatus: clean(row.customerConfirmationStatus) || null,
+    }))
+    .filter((row) => row.requestId && row.itemId);
+}
+
+/**
  * Latest fresh trusted Cloud waiting-confirm transaction for one customer/business.
  *
  * @param {{

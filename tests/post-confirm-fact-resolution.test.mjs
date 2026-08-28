@@ -721,14 +721,10 @@ test("unsupported fuel compose prompt cannot see closed owner answer", async () 
       };
     },
   });
-  assert.equal(composed.ok, true);
-  assert.doesNotMatch(composed.reply, /zimmedari|responsibility|bear/i);
-  const userContent = String(prompts[0]?.messages?.[1]?.content || "");
-  assert.match(userContent, /CONVERSATION_CONTEXT_JSON/);
-  assert.doesNotMatch(userContent, /VERIFIED_BUSINESS_PA_FACTS_JSON/);
-  assert.doesNotMatch(userContent, /Fuel is customer responsibility/i);
-  assert.doesNotMatch(userContent, /Lahore only/i);
-  assert.match(userContent, /"status":"unsupported"/);
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reason, "UNTRUSTED_FACT_COMPOSE_BLOCKED");
+  assert.equal(composed.reply, "");
+  assert.equal(prompts.length, 0);
 });
 
 test("found saved owner answer remains answerable only via Result", async () => {
