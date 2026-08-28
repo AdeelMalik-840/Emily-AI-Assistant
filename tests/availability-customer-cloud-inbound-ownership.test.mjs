@@ -382,8 +382,15 @@ test("Kar do on waiting_confirm_cloud confirms via cloud inbound handler", async
       return { ok: true, providerMessageId: "wamid.out-confirm-1" };
     },
     availabilityConfirmExecute: true,
-    __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
-    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
+    __catalogRowForTests: {
+      id: "civic-1",
+      name: "Honda Civic 2026",
+      dailyRate: 8000,
+    },
+    __decideCustomerTurnForTests:
+      decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests:
+      composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.handled, true);
   assert.equal(result.action, "confirmed_booking");
@@ -398,6 +405,14 @@ test("Kar do on waiting_confirm_cloud confirms via cloud inbound handler", async
   assert.equal(history[0].role, "assistant");
   assert.equal(history[0].sourceMessageId, "wamid.kar-do-1");
   assert.equal(history[0].providerMessageId, "wamid.out-confirm-1");
+  assert.deepEqual(history[0].verifiedReferences, [
+    {
+      kind: "historical_booking",
+      targetId: fake.getRequestDoc(REQUEST_ID).linkedBookingId,
+      provenance: "verified_booking_created_reply",
+      expiresAt: null,
+    },
+  ]);
 });
 
 for (const [label, sendResult] of [
@@ -422,8 +437,15 @@ for (const [label, sendResult] of [
         return sendResult;
       },
       availabilityConfirmExecute: true,
-    __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
-    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
+      __catalogRowForTests: {
+        id: "civic-1",
+        name: "Honda Civic 2026",
+        dailyRate: 8000,
+      },
+      __decideCustomerTurnForTests:
+        decideWaitingConfirmFromLegacyClassifierForTests,
+      __composeWaitingConfirmExecutionReplyForTests:
+        composeWaitingConfirmExecutionReplyForTests,
     });
 
     assert.equal(result.handled, false);
@@ -437,6 +459,14 @@ for (const [label, sendResult] of [
       Number(priorOutboundAt)
     );
     assert.equal(fake.getConversationMessages().length, 0);
+    assert.equal(
+      fake.getAllConversationMessages().some((row) =>
+        row.verifiedReferences?.some(
+          (reference) => reference.kind === "historical_booking"
+        )
+      ),
+      false
+    );
   });
 }
 
@@ -458,6 +488,11 @@ test("retry after failed confirmation send does not execute or send twice", asyn
         : { ok: true, providerMessageId: "wamid.confirm-recovered" };
     },
     availabilityConfirmExecute: true,
+    __catalogRowForTests: {
+      id: "civic-1",
+      name: "Honda Civic 2026",
+      dailyRate: 8000,
+    },
     __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
     __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   };
@@ -480,6 +515,14 @@ test("retry after failed confirmation send does not execute or send twice", asyn
     fake.getConversationMessages()[0].providerMessageId,
     "wamid.confirm-recovered"
   );
+  assert.deepEqual(fake.getConversationMessages()[0].verifiedReferences, [
+    {
+      kind: "historical_booking",
+      targetId: fake.getRequestDoc(REQUEST_ID).linkedBookingId,
+      provenance: "verified_booking_created_reply",
+      expiresAt: null,
+    },
+  ]);
 });
 
 test("duplicate same Cloud messageId does not double-book or double-send", async () => {

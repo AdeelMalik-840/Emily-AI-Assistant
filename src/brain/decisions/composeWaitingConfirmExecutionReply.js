@@ -191,7 +191,10 @@ STRICT SAFETY:
       /\b(avr|executor|firestore|brain|\bsystem\b)\b/i.test(customerReply)
         ? "internal_process_terms_in_customer_reply"
         : null,
-    fallbackReply: WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
+    fallbackReply:
+      verified.succeeded && frozen.action === "confirm_booking"
+        ? ""
+        : WAITING_CONFIRM_DM_TECHNICAL_FALLBACK,
     timeoutMs,
     timeoutErrorMessage: "WAITING_CONFIRM_COMPOSE_OPENAI_TIMEOUT",
     __chatCompletionsCreateForTests,
