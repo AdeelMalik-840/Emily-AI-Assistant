@@ -33,6 +33,9 @@ const {
 } = await import(
   "../src/brain/decisions/projectSemanticIntentFromBrainDecision.js"
 );
+const { resolveCloudDmOwnershipTrustedFocus } = await import(
+  "../src/services/whatsappInboundBuffer.js"
+);
 
 const catalogItems = [
   {
@@ -833,6 +836,41 @@ test("availability pending without canonical authority keeps existing continuati
   });
   assert.equal(selected.workflowType, "availability_inquiry");
   assert.equal(selected.reason, "availability_duration_pending_continuation");
+});
+
+test("Cloud ownership receives the participant-bound pending duration item as trusted focus", () => {
+  const pending = {
+    type: PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+    status: "awaiting",
+    pendingStage: "availability_duration",
+    pendingQuestion: "rental period required",
+    itemId: "civic",
+    itemLabel: "Honda Civic (White)",
+    participantKey: "pending-customer",
+    sourceTurnKey: "wamid.ask-duration",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+  };
+  const focus = resolveCloudDmOwnershipTrustedFocus({
+    memorySnapshot: { pendingAction: pending, emilyPending: pending },
+    participantKey: "pending-customer",
+    nowMs: Date.parse("2026-08-28T00:00:00.000Z"),
+  });
+
+  assert.deepEqual(focus, {
+    itemId: "civic",
+    itemLabel: "Honda Civic (White)",
+    sourceTurnId: "wamid.ask-duration",
+    provenance: "availability_duration_pending",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+  });
+  assert.equal(
+    resolveCloudDmOwnershipTrustedFocus({
+      memorySnapshot: { pendingAction: pending, emilyPending: pending },
+      participantKey: "different-customer",
+      nowMs: Date.parse("2026-08-28T00:00:00.000Z"),
+    }),
+    null
+  );
 });
 
 test("SOCIAL_GENERAL and UNCLEAR retain scoped safety without entering NEW_TRANSACTION authority", async () => {

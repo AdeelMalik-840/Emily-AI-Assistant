@@ -12,9 +12,13 @@ process.env.EMILY_BRAIN_V2_LIVE_BUSINESSES = "biz";
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
 const {
+  applyPostConfirmDerivedOwnershipMechanics,
   parseCloudDmOwnershipDecision,
   executeCloudDmOwnershipDecision,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+const { resolveCloudDmOwnershipTrustedFocus } = await import(
+  "../src/services/whatsappInboundBuffer.js"
+);
 const {
   hydrateCloudDmContextualItemReferents,
   resolveCloudDmContextualBindIdentity,
@@ -345,6 +349,78 @@ test("12-13. DB available + owner-check planned returns holding only, not confir
     assert.doesNotMatch(String(live.reply), /abhi available hai/i);
     assert.doesNotMatch(String(live.reply), /\bowner\b|\bstaff\b|\bPA\b/i);
     assert.equal(fake.listAvrs(BUSINESS_ID).length, 1);
+    assert.equal(ownerSends.length, 1);
+  });
+});
+
+test("duration-only Cloud continuation keeps the pending item and starts its owner check", async () => {
+  await withAvrExecuteFlags(async () => {
+    const fake = createFakeDb();
+    fake.setOwnerPhone(BUSINESS_ID, OWNER_PHONE);
+    const ownerSends = [];
+    const pending = {
+      type: "collect_availability_duration",
+      status: "awaiting",
+      pendingStage: "availability_duration",
+      pendingQuestion: "rental period required",
+      itemId: STONIC_ID,
+      itemLabel: "Kia Stonic",
+      participantKey: CUSTOMER_PHONE,
+      sourceTurnKey: "wamid.stonic-duration-ask",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    };
+    const memorySnapshot = { pendingAction: pending, emilyPending: pending };
+    const trustedFreshItemFocus = resolveCloudDmOwnershipTrustedFocus({
+      memorySnapshot,
+      participantKey: CUSTOMER_PHONE,
+      nowMs: Date.parse("2026-08-28T00:00:00.000Z"),
+    });
+    const parsed = parseCloudDmOwnershipDecision(
+      JSON.stringify(contextualFollowupDecision()),
+      {
+        customerMessage: "4 din",
+        trustedFreshItemFocus,
+        catalogItems: catalog,
+      }
+    );
+    const canonical = applyPostConfirmDerivedOwnershipMechanics(parsed, {
+      currentCustomerMessage: "4 din",
+      trustedFreshItemFocus,
+      catalogItems: catalog,
+    });
+
+    const live = await runBrainV2LivePipeline({
+      traceId: "duration-pending-stonic",
+      businessId: BUSINESS_ID,
+      message: "4 din",
+      messageId: "wamid.stonic-duration-answer",
+      channel: "whatsapp_cloud",
+      chatType: "dm",
+      participantKey: CUSTOMER_PHONE,
+      participantPhoneForDm: CUSTOMER_PHONE,
+      catalogItems: catalog,
+      memorySnapshot,
+      canonicalSemanticDecision: {
+        ...canonical,
+        semanticDecisionStatus: "released",
+        ownershipLane: "normal_routing",
+      },
+      getBookingsForItemFn: async () => [],
+      getBusinessProfileFn: async () => ({}),
+      executionContext: {
+        db: fake.db,
+        ownerNotificationPhone: OWNER_PHONE,
+        sendWhatsAppMessageFn: async (to, text) => {
+          ownerSends.push({ to, text });
+          return { ok: true, providerMessageId: "wamid.owner-stonic" };
+        },
+      },
+    });
+
+    assert.equal(live.customerTurnOutcome, "OWNER_CHECK");
+    assert.equal(fake.listAvrs(BUSINESS_ID).length, 1);
+    assert.equal(fake.listAvrs(BUSINESS_ID)[0].itemId, STONIC_ID);
+    assert.equal(fake.listAvrs(BUSINESS_ID)[0].requestedDuration, 4);
     assert.equal(ownerSends.length, 1);
   });
 });

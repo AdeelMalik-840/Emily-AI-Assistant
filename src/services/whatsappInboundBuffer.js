@@ -88,6 +88,10 @@ import {
   validatePostConfirmSemanticOwnership,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
 import { readFreshLastAvailabilityAssist } from "../brain/availability/availabilityAssistContext.js";
+import {
+  EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
+  readEmilyPendingForParticipant,
+} from "../brain/availability/emilyPendingContext.js";
 import { setMessageState } from "./messageState.js";
 import {
   normalizePlaywrightOutboundTrace,
@@ -528,6 +532,32 @@ export async function prepareBrainV2LiveMemorySnapshot(p) {
 export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
   if (!p.shadowEligible) return null;
   return loadBrainV2SessionMemorySnapshot(p);
+}
+
+export function resolveCloudDmOwnershipTrustedFocus({
+  memorySnapshot,
+  participantKey,
+  nowMs = Date.now(),
+} = {}) {
+  const pending = readEmilyPendingForParticipant({
+    memorySnapshot,
+    participantKey,
+    nowMs,
+  });
+  if (
+    pending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION &&
+    pending.itemId &&
+    pending.sourceTurnKey
+  ) {
+    return {
+      itemId: pending.itemId,
+      itemLabel: pending.itemLabel ?? null,
+      sourceTurnId: pending.sourceTurnKey,
+      provenance: "availability_duration_pending",
+      expiresAt: pending.expiresAt ?? null,
+    };
+  }
+  return readTrustedFreshItemFocus(memorySnapshot, nowMs);
 }
 
 /** @type {Map<string, BufferEntry>} */
@@ -2456,9 +2486,10 @@ export async function executeWhatsAppAiPipeline(p) {
         });
       } else {
         const currentOwnershipTurnId = `user:${String(messageId ?? "").trim()}`;
-        const trustedFreshItemFocus = readTrustedFreshItemFocus(
-          shadowPreTurnMemorySnapshot
-        );
+        const trustedFreshItemFocus = resolveCloudDmOwnershipTrustedFocus({
+          memorySnapshot: shadowPreTurnMemorySnapshot,
+          participantKey: normalizedParticipantKey,
+        });
         const lastAvailabilityAssist = readFreshLastAvailabilityAssist(
           shadowPreTurnMemorySnapshot?.lastAvailabilityAssist
         );
