@@ -251,3 +251,87 @@ test("8. guards unchanged for unknown fact-key claims", () => {
   assert.equal(result.ok, false);
   assert.equal(result.reason, "unknown_claim:dailyRate");
 });
+
+test("9. duration ask structurally collects the rental period before availability checking", async () => {
+  let captured = null;
+  const composed = await composeCloudCanonicalCustomerReply({
+    kind: "duration_ask",
+    semanticIntent: "availability_inquiry",
+    customerMessage: "Civic available hai?",
+    trustedFacts: {
+      itemId: "item-1",
+      itemLabel: "Honda Civic",
+      ownerCheckPlanned: false,
+      availabilityConfirmed: false,
+    },
+    fallbackReply: "",
+    __chatCompletionsCreateForTests: async (args) => {
+      captured = args;
+      return {
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              customerReply: "Honda Civic kitne din ya kin dates ke liye chahiye?",
+              customerInputRequested: true,
+              requestedInput: "rental_period",
+              availabilityCheckStarted: false,
+              replySemantics: {
+                claims: [],
+                languageStyle: "roman_urdu",
+                containsTimingPromise: false,
+                exposesInternalProcess: false,
+              },
+            }),
+          },
+        }],
+      };
+    },
+  });
+
+  assert.equal(composed.ok, true);
+  assert.equal(composed.attemptCount, 1);
+  assert.match(composed.reply, /kitne din|kin dates/i);
+  const schema = captured.response_format.json_schema.schema;
+  assert.deepEqual(schema.properties.requestedInput.enum, ["rental_period"]);
+  assert.ok(schema.required.includes("availabilityCheckStarted"));
+  assert.match(captured.messages[0].content, /before any availability check/i);
+});
+
+test("10. duration ask rejects check-started semantics and retries structurally", async () => {
+  let attempts = 0;
+  const composed = await composeCloudCanonicalCustomerReply({
+    kind: "duration_ask",
+    semanticIntent: "availability_inquiry",
+    trustedFacts: { itemId: "item-1", itemLabel: "Honda Civic" },
+    fallbackReply: "",
+    __chatCompletionsCreateForTests: async () => {
+      attempts += 1;
+      return {
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              customerReply:
+                attempts === 1
+                  ? "Honda Civic ki availability check kar deta hoon."
+                  : "Honda Civic kitne din ke liye chahiye?",
+              customerInputRequested: attempts === 2,
+              requestedInput: "rental_period",
+              availabilityCheckStarted: attempts === 1,
+              replySemantics: {
+                claims: [],
+                languageStyle: "roman_urdu",
+                containsTimingPromise: false,
+                exposesInternalProcess: false,
+              },
+            }),
+          },
+        }],
+      };
+    },
+  });
+
+  assert.equal(composed.ok, true);
+  assert.equal(composed.attemptCount, 2);
+  assert.equal(attempts, 2);
+  assert.match(composed.reply, /kitne din/i);
+});

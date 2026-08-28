@@ -126,8 +126,10 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
           ? "Availability is already confirmed. Write a short natural reply from TRUSTED_FACTS_JSON only: state the trusted item, duration, and total when present, and invite the customer to book. Do not mention staff, PA, internal process, or that anyone was asked."
         : kind === "social"
           ? "Write a short natural greeting, thanks, or goodbye. Do not mention availability, booking, price, rent, or owner-check unless TRUSTED_FACTS_JSON actually contains those facts because the customer asked about that transaction."
-          : kind === "clarification" || kind === "duration_ask"
-          ? "Ask one short useful clarification from trusted facts only. Do not invent answers."
+        : kind === "duration_ask"
+          ? "Ask one short natural question for the missing rental period (duration or dates) for the trusted item. The availability check has not started: do not say or imply that availability is being checked or will be checked yet."
+          : kind === "clarification"
+            ? "Ask one short useful clarification from trusted facts only. Do not invent answers."
           : kind === "image_intro"
             ? "Write a short intro for sending trusted catalog pictures. Do not invent URLs or extra facts."
             : "Answer the frozen semantic intent using only TRUSTED_FACTS_JSON.",
@@ -145,8 +147,24 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
       properties: {
         customerReply: { type: "string" },
         replySemantics: CLOUD_CANONICAL_REPLY_SEMANTICS_SCHEMA,
+        ...(kind === "duration_ask"
+          ? {
+              customerInputRequested: { type: "boolean" },
+              requestedInput: {
+                type: "string",
+                enum: ["rental_period"],
+              },
+              availabilityCheckStarted: { type: "boolean" },
+            }
+          : {}),
       },
-      required: ["customerReply", "replySemantics"],
+      required: [
+        "customerReply",
+        "replySemantics",
+        ...(kind === "duration_ask"
+          ? ["customerInputRequested", "requestedInput", "availabilityCheckStarted"]
+          : []),
+      ],
     }
   );
   const composed = await composeGuardedCustomerReply({
@@ -158,6 +176,7 @@ WORDING-ONLY CLOUD COMPOSER:
 - Do not invent prices, availability, bookings, or image URLs.
 - If KIND=social, greet or acknowledge naturally. Do not mention availability, booking, price, rent, or owner-check unless those facts are present because the customer asked about that transaction.
 - If KIND=availability_approved, availability is already confirmed in TRUSTED_FACTS_JSON. Do not treat catalog/DB availability as confirmation.
+- If KIND=duration_ask, ask for the missing rental period before any availability check. This overrides the general unconfirmed-availability guidance: do not say a check will happen until the customer supplies the period. Set customerInputRequested=true, requestedInput=rental_period, and availabilityCheckStarted=false.
 - KIND=${kind}
 - Return strict JSON only.`,
     userBase: `KIND: ${kind}
@@ -167,7 +186,15 @@ TRUSTED_FACTS_JSON: ${JSON.stringify(facts)}`,
     responseFormatName: "cloud_canonical_customer_reply",
     responseFormat,
     replyContract,
-    extraReject: (customerReply) => {
+    extraReject: (customerReply, parsed) => {
+      if (
+        kind === "duration_ask" &&
+        (parsed?.customerInputRequested !== true ||
+          parsed?.requestedInput !== "rental_period" ||
+          parsed?.availabilityCheckStarted !== false)
+      ) {
+        return "DURATION_INPUT_CONTRACT_NOT_SATISFIED";
+      }
       if (/\b(owner|staff|pa\b|internal|backend)\b/i.test(customerReply)) {
         return "INTERNAL_PROCESS_DISCLOSED";
       }
