@@ -2085,9 +2085,23 @@ const INFORMATIONAL_ITEM_SEMANTIC_INTENTS = new Set([
 ]);
 
 /**
+ * Fresh-transaction intents (inventory availability/price/new booking) can
+ * never legitimately be "about" an existing booking's own facts the way an
+ * informational ask sometimes can — so unlike INFORMATIONAL_ITEM_SEMANTIC_INTENTS,
+ * factKind=booking_fact must never exempt these from the rejection below.
+ */
+const TRANSACTIONAL_ITEM_SEMANTIC_INTENTS = new Set([
+  "availability_inquiry",
+  "pricing_inquiry",
+  "pricing_with_duration",
+  "booking_request",
+]);
+
+/**
  * Explicit current-turn catalog identity beats stale historical booking
- * ownership for a new informational item/business fact ask, unless the
- * customer actually references that historical booking.
+ * ownership for a new informational item/business fact ask, or for a fresh
+ * transactional ask (availability/pricing/new booking), unless the customer
+ * actually references that historical booking.
  */
 function staleHistoricalNamedCatalogRejection({
   turnScope,
@@ -2102,15 +2116,30 @@ function staleHistoricalNamedCatalogRejection({
   if (turnScope !== "OLD_BOOKING_REFERENCE") return null;
   if (cleanMutationIntent(mutationIntent) !== "none") return null;
   if (action !== "reply" && action !== "escalate_missing_info") return null;
-  if (cleanPostConfirmFactKind(factKind) === "booking_fact") return null;
-  const intent = cleanCustomerSemanticIntent(semanticIntent);
-  if (!INFORMATIONAL_ITEM_SEMANTIC_INTENTS.has(intent)) return null;
   if (listExplicitCatalogItemIds(customerMessage, catalogItems).length === 0) {
     return null;
   }
   const target = targetReference && typeof targetReference === "object"
     ? targetReference
     : null;
+
+  // Fail closed: a current-turn-only historical claim (no independent prior-turn
+  // provenance) alongside an explicit trusted catalog span must not be allowed to
+  // skip classification entirely via a null semanticIntent. Force the existing
+  // self-correction retry to make a real semantic distinction — informational
+  // existing-booking ask vs. fresh transactional ask — instead of silently
+  // defaulting to the historical booking.
+  if (target?.source === "current_turn" && semanticIntent == null) {
+    return "OLD_BOOKING_NULL_INTENT_CURRENT_TURN_CATALOG_SPAN";
+  }
+
+  const intent = cleanCustomerSemanticIntent(semanticIntent);
+  const isInformationalAsk = INFORMATIONAL_ITEM_SEMANTIC_INTENTS.has(intent);
+  const isTransactionalAsk = TRANSACTIONAL_ITEM_SEMANTIC_INTENTS.has(intent);
+  if (!isInformationalAsk && !isTransactionalAsk) return null;
+  if (isInformationalAsk && cleanPostConfirmFactKind(factKind) === "booking_fact") {
+    return null;
+  }
   if (
     target?.source === "conversation_turn" &&
     target?.targetType === "historical_booking" &&

@@ -37,6 +37,7 @@ const BUSINESS_ID = "biz";
 const CUSTOMER_PHONE = "923001112233";
 const OWNER_PHONE = "923009998877";
 const CIVIC_ID = "honda-civic";
+const COROLLA_ID = "toyota-corolla";
 const BOOKING_ID = "bk_civic_hist";
 const catalog = [
   {
@@ -45,6 +46,29 @@ const catalog = [
     displayLabel: "Honda Civic",
     aliases: ["Civic"],
     pricing: { daily: 8000 },
+  },
+];
+const catalogTwoItems = [
+  ...catalog,
+  {
+    id: COROLLA_ID,
+    name: "Toyota Corolla",
+    displayLabel: "Toyota Corolla",
+    aliases: ["Corolla"],
+    pricing: { daily: 6000 },
+  },
+];
+
+/** Generic synthetic fixture reproducing the reported structural shape only. */
+const ITEM_A_ID = "item-a";
+const BOOKING_A_ID = "booking-a";
+const catalogItemA = [
+  {
+    id: ITEM_A_ID,
+    name: "ItemA",
+    displayLabel: "ItemA",
+    aliases: ["ItemA"],
+    pricing: { daily: 5000 },
   },
 ];
 
@@ -150,6 +174,78 @@ function genuineOldBookingCivicPickup(message) {
     evidenceNeeds: [
       { entity: "active_booking", concept: "pickup", attributes: ["location"] },
     ],
+  };
+}
+
+/** Stale OLD_BOOKING_REFERENCE misclassification of a fresh transactional ask. */
+function staleOldBookingTransactionalAsk(message, semanticIntent, extra = {}) {
+  return {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent,
+    itemScope: "none",
+    itemReferents: [],
+    itemReferenceMode: "NONE",
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: "user:wamid.transactional",
+      targetType: "historical_booking",
+      targetId: BOOKING_ID,
+    },
+    targetId: BOOKING_ID,
+    mutationIntent: "none",
+    action: "reply",
+    factKind: "booking_fact",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      { entity: "active_booking", concept: "status", attributes: ["value"] },
+    ],
+    ...extra,
+  };
+}
+
+/**
+ * Exact live production shape: OLD_BOOKING_REFERENCE with a current-turn-only
+ * historical claim, an explicit catalog span in the message, and semanticIntent
+ * left null — the model never committed to a real classification.
+ */
+function staleOldBookingNullIntent(bookingId = BOOKING_ID, extra = {}) {
+  return {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
+    itemScope: "none",
+    itemReferents: [],
+    itemReferenceMode: "NONE",
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: "user:wamid.null-intent",
+      targetType: "historical_booking",
+      targetId: bookingId,
+    },
+    targetId: bookingId,
+    mutationIntent: "none",
+    action: "reply",
+    factKind: "booking_fact",
+    capability: "answer_from_active_booking",
+    evidenceNeeds: [
+      { entity: "active_booking", concept: "status", attributes: ["value"] },
+    ],
+    ...extra,
+  };
+}
+
+function newTransactionDecision(message, surface, semanticIntent) {
+  return {
+    turnScope: "NEW_TRANSACTION",
+    semanticIntent,
+    itemScope: "specific",
+    itemReferents: [span(message, surface)],
+    targetReference: noneTarget(),
+    targetId: null,
+    mutationIntent: "none",
+    action: "reply",
+    factKind: "freeform_business",
+    capability: null,
+    evidenceNeeds: [],
   };
 }
 
@@ -376,6 +472,431 @@ test("3. Civic mein child seat hai? resolves current Civic, not old booking", as
     resolveCanonicalItemReferents(result.decision.itemReferents, catalog)[0].itemId,
     CIVIC_ID
   );
+});
+
+test("6. same-item old booking + explicit availability inquiry: NEW_TRANSACTION allowed, OLD_BOOKING_REFERENCE rejected", () => {
+  const message = "Civic available hai?";
+  assert.equal(
+    parseCloudDmOwnershipDecision(
+      JSON.stringify(
+        staleOldBookingTransactionalAsk(message, "availability_inquiry")
+      ),
+      { customerMessage: message, catalogItems: catalog }
+    ),
+    null
+  );
+  const accepted = parseCloudDmOwnershipDecision(
+    JSON.stringify(newTransactionDecision(message, "Civic", "availability_inquiry")),
+    { customerMessage: message, catalogItems: catalog }
+  );
+  assert.equal(accepted.turnScope, "NEW_TRANSACTION");
+  assert.equal(accepted.semanticIntent, "availability_inquiry");
+});
+
+test("7. same-item old booking + pricing inquiry: NEW_TRANSACTION allowed, OLD_BOOKING_REFERENCE rejected", () => {
+  const message = "Civic ka rent kya hai?";
+  assert.equal(
+    parseCloudDmOwnershipDecision(
+      JSON.stringify(staleOldBookingTransactionalAsk(message, "pricing_inquiry")),
+      { customerMessage: message, catalogItems: catalog }
+    ),
+    null
+  );
+  const accepted = parseCloudDmOwnershipDecision(
+    JSON.stringify(newTransactionDecision(message, "Civic", "pricing_inquiry")),
+    { customerMessage: message, catalogItems: catalog }
+  );
+  assert.equal(accepted.turnScope, "NEW_TRANSACTION");
+  assert.equal(accepted.semanticIntent, "pricing_inquiry");
+});
+
+test("8. same-item old booking + fresh booking request: NEW_TRANSACTION allowed, OLD_BOOKING_REFERENCE rejected", () => {
+  const message = "Civic 3 din ke liye chahiye";
+  assert.equal(
+    parseCloudDmOwnershipDecision(
+      JSON.stringify(staleOldBookingTransactionalAsk(message, "booking_request")),
+      { customerMessage: message, catalogItems: catalog }
+    ),
+    null
+  );
+  const accepted = parseCloudDmOwnershipDecision(
+    JSON.stringify(newTransactionDecision(message, "Civic", "booking_request")),
+    { customerMessage: message, catalogItems: catalog }
+  );
+  assert.equal(accepted.turnScope, "NEW_TRANSACTION");
+  assert.equal(accepted.semanticIntent, "booking_request");
+});
+
+test("9. genuine historical-booking questions still resolve OLD_BOOKING_REFERENCE", () => {
+  const dateRangeMessage = "meri Civic booking kab se kab tak hai?";
+  const dateRangeParsed = parseCloudDmOwnershipDecision(
+    JSON.stringify(genuineOldBookingCivicPickup(dateRangeMessage)),
+    { customerMessage: dateRangeMessage, catalogItems: catalog }
+  );
+  assert.equal(dateRangeParsed.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(dateRangeParsed.factKind, "booking_fact");
+  assert.equal(dateRangeParsed.targetId, BOOKING_ID);
+
+  const confirmMessage = "meri booking confirm hai?";
+  const confirmParsed = parseCloudDmOwnershipDecision(
+    JSON.stringify(genuineOldBookingStatus()),
+    { customerMessage: confirmMessage, catalogItems: catalog }
+  );
+  assert.equal(confirmParsed.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(confirmParsed.targetId, BOOKING_ID);
+
+  const amountMessage = "us booking ka amount kya tha?";
+  const amountParsed = parseCloudDmOwnershipDecision(
+    JSON.stringify(genuineOldBookingStatus()),
+    { customerMessage: amountMessage, catalogItems: catalog }
+  );
+  assert.equal(amountParsed.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(amountParsed.targetId, BOOKING_ID);
+});
+
+test("10. different-item historical context remains safe: unrelated explicit item still forces NEW_TRANSACTION, no-item historical asks stay untouched", () => {
+  // Historical booking is Civic; customer explicitly names a different catalog
+  // item (Corolla) with a fresh transactional ask — must not be swallowed by
+  // the unrelated Civic booking reference.
+  const corollaMessage = "Corolla available hai?";
+  assert.equal(
+    parseCloudDmOwnershipDecision(
+      JSON.stringify(
+        staleOldBookingTransactionalAsk(corollaMessage, "availability_inquiry")
+      ),
+      { customerMessage: corollaMessage, catalogItems: catalogTwoItems }
+    ),
+    null
+  );
+  const corollaAccepted = parseCloudDmOwnershipDecision(
+    JSON.stringify(
+      newTransactionDecision(corollaMessage, "Corolla", "availability_inquiry")
+    ),
+    { customerMessage: corollaMessage, catalogItems: catalogTwoItems }
+  );
+  assert.equal(corollaAccepted.turnScope, "NEW_TRANSACTION");
+
+  // No explicit catalog item named at all: the widened transactional-intent
+  // set must not over-trigger without a trusted current-turn catalog span.
+  const genericMessage = "available hai kya abhi?";
+  const genericParsed = parseCloudDmOwnershipDecision(
+    JSON.stringify(
+      staleOldBookingTransactionalAsk(genericMessage, "availability_inquiry")
+    ),
+    { customerMessage: genericMessage, catalogItems: catalog }
+  );
+  assert.equal(genericParsed.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(genericParsed.targetId, BOOKING_ID);
+});
+
+test("11. exact live production shape (OLD_BOOKING_REFERENCE, semanticIntent=null, current_turn provenance, explicit catalog span) is rejected", () => {
+  const message = "ItemA available hai?";
+  let rejection = null;
+  const result = parseCloudDmOwnershipDecision(
+    JSON.stringify(staleOldBookingNullIntent(BOOKING_A_ID)),
+    {
+      customerMessage: message,
+      catalogItems: catalogItemA,
+      onStructuralRejection: (details) => {
+        rejection = details;
+      },
+    }
+  );
+  assert.equal(result, null);
+  assert.equal(
+    rejection?.rejectionCode,
+    "OLD_BOOKING_NULL_INTENT_CURRENT_TURN_CATALOG_SPAN"
+  );
+});
+
+test("11b. self-correction from the reported structural shape to NEW_TRANSACTION availability_inquiry, CURRENT_TURN ItemA", async () => {
+  const message = "ItemA available hai?";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalogItemA },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent(BOOKING_A_ID)
+          : newTransactionDecision(message, "ItemA", "availability_inquiry");
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ownershipCorrectionReason,
+    "OLD_BOOKING_NULL_INTENT_CURRENT_TURN_CATALOG_SPAN"
+  );
+  assert.equal(result.decision.turnScope, "NEW_TRANSACTION");
+  assert.equal(result.decision.semanticIntent, "availability_inquiry");
+  assert.equal(result.decision.itemReferenceMode, "CURRENT_TURN");
+  assert.equal(
+    resolveCanonicalItemReferents(result.decision.itemReferents, catalogItemA)[0]
+      .itemId,
+    ITEM_A_ID
+  );
+});
+
+test("11c. 'ItemA ka rent kya hai?' fresh pricing transaction survives despite the historical ItemA booking", async () => {
+  const message = "ItemA ka rent kya hai?";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalogItemA },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent(BOOKING_A_ID)
+          : newTransactionDecision(message, "ItemA", "pricing_inquiry");
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.decision.turnScope, "NEW_TRANSACTION");
+  assert.equal(result.decision.semanticIntent, "pricing_inquiry");
+});
+
+test("11d. 'ItemA 3 din ke liye chahiye' fresh booking transaction survives despite the historical ItemA booking", async () => {
+  const message = "ItemA 3 din ke liye chahiye";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalogItemA },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent(BOOKING_A_ID)
+          : newTransactionDecision(message, "ItemA", "booking_request");
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.decision.turnScope, "NEW_TRANSACTION");
+  assert.equal(result.decision.semanticIntent, "booking_request");
+});
+
+test("11e. genuine 'meri ItemA booking confirm hai?' recovers to OLD_BOOKING_REFERENCE after a null-intent first attempt", async () => {
+  const message = "meri ItemA booking confirm hai?";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalogItemA },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent(BOOKING_A_ID)
+          : {
+              turnScope: "OLD_BOOKING_REFERENCE",
+              semanticIntent: "details_inquiry",
+              itemScope: "none",
+              itemReferents: [],
+              targetReference: {
+                source: "current_turn",
+                sourceTurnId: "user:wamid.itemA-confirm",
+                targetType: "historical_booking",
+                targetId: BOOKING_A_ID,
+              },
+              targetId: BOOKING_A_ID,
+              mutationIntent: "none",
+              action: "reply",
+              factKind: "booking_fact",
+              capability: "answer_from_active_booking",
+              evidenceNeeds: [
+                { entity: "active_booking", concept: "status", attributes: ["value"] },
+              ],
+            };
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ownershipCorrectionReason,
+    "OLD_BOOKING_NULL_INTENT_CURRENT_TURN_CATALOG_SPAN"
+  );
+  assert.equal(result.decision.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(result.decision.semanticIntent, "details_inquiry");
+  assert.equal(result.decision.factKind, "booking_fact");
+  assert.equal(result.decision.targetId, BOOKING_A_ID);
+});
+
+test("11f. genuine 'meri ItemA booking kab se kab tak hai?' (date question) still resolves OLD_BOOKING_REFERENCE", async () => {
+  const message = "meri ItemA booking kab se kab tak hai?";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalogItemA },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent(BOOKING_A_ID)
+          : {
+              turnScope: "OLD_BOOKING_REFERENCE",
+              semanticIntent: "details_inquiry",
+              itemScope: "none",
+              itemReferents: [],
+              targetReference: {
+                source: "current_turn",
+                sourceTurnId: "user:wamid.itemA-dates",
+                targetType: "historical_booking",
+                targetId: BOOKING_A_ID,
+              },
+              targetId: BOOKING_A_ID,
+              mutationIntent: "none",
+              action: "reply",
+              factKind: "booking_fact",
+              capability: "answer_from_active_booking",
+              evidenceNeeds: [
+                { entity: "active_booking", concept: "dates", attributes: ["start", "end"] },
+              ],
+            };
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.decision.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(result.decision.semanticIntent, "details_inquiry");
+  assert.equal(result.decision.targetId, BOOKING_A_ID);
+  assert.deepEqual(
+    result.decision.evidenceNeeds[0]?.attributes?.sort(),
+    ["end", "start"]
+  );
+});
+
+test("12. self-correction from null-intent stale OLD_BOOKING_REFERENCE to NEW_TRANSACTION availability_inquiry is accepted", async () => {
+  const message = "Civic available hai?";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalog },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent()
+          : newTransactionDecision(message, "Civic", "availability_inquiry");
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ownershipCorrectionReason,
+    "OLD_BOOKING_NULL_INTENT_CURRENT_TURN_CATALOG_SPAN"
+  );
+  assert.equal(result.decision.turnScope, "NEW_TRANSACTION");
+  assert.equal(result.decision.semanticIntent, "availability_inquiry");
+  assert.equal(result.decision.itemReferenceMode, "CURRENT_TURN");
+});
+
+test("13. self-correction from null-intent stale OLD_BOOKING_REFERENCE to NEW_TRANSACTION pricing_inquiry is accepted", async () => {
+  const message = "Civic ka rent kya hai?";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalog },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent()
+          : newTransactionDecision(message, "Civic", "pricing_inquiry");
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.decision.turnScope, "NEW_TRANSACTION");
+  assert.equal(result.decision.semanticIntent, "pricing_inquiry");
+});
+
+test("14. self-correction from null-intent stale OLD_BOOKING_REFERENCE to NEW_TRANSACTION booking_request is accepted", async () => {
+  const message = "Civic 3 din ke liye chahiye";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalog },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1
+          ? staleOldBookingNullIntent()
+          : newTransactionDecision(message, "Civic", "booking_request");
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.decision.turnScope, "NEW_TRANSACTION");
+  assert.equal(result.decision.semanticIntent, "booking_request");
+});
+
+test("15. genuine 'meri Civic booking confirm hai?' recovers to OLD_BOOKING_REFERENCE after a null-intent first attempt", async () => {
+  const message = "meri Civic booking confirm hai?";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: catalog },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      const payload =
+        calls === 1 ? staleOldBookingNullIntent() : genuineOldBookingStatus();
+      return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.ownershipCorrectionReason,
+    "OLD_BOOKING_NULL_INTENT_CURRENT_TURN_CATALOG_SPAN"
+  );
+  assert.equal(result.decision.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(result.decision.semanticIntent, "details_inquiry");
+  assert.equal(result.decision.factKind, "booking_fact");
+  assert.equal(result.decision.targetId, BOOKING_ID);
+});
+
+test("16. trusted conversation_turn historical reference with null semanticIntent is unaffected", () => {
+  const message = "Civic mein child seat hai?";
+  const parsed = parseCloudDmOwnershipDecision(
+    JSON.stringify(
+      staleOldBookingNullIntent(BOOKING_ID, {
+        targetReference: {
+          source: "conversation_turn",
+          sourceTurnId: "assistant:wamid.prior-civic-turn",
+          targetType: "historical_booking",
+          targetId: BOOKING_ID,
+        },
+      })
+    ),
+    { customerMessage: message, catalogItems: catalog }
+  );
+  assert.notEqual(parsed, null);
+  assert.equal(parsed.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(parsed.semanticIntent, null);
+  assert.equal(parsed.targetId, BOOKING_ID);
+});
+
+test("17. null semanticIntent without an explicit catalog span does not over-trigger the fail-closed rule", () => {
+  const message = "meri booking confirm hai?";
+  const parsed = parseCloudDmOwnershipDecision(
+    JSON.stringify(staleOldBookingNullIntent()),
+    { customerMessage: message, catalogItems: catalog }
+  );
+  assert.notEqual(parsed, null);
+  assert.equal(parsed.turnScope, "OLD_BOOKING_REFERENCE");
+  assert.equal(parsed.semanticIntent, null);
+  assert.equal(parsed.targetId, BOOKING_ID);
 });
 
 test("4-5. unsupported/null/no-source fact cannot enter definitive factual compose", async () => {
