@@ -76,13 +76,30 @@ export function isConfidentInventoryUnavailable(availability) {
  * be safely computed for it. Callers must never treat this as "no date" and
  * must never fall back to duration_default_now for it — see
  * AvailabilityInquiryWorkflow's temporal-unresolved safety gate.
- * @type {{ startAt: null, endAt: null, confidence: "temporal_unresolved" }}
+ *
+ * unresolvedReason preserves WHY, distinctly from the customer having said
+ * nothing about a date at all:
+ * - "invalid_date": the customer stated a specific day+month, but it is not
+ *   a real calendar date (e.g. 31 February), or a relative date (kal/parson)
+ *   whose window could not be computed.
+ * - "ambiguous_date": the customer referenced a start date the AI temporal
+ *   owner could not map to a specific day+month (e.g. "next Friday", "next
+ *   week") — startDateKind=unresolved.
+ * Never produced by this function for "no date reference at all" — that
+ * case is a distinct, unrelated, already-correct fallback (duration-only
+ * window from now), not a temporal_unresolved state.
+ *
+ * @param {"invalid_date" | "ambiguous_date"} reason
+ * @returns {{ startAt: null, endAt: null, confidence: "temporal_unresolved", unresolvedReason: "invalid_date" | "ambiguous_date" }}
  */
-const TEMPORAL_UNRESOLVED_WINDOW = Object.freeze({
-  startAt: null,
-  endAt: null,
-  confidence: /** @type {const} */ ("temporal_unresolved"),
-});
+function temporalUnresolvedWindow(reason) {
+  return Object.freeze({
+    startAt: null,
+    endAt: null,
+    confidence: /** @type {const} */ ("temporal_unresolved"),
+    unresolvedReason: reason,
+  });
+}
 
 /**
  * Precedence: canonical unresolved temporal meaning (fail closed, never
@@ -111,7 +128,7 @@ const TEMPORAL_UNRESOLVED_WINDOW = Object.freeze({
  */
 export function resolveAvailabilityOverlapWindow(p = {}) {
   if (p.temporalUnresolved === true) {
-    return TEMPORAL_UNRESOLVED_WINDOW;
+    return temporalUnresolvedWindow("ambiguous_date");
   }
 
   const explicitStartDate =
@@ -135,7 +152,7 @@ export function resolveAvailabilityOverlapWindow(p = {}) {
     }
     // A trusted explicit-date claim existed but failed calendar validation
     // (e.g. Feb 31, Apr 31) — never silently fall through to duration-only.
-    return TEMPORAL_UNRESOLVED_WINDOW;
+    return temporalUnresolvedWindow("invalid_date");
   }
 
   const relative = String(p.calendarRelative ?? "").trim().toLowerCase();
@@ -159,8 +176,10 @@ export function resolveAvailabilityOverlapWindow(p = {}) {
       };
     }
     // A trusted relative-date claim existed but the window could not be
-    // computed — same fail-closed marker, never duration-only.
-    return TEMPORAL_UNRESOLVED_WINDOW;
+    // computed — same fail-closed marker, never duration-only. The customer's
+    // reference itself was not ambiguous (kal/parson), only its computation
+    // failed, so this is classified with the invalid-date wording objective.
+    return temporalUnresolvedWindow("invalid_date");
   }
   return resolveBookingDateWindowFromDuration(p.durationDays, p.nowMs);
 }
@@ -201,6 +220,14 @@ export async function resolveItemBookingAwareAvailability(p) {
   // window here — that would produce a customer-facing available/
   // unavailable claim for a period the customer never actually requested.
   if (window?.confidence === "temporal_unresolved") {
+    // WHY the date is unresolved, distinct from the gate value itself: an
+    // invalid calendar date (31 February) is not the same customer
+    // situation as an ambiguous reference ("next Friday") — the composer
+    // objective differs, even though both must equally block owner-check/
+    // AVR creation and any availability claim (dateWindowConfidence is
+    // unchanged and still the sole safety gate other callers rely on).
+    const unresolvedReason =
+      window.unresolvedReason === "invalid_date" ? "invalid_date" : "ambiguous_date";
     return {
       availability: {
         status: "unknown",
@@ -218,6 +245,7 @@ export async function resolveItemBookingAwareAvailability(p) {
         reason: "temporal_unresolved",
         windowApplied: false,
         dateWindowConfidence: "temporal_unresolved",
+        temporalUnresolvedReason: unresolvedReason,
         requestedStartAt: null,
         requestedEndAt: null,
         verifiedAlternatives: [],
@@ -225,7 +253,7 @@ export async function resolveItemBookingAwareAvailability(p) {
         activeBlockingBookingCount: 0,
       },
       sourceEvidence: {
-        availability: { reason: "temporal_unresolved", itemId },
+        availability: { reason: "temporal_unresolved", unresolvedReason, itemId },
       },
     };
   }

@@ -280,18 +280,24 @@ test("Compose-A/B/C. temporal_clarification compose input: correct kind, trusted
   // A. composeKind resolved to the dedicated kind, not duration_ask.
   assert.match(userContent, /^KIND: temporal_clarification/m);
 
-  // B. trusted facts passed to the composer.
+  // B. trusted facts passed to the composer. 31 February is a stated day+month
+  // that is not a real calendar date -- this is the invalid_date reason, not
+  // an ambiguous/unmappable reference.
   const trustedFactsMatch = userContent.match(/TRUSTED_FACTS_JSON:\s*(\{.*\})/s);
   assert.ok(trustedFactsMatch, "expected TRUSTED_FACTS_JSON in the composer user content");
   const trustedFacts = JSON.parse(trustedFactsMatch[1]);
   assert.equal(trustedFacts.durationDays, 2);
   assert.equal(trustedFacts.dateWindowConfidence, "temporal_unresolved");
   assert.equal(trustedFacts.clarifyStartDate, true);
+  assert.equal(trustedFacts.dateIssueReason, "invalid_date");
 
-  // C. the system prompt explicitly instructs clarifying the start date and
-  // preserving known duration (not re-asking for it).
+  // C. the system prompt explicitly instructs acknowledging the invalid date
+  // (not the generic "clarify" wording, which is reserved for a genuinely
+  // ambiguous/unmappable reference) and preserving known duration.
   assert.match(systemContent, /KIND=temporal_clarification/);
-  assert.match(systemContent, /clarify.*(start date|exact start date)/i);
+  assert.match(systemContent, /not (a )?real calendar date/i);
+  assert.match(systemContent, /not valid/i);
+  assert.doesNotMatch(systemContent, /kind=temporal_clarification and TRUSTED_FACTS_JSON\.dateIssueReason=ambiguous_date/i);
   assert.match(systemContent, /durationDays.*already known/i);
   assert.match(systemContent, /do not ask for duration again/i);
   assert.match(systemContent, /requestedInput=start_date/);

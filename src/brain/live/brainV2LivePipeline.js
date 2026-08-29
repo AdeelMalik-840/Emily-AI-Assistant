@@ -1560,6 +1560,16 @@ export function trustedFactsForCloudCompose(p) {
           // AI temporal owner flagged a start date it could not resolve —
           // the customer must be asked to clarify it, nothing else.
           clarifyStartDate: verified.availability?.dateWindowConfidence === "temporal_unresolved",
+          // WHY it is unresolved — an invalid calendar date (31 February) is
+          // a different customer situation from an ambiguous reference
+          // ("next Friday"), and must not get identical wording. Deterministic
+          // fact only; the composer still owns natural phrasing per reason.
+          dateIssueReason:
+            verified.availability?.dateWindowConfidence === "temporal_unresolved"
+              ? (verified.availability?.temporalUnresolvedReason === "invalid_date"
+                  ? "invalid_date"
+                  : "ambiguous_date")
+              : null,
         }
       : {}),
     currency: String(pricing.currency ?? quote.currency ?? "PKR").trim() || "PKR",

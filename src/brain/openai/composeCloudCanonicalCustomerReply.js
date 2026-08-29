@@ -53,6 +53,23 @@ function factsObject(raw) {
 }
 
 /**
+ * temporal_clarification's wording OBJECTIVE differs by why the date is
+ * unresolved — deterministic fact in, natural wording still fully owned by
+ * the model. An invalid calendar date (31 February) is not the same
+ * customer situation as an ambiguous reference ("next Friday"): treating
+ * both as "no date given" makes the reply look like it ignored what the
+ * customer actually said.
+ * @param {unknown} dateIssueReason
+ * @returns {string}
+ */
+function temporalClarificationObjective(dateIssueReason) {
+  if (dateIssueReason === "invalid_date") {
+    return "The customer stated a specific start date, but it is not a real calendar date (the day does not exist in that month). Naturally acknowledge that the date they gave isn't valid/doesn't exist, then ask for a correct start date. If TRUSTED_FACTS_JSON.durationDays is present, treat the rental duration as already known — do not ask for duration again, only the corrected date. Do not invent, guess, or state any specific calendar date yourself. The availability check has not started: do not say or imply that availability is being checked, confirmed, or unavailable.";
+  }
+  return "The customer's reference to a start date could not be mapped to a specific date. Ask one short natural question for the customer to clarify or restate the exact start date for the trusted item. If TRUSTED_FACTS_JSON.durationDays is present, treat the rental duration as already known — do not ask for duration again, only the date. Do not invent, guess, or state any specific calendar date yourself. The availability check has not started: do not say or imply that availability is being checked, confirmed, or unavailable.";
+}
+
+/**
  * @param {{
  *   kind: string,
  *   semanticIntent?: string | null,
@@ -131,7 +148,7 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
         : kind === "duration_ask"
           ? "Ask one short natural question for the missing rental period (duration or dates) for the trusted item. The availability check has not started: do not say or imply that availability is being checked or will be checked yet."
           : kind === "temporal_clarification"
-            ? "The customer stated a start date that could not be understood or confirmed. Ask one short natural question for the customer to clarify or restate the exact start date for the trusted item. If TRUSTED_FACTS_JSON.durationDays is present, treat the rental duration as already known — do not ask for duration again, only the date. Do not invent, guess, or state any specific calendar date yourself. The availability check has not started: do not say or imply that availability is being checked, confirmed, or unavailable."
+            ? temporalClarificationObjective(facts.dateIssueReason)
           : kind === "clarification"
             ? "Ask one short useful clarification from trusted facts only. Do not invent answers."
           : kind === "image_intro"
@@ -185,7 +202,9 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
           : kind === "duration_ask"
             ? '- If KIND=duration_ask, ask for the missing rental period before any availability check. This overrides the general unconfirmed-availability guidance: do not say a check will happen until the customer supplies the period. Set customerInputRequested=true, requestedInput=rental_period, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu leads with the item then the duration question, e.g. "Corolla kitne din ke liye chahiye?" or "Civic kitne din ke liye chahiye aapko?" — avoid a stiff "[Item] ke liye kitne din chahiye aapko?" translated-English structure.'
             : kind === "temporal_clarification"
-              ? '- If KIND=temporal_clarification, TRUSTED_FACTS_JSON.clarifyStartDate=true (dateWindowConfidence=temporal_unresolved): the customer stated a start date that could not be understood or confirmed. The exact start date is the missing input — this is NOT a duration question. If TRUSTED_FACTS_JSON.durationDays is already known, do not ask for duration again, do not repeat it back, and do not mention it as missing. Never invent, guess, or repair the customer\'s date yourself. Ask exactly one short natural question requesting the correct start date. Set customerInputRequested=true, requestedInput=start_date, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu asking for the date, e.g. "Corolla kis date se chahiye?" or "Sahi start date confirm kar dein?" — do not ask about din/duration in this reply.'
+              ? (facts.dateIssueReason === "invalid_date"
+                  ? '- If KIND=temporal_clarification and TRUSTED_FACTS_JSON.dateIssueReason=invalid_date: the customer stated a specific start date, but it is not a real calendar date (e.g. a day that does not exist in that month). Naturally acknowledge that the date is not valid, then ask for a correct start date — this is NOT a duration question and NOT "no date was given". If TRUSTED_FACTS_JSON.durationDays is already known, do not ask for duration again, do not repeat it back, and do not mention it as missing. Never invent, guess, or repair the customer\'s date yourself. Set customerInputRequested=true, requestedInput=start_date, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu acknowledging the invalid date and asking again, e.g. "Ye date sahi nahi hai, sahi date bata dein Corolla ke liye?" or "Ye date valid nahi hai, dobara sahi date confirm kar dein?" — do not phrase it as if no date was mentioned at all.'
+                  : '- If KIND=temporal_clarification and TRUSTED_FACTS_JSON.dateIssueReason=ambiguous_date (or clarifyStartDate=true with no dateIssueReason), the customer referenced a start date the system could not map to a specific date. The exact start date is the missing input — this is NOT a duration question. If TRUSTED_FACTS_JSON.durationDays is already known, do not ask for duration again, do not repeat it back, and do not mention it as missing. Never invent, guess, or repair the customer\'s date yourself. Ask exactly one short natural question requesting the correct start date. Set customerInputRequested=true, requestedInput=start_date, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu asking for the date, e.g. "Corolla kis date se chahiye?" or "Sahi start date confirm kar dein?" — do not ask about din/duration in this reply.')
               : "";
   const composed = await composeGuardedCustomerReply({
     system: [
