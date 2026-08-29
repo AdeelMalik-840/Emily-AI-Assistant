@@ -46,9 +46,12 @@ const STONIC_LABEL = "Kia Stonic EX Plus 2021 (White)";
 const COROLLA_ID = "toyota_corolla_metallic_grey";
 const COROLLA_LABEL = "Toyota Corolla (Metallic Grey)";
 const CATALOG = [
-  { id: CIVIC_ID, name: CIVIC_LABEL, displayLabel: CIVIC_LABEL },
-  { id: STONIC_ID, name: STONIC_LABEL, displayLabel: STONIC_LABEL },
-  { id: COROLLA_ID, name: COROLLA_LABEL, displayLabel: COROLLA_LABEL },
+  // Real pricing so a pricing_inquiry turn (used here only as a vehicle for
+  // item-focus/session-identity persistence) resolves normally instead of
+  // triggering the known-item-missing-price composer override added later.
+  { id: CIVIC_ID, name: CIVIC_LABEL, displayLabel: CIVIC_LABEL, pricing: { daily: 8000, monthly: 165000 } },
+  { id: STONIC_ID, name: STONIC_LABEL, displayLabel: STONIC_LABEL, pricing: { daily: 6000 } },
+  { id: COROLLA_ID, name: COROLLA_LABEL, displayLabel: COROLLA_LABEL, pricing: { daily: 5000 } },
 ];
 const NOW_MS = Date.parse("2026-08-29T20:31:00.000Z");
 

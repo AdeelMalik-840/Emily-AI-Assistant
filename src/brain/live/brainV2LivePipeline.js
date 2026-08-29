@@ -28,6 +28,7 @@ import {
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
 import { composeBrowseOptionsCustomerReply } from "../openai/composeBrowseOptionsCustomerReply.js";
 import { composeUnknownItemCustomerReply } from "../openai/composeUnknownItemCustomerReply.js";
+import { composeMissingCatalogFactCustomerReply } from "../openai/composeMissingCatalogFactCustomerReply.js";
 import { composeCloudCanonicalCustomerReply } from "../openai/composeCloudCanonicalCustomerReply.js";
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 import {
@@ -625,6 +626,45 @@ export async function runBrainV2LivePipeline(params) {
       }
       finalReply = composedUnknown.reply;
       finalReplySource = "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE";
+    }
+
+    // Item is real and matched (never overlaps canonicalUnknownItem above,
+    // which requires not_matched) but its price is a genuinely missing
+    // catalog field -- no owner-check/escalation architecture exists for
+    // catalog data, so the wording is AI-composed with the same
+    // no-fabrication, no-echo, no-fake-promise discipline as the
+    // unknown-item composer, rather than a static conversational reply.
+    const canonicalKnownItemMissingPrice =
+      !canonicalUnknownItem &&
+      (workflowType === "pricing_inquiry" || workflowType === "pricing_with_duration") &&
+      resolvedBusinessTurnContext?.resolvedItem?.status === "resolved" &&
+      resolvedBusinessTurnContext?.verified?.pricing?.status === "missing";
+    if (canonicalKnownItemMissingPrice) {
+      const itemLabel = String(
+        resolvedBusinessTurnContext?.resolvedItem?.displayLabel ??
+          resolvedBusinessTurnContext?.resolvedItem?.name ??
+          ""
+      ).trim();
+      const composedMissingPrice = await composeMissingCatalogFactCustomerReply({
+        semanticIntent: authoritativeSemanticIntent,
+        itemLabel,
+        customerMessage: message,
+        timeoutMs: params.__missingCatalogFactComposeTimeoutMs ?? 8000,
+        __chatCompletionsCreateForTests:
+          params.__missingCatalogFactComposeChatCreate ?? null,
+      });
+      assertBrainV2ExecutionActive(params);
+      if (!composedMissingPrice.ok || !String(composedMissingPrice.reply ?? "").trim()) {
+        return buildSilentPipelineResult({
+          traceId,
+          channel,
+          chatType,
+          isGroupInbound: params.isGroupInbound,
+          reason: `MISSING_CATALOG_FACT_COMPOSE_FAIL_CLOSED:${composedMissingPrice.reason ?? "no_reply"}`,
+        });
+      }
+      finalReply = composedMissingPrice.reply;
+      finalReplySource = "BRAIN_V2_MISSING_CATALOG_FACT_OPENAI_COMPOSE";
     }
 
     if (workflowType === "browse_options") {
