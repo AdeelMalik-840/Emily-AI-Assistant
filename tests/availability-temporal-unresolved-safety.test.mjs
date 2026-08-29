@@ -18,6 +18,7 @@ import { parseCloudDmOwnershipDecision } from "../src/brain/decisions/decidePost
 import { resolveBusinessTurnContext } from "../src/brain/facts/resolveBusinessTurnContext.js";
 import { buildAvailabilityInquiryActionPlan } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import { runBrainV2LivePipeline } from "../src/brain/live/brainV2LivePipeline.js";
+import { composeCloudCanonicalCustomerReply } from "../src/brain/openai/composeCloudCanonicalCustomerReply.js";
 
 const BUSINESS_ID = "biz-temporal-unresolved";
 const COROLLA_ID = "toyota_corolla";
@@ -221,7 +222,7 @@ function temporalClarificationCanonicalDecision(message, temporalRequest) {
   return { ...parsed, semanticDecisionStatus: "released" };
 }
 
-function temporalClarificationComposeResponse(reply) {
+function temporalClarificationComposeResponse(reply, requestedInput = "start_date") {
   return {
     choices: [
       {
@@ -235,7 +236,7 @@ function temporalClarificationComposeResponse(reply) {
               exposesInternalProcess: false,
             },
             customerInputRequested: true,
-            requestedInput: "rental_period",
+            requestedInput,
             availabilityCheckStarted: false,
           }),
         },
@@ -293,6 +294,17 @@ test("Compose-A/B/C. temporal_clarification compose input: correct kind, trusted
   assert.match(systemContent, /clarify.*(start date|exact start date)/i);
   assert.match(systemContent, /durationDays.*already known/i);
   assert.match(systemContent, /do not ask for duration again/i);
+  assert.match(systemContent, /requestedInput=start_date/);
+
+  // The structural objective for THIS turn must be start_date, not the
+  // shared duration_ask label.
+  assert.doesNotMatch(systemContent, /requestedInput=rental_period/);
+
+  // No active duration_ask concrete example competing in the effective
+  // prompt: its own KIND=duration_ask bullet (and "kitne din" demonstration)
+  // must not be present when composing for a different kind.
+  assert.doesNotMatch(systemContent, /KIND=duration_ask/);
+  assert.doesNotMatch(systemContent, /kitne din/i);
 });
 
 test("Compose-D. duration_ask remains unchanged for genuinely missing duration (not routed to temporal_clarification)", async () => {
@@ -318,15 +330,96 @@ test("Compose-D. duration_ask remains unchanged for genuinely missing duration (
     getBusinessProfileFn: async () => ({}),
     __cloudComposeChatCreate: async (args) => {
       capturedArgs = args;
-      return temporalClarificationComposeResponse("Corolla ka mai check kar leta hun. Kitne din ke liye chahiye?");
+      return temporalClarificationComposeResponse(
+        "Corolla ka mai check kar leta hun. Kitne din ke liye chahiye?",
+        "rental_period"
+      );
     },
   });
 
   assert.equal(result.handled, true);
   assert.ok(capturedArgs, "expected the composer to be invoked");
+  const systemContent = String(capturedArgs.messages?.[0]?.content ?? "");
   const userContent = String(capturedArgs.messages?.[1]?.content ?? "");
   assert.match(userContent, /^KIND: duration_ask/m);
   assert.doesNotMatch(userContent, /clarifyStartDate/);
+  assert.match(systemContent, /requestedInput=rental_period/);
+  // duration_ask's own contract and example remain exactly as before.
+  assert.match(systemContent, /kitne din/i);
+  // The sibling temporal_clarification bullet must not leak into this prompt.
+  assert.doesNotMatch(systemContent, /KIND=temporal_clarification/);
+  assert.doesNotMatch(systemContent, /requestedInput=start_date/);
+});
+
+// ---------------------------------------------------------------------------
+// Structural contract: requestedInput distinguishes "date" from "duration"
+// missing-input objectives, validated by composeCloudCanonicalCustomerReply()
+// directly (not the full pipeline) so these tests exercise the accept/reject
+// contract itself rather than one fixed sentence.
+// ---------------------------------------------------------------------------
+
+test("Compose-B. temporal_clarification response is accepted only when requestedInput=start_date", async () => {
+  let calls = 0;
+  const result = await composeCloudCanonicalCustomerReply({
+    kind: "temporal_clarification",
+    trustedFacts: { itemId: "corolla", itemLabel: "Toyota Corolla", durationDays: 2, dateWindowConfidence: "temporal_unresolved", clarifyStartDate: true },
+    fallbackReply: "fallback",
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      return temporalClarificationComposeResponse("Corolla kis date se chahiye?", "start_date");
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai_cloud_canonical_compose");
+  assert.equal(calls, 1, "a correct first attempt must not be retried");
+});
+
+test("Compose-C. temporal_clarification response with requestedInput=rental_period is rejected by the existing validation/retry path", async () => {
+  let calls = 0;
+  const result = await composeCloudCanonicalCustomerReply({
+    kind: "temporal_clarification",
+    trustedFacts: { itemId: "corolla", itemLabel: "Toyota Corolla", durationDays: 2, dateWindowConfidence: "temporal_unresolved", clarifyStartDate: true },
+    fallbackReply: "fallback",
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      // Wrong structural objective for this kind on every attempt.
+      return temporalClarificationComposeResponse("Corolla kitne din ke liye chahiye?", "rental_period");
+    },
+  });
+  // composeCloudCanonicalCustomerReply()'s outer .ok reflects whether a
+  // non-empty reply was returned at all (including the fallback), not
+  // whether real OpenAI composition succeeded — .source is the reliable
+  // signal, same convention already used by the active-blocking-now and
+  // temporal_unresolved fail-closed checks elsewhere in this codebase.
+  assert.notEqual(result.source, "openai_cloud_canonical_compose");
+  assert.equal(result.reason, "DURATION_INPUT_CONTRACT_NOT_SATISFIED");
+  assert.equal(result.reply, "fallback");
+  assert.ok(calls > 1, "the contract violation must trigger the existing retry mechanism");
+});
+
+test("Compose-D2. duration_ask response with requestedInput=start_date (wrong for this kind) is rejected", async () => {
+  const result = await composeCloudCanonicalCustomerReply({
+    kind: "duration_ask",
+    trustedFacts: { itemId: "corolla", itemLabel: "Toyota Corolla" },
+    fallbackReply: "fallback",
+    __chatCompletionsCreateForTests: async () =>
+      temporalClarificationComposeResponse("Corolla kis date se chahiye?", "start_date"),
+  });
+  assert.notEqual(result.source, "openai_cloud_canonical_compose");
+  assert.equal(result.reason, "DURATION_INPUT_CONTRACT_NOT_SATISFIED");
+  assert.equal(result.reply, "fallback");
+});
+
+test("Compose-D3. duration_ask response with requestedInput=rental_period is still accepted (unchanged)", async () => {
+  const result = await composeCloudCanonicalCustomerReply({
+    kind: "duration_ask",
+    trustedFacts: { itemId: "corolla", itemLabel: "Toyota Corolla" },
+    fallbackReply: "fallback",
+    __chatCompletionsCreateForTests: async () =>
+      temporalClarificationComposeResponse("Corolla kitne din ke liye chahiye?", "rental_period"),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "openai_cloud_canonical_compose");
 });
 
 test("E2. end-to-end Cloud DM pipeline: temporal_unresolved never creates an AVR or owner notification, and wording is AI-composed (not hardcoded)", async () => {

@@ -156,7 +156,7 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
               customerInputRequested: { type: "boolean" },
               requestedInput: {
                 type: "string",
-                enum: ["rental_period"],
+                enum: ["rental_period", "start_date"],
               },
               availabilityCheckStarted: { type: "boolean" },
             }
@@ -171,20 +171,34 @@ export async function composeCloudCanonicalCustomerReply(p = {}) {
       ],
     }
   );
+  // Only the active kind's own instruction is ever shown to the model — a
+  // sibling kind's concrete style example (e.g. duration_ask's "kitne din"
+  // demonstration) must never sit in context as a competing anchor for a
+  // different kind's reply.
+  const kindSpecificInstruction =
+    kind === "social"
+      ? "- If KIND=social, greet or acknowledge naturally. Do not mention availability, booking, price, rent, or owner-check unless those facts are present because the customer asked about that transaction."
+      : kind === "availability_approved"
+        ? "- If KIND=availability_approved, availability is already confirmed in TRUSTED_FACTS_JSON. Do not treat catalog/DB availability as confirmation."
+        : kind === "availability"
+          ? "- If KIND=availability and TRUSTED_FACTS_JSON.availabilityStatus=unavailable while availabilityWindowRequested=false: say it is currently unavailable/booked right now ONLY if hasActiveBlockingBookingNow=true (this has been proven from real dates). If hasActiveBlockingBookingNow is not true, no specific rental period has been requested yet and the booking's own dates have not been checked against now: say only that the item already has an existing booking against it. Do not say or imply it is occupied at this exact moment in that case. Either way, do not say or imply it is unavailable for any other or future dates — that has not been checked."
+          : kind === "duration_ask"
+            ? '- If KIND=duration_ask, ask for the missing rental period before any availability check. This overrides the general unconfirmed-availability guidance: do not say a check will happen until the customer supplies the period. Set customerInputRequested=true, requestedInput=rental_period, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu leads with the item then the duration question, e.g. "Corolla kitne din ke liye chahiye?" or "Civic kitne din ke liye chahiye aapko?" — avoid a stiff "[Item] ke liye kitne din chahiye aapko?" translated-English structure.'
+            : kind === "temporal_clarification"
+              ? '- If KIND=temporal_clarification, TRUSTED_FACTS_JSON.clarifyStartDate=true (dateWindowConfidence=temporal_unresolved): the customer stated a start date that could not be understood or confirmed. The exact start date is the missing input — this is NOT a duration question. If TRUSTED_FACTS_JSON.durationDays is already known, do not ask for duration again, do not repeat it back, and do not mention it as missing. Never invent, guess, or repair the customer\'s date yourself. Ask exactly one short natural question requesting the correct start date. Set customerInputRequested=true, requestedInput=start_date, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu asking for the date, e.g. "Corolla kis date se chahiye?" or "Sahi start date confirm kar dein?" — do not ask about din/duration in this reply.'
+              : "";
   const composed = await composeGuardedCustomerReply({
-    system: `${buildCustomerCommunicationPolicy({ channel: "dm" })}
-
-WORDING-ONLY CLOUD COMPOSER:
-- Use only TRUSTED_FACTS_JSON and KIND. Do not reinterpret meaning.
-- Do not mention owner, staff, PA, internal checking process, or that a person is being asked.
-- Do not invent prices, availability, bookings, or image URLs.
-- If KIND=social, greet or acknowledge naturally. Do not mention availability, booking, price, rent, or owner-check unless those facts are present because the customer asked about that transaction.
-- If KIND=availability_approved, availability is already confirmed in TRUSTED_FACTS_JSON. Do not treat catalog/DB availability as confirmation.
-- If KIND=availability and TRUSTED_FACTS_JSON.availabilityStatus=unavailable while availabilityWindowRequested=false: say it is currently unavailable/booked right now ONLY if hasActiveBlockingBookingNow=true (this has been proven from real dates). If hasActiveBlockingBookingNow is not true, no specific rental period has been requested yet and the booking's own dates have not been checked against now: say only that the item already has an existing booking against it. Do not say or imply it is occupied at this exact moment in that case. Either way, do not say or imply it is unavailable for any other or future dates — that has not been checked.
-- If KIND=duration_ask, ask for the missing rental period before any availability check. This overrides the general unconfirmed-availability guidance: do not say a check will happen until the customer supplies the period. Set customerInputRequested=true, requestedInput=rental_period, and availabilityCheckStarted=false. Style demonstration only (NOT a fixed reply): natural Roman Urdu leads with the item then the duration question, e.g. "Corolla kitne din ke liye chahiye?" or "Civic kitne din ke liye chahiye aapko?" — avoid a stiff "[Item] ke liye kitne din chahiye aapko?" translated-English structure.
-- If KIND=temporal_clarification, TRUSTED_FACTS_JSON.clarifyStartDate=true (dateWindowConfidence=temporal_unresolved): the customer's stated start date could not be understood or confirmed. Ask them to clarify or restate the exact start date only. If TRUSTED_FACTS_JSON.durationDays is present, that rental duration is already known — do not ask for duration again, do not repeat it back as a question. Never invent, guess, or state a specific calendar date yourself. This overrides the general unconfirmed-availability guidance: do not say a check will happen, is happening, or that the item is available/unavailable. Set customerInputRequested=true, requestedInput=rental_period, and availabilityCheckStarted=false.
-- KIND=${kind}
-- Return strict JSON only.`,
+    system: [
+      buildCustomerCommunicationPolicy({ channel: "dm" }),
+      "",
+      "WORDING-ONLY CLOUD COMPOSER:",
+      "- Use only TRUSTED_FACTS_JSON and KIND. Do not reinterpret meaning.",
+      "- Do not mention owner, staff, PA, internal checking process, or that a person is being asked.",
+      "- Do not invent prices, availability, bookings, or image URLs.",
+      ...(kindSpecificInstruction ? [kindSpecificInstruction] : []),
+      `- KIND=${kind}`,
+      "- Return strict JSON only.",
+    ].join("\n"),
     userBase: `KIND: ${kind}
 SEMANTIC_INTENT: ${clean(p.semanticIntent, 80) || "unknown"}
 TRUSTED_FACTS_JSON: ${JSON.stringify(facts)}`,
@@ -193,10 +207,16 @@ TRUSTED_FACTS_JSON: ${JSON.stringify(facts)}`,
     responseFormat,
     replyContract,
     extraReject: (customerReply, parsed) => {
+      const expectedRequestedInput =
+        kind === "duration_ask"
+          ? "rental_period"
+          : kind === "temporal_clarification"
+            ? "start_date"
+            : null;
       if (
-        (kind === "duration_ask" || kind === "temporal_clarification") &&
+        expectedRequestedInput &&
         (parsed?.customerInputRequested !== true ||
-          parsed?.requestedInput !== "rental_period" ||
+          parsed?.requestedInput !== expectedRequestedInput ||
           parsed?.availabilityCheckStarted !== false)
       ) {
         return "DURATION_INPUT_CONTRACT_NOT_SATISFIED";

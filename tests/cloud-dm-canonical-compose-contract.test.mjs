@@ -411,7 +411,7 @@ test("9. duration ask structurally collects the rental period before availabilit
   assert.equal(composed.attemptCount, 1);
   assert.match(composed.reply, /kitne din|kin dates/i);
   const schema = captured.response_format.json_schema.schema;
-  assert.deepEqual(schema.properties.requestedInput.enum, ["rental_period"]);
+  assert.deepEqual(schema.properties.requestedInput.enum, ["rental_period", "start_date"]);
   assert.ok(schema.required.includes("availabilityCheckStarted"));
   assert.match(captured.messages[0].content, /before any availability check/i);
 });
