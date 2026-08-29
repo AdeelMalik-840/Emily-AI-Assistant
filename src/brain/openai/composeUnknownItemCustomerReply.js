@@ -37,7 +37,7 @@ export async function composeUnknownItemCustomerReply(p = {}) {
   const replyContract = buildCustomerReplyContract({
     channel: "dm",
     conversationalGoal:
-      "Naturally answer the requested intent while stating only that the named referent has no trusted catalog match and its requested facts cannot be verified.",
+      "Naturally tell the customer, as an ordinary business fact, that this specific item/vehicle is not one you have — so its requested details (price, availability, etc.) are not something you can share right now. Never claim it is unavailable, out of stock, or invalid, and never describe this as an internal system, catalog, or verification concept.",
     verifiedCustomerFacts: {
       requestedReferent: itemLabel,
       catalogMatchStatus: "not_matched",
@@ -75,10 +75,10 @@ export async function composeUnknownItemCustomerReply(p = {}) {
 
 WORDING-ONLY UNKNOWN-REFERENT COMPOSER:
 - Use only TRUSTED_FACTS_JSON. Do not reinterpret semanticIntent.
-- The requested referent has no trusted catalog match. This is not proof that it is unavailable.
+- catalogMatchStatus="not_matched" means this business does not have that specific item — a plain business fact, not proof it is unavailable/out of stock.
 - Do not invent or quote price, availability, booking state, catalog items, or alternatives.
 - Do not offer or name any alternative item.
-- Naturally explain that the requested fact cannot be verified from the trusted catalog.
+- Naturally tell the customer you don't have that specific item, so this question can't be answered — as a real person would say it. Never say "catalog", "verify"/"verified", "trusted", "match", "canonical", "database", or any other internal/system word.
 - mentionedReferents must exhaustively list every item/service label named in customerReply and may contain only the exact requestedReferent.
 - Return strict JSON only.`,
     userBase: `TRUSTED_FACTS_JSON: ${JSON.stringify({ semanticIntent, requestedReferent: itemLabel, catalogMatchStatus: "not_matched", verifiedAlternatives: [] })}`,

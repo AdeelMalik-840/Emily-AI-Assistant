@@ -176,7 +176,7 @@ export async function composeBrowseOptionsCustomerReply(p = {}) {
   const replyContract = buildCustomerReplyContract({
     channel,
     conversationalGoal:
-      "Naturally answer the browse request from the verified option count and verified item facts. With one option, do not ask the customer to choose between options.",
+      "Naturally answer the browse request from the given option count and item facts, as ordinary business facts. With one option, do not ask the customer to choose between options.",
     verifiedCustomerFacts: {
       availableCount: facts.availableCount,
       catalogItems: facts.catalogItems,
@@ -217,10 +217,11 @@ WORDING-ONLY BROWSE COMPOSER:
 - Use only VERIFIED_BROWSE_FACTS_JSON.
 - Do not add, rename, substitute, or infer catalog options or prices.
 - mentionedAvailableItemIds must exhaustively identify every option named in customerReply and may contain only IDs from VERIFIED_BROWSE_FACTS_JSON.
-- availableCount=0: naturally communicate that no verified option is currently available.
-- availableCount=1: present the single verified option; do not ask a choice-style “which option” question.
-- availableCount>=2: present verified choices and optionally ask preference.
+- availableCount=0: naturally say that nothing is available right now, as an ordinary business fact.
+- availableCount=1: present the single available option; do not ask a choice-style “which option” question.
+- availableCount>=2: present the available choices and optionally ask preference.
 - Never claim booking, payment, owner contact, approval, or completion.
+- Never say "catalog", "verify"/"verified", "trusted", "match", or any other internal/system word.
 - Return only the strict customerReply JSON schema.`;
   const composed = await composeGuardedCustomerReply({
     system,
