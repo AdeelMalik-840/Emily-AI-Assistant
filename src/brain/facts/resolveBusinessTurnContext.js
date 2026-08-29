@@ -685,6 +685,40 @@ export async function resolveBusinessTurnContext(params) {
   )
     ? params.turnContext.canonicalSemanticDecision.itemScope
     : null;
+  // A frozen Cloud ownership decision exists for this turn (Cloud DM path).
+  // When present, its temporalRequest is the single authoritative temporal
+  // owner (kal/tomorrow/parson/explicit dates all included) — the legacy
+  // regex signal below is never consulted, avoiding dual-source ambiguity.
+  // When absent (Group/legacy/non-canonical callers), the legacy regex
+  // remains the sole fallback, unchanged.
+  const hasCanonicalSemanticDecision = params.turnContext?.canonicalSemanticDecision != null;
+  // AI-proposed structured temporal meaning. Deterministic code below still
+  // owns date validity, timezone conversion, year resolution, and the exact
+  // window — this only carries the model's structural proposal through.
+  const temporalRequest =
+    params.turnContext?.canonicalSemanticDecision?.temporalRequest &&
+    typeof params.turnContext.canonicalSemanticDecision.temporalRequest === "object"
+      ? params.turnContext.canonicalSemanticDecision.temporalRequest
+      : null;
+  const explicitStartDateFromTemporalRequest =
+    temporalRequest?.startDateKind === "explicit_date" &&
+    temporalRequest?.startDate &&
+    typeof temporalRequest.startDate === "object"
+      ? {
+          month: Number(temporalRequest.startDate.month),
+          day: Number(temporalRequest.startDate.day),
+        }
+      : null;
+  const canonicalRelativeKind =
+    temporalRequest?.startDateKind === "relative_tomorrow"
+      ? "tomorrow"
+      : temporalRequest?.startDateKind === "relative_day_after_tomorrow"
+        ? "day_after_tomorrow"
+        : null;
+  // A trusted date-bearing reference exists (invalid, or a customer date the
+  // model could not represent) that must never be silently treated as "no
+  // date" — the availability layer fails closed instead of defaulting to now.
+  const temporalUnresolvedRequested = temporalRequest?.startDateKind === "unresolved";
   const understanding =
     admittedTurn && params.turnContext
       ? understandTurn({
@@ -833,10 +867,25 @@ export async function resolveBusinessTurnContext(params) {
     assistDurationDays: lastAvailabilityAssist?.durationDays,
     normalizedMessage,
   });
-  const calendarRelative = resolveAvailabilityCalendarRelative({
+  // Single temporal owner for Cloud turns: once a frozen ownership decision
+  // exists, its temporalRequest is authoritative (kal/tomorrow included) and
+  // the legacy regex signal is never consulted, even when it would disagree.
+  // The regex remains the sole source only when no canonical decision exists
+  // at all (Group/legacy/non-canonical callers of this function).
+  const legacyCalendarRelative = resolveAvailabilityCalendarRelative({
     explicitDurationDays: explicitDurationDaysForFacts,
     normalizedMessage,
   });
+  const calendarRelative = hasCanonicalSemanticDecision
+    ? canonicalRelativeKind
+    : legacyCalendarRelative;
+  // True whenever the window's date signal came from the canonical AI
+  // decision (duration sizes the window) rather than the legacy regex
+  // fallback (fixed 1-day "kal" window, duration suppressed — unchanged).
+  const hasNewTemporalContractWindow =
+    explicitStartDateFromTemporalRequest != null ||
+    temporalUnresolvedRequested ||
+    (hasCanonicalSemanticDecision && calendarRelative != null);
   const rentalDurationDays = canonicalDuration.days;
   const availabilityTimeZone = resolveBusinessTimeZoneForAvailability({
     businessTimeZone: params.businessTimeZone ?? params.timeZone ?? null,
@@ -854,14 +903,22 @@ export async function resolveBusinessTurnContext(params) {
     requestedField: understanding?.askedField ?? turnContextInput?.requestedField ?? null,
     // Prefer canonical rental days; fall back to readiness only when calendarRelative
     // is unset and no rental days (legacy owner-check readiness path).
-    durationDays: calendarRelative
-      ? null
-      : rentalDurationDays ?? durationDaysResolved,
+    // Explicit date / day_after_tomorrow (the new temporal contract) always
+    // size their window from the real duration — only legacy kal/tomorrow
+    // keeps its original fixed single-day window.
+    durationDays:
+      hasNewTemporalContractWindow
+        ? (rentalDurationDays ?? durationDaysResolved)
+        : calendarRelative
+          ? null
+          : rentalDurationDays ?? durationDaysResolved,
     calendarRelative,
+    explicitStartDate: explicitStartDateFromTemporalRequest,
+    temporalUnresolved: temporalUnresolvedRequested,
     timeZone: availabilityTimeZone,
     getBookingsForItemFn: params.getBookingsForItemFn,
     ...(function resolveAvailabilityNowMs() {
-      if (calendarRelative) {
+      if (calendarRelative || hasNewTemporalContractWindow) {
         return { nowMs: clockNowMs };
       }
       const startMs = Date.parse(
@@ -1105,10 +1162,18 @@ export async function resolveBusinessTurnContext(params) {
       sourceTurnKey,
       ...(canonicalDuration.windowStartAt
         ? { requestedStartAt: canonicalDuration.windowStartAt }
-        : {}),
+        : hasNewTemporalContractWindow &&
+            availabilityFacts.availability?.windowApplied === true &&
+            availabilityFacts.availability?.requestedStartAt
+          ? { requestedStartAt: availabilityFacts.availability.requestedStartAt }
+          : {}),
       ...(canonicalDuration.windowEndAt
         ? { requestedEndAt: canonicalDuration.windowEndAt }
-        : {}),
+        : hasNewTemporalContractWindow &&
+            availabilityFacts.availability?.windowApplied === true &&
+            availabilityFacts.availability?.requestedEndAt
+          ? { requestedEndAt: availabilityFacts.availability.requestedEndAt }
+          : {}),
     },
 
     duration: Object.freeze({

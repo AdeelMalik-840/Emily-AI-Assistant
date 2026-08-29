@@ -89,19 +89,26 @@ function addCalendarDays(year, month, day, deltaDays) {
   };
 }
 
+/** @type {Record<string, number>} */
+const RELATIVE_DAY_OFFSETS = Object.freeze({
+  tomorrow: 1,
+  day_after_tomorrow: 2,
+});
+
 /**
  * Resolve an exclusive-end calendar window for a relative day key.
  *
- * Supported now: `tomorrow` (kal). Structure allows later relatives without
- * expanding message regex at this layer.
+ * Supported: `tomorrow` (kal), `day_after_tomorrow` (parson). Structure allows
+ * later relatives without expanding message regex at this layer.
  *
  * @param {{
- *   relative?: "tomorrow" | null,
+ *   relative?: "tomorrow" | "day_after_tomorrow" | null,
+ *   durationDays?: number | null,
  *   timeZone?: string | null,
  *   nowMs?: number,
  * }} [p]
  * @returns {{
- *   relative: "tomorrow",
+ *   relative: "tomorrow" | "day_after_tomorrow",
  *   timeZone: string,
  *   startAt: Date,
  *   endAt: Date,
@@ -110,11 +117,13 @@ function addCalendarDays(year, month, day, deltaDays) {
  */
 export function resolveCalendarDateWindow(p = {}) {
   const relative = String(p.relative ?? "").trim().toLowerCase();
-  if (relative !== "tomorrow") return null;
+  const dayOffset = RELATIVE_DAY_OFFSETS[relative];
+  if (!Number.isFinite(dayOffset)) return null;
 
   const timeZone = String(p.timeZone ?? "").trim();
   if (!timeZone) return null;
 
+  const durationN = Math.max(1, Math.min(365, Math.floor(Number(p.durationDays) || 1)));
   const nowMs = Number.isFinite(Number(p.nowMs)) ? Number(p.nowMs) : Date.now();
   const local = getZonedParts(nowMs, timeZone);
   if (
@@ -125,8 +134,8 @@ export function resolveCalendarDateWindow(p = {}) {
     return null;
   }
 
-  const startDay = addCalendarDays(local.year, local.month, local.day, 1);
-  const endDay = addCalendarDays(local.year, local.month, local.day, 2);
+  const startDay = addCalendarDays(local.year, local.month, local.day, dayOffset);
+  const endDay = addCalendarDays(local.year, local.month, local.day, dayOffset + durationN);
   const startMs = zonedWallTimeToUtcMs(
     startDay.year,
     startDay.month,
@@ -150,10 +159,104 @@ export function resolveCalendarDateWindow(p = {}) {
   }
 
   return {
-    relative: "tomorrow",
+    relative,
     timeZone,
     startAt: new Date(startMs),
     endAt: new Date(endMs),
     confidence: "calendar_relative",
+  };
+}
+
+/**
+ * @param {number} year
+ * @param {number} month
+ * @param {number} day
+ * @returns {boolean}
+ */
+function isValidCalendarDate(year, month, day) {
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  return (
+    dt.getUTCFullYear() === year &&
+    dt.getUTCMonth() === month - 1 &&
+    dt.getUTCDate() === day
+  );
+}
+
+/**
+ * Resolve an exact requested window from an explicit day+month with no year
+ * given (e.g. "3 September"). Deterministic year resolution only — never lets
+ * a proposed calendar date default to a year that has already passed:
+ *
+ * - If day+month in the current business-local year is still today or later,
+ *   use the current year.
+ * - If it has already passed this year, roll forward to next year.
+ * - If the resulting date is not a real calendar date (e.g. Feb 29 in a
+ *   non-leap year), fail closed to null rather than guess a different year.
+ *
+ * @param {{
+ *   month?: number,
+ *   day?: number,
+ *   durationDays?: number | null,
+ *   timeZone?: string | null,
+ *   nowMs?: number,
+ * }} [p]
+ * @returns {{
+ *   year: number,
+ *   month: number,
+ *   day: number,
+ *   timeZone: string,
+ *   startAt: Date,
+ *   endAt: Date,
+ *   confidence: "explicit_calendar_date",
+ * } | null}
+ */
+export function resolveExplicitCalendarDateWindow(p = {}) {
+  const month = Number(p.month);
+  const day = Number(p.day);
+  if (!Number.isInteger(month) || month < 1 || month > 12) return null;
+  if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+
+  const timeZone = String(p.timeZone ?? "").trim();
+  if (!timeZone) return null;
+
+  const durationN = Math.max(1, Math.min(365, Math.floor(Number(p.durationDays) || 1)));
+  const nowMs = Number.isFinite(Number(p.nowMs)) ? Number(p.nowMs) : Date.now();
+  const local = getZonedParts(nowMs, timeZone);
+  if (
+    !Number.isFinite(local.year) ||
+    !Number.isFinite(local.month) ||
+    !Number.isFinite(local.day)
+  ) {
+    return null;
+  }
+
+  const hasPassedThisYear =
+    month < local.month || (month === local.month && day < local.day);
+  const year = hasPassedThisYear ? local.year + 1 : local.year;
+  if (!isValidCalendarDate(year, month, day)) return null;
+
+  const endDay = addCalendarDays(year, month, day, durationN);
+  const startMs = zonedWallTimeToUtcMs(year, month, day, 0, 0, 0, timeZone);
+  const endMs = zonedWallTimeToUtcMs(
+    endDay.year,
+    endDay.month,
+    endDay.day,
+    0,
+    0,
+    0,
+    timeZone
+  );
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return null;
+  }
+
+  return {
+    year,
+    month,
+    day,
+    timeZone,
+    startAt: new Date(startMs),
+    endAt: new Date(endMs),
+    confidence: "explicit_calendar_date",
   };
 }

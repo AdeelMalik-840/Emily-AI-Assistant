@@ -8,7 +8,10 @@ import {
 } from "../../services/inventoryService.js";
 import { latestBlockingBookingEnd, isBookingActiveAt } from "./bookingDateUtils.js";
 import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow.js";
-import { resolveCalendarDateWindow } from "./resolveCalendarDateWindow.js";
+import {
+  resolveCalendarDateWindow,
+  resolveExplicitCalendarDateWindow,
+} from "./resolveCalendarDateWindow.js";
 
 /**
  * @param {Record<string, unknown>} booking
@@ -68,26 +71,83 @@ export function isConfidentInventoryUnavailable(availability) {
 }
 
 /**
- * Prefer calendar-relative window when provided; otherwise rolling duration.
- * `durationDays` must not drive overlap when `calendarRelative` is set.
+ * Fail-closed marker: a trusted temporal claim existed (explicit date,
+ * relative date, or the AI-owned "unresolved" kind) but no exact window could
+ * be safely computed for it. Callers must never treat this as "no date" and
+ * must never fall back to duration_default_now for it — see
+ * AvailabilityInquiryWorkflow's temporal-unresolved safety gate.
+ * @type {{ startAt: null, endAt: null, confidence: "temporal_unresolved" }}
+ */
+const TEMPORAL_UNRESOLVED_WINDOW = Object.freeze({
+  startAt: null,
+  endAt: null,
+  confidence: /** @type {const} */ ("temporal_unresolved"),
+});
+
+/**
+ * Precedence: canonical unresolved temporal meaning (fail closed, never
+ * duration-only) > explicit trusted start date (from AI-proposed temporal
+ * understanding) > trusted relative date (kal/parson) > duration-only rolling
+ * window. An explicit date or a new-contract relative date is never
+ * suppressed by an explicit numeric duration — the duration instead sizes
+ * that window. `durationDays` alone must not drive overlap when a date signal
+ * is present. A trusted date-bearing claim that fails deterministic
+ * validation (e.g. Feb 31) or otherwise cannot be resolved returns the same
+ * temporal_unresolved marker instead of silently defaulting to now.
  *
  * @param {{
  *   durationDays?: number | null,
- *   calendarRelative?: "tomorrow" | null,
+ *   calendarRelative?: "tomorrow" | "day_after_tomorrow" | null,
+ *   explicitStartDate?: { month?: number, day?: number } | null,
+ *   temporalUnresolved?: boolean,
  *   timeZone?: string | null,
  *   nowMs?: number,
  * }} p
  * @returns {{
- *   startAt: Date,
- *   endAt: Date,
+ *   startAt: Date | null,
+ *   endAt: Date | null,
  *   confidence: string,
  * } | null}
  */
 export function resolveAvailabilityOverlapWindow(p = {}) {
+  if (p.temporalUnresolved === true) {
+    return TEMPORAL_UNRESOLVED_WINDOW;
+  }
+
+  const explicitStartDate =
+    p.explicitStartDate && typeof p.explicitStartDate === "object"
+      ? p.explicitStartDate
+      : null;
+  if (explicitStartDate) {
+    const explicit = resolveExplicitCalendarDateWindow({
+      month: explicitStartDate.month,
+      day: explicitStartDate.day,
+      durationDays: p.durationDays,
+      timeZone: p.timeZone,
+      nowMs: p.nowMs,
+    });
+    if (explicit) {
+      return {
+        startAt: explicit.startAt,
+        endAt: explicit.endAt,
+        confidence: explicit.confidence,
+      };
+    }
+    // A trusted explicit-date claim existed but failed calendar validation
+    // (e.g. Feb 31, Apr 31) — never silently fall through to duration-only.
+    return TEMPORAL_UNRESOLVED_WINDOW;
+  }
+
   const relative = String(p.calendarRelative ?? "").trim().toLowerCase();
-  if (relative === "tomorrow") {
+  if (relative === "tomorrow" || relative === "day_after_tomorrow") {
+    // durationDays sizes the window when the caller supplies one (the
+    // canonical AI-owned temporal contract, for both tomorrow and
+    // day_after_tomorrow); resolveCalendarDateWindow defaults to a fixed
+    // 1-day span when it is null (the legacy regex-only "kal" fallback,
+    // unchanged from before this contract existed).
     const calendar = resolveCalendarDateWindow({
-      relative: "tomorrow",
+      relative,
+      durationDays: p.durationDays,
       timeZone: p.timeZone,
       nowMs: p.nowMs,
     });
@@ -98,6 +158,9 @@ export function resolveAvailabilityOverlapWindow(p = {}) {
         confidence: calendar.confidence,
       };
     }
+    // A trusted relative-date claim existed but the window could not be
+    // computed — same fail-closed marker, never duration-only.
+    return TEMPORAL_UNRESOLVED_WINDOW;
   }
   return resolveBookingDateWindowFromDuration(p.durationDays, p.nowMs);
 }
@@ -110,7 +173,9 @@ export function resolveAvailabilityOverlapWindow(p = {}) {
  *   itemName?: string | null,
  *   wantsAvailability?: boolean,
  *   durationDays?: number | null,
- *   calendarRelative?: "tomorrow" | null,
+ *   calendarRelative?: "tomorrow" | "day_after_tomorrow" | null,
+ *   explicitStartDate?: { month?: number, day?: number } | null,
+ *   temporalUnresolved?: boolean,
  *   timeZone?: string | null,
  *   nowMs?: number,
  *   getBookingsForItemFn?: typeof getBookingsForItem,
@@ -123,9 +188,47 @@ export async function resolveItemBookingAwareAvailability(p) {
   const window = resolveAvailabilityOverlapWindow({
     durationDays: p.durationDays,
     calendarRelative: p.calendarRelative,
+    explicitStartDate: p.explicitStartDate,
+    temporalUnresolved: p.temporalUnresolved,
     timeZone: p.timeZone,
     nowMs: p.nowMs,
   });
+
+  // A trusted date-bearing temporal claim exists but could not be safely
+  // resolved (invalid explicit date, ambiguous/unrepresentable relative
+  // reference, or a canonical "unresolved" proposal). Never query bookings
+  // or run computeUserFacingAvailability for the wrong (no-date / now)
+  // window here — that would produce a customer-facing available/
+  // unavailable claim for a period the customer never actually requested.
+  if (window?.confidence === "temporal_unresolved") {
+    return {
+      availability: {
+        status: "unknown",
+        isAvailable: null,
+        source: "temporal_unresolved",
+        bookingAware: false,
+        blockingBookingCount: 0,
+        blockingBookings: [],
+        unavailableUntil: null,
+        nextAvailableAt: null,
+        dateConfidence: "none",
+        dateSource: null,
+        ownerDisabled: false,
+        staleCatalogAvailability: false,
+        reason: "temporal_unresolved",
+        windowApplied: false,
+        dateWindowConfidence: "temporal_unresolved",
+        requestedStartAt: null,
+        requestedEndAt: null,
+        verifiedAlternatives: [],
+        hasActiveBlockingBookingNow: false,
+        activeBlockingBookingCount: 0,
+      },
+      sourceEvidence: {
+        availability: { reason: "temporal_unresolved", itemId },
+      },
+    };
+  }
 
   const catalogAvailabilityFalse =
     p.catalogRow != null &&

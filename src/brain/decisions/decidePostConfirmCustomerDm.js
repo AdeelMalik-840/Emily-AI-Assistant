@@ -3064,8 +3064,59 @@ function defaultDecision(overrides = {}) {
     selectedBookingIndex: null,
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
+    temporalRequest: { startDateKind: "none", startDate: null },
     ...overrides,
   };
+}
+
+const TEMPORAL_REQUEST_START_DATE_KINDS = Object.freeze([
+  "none",
+  "explicit_date",
+  "relative_tomorrow",
+  "relative_day_after_tomorrow",
+  "unresolved",
+]);
+
+/**
+ * Fail-closed normalization for the model-proposed temporalRequest field.
+ *
+ * A malformed model output and a customer genuinely giving no date are not
+ * the same semantic state: a completely absent/non-object proposal carries
+ * no evidence either way and degrades to "none" (matches pre-existing
+ * behavior for callers with nothing to say). But once the proposal shows any
+ * sign of attempting to express a date — a recognized-but-broken
+ * explicit_date payload, or a startDateKind value that isn't blank — it must
+ * never quietly become "none" (which would let duration_default_now
+ * proceed as if nothing were said); it degrades to "unresolved" instead,
+ * which the workflow safety gate must treat as "do not default to now."
+ *
+ * @param {unknown} raw
+ * @returns {{ startDateKind: "none" | "explicit_date" | "relative_tomorrow" | "relative_day_after_tomorrow" | "unresolved", startDate: { day: number, month: number } | null }}
+ */
+function cleanTemporalRequest(raw) {
+  const none = { startDateKind: /** @type {const} */ ("none"), startDate: null };
+  const unresolved = { startDateKind: /** @type {const} */ ("unresolved"), startDate: null };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return none;
+
+  const kindRaw = /** @type {Record<string, unknown>} */ (raw).startDateKind;
+  const kind = String(kindRaw ?? "").trim();
+  if (kind === "") return none; // no attempt to express a startDateKind at all
+  if (kind === "none") return none;
+  if (kind === "relative_tomorrow" || kind === "relative_day_after_tomorrow") {
+    return { startDateKind: /** @type {const} */ (kind), startDate: null };
+  }
+  if (kind === "unresolved") return unresolved;
+  if (kind !== "explicit_date") return unresolved; // an unrecognized-but-present kind is a date-bearing attempt
+
+  const startDateRaw = /** @type {Record<string, unknown>} */ (raw).startDate;
+  if (!startDateRaw || typeof startDateRaw !== "object" || Array.isArray(startDateRaw)) {
+    return unresolved; // declared explicit_date but the payload is broken — never silently "none"
+  }
+  const day = Number(/** @type {Record<string, unknown>} */ (startDateRaw).day);
+  const month = Number(/** @type {Record<string, unknown>} */ (startDateRaw).month);
+  if (!Number.isInteger(day) || day < 1 || day > 31) return unresolved;
+  if (!Number.isInteger(month) || month < 1 || month > 12) return unresolved;
+  return { startDateKind: /** @type {const} */ ("explicit_date"), startDate: { day, month } };
 }
 
 /**
@@ -4268,6 +4319,7 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
     factKind,
     capability,
     evidenceNeeds,
+    temporalRequest: cleanTemporalRequest(parsed.temporalRequest),
     customerReply: "",
     shouldReply: action !== "silence",
     semanticDecisionVersion: CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION,
@@ -4450,6 +4502,37 @@ export async function executeCloudDmOwnershipDecision({
             required: ["entity", "concept", "attributes"],
           },
         },
+        temporalRequest: {
+          type: "object",
+          additionalProperties: false,
+          description:
+            "Structured proposal of any rental start date the customer stated in THIS message, for NEW_TRANSACTION/PENDING_AVAILABILITY_REFERENCE availability/booking asks only. This is a structural proposal, not a computed date or timestamp — runtime resolves the actual year/timezone/window deterministically.",
+          properties: {
+            startDateKind: {
+              type: "string",
+              enum: ["none", "explicit_date", "relative_tomorrow", "relative_day_after_tomorrow", "unresolved"],
+              description:
+                "none = customer genuinely expresses no start-date/day reference (duration-only). explicit_date = an explicit day+month calendar date stated (any order/spelling/abbreviation of the month, in any supported language). relative_tomorrow = 'kal'/tomorrow stated. relative_day_after_tomorrow = 'parson'/day-after-tomorrow stated. unresolved = the customer clearly refers to a start date/day but it cannot be represented safely by any of the above (e.g. a weekday name like 'next Friday', 'next week', or another vague/ambiguous date expression) — never guess a date for this case.",
+            },
+            startDate: {
+              anyOf: [
+                {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    day: { type: "integer", minimum: 1, maximum: 31 },
+                    month: { type: "integer", minimum: 1, maximum: 12 },
+                  },
+                  required: ["day", "month"],
+                },
+                { type: "null" },
+              ],
+              description:
+                "The stated day-of-month and month-number (1=January .. 12=December) when startDateKind=explicit_date. Never invent a year. Null for every other startDateKind.",
+            },
+          },
+          required: ["startDateKind", "startDate"],
+        },
       },
       required: [
         "turnScope",
@@ -4464,13 +4547,14 @@ export async function executeCloudDmOwnershipDecision({
         "factKind",
         "capability",
         "evidenceNeeds",
+        "temporalRequest",
       ],
     }
   );
 
   const system = [
     "You classify Cloud DM transaction ownership only.",
-    "Return JSON with turnScope, semanticIntent, itemScope, itemReferents, itemReferenceMode, targetReference, targetId, mutationIntent, action, factKind, capability, evidenceNeeds.",
+    "Return JSON with turnScope, semanticIntent, itemScope, itemReferents, itemReferenceMode, targetReference, targetId, mutationIntent, action, factKind, capability, evidenceNeeds, temporalRequest.",
     "Do not write customer wording. customerReply is not part of this schema.",
     "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
     `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
@@ -4524,6 +4608,12 @@ export async function executeCloudDmOwnershipDecision({
     "Ambiguous which listed candidate is meant → UNCLEAR, targetId=null, mutationIntent=none, action=reply, factKind=vague.",
     "If multiple pending offers exist and the customer does not uniquely identify one, use UNCLEAR. Do not pick by list order.",
     "Do not emit bookingSelectionMode, selectedBookingIndex, targetContext, or pendingAvailabilitySelectionIndex.",
+    "temporalRequest: propose structured rental start-date meaning only, never a computed date, timestamp, or year. You are the single temporal understanding owner for this decision — this includes 'kal'/tomorrow and 'parson'/day-after-tomorrow, not only explicit calendar dates.",
+    "startDateKind=explicit_date whenever CUSTOMER_MESSAGE states a specific calendar day and month for the rental start, in any order, language, spelling, or abbreviation (e.g. day-then-month, month-then-day, full or abbreviated month name). Emit startDate={day, month} using the stated day-of-month and month number (1=January..12=December). Never invent, assume, or output a year — year resolution happens outside this decision.",
+    "startDateKind=relative_tomorrow whenever CUSTOMER_MESSAGE means tomorrow (e.g. 'kal'). startDateKind=relative_day_after_tomorrow whenever it means the day after tomorrow (e.g. 'parson'). startDate must be null for both.",
+    "startDateKind=unresolved whenever CUSTOMER_MESSAGE clearly references a rental start date/day that is not tomorrow, day-after-tomorrow, or a stated day+month — e.g. a weekday name ('next Friday'), 'next week', or another vague/ambiguous date expression. Do not guess a date and do not use explicit_date/relative_tomorrow/relative_day_after_tomorrow for these. startDate must be null.",
+    "startDateKind=none ONLY when the customer genuinely expresses no start-date/day reference at all: duration-only requests, or any non-availability/non-booking turn. Never use none merely because a stated date reference does not fit explicit_date/relative_tomorrow/relative_day_after_tomorrow — use unresolved instead. startDate must be null whenever startDateKind is not explicit_date.",
+    "temporalRequest is about the rental start date only. It never represents duration, an end date, or a booking's existing/confirmed dates.",
   ].join("\n");
 
   const userPayload = [

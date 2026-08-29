@@ -1434,6 +1434,16 @@ function cloudCanonicalComposeKind(p) {
   }
   if (workflowType === "availability_inquiry" || intent === "availability_inquiry") {
     const actions = Array.isArray(p.actionPlan?.actions) ? p.actionPlan.actions : [];
+    // A trusted date-bearing temporal claim exists but could not be resolved
+    // (see AvailabilityInquiryWorkflow's temporal-unresolved safety gate).
+    // This is its own narrow kind — it must not ask for duration again when
+    // durationDays is already known, which duration_ask's contract does not
+    // represent.
+    const asksTemporalClarification = actions.some(
+      (action) =>
+        String(action?.payload?.source ?? "") === "canonical_owner_check_ask_temporal_clarification"
+    );
+    if (asksTemporalClarification) return "temporal_clarification";
     const asksDuration = actions.some(
       (action) =>
         String(action?.payload?.pendingStage ?? "").includes("duration") ||
@@ -1494,6 +1504,22 @@ export function trustedFactsForCloudCompose(p) {
             Number(quote.durationDays) >= 1
               ? Math.floor(Number(quote.durationDays))
               : null,
+        }
+      : {}),
+    ...(composeKind === "temporal_clarification"
+      ? {
+          // Trusted rental duration if the customer already stated one — the
+          // temporal_clarification prompt must preserve it, not re-ask for it.
+          durationDays:
+            Number.isFinite(Number(p.resolvedBusinessTurnContext?.turn?.durationDays)) &&
+            Number(p.resolvedBusinessTurnContext?.turn?.durationDays) >= 1
+              ? Math.floor(Number(p.resolvedBusinessTurnContext.turn.durationDays))
+              : null,
+          dateWindowConfidence: String(verified.availability?.dateWindowConfidence ?? "").trim() || null,
+          // Explicit objective signal beyond dateWindowConfidence: the single
+          // AI temporal owner flagged a start date it could not resolve —
+          // the customer must be asked to clarify it, nothing else.
+          clarifyStartDate: verified.availability?.dateWindowConfidence === "temporal_unresolved",
         }
       : {}),
     currency: String(pricing.currency ?? quote.currency ?? "PKR").trim() || "PKR",

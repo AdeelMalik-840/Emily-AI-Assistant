@@ -192,6 +192,22 @@ function hasActiveBlockingBookingNowWithNoRequestedWindow(availability) {
 }
 
 /**
+ * A trusted date-bearing temporal claim existed (invalid explicit date, or an
+ * ambiguous/unresolvable reference the single AI temporal owner flagged) but
+ * no exact window could be safely computed. Must never be treated as "no
+ * date" — no owner-check, no AVR, no available/unavailable claim for any
+ * other window; the customer must be asked to clarify instead.
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {boolean}
+ */
+function isAvailabilityTemporalUnresolved(availability) {
+  if (!availability || typeof availability !== "object" || Array.isArray(availability)) {
+    return false;
+  }
+  return availability.dateWindowConfidence === "temporal_unresolved";
+}
+
+/**
  * @param {number | null | undefined} durationDays
  * @returns {boolean}
  */
@@ -584,6 +600,19 @@ export function logAvailabilityOwnerCheckPlanned(p) {
 export function buildAskDurationAvailabilityReply(conversationalLabel) {
   const label = String(conversationalLabel ?? "").trim() || "item";
   return `${label} ka mai check kar leta hun. Kitne din ke liye chahiye?`;
+}
+
+/**
+ * Deterministic fallback only — the live Cloud DM channel composes this
+ * question with OpenAI (reusing the existing duration_ask prompt, which
+ * already covers "the missing rental period (duration or dates)"). Used
+ * as the draft/fail-safe text, same convention as buildAskDurationAvailabilityReply.
+ * @param {string} conversationalLabel
+ * @returns {string}
+ */
+export function buildAskTemporalClarificationAvailabilityReply(conversationalLabel) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  return `${label} ke liye exact date confirm kar dein, please?`;
 }
 
 /**
@@ -1342,9 +1371,43 @@ export function buildAvailabilityInquiryActionPlan({
     const itemId = String(resolvedItem.id ?? "").trim() || null;
     const itemLabel = String(resolvedItem.displayLabel ?? resolvedItem.name ?? "").trim() || "item";
     const conversationalLabel = conversationalItemLabelFromResolvedItem(resolvedItem);
+    const canonicalAvailability = canonical.verified?.availability ?? null;
+
+    // Safety gate: a trusted date-bearing temporal claim exists but could not
+    // be resolved (invalid explicit date, or an ambiguous/unrepresentable
+    // reference the single AI temporal owner flagged as unresolved). Must run
+    // before owner-check readiness, AVR creation, and any confident-
+    // unavailable claim — never default to now, never claim availability for
+    // a different window, only ask the customer to clarify.
+    if (isAvailabilityTemporalUnresolved(canonicalAvailability)) {
+      const clarifyReplyDraft = buildAskTemporalClarificationAvailabilityReply(conversationalLabel);
+      return Object.freeze({
+        planId: randomUUID(),
+        replyDraft: clarifyReplyDraft,
+        actions: Object.freeze([
+          Object.freeze({
+            type: "REPLY",
+            payload: Object.freeze({
+              channel: "whatsapp_web",
+              text: clarifyReplyDraft,
+              field: "availability",
+              itemId,
+              itemLabel,
+              source: "canonical_owner_check_ask_temporal_clarification",
+              execute: false,
+            }),
+          }),
+        ]),
+        persistenceIntent: Object.freeze({
+          rememberResolvedItem: true,
+          itemId,
+          execute: false,
+        }),
+      });
+    }
+
     const durationDays = canonical.turn?.durationDays ?? null;
     const ownerCheckTiming = resolveOwnerCheckTiming(canonical, message);
-    const canonicalAvailability = canonical.verified?.availability ?? null;
     const execute = canonical.actions?.availabilityOwnerCheckExecute === true;
 
     if (!ownerCheckTiming.ready) {
