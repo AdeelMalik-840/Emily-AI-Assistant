@@ -17,6 +17,7 @@ import { getBookingsForItem } from "../../services/inventoryService.js";
 import { resolveCatalogBrowseAvailabilityFacts } from "./resolveCatalogBrowseAvailabilityFacts.js";
 import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
+import { readFreshPendingTemporalClarification } from "../availability/temporalClarificationContext.js";
 import { decideAvailabilityAssistFollowUp } from "../availability/decideAvailabilityAssistFollowUp.js";
 import { isConfidentInventoryUnavailable } from "./resolveItemBookingAwareAvailability.js";
 import { findVerifiedAvailabilityAlternatives } from "../../services/availabilityRejectionAlternatives.js";
@@ -121,13 +122,16 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
  *
  * Precedence:
  * 1. explicit current-message duration
- * 2. fresh trusted availability assist
- * 3. active trusted AVR lifecycle duration
- * 4. gated session duration only with trustedContinuation co-signal
- * 5. none
+ * 2. pending temporal-clarification continuation (already item/TTL-matched
+ *    by the caller — narrow, single-purpose carrier, distinct from #3/#5)
+ * 3. fresh trusted availability assist
+ * 4. active trusted AVR lifecycle duration
+ * 5. gated session duration only with trustedContinuation co-signal
+ * 6. none
  *
  * @param {{
  *   explicitDurationDays?: number | null,
+ *   pendingClarificationDurationDays?: number | null,
  *   freshAssist?: Record<string, unknown> | null,
  *   activeAvrDurationDays?: number | null,
  *   sessionDurationDays?: number | null,
@@ -135,7 +139,7 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
  * }} p
  * @returns {{
  *   days: number | null,
- *   source: "explicit" | "assist" | "avr" | "gated_session" | "none",
+ *   source: "explicit" | "temporal_clarification_continuation" | "assist" | "avr" | "gated_session" | "none",
  *   trustedContinuation: boolean,
  *   windowStartAt: string | null,
  *   windowEndAt: string | null,
@@ -158,6 +162,24 @@ export function resolveCanonicalRentalDuration(p = {}) {
       days: Math.max(1, Math.floor(explicit)),
       source: /** @type {const} */ ("explicit"),
       trustedContinuation: false,
+      windowStartAt: null,
+      windowEndAt: null,
+      calendarRelative: null,
+    });
+  }
+
+  // Narrow, single-purpose carrier: already item-matched and TTL-checked by
+  // the caller (readFreshPendingTemporalClarification), and only ever
+  // produced by the temporal_unresolved clarification branch itself. Sits
+  // above assist/avr because it is the most specific, most recently-known
+  // truth for this exact continuation — but explicit current-turn duration
+  // (above) always overrides it.
+  const pendingClarificationDays = Number(p.pendingClarificationDurationDays);
+  if (Number.isFinite(pendingClarificationDays) && pendingClarificationDays >= 1) {
+    return Object.freeze({
+      days: Math.max(1, Math.floor(pendingClarificationDays)),
+      source: /** @type {const} */ ("temporal_clarification_continuation"),
+      trustedContinuation: true,
       windowStartAt: null,
       windowEndAt: null,
       calendarRelative: null,
@@ -852,8 +874,36 @@ export async function resolveBusinessTurnContext(params) {
       ? Math.max(1, Math.floor(Number(memorySnapshot.lastDurationDays)))
       : null;
 
+  // Pending temporal-clarification continuation: only ever consulted when
+  // this exact turn is itself carrying a start-date signal (a resolved
+  // date, a relative date, or still-unresolved) for the SAME item the
+  // clarification was raised for. An ordinary contextual turn with no
+  // temporal signal at all (price question, image request, etc.) never
+  // reads this, even for the same item within the TTL window — that is the
+  // structural boundary that keeps this narrow and non-generic.
+  const pendingTemporalClarificationRaw =
+    memorySnapshot.pendingTemporalClarification &&
+    typeof memorySnapshot.pendingTemporalClarification === "object" &&
+    !Array.isArray(memorySnapshot.pendingTemporalClarification)
+      ? memorySnapshot.pendingTemporalClarification
+      : null;
+  const isResolvingTemporalClarification =
+    explicitStartDateFromTemporalRequest != null ||
+    canonicalRelativeKind != null ||
+    temporalUnresolvedRequested === true;
+  const nowMsForPendingClarification = Number.isFinite(Number(params.nowMs))
+    ? Number(params.nowMs)
+    : Date.now();
+  const pendingTemporalClarification = isResolvingTemporalClarification
+    ? readFreshPendingTemporalClarification(pendingTemporalClarificationRaw, {
+        itemId: itemFacts.id,
+        nowMs: nowMsForPendingClarification,
+      })
+    : null;
+
   const canonicalDuration = resolveCanonicalRentalDuration({
     explicitDurationDays: explicitDurationDaysForFacts,
+    pendingClarificationDurationDays: pendingTemporalClarification?.durationDays ?? null,
     freshAssist: lastAvailabilityAssist,
     activeAvrDurationDays,
     sessionDurationDays,
@@ -1197,6 +1247,11 @@ export async function resolveBusinessTurnContext(params) {
     participant: participantFacts.participant,
     sourceIdentity,
     lastAvailabilityAssist,
+    // Raw, unfiltered session value (mirrors lastAvailabilityAssist above) --
+    // callers that need to detect/supersede a stale record for a DIFFERENT
+    // item re-check freshness/item-match themselves via
+    // readFreshPendingTemporalClarification.
+    pendingTemporalClarification: pendingTemporalClarificationRaw,
     availabilityAssistFollowUp,
     unavailableCustomerReply,
     presentedAlternativeItemIds: Object.freeze([...presentedAlternativeItemIds]),

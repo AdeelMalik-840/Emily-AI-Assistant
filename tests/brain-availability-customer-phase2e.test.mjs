@@ -134,6 +134,13 @@ class FakeDb {
   collection(name) {
     return new FakeCollectionRef(this, [name]);
   }
+  async runTransaction(fn) {
+    return fn({
+      get: (ref) => ref.get(),
+      update: (ref, data) => ref.update(data),
+      set: (ref, data, options) => ref.set(data, options),
+    });
+  }
 }
 
 function seedWaitingConfirmRequest(fakeDb, requestId, overrides = {}) {

@@ -5,6 +5,7 @@ import { logBookingEvent } from "../utils/bookingLogger.js";
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import { bookingOverlapsRequestedWindow } from "./bookingIntervalOverlap.js";
 import { isSyntheticFirstSeenParticipantKey } from "./participantIdentity.js";
+import { toValidBookingDate } from "../brain/facts/bookingDateUtils.js";
 
 const Timestamp = admin.firestore.Timestamp;
 const FieldValue = admin.firestore.FieldValue;
@@ -963,7 +964,7 @@ export function __displayNameFromParticipantKeyForTests(value) {
 /**
  * @param {string} traceId - Correlates with pipeline / processMessage logs
  * @param {string} userId
- * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, availabilityRequestId?: string | null, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceTurnKey?: string | null, guaranteeKey?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null, dbOverride?: unknown, abortSignal?: AbortSignal, executionGuard?: Record<string, unknown> }} opts
+ * @param {{ itemId: string, itemName?: string, durationDays: number, customerName?: string, customerPhone?: string, source?: string, groupName?: string, sessionKey?: string, messageId?: string, participantName?: string, senderScope?: string, playwrightChatKey?: string, dmTargetPhone?: string, dmTargetSource?: string, canDmCustomer?: boolean, approvalStage?: string, availabilityRequestId?: string | null, sourceGroupName?: string | null, sourcePlaywrightChatKey?: string | null, sourceMessageId?: string | null, sourceTurnKey?: string | null, guaranteeKey?: string | null, sourceText?: string | null, originalUserMessageText?: string | null, requestedStartAt?: unknown, requestedEndAt?: unknown, sourceTimestamp?: number | null, sourceSenderScope?: string | null, sourceParticipantName?: string | null, sourceParticipantDisplayName?: string | null, sourceParticipantPhone?: string | null, sourceParticipantKey?: string | null, sourceRowKey?: string | null, sourceMessageIndex?: number | null, dbOverride?: unknown, abortSignal?: AbortSignal, executionGuard?: Record<string, unknown> }} opts
  */
 export async function createBooking(
   traceId,
@@ -1006,6 +1007,8 @@ export async function createBooking(
     sourceRowKey,
     sourceMessageIndex,
     originalUserMessageText,
+    requestedStartAt,
+    requestedEndAt,
     dbOverride,
     abortSignal,
     executionGuard,
@@ -1065,10 +1068,22 @@ export async function createBooking(
     status: "start",
     data: { itemId: id, durationDays: days },
   });
-  const startAt = Timestamp.now();
-  const endAt = Timestamp.fromMillis(
-    startAt.toMillis() + days * 86400000
-  );
+  // Trusted approved window from the waiting_confirm AVR, when present and
+  // valid, is authoritative — never re-derived from "now" or re-parsed from
+  // customer text. Legacy/no-window callers keep the existing now-based
+  // fallback unchanged.
+  const trustedRequestedStart = toValidBookingDate(requestedStartAt);
+  const trustedRequestedEnd = toValidBookingDate(requestedEndAt);
+  const hasTrustedWindow =
+    trustedRequestedStart != null &&
+    trustedRequestedEnd != null &&
+    trustedRequestedEnd.getTime() > trustedRequestedStart.getTime();
+  const startAt = hasTrustedWindow
+    ? Timestamp.fromDate(trustedRequestedStart)
+    : Timestamp.now();
+  const endAt = hasTrustedWindow
+    ? Timestamp.fromDate(trustedRequestedEnd)
+    : Timestamp.fromMillis(startAt.toMillis() + days * 86400000);
 
   const name =
     itemName != null && String(itemName).trim() !== ""

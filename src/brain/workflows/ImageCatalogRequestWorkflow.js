@@ -94,13 +94,19 @@ export function buildImageCatalogActionPlan({
           whatsappImageUrls: Object.freeze([...imageUrls]),
           deliveryIntent: "show_images",
           source: "trusted_catalog_images",
+          presentedItemIds: Object.freeze(itemId ? [itemId] : []),
           execute: false,
         }),
       }),
     ]),
+    // Catalog photos were just sent for this exact, unambiguous item — a
+    // normal itemless follow-up ("iska rent kitna hai?") should bind to it.
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
       itemId,
+      rememberPresentedItemFocus: Boolean(itemId),
+      presentedItemId: itemId,
+      presentedItemLabel: itemLabel,
       execute: false,
     }),
   });

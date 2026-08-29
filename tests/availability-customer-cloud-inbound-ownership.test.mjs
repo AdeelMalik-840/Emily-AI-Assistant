@@ -1445,6 +1445,7 @@ test("duplicate provider ID executes waiting-confirm OpenAI, booking and send on
       sends += 1;
       return { ok: true };
     },
+    __composeWaitingConfirmExecutionReplyForTests: composeWaitingConfirmExecutionReplyForTests,
   };
   const first = await handleAvailabilityCustomerCloudInbound(params);
   const second = await handleAvailabilityCustomerCloudInbound(params);

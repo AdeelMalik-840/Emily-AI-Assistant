@@ -205,13 +205,19 @@ export function buildPricingInquiryActionPlan({
           itemId,
           itemLabel,
           source,
+          presentedItemIds: Object.freeze(itemId ? [itemId] : []),
           execute: false,
         }),
       }),
     ]),
+    // A plain, single-item price answer names the item directly — a normal
+    // itemless follow-up should validly bind back to it.
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
       itemId,
+      rememberPresentedItemFocus: Boolean(itemId),
+      presentedItemId: itemId,
+      presentedItemLabel: itemLabel,
       execute: false,
     }),
   });

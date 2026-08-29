@@ -312,6 +312,16 @@ export function applySessionMemoryFromActionPlan(p) {
     patch.lastAvailabilityAssist = structuredClone(persistence.lastAvailabilityAssist);
   }
 
+  if (persistence?.clearPendingTemporalClarification === true) {
+    patch.pendingTemporalClarification = null;
+  } else if (
+    persistence?.rememberPendingTemporalClarification === true &&
+    persistence?.pendingTemporalClarification &&
+    typeof persistence.pendingTemporalClarification === "object"
+  ) {
+    patch.pendingTemporalClarification = structuredClone(persistence.pendingTemporalClarification);
+  }
+
   if (persistence?.clearPendingAction === true) {
     patch.pendingAction = null;
   } else if (

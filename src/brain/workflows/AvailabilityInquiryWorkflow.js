@@ -11,6 +11,7 @@ import {
   withAvailabilityAssistPendingQuestion,
 } from "../availability/availabilityAssistContext.js";
 import { resolveAvailabilityAssistFollowUpDecision } from "../availability/decideAvailabilityAssistFollowUp.js";
+import { buildPendingTemporalClarification } from "../availability/temporalClarificationContext.js";
 import { PENDING_ACTION_COLLECT_AVAILABILITY_DURATION } from "../availability/availabilityPendingActions.js";
 import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
@@ -1001,6 +1002,11 @@ export function buildOwnerCheckActionPlan(p) {
       clearLastAvailabilityAssist: clearAssist === true,
       clearPendingAction: true,
       clearEmilyPending: true,
+      // Item + date + duration are all resolved by the time a real
+      // owner-check plan is built — any temporal-clarification continuation
+      // this item (or a stale different item) was waiting on has now been
+      // fully consumed or superseded, so it must not survive further.
+      clearPendingTemporalClarification: true,
       // Session memory only — never couple to action-side execute flags.
       execute: false,
     }),
@@ -1381,6 +1387,22 @@ export function buildAvailabilityInquiryActionPlan({
     // a different window, only ask the customer to clarify.
     if (isAvailabilityTemporalUnresolved(canonicalAvailability)) {
       const clarifyReplyDraft = buildAskTemporalClarificationAvailabilityReply(conversationalLabel);
+      // Duration is already known on THIS turn (canonical.turn.durationDays
+      // reflects it — including a duration recovered from a still-fresh
+      // matching pendingTemporalClarification on a repeated invalid date).
+      // Only ever carry it forward when it is genuinely known; never invent
+      // one. See temporalClarificationContext.js for the exact contract.
+      const knownDurationDaysForClarification = Number(canonical.turn?.durationDays);
+      const freshPendingClarification =
+        itemId &&
+        Number.isFinite(knownDurationDaysForClarification) &&
+        knownDurationDaysForClarification >= 1
+          ? buildPendingTemporalClarification({
+              itemId,
+              durationDays: knownDurationDaysForClarification,
+              sourceTurnKey: String(canonical?.turn?.sourceTurnKey ?? "").trim() || null,
+            })
+          : null;
       return Object.freeze({
         planId: randomUUID(),
         replyDraft: clarifyReplyDraft,
@@ -1394,13 +1416,29 @@ export function buildAvailabilityInquiryActionPlan({
               itemId,
               itemLabel,
               source: "canonical_owner_check_ask_temporal_clarification",
+              presentedItemIds: Object.freeze([itemId]),
               execute: false,
             }),
           }),
         ]),
+        // The customer's very next turn may contain only the corrected date,
+        // with no item name at all — trusted contextual focus on this exact
+        // item must survive so ownership can bind it via trusted_fresh_focus
+        // instead of fabricating a current_turn span. If a duration was
+        // already known, it rides along on its own narrow, item-scoped
+        // carrier (never the generic session duration/assist mechanisms).
         persistenceIntent: Object.freeze({
           rememberResolvedItem: true,
           itemId,
+          rememberPresentedItemFocus: true,
+          presentedItemId: itemId,
+          presentedItemLabel: itemLabel,
+          ...(freshPendingClarification
+            ? {
+                rememberPendingTemporalClarification: true,
+                pendingTemporalClarification: freshPendingClarification,
+              }
+            : { clearPendingTemporalClarification: true }),
           execute: false,
         }),
       });
@@ -1432,13 +1470,19 @@ export function buildAvailabilityInquiryActionPlan({
                 itemId,
                 itemLabel,
                 source: "canonical_owner_check_active_blocking_now",
+                presentedItemIds: Object.freeze([itemId]),
                 execute: false,
               }),
             }),
           ]),
+          // This exact item was just named as currently occupied — a normal
+          // itemless follow-up ("kab free hoga?") should bind to it.
           persistenceIntent: Object.freeze({
             rememberResolvedItem: true,
             itemId,
+            rememberPresentedItemFocus: true,
+            presentedItemId: itemId,
+            presentedItemLabel: itemLabel,
             execute: false,
           }),
         });
@@ -1597,13 +1641,19 @@ export function buildAvailabilityInquiryActionPlan({
           itemId,
           itemLabel,
           source,
+          presentedItemIds: Object.freeze(itemId ? [itemId] : []),
           execute: false,
         }),
       }),
     ]),
+    // A plain, single-item availability answer names the item directly — a
+    // normal itemless follow-up should validly bind back to it.
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
       itemId,
+      rememberPresentedItemFocus: Boolean(itemId),
+      presentedItemId: itemId,
+      presentedItemLabel: itemLabel,
       execute: false,
     }),
   });

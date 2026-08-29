@@ -1751,33 +1751,69 @@ export async function claimAvailabilityRequestCustomerConfirmProcessing({
 }) {
   const ref = availabilityRequestDocRef(connection, businessId, requestId);
   if (!ref) return { ok: false, reason: "MISSING_REQUEST_REF" };
-  const snap = await ref.get();
-  if (!snap?.exists) return { ok: false, reason: "REQUEST_NOT_FOUND" };
-  const data = snap.data() || {};
-  if (clean(data.linkedBookingId)) {
-    return { ok: false, reason: "BOOKING_ALREADY_LINKED", request: { requestId, ...data } };
+  const firestore = resolveAvailabilityRequestDb(connection);
+  if (!firestore || typeof firestore.runTransaction !== "function") {
+    return { ok: false, reason: "MISSING_REQUEST_REF" };
   }
-  const processing = clean(data.customerConfirmProcessingStatus);
-  if (processing === "processing" || processing === "done") {
-    return { ok: false, reason: "ALREADY_PROCESSING", request: { requestId, ...data } };
+
+  // Single atomic transaction: the eligibility read and the idle->processing
+  // write must happen as one unit, or two near-simultaneous callers can both
+  // read "idle" before either writes and both proceed to execute the booking.
+  // Every existing eligibility check is preserved unchanged, just moved
+  // inside the transaction boundary.
+  let claimReason = null;
+  let claimedData = null;
+  try {
+    await firestore.runTransaction(async (transaction) => {
+      const snap = await transaction.get(ref);
+      if (!snap?.exists) {
+        claimReason = "REQUEST_NOT_FOUND";
+        return;
+      }
+      const data = snap.data() || {};
+      claimedData = data;
+      if (clean(data.linkedBookingId)) {
+        claimReason = "BOOKING_ALREADY_LINKED";
+        return;
+      }
+      const processing = clean(data.customerConfirmProcessingStatus);
+      if (processing === "processing" || processing === "done") {
+        claimReason = "ALREADY_PROCESSING";
+        return;
+      }
+      const expiry = classifyOptionalExpiryTimestamp(data.confirmExpiresAt);
+      if (expiry.state === "invalid") {
+        claimReason = "REQUEST_EXPIRY_INVALID";
+        return;
+      }
+      if (expiry.state === "expired") {
+        claimReason = "REQUEST_EXPIRED";
+        return;
+      }
+      // set(..., {merge:true}) rather than update(): existence is already
+      // proven by the transaction.get() above, and merge-set is supported by
+      // every Firestore transaction object uniformly.
+      transaction.set(
+        ref,
+        {
+          customerConfirmProcessingStatus: "processing",
+          customerConfirmProcessingStartedAtMs: Date.now(),
+          updatedAt: new Date(),
+        },
+        { merge: true }
+      );
+    });
+  } catch {
+    return { ok: false, reason: "CLAIM_FAILED" };
   }
-  const expiry = classifyOptionalExpiryTimestamp(data.confirmExpiresAt);
-  if (expiry.state === "invalid") {
-    return { ok: false, reason: "REQUEST_EXPIRY_INVALID", request: { requestId, ...data } };
+
+  if (claimReason) {
+    return {
+      ok: false,
+      reason: claimReason,
+      ...(claimedData ? { request: { requestId, ...claimedData } } : {}),
+    };
   }
-  if (expiry.state === "expired") {
-    return { ok: false, reason: "REQUEST_EXPIRED", request: { requestId, ...data } };
-  }
-  const updated = await updateAvailabilityRequestFields({
-    db: connection,
-    businessId,
-    requestId,
-    patch: {
-      customerConfirmProcessingStatus: "processing",
-      customerConfirmProcessingStartedAtMs: Date.now(),
-    },
-  });
-  if (!updated) return { ok: false, reason: "CLAIM_FAILED" };
   const fresh = await getAvailabilityRequest({ db: connection, businessId, requestId });
   return { ok: true, request: fresh };
 }
