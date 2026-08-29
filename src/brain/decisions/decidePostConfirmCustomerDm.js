@@ -4795,8 +4795,25 @@ export async function executeCloudDmOwnershipDecision({
     };
   } catch (err) {
     const reason = String(err?.message ?? err ?? "OPENAI_ERROR");
+    const timedOut = /TIMEOUT/i.test(reason);
+    // Observability only: this catch previously returned silently with no
+    // console output at all, making a raw API/network failure on the Cloud
+    // DM ownership call structurally invisible in logs (distinct from the
+    // [cloud_dm_ownership_structural_rejected] warn below, which only fires
+    // for a parseable-but-invalid model response). Return value is
+    // unchanged.
+    console.error("[cloud_dm_ownership_openai_call_failed]", {
+      currentOwnershipTurnId: clean(facts?.currentOwnershipTurnId, 320) || null,
+      classifiedReason: timedOut
+        ? "CLOUD_DM_OWNERSHIP_OPENAI_TIMEOUT"
+        : "CLOUD_DM_OWNERSHIP_OPENAI_ERROR",
+      timedOut,
+      errorName: err?.name ? String(err.name).slice(0, 80) : null,
+      errorMessage: reason.slice(0, 200),
+      messagePreview: userLine.slice(0, 120),
+    });
     return cloudDmOwnershipUnusableResult({
-      reason: /TIMEOUT/i.test(reason)
+      reason: timedOut
         ? "CLOUD_DM_OWNERSHIP_OPENAI_TIMEOUT"
         : `CLOUD_DM_OWNERSHIP_OPENAI_ERROR:${reason.slice(0, 120)}`,
       retryable: true,
