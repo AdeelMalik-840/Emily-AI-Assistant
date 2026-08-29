@@ -751,6 +751,8 @@ export async function sendAvailabilityCustomerNotification({
       excludeItemId: clean(current.itemId),
       referenceItemLabel: clean(current.itemLabel),
       limit: 2,
+      requestedStart: current.requestedStartAt ?? null,
+      requestedEnd: current.requestedEndAt ?? null,
     });
     built = buildAvailabilityCustomerNotificationMessage(current, {
       alternativeLabels: alternatives.map((row) => row.itemLabel),

@@ -295,6 +295,8 @@ async function buildAlternativesReplyForRequest(request) {
     excludeItemId: clean(request?.itemId),
     referenceItemLabel: clean(request?.itemLabel),
     limit: 2,
+    requestedStart: request?.requestedStartAt ?? null,
+    requestedEnd: request?.requestedEndAt ?? null,
   });
   if (alternatives.length === 0) {
     return buildRejectedAvailabilityNoOptionsMessage();
@@ -1848,6 +1850,14 @@ export async function loadAvailabilityRequestById(params) {
 export async function buildAvailabilityRecordedPriceInfoReply({ request }) {
   const reply = await buildPriceReplyForRequest(request, { withConfirmPrompt: false });
   return { reply, promptType: AVAILABILITY_DM_PROMPT_TYPES.PRICE_INFO };
+}
+
+/**
+ * Test-only wrapper for the legacy-flag-OFF alternatives reply builder.
+ * @param {Record<string, unknown>} request
+ */
+export async function __buildAvailabilityAlternativesReplyForTests(request) {
+  return buildAlternativesReplyForRequest(request);
 }
 
 export { resolveAvailabilityCustomerDmPromptType };

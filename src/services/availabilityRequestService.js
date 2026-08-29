@@ -11,6 +11,7 @@ import {
   isRetryablePhoneExtractionError,
 } from "./availabilityCustomerPhone.js";
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
+import { toValidBookingDate } from "../brain/facts/bookingDateUtils.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
@@ -455,6 +456,8 @@ function normalizeAvailabilityRequestPayload(payload = {}, executionContext = {}
   const ownerTarget = clean(payload.ownerTarget) || null;
   const requestedDuration = toFiniteNumber(payload.requestedDuration ?? payload.durationDays);
   const requestedDates = normalizeRequestedDates(payload.requestedDates);
+  const requestedStartAt = toValidBookingDate(payload.requestedStartAt);
+  const requestedEndAt = toValidBookingDate(payload.requestedEndAt);
   const canonicalAvailabilityStatus =
     clean(payload.canonicalAvailabilityStatus) ||
     clean(payload.canonicalAvailability?.status) ||
@@ -474,6 +477,8 @@ function normalizeAvailabilityRequestPayload(payload = {}, executionContext = {}
     status: "pending",
     requestedDuration,
     requestedDates,
+    requestedStartAt,
+    requestedEndAt,
     canonicalAvailabilityStatus,
     priceQuote,
     ownerNotificationStatus: "not_started",
@@ -641,6 +646,8 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     status: normalized.status,
     requestedDuration: normalized.requestedDuration,
     requestedDates: normalized.requestedDates,
+    requestedStartAt: normalized.requestedStartAt,
+    requestedEndAt: normalized.requestedEndAt,
     canonicalAvailabilityStatus: normalized.canonicalAvailabilityStatus,
     priceQuote: normalized.priceQuote,
     ownerNotificationStatus: normalized.ownerNotificationStatus,
