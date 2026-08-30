@@ -4782,6 +4782,26 @@ export async function executeCloudDmOwnershipDecision({
       trustedFreshItemFocusPresent: Boolean(trustedFocusId),
       trustedFreshItemFocusId: trustedFocusId,
       recentConversationCount: countRecentConversationTurns(conversationHistory),
+      // Diagnostic only: exposes the already-normalized temporalRequest this
+      // decision carries so a real-model startDateKind classification (e.g.
+      // explicit_date vs. unresolved for an invalid calendar date) is provable
+      // from logs instead of inferred. Reading these fields changes nothing —
+      // no downstream code consumes this log line.
+      temporalRequest: {
+        startDateKind: decision.temporalRequest?.startDateKind ?? null,
+        day: decision.temporalRequest?.startDate?.day ?? null,
+        month: decision.temporalRequest?.startDate?.month ?? null,
+        // Always null under the current contract: the model is never allowed
+        // to propose a year (runtime resolves it deterministically). Kept
+        // here so a future contract violation would be visible in logs.
+        year: null,
+        relativeDate:
+          decision.temporalRequest?.startDateKind === "relative_tomorrow"
+            ? "tomorrow"
+            : decision.temporalRequest?.startDateKind === "relative_day_after_tomorrow"
+              ? "day_after_tomorrow"
+              : null,
+      },
     });
     return {
       ok: true,

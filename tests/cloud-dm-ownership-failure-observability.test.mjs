@@ -294,3 +294,170 @@ test("CLOUD_SEMANTIC_TECHNICAL_RECOVERY reply and routing remain unchanged by th
   assert.ok(sentPayload, "expected an outbound send for the technical fallback");
   assert.equal(sentPayload.reply, POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK);
 });
+
+// --- temporalRequest classification diagnostic (successful decisions) ---
+//
+// The live-acceptance audit found that [cloud_dm_ownership_decided] never
+// logged the model-proposed temporalRequest at all, so it was impossible to
+// prove from logs alone whether GPT-4o classified an invalid calendar date
+// (e.g. "31 February") as startDateKind=explicit_date (correct: deterministic
+// code then detects the invalid date) or startDateKind=unresolved (routes to
+// the generic ambiguous-date wording instead, bypassing invalid-date
+// detection entirely). These tests prove only that the new log field
+// faithfully reflects the already-normalized decision.temporalRequest, and
+// that reading it for logging changes nothing about the returned decision.
+
+function successfulOwnershipMock(temporalRequest) {
+  return async () => ({
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            turnScope: "NEW_TRANSACTION",
+            semanticIntent: "availability_inquiry",
+            itemScope: "specific",
+            itemReferents: [
+              {
+                source: "current_turn",
+                surfaceText: "Corolla",
+                start: 0,
+                end: 7,
+                trustedItemId: null,
+                sourceTurnId: null,
+              },
+            ],
+            itemReferenceMode: "CURRENT_TURN",
+            targetReference: { source: "none", sourceTurnId: null, targetType: "none", targetId: null },
+            targetId: null,
+            mutationIntent: "none",
+            action: "reply",
+            factKind: "booking_fact",
+            capability: null,
+            evidenceNeeds: [],
+            temporalRequest,
+          }),
+        },
+      },
+    ],
+  });
+}
+
+test("1. successful decision logs a normalized explicit_date temporalRequest (proves the 31 February live-equivalent classification)", async () => {
+  const message = "Corolla 31 February se 2 din ke liye available hai?";
+  const run = withConsoleSpy("log", async () =>
+    executeCloudDmOwnershipDecision({
+      facts: { catalogItems: [{ id: "corolla", name: "Corolla" }] },
+      userMessage: message,
+      __chatCompletionsCreateForTests: successfulOwnershipMock({
+        startDateKind: "explicit_date",
+        startDate: { day: 31, month: 2 },
+      }),
+    })
+  );
+  const { result, calls } = await run();
+
+  const event = calls.find(([name]) => name === "[cloud_dm_ownership_decided]");
+  assert.ok(event, "expected [cloud_dm_ownership_decided] log");
+  assert.deepEqual(event[1].temporalRequest, {
+    startDateKind: "explicit_date",
+    day: 31,
+    month: 2,
+    year: null,
+    relativeDate: null,
+  });
+
+  // Diagnostic-only: the underlying decision is unaffected.
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.decision.temporalRequest, {
+    startDateKind: "explicit_date",
+    startDate: { day: 31, month: 2 },
+  });
+});
+
+test("2. successful decision logs a normalized unresolved temporalRequest (the deviation the live audit inferred)", async () => {
+  const message = "Corolla 31 February se 2 din ke liye available hai?";
+  const run = withConsoleSpy("log", async () =>
+    executeCloudDmOwnershipDecision({
+      facts: { catalogItems: [{ id: "corolla", name: "Corolla" }] },
+      userMessage: message,
+      __chatCompletionsCreateForTests: successfulOwnershipMock({
+        startDateKind: "unresolved",
+        startDate: null,
+      }),
+    })
+  );
+  const { result, calls } = await run();
+
+  const event = calls.find(([name]) => name === "[cloud_dm_ownership_decided]");
+  assert.ok(event, "expected [cloud_dm_ownership_decided] log");
+  assert.deepEqual(event[1].temporalRequest, {
+    startDateKind: "unresolved",
+    day: null,
+    month: null,
+    year: null,
+    relativeDate: null,
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.decision.temporalRequest, {
+    startDateKind: "unresolved",
+    startDate: null,
+  });
+});
+
+test("3. temporalRequest logging does not alter the returned ownership decision", async () => {
+  const message = "Corolla 31 February se 2 din ke liye available hai?";
+  const mock = successfulOwnershipMock({
+    startDateKind: "explicit_date",
+    startDate: { day: 31, month: 2 },
+  });
+
+  const spied = await withConsoleSpy("log", async () =>
+    executeCloudDmOwnershipDecision({
+      facts: { catalogItems: [{ id: "corolla", name: "Corolla" }] },
+      userMessage: message,
+      __chatCompletionsCreateForTests: mock,
+    })
+  )();
+
+  const originalLog = console.log;
+  console.log = () => {};
+  let unspiedResult;
+  try {
+    unspiedResult = await executeCloudDmOwnershipDecision({
+      facts: { catalogItems: [{ id: "corolla", name: "Corolla" }] },
+      userMessage: message,
+      __chatCompletionsCreateForTests: mock,
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  // Whether or not the new diagnostic is observed, the returned decision
+  // (and every field routing/retry/reply logic reads) is byte-identical.
+  assert.deepEqual(spied.result, unspiedResult);
+});
+
+test("4. relativeDate diagnostic label reflects relative_tomorrow / relative_day_after_tomorrow without changing the decision", async () => {
+  for (const [startDateKind, expectedLabel] of [
+    ["relative_tomorrow", "tomorrow"],
+    ["relative_day_after_tomorrow", "day_after_tomorrow"],
+    ["none", null],
+  ]) {
+    const run = withConsoleSpy("log", async () =>
+      executeCloudDmOwnershipDecision({
+        facts: { catalogItems: [{ id: "corolla", name: "Corolla" }] },
+        userMessage: "Corolla kal se 2 din ke liye available hai?",
+        __chatCompletionsCreateForTests: successfulOwnershipMock({
+          startDateKind,
+          startDate: null,
+        }),
+      })
+    );
+    const { result, calls } = await run();
+    const event = calls.find(([name]) => name === "[cloud_dm_ownership_decided]");
+    assert.ok(event, `expected [cloud_dm_ownership_decided] log for ${startDateKind}`);
+    assert.equal(event[1].temporalRequest.relativeDate, expectedLabel);
+    assert.equal(result.decision.temporalRequest.startDateKind, startDateKind);
+  }
+});
