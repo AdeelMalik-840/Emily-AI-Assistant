@@ -191,8 +191,12 @@ test("post-anchor message whose forward returns false is retried, not permanentl
 
   const tick1 = admit({ msg, sorted, freshState, tickMs: 1_000 });
   assert.equal(tick1.admittedTurns.length, 1, "first extraction admits the new post-anchor row");
-  assert.ok(freshState.admittedFreshStableIds.has(stableId));
-  assert.ok(freshState.tickFirstSeenByStableId.has(stableId));
+  assert.equal(
+    freshState.admittedFreshStableIds.has(stableId),
+    false,
+    "tick-local admit must not durably mark session-seen"
+  );
+  assert.equal(freshState.tickFirstSeenByStableId.has(stableId), false);
 
   const pass1 = await runPlaywrightForwardPass({
     messagesToForward: [msg],
@@ -248,7 +252,7 @@ test("post-anchor message whose forward throws is retried, not permanently sessi
   });
 
   admit({ msg, sorted, freshState, tickMs: 1_000 });
-  assert.ok(freshState.admittedFreshStableIds.has(stableId));
+  assert.equal(freshState.admittedFreshStableIds.has(stableId), false);
 
   const pass1 = await runPlaywrightForwardPass({
     messagesToForward: [msg],
@@ -307,7 +311,7 @@ test("post-anchor message whose forward succeeds stays permanently session_seen 
   assert.equal(pass1.anyForwarded, true);
   assert.equal(pipelineCalls.length, 1);
 
-  // Success leaves the admission mark exactly as resolveFreshAdmittedTurns() set it.
+  // Success commits durable session-seen at the same boundary as tail-anchor advance.
   assert.ok(freshState.admittedFreshStableIds.has(stableId));
   assert.ok(freshState.tickFirstSeenByStableId.has(stableId));
 
@@ -460,7 +464,11 @@ test("distinct durable WhatsApp IDs at a reused index remain independently admit
   const idA = buildStableMessageKey(msgA, sortedA).id;
   const tickA = admit({ msg: msgA, sorted: sortedA, freshState, tickMs: 1_000 });
   assert.equal(tickA.admittedTurns.length, 1);
-  assert.ok(freshState.admittedFreshStableIds.has(idA));
+  assert.equal(
+    freshState.admittedFreshStableIds.has(idA),
+    false,
+    "tick-local admit of A must not durably session-see A before forward"
+  );
 
   // msgA is later replaced in the DOM by msgB at the same sorted index (a
   // real WhatsApp Web index-reuse scenario) -- msgB carries a distinct

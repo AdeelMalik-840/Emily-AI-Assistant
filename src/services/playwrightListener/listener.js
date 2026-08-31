@@ -3736,11 +3736,7 @@ export function filterGuaranteeFirstEligibleUserRows(p) {
   const droppedBaseline = [];
   /** @type {any[]} */
   const survivors = [];
-
-  if (!freshState.tickFirstSeenByStableId) {
-    freshState.tickFirstSeenByStableId = new Map();
-  }
-  const tickFirstSeen = freshState.tickFirstSeenByStableId;
+  const tickLocalAdmitted = new Set();
 
   for (const msg of userMessages) {
     const sortedIndex = Number(msg?.__position);
@@ -3862,14 +3858,25 @@ export function filterGuaranteeFirstEligibleUserRows(p) {
       continue;
     }
 
-    if (!tickFirstSeen.has(stableId)) {
-      tickFirstSeen.set(stableId, tickMs);
+    if (
+      hasStableIdBeenSeenInFreshSession(freshState, stableId) ||
+      tickLocalAdmitted.has(stableId)
+    ) {
+      if (droppedDone.length < 3) droppedDone.push(stableId);
+      console.log("[guarantee_first_row_decision]", {
+        chatKey,
+        stableId,
+        sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
+        textPreview: String(msg?.text ?? "").slice(0, 120),
+        finalDecision: "drop",
+        dropReason: "session_seen_stable_id",
+        guaranteeState: st?.state || "idle",
+      });
+      continue;
     }
 
+    tickLocalAdmitted.add(stableId);
     survivors.push(msg);
-    if (freshState.admittedFreshStableIds instanceof Set) {
-      freshState.admittedFreshStableIds.add(stableId);
-    }
     if (matchesBaselineDeferredTailUser(msg, freshState, extractedList)) {
       console.log("[baseline_tail_user_admitted]", {
         chatKey,
@@ -3924,6 +3931,33 @@ function hasStableIdBeenSeenInFreshSession(freshState, stableId) {
     freshState?.tickFirstSeenByStableId instanceof Map &&
     freshState.tickFirstSeenByStableId.has(sid)
   );
+}
+
+/**
+ * Durable in-session seen commit. Call only after forwardToPipeline === true
+ * (same success boundary as cursor persist / tail-anchor advance).
+ * Tick-local admission must not write these structures.
+ * @param {object | null | undefined} freshState
+ * @param {Iterable<string>} stableIds
+ * @param {number} [tickMs]
+ */
+export function commitDurableFreshSessionSeen(freshState, stableIds, tickMs = Date.now()) {
+  if (!freshState || typeof freshState !== "object") return;
+  if (!(freshState.admittedFreshStableIds instanceof Set)) {
+    freshState.admittedFreshStableIds = new Set();
+  }
+  if (!(freshState.tickFirstSeenByStableId instanceof Map)) {
+    freshState.tickFirstSeenByStableId = new Map();
+  }
+  const now = Number(tickMs) || Date.now();
+  for (const raw of stableIds || []) {
+    const sid = String(raw ?? "").trim();
+    if (!sid) continue;
+    freshState.admittedFreshStableIds.add(sid);
+    if (!freshState.tickFirstSeenByStableId.has(sid)) {
+      freshState.tickFirstSeenByStableId.set(sid, now);
+    }
+  }
 }
 
 function hasNewerConflictingVerifiedUserRowForIndexReuse({
@@ -4068,11 +4102,6 @@ export function resolveFreshAdmittedTurns(p) {
       ledgerState,
     });
   };
-
-  if (!freshState.tickFirstSeenByStableId) {
-    freshState.tickFirstSeenByStableId = new Map();
-  }
-  const tickFirstSeen = freshState.tickFirstSeenByStableId;
 
   for (const msg of userMessages) {
     const sortedIndex = Number(msg?.__position);
@@ -4226,10 +4255,9 @@ export function resolveFreshAdmittedTurns(p) {
       continue;
     }
 
-    const seenInFreshSession = hasStableIdBeenSeenInFreshSession(
-      freshState,
-      stableId
-    );
+    const seenInFreshSession =
+      hasStableIdBeenSeenInFreshSession(freshState, stableId) ||
+      currentFreshAdmittedStableIds.has(stableId);
     if (seenInFreshSession) {
       if (droppedDone.length < 3) droppedDone.push(stableId);
       console.log("[guarantee_first_row_decision]", {
@@ -4310,9 +4338,6 @@ export function resolveFreshAdmittedTurns(p) {
     const admissionReason = isUnseenIndexReuseAdmission
       ? "ADMITTED_UNSEEN_WHATSAPP_ID_INDEX_REUSE"
       : "ADMITTED_POST_CURRENT_ANCHOR";
-    if (!tickFirstSeen.has(stableId)) {
-      tickFirstSeen.set(stableId, tickMs);
-    }
 
     survivors.push(msg);
     const participantKey = String(msg?.participantKey ?? "").trim() || "(missing)";
@@ -4342,9 +4367,6 @@ export function resolveFreshAdmittedTurns(p) {
       ledgerState: st?.state || "idle",
       originalRow: msg,
     });
-    if (freshState.admittedFreshStableIds instanceof Set) {
-      freshState.admittedFreshStableIds.add(stableId);
-    }
     if (matchesBaselineDeferredTailUser(msg, freshState, extractedList)) {
       console.log("[baseline_tail_user_admitted]", {
         chatKey,
@@ -4498,10 +4520,7 @@ export function filterPostAnchorFreshUserRows(p) {
   const ledger = Array.isArray(freshState?.sessionVisibilityLedger)
     ? freshState.sessionVisibilityLedger
     : [];
-  if (!freshState.tickFirstSeenByStableId) {
-    freshState.tickFirstSeenByStableId = new Map();
-  }
-  const tickFirstSeen = freshState.tickFirstSeenByStableId;
+  const tickLocalAdmitted = new Set();
 
   supersedeAnchorHoldIfNewerPostAnchorRow(
     freshState,
@@ -4817,9 +4836,23 @@ export function filterPostAnchorFreshUserRows(p) {
       continue;
     }
 
-    if (!tickFirstSeen.has(stableId)) {
-      tickFirstSeen.set(stableId, tickMs);
+    if (
+      hasStableIdBeenSeenInFreshSession(freshState, stableId) ||
+      tickLocalAdmitted.has(stableId)
+    ) {
+      if (droppedDone.length < 2) droppedDone.push(stableId);
+      logFreshDeltaRowDecisionTrace({
+        ...traceBase,
+        stableId,
+        holdEligible,
+        sameIndexDecision,
+        finalDecision: "drop",
+        dropReason: "session_seen_stable_id",
+      });
+      continue;
     }
+
+    tickLocalAdmitted.add(stableId);
 
     if (holdEligible && freshState.anchorHoldUserForward) {
       freshState.anchorHoldUserForward.consumed = true;
@@ -4840,9 +4873,6 @@ export function filterPostAnchorFreshUserRows(p) {
       dropReason: null,
     });
     survivors.push(msg);
-    if (freshState.admittedFreshStableIds instanceof Set) {
-      freshState.admittedFreshStableIds.add(stableId);
-    }
     console.log("[fresh_delta_post_anchor_candidate]", {
       chatKey,
       stableId,
@@ -5404,6 +5434,7 @@ function getFreshDeltaChatState(chatKey) {
     /** Phase A: reuse __rowKey across polls (identity pin → rowKey, stableId → rowKey). */
     pinnedRowKeyByIdentityPin: new Map(),
     pinnedRowKeyByStableId: new Map(),
+    tickFirstSeenByStableId: new Map(),
   };
   globalThis.__playwrightFreshDeltaState[key] = next;
   return next;
@@ -9191,25 +9222,12 @@ export async function runPlaywrightForwardPass(p = {}) {
   const scheduledStableIds = [];
   const lockSkippedStableIds = [];
 
-  // A row's stableId is written into freshState.admittedFreshStableIds /
-  // tickFirstSeenByStableId by resolveFreshAdmittedTurns() the moment it
-  // passes the anchor/index gate -- before this pass ever attempts to
-  // forward it. The persistent inbound-turn ledger is marked "processing"
-  // for the same stableId just below, before the forward attempt too. Both
-  // marks have no expiry and nothing else in the file rolls them back, so a
-  // row whose forward attempt here fails (forwardToPipeline returns false,
-  // or throws) would otherwise be permanently unrecoverable: every later
-  // tick re-extracts the same still-visible message and either
-  // hasStableIdBeenSeenInFreshSession() reports it as already handled
-  // (dropReason: "session_seen_stable_id"), or the ledger's own
-  // resolveInboundTurnAdmissionBlock() blocks it as still "processing"
-  // until PROCESSING_STALE_MS quietly expires. Mirrors the existing failure
-  // handling just below (notifyPlaywrightGuaranteeReleased +
-  // __playwrightFailedRetryCount) so a genuinely unforwarded row becomes
-  // eligible for admission again on the next tick. A row that forwarded
-  // successfully is untouched by any of this -- its admission mark stays
-  // exactly as resolveFreshAdmittedTurns() set it, so stable-ID dedupe for
-  // completed messages is unchanged.
+  // Durable session-seen is committed only after forwardToPipeline === true.
+  // That return is the irreversible handoff: later listener bookkeeping
+  // (pending map, tail-anchor, visibility ledger) must not un-see the id,
+  // mark the inbound ledger failed, or release the guarantee as a failed
+  // forward. 7eaa07f rollback applies only when the handoff itself fails
+  // (forward returns false or throws before accept).
   const rollbackFreshAdmissionOnForwardFailure = (ids, failureReason) => {
     for (const sid of ids) {
       if (!sid) continue;
@@ -9401,11 +9419,12 @@ export async function runPlaywrightForwardPass(p = {}) {
       }
     }
     setMessageState(guaranteeKey, "processing");
+    const listenerInboundId =
+      String(msg?.__listenerInboundId ?? "").trim() ||
+      getMessageIdFromExtracted(msg, extractedMessages);
+    let forwarded = false;
     try {
-      const listenerInboundId =
-        String(msg?.__listenerInboundId ?? "").trim() ||
-        getMessageIdFromExtracted(msg, extractedMessages);
-      const forwarded = await forwardToPipeline({
+      forwarded = await forwardToPipeline({
         messageId,
         text: msg.text,
         sender: msg.sender,
@@ -9431,89 +9450,6 @@ export async function runPlaywrightForwardPass(p = {}) {
         cursorLastAssistantOutboundTrace:
           msg.__persistedCursor?.lastAssistantOutboundTrace || null,
       });
-      if (forwarded) {
-        anyForwarded = true;
-        for (const sid of claimIds) {
-          if (sid) scheduledStableIds.push(sid);
-        }
-        globalThis.__playwrightChatLastProcessedAt =
-          globalThis.__playwrightChatLastProcessedAt ||
-          Object.create(null);
-        globalThis.__playwrightChatLastProcessedAt[chatKey] =
-          Date.now();
-        if (
-          globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map
-        ) {
-          globalThis.__playwrightListenerMsgIdByGuarantee.set(
-            guaranteeKey,
-            listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages)
-          );
-        }
-        recordPlaywrightInboundScheduled({
-          guaranteeKey,
-          chatKey,
-          rowKey: String(msg.__rowKey ?? "").trim(),
-          participantCursorKey: participantCursorKeyForMessage(chatKey, msg),
-          burstStableIds: claimIds,
-          ownerUserId: ownerUserIdForCursor,
-          groupChatKey: chatKey,
-          participantKey: String(msg.participantKey ?? "").trim(),
-          inboundId:
-            listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages),
-          sourceMessageIndex:
-            msg.sourceMessageIndex != null &&
-            Number.isFinite(Number(msg.sourceMessageIndex))
-              ? Number(msg.sourceMessageIndex)
-              : msg.__position,
-        });
-        if (
-          freshState &&
-          matchesBaselineDeferredTailUser(msg, freshState, extractedMessages)
-        ) {
-          if (freshState.baselineDeferredTailUser) {
-            freshState.baselineDeferredTailUser.consumed = true;
-          }
-          if (freshState.anchorHoldUserForward) {
-            freshState.anchorHoldUserForward.consumed = true;
-          }
-        }
-        if (freshState) {
-          // Advance runtime anchor only after a successfully admitted/forwarded turn.
-          advanceTailAnchor(
-            freshState,
-            msg,
-            sortedWithPos,
-            chatKey,
-            extractedMessages
-          );
-          recordSessionVisibilityLedger(
-            freshState,
-            sortedWithPos,
-            Number(msg?.__position) >= 0
-              ? Number(msg.__position)
-              : sortedWithPos.length - 1,
-            chatKey,
-            sortedWithPos
-          );
-        }
-      } else {
-        globalThis.__chatResponding[chatKey] = false;
-        globalThis.__processingChats.delete(chatKey);
-        if (globalThis.__playwrightFailedRetryCount instanceof Map) {
-          globalThis.__playwrightFailedRetryCount.set(
-            guaranteeKey,
-            Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0) + 1
-          );
-        }
-        notifyPlaywrightGuaranteeReleased(guaranteeKey);
-        rollbackFreshAdmissionOnForwardFailure(claimIds, "forward_returned_false");
-        console.log("[fresh_admission_rolled_back_on_forward_failure]", {
-          chatKey,
-          guaranteeKey,
-          claimIds,
-          reason: "forward_returned_false",
-        });
-      }
     } catch (fwdErr) {
       globalThis.__chatResponding[chatKey] = false;
       globalThis.__processingChats.delete(chatKey);
@@ -9537,6 +9473,135 @@ export async function runPlaywrightForwardPass(p = {}) {
       console.error(
         "[Playwright] forwardPlaywrightGroupToPipeline error:",
         fwdErr instanceof Error ? fwdErr.message : fwdErr
+      );
+      continue;
+    }
+    if (!forwarded) {
+      // Pre-handoff: forwardToPipeline itself never accepted this inbound, so
+      // durable seen was never committed. This cleanup (guarantee release,
+      // admission rollback, retry-count bookkeeping) must not be able to
+      // abort the remaining messagesToForward for this tick if any of it
+      // unexpectedly throws -- mirrors the post-handoff bookkeeping try/catch
+      // below. A cleanup failure here is logged and swallowed; it never
+      // durably marks the row seen and never promotes this into post-handoff
+      // behavior.
+      try {
+        globalThis.__chatResponding[chatKey] = false;
+        globalThis.__processingChats.delete(chatKey);
+        if (globalThis.__playwrightFailedRetryCount instanceof Map) {
+          globalThis.__playwrightFailedRetryCount.set(
+            guaranteeKey,
+            Number(globalThis.__playwrightFailedRetryCount.get(guaranteeKey) ?? 0) + 1
+          );
+        }
+        notifyPlaywrightGuaranteeReleased(guaranteeKey);
+        rollbackFreshAdmissionOnForwardFailure(claimIds, "forward_returned_false");
+        console.log("[fresh_admission_rolled_back_on_forward_failure]", {
+          chatKey,
+          guaranteeKey,
+          claimIds,
+          reason: "forward_returned_false",
+        });
+      } catch (cleanupErr) {
+        console.log("[fresh_admission_pre_handoff_cleanup_failed]", {
+          chatKey,
+          guaranteeKey,
+          claimIds,
+          reason:
+            cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        });
+        console.error(
+          "[Playwright] pre-handoff cleanup error:",
+          cleanupErr instanceof Error ? cleanupErr.message : cleanupErr
+        );
+      }
+      continue;
+    }
+
+    // Irreversible handoff: pipeline already accepted this inbound.
+    anyForwarded = true;
+    for (const sid of claimIds) {
+      if (sid) scheduledStableIds.push(sid);
+    }
+    commitDurableFreshSessionSeen(freshState, claimIds);
+    try {
+      globalThis.__playwrightChatLastProcessedAt =
+        globalThis.__playwrightChatLastProcessedAt ||
+        Object.create(null);
+      globalThis.__playwrightChatLastProcessedAt[chatKey] =
+        Date.now();
+      if (
+        globalThis.__playwrightListenerMsgIdByGuarantee instanceof Map
+      ) {
+        globalThis.__playwrightListenerMsgIdByGuarantee.set(
+          guaranteeKey,
+          listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages)
+        );
+      }
+      recordPlaywrightInboundScheduled({
+        guaranteeKey,
+        chatKey,
+        rowKey: String(msg.__rowKey ?? "").trim(),
+        participantCursorKey: participantCursorKeyForMessage(chatKey, msg),
+        burstStableIds: claimIds,
+        ownerUserId: ownerUserIdForCursor,
+        groupChatKey: chatKey,
+        participantKey: String(msg.participantKey ?? "").trim(),
+        inboundId:
+          listenerInboundId || getMessageIdFromExtracted(msg, extractedMessages),
+        sourceMessageIndex:
+          msg.sourceMessageIndex != null &&
+          Number.isFinite(Number(msg.sourceMessageIndex))
+            ? Number(msg.sourceMessageIndex)
+            : msg.__position,
+      });
+      if (
+        freshState &&
+        matchesBaselineDeferredTailUser(msg, freshState, extractedMessages)
+      ) {
+        if (freshState.baselineDeferredTailUser) {
+          freshState.baselineDeferredTailUser.consumed = true;
+        }
+        if (freshState.anchorHoldUserForward) {
+          freshState.anchorHoldUserForward.consumed = true;
+        }
+      }
+      if (freshState) {
+        // Advance runtime anchor only after a successfully admitted/forwarded turn.
+        advanceTailAnchor(
+          freshState,
+          msg,
+          sortedWithPos,
+          chatKey,
+          extractedMessages
+        );
+        recordSessionVisibilityLedger(
+          freshState,
+          sortedWithPos,
+          Number(msg?.__position) >= 0
+            ? Number(msg.__position)
+            : sortedWithPos.length - 1,
+          chatKey,
+          sortedWithPos
+        );
+      }
+    } catch (bookkeepingErr) {
+      // Handoff already succeeded. Leave durable seen, ledger processing,
+      // and the in-flight guarantee in place so the same wa:: id cannot be
+      // scheduled again. Stale-recovery may later mark the ledger failed;
+      // session-seen still blocks re-admission.
+      console.log("[fresh_admission_post_handoff_bookkeeping_failed]", {
+        chatKey,
+        guaranteeKey,
+        claimIds,
+        reason:
+          bookkeepingErr instanceof Error
+            ? bookkeepingErr.message
+            : String(bookkeepingErr),
+      });
+      console.error(
+        "[Playwright] post-handoff bookkeeping error:",
+        bookkeepingErr instanceof Error ? bookkeepingErr.message : bookkeepingErr
       );
     }
     }

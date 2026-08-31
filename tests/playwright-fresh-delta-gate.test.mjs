@@ -613,7 +613,11 @@ test("failed retry baseline row → no retry; admitted fresh row → retry eligi
   });
   assert.equal(survivors2.length, 1);
   const sid = buildStableMessageKey(fresh, sorted).id;
-  assert.equal(st.admittedFreshStableIds.has(sid), true);
+  assert.equal(
+    st.admittedFreshStableIds.has(sid),
+    false,
+    "tick-local survivor must not durably session-see before successful forward"
+  );
 });
 
 test("DOM index shift with same data-id treated as seen via baseline", () => {
