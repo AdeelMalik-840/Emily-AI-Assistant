@@ -80,6 +80,14 @@ function clean(value, max = 500) {
   return text ? text.slice(0, max) : "";
 }
 
+function trustedOriginalGroupUserMessageText(request) {
+  const identity =
+    request?.sourceIdentity && typeof request.sourceIdentity === "object"
+      ? request.sourceIdentity
+      : {};
+  return clean(identity.sourceTextPreview) || clean(request?.sourceTextPreview) || "";
+}
+
 function timestampMs(value) {
   if (value == null) return null;
   if (typeof value?.toMillis === "function") {
@@ -778,6 +786,7 @@ export async function executeAvailabilityCustomerConfirmBooking({
       approvalStage: "owner_approved_waiting_customer_details",
       availabilityRequestId: requestId,
       sourceMessage: clean(messageText),
+      originalUserMessageText: trustedOriginalGroupUserMessageText(request),
       sourceTurnKey: customerConfirmTurnKey || originalSourceTurnKey || null,
       sourceMessageId: dmMessageId || null,
       sourceRowKey: clean(sourceIdentity.sourceRowKey),

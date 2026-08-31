@@ -5,6 +5,7 @@ process.env.NODE_ENV = "test";
 
 import { AVAILABILITY_DM_PROMPT_TYPES, containsCustomerFacingOwnerLanguage } from "../src/brain/availabilityConfirmation/index.js";
 import { handleAvailabilityCustomerCloudInbound } from "../src/services/availabilityCustomerConfirmService.js";
+import { executeCreateBooking } from "../src/services/executors/createBookingExecutor.js";
 import { buildConfirmExpiresAt } from "../src/services/availabilityRequestService.js";
 
 const BUSINESS_ID = "owner1";
@@ -144,7 +145,11 @@ function createFakeDb() {
     return store.businesses[BUSINESS_ID]?.bookings?.[bookingId]?.data ?? null;
   }
 
-  return { db, seedAvailabilityRequest, getRequestDoc, getBookingDoc };
+  function listBookingIds() {
+    return Object.keys(store.businesses[BUSINESS_ID]?.bookings ?? {});
+  }
+
+  return { db, seedAvailabilityRequest, getRequestDoc, getBookingDoc, listBookingIds };
 }
 
 function baseWaitingRequest(overrides = {}) {
@@ -447,6 +452,10 @@ test("3B booking D: confirm_booking uses owner_approved_waiting_customer_details
   );
   const sendCalls = [];
   const dmMessageId = "3EB0DM_CONFIRM_001";
+  const {
+    decideWaitingConfirmFromLegacyClassifierForTests,
+    composeWaitingConfirmExecutionReplyForTests,
+  } = await import("./helpers/waitingConfirmBrainTestDouble.mjs");
   const result = await handleAvailabilityCustomerCloudInbound({
     db: fake.db,
     businessId: BUSINESS_ID,
@@ -458,9 +467,9 @@ test("3B booking D: confirm_booking uses owner_approved_waiting_customer_details
       return { ok: true };
     },
     availabilityConfirmExecute: true,
-    __decideCustomerTurnForTests: (
-      await import("./helpers/waitingConfirmBrainTestDouble.mjs")
-    ).decideWaitingConfirmFromLegacyClassifierForTests,
+    __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests:
+      composeWaitingConfirmExecutionReplyForTests,
   });
   assert.equal(result.action, "confirmed_booking");
   const stored = fake.getRequestDoc(REQUEST_ID);
@@ -478,5 +487,205 @@ test("3B booking D: confirm_booking uses owner_approved_waiting_customer_details
   assert.equal(booking.messageId, dmMessageId);
   assert.equal(booking.customerConfirmationMessageId, dmMessageId);
   assert.equal(booking.sourceMessage, "Book kar do");
+  assert.equal(booking.sourceText, "Book kar do");
+  assert.equal(booking.customerConfirmationTextPreview, "Book kar do");
+  assert.equal(booking.sourceTurnKey, `adeel-malik::wa::${dmMessageId}`);
+  assert.equal(booking.sourceMessageId, dmMessageId);
+  assert.equal(booking.originalUserMessageText, "");
+  assert.notEqual(booking.originalUserMessageText, "Book kar do");
   assert.equal(booking.customerDmPlaywrightChatKey, "adeel-malik");
+});
+
+const GROUP_REQUEST_TEXT = "Civic 2 din k liye chahiye";
+const CLOUD_CONFIRM_TEXT = "Kar do";
+const GROUP_ROW_KEY = "real:3EB0BCEDD4FB536A3B0AA2#1";
+const GROUP_SOURCE_TURN_KEY = "leads::wa::3EB0BCEDD4FB536A3B0AA2";
+const CLOUD_CONFIRM_WAMID = "wamid.HBgMOTA1NDQzODI5OTkwFQIAEhgTESTCONFIRM001";
+
+function seedGroupOriginWaitingRequest(fake, extra = {}) {
+  fake.seedAvailabilityRequest(
+    REQUEST_ID,
+    baseWaitingRequest({
+      sourceChatId: "leads",
+      sourceTurnKey: GROUP_SOURCE_TURN_KEY,
+      customerDmChatTitle: "Adeel malik",
+      customerDmPlaywrightChatKey: "adeel-malik",
+      sourceIdentity: {
+        participantKey: "cust-1",
+        chatId: "leads",
+        chatType: "group",
+        sourceRowKey: GROUP_ROW_KEY,
+        sourceTurnKey: GROUP_SOURCE_TURN_KEY,
+        sourceTextPreview: GROUP_REQUEST_TEXT,
+      },
+      ...extra,
+    })
+  );
+}
+
+async function confirmCloudKarDo(fake, messageId = CLOUD_CONFIRM_WAMID) {
+  const sendCalls = [];
+  const {
+    decideWaitingConfirmFromLegacyClassifierForTests,
+    composeWaitingConfirmExecutionReplyForTests,
+  } = await import("./helpers/waitingConfirmBrainTestDouble.mjs");
+  const result = await handleAvailabilityCustomerCloudInbound({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: CLOUD_CONFIRM_TEXT,
+    messageId,
+    sendWhatsAppMessageFn: async (...args) => {
+      sendCalls.push(args);
+      return { ok: true };
+    },
+    availabilityConfirmExecute: true,
+    __decideCustomerTurnForTests: decideWaitingConfirmFromLegacyClassifierForTests,
+    __composeWaitingConfirmExecutionReplyForTests:
+      composeWaitingConfirmExecutionReplyForTests,
+  });
+  return { result, sendCalls };
+}
+
+function assertCloudConfirmFieldsUnchanged(booking, messageId = CLOUD_CONFIRM_WAMID) {
+  assert.equal(booking.sourceTurnKey, `adeel-malik::wa::${messageId}`);
+  assert.equal(booking.sourceMessageId, messageId);
+  assert.equal(booking.messageId, messageId);
+  assert.equal(booking.sourceText, CLOUD_CONFIRM_TEXT);
+  assert.equal(booking.sourceMessage, CLOUD_CONFIRM_TEXT);
+  assert.equal(booking.customerConfirmationMessageId, messageId);
+  assert.equal(booking.customerConfirmationTextPreview, CLOUD_CONFIRM_TEXT);
+}
+
+function locatorExpectedGroupText(booking) {
+  const identity =
+    booking?.sourceIdentity && typeof booking.sourceIdentity === "object"
+      ? booking.sourceIdentity
+      : {};
+  return (
+    String(identity.sourceTextPreview ?? "").trim() ||
+    String(booking?.originalUserMessageText ?? "").trim() ||
+    null
+  );
+}
+
+function pollerReplyPrivateSourceText(booking) {
+  const identity =
+    booking?.sourceIdentity && typeof booking.sourceIdentity === "object"
+      ? booking.sourceIdentity
+      : {};
+  return (
+    String(
+      booking?.originalUserMessageText ?? booking?.sourceText ?? identity.sourceTextPreview ?? ""
+    ).trim() || null
+  );
+}
+
+test("AVR Cloud confirm stores Group originalUserMessageText not Kar do", async () => {
+  const fake = createFakeDb();
+  seedGroupOriginWaitingRequest(fake);
+  const { result } = await confirmCloudKarDo(fake);
+  assert.equal(result.action, "confirmed_booking");
+  const stored = fake.getRequestDoc(REQUEST_ID);
+  const booking = fake.getBookingDoc(stored.linkedBookingId);
+  assert.ok(booking);
+
+  assertCloudConfirmFieldsUnchanged(booking);
+  assert.equal(booking.originalUserMessageText, GROUP_REQUEST_TEXT);
+  assert.notEqual(booking.originalUserMessageText, CLOUD_CONFIRM_TEXT);
+  assert.equal(booking.originalMessageRowKey, GROUP_ROW_KEY);
+  assert.equal(booking.sourceRowKey, GROUP_ROW_KEY);
+  assert.equal(booking.sourcePlaywrightChatKey, "leads");
+  assert.equal(booking.sourceGroupName, "leads");
+  assert.equal(booking.originalAvailabilityRequestSourceTurnKey, GROUP_SOURCE_TURN_KEY);
+  assert.equal(booking.availabilityRequestId, REQUEST_ID);
+  assert.equal(booking.status, "approved");
+  assert.equal(booking.approvalStage, "owner_approved_waiting_customer_details");
+  assert.equal(booking.sourceIdentity?.sourceTextPreview, GROUP_REQUEST_TEXT);
+  assert.notEqual(booking.sourceIdentity?.sourceTextPreview, CLOUD_CONFIRM_TEXT);
+  assert.equal(locatorExpectedGroupText(booking), GROUP_REQUEST_TEXT);
+  assert.equal(pollerReplyPrivateSourceText(booking), GROUP_REQUEST_TEXT);
+  assert.notEqual(pollerReplyPrivateSourceText(booking), CLOUD_CONFIRM_TEXT);
+});
+
+test("AVR Cloud confirm uses request.sourceTextPreview when identity preview is absent", async () => {
+  const fake = createFakeDb();
+  seedGroupOriginWaitingRequest(fake, {
+    sourceTextPreview: GROUP_REQUEST_TEXT,
+    sourceIdentity: {
+      participantKey: "cust-1",
+      chatId: "leads",
+      chatType: "group",
+      sourceRowKey: GROUP_ROW_KEY,
+      sourceTurnKey: GROUP_SOURCE_TURN_KEY,
+    },
+  });
+  const { result } = await confirmCloudKarDo(fake);
+  assert.equal(result.action, "confirmed_booking");
+  const booking = fake.getBookingDoc(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
+  assertCloudConfirmFieldsUnchanged(booking);
+  assert.equal(booking.originalUserMessageText, GROUP_REQUEST_TEXT);
+  assert.notEqual(booking.originalUserMessageText, CLOUD_CONFIRM_TEXT);
+  assert.equal(booking.approvalStage, "owner_approved_waiting_customer_details");
+});
+
+test("AVR Cloud confirm leaves originalUserMessageText empty when Group preview is missing", async () => {
+  const fake = createFakeDb();
+  seedGroupOriginWaitingRequest(fake, {
+    sourceIdentity: {
+      participantKey: "cust-1",
+      chatId: "leads",
+      chatType: "group",
+      sourceRowKey: GROUP_ROW_KEY,
+      sourceTurnKey: GROUP_SOURCE_TURN_KEY,
+    },
+  });
+  const { result } = await confirmCloudKarDo(fake);
+  assert.equal(result.action, "confirmed_booking");
+  const booking = fake.getBookingDoc(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
+  assertCloudConfirmFieldsUnchanged(booking);
+  assert.equal(booking.originalUserMessageText, "");
+  assert.notEqual(booking.originalUserMessageText, CLOUD_CONFIRM_TEXT);
+  assert.equal(booking.sourceIdentity?.sourceTextPreview ?? null, null);
+  assert.notEqual(booking.sourceIdentity?.sourceTextPreview, CLOUD_CONFIRM_TEXT);
+  assert.equal(locatorExpectedGroupText(booking), null);
+  assert.equal(pollerReplyPrivateSourceText(booking), null);
+  assert.notEqual(pollerReplyPrivateSourceText(booking), CLOUD_CONFIRM_TEXT);
+  assert.equal(booking.approvalStage, "owner_approved_waiting_customer_details");
+  assert.equal(booking.status, "approved");
+});
+
+test("same Cloud sourceTurnKey does not create a second booking", async () => {
+  const fake = createFakeDb();
+  seedGroupOriginWaitingRequest(fake);
+  const { result } = await confirmCloudKarDo(fake);
+  assert.equal(result.action, "confirmed_booking");
+  const firstId = fake.getRequestDoc(REQUEST_ID).linkedBookingId;
+  const first = fake.getBookingDoc(firstId);
+  assert.equal(fake.listBookingIds().length, 1);
+
+  const second = await executeCreateBooking({
+    payload: {
+      itemId: ITEM_ID,
+      itemName: "Honda Civic 2026",
+      durationDays: 2,
+      sourceMessage: CLOUD_CONFIRM_TEXT,
+      sourceTurnKey: first.sourceTurnKey,
+      sourceMessageId: CLOUD_CONFIRM_WAMID,
+    },
+    executionContext: {
+      businessId: BUSINESS_ID,
+      traceId: "confirm-source-turn-idempotency",
+      dbOverride: fake.db,
+    },
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.booking?.id, firstId);
+  assert.equal(second.booking?.duplicateSourceTurn, true);
+  assert.equal(fake.listBookingIds().length, 1);
+  const stored = fake.getBookingDoc(firstId);
+  assertCloudConfirmFieldsUnchanged(stored);
+  assert.equal(stored.originalUserMessageText, GROUP_REQUEST_TEXT);
+  assert.equal(stored.approvalStage, "owner_approved_waiting_customer_details");
 });

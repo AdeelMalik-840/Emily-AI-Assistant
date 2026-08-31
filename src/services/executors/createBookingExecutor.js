@@ -215,9 +215,10 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
             executionContext?.senderScope ??
             ""
         ).trim() || undefined,
-      originalUserMessageText:
-        String(payload?.sourceMessage ?? executionContext?.message ?? "").trim() ||
-        undefined,
+      originalUserMessageText: Object.hasOwn(payload ?? {}, "originalUserMessageText")
+        ? String(payload.originalUserMessageText ?? "").trim()
+        : String(payload?.sourceMessage ?? executionContext?.message ?? "").trim() ||
+          undefined,
       // Trusted approved window from the same AVR the confirm gate above
       // already fetched — never re-derived from "now", never re-parsed from
       // customer text. Absent for legacy/no-AVR bookings, which keep the
