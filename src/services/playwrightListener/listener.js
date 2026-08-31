@@ -44,6 +44,7 @@ import {
   hydrateInboundTurnLedgerIntoMessageState,
   isInboundTurnLedgerEnabled,
   markInboundTurnLedgerBaselineAbsorbed,
+  markInboundTurnLedgerFailed,
   markInboundTurnLedgerProcessing,
   resolveInboundTurnAdmissionBlock,
 } from "../inboundTurnLedger.js";
@@ -9190,6 +9191,45 @@ export async function runPlaywrightForwardPass(p = {}) {
   const scheduledStableIds = [];
   const lockSkippedStableIds = [];
 
+  // A row's stableId is written into freshState.admittedFreshStableIds /
+  // tickFirstSeenByStableId by resolveFreshAdmittedTurns() the moment it
+  // passes the anchor/index gate -- before this pass ever attempts to
+  // forward it. The persistent inbound-turn ledger is marked "processing"
+  // for the same stableId just below, before the forward attempt too. Both
+  // marks have no expiry and nothing else in the file rolls them back, so a
+  // row whose forward attempt here fails (forwardToPipeline returns false,
+  // or throws) would otherwise be permanently unrecoverable: every later
+  // tick re-extracts the same still-visible message and either
+  // hasStableIdBeenSeenInFreshSession() reports it as already handled
+  // (dropReason: "session_seen_stable_id"), or the ledger's own
+  // resolveInboundTurnAdmissionBlock() blocks it as still "processing"
+  // until PROCESSING_STALE_MS quietly expires. Mirrors the existing failure
+  // handling just below (notifyPlaywrightGuaranteeReleased +
+  // __playwrightFailedRetryCount) so a genuinely unforwarded row becomes
+  // eligible for admission again on the next tick. A row that forwarded
+  // successfully is untouched by any of this -- its admission mark stays
+  // exactly as resolveFreshAdmittedTurns() set it, so stable-ID dedupe for
+  // completed messages is unchanged.
+  const rollbackFreshAdmissionOnForwardFailure = (ids, failureReason) => {
+    for (const sid of ids) {
+      if (!sid) continue;
+      if (freshState?.admittedFreshStableIds instanceof Set) {
+        freshState.admittedFreshStableIds.delete(sid);
+      }
+      if (freshState?.tickFirstSeenByStableId instanceof Map) {
+        freshState.tickFirstSeenByStableId.delete(sid);
+      }
+      if (isInboundTurnLedgerEnabled()) {
+        markInboundTurnLedgerFailed({
+          chatKey,
+          stableId: sid,
+          guaranteeKey: playwrightGuaranteeKeyForStableId(chatKey, sid),
+          lastError: failureReason,
+        });
+      }
+    }
+  };
+
   // Acquire hard chat lock for this chatKey before forwarding (prevents any chat switching).
   if (!activeChatLockKey()) {
     globalThis.__activeChatLock = { chatKey, inProgress: true, startedAtMs: Date.now() };
@@ -9466,6 +9506,13 @@ export async function runPlaywrightForwardPass(p = {}) {
           );
         }
         notifyPlaywrightGuaranteeReleased(guaranteeKey);
+        rollbackFreshAdmissionOnForwardFailure(claimIds, "forward_returned_false");
+        console.log("[fresh_admission_rolled_back_on_forward_failure]", {
+          chatKey,
+          guaranteeKey,
+          claimIds,
+          reason: "forward_returned_false",
+        });
       }
     } catch (fwdErr) {
       globalThis.__chatResponding[chatKey] = false;
@@ -9477,6 +9524,16 @@ export async function runPlaywrightForwardPass(p = {}) {
         );
       }
       notifyPlaywrightGuaranteeReleased(guaranteeKey);
+      rollbackFreshAdmissionOnForwardFailure(
+        claimIds,
+        fwdErr instanceof Error ? fwdErr.message : String(fwdErr)
+      );
+      console.log("[fresh_admission_rolled_back_on_forward_failure]", {
+        chatKey,
+        guaranteeKey,
+        claimIds,
+        reason: "forward_threw",
+      });
       console.error(
         "[Playwright] forwardPlaywrightGroupToPipeline error:",
         fwdErr instanceof Error ? fwdErr.message : fwdErr
