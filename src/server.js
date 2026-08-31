@@ -51,6 +51,7 @@ import { getWhatsAppEnv, validateWhatsAppEnv } from "./utils/env.js";
 import { metaCloudFromIsGroupThread } from "./utils/waMetaThreadMarkers.js";
 import { logBrainV2LiveStartupSnapshot } from "./brain/live/brainRouteGate.js";
 import { handlePollAvailabilityCustomerConfirmManualTrigger } from "./internal/pollAvailabilityCustomerConfirmManualTrigger.js";
+import { handleWhatsAppParticipantIdentityDiagnostic } from "./internal/whatsappParticipantIdentityDiagnostic.js";
 import {
   startLocalAvailabilityCustomerConfirmPollerScheduler,
   stopLocalAvailabilityCustomerConfirmPollerScheduler,
@@ -141,6 +142,16 @@ app.post("/internal/clear-extraction-state", async (req, res) => {
 app.post(
   "/internal/poll-availability-customer-confirm",
   handlePollAvailabilityCustomerConfirmManualTrigger
+);
+
+/**
+ * Read-only Playwright WhatsApp Store participant identity diagnostic.
+ * Requires CLEAR_EXTRACTION_STATE_SECRET and header x-clear-secret.
+ * Does not affect Group identity, forwarding, AVR, Brain, or booking.
+ */
+app.post(
+  "/internal/diagnostics/whatsapp-participant-identity",
+  handleWhatsAppParticipantIdentityDiagnostic
 );
 
 async function getUidFromBearer(req) {

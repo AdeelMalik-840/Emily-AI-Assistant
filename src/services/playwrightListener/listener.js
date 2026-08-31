@@ -59,6 +59,14 @@ import {
   isSyntheticFirstSeenParticipantKey,
   resolveParticipantIdentity,
 } from "../participantIdentity.js";
+import {
+  isGroupChatJid,
+  isPlaywrightParticipantIdentityTier2Enabled,
+  parseWhatsAppGroupShapedDataId,
+  participantAnchorFromSurroundingWhatsAppDataIds,
+  participantAnchorFromWhatsAppDataId,
+  resolveWhatsAppParticipantIdentity,
+} from "../whatsappParticipantIdentityResolver.js";
 import { loadPlaywrightInboundCursor } from "../playwrightInboundCursorStore.js";
 import {
   candidateRowsAfterNormalizedCursor,
@@ -5467,6 +5475,12 @@ function buildRowKey(message) {
   return `row:${ts}:${hash(txt)}`;
 }
 
+export {
+  parseWhatsAppGroupShapedDataId,
+  participantAnchorFromSurroundingWhatsAppDataIds,
+  participantAnchorFromWhatsAppDataId,
+};
+
 /**
  * WhatsApp `data-id` from an extracted row (DOM Phase A).
  * @param {{ id?: unknown, _data?: unknown, dataId?: unknown }} msg
@@ -5485,33 +5499,35 @@ export function getExtractedWhatsAppDataId(msg) {
 }
 
 /**
- * Stable participant JID from inbound WhatsApp Web `data-id` (`false_*` only).
- * Examples: `false_923001112233@c.us_ABC` → `923001112233@c.us`, `false_123@lid` → `123@lid`.
- * Outbound `true_*` rows never produce an anchor.
- * @param {unknown} dataId
- * @returns {string}
- */
-export function participantAnchorFromWhatsAppDataId(dataId) {
-  const raw = String(dataId ?? "").trim();
-  if (!raw || !raw.toLowerCase().startsWith("false_")) return "";
-  const rest = raw.slice("false_".length);
-  if (!rest) return "";
-  const match = rest.match(/^([^\s@]+@[^\s_]+)(?:_.+)?$/i);
-  if (!match) return "";
-  const jid = String(match[1] ?? "").trim().toLowerCase();
-  if (!jid || !/@(?:c\.us|lid)$/i.test(jid)) return "";
-  return jid;
-}
-
-/**
- * DOM sender anchor when present; otherwise inbound participant JID from `data-id`.
+ * DOM sender anchor when present; otherwise participant JID from `data-id`
+ * or a surrounding Group-shaped id bound to the same short message id.
+ * Never uses `@g.us` as participant identity.
  * @param {object} m
  * @returns {string}
  */
 function resolveExtractedSenderAnchor(m) {
   const domAnchor = String(m?.senderAnchor ?? "").trim();
-  if (domAnchor) return domAnchor;
-  return participantAnchorFromWhatsAppDataId(getExtractedWhatsAppDataId(m));
+  if (domAnchor && !isGroupChatJid(domAnchor)) return domAnchor;
+  const dataId = getExtractedWhatsAppDataId(m);
+  const fromDataId = participantAnchorFromWhatsAppDataId(dataId);
+  if (fromDataId) return fromDataId;
+  const surrounding = Array.isArray(m?.surroundingDataIds)
+    ? m.surroundingDataIds
+    : [];
+  return participantAnchorFromSurroundingWhatsAppDataIds(dataId, surrounding);
+}
+
+async function resolveSenderAnchorForExtractedMessage(m, page) {
+  if (!isPlaywrightParticipantIdentityTier2Enabled()) {
+    return resolveExtractedSenderAnchor(m);
+  }
+  const result = await resolveWhatsAppParticipantIdentity({
+    dataId: getExtractedWhatsAppDataId(m),
+    surroundingDataIds: m?.surroundingDataIds,
+    senderAnchor: m?.senderAnchor,
+    page,
+  });
+  return result.participantJid || "";
 }
 
 /**
@@ -5759,6 +5775,12 @@ const PLAYWRIGHT_MSG_CONTAINER_ROW_SELECTOR = '[data-testid="msg-container"]';
 
 /**
  * Browser-side extraction helpers (inlined in page.evaluate / waitForFunction).
+ *
+ * Direction uses the first `data-id` from playwrightDataIdFromNode plus
+ * message-in / message-out classes. Harvested long-form
+ * `{true|false}_<group@g.us>_...` ids are identity evidence only — a Store
+ * key that begins with `true_` must not flip an incoming message-in row.
+ *
  * @returns {string}
  */
 function playwrightMessageRowBrowserHelpersSource() {
@@ -5823,6 +5845,26 @@ function playwrightMessageRowBrowserHelpersSource() {
         el = el.parentElement;
       }
       return "";
+    }
+    function playwrightCollectSurroundingDataIds(n) {
+      const ids = [];
+      const seen = {};
+      const add = (el) => {
+        const id = String(el && el.getAttribute ? el.getAttribute("data-id") || "" : "").trim();
+        if (!id || seen[id]) return;
+        seen[id] = true;
+        ids.push(id);
+      };
+      add(n);
+      const children =
+        n && n.querySelectorAll ? Array.from(n.querySelectorAll("[data-id]")) : [];
+      for (const child of children) add(child);
+      let parent = n && n.parentElement;
+      for (let depth = 0; depth < 6 && parent; depth++) {
+        add(parent);
+        parent = parent.parentElement;
+      }
+      return ids;
     }
     function playwrightSenderFromDataId(dataId) {
       const id = String(dataId || "").trim();
@@ -6994,6 +7036,7 @@ async function extractIncomingMessages(page, opts = {}) {
                 senderAnchor,
                 prePlainText: plain,
               dataId: dataId || null,
+              surroundingDataIds: playwrightCollectSurroundingDataIds(node),
               timestamp,
               sourceMessageIndex: nodes.indexOf(node),
             };
@@ -7110,7 +7153,8 @@ async function extractIncomingMessages(page, opts = {}) {
 
   for (const m of newMessages) {
     const normalizedGroupChatKey = normalizeTitle(groupName) || groupName;
-    const senderAnchor = resolveExtractedSenderAnchor(m);
+    const senderAnchor = await resolveSenderAnchorForExtractedMessage(m, page);
+    m.senderAnchor = senderAnchor;
     const senderScope =
       groupSenderScopeFromAnchor(normalizedGroupChatKey, senderAnchor) || "";
     const identity = resolveParticipantIdentity({
@@ -7144,7 +7188,9 @@ async function extractIncomingMessages(page, opts = {}) {
 
   return newMessages.map((m) => {
     const dataId = getExtractedWhatsAppDataId(m);
-    const senderAnchor = resolveExtractedSenderAnchor(m);
+    const senderAnchor = String(m.senderAnchor ?? "").trim()
+      ? String(m.senderAnchor).trim()
+      : resolveExtractedSenderAnchor(m);
     const prePlainText =
       m.prePlainText != null && String(m.prePlainText).trim() !== ""
         ? String(m.prePlainText).trim()
@@ -9126,6 +9172,17 @@ export function isLikelyAssistantOutboundCopy(text) {
 export function __mapExtractedIncomingMessageForTests(m, groupName = "Test Group") {
   const dataId = getExtractedWhatsAppDataId(m);
   const senderAnchor = resolveExtractedSenderAnchor(m);
+  const normalizedGroupChatKey = normalizeTitle(groupName) || groupName;
+  const senderScope =
+    groupSenderScopeFromAnchor(normalizedGroupChatKey, senderAnchor) || "";
+  const identity = resolveParticipantIdentity({
+    participantPhone: m.participantPhone,
+    participantName: m.participantName,
+    senderAnchor,
+    groupChatKey: normalizedGroupChatKey,
+    senderScope,
+  });
+  const participantKey = stampExtractedGroupParticipantKey(identity);
   const prePlainText =
     m.prePlainText != null && String(m.prePlainText).trim() !== ""
       ? String(m.prePlainText).trim()
@@ -9142,10 +9199,7 @@ export function __mapExtractedIncomingMessageForTests(m, groupName = "Test Group
       m.participantPhone != null && String(m.participantPhone).trim() !== ""
         ? String(m.participantPhone).trim()
         : null,
-    participantKey:
-      m.participantKey != null && String(m.participantKey).trim() !== ""
-        ? String(m.participantKey).trim()
-        : null,
+    participantKey,
     senderAnchor: senderAnchor || null,
     prePlainText,
     dataId: dataId || null,

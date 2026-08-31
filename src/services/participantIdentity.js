@@ -39,6 +39,67 @@ function stableAnchorValue(...values) {
   return "";
 }
 
+function isTrustedParticipantJid(value) {
+  const jid = String(value ?? "").trim().toLowerCase();
+  if (!jid || /@g\.us$/i.test(jid)) return false;
+  return /^[^\s@]+@(?:c\.us|lid)$/i.test(jid);
+}
+
+function collectTrustedParticipantJids(messageMeta = {}, extractedRow = {}) {
+  const values = [
+    messageMeta.senderContactId,
+    messageMeta.contactKey,
+    messageMeta.senderAnchor,
+    messageMeta.stableSenderAnchor,
+    messageMeta.messageSender,
+    messageMeta.sourceSenderId,
+    messageMeta.senderId,
+    messageMeta.participantId,
+    extractedRow.senderContactId,
+    extractedRow.contactKey,
+    extractedRow.senderAnchor,
+    extractedRow.stableSenderAnchor,
+    extractedRow.messageSender,
+    extractedRow.sourceSenderId,
+    extractedRow.senderId,
+    extractedRow.participantId,
+  ];
+  const jids = new Set();
+  for (const value of values) {
+    const raw = String(value ?? "").trim().toLowerCase();
+    if (isTrustedParticipantJid(raw)) jids.add(raw);
+  }
+  return [...jids];
+}
+
+function phoneConflictsWithCusJid(participantPhone, jid) {
+  const phone = normalizePhone(participantPhone);
+  const match = String(jid ?? "")
+    .trim()
+    .toLowerCase()
+    .match(/^(\d+)@c\.us$/);
+  if (!phone || !match) return false;
+  const jidDigits = match[1];
+  if (phone === jidDigits) return false;
+  if (phone.endsWith(jidDigits) || jidDigits.endsWith(phone)) return false;
+  return true;
+}
+
+function unresolvedGroupIdentity(participantName, participantPhone, groupChatKey, reason) {
+  console.warn("[participant_identity_unresolved_fail_closed]", {
+    participantName: participantName || null,
+    groupChatKey: groupChatKey || null,
+    reason,
+  });
+  return {
+    participantKey: null,
+    participantName: participantName || null,
+    participantPhone: participantPhone || null,
+    confidence: "none",
+    source: "unresolved",
+  };
+}
+
 /** Leftover display-name first-seen keys are not durable Group identity. */
 export function isSyntheticFirstSeenParticipantKey(value) {
   return /(?:^|::)first-seen-\d+$/i.test(String(value ?? "").trim());
@@ -103,6 +164,26 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
     "";
   const normalizedGroupChatKey = normalizeGroupChatKey(groupChatKey);
   const isGroupContext = Boolean(normalizedGroupChatKey);
+
+  if (isGroupContext) {
+    const trustedJids = collectTrustedParticipantJids(messageMeta, extractedRow);
+    if (trustedJids.length > 1) {
+      return unresolvedGroupIdentity(
+        participantName,
+        participantPhone,
+        normalizedGroupChatKey,
+        "TRUSTED_IDENTITY_CONFLICT"
+      );
+    }
+    if (trustedJids.some((jid) => phoneConflictsWithCusJid(participantPhone, jid))) {
+      return unresolvedGroupIdentity(
+        participantName,
+        participantPhone,
+        normalizedGroupChatKey,
+        "TRUSTED_IDENTITY_CONFLICT"
+      );
+    }
+  }
 
   // Core rule:
   // - participantKey is stable session identity for group conversations
@@ -204,18 +285,12 @@ export function resolveParticipantIdentity(messageMeta = {}, extractedRow = {}) 
   }
 
   if (isGroupContext) {
-    console.warn("[participant_identity_unresolved_fail_closed]", {
-      participantName: participantName || null,
-      groupChatKey: normalizedGroupChatKey || null,
-      reason: "NO_TRUSTED_SENDER_EVIDENCE",
-    });
-    return {
-      participantKey: null,
-      participantName: participantName || null,
-      participantPhone: participantPhone || null,
-      confidence: "none",
-      source: "unresolved",
-    };
+    return unresolvedGroupIdentity(
+      participantName,
+      participantPhone,
+      normalizedGroupChatKey,
+      "NO_TRUSTED_SENDER_EVIDENCE"
+    );
   }
 
   const explicitKey = keyFromName(
