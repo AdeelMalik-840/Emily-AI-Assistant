@@ -8,6 +8,33 @@ const { executePostConfirmPaLaneDecision } = await import(
 );
 
 const COROLLA_BOOKING_ID = "booking-corolla";
+const CURRENT_OWNERSHIP_TURN_ID = "user:fresh-avail-1";
+
+function currentTurnReferent(message, surfaceText) {
+  const start = String(message).indexOf(surfaceText);
+  return {
+    source: "current_turn",
+    surfaceText,
+    start,
+    end: start + surfaceText.length,
+    trustedItemId: null,
+    sourceTurnId: null,
+  };
+}
+
+function availabilitySurface(message) {
+  const text = String(message);
+  for (const surface of [
+    "Kia stonic",
+    "HONDA CIVIC",
+    "Honda Civic",
+    "Civic",
+    "Corolla",
+  ]) {
+    if (text.includes(surface)) return surface;
+  }
+  return text.slice(0, Math.max(1, text.indexOf(" ") > 0 ? text.indexOf(" ") : text.length));
+}
 
 function focusedCorollaFacts() {
   const booking = {
@@ -33,14 +60,24 @@ function focusedCorollaFacts() {
     known: {},
     replyGuardFacts: { activeBookings: [booking] },
     policy: { readOnly: true },
+    currentOwnershipTurnId: CURRENT_OWNERSHIP_TURN_ID,
   };
 }
 
 function rawDecision(overrides = {}) {
   return JSON.stringify({
     turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
+    itemScope: "none",
+    itemReferents: [],
     targetContext: "CONFIRMED_BOOKING",
     targetId: COROLLA_BOOKING_ID,
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: CURRENT_OWNERSHIP_TURN_ID,
+      targetType: "historical_booking",
+      targetId: COROLLA_BOOKING_ID,
+    },
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -75,6 +112,7 @@ function rawDecision(overrides = {}) {
     },
     bookingSelectionMode: "focused",
     selectedBookingIndex: 1,
+    selectedBookingId: COROLLA_BOOKING_ID,
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     groundedFacts: {
@@ -101,11 +139,22 @@ function rawDecision(overrides = {}) {
   });
 }
 
-function availabilityDecision({ withCatalogEvidence = false } = {}) {
+function availabilityDecision(message, { withCatalogEvidence = false } = {}) {
+  const surface = availabilitySurface(message);
   return rawDecision({
     turnScope: "NEW_TRANSACTION",
+    semanticIntent: "availability_inquiry",
+    itemScope: "specific",
+    itemReferents: [currentTurnReferent(message, surface)],
     targetContext: "NEW_TRANSACTION",
     targetId: null,
+    selectedBookingId: null,
+    targetReference: {
+      source: "none",
+      sourceTurnId: null,
+      targetType: "none",
+      targetId: null,
+    },
     factKind: "booking_fact",
     capability: "availability_request",
     evidenceNeeds: withCatalogEvidence
@@ -119,7 +168,7 @@ function availabilityDecision({ withCatalogEvidence = false } = {}) {
 test("catalog evidence cannot remap fresh availability to an active-booking answer", async () => {
   const { decision } = await runBrainContract(
     "Kia stonic 5 din k lye chyh",
-    availabilityDecision({ withCatalogEvidence: true })
+    availabilityDecision("Kia stonic 5 din k lye chyh", { withCatalogEvidence: true })
   );
   assert.equal(decision.capability, "availability_request");
   assert.equal(decision.bookingSelectionMode, "none");
@@ -156,7 +205,7 @@ for (const message of freshRequests) {
   test(`fresh availability contract releases existing focus: ${message}`, async () => {
     const { decision, system } = await runBrainContract(
       message,
-      availabilityDecision()
+      availabilityDecision(message)
     );
     assert.match(system, /INDEPENDENT fresh inventory availability/i);
     assert.match(system, /BOOKING-RELATIVE comparison/i);
@@ -426,8 +475,18 @@ test("named Civic mileage fact cannot attach focused Corolla", async () => {
     "Mileage kitni hai Civic ki?",
     rawDecision({
       turnScope: "NEW_TRANSACTION",
+      semanticIntent: "details_inquiry",
+      itemScope: "specific",
+      itemReferents: [currentTurnReferent("Mileage kitni hai Civic ki?", "Civic")],
       targetContext: "NEW_TRANSACTION",
       targetId: null,
+      selectedBookingId: null,
+      targetReference: {
+        source: "none",
+        sourceTurnId: null,
+        targetType: "none",
+        targetId: null,
+      },
       factKind: "freeform_business",
       capability: "answer_from_saved_owner_answer",
       evidenceNeeds: [
@@ -452,8 +511,18 @@ test("live vague/none model failure cannot deterministically attach Corolla", as
     "HONDA CIVIC 5 DIN K LYE CHYH",
     rawDecision({
       turnScope: "UNCLEAR",
+      semanticIntent: "unclear",
+      itemScope: "none",
+      itemReferents: [],
       targetContext: "NONE",
       targetId: null,
+      selectedBookingId: null,
+      targetReference: {
+        source: "none",
+        sourceTurnId: null,
+        targetType: "none",
+        targetId: null,
+      },
       conversationAct: "unknown",
       customerIntent: "unclear",
       customerIsAskingQuestion: false,

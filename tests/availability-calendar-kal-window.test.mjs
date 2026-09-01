@@ -102,7 +102,8 @@ test("A: resolver + facts — kal noon PKT → tomorrow calendar absolute window
     nowMs: NOON_PKT_MS,
   });
   const av = canonical.verified.availability;
-  assert.equal(canonical.turn.durationDays, 1);
+  assert.equal(canonical.turn.durationDays ?? null, null);
+  assert.equal(canonical.duration.calendarRelative, "tomorrow");
   assert.equal(av.windowApplied, true);
   assert.equal(av.dateWindowConfidence, "calendar_relative");
   assert.equal(av.requestedStartAt, "2026-08-07T19:00:00.000Z");

@@ -218,6 +218,12 @@ export async function executeCreateBooking({ payload, executionContext = {} }) {
       originalUserMessageText:
         String(payload?.sourceMessage ?? executionContext?.message ?? "").trim() ||
         undefined,
+      // Trusted approved window from the same AVR the confirm gate above
+      // already fetched — never re-derived from "now", never re-parsed from
+      // customer text. Absent for legacy/no-AVR bookings, which keep the
+      // existing duration-from-now fallback inside createBooking().
+      requestedStartAt: gate.request?.requestedStartAt,
+      requestedEndAt: gate.request?.requestedEndAt,
       canDmCustomer: executionContext?.canDmCustomer === true || payload?.canDmCustomer === true,
       dmTargetPhone:
         String(payload?.dmTargetPhone ?? executionContext?.participantPhoneForDm ?? "").trim() ||

@@ -16,6 +16,7 @@ import {
   applyPostConfirmDerivedOwnershipMechanics,
   canEscalatePostConfirmMissingInfo,
   isDeferredPostConfirmInformationalDecision,
+  mapFactKindToTurnPlan,
   PA_MISSING_INFO_GATE_OUTCOME,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
 import {
@@ -82,8 +83,17 @@ function hydrateDecisionFromCanonicalSnapshot(snapshot) {
     action === "confirm_pending_availability" ||
     action === "decline_pending_availability";
   const mutationAction = action === "request_booking_mutation";
-  return {
+  const factKind = row.factKind ?? null;
+  const mapped = mapFactKindToTurnPlan(
+    factKind,
+    row.capability,
+    row.evidenceNeeds
+  );
+  const hydrated = {
     turnScope: row.turnScope ?? null,
+    semanticIntent: Object.prototype.hasOwnProperty.call(row, "semanticIntent")
+      ? row.semanticIntent
+      : null,
     targetContext: row.targetContext ?? null,
     targetId: row.targetId ?? null,
     selectedBookingId: row.selectedBookingId ?? null,
@@ -91,15 +101,23 @@ function hydrateDecisionFromCanonicalSnapshot(snapshot) {
       row.pendingAvailabilitySelectionIndex ?? null,
     mutationIntent: row.mutationIntent ?? "none",
     action,
-    factKind: row.factKind ?? null,
-    capability: row.capability ?? null,
-    evidenceNeeds: Array.isArray(row.evidenceNeeds) ? row.evidenceNeeds : [],
+    factKind,
+    capability: mapped?.capability ?? row.capability ?? null,
+    evidenceNeeds: Array.isArray(mapped?.evidenceNeeds)
+      ? mapped.evidenceNeeds
+      : Array.isArray(row.evidenceNeeds)
+        ? row.evidenceNeeds
+        : [],
     customerReply: "",
     shouldReply: true,
-    informationalReplyDeferred: !mutationAction && !pendingAction,
     mutationExecutionRequested: mutationAction,
     mutationExecutionStatus: "not_executed",
   };
+  hydrated.informationalReplyDeferred =
+    !mutationAction &&
+    !pendingAction &&
+    isDeferredPostConfirmInformationalDecision(hydrated);
+  return hydrated;
 }
 
 function persistAcceptedPaSemanticDecision({
@@ -494,6 +512,153 @@ export async function executePostConfirmPaMissingInfoOwnerCheck({
     missingInfoType: type,
     ownerNotifyStatus,
     reason: clean(notify?.reason, 80) || "OWNER_CHECK_STARTED",
+  };
+}
+
+/**
+ * Customer may receive OWNER_CHECK holding only when a durable request exists
+ * and owner notify succeeded (or an already-notified row is reused).
+ */
+export function isCloudMissingFactHoldingAuthorized(execution) {
+  if (!execution || execution.ownerCheckAuthorized !== true) return false;
+  const requestId = String(execution.missingInfoRequestId ?? "").trim();
+  if (!requestId) return false;
+  const notify = String(execution.ownerNotifyStatus ?? "").trim().toLowerCase();
+  return notify === "sent" || notify === "queued" || notify === "sending";
+}
+
+/**
+ * Catalog/business-general missing-fact owner-check. Same pamiss ledger + owner
+ * notify + owner-answer path as post-confirm, but bookingId is not required.
+ */
+export async function executeCloudMissingBusinessFactOwnerCheck({
+  db: connection,
+  businessId,
+  customerPhone,
+  messageText,
+  messageId = null,
+  sourceTurnId = null,
+  itemId = null,
+  itemLabel = null,
+  missingInfoType = "other",
+  sendCredentials = null,
+  executionContext = {},
+  __createOrGetOpenPaMissingInfoRequestFn = createOrGetOpenPaMissingInfoRequest,
+  __sendPaMissingInfoOwnerNotificationFn = sendPaMissingInfoOwnerNotification,
+  __sendWhatsAppMessageFn = sendWhatsAppMessage,
+} = {}) {
+  const uid = clean(businessId, 120);
+  const phone = String(customerPhone ?? "").trim();
+  const type = clean(missingInfoType, 40) || "other";
+  const empty = {
+    gateOutcome: PA_MISSING_INFO_GATE_OUTCOME.NOT_ALLOWED,
+    ownerCheckAuthorized: false,
+    ownerCheckPending: false,
+    missingInfoEscalated: false,
+    missingInfoRequestId: null,
+    missingInfoType: type,
+    ownerNotifyStatus: null,
+    request: null,
+  };
+  if (!connection || !uid || !phone || !clean(messageText, 800)) {
+    return { ...empty, reason: "MISSING_CONTEXT" };
+  }
+
+  let created;
+  try {
+    created = await __createOrGetOpenPaMissingInfoRequestFn({
+      db: connection,
+      businessId: uid,
+      customerPhone: phone,
+      bookingId: null,
+      itemId,
+      itemLabel,
+      sourceTurnId: sourceTurnId || messageId,
+      missingInfoType: type,
+      customerQuestion: clean(messageText, 800),
+      customerMessageId: clean(messageId, 160) || null,
+    });
+  } catch (err) {
+    console.warn("[cloud_missing_fact_create_failed]", {
+      businessId: uid,
+      missingInfoType: type,
+      error: err?.message || String(err),
+    });
+    return { ...empty, reason: "CREATE_FAILED" };
+  }
+  if (!created?.ok || !created.request) {
+    return {
+      ...empty,
+      reason: clean(created?.reason, 80) || "CREATE_FAILED",
+    };
+  }
+
+  const requestId =
+    clean(created.request.requestId || created.request.id, 120) || null;
+  const priorNotify =
+    clean(created.request.ownerNotifyStatus, 40) || "not_started";
+  if (["queued", "sending", "sent"].includes(priorNotify)) {
+    return {
+      gateOutcome: PA_MISSING_INFO_GATE_OUTCOME.ALREADY_PENDING,
+      ownerCheckAuthorized: true,
+      ownerCheckPending: true,
+      missingInfoEscalated: false,
+      missingInfoRequestId: requestId,
+      missingInfoType: type,
+      ownerNotifyStatus: priorNotify,
+      request: created.request,
+      reason: "ALREADY_PENDING",
+    };
+  }
+
+  let notify;
+  try {
+    notify = await __sendPaMissingInfoOwnerNotificationFn({
+      db: connection,
+      businessId: uid,
+      request: created.request,
+      itemLabel: clean(itemLabel, 200) || clean(created.request?.itemLabel, 200) || null,
+      sendCredentials,
+      executionContext,
+      sendWhatsAppMessageFn: __sendWhatsAppMessageFn,
+    });
+  } catch (err) {
+    console.warn("[cloud_missing_fact_notify_failed]", {
+      businessId: uid,
+      requestId,
+      error: err?.message || String(err),
+    });
+    return {
+      ...empty,
+      missingInfoRequestId: requestId,
+      ownerNotifyStatus: "failed",
+      request: created.request,
+      reason: "NOTIFY_FAILED",
+    };
+  }
+
+  const ownerNotifyStatus =
+    clean(notify?.ownerNotifyStatus, 40) || priorNotify || null;
+  const authorized =
+    notify?.ok === true &&
+    (notify?.sent === true ||
+      notify?.skipped === true ||
+      ownerNotifyStatus === "sent" ||
+      ownerNotifyStatus === "queued" ||
+      ownerNotifyStatus === "sending");
+
+  return {
+    gateOutcome: authorized
+      ? PA_MISSING_INFO_GATE_OUTCOME.CREATE_AND_NOTIFY
+      : PA_MISSING_INFO_GATE_OUTCOME.NOT_ALLOWED,
+    ownerCheckAuthorized: authorized,
+    ownerCheckPending: notify?.skipped === true,
+    missingInfoEscalated: authorized,
+    missingInfoRequestId: requestId,
+    missingInfoType: type,
+    ownerNotifyStatus,
+    request: created.request,
+    reason: clean(notify?.reason, 80) || (authorized ? "OWNER_CHECK_STARTED" : "NOTIFY_FAILED"),
   };
 }
 

@@ -65,6 +65,7 @@ export function buildTurnContextInput(p) {
     traceId: p.traceId,
     authoritativeSemanticIntent: p.authoritativeSemanticIntent,
     canonicalItemReferents: p.canonicalItemReferents,
+    authoritativeItemScope: p.authoritativeItemScope,
     resolveTrustedSessionItem:
       typeof p.resolveTrustedSessionItem === "function"
         ? (inner) =>
@@ -124,6 +125,7 @@ export function buildTurnContextInput(p) {
       String(p.authoritativeSemanticIntent ?? "").trim() || null,
     canonicalItemReferents: Object.freeze([...(authority.canonicalItemReferents ?? [])]),
     canonicalItemResolutions: Object.freeze([...(authority.canonicalItemResolutions ?? [])]),
+    itemReferenceMode: authority.itemReferenceMode ?? null,
     /** @internal bridge */
     _emilySessionKey: emilySessionKey,
     /** @internal bridge */

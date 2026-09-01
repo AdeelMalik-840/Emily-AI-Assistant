@@ -61,7 +61,7 @@ const SEMANTIC_INTENT_WORKFLOW_TYPES = Object.freeze({
   // clarification workflow instead of letting text heuristics choose another
   // transactional family.
   details_inquiry: "clarification",
-  image_catalog_request: "clarification",
+  image_catalog_request: "image_catalog_request",
   general_business_question: "clarification",
   social: "clarification",
   unclear: "clarification",

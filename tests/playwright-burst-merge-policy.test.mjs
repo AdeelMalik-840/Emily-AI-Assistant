@@ -9,6 +9,7 @@ import {
   attachBurstMergeContinuations,
   buildParticipantForwardCandidate,
   splitBurstMergeRuns,
+  __freshAdmittedStableIdsForTests,
 } from "../src/services/playwrightListener/listener.js";
 import { resolveCurrentTurnAuthority } from "../src/services/currentTurnAuthority.js";
 
@@ -41,6 +42,7 @@ function mkRow({ text, position, participantKey = "p1", dataId }) {
     __rowKey: dataId ? `real:${dataId}#1` : `row::${position}:x#1`,
     id: dataId ? { _serialized: dataId } : undefined,
     sourceMessageIndex: position,
+    timestamp: 1_714_520_000_000 + Number(position) * 1000,
   };
 }
 
@@ -106,7 +108,8 @@ test("attachBurstMergeContinuations does not join Civic with Corolla", () => {
     new Map(),
     sorted,
     CHAT,
-    CATALOG
+    CATALOG,
+    { currentFreshAdmittedStableIds: __freshAdmittedStableIdsForTests(sorted) }
   );
   assert.equal(merged.text, "Civic available?");
   assert.equal(merged.__burstMergedCount, undefined);
@@ -124,7 +127,8 @@ test("attachBurstMergeContinuations still merges Civic + ?", () => {
     new Map(),
     sorted,
     CHAT,
-    CATALOG
+    CATALOG,
+    { currentFreshAdmittedStableIds: __freshAdmittedStableIdsForTests([civic]) }
   );
   assert.equal(merged.text, "Civic available? ?");
   assert.equal(merged.__burstMergedCount, 2);
@@ -157,6 +161,54 @@ test("guarantee-first forward candidate returns Civic alone when Corolla follows
   });
   assert.match(candidate.text, /Civic available/i);
   assert.doesNotMatch(candidate.text, /Corolla/i);
+});
+
+test("name-only / first-seen keys do not burst-merge into one participant turn", () => {
+  const first = mkRow({
+    text: "Civic available?",
+    position: 1,
+    participantKey: "adeel::first-seen-1",
+  });
+  const second = mkRow({
+    text: "3 din",
+    position: 2,
+    participantKey: "adeel::first-seen-1",
+  });
+  const sorted = [first, second];
+  const merged = attachBurstMergeContinuations(
+    first,
+    new Map(),
+    sorted,
+    CHAT,
+    CATALOG,
+    { currentFreshAdmittedStableIds: __freshAdmittedStableIdsForTests(sorted) }
+  );
+  assert.equal(merged.text, "Civic available?");
+  assert.equal(merged.__burstMergedCount, undefined);
+});
+
+test("empty participant keys do not burst-merge two display-name-only rows", () => {
+  const first = mkRow({
+    text: "Civic available?",
+    position: 1,
+    participantKey: "",
+  });
+  const second = mkRow({
+    text: "3 din",
+    position: 2,
+    participantKey: "",
+  });
+  const sorted = [first, second];
+  const merged = attachBurstMergeContinuations(
+    first,
+    new Map(),
+    sorted,
+    CHAT,
+    CATALOG,
+    { currentFreshAdmittedStableIds: __freshAdmittedStableIdsForTests(sorted) }
+  );
+  assert.equal(merged.text, "Civic available?");
+  assert.equal(merged.__burstMergedCount, undefined);
 });
 
 test("solo Corolla after Civic memory resolves Corolla item authority", () => {

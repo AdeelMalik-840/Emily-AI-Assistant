@@ -9,6 +9,43 @@ const FieldValue = admin.firestore.FieldValue;
 const MAX_MESSAGES = 200;
 const DEFAULT_PROMPT_LIMIT = 20;
 
+/** Assistant recovery/system rows must not enter ownership or prompt history. */
+export const CONVERSATION_HISTORY_KIND_TECHNICAL_RECOVERY = "technical_recovery";
+
+/**
+ * Semantic conversation history for ownership/prompts excludes recovery rows.
+ * Ordinary assistant/user turns are never excluded by this helper.
+ * @param {unknown} message
+ * @returns {boolean}
+ */
+export function shouldExcludeConversationTurnFromSemanticHistory(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return false;
+  }
+  const row = /** @type {Record<string, unknown>} */ (message);
+  if (row.excludeFromSemanticHistory === true) return true;
+  if (row.semanticHistory === false) return true;
+  const kind = String(row.historyKind ?? "").trim();
+  return (
+    kind === CONVERSATION_HISTORY_KIND_TECHNICAL_RECOVERY || kind === "system"
+  );
+}
+
+/**
+ * Tag Cloud technical-recovery assistant rows so prompt/ownership history skips them.
+ * @param {unknown} finalReplySource
+ * @returns {Record<string, unknown>}
+ */
+export function conversationHistoryFieldsForOutbound(finalReplySource) {
+  if (String(finalReplySource ?? "").trim() !== "CLOUD_SEMANTIC_TECHNICAL_RECOVERY") {
+    return {};
+  }
+  return {
+    historyKind: CONVERSATION_HISTORY_KIND_TECHNICAL_RECOVERY,
+    excludeFromSemanticHistory: true,
+  };
+}
+
 function clean(value, max = 320) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
@@ -57,6 +94,8 @@ function conversationDocId(ownerUserId, customerNumber) {
  * @param {string | null} [p.sourceMessageId] - inbound provider id that caused this entry
  * @param {string | null} [p.providerMessageId] - provider id for this exact message
  * @param {Array<Record<string, unknown>>} [p.verifiedReferences]
+ * @param {string | null} [p.historyKind]
+ * @param {boolean} [p.excludeFromSemanticHistory]
  */
 export async function appendConversationMessage(db, p) {
   const docId = conversationDocId(p.ownerUserId, p.customerNumber);
@@ -72,6 +111,8 @@ export async function appendConversationMessage(db, p) {
     .slice(0, 320);
   const turnIdentity = sourceMessageId || providerMessageId;
   const verifiedReferences = sanitizeVerifiedReferences(p.verifiedReferences);
+  const historyKind = clean(p.historyKind, 40);
+  const excludeFromSemanticHistory = p.excludeFromSemanticHistory === true;
 
   const entry = {
     role,
@@ -80,6 +121,8 @@ export async function appendConversationMessage(db, p) {
     ...(sourceMessageId ? { sourceMessageId } : {}),
     ...(providerMessageId ? { providerMessageId } : {}),
     ...(verifiedReferences.length > 0 ? { verifiedReferences } : {}),
+    ...(historyKind ? { historyKind } : {}),
+    ...(excludeFromSemanticHistory ? { excludeFromSemanticHistory: true } : {}),
     // Firestore forbids FieldValue.serverTimestamp() inside array elements
     timestamp: new Date(),
   };
@@ -142,8 +185,11 @@ export async function getRecentConversationReferenceContext(
   const messages = Array.isArray(snap.data()?.messages)
     ? snap.data().messages
     : [];
-  return messages.slice(-limit).map((message, index) => ({
-    turnId: conversationTurnId(message, Math.max(0, messages.length - limit) + index),
+  const semantic = messages.filter(
+    (message) => !shouldExcludeConversationTurnFromSemanticHistory(message)
+  );
+  return semantic.slice(-limit).map((message, index) => ({
+    turnId: conversationTurnId(message, Math.max(0, semantic.length - limit) + index),
     role: message?.role === "assistant" ? "assistant" : "user",
     verifiedReferences: sanitizeVerifiedReferences(message?.verifiedReferences),
   }));
@@ -164,9 +210,12 @@ export async function getRecentConversationForPrompt(
   const snap = await db.collection("conversations").doc(docId).get();
   const data = snap.data();
   const messages = Array.isArray(data?.messages) ? data.messages : [];
-  if (messages.length === 0) return "";
+  const semantic = messages.filter(
+    (message) => !shouldExcludeConversationTurnFromSemanticHistory(message)
+  );
+  if (semantic.length === 0) return "";
 
-  const slice = messages.slice(-limit);
+  const slice = semantic.slice(-limit);
   return slice
     .map((m) => {
       const role = m.role === "assistant" ? "Assistant" : "User";

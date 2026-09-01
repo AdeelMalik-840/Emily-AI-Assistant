@@ -11,6 +11,9 @@ export {
   buildClarificationActionPlan,
 } from "./ClarificationWorkflow.js";
 export {
+  buildImageCatalogActionPlan,
+} from "./ImageCatalogRequestWorkflow.js";
+export {
   buildContactCollectionActionPlan,
   buildContactRequestActionPlan,
 } from "./ContactCollectionWorkflow.js";

@@ -295,6 +295,8 @@ async function buildAlternativesReplyForRequest(request) {
     excludeItemId: clean(request?.itemId),
     referenceItemLabel: clean(request?.itemLabel),
     limit: 2,
+    requestedStart: request?.requestedStartAt ?? null,
+    requestedEnd: request?.requestedEndAt ?? null,
   });
   if (alternatives.length === 0) {
     return buildRejectedAvailabilityNoOptionsMessage();
@@ -361,7 +363,7 @@ function resolveBrainEnabledOutboundReply(decision) {
 /**
  * @param {Record<string, unknown> | null | undefined} turnResult
  */
-function mapFrozenPendingOwnershipToWaitingConfirmDecision(frozen, requestId) {
+export function mapFrozenPendingOwnershipToWaitingConfirmDecision(frozen, requestId) {
   const rawAction = clean(frozen?.action, 40);
   let action = "reply";
   if (rawAction === "confirm_pending_availability") action = "confirm_booking";
@@ -444,6 +446,7 @@ async function sendCustomerDmReply({
   requestId,
   promptType,
   sourceMessageId = null,
+  verifiedBookingId = null,
   recordOutboundOnSuccess = true,
   includeDeliveryStatus = false,
 }) {
@@ -469,6 +472,7 @@ async function sendCustomerDmReply({
     }).catch(() => null);
   }
   if (providerAccepted) {
+    const bookingId = clean(verifiedBookingId, 160) || null;
     await appendConversationMessage(connection, {
       ownerUserId: businessId,
       customerNumber: phone,
@@ -477,6 +481,16 @@ async function sendCustomerDmReply({
       sourceMessageId,
       providerMessageId:
         sendResult?.providerMessageId ?? sendResult?.messages?.[0]?.id ?? null,
+      ...(bookingId
+        ? {
+            verifiedReferences: [{
+              kind: "historical_booking",
+              targetId: bookingId,
+              provenance: "verified_booking_created_reply",
+              expiresAt: null,
+            }],
+          }
+        : {}),
     }).catch(() => null);
   }
   return includeDeliveryStatus
@@ -1302,9 +1316,27 @@ async function runWaitingConfirmDmBrainTurn({
       styleKey: turnContext.styleKey || "casual_local",
       __chatCompletionsCreateForTests: chatCompletionsCreateForTests,
     });
+    const successfulBookingExecution =
+      executionResult?.succeeded === true && action === "confirm_booking";
     const reply =
-      clean(composed?.reply) || WAITING_CONFIRM_DM_TECHNICAL_FALLBACK;
+      clean(composed?.reply) ||
+      (successfulBookingExecution ? "" : WAITING_CONFIRM_DM_TECHNICAL_FALLBACK);
     if (confirmResult) {
+      if (!reply) {
+        return waitingConfirmBrainMeta({
+          handled: false,
+          retryable: true,
+          action: "confirm_reply_compose_failed",
+          reason: composed?.reason ?? "CONFIRM_REPLY_COMPOSE_FAILED",
+          reply: "",
+          result: confirmResult,
+          decision,
+          requestId,
+          actionType: "confirm_booking",
+          composedAfterExecution: true,
+          executionResult,
+        });
+      }
       const sendOutcome = await sendReply({
         reply,
         promptType,
@@ -1577,6 +1609,7 @@ export async function handleAvailabilityCustomerCloudInbound({
           requestId: priorRequestId,
           promptType: AVAILABILITY_DM_PROMPT_TYPES.GENERAL_INFO,
           sourceMessageId: inboundMessageId,
+          verifiedBookingId: clean(prior.linkedBookingId, 160) || null,
           recordOutboundOnSuccess: true,
           includeDeliveryStatus: true,
         });
@@ -1788,6 +1821,10 @@ export async function handleAvailabilityCustomerCloudInbound({
         requestId,
         promptType,
         sourceMessageId: inboundMessageId || null,
+        verifiedBookingId:
+          confirmResult?.ok === true
+            ? clean(confirmResult.bookingId, 160) || null
+            : null,
         recordOutboundOnSuccess: confirmResult ? confirmResult.ok === true : true,
         includeDeliveryStatus: Boolean(confirmResult),
       }),
@@ -1813,6 +1850,14 @@ export async function loadAvailabilityRequestById(params) {
 export async function buildAvailabilityRecordedPriceInfoReply({ request }) {
   const reply = await buildPriceReplyForRequest(request, { withConfirmPrompt: false });
   return { reply, promptType: AVAILABILITY_DM_PROMPT_TYPES.PRICE_INFO };
+}
+
+/**
+ * Test-only wrapper for the legacy-flag-OFF alternatives reply builder.
+ * @param {Record<string, unknown>} request
+ */
+export async function __buildAvailabilityAlternativesReplyForTests(request) {
+  return buildAlternativesReplyForRequest(request);
 }
 
 export { resolveAvailabilityCustomerDmPromptType };

@@ -33,6 +33,9 @@ const {
 } = await import(
   "../src/brain/decisions/projectSemanticIntentFromBrainDecision.js"
 );
+const { resolveCloudDmOwnershipTrustedFocus } = await import(
+  "../src/services/whatsappInboundBuffer.js"
+);
 
 const catalogItems = [
   {
@@ -124,7 +127,7 @@ test("every semantic intent has a structural workflow family and canonical signa
     ["booking_request", "booking_request"],
     ["browse_options", "browse_options"],
     ["details_inquiry", "clarification"],
-    ["image_catalog_request", "clarification"],
+    ["image_catalog_request", "image_catalog_request"],
     ["general_business_question", "clarification"],
     ["clarification", "clarification"],
     ["social", "clarification"],
@@ -161,7 +164,7 @@ test("canonical semantic-intent matrix wins through understanding, facts, and wo
     ["booking_request", "booking_request"],
     ["browse_options", "browse_options"],
     ["details_inquiry", "clarification"],
-    ["image_catalog_request", "clarification"],
+    ["image_catalog_request", "image_catalog_request"],
     ["general_business_question", "clarification"],
     ["clarification", "clarification"],
     ["unclear", "clarification"],
@@ -498,7 +501,7 @@ test("Cloud DM itemScope gates unlisted routing without changing shared extracti
       intent: "image_catalog_request",
       itemScope: "specific",
       referent: "Revo",
-      expected: "clarification",
+      expected: "image_catalog_request",
     },
     {
       name: "unknown booking",
@@ -680,7 +683,9 @@ test("released NEW_TRANSACTION without a valid canonical semantic intent fails c
   });
   assert.equal(result.handled, true);
   assert.equal(result.reason, "CANONICAL_SEMANTIC_INTENT_INVALID");
-  assert.equal(result.sendVia, "NONE");
+  assert.equal(result.sendVia, "CLOUD_API");
+  assert.notEqual(String(result.reply ?? "").trim(), "");
+  assert.equal(result.customerTurnOutcome, "TECHNICAL_RECOVERY");
   assert.equal(orchestratorCalls, 0);
 });
 
@@ -833,6 +838,41 @@ test("availability pending without canonical authority keeps existing continuati
   assert.equal(selected.reason, "availability_duration_pending_continuation");
 });
 
+test("Cloud ownership receives the participant-bound pending duration item as trusted focus", () => {
+  const pending = {
+    type: PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+    status: "awaiting",
+    pendingStage: "availability_duration",
+    pendingQuestion: "rental period required",
+    itemId: "civic",
+    itemLabel: "Honda Civic (White)",
+    participantKey: "pending-customer",
+    sourceTurnKey: "wamid.ask-duration",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+  };
+  const focus = resolveCloudDmOwnershipTrustedFocus({
+    memorySnapshot: { pendingAction: pending, emilyPending: pending },
+    participantKey: "pending-customer",
+    nowMs: Date.parse("2026-08-28T00:00:00.000Z"),
+  });
+
+  assert.deepEqual(focus, {
+    itemId: "civic",
+    itemLabel: "Honda Civic (White)",
+    sourceTurnId: "wamid.ask-duration",
+    provenance: "availability_duration_pending",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+  });
+  assert.equal(
+    resolveCloudDmOwnershipTrustedFocus({
+      memorySnapshot: { pendingAction: pending, emilyPending: pending },
+      participantKey: "different-customer",
+      nowMs: Date.parse("2026-08-28T00:00:00.000Z"),
+    }),
+    null
+  );
+});
+
 test("SOCIAL_GENERAL and UNCLEAR retain scoped safety without entering NEW_TRANSACTION authority", async () => {
   for (const [turnScope, semanticIntent] of [
     ["SOCIAL_GENERAL", "social"],
@@ -873,7 +913,7 @@ test("SOCIAL_GENERAL and UNCLEAR retain scoped safety without entering NEW_TRANS
         };
       },
     });
-    assert.equal(captured.turnContext.authoritativeSemanticIntent, undefined);
+    assert.equal(captured.turnContext.authoritativeSemanticIntent, semanticIntent);
     assert.equal(captured.turnContext.canonicalSemanticDecision.turnScope, turnScope);
     assert.equal(result.messageMeta?.actionRouter?.actions?.some(
       (action) => action.type === "CREATE_BOOKING"

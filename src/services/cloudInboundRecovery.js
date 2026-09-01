@@ -18,7 +18,7 @@ import {
   markOutboundUncertainManualReview,
   releaseOutboundLockedRecoveryClaim,
 } from "./inboundTurnLedger.js";
-import { appendConversationMessage } from "./conversationStore.js";
+import { appendConversationMessage, conversationHistoryFieldsForOutbound } from "./conversationStore.js";
 import { sendOutboundMessage } from "./messagingService.js";
 
 function hashReply(text, salt) {
@@ -227,6 +227,10 @@ export async function tryRecoverCloudOutboundLockedTurn({
               sendResult?.providerMessageId ??
               sendResult?.messages?.[0]?.id ??
               null,
+            ...conversationHistoryFieldsForOutbound(
+              entry.finalReplySource ??
+                sendResult?.messageMeta?.outboundTrace?.finalReplySource
+            ),
           });
         } catch (historyErr) {
           console.warn("[cloud_inbound_recovery_history_failed]", {

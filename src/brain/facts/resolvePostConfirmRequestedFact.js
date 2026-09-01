@@ -788,6 +788,26 @@ export function resolvePostConfirmTurnEvidence({
   };
 }
 
+/**
+ * True only when a trusted found value has a supporting source.
+ * Unsupported / missing / null / no-source must never enter definitive compose.
+ */
+export function isTrustedVerifiedFactResolution(resolution) {
+  const raw = resolution && typeof resolution === "object" ? resolution : null;
+  if (!raw) return false;
+  if (String(raw.status ?? "").trim() !== "found") return false;
+  if (raw.verifiedValue == null || raw.verifiedValue === "") {
+    const items = Array.isArray(raw.items) ? raw.items : [];
+    return items.some(
+      (item) =>
+        item?.status === "found" &&
+        item?.verifiedValue != null &&
+        item?.verifiedValue !== ""
+    );
+  }
+  return true;
+}
+
 function mapEvidenceStatusForLegacyShim(status) {
   return status === "conflicting" || status === "missing" ? "not_found" : status;
 }

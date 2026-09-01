@@ -8,6 +8,7 @@ import {
   evaluateReplyAfterGuard,
   isGroupContinuationMessage,
   __resolvePlaywrightForwardIdentityForTests,
+  __freshAdmittedStableIdsForTests,
 } from "../src/services/playwrightListener/listener.js";
 import {
   recordPlaywrightInboundScheduled,
@@ -110,6 +111,7 @@ test("A2: buildParticipantForwardCandidate merges pending burst after cursor", (
     text: "Corolla available",
     __rowKey: "row::1:c1#1",
     __position: 1,
+    timestamp: 1_714_520_001_000,
   };
   const question = {
     sender: "user",
@@ -117,6 +119,7 @@ test("A2: buildParticipantForwardCandidate merges pending burst after cursor", (
     text: "?",
     __rowKey: "row::2:q1#1",
     __position: 2,
+    timestamp: 1_714_520_001_400,
   };
   const sorted = [corolla, question];
   const candidate = buildParticipantForwardCandidate({
@@ -126,6 +129,7 @@ test("A2: buildParticipantForwardCandidate merges pending burst after cursor", (
     extractedMessages: sorted,
     sorted,
     normalizedGroupChatKeyForCompare: CHAT,
+    currentFreshAdmittedStableIds: __freshAdmittedStableIdsForTests(sorted),
   });
   assert.equal(candidate.text, "Corolla available ?");
 });

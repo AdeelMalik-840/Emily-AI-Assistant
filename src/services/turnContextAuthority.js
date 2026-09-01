@@ -14,6 +14,11 @@ import { hasStrongBookingCommitPhrase } from "./conversationRouter.js";
 import { extractTurnSignals } from "./intentShapeResolver.js";
 import { isGenericBrowseListAsk } from "../brain/workflow/browseIntent.js";
 import {
+  applyUnknownCurrentBinding,
+  classifyCanonicalCloudTurnShape,
+  deriveCloudItemReferenceMode,
+} from "../brain/contracts/cloudCanonicalSemantic.js";
+import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
   isAvailabilityDurationPendingAction,
   readEmilyPendingFromMemory,
@@ -288,20 +293,22 @@ export function resolveTurnContext(opts = {}) {
     : Boolean(!explicitItem && fuzzyMention.found && fuzzyMention.ambiguous);
   const hasExplicitItem = Boolean(explicitItem || fuzzyItem);
 
-  const itemlessPriceDurationFollowupRaw = isItemlessPriceDurationFollowup(
-    message,
-    catalogItems
-  );
+  const itemlessPriceDurationFollowupRaw = canonicalAuthorityActive
+    ? false
+    : isItemlessPriceDurationFollowup(message, catalogItems);
   const itemlessPriceDurationFollowup =
     itemlessPriceDurationFollowupRaw && !hasExplicitItem;
   const requestedField = String(detectAskedField(message) ?? "").trim().toLowerCase();
   const authoritativeSemanticIntent = String(
     opts.authoritativeSemanticIntent ?? ""
   ).trim();
-  const browseAsk =
-    authoritativeSemanticIntent === "browse_options" ||
-    Boolean(extractTurnSignals({ message }).browseAsk);
-  const broadBrowseAsk = browseAsk || isGenericBrowseListAsk(message);
+  const browseAsk = canonicalAuthorityActive
+    ? authoritativeSemanticIntent === "browse_options"
+    : authoritativeSemanticIntent === "browse_options" ||
+      Boolean(extractTurnSignals({ message }).browseAsk);
+  const broadBrowseAsk = canonicalAuthorityActive
+    ? browseAsk
+    : browseAsk || isGenericBrowseListAsk(message);
   const itemlessTrustedContextFollowup =
     !canonicalAuthorityActive &&
     !hasExplicitItem &&
@@ -311,12 +318,23 @@ export function resolveTurnContext(opts = {}) {
       messageLooksLikeAvailabilityQuery(message) ||
       requestedField === "media");
 
-  const turnShape = classifyTurnShape({
-    message,
-    catalogItems,
-    hasExplicitItem,
-    itemlessPriceDuration: itemlessPriceDurationFollowup,
-  });
+  const turnShape = canonicalAuthorityActive
+    ? classifyCanonicalCloudTurnShape(authoritativeSemanticIntent)
+    : classifyTurnShape({
+        message,
+        catalogItems,
+        hasExplicitItem,
+        itemlessPriceDuration: itemlessPriceDurationFollowup,
+      });
+  const itemReferenceMode = canonicalAuthorityActive
+    ? applyUnknownCurrentBinding(
+        deriveCloudItemReferenceMode(
+          canonicalItemReferents,
+          String(opts.authoritativeItemScope ?? "").trim() || null
+        ),
+        canonicalItemResolutions
+      )
+    : null;
 
   let trustedSessionItem = null;
   let trustedSessionProofSource = null;
@@ -399,6 +417,7 @@ export function resolveTurnContext(opts = {}) {
     canonicalItemReferents: canonicalItemReferents ?? [],
     canonicalItemResolutions,
     canonicalAuthorityActive,
+    itemReferenceMode,
   };
 
   console.log("[turn_context_resolved]", {

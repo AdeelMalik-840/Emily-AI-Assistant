@@ -26,6 +26,10 @@ const {
   isPostConfirmModelContractFailureError,
   isCloudPostConfirmAutoRetryEnabled,
 } = await import("../src/services/whatsappInboundBuffer.js");
+const {
+  canonicalOldBookingOwnership,
+  CANONICAL_OWNERSHIP_TURN_ID,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const STONIC_ITEM_ID = "test-stonic-item";
@@ -106,11 +110,13 @@ function focusedFacts(known = {}, bookingOverrides = {}) {
       doNotInventPolicies: true,
       doNotMutateBooking: true,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
   };
 }
 
 function decision(overrides = {}) {
   return JSON.stringify({
+    ...canonicalOldBookingOwnership({ bookingId: "test-booking-stonic" }),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",

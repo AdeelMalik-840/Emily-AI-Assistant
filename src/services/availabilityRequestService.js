@@ -11,6 +11,7 @@ import {
   isRetryablePhoneExtractionError,
 } from "./availabilityCustomerPhone.js";
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
+import { toValidBookingDate } from "../brain/facts/bookingDateUtils.js";
 
 const DEFAULT_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OWNER_NOTIFICATION_FAILED_RETRIES = 3;
@@ -455,6 +456,8 @@ function normalizeAvailabilityRequestPayload(payload = {}, executionContext = {}
   const ownerTarget = clean(payload.ownerTarget) || null;
   const requestedDuration = toFiniteNumber(payload.requestedDuration ?? payload.durationDays);
   const requestedDates = normalizeRequestedDates(payload.requestedDates);
+  const requestedStartAt = toValidBookingDate(payload.requestedStartAt);
+  const requestedEndAt = toValidBookingDate(payload.requestedEndAt);
   const canonicalAvailabilityStatus =
     clean(payload.canonicalAvailabilityStatus) ||
     clean(payload.canonicalAvailability?.status) ||
@@ -474,6 +477,8 @@ function normalizeAvailabilityRequestPayload(payload = {}, executionContext = {}
     status: "pending",
     requestedDuration,
     requestedDates,
+    requestedStartAt,
+    requestedEndAt,
     canonicalAvailabilityStatus,
     priceQuote,
     ownerNotificationStatus: "not_started",
@@ -641,6 +646,8 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
     status: normalized.status,
     requestedDuration: normalized.requestedDuration,
     requestedDates: normalized.requestedDates,
+    requestedStartAt: normalized.requestedStartAt,
+    requestedEndAt: normalized.requestedEndAt,
     canonicalAvailabilityStatus: normalized.canonicalAvailabilityStatus,
     priceQuote: normalized.priceQuote,
     ownerNotificationStatus: normalized.ownerNotificationStatus,
@@ -1456,6 +1463,86 @@ export async function findWaitingConfirmCloudAvailabilityRequestsByPhone({
 }
 
 /**
+ * Open owner-check AVR (pending/processing), not waiting_confirm / booked.
+ * Used as continuation provenance, not as a confirm/decline target.
+ */
+export function isOpenOwnerCheckAvailabilityRequest(request) {
+  const req = request && typeof request === "object" ? request : null;
+  if (!req) return false;
+  const status = clean(req.status) || "pending";
+  if (FINAL_AVAILABILITY_REQUEST_STATUSES.has(status)) return false;
+  const confirmStatus = clean(req.customerConfirmationStatus);
+  if (
+    confirmStatus === "superseded" ||
+    confirmStatus === "confirmed" ||
+    confirmStatus === "declined" ||
+    confirmStatus === "waiting_confirm"
+  ) {
+    return false;
+  }
+  if (clean(req.supersededByAvailabilityRequestId)) return false;
+  if (clean(req.linkedBookingId)) return false;
+  return status === "pending" || status === "processing";
+}
+
+/**
+ * @param {{
+ *   db?: unknown,
+ *   businessId: string,
+ *   customerPhone: string,
+ * }} params
+ */
+export async function findOpenOwnerCheckCloudAvailabilityRequestsByPhone({
+  db: connection,
+  businessId,
+  customerPhone,
+} = {}) {
+  const firestore = resolveAvailabilityRequestDb(connection);
+  const uid = clean(businessId);
+  const phone = phoneDigitsOnly(customerPhone);
+  if (!uid || !phone) return [];
+
+  const seen = new Set();
+  const collected = [];
+  const addRow = (row) => {
+    const requestId = clean(row?.requestId ?? row?.id);
+    if (!requestId || seen.has(requestId)) return;
+    seen.add(requestId);
+    collected.push({ ...row, requestId });
+  };
+
+  if (firestore) {
+    const collection = availabilityRequestCollectionRef(connection, uid);
+    for (const status of ["pending", "processing"]) {
+      const snap = await collection
+        .where("status", "==", status)
+        .limit(20)
+        .get()
+        .catch(() => null);
+      for (const doc of snap?.docs ?? []) {
+        addRow({ requestId: doc.id, ...(doc.data() || {}) });
+      }
+    }
+  }
+  for (const row of scanAvailabilityRequestsFromTestStore(connection, uid)) {
+    addRow(row);
+  }
+
+  return collected
+    .filter((row) => isOpenOwnerCheckAvailabilityRequest(row))
+    .filter((row) => availabilityRequestMatchesCloudCustomerPhone(row, phone))
+    .map((row) => ({
+      requestId: clean(row.requestId ?? row.id),
+      itemId: clean(row.itemId) || null,
+      itemLabel: clean(row.itemLabel) || null,
+      status: clean(row.status) || "pending",
+      requestedDuration: row.requestedDuration ?? null,
+      customerConfirmationStatus: clean(row.customerConfirmationStatus) || null,
+    }))
+    .filter((row) => row.requestId && row.itemId);
+}
+
+/**
  * Latest fresh trusted Cloud waiting-confirm transaction for one customer/business.
  *
  * @param {{
@@ -1664,33 +1751,69 @@ export async function claimAvailabilityRequestCustomerConfirmProcessing({
 }) {
   const ref = availabilityRequestDocRef(connection, businessId, requestId);
   if (!ref) return { ok: false, reason: "MISSING_REQUEST_REF" };
-  const snap = await ref.get();
-  if (!snap?.exists) return { ok: false, reason: "REQUEST_NOT_FOUND" };
-  const data = snap.data() || {};
-  if (clean(data.linkedBookingId)) {
-    return { ok: false, reason: "BOOKING_ALREADY_LINKED", request: { requestId, ...data } };
+  const firestore = resolveAvailabilityRequestDb(connection);
+  if (!firestore || typeof firestore.runTransaction !== "function") {
+    return { ok: false, reason: "MISSING_REQUEST_REF" };
   }
-  const processing = clean(data.customerConfirmProcessingStatus);
-  if (processing === "processing" || processing === "done") {
-    return { ok: false, reason: "ALREADY_PROCESSING", request: { requestId, ...data } };
+
+  // Single atomic transaction: the eligibility read and the idle->processing
+  // write must happen as one unit, or two near-simultaneous callers can both
+  // read "idle" before either writes and both proceed to execute the booking.
+  // Every existing eligibility check is preserved unchanged, just moved
+  // inside the transaction boundary.
+  let claimReason = null;
+  let claimedData = null;
+  try {
+    await firestore.runTransaction(async (transaction) => {
+      const snap = await transaction.get(ref);
+      if (!snap?.exists) {
+        claimReason = "REQUEST_NOT_FOUND";
+        return;
+      }
+      const data = snap.data() || {};
+      claimedData = data;
+      if (clean(data.linkedBookingId)) {
+        claimReason = "BOOKING_ALREADY_LINKED";
+        return;
+      }
+      const processing = clean(data.customerConfirmProcessingStatus);
+      if (processing === "processing" || processing === "done") {
+        claimReason = "ALREADY_PROCESSING";
+        return;
+      }
+      const expiry = classifyOptionalExpiryTimestamp(data.confirmExpiresAt);
+      if (expiry.state === "invalid") {
+        claimReason = "REQUEST_EXPIRY_INVALID";
+        return;
+      }
+      if (expiry.state === "expired") {
+        claimReason = "REQUEST_EXPIRED";
+        return;
+      }
+      // set(..., {merge:true}) rather than update(): existence is already
+      // proven by the transaction.get() above, and merge-set is supported by
+      // every Firestore transaction object uniformly.
+      transaction.set(
+        ref,
+        {
+          customerConfirmProcessingStatus: "processing",
+          customerConfirmProcessingStartedAtMs: Date.now(),
+          updatedAt: new Date(),
+        },
+        { merge: true }
+      );
+    });
+  } catch {
+    return { ok: false, reason: "CLAIM_FAILED" };
   }
-  const expiry = classifyOptionalExpiryTimestamp(data.confirmExpiresAt);
-  if (expiry.state === "invalid") {
-    return { ok: false, reason: "REQUEST_EXPIRY_INVALID", request: { requestId, ...data } };
+
+  if (claimReason) {
+    return {
+      ok: false,
+      reason: claimReason,
+      ...(claimedData ? { request: { requestId, ...claimedData } } : {}),
+    };
   }
-  if (expiry.state === "expired") {
-    return { ok: false, reason: "REQUEST_EXPIRED", request: { requestId, ...data } };
-  }
-  const updated = await updateAvailabilityRequestFields({
-    db: connection,
-    businessId,
-    requestId,
-    patch: {
-      customerConfirmProcessingStatus: "processing",
-      customerConfirmProcessingStartedAtMs: Date.now(),
-    },
-  });
-  if (!updated) return { ok: false, reason: "CLAIM_FAILED" };
   const fresh = await getAvailabilityRequest({ db: connection, businessId, requestId });
   return { ok: true, request: fresh };
 }

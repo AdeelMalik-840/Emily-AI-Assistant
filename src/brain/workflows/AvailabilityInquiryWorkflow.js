@@ -11,6 +11,7 @@ import {
   withAvailabilityAssistPendingQuestion,
 } from "../availability/availabilityAssistContext.js";
 import { resolveAvailabilityAssistFollowUpDecision } from "../availability/decideAvailabilityAssistFollowUp.js";
+import { buildPendingTemporalClarification } from "../availability/temporalClarificationContext.js";
 import { PENDING_ACTION_COLLECT_AVAILABILITY_DURATION } from "../availability/availabilityPendingActions.js";
 import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
@@ -167,6 +168,44 @@ function readSourceIdentity(canonical) {
 function hasCanonicalOwnerCheckContext(canonical) {
   const itemId = String(canonical?.resolvedItem?.id ?? "").trim();
   return Boolean(itemId);
+}
+
+/**
+ * Trusted, resolver-proven signal only: hasActiveBlockingBookingNow is set by
+ * resolveItemBookingAwareAvailability() from real start/end dates
+ * (isBookingActiveAt: start <= evaluationTime && (no end || end > evaluationTime))
+ * — never inferred here from isAvailable/status, which cannot distinguish a
+ * booking active today from one that merely exists but starts in the future
+ * or has an unknown start. A booking not yet started, or with an unproven
+ * start, must fall through to the ordinary duration-collection flow instead —
+ * see buildAvailabilityInquiryActionPlan's caller.
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {boolean}
+ */
+function hasActiveBlockingBookingNowWithNoRequestedWindow(availability) {
+  if (!availability || typeof availability !== "object" || Array.isArray(availability)) {
+    return false;
+  }
+  if (availability.windowApplied === true) return false;
+  if (availability.bookingAware !== true) return false;
+  if (availability.source !== "computeUserFacingAvailability") return false;
+  return availability.hasActiveBlockingBookingNow === true;
+}
+
+/**
+ * A trusted date-bearing temporal claim existed (invalid explicit date, or an
+ * ambiguous/unresolvable reference the single AI temporal owner flagged) but
+ * no exact window could be safely computed. Must never be treated as "no
+ * date" — no owner-check, no AVR, no available/unavailable claim for any
+ * other window; the customer must be asked to clarify instead.
+ * @param {Record<string, unknown> | null | undefined} availability
+ * @returns {boolean}
+ */
+function isAvailabilityTemporalUnresolved(availability) {
+  if (!availability || typeof availability !== "object" || Array.isArray(availability)) {
+    return false;
+  }
+  return availability.dateWindowConfidence === "temporal_unresolved";
 }
 
 /**
@@ -565,6 +604,34 @@ export function buildAskDurationAvailabilityReply(conversationalLabel) {
 }
 
 /**
+ * Deterministic fallback only — the live Cloud DM channel composes this
+ * question with OpenAI (reusing the existing duration_ask prompt, which
+ * already covers "the missing rental period (duration or dates)"). Used
+ * as the draft/fail-safe text, same convention as buildAskDurationAvailabilityReply.
+ * @param {string} conversationalLabel
+ * @returns {string}
+ */
+export function buildAskTemporalClarificationAvailabilityReply(conversationalLabel) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  return `${label} ke liye exact date confirm kar dein, please?`;
+}
+
+/**
+ * Present-tense acknowledgement that the item is occupied right now — used
+ * only when hasActiveBlockingBookingNow has been proven true by the resolver
+ * from real start/end dates (start <= evaluationTime && (no end || end >
+ * evaluationTime)). Says nothing about any specific future window — that
+ * remains governed by isConfidentInventoryUnavailable() once a duration/date
+ * is actually supplied.
+ * @param {string} conversationalLabel
+ * @returns {string}
+ */
+export function buildCurrentlyBlockedNoDurationReply(conversationalLabel) {
+  const label = String(conversationalLabel ?? "").trim() || "item";
+  return `${label} abhi kisi booking mein hai.`;
+}
+
+/**
  * @param {string} conversationalLabel
  * @param {number} durationDays
  * @returns {string}
@@ -935,6 +1002,11 @@ export function buildOwnerCheckActionPlan(p) {
       clearLastAvailabilityAssist: clearAssist === true,
       clearPendingAction: true,
       clearEmilyPending: true,
+      // Item + date + duration are all resolved by the time a real
+      // owner-check plan is built — any temporal-clarification continuation
+      // this item (or a stale different item) was waiting on has now been
+      // fully consumed or superseded, so it must not survive further.
+      clearPendingTemporalClarification: true,
       // Session memory only — never couple to action-side execute flags.
       execute: false,
     }),
@@ -1181,7 +1253,12 @@ export function buildAvailabilityInquiryActionPlan({
 }) {
   const message = String(admittedTurn?.turn?.text ?? "");
   const canonical = readResolvedBusinessTurnContext(businessContext);
-  const assist = readFreshLastAvailabilityAssist(canonical?.lastAvailabilityAssist);
+  const canonicalAuthorityActive = Boolean(
+    String(understanding?.authoritativeSemanticIntent ?? "").trim()
+  );
+  const assist = canonicalAuthorityActive
+    ? null
+    : readFreshLastAvailabilityAssist(canonical?.lastAvailabilityAssist);
   const brainDecision =
     (businessContext?.__availabilityAssistFollowUpDecision &&
     typeof businessContext.__availabilityAssistFollowUpDecision === "object"
@@ -1300,12 +1377,116 @@ export function buildAvailabilityInquiryActionPlan({
     const itemId = String(resolvedItem.id ?? "").trim() || null;
     const itemLabel = String(resolvedItem.displayLabel ?? resolvedItem.name ?? "").trim() || "item";
     const conversationalLabel = conversationalItemLabelFromResolvedItem(resolvedItem);
+    const canonicalAvailability = canonical.verified?.availability ?? null;
+
+    // Safety gate: a trusted date-bearing temporal claim exists but could not
+    // be resolved (invalid explicit date, or an ambiguous/unrepresentable
+    // reference the single AI temporal owner flagged as unresolved). Must run
+    // before owner-check readiness, AVR creation, and any confident-
+    // unavailable claim — never default to now, never claim availability for
+    // a different window, only ask the customer to clarify.
+    if (isAvailabilityTemporalUnresolved(canonicalAvailability)) {
+      const clarifyReplyDraft = buildAskTemporalClarificationAvailabilityReply(conversationalLabel);
+      // Duration is already known on THIS turn (canonical.turn.durationDays
+      // reflects it — including a duration recovered from a still-fresh
+      // matching pendingTemporalClarification on a repeated invalid date).
+      // Only ever carry it forward when it is genuinely known; never invent
+      // one. See temporalClarificationContext.js for the exact contract.
+      const knownDurationDaysForClarification = Number(canonical.turn?.durationDays);
+      const freshPendingClarification =
+        itemId &&
+        Number.isFinite(knownDurationDaysForClarification) &&
+        knownDurationDaysForClarification >= 1
+          ? buildPendingTemporalClarification({
+              itemId,
+              durationDays: knownDurationDaysForClarification,
+              sourceTurnKey: String(canonical?.turn?.sourceTurnKey ?? "").trim() || null,
+            })
+          : null;
+      return Object.freeze({
+        planId: randomUUID(),
+        replyDraft: clarifyReplyDraft,
+        actions: Object.freeze([
+          Object.freeze({
+            type: "REPLY",
+            payload: Object.freeze({
+              channel: "whatsapp_web",
+              text: clarifyReplyDraft,
+              field: "availability",
+              itemId,
+              itemLabel,
+              source: "canonical_owner_check_ask_temporal_clarification",
+              presentedItemIds: Object.freeze([itemId]),
+              execute: false,
+            }),
+          }),
+        ]),
+        // The customer's very next turn may contain only the corrected date,
+        // with no item name at all — trusted contextual focus on this exact
+        // item must survive so ownership can bind it via trusted_fresh_focus
+        // instead of fabricating a current_turn span. If a duration was
+        // already known, it rides along on its own narrow, item-scoped
+        // carrier (never the generic session duration/assist mechanisms).
+        persistenceIntent: Object.freeze({
+          rememberResolvedItem: true,
+          itemId,
+          rememberPresentedItemFocus: true,
+          presentedItemId: itemId,
+          presentedItemLabel: itemLabel,
+          ...(freshPendingClarification
+            ? {
+                rememberPendingTemporalClarification: true,
+                pendingTemporalClarification: freshPendingClarification,
+              }
+            : { clearPendingTemporalClarification: true }),
+          execute: false,
+        }),
+      });
+    }
+
     const durationDays = canonical.turn?.durationDays ?? null;
     const ownerCheckTiming = resolveOwnerCheckTiming(canonical, message);
-    const canonicalAvailability = canonical.verified?.availability ?? null;
     const execute = canonical.actions?.availabilityOwnerCheckExecute === true;
 
     if (!ownerCheckTiming.ready) {
+      // Only a resolver-proven active-now blocking booking (real start/end
+      // dates, not mere existence of a blocking-status row) short-circuits
+      // the blind duration ask. A booking that starts in the future, or
+      // whose start is unknown, must fall through to the ordinary
+      // duration-collection flow below — the customer's requested period is
+      // still needed before window-aware availability can decide anything.
+      if (hasActiveBlockingBookingNowWithNoRequestedWindow(canonicalAvailability)) {
+        const activeNowReplyDraft = buildCurrentlyBlockedNoDurationReply(conversationalLabel);
+        return Object.freeze({
+          planId: randomUUID(),
+          replyDraft: activeNowReplyDraft,
+          actions: Object.freeze([
+            Object.freeze({
+              type: "REPLY",
+              payload: Object.freeze({
+                channel: "whatsapp_web",
+                text: activeNowReplyDraft,
+                field: "availability",
+                itemId,
+                itemLabel,
+                source: "canonical_owner_check_active_blocking_now",
+                presentedItemIds: Object.freeze([itemId]),
+                execute: false,
+              }),
+            }),
+          ]),
+          // This exact item was just named as currently occupied — a normal
+          // itemless follow-up ("kab free hoga?") should bind to it.
+          persistenceIntent: Object.freeze({
+            rememberResolvedItem: true,
+            itemId,
+            rememberPresentedItemFocus: true,
+            presentedItemId: itemId,
+            presentedItemLabel: itemLabel,
+            execute: false,
+          }),
+        });
+      }
       const replyDraft = buildAskDurationAvailabilityReply(conversationalLabel);
       const emilyPending = buildEmilyPending({
         stage: EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
@@ -1460,13 +1641,19 @@ export function buildAvailabilityInquiryActionPlan({
           itemId,
           itemLabel,
           source,
+          presentedItemIds: Object.freeze(itemId ? [itemId] : []),
           execute: false,
         }),
       }),
     ]),
+    // A plain, single-item availability answer names the item directly — a
+    // normal itemless follow-up should validly bind back to it.
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
       itemId,
+      rememberPresentedItemFocus: Boolean(itemId),
+      presentedItemId: itemId,
+      presentedItemLabel: itemLabel,
       execute: false,
     }),
   });

@@ -17,6 +17,7 @@ import { getBookingsForItem } from "../../services/inventoryService.js";
 import { resolveCatalogBrowseAvailabilityFacts } from "./resolveCatalogBrowseAvailabilityFacts.js";
 import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
+import { readFreshPendingTemporalClarification } from "../availability/temporalClarificationContext.js";
 import { decideAvailabilityAssistFollowUp } from "../availability/decideAvailabilityAssistFollowUp.js";
 import { isConfidentInventoryUnavailable } from "./resolveItemBookingAwareAvailability.js";
 import { findVerifiedAvailabilityAlternatives } from "../../services/availabilityRejectionAlternatives.js";
@@ -121,13 +122,16 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
  *
  * Precedence:
  * 1. explicit current-message duration
- * 2. fresh trusted availability assist
- * 3. active trusted AVR lifecycle duration
- * 4. gated session duration only with trustedContinuation co-signal
- * 5. none
+ * 2. pending temporal-clarification continuation (already item/TTL-matched
+ *    by the caller — narrow, single-purpose carrier, distinct from #3/#5)
+ * 3. fresh trusted availability assist
+ * 4. active trusted AVR lifecycle duration
+ * 5. gated session duration only with trustedContinuation co-signal
+ * 6. none
  *
  * @param {{
  *   explicitDurationDays?: number | null,
+ *   pendingClarificationDurationDays?: number | null,
  *   freshAssist?: Record<string, unknown> | null,
  *   activeAvrDurationDays?: number | null,
  *   sessionDurationDays?: number | null,
@@ -135,7 +139,7 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
  * }} p
  * @returns {{
  *   days: number | null,
- *   source: "explicit" | "assist" | "avr" | "gated_session" | "none",
+ *   source: "explicit" | "temporal_clarification_continuation" | "assist" | "avr" | "gated_session" | "none",
  *   trustedContinuation: boolean,
  *   windowStartAt: string | null,
  *   windowEndAt: string | null,
@@ -158,6 +162,24 @@ export function resolveCanonicalRentalDuration(p = {}) {
       days: Math.max(1, Math.floor(explicit)),
       source: /** @type {const} */ ("explicit"),
       trustedContinuation: false,
+      windowStartAt: null,
+      windowEndAt: null,
+      calendarRelative: null,
+    });
+  }
+
+  // Narrow, single-purpose carrier: already item-matched and TTL-checked by
+  // the caller (readFreshPendingTemporalClarification), and only ever
+  // produced by the temporal_unresolved clarification branch itself. Sits
+  // above assist/avr because it is the most specific, most recently-known
+  // truth for this exact continuation — but explicit current-turn duration
+  // (above) always overrides it.
+  const pendingClarificationDays = Number(p.pendingClarificationDurationDays);
+  if (Number.isFinite(pendingClarificationDays) && pendingClarificationDays >= 1) {
+    return Object.freeze({
+      days: Math.max(1, Math.floor(pendingClarificationDays)),
+      source: /** @type {const} */ ("temporal_clarification_continuation"),
+      trustedContinuation: true,
       windowStartAt: null,
       windowEndAt: null,
       calendarRelative: null,
@@ -467,7 +489,9 @@ function resolveBusinessDecision(p) {
               ? "price_answer"
               : canonicalWorkflowType === "booking_request"
                 ? "booking_ack"
-                : "clarification",
+                : canonicalWorkflowType === "image_catalog_request"
+                  ? "image_catalog"
+                  : "clarification",
       requestedField: canonicalRequestedField,
       resolvedItemId,
       durationDays,
@@ -683,6 +707,40 @@ export async function resolveBusinessTurnContext(params) {
   )
     ? params.turnContext.canonicalSemanticDecision.itemScope
     : null;
+  // A frozen Cloud ownership decision exists for this turn (Cloud DM path).
+  // When present, its temporalRequest is the single authoritative temporal
+  // owner (kal/tomorrow/parson/explicit dates all included) — the legacy
+  // regex signal below is never consulted, avoiding dual-source ambiguity.
+  // When absent (Group/legacy/non-canonical callers), the legacy regex
+  // remains the sole fallback, unchanged.
+  const hasCanonicalSemanticDecision = params.turnContext?.canonicalSemanticDecision != null;
+  // AI-proposed structured temporal meaning. Deterministic code below still
+  // owns date validity, timezone conversion, year resolution, and the exact
+  // window — this only carries the model's structural proposal through.
+  const temporalRequest =
+    params.turnContext?.canonicalSemanticDecision?.temporalRequest &&
+    typeof params.turnContext.canonicalSemanticDecision.temporalRequest === "object"
+      ? params.turnContext.canonicalSemanticDecision.temporalRequest
+      : null;
+  const explicitStartDateFromTemporalRequest =
+    temporalRequest?.startDateKind === "explicit_date" &&
+    temporalRequest?.startDate &&
+    typeof temporalRequest.startDate === "object"
+      ? {
+          month: Number(temporalRequest.startDate.month),
+          day: Number(temporalRequest.startDate.day),
+        }
+      : null;
+  const canonicalRelativeKind =
+    temporalRequest?.startDateKind === "relative_tomorrow"
+      ? "tomorrow"
+      : temporalRequest?.startDateKind === "relative_day_after_tomorrow"
+        ? "day_after_tomorrow"
+        : null;
+  // A trusted date-bearing reference exists (invalid, or a customer date the
+  // model could not represent) that must never be silently treated as "no
+  // date" — the availability layer fails closed instead of defaulting to now.
+  const temporalUnresolvedRequested = temporalRequest?.startDateKind === "unresolved";
   const understanding =
     admittedTurn && params.turnContext
       ? understandTurn({
@@ -709,11 +767,22 @@ export async function resolveBusinessTurnContext(params) {
         : null;
 
   const itemMentioned = understanding?.itemSource === "explicit";
-  const rawSignals = extractTurnSignals({
-    message: rawMessage,
-    hasDuration: understanding?.durationDays != null,
-    itemMentioned,
-  });
+  const rawSignals = authoritativeSemanticIntent
+    ? {
+        priceAsk: false,
+        availabilityAsk: false,
+        bookingCommitment: false,
+        browseAsk: false,
+        photoAsk: false,
+        detailsAsk: false,
+        durationMentioned: understanding?.durationDays != null,
+        rentAvailabilityCompound: false,
+      }
+    : extractTurnSignals({
+        message: rawMessage,
+        hasDuration: understanding?.durationDays != null,
+        itemMentioned,
+      });
   const signals = applyCustomerSemanticIntentToSignals(
     rawSignals,
     authoritativeSemanticIntent
@@ -805,8 +874,36 @@ export async function resolveBusinessTurnContext(params) {
       ? Math.max(1, Math.floor(Number(memorySnapshot.lastDurationDays)))
       : null;
 
+  // Pending temporal-clarification continuation: only ever consulted when
+  // this exact turn is itself carrying a start-date signal (a resolved
+  // date, a relative date, or still-unresolved) for the SAME item the
+  // clarification was raised for. An ordinary contextual turn with no
+  // temporal signal at all (price question, image request, etc.) never
+  // reads this, even for the same item within the TTL window — that is the
+  // structural boundary that keeps this narrow and non-generic.
+  const pendingTemporalClarificationRaw =
+    memorySnapshot.pendingTemporalClarification &&
+    typeof memorySnapshot.pendingTemporalClarification === "object" &&
+    !Array.isArray(memorySnapshot.pendingTemporalClarification)
+      ? memorySnapshot.pendingTemporalClarification
+      : null;
+  const isResolvingTemporalClarification =
+    explicitStartDateFromTemporalRequest != null ||
+    canonicalRelativeKind != null ||
+    temporalUnresolvedRequested === true;
+  const nowMsForPendingClarification = Number.isFinite(Number(params.nowMs))
+    ? Number(params.nowMs)
+    : Date.now();
+  const pendingTemporalClarification = isResolvingTemporalClarification
+    ? readFreshPendingTemporalClarification(pendingTemporalClarificationRaw, {
+        itemId: itemFacts.id,
+        nowMs: nowMsForPendingClarification,
+      })
+    : null;
+
   const canonicalDuration = resolveCanonicalRentalDuration({
     explicitDurationDays: explicitDurationDaysForFacts,
+    pendingClarificationDurationDays: pendingTemporalClarification?.durationDays ?? null,
     freshAssist: lastAvailabilityAssist,
     activeAvrDurationDays,
     sessionDurationDays,
@@ -820,10 +917,25 @@ export async function resolveBusinessTurnContext(params) {
     assistDurationDays: lastAvailabilityAssist?.durationDays,
     normalizedMessage,
   });
-  const calendarRelative = resolveAvailabilityCalendarRelative({
+  // Single temporal owner for Cloud turns: once a frozen ownership decision
+  // exists, its temporalRequest is authoritative (kal/tomorrow included) and
+  // the legacy regex signal is never consulted, even when it would disagree.
+  // The regex remains the sole source only when no canonical decision exists
+  // at all (Group/legacy/non-canonical callers of this function).
+  const legacyCalendarRelative = resolveAvailabilityCalendarRelative({
     explicitDurationDays: explicitDurationDaysForFacts,
     normalizedMessage,
   });
+  const calendarRelative = hasCanonicalSemanticDecision
+    ? canonicalRelativeKind
+    : legacyCalendarRelative;
+  // True whenever the window's date signal came from the canonical AI
+  // decision (duration sizes the window) rather than the legacy regex
+  // fallback (fixed 1-day "kal" window, duration suppressed — unchanged).
+  const hasNewTemporalContractWindow =
+    explicitStartDateFromTemporalRequest != null ||
+    temporalUnresolvedRequested ||
+    (hasCanonicalSemanticDecision && calendarRelative != null);
   const rentalDurationDays = canonicalDuration.days;
   const availabilityTimeZone = resolveBusinessTimeZoneForAvailability({
     businessTimeZone: params.businessTimeZone ?? params.timeZone ?? null,
@@ -841,14 +953,22 @@ export async function resolveBusinessTurnContext(params) {
     requestedField: understanding?.askedField ?? turnContextInput?.requestedField ?? null,
     // Prefer canonical rental days; fall back to readiness only when calendarRelative
     // is unset and no rental days (legacy owner-check readiness path).
-    durationDays: calendarRelative
-      ? null
-      : rentalDurationDays ?? durationDaysResolved,
+    // Explicit date / day_after_tomorrow (the new temporal contract) always
+    // size their window from the real duration — only legacy kal/tomorrow
+    // keeps its original fixed single-day window.
+    durationDays:
+      hasNewTemporalContractWindow
+        ? (rentalDurationDays ?? durationDaysResolved)
+        : calendarRelative
+          ? null
+          : rentalDurationDays ?? durationDaysResolved,
     calendarRelative,
+    explicitStartDate: explicitStartDateFromTemporalRequest,
+    temporalUnresolved: temporalUnresolvedRequested,
     timeZone: availabilityTimeZone,
     getBookingsForItemFn: params.getBookingsForItemFn,
     ...(function resolveAvailabilityNowMs() {
-      if (calendarRelative) {
+      if (calendarRelative || hasNewTemporalContractWindow) {
         return { nowMs: clockNowMs };
       }
       const startMs = Date.parse(
@@ -999,7 +1119,13 @@ export async function resolveBusinessTurnContext(params) {
   }
 
   let availabilityAssistFollowUp = null;
-  if (lastAvailabilityAssist) {
+  const canonicalCloudDm =
+    String(turnContextInput?.channel ?? params.turnContext?.channel ?? "") ===
+      "whatsapp_cloud" &&
+    String(turnContextInput?.chatType ?? params.turnContext?.chatType ?? "") !==
+      "group" &&
+    Boolean(authoritativeSemanticIntent);
+  if (lastAvailabilityAssist && !canonicalCloudDm) {
     try {
       availabilityAssistFollowUp = await decideAvailabilityAssistFollowUp({
         customerText: rawMessage,
@@ -1086,10 +1212,18 @@ export async function resolveBusinessTurnContext(params) {
       sourceTurnKey,
       ...(canonicalDuration.windowStartAt
         ? { requestedStartAt: canonicalDuration.windowStartAt }
-        : {}),
+        : hasNewTemporalContractWindow &&
+            availabilityFacts.availability?.windowApplied === true &&
+            availabilityFacts.availability?.requestedStartAt
+          ? { requestedStartAt: availabilityFacts.availability.requestedStartAt }
+          : {}),
       ...(canonicalDuration.windowEndAt
         ? { requestedEndAt: canonicalDuration.windowEndAt }
-        : {}),
+        : hasNewTemporalContractWindow &&
+            availabilityFacts.availability?.windowApplied === true &&
+            availabilityFacts.availability?.requestedEndAt
+          ? { requestedEndAt: availabilityFacts.availability.requestedEndAt }
+          : {}),
     },
 
     duration: Object.freeze({
@@ -1113,6 +1247,11 @@ export async function resolveBusinessTurnContext(params) {
     participant: participantFacts.participant,
     sourceIdentity,
     lastAvailabilityAssist,
+    // Raw, unfiltered session value (mirrors lastAvailabilityAssist above) --
+    // callers that need to detect/supersede a stale record for a DIFFERENT
+    // item re-check freshness/item-match themselves via
+    // readFreshPendingTemporalClarification.
+    pendingTemporalClarification: pendingTemporalClarificationRaw,
     availabilityAssistFollowUp,
     unavailableCustomerReply,
     presentedAlternativeItemIds: Object.freeze([...presentedAlternativeItemIds]),

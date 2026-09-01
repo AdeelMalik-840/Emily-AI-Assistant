@@ -143,7 +143,7 @@ test("participant identity prefers phone then normalized display name fallback",
   assert.equal(byName.source, "name");
 });
 
-test("participant identity keeps same fallback anchor across same sender messages", () => {
+test("participant identity does not mint first-seen keys from display name in a group", () => {
   const first = resolveParticipantIdentity({
     groupChatKey: "Rental Leads",
     participantName: "Same Sender",
@@ -153,9 +153,10 @@ test("participant identity keeps same fallback anchor across same sender message
     participantName: "Same Sender",
   });
 
-  assert.equal(first.participantKey, second.participantKey);
-  assert.equal(first.source, "first_seen_anchor");
-  assert.match(first.participantKey, /^same-sender::first-seen-/);
+  assert.equal(first.participantKey, null);
+  assert.equal(second.participantKey, null);
+  assert.equal(first.source, "unresolved");
+  assert.equal(second.source, "unresolved");
 });
 
 test("participant identity separates same-name senders when real anchor exists", () => {
@@ -176,7 +177,7 @@ test("participant identity separates same-name senders when real anchor exists",
   assert.equal(first.source, "real_anchor");
 });
 
-test("participant identity real anchor takes precedence over cached fallback", () => {
+test("participant identity real anchor takes precedence over name-only unresolved", () => {
   const fallback = resolveParticipantIdentity({
     groupChatKey: "Support Group",
     participantName: "Adeel",
@@ -187,7 +188,8 @@ test("participant identity real anchor takes precedence over cached fallback", (
     senderAnchor: "contact-adeel",
   });
 
-  assert.match(fallback.participantKey, /^adeel::first-seen-/);
+  assert.equal(fallback.participantKey, null);
+  assert.equal(fallback.source, "unresolved");
   assert.equal(real.participantKey, "adeel::contact-adeel");
   assert.equal(real.source, "real_anchor");
 });

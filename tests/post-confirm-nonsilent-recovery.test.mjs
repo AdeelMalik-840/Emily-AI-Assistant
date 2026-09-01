@@ -14,6 +14,11 @@ const {
   executePostConfirmPaLaneDecision,
   classifyPostConfirmOpenAiUsabilityFailure,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+const {
+  canonicalOldBookingOwnership,
+  canonicalSocialOwnership,
+  CANONICAL_OWNERSHIP_TURN_ID,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 const { handleCustomerBusinessPaInbound } = await import(
   "../src/services/customerBusinessPaAgentService.js"
 );
@@ -77,6 +82,7 @@ function focusedFacts(known = {}) {
       doNotInventPolicies: true,
       doNotMutateBooking: true,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
   };
 }
 
@@ -142,6 +148,7 @@ function inferTestOnlyFactKind(d) {
 
 function decision(overrides = {}) {
   const payload = {
+    ...canonicalOldBookingOwnership({ bookingId: "test-booking-stonic" }),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -198,6 +205,7 @@ function decision(overrides = {}) {
 
 function socialSilenceDecision() {
   return decision({
+    ...canonicalSocialOwnership(),
     situation: "conversation_closing",
     conversationAct: "thanks",
     customerIntent: "thanks",
@@ -306,15 +314,12 @@ test("2. first attempts malformed, deferred Turn Plan in recovery stays retryabl
       }),
     }
   );
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(result.ok, false);
   assert.equal(result.source, "technical_fallback");
   assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
-  assert.equal(result.retryable, true);
-  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
-  const recoveryPrompt = String(calls[2]?.messages?.[1]?.content || "");
-  assert.match(recoveryPrompt, /empty\/invalid output recovery/i);
-  assert.match(recoveryPrompt, /Do NOT use request_booking_mutation/);
+  assert.equal(result.retryable, false);
+  assert.equal(result.usabilityClassification, "malformed_json");
 });
 
 test("3. delivery fact missing Turn Plan in recovery stays retryable", async () => {
@@ -347,15 +352,15 @@ test("3. delivery fact missing Turn Plan in recovery stays retryable", async () 
   assert.equal(result.ok, false);
   assert.equal(result.source, "technical_fallback");
   assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
-  assert.equal(result.retryable, true);
-  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
+  assert.equal(result.retryable, false);
+  assert.equal(result.usabilityClassification, "empty_content");
 });
 
 test("4. all attempts fail → retryable, not intentionalSilent/silent_noop", async () => {
   const { result, calls } = await runDecide(["", "", ""]);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(result.ok, false);
-  assert.equal(result.retryable, true);
+  assert.equal(result.retryable, false);
   assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
   assert.equal(result.usabilityClassification, "empty_content");
 
@@ -366,8 +371,8 @@ test("4. all attempts fail → retryable, not intentionalSilent/silent_noop", as
     preResolvedBookingFacts: { ok: true, facts: focusedFacts() },
     __decideCustomerTurnFn: async () => result,
   });
-  assert.equal(agent.retryable, true);
-  assert.equal(agent.terminalFailure, false);
+  assert.equal(agent.retryable, false);
+  assert.equal(agent.terminalFailure, true);
   assert.equal(agent.sentReply, false);
 
   assert.equal(

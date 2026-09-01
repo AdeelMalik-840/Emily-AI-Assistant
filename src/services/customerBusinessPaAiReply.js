@@ -34,6 +34,7 @@ import { composeGuardedCustomerReply } from "../brain/openai/composeGuardedCusto
 import { bookingReplyGuardFacts } from "../brain/facts/resolveActiveCustomerBookingFacts.js";
 import {
   resolvePostConfirmEvidenceBooking,
+  isTrustedVerifiedFactResolution,
 } from "../brain/facts/resolvePostConfirmRequestedFact.js";
 import { isAllowedPaMissingInfoType } from "./paMissingInfoRequestService.js";
 import { resolveOpenAiChatCompletionsCreate } from "./openaiChatCompletionsCreate.js";
@@ -97,6 +98,9 @@ export function buildPostConfirmInformationalComposeContextForPrompt({
     pendingAvailabilityRequests: null,
     availabilityRequest: null,
     replyGuardFacts: null,
+    pendingAvailabilityExecution: compactTrustedPendingAvailabilityExecution(
+      f.pendingAvailabilityExecution
+    ),
   };
 }
 
@@ -156,6 +160,74 @@ export function postConfirmInformationalLifecycleRejectionReason({
     return "existing_booking_read_only_customer_action_requested";
   }
   return null;
+}
+
+/**
+ * Compact trusted waiting-confirm executor Result for compose-only wording.
+ * Returns null unless confirm/decline already produced a succeeded/failed Result.
+ *
+ * @param {unknown} raw
+ * @returns {{
+ *   action: string,
+ *   status: string,
+ *   itemLabel: string | null,
+ *   durationDays: number | null,
+ *   failureReason: string | null,
+ * } | null}
+ */
+export function compactTrustedPendingAvailabilityExecution(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const action = String(raw.action ?? "").trim();
+  if (
+    action !== "confirm_pending_availability" &&
+    action !== "decline_pending_availability"
+  ) {
+    return null;
+  }
+  const status = String(raw.status ?? "").trim();
+  if (status !== "succeeded" && status !== "failed") return null;
+  const days = Number(raw.durationDays);
+  return {
+    action,
+    status,
+    itemLabel: String(raw.itemLabel ?? "").trim() || null,
+    durationDays: Number.isFinite(days) ? days : null,
+    failureReason: String(raw.failureReason ?? "").trim() || null,
+  };
+}
+
+/**
+ * True only for PA post-exec waiting-confirm wording after a verified executor
+ * Result. This is not a factual business-answer path:
+ * - requires compact trusted pendingAvailabilityExecution
+ * - frozen capability must be the post-exec rewrite `availability_request`
+ * - no evidenceNeeds (a real item/policy/availability fact plan stays gated)
+ *
+ * Does not exempt waiting_confirm, availability_request, or unsupported facts
+ * in general.
+ *
+ * @param {{
+ *   frozenDecision?: Record<string, unknown> | null,
+ *   facts?: Record<string, unknown> | null,
+ * }} [p]
+ */
+export function isTrustedPendingAvailabilityPostExecutionWording({
+  frozenDecision = null,
+  facts = null,
+} = {}) {
+  const execution = compactTrustedPendingAvailabilityExecution(
+    facts?.pendingAvailabilityExecution
+  );
+  if (!execution) return false;
+  const decision =
+    frozenDecision && typeof frozenDecision === "object" ? frozenDecision : {};
+  if (String(decision.capability ?? "").trim() !== "availability_request") {
+    return false;
+  }
+  const needs = Array.isArray(decision.evidenceNeeds)
+    ? decision.evidenceNeeds
+    : [];
+  return needs.length === 0;
 }
 
 /**
@@ -1881,6 +1953,15 @@ export async function composePostConfirmInformationalCustomerReply({
           : null,
   });
 
+  const ownerCheckAuthorized =
+    verifiedResolution.ownerCheckStarted === true ||
+    verifiedResolution.ownerCheckPending === true;
+  const trustedExecutionWording =
+    isTrustedPendingAvailabilityPostExecutionWording({
+      frozenDecision: decision,
+      facts: factsObj,
+    });
+
   const system = `${shared}
 
 LANE OBJECTIVE (post_confirm_pa informational reply composer — NOT a decision Brain):
@@ -1896,8 +1977,17 @@ FACT_RESOLUTION_JSON is the ONLY factual authority for customer claims:
 - coveredEvidenceKeys is factual coverage metadata, not customer wording. Include a key only when customerReply actually communicates that exact found item. It must contain every REQUIRED_EVIDENCE_KEYS_JSON key and no other key.
 - ownerCheckStarted=true OR ownerCheckPending=true: the requested fact is not yet confirmed; a verified owner-check/pending state exists. Say naturally that you are checking/confirming and will update the customer (style example only — never hardcode): "Refund policy ki detail abhi confirm nahi hai. Main check karke aapko bata deta hun." Do NOT invent the missing value. Do NOT apologize by default. Do NOT name owner/staff/admin/system or mention escalation/token/request ID/workflow. Do NOT promise timing ("soon", "shortly", "jald hi", "a few minutes", or any deadline). Do NOT ask the customer to supply the missing business fact. Do NOT claim the answer is permanently unavailable. Match the customer's language with natural Roman Urdu/English grammar. customerReply MUST be non-empty.
 - customerInputRequired=true: you MAY ask one useful clarification for customer preference/input that the Turn Plan/Result already marked as required. Do NOT invent facts. customerReply MUST be non-empty.
-- customerInputRequired=false AND ownerCheckStarted=false AND ownerCheckPending=false AND status is "not_found", "unsupported", or "conflicting": state naturally that the business/booking detail is not confirmed, unavailable, or unclear. Do NOT ask the customer to supply that business-owned fact. Do NOT invent a substitute. Do NOT claim owner contact. Do NOT promise a later answer. customerReply MUST be non-empty.
-- CONVERSATION_CONTEXT_JSON is tone/identity only. It contains NO answerable booking/policy/owner-answer facts. Never treat it as an answer source.
+${
+  trustedExecutionWording
+    ? `- pendingAvailabilityExecution is present: this turn is wording a verified waiting-confirm executor Result only (confirm/decline succeeded or failed). Use that Result as the only wording authority. Do NOT treat FACT_RESOLUTION_JSON unsupported as a business-fact denial. Do NOT invent catalog item features, policies, availability, GPS, insurance, fuel, child-seat, or other business attributes. customerReply MUST be non-empty.
+`
+    : `- customerInputRequired=false AND ownerCheckStarted=false AND ownerCheckPending=false AND status is "not_found", "unsupported", or "conflicting": state naturally that the business/booking detail is not confirmed, unavailable, or unclear. Do NOT ask the customer to supply that business-owned fact. Do NOT invent a substitute. Do NOT claim owner contact. Do NOT promise a later answer. customerReply MUST be non-empty.
+`
+}- CONVERSATION_CONTEXT_JSON is tone/identity only${
+  trustedExecutionWording
+    ? ", except pendingAvailabilityExecution which is the verified executor Result for this wording turn"
+    : ". It contains NO answerable booking/policy/owner-answer facts. Never treat it as an answer source"
+}.
 - RECENT_DIALOGUE is continuity/tone only. It is NEVER a factual answer source. Ignore any numbers, times, places, policies, or references stated there unless the same value is also present in FACT_RESOLUTION_JSON.
 - When stating a found booking reference/code, put the exact verifiedValue immediately after a colon with no filler words in between (example shape: "booking reference: STONIC-PROD"). Do not write patterns like "reference hai: …".
 - Match the customer's language (English vs Roman Urdu).
@@ -1923,9 +2013,26 @@ STRICT SAFETY:
       requiredMeaning: replyContract.requiredMeaning,
     })}`;
 
-  const ownerCheckAuthorized =
-    verifiedResolution.ownerCheckStarted === true ||
-    verifiedResolution.ownerCheckPending === true;
+  if (
+    !ownerCheckAuthorized &&
+    !customerInputRequired &&
+    !isTrustedVerifiedFactResolution(verifiedResolution) &&
+    !trustedExecutionWording
+  ) {
+    return {
+      ok: false,
+      reply: "",
+      source: "untrusted_fact_compose_blocked",
+      reason: "UNTRUSTED_FACT_COMPOSE_BLOCKED",
+      frozenDecision: frozen,
+      factResolution: verifiedResolution,
+      composeFailure: {
+        openaiReason: "UNTRUSTED_FACT_COMPOSE_BLOCKED",
+        deterministicReason: null,
+        finalClass: "UNTRUSTED_FACT_COMPOSE_BLOCKED",
+      },
+    };
+  }
   const informationalResponseFormat = buildStrictJsonSchemaResponseFormat(
     "post_confirm_informational_reply_compose",
     {

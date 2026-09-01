@@ -55,6 +55,7 @@ import { isReplyPrivateLockActive } from "../replyPrivateUiController.js";
 import {
   buildParticipantCursorKey,
   isGroupMessageStale,
+  isSyntheticFirstSeenParticipantKey,
   resolveParticipantIdentity,
 } from "../participantIdentity.js";
 import { loadPlaywrightInboundCursor } from "../playwrightInboundCursorStore.js";
@@ -329,18 +330,27 @@ function groupSenderScopeFromAnchor(groupKey, senderAnchor) {
 }
 
 /**
- * Group reply-after guard: match participant rows with stable keys when present.
+ * Group reply-after / burst identity: only reusable (non-first-seen) keys match.
+ * Display name / missing keys never collapse two rows into one participant.
  * @param {{ participantKey?: string | null, sender?: string }} a
  * @param {{ participantKey?: string | null, sender?: string }} b
  */
 function isSameParticipant(a, b) {
-  if (a.participantKey && b.participantKey) {
-    return a.participantKey === b.participantKey;
-  }
-  if (!a.participantKey && !b.participantKey) {
-    return Boolean(a.sender && b.sender && a.sender === b.sender);
-  }
+  const ka = reusableGroupParticipantKey(a?.participantKey);
+  const kb = reusableGroupParticipantKey(b?.participantKey);
+  if (ka && kb) return ka === kb;
   return false;
+}
+
+function reusableGroupParticipantKey(value) {
+  const key = String(value ?? "").trim();
+  if (!key) return "";
+  if (isSyntheticFirstSeenParticipantKey(key)) return "";
+  return key;
+}
+
+function stampExtractedGroupParticipantKey(identity) {
+  return reusableGroupParticipantKey(identity?.participantKey) || null;
 }
 
 /**
@@ -359,7 +369,7 @@ function participantComparableFromSortedRow(m, normalizedGroupChatKey) {
     senderScope,
   });
   return {
-    participantKey: identity.participantKey || null,
+    participantKey: stampExtractedGroupParticipantKey(identity),
     sender: String(m?.sender ?? "").trim() || "user",
   };
 }
@@ -1858,6 +1868,15 @@ function collapseRowsForForward(rows, opts = {}) {
   ];
 }
 
+/** @internal Tests — stable IDs the live listener would mark fresh-admitted. */
+export function __freshAdmittedStableIdsForTests(rows, extractedMessages = rows) {
+  return new Set(
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => getMessageIdFromExtracted(row, extractedMessages || rows))
+      .filter(Boolean)
+  );
+}
+
 /** @internal Tests — row timestamp from DOM or prePlainText. */
 export function __getRowTimestampMsForTests(row) {
   return getRowTimestampMs(row);
@@ -1870,7 +1889,19 @@ export function __candidateRowsAfterCursorForTests(args) {
 
 /** @internal Tests — merge last two catch-up user rows for one forward. */
 export function __collapseRowsForForwardForTests(rows, opts = {}) {
-  return collapseRowsForForward(rows, opts);
+  const extracted = Array.isArray(rows) ? rows : [];
+  const admitted =
+    opts.currentFreshAdmittedStableIds instanceof Set
+      ? opts.currentFreshAdmittedStableIds
+      : new Set(
+          extracted
+            .map((row) => getMessageIdFromExtracted(row, extracted))
+            .filter(Boolean)
+        );
+  return collapseRowsForForward(rows, {
+    ...opts,
+    currentFreshAdmittedStableIds: admitted,
+  });
 }
 
 /**
@@ -1895,7 +1926,16 @@ export function __planPlaywrightStartupForwardForTests({
     sidebarHasSignal,
     now,
   });
-  const rowsForForward = collapseRowsForForward(candidateRows);
+  const admitted = new Set(
+    (extractedMessages || [])
+      .filter((row) => row?.sender === "user")
+      .map((row) => getMessageIdFromExtracted(row, extractedMessages))
+      .filter(Boolean)
+  );
+  const rowsForForward = collapseRowsForForward(candidateRows, {
+    currentFreshAdmittedStableIds: admitted,
+    chatKey: normalizedGroupChatKeyForCompare,
+  });
   const selected = [];
   for (const candidate of rowsForForward) {
     const extractedIdBuilt =
@@ -2142,7 +2182,7 @@ export function attachBurstMergeContinuations(
   ) {
     return anchorMsg;
   }
-  const anchorParticipantKey = String(anchorMsg?.participantKey ?? "").trim();
+  const anchorParticipantKey = reusableGroupParticipantKey(anchorMsg?.participantKey);
   const allowMultiRowMerge = Boolean(anchorParticipantKey);
   const byPos = new Map(
     (allParticipantUserRows || [])
@@ -2150,9 +2190,14 @@ export function attachBurstMergeContinuations(
         if (row?.sender !== "user") return false;
         if (!String(row?.text ?? "").trim()) return false;
         if (!allowMultiRowMerge) return row === anchorMsg;
-        const participantKey = String(row?.participantKey ?? "").trim();
+        const participantKey = reusableGroupParticipantKey(row?.participantKey);
         if (participantKey !== anchorParticipantKey) return false;
         const stableId = getMessageIdFromExtracted(row, extractedMessages);
+        // Punctuation continuations ("?", "??") are not independent admissions,
+        // but they must still attach to the already-admitted anchor.
+        if (isBurstMergeContinuationText(row?.text) && stableId) {
+          return true;
+        }
         return isFreshMergeSourceAllowed({
           row,
           stableId,
@@ -2442,9 +2487,9 @@ export function buildParticipantForwardCandidate(p) {
  * @param {string} normalizedGroupChatKey
  */
 function participantComparableForGuard(m, normalizedGroupChatKey) {
-  const directKey = String(m?.participantKey ?? "").trim();
+  const directKey = reusableGroupParticipantKey(m?.participantKey);
   if (directKey) {
-  return {
+    return {
       participantKey: directKey,
       sender: String(m?.sender ?? "user").trim() || "user",
     };
@@ -7043,7 +7088,7 @@ async function extractIncomingMessages(page, opts = {}) {
       groupChatKey: normalizedGroupChatKey,
       senderScope,
     });
-    m.participantKey = identity.participantKey || null;
+    m.participantKey = stampExtractedGroupParticipantKey(identity);
     console.log("[Playwright] ✅ New message:", m.text, `(${m.sender})`);
     if (m.sender === "user" && identity.participantKey) {
       console.log("[playwright_message_sender_metadata_extracted]", {
@@ -8146,7 +8191,7 @@ async function runListenerBody() {
             );
             userMessages.push({
               ...m,
-              participantKey: identity.participantKey || null,
+              participantKey: stampExtractedGroupParticipantKey(identity),
               participantName: identity.participantName || m.participantName || null,
               participantPhone: identity.participantPhone || m.participantPhone || null,
               __position: sortedIdx,

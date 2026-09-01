@@ -19,6 +19,10 @@ const {
   buildPostConfirmClarificationAnswerContinuityCorrection,
   cleanPostConfirmFactKind,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+const {
+  canonicalOldBookingOwnership,
+  CANONICAL_OWNERSHIP_TURN_ID,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const decideSrc = readFileSync(
@@ -69,11 +73,13 @@ function focusedFacts() {
       doNotInventPolicies: true,
       doNotMutateBooking: true,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
   };
 }
 
 function decisionJson(overrides = {}) {
   return JSON.stringify({
+    ...canonicalOldBookingOwnership({ bookingId: "bk-1" }),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",

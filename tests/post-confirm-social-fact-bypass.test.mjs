@@ -12,6 +12,13 @@ import {
   executePostConfirmPaLaneDecision,
   parsePostConfirmCustomerDmDecision,
 } from "../src/brain/decisions/decidePostConfirmCustomerDm.js";
+import {
+  canonicalOldBookingOwnership,
+  canonicalSocialOwnership,
+  CANONICAL_OWNERSHIP_TURN_ID,
+  noneTargetReference,
+  historicalBookingTargetReference,
+} from "./helpers/canonicalPostConfirmFixture.mjs";
 
 function booking(overrides = {}) {
   return {
@@ -80,6 +87,7 @@ function focusedFacts(extra = {}) {
       doNotInventPolicies: true,
       doNotMutateBooking: true,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
     ...extra,
   };
 }
@@ -89,9 +97,19 @@ function decisionJson(overrides = {}) {
     overrides.factKind === "non_business" ||
     overrides.capability === "social";
   return JSON.stringify({
+    ...(social
+      ? canonicalSocialOwnership()
+      : canonicalOldBookingOwnership({ bookingId: "bk-1" })),
     turnScope: social ? "SOCIAL_GENERAL" : "OLD_BOOKING_REFERENCE",
     targetContext: social ? "NONE" : "CONFIRMED_BOOKING",
     targetId: social ? null : "bk-1",
+    selectedBookingId: social ? null : "bk-1",
+    semanticIntent: social ? "social" : null,
+    itemScope: "none",
+    itemReferents: [],
+    targetReference: social
+      ? noneTargetReference()
+      : historicalBookingTargetReference("bk-1"),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",

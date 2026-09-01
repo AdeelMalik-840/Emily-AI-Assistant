@@ -1631,8 +1631,48 @@ function sameSemanticMeaning(left, right) {
     cleanSemanticField(left?.factKind) === cleanSemanticField(right?.factKind) &&
     cleanSemanticField(left?.capability) === cleanSemanticField(right?.capability) &&
     normalizedEvidence(left?.evidenceNeeds) ===
-      normalizedEvidence(right?.evidenceNeeds)
+      normalizedEvidence(right?.evidenceNeeds) &&
+    JSON.stringify(sanitizeSemanticTemporalRequest(left?.temporalRequest)) ===
+      JSON.stringify(sanitizeSemanticTemporalRequest(right?.temporalRequest))
   );
+}
+
+const CLOUD_SEMANTIC_TEMPORAL_START_DATE_KINDS = new Set([
+  "none",
+  "explicit_date",
+  "relative_tomorrow",
+  "relative_day_after_tomorrow",
+  "unresolved",
+]);
+
+/**
+ * Ledger-boundary temporal contract. Preserves an already-valid
+ * temporalRequest exactly (including a legitimate startDateKind="none",
+ * which is a real signal that the customer expressed no date). Anything
+ * else — missing, wrong-shaped, an unrecognized kind, or an explicit_date
+ * claim with a broken/out-of-range startDate — is uncertainty, never
+ * evidence of "no date", and fails closed to "unresolved" so downstream
+ * code cannot silently default to now for it.
+ * @param {unknown} raw
+ * @returns {{ startDateKind: "none" | "explicit_date" | "relative_tomorrow" | "relative_day_after_tomorrow" | "unresolved", startDate: { day: number, month: number } | null }}
+ */
+function sanitizeSemanticTemporalRequest(raw) {
+  const unresolvedFallback = { startDateKind: /** @type {const} */ ("unresolved"), startDate: null };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return unresolvedFallback;
+  const kind = cleanSemanticField(raw.startDateKind, 40);
+  if (!kind || !CLOUD_SEMANTIC_TEMPORAL_START_DATE_KINDS.has(kind)) return unresolvedFallback;
+  if (kind !== "explicit_date") {
+    return { startDateKind: /** @type {const} */ (kind), startDate: null };
+  }
+  const startDateRaw = raw.startDate;
+  if (!startDateRaw || typeof startDateRaw !== "object" || Array.isArray(startDateRaw)) {
+    return unresolvedFallback;
+  }
+  const day = Number(startDateRaw.day);
+  const month = Number(startDateRaw.month);
+  if (!Number.isInteger(day) || day < 1 || day > 31) return unresolvedFallback;
+  if (!Number.isInteger(month) || month < 1 || month > 12) return unresolvedFallback;
+  return { startDateKind: /** @type {const} */ ("explicit_date"), startDate: { day, month } };
 }
 
 function sanitizeSemanticEvidenceNeeds(raw) {
@@ -1703,6 +1743,7 @@ function sanitizeCloudSemanticDecision(p = {}) {
     semanticIntent,
     itemScope,
     itemReferents,
+    itemReferenceMode: cleanSemanticField(p.itemReferenceMode, 40),
     targetReference,
     targetId: cleanSemanticField(p.targetId, 160),
     targetContext: cleanSemanticField(p.targetContext, 80),
@@ -1715,6 +1756,7 @@ function sanitizeCloudSemanticDecision(p = {}) {
     factKind: cleanSemanticField(p.factKind, 80),
     capability: cleanSemanticField(p.capability, 80),
     evidenceNeeds: sanitizeSemanticEvidenceNeeds(p.evidenceNeeds),
+    temporalRequest: sanitizeSemanticTemporalRequest(p.temporalRequest),
     semanticDecisionVersion: CLOUD_SEMANTIC_DECISION_VERSION,
     semanticDecisionStatus: status,
     acceptedAtMs: Number(p.acceptedAtMs) > 0 ? Number(p.acceptedAtMs) : Date.now(),

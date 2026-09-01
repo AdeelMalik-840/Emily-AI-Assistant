@@ -206,11 +206,33 @@ test("Issue 1 integrated: stale Corolla focus releases Civic unavailable flow an
         ok: true,
         source: "openai",
         decision: {
+          turnScope: "NEW_TRANSACTION",
+          semanticIntent: "availability_inquiry",
+          itemScope: "specific",
+          itemReferents: [
+            {
+              source: "current_turn",
+              surfaceText: "Honda Civic",
+              start: 0,
+              end: "Honda Civic".length,
+              trustedItemId: null,
+              sourceTurnId: null,
+            },
+          ],
+          targetReference: {
+            source: "none",
+            sourceTurnId: null,
+            targetType: "none",
+            targetId: null,
+          },
+          targetContext: "NEW_TRANSACTION",
+          targetId: null,
+          selectedBookingId: null,
+          bookingSelectionMode: "none",
           factKind: "booking_fact",
           capability: "availability_request",
           action: "reply",
           mutationIntent: "none",
-          bookingSelectionMode: "none",
           selectedBookingIndex: null,
           pendingAvailabilitySelectionIndex: null,
         },
@@ -230,7 +252,7 @@ test("Issue 1 integrated: stale Corolla focus releases Civic unavailable flow an
     },
   });
   assert.equal(pa.ownershipReleased, true);
-  assert.equal(pa.releaseReason, "FRESH_AVAILABILITY_REQUEST");
+  assert.equal(pa.releaseReason, "SEMANTIC_SCOPE_NEW_TRANSACTION");
   assert.equal(pa.semanticDecisionCount, 1);
   assert.equal(pa.composeCalls, 0);
   assert.deepEqual(forbiddenPaCalls, {

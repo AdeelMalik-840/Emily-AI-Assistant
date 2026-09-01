@@ -14,8 +14,10 @@ const {
   parsePaMissingInfoOwnerAnswerMessage,
   extractTrustedOwnerAdvanceAmount,
   PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE,
+  PA_MISSING_INFO_OWNER_EXPIRED_NUDGE,
 } = await import("../src/services/paMissingInfoOwnerAnswerService.js");
 const {
+  createOrGetOpenPaMissingInfoRequest,
   getPaMissingInfoRequest,
   isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback,
   listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests,
@@ -31,6 +33,10 @@ const REQUEST_ID = "pamiss_abcdef0123456789ab";
 const NOTIFY_WAMID = "wamid.pa-notify-1";
 const OTHER_NOTIFY_WAMID = "wamid.pa-notify-2";
 const OTHER_CUSTOMER = "923004445556";
+const CATALOG_REQUEST_ID = "pamiss_catalog_aaaaaaaaaa";
+const CATALOG_REQUEST_ID_B = "pamiss_catalog_bbbbbbbbbb";
+const CATALOG_NOTIFY_WAMID = "wamid.catalog-notify-1";
+const CATALOG_NOTIFY_WAMID_B = "wamid.catalog-notify-2";
 
 function withFlags({ missingInfo = false, ownerAnswer = false }, fn) {
   const prevMiss = process.env.EMILY_BUSINESS_PA_MISSING_INFO_ENABLED;
@@ -242,6 +248,43 @@ function baseRequest(overrides = {}) {
     expiresAt: new Date(now.getTime() + 48 * 60 * 60 * 1000),
     ...overrides,
   };
+}
+
+function baseCatalogRequest(overrides = {}) {
+  const now = new Date();
+  return {
+    requestId: CATALOG_REQUEST_ID,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    bookingId: null,
+    availabilityRequestId: null,
+    itemId: "civic-1",
+    itemLabel: "Honda Civic 2026",
+    scopeKind: "catalog_item",
+    missingInfoType: "other",
+    customerQuestion: "Does Civic have a child seat?",
+    customerMessageId: "wamid.cust-catalog-1",
+    sourceTurnId: "wamid.cust-catalog-1",
+    status: "owner_notified",
+    ownerNotifyStatus: "sent",
+    ownerNotifyProviderMessageId: CATALOG_NOTIFY_WAMID,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: new Date(now.getTime() + 48 * 60 * 60 * 1000),
+    ...overrides,
+  };
+}
+
+function seedCatalogOnly(fake, secondRequest = null) {
+  fake.setOwnerPhone(BUSINESS_ID, OWNER_PHONE);
+  fake.seedMissingInfo(
+    BUSINESS_ID,
+    CATALOG_REQUEST_ID,
+    baseCatalogRequest()
+  );
+  if (secondRequest) {
+    fake.seedMissingInfo(BUSINESS_ID, secondRequest.requestId, secondRequest);
+  }
 }
 
 function seedContext(fake, { requestOverrides = {}, secondRequest = null } = {}) {
@@ -1281,4 +1324,406 @@ test("getPaMissingInfoRequest loads by id", async () => {
   });
   assert.equal(row.requestId, REQUEST_ID);
   assert.equal(row.status, "owner_notified");
+});
+
+const finalAnswerClassifier = async () => ({
+  ok: true,
+  kind: "final_answer",
+  source: "test",
+});
+
+test("unquoted: one open catalog request only may resolve", async () => {
+  const fake = createFakeDb();
+  seedCatalogOnly(fake);
+  const customerSends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Haan, Civic mein child seat hai",
+      messageId: "wamid.owner-catalog-only",
+      sendWhatsAppMessageFn: async (to, text) => {
+        customerSends.push({ to, text });
+        return { ok: true, providerMessageId: "wamid.cust-catalog-out" };
+      },
+      __generateFollowupFn: async () => ({
+        ok: true,
+        reply: "Haan, Civic mein child seat hai.",
+        source: "openai",
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "CUSTOMER_FOLLOWUP_SENT");
+    assert.equal(result.matchReason, "SINGLE_OWNER_NOTIFIED");
+    assert.equal(result.requestId, CATALOG_REQUEST_ID);
+    assert.equal(customerSends.length, 1);
+    assert.equal(phoneDigits(customerSends[0].to), CUSTOMER_PHONE);
+  });
+});
+
+test("unquoted: one booking + one catalog request resolves NONE", async () => {
+  const fake = createFakeDb();
+  seedContext(fake, {
+    secondRequest: baseCatalogRequest({
+      requestId: CATALOG_REQUEST_ID,
+      ownerNotifyProviderMessageId: CATALOG_NOTIFY_WAMID,
+    }),
+  });
+  const sends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Yes available",
+      messageId: "wamid.owner-booking-catalog",
+      sendWhatsAppMessageFn: async (to, text) => {
+        sends.push({ to, text });
+        return { ok: true };
+      },
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "AMBIGUOUS_ELIGIBLE_REQUESTS");
+    assert.equal(result.eligibleCount, 2);
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(sends.length, 1);
+    assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
+    assert.equal(sends[0].text, PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE);
+    assert.equal(fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status, "owner_notified");
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, CATALOG_REQUEST_ID).status,
+      "owner_notified"
+    );
+  });
+});
+
+test("unquoted flags-off: one booking + one catalog still resolves NONE (no catalog preference)", async () => {
+  const fake = createFakeDb();
+  seedContext(fake, {
+    secondRequest: baseCatalogRequest({
+      requestId: CATALOG_REQUEST_ID,
+      ownerNotifyProviderMessageId: CATALOG_NOTIFY_WAMID,
+    }),
+  });
+  const sends = [];
+
+  const result = await handlePaMissingInfoOwnerAnswerInbound({
+    missingInfoEnabled: false,
+    ownerAnswerEnabled: false,
+    __classifyOwnerResponseKindFn: finalAnswerClassifier,
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    senderPhone: OWNER_PHONE,
+    messageText: "Yes available",
+    messageId: "wamid.owner-flags-off-ambiguous",
+    sendWhatsAppMessageFn: async (to, text) => {
+      sends.push({ to, text });
+      return { ok: true };
+    },
+  });
+  assert.equal(result.handled, true);
+  assert.equal(result.reason, "AMBIGUOUS_ELIGIBLE_REQUESTS");
+  assert.equal(result.customerFollowupSent, false);
+  assert.equal(sends.length, 1);
+  assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
+});
+
+test("unquoted: two catalog requests for different customers resolve NONE", async () => {
+  const fake = createFakeDb();
+  seedCatalogOnly(
+    fake,
+    baseCatalogRequest({
+      requestId: CATALOG_REQUEST_ID_B,
+      customerPhone: OTHER_CUSTOMER,
+      customerQuestion: "Does Civic have a sunroof?",
+      customerMessageId: "wamid.cust-catalog-2",
+      sourceTurnId: "wamid.cust-catalog-2",
+      ownerNotifyProviderMessageId: CATALOG_NOTIFY_WAMID_B,
+    })
+  );
+  const sends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Haan available",
+      messageId: "wamid.owner-two-catalog-customers",
+      sendWhatsAppMessageFn: async (to, text) => {
+        sends.push({ to, text });
+        return { ok: true };
+      },
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "AMBIGUOUS_ELIGIBLE_REQUESTS");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(sends.length, 1);
+    assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
+    assert.notEqual(phoneDigits(sends[0].to), CUSTOMER_PHONE);
+    assert.notEqual(phoneDigits(sends[0].to), OTHER_CUSTOMER);
+  });
+});
+
+test("unquoted: same customer with two different questions resolves NONE", async () => {
+  const fake = createFakeDb();
+  seedCatalogOnly(
+    fake,
+    baseCatalogRequest({
+      requestId: CATALOG_REQUEST_ID_B,
+      customerQuestion: "Does Civic have a sunroof?",
+      customerMessageId: "wamid.cust-catalog-2",
+      sourceTurnId: "wamid.cust-catalog-2",
+      ownerNotifyProviderMessageId: CATALOG_NOTIFY_WAMID_B,
+    })
+  );
+  const sends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Haan available",
+      messageId: "wamid.owner-same-cust-two-q",
+      sendWhatsAppMessageFn: async (to, text) => {
+        sends.push({ to, text });
+        return { ok: true };
+      },
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "AMBIGUOUS_ELIGIBLE_REQUESTS");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(sends.length, 1);
+    assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
+  });
+});
+
+test("quoted reply resolves the exact request even if others are open", async () => {
+  const fake = createFakeDb();
+  seedContext(fake, {
+    secondRequest: baseCatalogRequest({
+      requestId: CATALOG_REQUEST_ID,
+      customerPhone: OTHER_CUSTOMER,
+      ownerNotifyProviderMessageId: CATALOG_NOTIFY_WAMID,
+    }),
+  });
+  const customerSends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Haan, Civic mein child seat hai",
+      messageId: "wamid.owner-quoted-catalog",
+      contextMessageId: CATALOG_NOTIFY_WAMID,
+      sendWhatsAppMessageFn: async (to, text) => {
+        customerSends.push({ to, text });
+        return { ok: true, providerMessageId: "wamid.quoted-catalog-out" };
+      },
+      __generateFollowupFn: async () => ({
+        ok: true,
+        reply: "Haan, Civic mein child seat hai.",
+        source: "openai",
+      }),
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.matchReason, "CONTEXT_ID");
+    assert.equal(result.requestId, CATALOG_REQUEST_ID);
+    assert.equal(result.customerFollowupSent, true);
+    assert.equal(customerSends.length, 1);
+    assert.equal(phoneDigits(customerSends[0].to), OTHER_CUSTOMER);
+    assert.notEqual(phoneDigits(customerSends[0].to), CUSTOMER_PHONE);
+    assert.equal(fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status, "owner_notified");
+  });
+});
+
+test("wrong quote resolves NONE", async () => {
+  const fake = createFakeDb();
+  seedContext(fake, {
+    secondRequest: baseCatalogRequest({
+      requestId: CATALOG_REQUEST_ID,
+      ownerNotifyProviderMessageId: CATALOG_NOTIFY_WAMID,
+    }),
+  });
+  const sends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Haan available",
+      messageId: "wamid.owner-wrong-quote",
+      contextMessageId: "wamid.does-not-match-any-request",
+      sendWhatsAppMessageFn: async (to, text) => {
+        sends.push({ to, text });
+        return { ok: true };
+      },
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "CONTEXT_UNKNOWN");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(result.matchReason, null);
+    assert.equal(sends.length, 1);
+    assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status,
+      "owner_notified"
+    );
+    assert.equal(
+      fake.getMissingInfo(BUSINESS_ID, CATALOG_REQUEST_ID).status,
+      "owner_notified"
+    );
+  });
+});
+
+test("quoted expired unresolved request does not send to customer", async () => {
+  const fake = createFakeDb();
+  seedContext(fake, {
+    requestOverrides: {
+      expiresAt: new Date(Date.now() - 60_000),
+    },
+  });
+  const sends = [];
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const result = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance 50 percent hai",
+      messageId: "wamid.owner-expired",
+      contextMessageId: NOTIFY_WAMID,
+      sendWhatsAppMessageFn: async (to, text) => {
+        sends.push({ to, text });
+        return { ok: true };
+      },
+    });
+    assert.equal(result.handled, true);
+    assert.equal(result.reason, "REQUEST_EXPIRED");
+    assert.equal(result.customerFollowupSent, false);
+    assert.equal(result.matchReason, "CONTEXT_ID");
+    assert.equal(sends.length, 1);
+    assert.equal(phoneDigits(sends[0].to), OWNER_PHONE);
+    assert.equal(sends[0].text, PA_MISSING_INFO_OWNER_EXPIRED_NUDGE);
+    assert.equal(fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).status, "owner_notified");
+    assert.equal(fake.getMissingInfo(BUSINESS_ID, REQUEST_ID).ownerAnswer ?? null, null);
+  });
+});
+
+test("quoted expired already-answered request stays idempotent and does not resend", async () => {
+  const fake = createFakeDb();
+  seedContext(fake, {
+    requestOverrides: {
+      status: "closed",
+      ownerAnswer: "Advance half hai",
+      ownerAnswerMessageId: "wamid.owner-already",
+      expiresAt: new Date(Date.now() - 60_000),
+    },
+  });
+  let sendCount = 0;
+
+  await withFlags({ missingInfo: true, ownerAnswer: true }, async () => {
+    const same = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance half hai",
+      messageId: "wamid.owner-already",
+      contextMessageId: NOTIFY_WAMID,
+      sendWhatsAppMessageFn: async () => {
+        sendCount += 1;
+        throw new Error("should not send");
+      },
+    });
+    assert.equal(same.handled, true);
+    assert.equal(same.reason, "IDEMPOTENT_SAME_MESSAGE");
+    assert.equal(same.customerFollowupSent, false);
+    assert.equal(sendCount, 0);
+
+    const other = await handlePaMissingInfoOwnerAnswerInbound({
+      __classifyOwnerResponseKindFn: finalAnswerClassifier,
+      db: fake.db,
+      businessId: BUSINESS_ID,
+      senderPhone: OWNER_PHONE,
+      messageText: "Advance half hai again",
+      messageId: "wamid.owner-already-other",
+      contextMessageId: NOTIFY_WAMID,
+      sendWhatsAppMessageFn: async () => {
+        sendCount += 1;
+        throw new Error("should not send");
+      },
+    });
+    assert.equal(other.handled, true);
+    assert.equal(other.reason, "ALREADY_ANSWERED");
+    assert.equal(other.customerFollowupSent, false);
+    assert.equal(sendCount, 0);
+  });
+});
+
+test("source-turn dedupe is customer-scoped: same synthetic sourceTurnId must not collide", async () => {
+  const fake = createFakeDb();
+  fake.setOwnerPhone(BUSINESS_ID, OWNER_PHONE);
+  const syntheticTurn = "synthetic-source-turn-collision";
+
+  const first = await createOrGetOpenPaMissingInfoRequest({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    bookingId: null,
+    itemId: "civic-1",
+    itemLabel: "Honda Civic",
+    sourceTurnId: syntheticTurn,
+    missingInfoType: "other",
+    customerQuestion: "Does Civic have a child seat?",
+    customerMessageId: "wamid.cust-collision-a",
+  });
+  const second = await createOrGetOpenPaMissingInfoRequest({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: OTHER_CUSTOMER,
+    bookingId: null,
+    itemId: "civic-1",
+    itemLabel: "Honda Civic",
+    sourceTurnId: syntheticTurn,
+    missingInfoType: "other",
+    customerQuestion: "Does Civic have a sunroof?",
+    customerMessageId: "wamid.cust-collision-b",
+  });
+  const reuse = await createOrGetOpenPaMissingInfoRequest({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    bookingId: null,
+    itemId: "civic-1",
+    itemLabel: "Honda Civic",
+    sourceTurnId: syntheticTurn,
+    missingInfoType: "other",
+    customerQuestion: "Does Civic have a child seat?",
+    customerMessageId: "wamid.cust-collision-a",
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(first.created, true);
+  assert.equal(second.ok, true);
+  assert.equal(second.created, true);
+  assert.notEqual(first.request.requestId, second.request.requestId);
+  assert.equal(first.request.customerPhone.replace(/\D/g, ""), CUSTOMER_PHONE);
+  assert.equal(second.request.customerPhone.replace(/\D/g, ""), OTHER_CUSTOMER);
+  assert.equal(reuse.ok, true);
+  assert.equal(reuse.created, false);
+  assert.equal(reuse.request.requestId, first.request.requestId);
 });

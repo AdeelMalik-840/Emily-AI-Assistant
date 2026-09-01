@@ -291,6 +291,37 @@ function baseApprovedBooking(overrides = {}) {
   };
 }
 
+function canonicalOldBookingFields({ factKind = "non_business" } = {}) {
+  return {
+    turnScope: "OLD_BOOKING_REFERENCE",
+    semanticIntent: null,
+    itemScope: "none",
+    itemReferents: [],
+    targetContext: "CONFIRMED_BOOKING",
+    targetId: BOOKING_ID,
+    selectedBookingId: BOOKING_ID,
+    bookingSelectionMode: "focused",
+    selectedBookingIndex: 1,
+    factKind,
+    targetReference: {
+      source: "current_turn",
+      sourceTurnId: "user:direct",
+      targetType: "historical_booking",
+      targetId: BOOKING_ID,
+    },
+  };
+}
+
+function factKindForMissingType(type) {
+  if (type === "delivery") return "delivery_policy";
+  if (type === "driver") return "driver_policy";
+  if (type === "documents") return "documents_checklist";
+  if (type === "payment") return "payment_method";
+  if (type === "other") return "freeform_business";
+  if (type === "advance") return "advance";
+  return "non_business";
+}
+
 function jsonAiReply({
   customerReply,
   needsFollowup = false,
@@ -346,6 +377,11 @@ function jsonAiReply({
       {
         message: {
           content: JSON.stringify({
+            ...canonicalOldBookingFields({
+              factKind: escalate
+                ? factKindForMissingType(missingInfoType)
+                : "non_business",
+            }),
             situation: situationValue,
             conversationAct: act,
             customerIntent: intentValue,
@@ -430,16 +466,35 @@ function deferredPolicyTurnPlan({
   attributes = ["amount", "policy"],
   capability = "answer_from_business_profile",
 } = {}) {
+  const factKind =
+    concept === "delivery"
+      ? "delivery_policy"
+      : concept === "driver"
+        ? "driver_policy"
+        : concept === "documents"
+          ? "documents_checklist"
+          : concept === "payment"
+            ? "payment_method"
+            : concept === "other"
+              ? "freeform_business"
+              : "advance";
   return {
     ok: true,
     source: "openai",
     decision: {
+      turnScope: "OLD_BOOKING_REFERENCE",
+      semanticIntent: null,
+      itemScope: "none",
+      itemReferents: [],
+      targetContext: "CONFIRMED_BOOKING",
+      targetId: BOOKING_ID,
       situation: "new_question",
       conversationAct: "information_request",
       customerIntent: "ask_fact",
       customerIsAskingQuestion: true,
       requestedInfoType: null,
       requestedInformation: null,
+      factKind,
       capability,
       evidenceNeeds: [{ entity: "business_profile", concept, attributes }],
       shouldReply: true,
@@ -464,12 +519,19 @@ function deferredFreeformOtherTurnPlan() {
     ok: true,
     source: "openai",
     decision: {
+      turnScope: "OLD_BOOKING_REFERENCE",
+      semanticIntent: null,
+      itemScope: "none",
+      itemReferents: [],
+      targetContext: "CONFIRMED_BOOKING",
+      targetId: BOOKING_ID,
       situation: "new_question",
       conversationAct: "information_request",
       customerIntent: "ask_fact",
       customerIsAskingQuestion: true,
       requestedInfoType: null,
       requestedInformation: null,
+      factKind: "freeform_business",
       capability: "answer_from_saved_owner_answer",
       evidenceNeeds: [
         {
@@ -1067,6 +1129,7 @@ test("action intent kar do reaches OpenAI and does not escalate", async () => {
             {
               message: {
                 content: JSON.stringify({
+                  ...canonicalOldBookingFields({ factKind: "action" }),
                   situation: "unclear",
                   conversationAct: "action_request",
                   customerIntent: "ask_action",
@@ -1368,6 +1431,19 @@ test("shared decideCustomerTurn exists and post-confirm wrapper stays compatible
   assert.equal(ctx.pendingPromises, null);
 
   const decisionJson = {
+    ...canonicalOldBookingFields({ factKind: "non_business" }),
+    turnScope: "SOCIAL_GENERAL",
+    semanticIntent: "social",
+    targetId: null,
+    selectedBookingId: null,
+    bookingSelectionMode: "none",
+    selectedBookingIndex: null,
+    targetReference: {
+      source: "none",
+      sourceTurnId: null,
+      targetType: "none",
+      targetId: null,
+    },
     situation: "conversation_closing",
     conversationAct: "chit_chat",
     customerIntent: "farewell",
@@ -1503,6 +1579,7 @@ test("OK after customerFollowupText → acknowledgement_after_answer, no request
         ok: true,
         source: "openai",
         decision: {
+          ...canonicalOldBookingFields({ factKind: "non_business" }),
           situation: "acknowledgement_after_answer",
           conversationAct: "acknowledgement",
           customerIntent: "ack",
@@ -1517,9 +1594,6 @@ test("OK after customerFollowupText → acknowledgement_after_answer, no request
           mutationExecutionRequested: false,
           mutationExecutionStatus: "not_executed",
           actionParameters: {},
-          bookingSelectionMode: "none",
-          selectedBookingIndex: null,
-          selectedBookingId: null,
           informationalReplyDeferred: false,
         },
       }),
@@ -1579,6 +1653,7 @@ test("thanks after customerFollowupText exists → no escalation", async () => {
         ok: true,
         source: "openai",
         decision: {
+          ...canonicalOldBookingFields({ factKind: "non_business" }),
           situation: "acknowledgement_after_answer",
           conversationAct: "thanks",
           customerIntent: "thanks",
@@ -1593,9 +1668,6 @@ test("thanks after customerFollowupText exists → no escalation", async () => {
           mutationExecutionRequested: false,
           mutationExecutionStatus: "not_executed",
           actionParameters: {},
-          bookingSelectionMode: "none",
-          selectedBookingIndex: null,
-          selectedBookingId: null,
           informationalReplyDeferred: false,
         },
       }),
@@ -1847,6 +1919,7 @@ test("unclear message → no dangerous action / no owner notify", async () => {
         ok: true,
         source: "openai",
         decision: {
+          ...canonicalOldBookingFields({ factKind: "non_business" }),
           situation: "unclear",
           conversationAct: "unknown",
           customerIntent: "unclear",
@@ -1861,9 +1934,6 @@ test("unclear message → no dangerous action / no owner notify", async () => {
           mutationExecutionRequested: false,
           mutationExecutionStatus: "not_executed",
           actionParameters: {},
-          bookingSelectionMode: "none",
-          selectedBookingIndex: null,
-          selectedBookingId: null,
           informationalReplyDeferred: false,
         },
       }),
@@ -2015,6 +2085,7 @@ test("anti-echo: Have a good day near-echo is rejected for regen, not blanked", 
             {
               message: {
                 content: JSON.stringify({
+                  ...canonicalOldBookingFields({ factKind: "non_business" }),
                   situation: "conversation_closing",
                   conversationAct: "chit_chat",
                   customerIntent: "farewell",
@@ -2083,6 +2154,7 @@ test("anti-echo: you too near-echo regenerates instead of deterministic silence"
             {
               message: {
                 content: JSON.stringify({
+                  ...canonicalOldBookingFields({ factKind: "non_business" }),
                   situation: "conversation_closing",
                   conversationAct: "chit_chat",
                   customerIntent: "farewell",
@@ -2351,6 +2423,7 @@ test("non-business social asks never use other escalate path", async () => {
       ok: true,
       source: "openai",
       decision: {
+        ...canonicalOldBookingFields({ factKind: "non_business" }),
         situation: "unclear",
         conversationAct: "chit_chat",
         customerIntent: "unclear",
@@ -2366,9 +2439,6 @@ test("non-business social asks never use other escalate path", async () => {
         mutationExecutionRequested: false,
         mutationExecutionStatus: "not_executed",
         actionParameters: {},
-        bookingSelectionMode: "none",
-        selectedBookingIndex: null,
-        selectedBookingId: null,
         informationalReplyDeferred: false,
       },
     };
@@ -2697,37 +2767,6 @@ test("structured documents/payment/delivery/driver still escalate with matching 
     const fake = createFakeDb();
     const resolveFacts = seedActiveContext(fake);
     const sends = captureSend();
-    const decision = {
-      ok: true,
-      source: "openai",
-      decision: {
-        situation: "new_question",
-        conversationAct: "information_request",
-        customerIntent: "ask_fact",
-        customerIsAskingQuestion: true,
-        requestedInfoType: null,
-        requestedInformation: null,
-        capability: "answer_from_business_profile",
-        evidenceNeeds: [
-          {
-            entity: "business_profile",
-            concept: row.concept,
-            attributes: ["policy"],
-          },
-        ],
-        shouldReply: true,
-        customerReply: "",
-        action: "reply",
-        mutationIntent: "none",
-        mutationExecutionRequested: false,
-        mutationExecutionStatus: "not_executed",
-        actionParameters: {},
-        bookingSelectionMode: "focused",
-        selectedBookingIndex: 1,
-        selectedBookingId: BOOKING_ID,
-        informationalReplyDeferred: true,
-      },
-    };
 
     await withFlags({ pa: true, missingInfo: true, ownerAnswer: true }, async () => {
       const result = await handleCustomerBusinessPaInbound({
@@ -2737,7 +2776,11 @@ test("structured documents/payment/delivery/driver still escalate with matching 
         messageText: row.message,
         __sendWhatsAppMessageFn: sends.sendWhatsAppMessageFn,
         __resolveActiveCustomerBookingFactsFn: resolveFacts,
-        __decideCustomerTurnFn: async () => decision,
+        __decideCustomerTurnFn: async () =>
+        deferredPolicyTurnPlan({
+          concept: row.concept,
+          attributes: ["policy"],
+        }),
         __composePostConfirmInformationalCustomerReplyFn: async (p) => {
           assert.equal(p.factResolution?.missingInfoType, row.type);
           assert.equal(p.factResolution?.ownerCheckStarted, true);

@@ -90,6 +90,8 @@ test("guard: rejects english customer with roman_urdu reply", () => {
   const c = buildGroupPostExecutePendingAvailabilityContract({
     customerMessageText: "Is the Corolla available for two days?",
     styleKey: "neutral_english",
+    itemLabel: "Corolla",
+    durationDays: 2,
   });
   assert.equal(c.customerLanguageStyle, "english");
   const bad = validateCustomerReplyAgainstContract(
@@ -129,6 +131,8 @@ test("guard: rejects english customer with roman_urdu reply", () => {
 test("guard: rejects roman_urdu customer with english-only reply", () => {
   const c = buildGroupPostExecutePendingAvailabilityContract({
     customerMessageText: "Corolla 2 din k liye available hai?",
+    itemLabel: "Corolla",
+    durationDays: 2,
   });
   assert.equal(c.customerLanguageStyle, "roman_urdu");
   const bad = validateCustomerReplyAgainstContract(
@@ -225,6 +229,8 @@ test("guard: rejects false confirmed-available wording when forbidden", () => {
 test("guard: allows check-in-progress wording without confirmed claim", () => {
   const c = buildGroupPostExecutePendingAvailabilityContract({
     customerMessageText: "Corolla 2 din check karo",
+    itemLabel: "Corolla",
+    durationDays: 2,
   });
   const ok = validateCustomerReplyAgainstContract(
     "Corolla 2 din ke liye check kar leta hun",
@@ -878,6 +884,8 @@ test("waiting_confirm: confirm_booking rejects pre-execution success claim then 
                 shouldReply: true,
                 customerReply: "Booking confirm kar raha hun.",
                 action: "confirm_booking",
+                targetContext: "pending_availability",
+                targetId: "avr-wait-1",
                 confidence: 0.95,
                 safetyNotes: null,
                 reason: "confirm",
@@ -912,6 +920,8 @@ test("waiting_confirm: confirm_booking rejects pre-execution success claim then 
               customerReply:
                 "Theek hai, confirm mil gaya — request aage badha rahi hun.",
               action: "confirm_booking",
+              targetContext: "pending_availability",
+              targetId: "avr-wait-1",
               confidence: 0.95,
               safetyNotes: null,
               reason: "confirm",
@@ -940,10 +950,10 @@ test("waiting_confirm: confirm_booking rejects pre-execution success claim then 
     },
     __chatCompletionsCreateForTests: create,
   });
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   assert.equal(result.ok, true);
   assert.equal(result.decision.action, "confirm_booking");
-  assert.doesNotMatch(String(result.decision.customerReply), /booking confirm/i);
+  assert.equal(String(result.decision.customerReply || ""), "");
   assert.equal(result.decision.replySemantics, undefined);
 });
 

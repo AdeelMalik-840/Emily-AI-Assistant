@@ -16,6 +16,7 @@ import { isGenericBrowseListAsk } from "../workflow/browseIntent.js";
 import {
   applyCustomerSemanticIntentToSignals,
   requestedFieldForCustomerSemanticIntent,
+  workflowTypeForCustomerSemanticIntent,
 } from "../decisions/projectSemanticIntentFromBrainDecision.js";
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 
@@ -100,11 +101,23 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
       : undefined;
 
   const itemMentioned = Boolean(explicitMention.found);
-  const rawSignals = extractTurnSignals({
-    message,
-    hasDuration: durationDays != null,
-    itemMentioned,
-  });
+  const rawSignals = canonicalAuthorityActive
+    ? {
+        priceAsk: false,
+        availabilityAsk: false,
+        bookingCommitment: false,
+        browseAsk: false,
+        photoAsk: false,
+        detailsAsk: false,
+        durationMentioned: durationDays != null,
+        rentAvailabilityCompound: false,
+        askedFieldRaw: null,
+      }
+    : extractTurnSignals({
+        message,
+        hasDuration: durationDays != null,
+        itemMentioned,
+      });
   const signals = applyCustomerSemanticIntentToSignals(
     rawSignals,
     authoritativeSemanticIntent
@@ -213,6 +226,10 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
       ? Object.freeze([...canonicalItemResolutions])
       : undefined,
     authoritativeSemanticIntent: authoritativeSemanticIntent ?? undefined,
+    authoritativeWorkflowType: authoritativeSemanticIntent
+      ? workflowTypeForCustomerSemanticIntent(authoritativeSemanticIntent) ||
+        "clarification"
+      : undefined,
     signals: {
       priceAsk: Boolean(signals.priceAsk),
       bookingCommitment: Boolean(signals.bookingCommitment),

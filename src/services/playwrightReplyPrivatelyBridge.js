@@ -12,6 +12,10 @@ import {
 } from "./replyPrivateUiController.js";
 import db from "../config/firebase.js";
 import { logBookingEvent } from "../utils/bookingLogger.js";
+import {
+  isSyntheticFirstSeenParticipantKey,
+  isTrustedReusableGroupParticipantKey,
+} from "./participantIdentity.js";
 
 function clean(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
@@ -192,6 +196,8 @@ function normalizeParticipantTarget(value) {
 function participantBaseNameFromKey(value) {
   const raw = clean(value);
   if (!raw) return "";
+  if (/^scope::/i.test(raw)) return "";
+  if (isSyntheticFirstSeenParticipantKey(raw)) return "";
   const beforeAnchor = raw.split("::")[0] || raw;
   return normalizeParticipantTarget(
     beforeAnchor
@@ -1005,8 +1011,23 @@ export function isSameParticipantIdentity(expected = {}, candidate = {}) {
     allowed = compatibleNames(expected, candidate);
     reason = allowed ? "ROW_KEY_AND_NAME_MATCH" : "ROW_KEY_NAME_MISMATCH";
   } else if (compatibleNames(expected, candidate)) {
-    allowed = true;
-    reason = "NAME_MATCH";
+    const expectedKey = clean(
+      expected.sourceParticipantKey ?? expected.participantKey ?? ""
+    );
+    const expectedDurable =
+      Boolean(identityPhone(expected)) ||
+      isTrustedReusableGroupParticipantKey(expectedKey) ||
+      Boolean(rowKeyFromIdentity(expected));
+    if (
+      expectedDurable &&
+      !isSyntheticFirstSeenParticipantKey(expectedKey)
+    ) {
+      allowed = true;
+      reason = "NAME_MATCH";
+    } else {
+      allowed = false;
+      reason = "NAME_ONLY_IDENTITY_NOT_TRUSTED";
+    }
   } else {
     reason = "NAME_MISMATCH";
   }
@@ -1076,6 +1097,27 @@ function candidateLogPayload({ bookingId, source, candidate, reason = "" }) {
   };
 }
 
+function sourceHasTrustedDmHandoffEvidence(sourceMessage = {}) {
+  if (identityPhone(sourceMessage)) return true;
+  const scope = clean(
+    sourceMessage.sourceSenderScope ?? sourceMessage.senderScope ?? ""
+  );
+  if (scope) return true;
+  const key = clean(
+    sourceMessage.sourceParticipantKey ?? sourceMessage.participantKey ?? ""
+  );
+  if (isTrustedReusableGroupParticipantKey(key)) return true;
+  const anchor = clean(
+    sourceMessage.senderAnchor ?? sourceMessage.sourceSenderAnchor ?? ""
+  );
+  if (anchor && /@(?:c\.us|lid)$/i.test(anchor)) return true;
+  const id = clean(sourceMessage.sourceMessageId ?? sourceMessage.sourceRowKey ?? "");
+  if (/false_[^@\s]+@(?:c\.us|lid)/i.test(id) || /^real:false_/i.test(id)) {
+    return true;
+  }
+  return false;
+}
+
 export function verifyOpenedDmMatchesSource({
   sourceMessage = {},
   dmChatTitle,
@@ -1096,6 +1138,14 @@ export function verifyOpenedDmMatchesSource({
   if (!sourceParticipantName && !sourceParticipantDisplayName && !sourceParticipantKey) {
     console.warn("[reply_privately_dm_target_mismatch]", {
       reason: "SOURCE_PARTICIPANT_MISSING",
+      dmChatTitle: clean(dmChatTitle) || null,
+    });
+    return { ok: false, reason: "REPLY_PRIVATE_DM_TARGET_MISMATCH" };
+  }
+  if (!sourceHasTrustedDmHandoffEvidence(sourceMessage)) {
+    console.warn("[reply_privately_dm_target_mismatch]", {
+      reason: "NAME_ONLY_IDENTITY_NOT_TRUSTED",
+      sourceParticipantKey: sourceParticipantKey || null,
       dmChatTitle: clean(dmChatTitle) || null,
     });
     return { ok: false, reason: "REPLY_PRIVATE_DM_TARGET_MISMATCH" };
@@ -2984,6 +3034,16 @@ async function locateVerifiedSourceBubbleLocator({ page, sourceMessage, bookingI
     return { selector: "", locator: page.locator("#main").first(), count: 0 };
   };
   const withShortTimeout = async (fn, ms, fallback, meta = null) => {
+    if (page?.__emilyFakeLocatorPage === true) {
+      try {
+        const result = await fn();
+        if (meta) meta.timedOut = false;
+        return result;
+      } catch {
+        if (meta) meta.failed = true;
+        return fallback;
+      }
+    }
     let settled = false;
     try {
       const value = await Promise.race([

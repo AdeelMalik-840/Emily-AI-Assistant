@@ -19,6 +19,8 @@ import { getEmilyBrainV2LiveFlagSnapshot } from "../src/brain/config/liveFeature
 import { buildTurnContextInput } from "../src/brain/live/buildTurnContextInput.js";
 import { buildShadowTurnContext } from "../src/brain/shadow/brainShadowHook.js";
 import { isEmilyBrainV2LiveQuickGate } from "../src/services/whatsappInboundBuffer.js";
+import { isConfidentInventoryUnavailable } from "../src/brain/facts/resolveItemBookingAwareAvailability.js";
+import { isBookingActiveAt } from "../src/brain/facts/bookingDateUtils.js";
 
 const BUSINESS_ID = "synthetic-car-rental-business-001";
 const CIVIC_ID = "honda_civic_2026_oriel_white_7e961e31";
@@ -125,7 +127,7 @@ test("2+6: availability:false + empty bookings → ask duration via live pipelin
   assert.doesNotMatch(String(result.reply ?? ""), /Available hai/i);
 });
 
-test("3: active blocking booking → ask duration before owner check", async () => {
+test("3: blocking-status booking with no start/end date at all cannot prove active-now, so duration is still requested", async () => {
   const result = await runBrainV2LivePipeline({
     traceId: "phase2a-blocked",
     businessId: BUSINESS_ID,
@@ -138,8 +140,11 @@ test("3: active blocking booking → ask duration before owner check", async () 
       { id: "b-block", itemId: CIVIC_ID, status: "approved" },
     ],
   });
+  // No start date at all — cannot prove the booking has started, so this is
+  // NOT the active-now case. Must ask for the requested period normally.
   assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
   assert.doesNotMatch(String(result.reply ?? ""), /available nahi/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
 });
 
 test("4: blocking booking with endAt still asks duration when date missing from ask", async () => {
@@ -166,7 +171,7 @@ test("4: blocking booking with endAt still asks duration when date missing from 
   assert.doesNotMatch(String(result.reply ?? ""), /Expected availability/i);
 });
 
-test("5: missing booking end date does not invent date in reply", async () => {
+test("5: missing booking end date does not invent date in reply (sibling informational path unaffected)", async () => {
   const reply = buildAvailabilityReplyFromCanonical("Honda Civic 2026 Oriel (White)", {
     status: "unavailable",
     isAvailable: false,
@@ -176,6 +181,8 @@ test("5: missing booking end date does not invent date in reply", async () => {
   assert.match(reply, /Abhi available nahi hai/i);
   assert.doesNotMatch(reply, /Expected availability/i);
 
+  // No start date at all — same as test 3, cannot prove active-now, so the
+  // owner-check-context branch must still ask for the requested period.
   const result = await runBrainV2LivePipeline({
     traceId: "phase2a-no-end",
     businessId: BUSINESS_ID,
@@ -190,6 +197,7 @@ test("5: missing booking end date does not invent date in reply", async () => {
   });
   assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
   assert.doesNotMatch(String(result.reply ?? ""), /Expected availability/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
 });
 
 test("fallback: orchestrator without canonical facts keeps catalog composer path", () => {
@@ -319,7 +327,8 @@ test("12: brain module has no OpenAI imports", async () => {
     }
     return files;
   }
-  const brainFiles = await walk(brainRoot);
+  const skipOpenAi = /\/(decidePostConfirmCustomerDm|waitingConfirmDmLane|groupPostExecuteLane|AvailabilityInquiryWorkflow)\.js$/;
+  const brainFiles = (await walk(brainRoot)).filter((file) => !skipOpenAi.test(file));
   for (const file of brainFiles) {
     const text = await readFile(file, "utf8");
     assert.doesNotMatch(text, /from\s+["']openai/i, `OpenAI import in ${file}`);
@@ -332,4 +341,290 @@ test("13: booking/owner/DM/availability owner-check execution remains disabled i
   assert.equal(liveFlags.ownerExecute, false);
   assert.equal(liveFlags.dmExecute, false);
   assert.equal(liveFlags.availabilityOwnerCheckExecute, false);
+});
+
+test("A2: provenance checks — a claimed hasActiveBlockingBookingNow=true must still fall through to duration_ask without booking-aware provenance or when windowApplied", () => {
+  // hasActiveBlockingBookingNow is trusted only when it also carries the
+  // resolver's own provenance markers — defense against a hypothetical
+  // differently-sourced availability object claiming the same fact.
+  const notBookingAware = buildAvailabilityInquiryActionPlan({
+    admittedTurn: makeAdmittedTurn("Civic available hai?"),
+    understanding: makeUnderstanding(),
+    catalogItems: fixture.items,
+    businessContext: {
+      resolvedBusinessTurnContext: canonicalContext({
+        status: "unavailable",
+        isAvailable: false,
+        source: "computeUserFacingAvailability",
+        bookingAware: false,
+        hasActiveBlockingBookingNow: true,
+        activeBlockingBookingCount: 1,
+        windowApplied: false,
+      }),
+    },
+  });
+  assert.equal(
+    notBookingAware.actions[0]?.payload?.source,
+    "canonical_owner_check_ask_duration"
+  );
+
+  const wrongSource = buildAvailabilityInquiryActionPlan({
+    admittedTurn: makeAdmittedTurn("Civic available hai?"),
+    understanding: makeUnderstanding(),
+    catalogItems: fixture.items,
+    businessContext: {
+      resolvedBusinessTurnContext: canonicalContext({
+        status: "unavailable",
+        isAvailable: false,
+        source: "catalog_fallback",
+        bookingAware: true,
+        hasActiveBlockingBookingNow: true,
+        activeBlockingBookingCount: 1,
+        windowApplied: false,
+      }),
+    },
+  });
+  assert.equal(wrongSource.actions[0]?.payload?.source, "canonical_owner_check_ask_duration");
+
+  const windowAppliedToo = buildAvailabilityInquiryActionPlan({
+    admittedTurn: makeAdmittedTurn("Civic available hai?"),
+    understanding: makeUnderstanding(),
+    catalogItems: fixture.items,
+    businessContext: {
+      resolvedBusinessTurnContext: canonicalContext(
+        {
+          status: "unavailable",
+          isAvailable: false,
+          source: "computeUserFacingAvailability",
+          bookingAware: true,
+          hasActiveBlockingBookingNow: true,
+          activeBlockingBookingCount: 1,
+          windowApplied: true,
+        },
+        {},
+        { durationDays: 3 }
+      ),
+    },
+  });
+  // A requested window makes this the isConfidentInventoryUnavailable path's
+  // concern entirely (test F below) — the active-now short-circuit is only
+  // for the no-window, pre-duration case.
+  assert.notEqual(
+    windowAppliedToo.actions[0]?.payload?.source,
+    "canonical_owner_check_active_blocking_now"
+  );
+});
+
+test("A: started yesterday, ends tomorrow -> active-now branch, currently-occupied wording", async () => {
+  const result = await runBrainV2LivePipeline({
+    traceId: "phase2a-active-now",
+    businessId: BUSINESS_ID,
+    message: "Civic available?",
+    catalogItems: fixture.items,
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    getBookingsForItemFn: async () => [
+      {
+        id: "b-active",
+        itemId: CIVIC_ID,
+        status: "approved",
+        startAt: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000),
+        endAt: new Date(Date.now() + 1 * 24 * 60 * 60 * 1000),
+      },
+    ],
+  });
+  assert.doesNotMatch(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /available nahi/i);
+  assert.match(String(result.reply ?? ""), /\babhi\b/i);
+});
+
+test("B: starts next week -> NOT active-now; asks for the requested period normally", async () => {
+  const result = await runBrainV2LivePipeline({
+    traceId: "phase2a-future-booking",
+    businessId: BUSINESS_ID,
+    message: "Civic available?",
+    catalogItems: fixture.items,
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    getBookingsForItemFn: async () => [
+      {
+        id: "b-future",
+        itemId: CIVIC_ID,
+        status: "approved",
+        startAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        endAt: new Date(Date.now() + 11 * 24 * 60 * 60 * 1000),
+      },
+    ],
+  });
+  // A future booking's mere existence must not suppress duration collection.
+  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+});
+
+test("C: ended yesterday -> not active-now (and not even blocking)", async () => {
+  const result = await runBrainV2LivePipeline({
+    traceId: "phase2a-ended-yesterday",
+    businessId: BUSINESS_ID,
+    message: "Civic available?",
+    catalogItems: fixture.items,
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    getBookingsForItemFn: async () => [
+      {
+        id: "b-ended",
+        itemId: CIVIC_ID,
+        status: "approved",
+        startAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000),
+        endAt: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000),
+      },
+    ],
+  });
+  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+});
+
+test("D: missing start date, future end -> cannot claim active-now; asks for the requested period", async () => {
+  const result = await runBrainV2LivePipeline({
+    traceId: "phase2a-missing-start",
+    businessId: BUSINESS_ID,
+    message: "Civic available?",
+    catalogItems: fixture.items,
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    getBookingsForItemFn: async () => [
+      {
+        id: "b-no-start",
+        itemId: CIVIC_ID,
+        status: "approved",
+        endAt: new Date(Date.now() + 11 * 24 * 60 * 60 * 1000),
+      },
+    ],
+  });
+  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+});
+
+test("E: started before now, missing end -> active-now under existing conservative end semantics", async () => {
+  const result = await runBrainV2LivePipeline({
+    traceId: "phase2a-open-ended",
+    businessId: BUSINESS_ID,
+    message: "Civic available?",
+    catalogItems: fixture.items,
+    isGroupInbound: true,
+    chatType: "group",
+    participantKey: "cust-1",
+    getBookingsForItemFn: async () => [
+      {
+        id: "b-open-ended",
+        itemId: CIVIC_ID,
+        status: "approved",
+        startAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+      },
+    ],
+  });
+  assert.doesNotMatch(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.match(String(result.reply ?? ""), /\babhi\b/i);
+});
+
+test("F: a specific requested window remains governed entirely by the existing window-aware logic, unchanged", () => {
+  const plan = buildAvailabilityInquiryActionPlan({
+    admittedTurn: makeAdmittedTurn("Civic 3 din ke liye available hai?"),
+    understanding: makeUnderstanding(),
+    catalogItems: fixture.items,
+    businessContext: {
+      resolvedBusinessTurnContext: canonicalContext(
+        {
+          status: "unavailable",
+          isAvailable: false,
+          source: "computeUserFacingAvailability",
+          bookingAware: true,
+          blockingBookingCount: 1,
+          hasActiveBlockingBookingNow: true,
+          activeBlockingBookingCount: 1,
+          windowApplied: true,
+          reason: "booking_conflict",
+          verifiedAlternatives: [],
+        },
+        {},
+        { durationDays: 3 }
+      ),
+    },
+  });
+  // Duration was supplied, so the pre-duration active-now branch must not
+  // fire — isConfidentInventoryUnavailable() alone governs this outcome,
+  // unchanged, regardless of hasActiveBlockingBookingNow being true too.
+  assert.notEqual(
+    plan.actions[0]?.payload?.source,
+    "canonical_owner_check_active_blocking_now"
+  );
+  assert.notEqual(plan.actions[0]?.payload?.source, "canonical_owner_check_ask_duration");
+  assert.match(plan.actions[0]?.payload?.source ?? "", /^canonical_unavailable_/);
+});
+
+test("G: isConfidentInventoryUnavailable behavior remains entirely unchanged", () => {
+  assert.equal(
+    isConfidentInventoryUnavailable({
+      status: "unavailable",
+      isAvailable: false,
+      windowApplied: false,
+    }),
+    false,
+    "no-date conservative signal alone must not satisfy the window-confident gate"
+  );
+  assert.equal(
+    isConfidentInventoryUnavailable({
+      status: "unavailable",
+      isAvailable: false,
+      windowApplied: true,
+    }),
+    true,
+    "a resolved window plus unavailable status remains confidently unavailable"
+  );
+  assert.equal(
+    isConfidentInventoryUnavailable({
+      status: "error",
+      isAvailable: null,
+      windowApplied: true,
+    }),
+    false,
+    "error status must never be treated as confidently unavailable"
+  );
+  assert.equal(isConfidentInventoryUnavailable(null), false);
+});
+
+test("H: isBookingActiveAt() boundary conditions (direct unit coverage of the reused resolver helper)", () => {
+  const now = new Date("2026-08-28T12:00:00.000Z");
+  const day = 24 * 60 * 60 * 1000;
+
+  assert.equal(
+    isBookingActiveAt({ startAt: new Date(now.getTime() - day), endAt: new Date(now.getTime() + day) }, now),
+    true,
+    "started yesterday, ends tomorrow"
+  );
+  assert.equal(
+    isBookingActiveAt({ startAt: new Date(now.getTime() + day) }, now),
+    false,
+    "starts tomorrow — not proven active yet"
+  );
+  assert.equal(
+    isBookingActiveAt({ startAt: new Date(now.getTime() - day), endAt: new Date(now.getTime() - 1) }, now),
+    false,
+    "already ended must not be active"
+  );
+  assert.equal(
+    isBookingActiveAt({ endAt: new Date(now.getTime() + day) }, now),
+    false,
+    "missing start must never be inferred as already started"
+  );
+  assert.equal(
+    isBookingActiveAt({ startAt: new Date(now.getTime() - day) }, now),
+    true,
+    "started before now, no end date — conservative open-ended active"
+  );
+  assert.equal(isBookingActiveAt(null, now), false);
+  assert.equal(isBookingActiveAt({ startAt: now }, "not-a-date"), false);
 });

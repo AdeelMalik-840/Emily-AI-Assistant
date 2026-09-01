@@ -28,6 +28,9 @@ const { buildConfirmExpiresAt } = await import(
 const { composeWaitingConfirmExecutionReplyForTests } = await import(
   "./helpers/waitingConfirmBrainTestDouble.mjs"
 );
+const { composeWaitingConfirmExecutionReply } = await import(
+  "../src/brain/decisions/composeWaitingConfirmExecutionReply.js"
+);
 const {
   validateCustomerReplyAgainstContract,
 } = await import("../src/brain/guards/customerReplyGuard.js");
@@ -313,6 +316,68 @@ test("shared path: execute disabled → compose failure wording, no booking", as
   assert.equal(fake.getRequestDoc(REQUEST_ID).linkedBookingId, undefined);
   assert.match(String(sendCalls[0][1]), /confirm nahi ho saki/i);
   assert.doesNotMatch(String(sendCalls[0][1]), /Booking confirm ho gayi/i);
+});
+
+test("verified booking success compose failure returns empty instead of failure fallback", async () => {
+  const composed = await composeWaitingConfirmExecutionReply({
+    facts: {
+      itemId: ITEM_ID,
+      itemLabel: "Honda Civic 2026",
+      durationDays: 2,
+    },
+    userMessage: "haan book kar dein",
+    frozenDecision: confirmDecision().decision,
+    executionResult: {
+      attempted: true,
+      succeeded: true,
+      bookingId: "booking-compose-failure-1",
+      requestId: REQUEST_ID,
+      itemId: ITEM_ID,
+      itemLabel: "Honda Civic 2026",
+      durationDays: 2,
+      totalAmount: 16000,
+      currency: "PKR",
+    },
+    __chatCompletionsCreateForTests: async () => {
+      throw new Error("forced compose failure");
+    },
+  });
+
+  assert.equal(composed.ok, false);
+  assert.equal(composed.reply, "");
+  assert.notEqual(composed.reply, WAITING_CONFIRM_DM_TECHNICAL_FALLBACK);
+});
+
+test("verified booking success with empty compose result is recoverable and sends nothing", async () => {
+  const fake = createFakeDb();
+  fake.seedAvailabilityRequest(REQUEST_ID, baseWaitingRequest());
+  let sends = 0;
+  const result = await handleAvailabilityCustomerCloudInbound({
+    db: fake.db,
+    businessId: BUSINESS_ID,
+    customerPhone: CUSTOMER_PHONE,
+    messageText: "haan book kar dein",
+    messageId: "dec-success-compose-failed-1",
+    sendWhatsAppMessageFn: async () => {
+      sends += 1;
+      return { ok: true };
+    },
+    availabilityConfirmExecute: true,
+    __catalogRowForTests: CATALOG_ROW,
+    __decideCustomerTurnForTests: async () => confirmDecision(),
+    __composeWaitingConfirmExecutionReplyForTests: async () => ({
+      ok: false,
+      reply: "",
+      reason: "COMPOSE_FAILED",
+    }),
+  });
+
+  assert.equal(result.handled, false);
+  assert.equal(result.retryable, true);
+  assert.equal(result.action, "confirm_reply_compose_failed");
+  assert.equal(result.reply, "");
+  assert.equal(sends, 0);
+  assert.ok(fake.getRequestDoc(REQUEST_ID).linkedBookingId);
 });
 
 test("shared path: duplicate inbound — no second decide/compose/outbound", async () => {

@@ -13,12 +13,14 @@ import { validateBrainV2PipelineResult } from "../brain/live/brainV2ResultContra
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import {
   appendConversationMessage,
+  conversationHistoryFieldsForOutbound,
   getRecentConversationForPrompt,
   getRecentConversationReferenceContext,
 } from "./conversationStore.js";
 import {
   applySessionMemoryFromActionPlan,
   readTrustedFreshItemFocus,
+  readVerifiedSinglePresentedItemFromActionPlan,
 } from "./executors/sessionMemoryExecutor.js";
 import {
   sendWhatsAppInteractiveButtons,
@@ -29,7 +31,10 @@ import {
   handleAvailabilityRequestApproval,
   parseAvailabilityApprovalMessage,
 } from "./availabilityApprovalService.js";
-import { evaluateAvailabilityWaitingConfirmOwnershipGuard } from "./availabilityRequestService.js";
+import {
+  evaluateAvailabilityWaitingConfirmOwnershipGuard,
+  findOpenOwnerCheckCloudAvailabilityRequestsByPhone,
+} from "./availabilityRequestService.js";
 import {
   handleBookingApproval,
   parseApprovalMessage,
@@ -78,9 +83,15 @@ import { tryRecoverCloudOutboundLockedTurn } from "./cloudInboundRecovery.js";
 import {
   applyPostConfirmDerivedOwnershipMechanics,
   buildNeutralCloudDmOwnershipFacts,
+  POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK,
   resolveCloudDmCanonicalOwnership,
   validatePostConfirmSemanticOwnership,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
+import { readFreshLastAvailabilityAssist } from "../brain/availability/availabilityAssistContext.js";
+import {
+  EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
+  readEmilyPendingForParticipant,
+} from "../brain/availability/emilyPendingContext.js";
 import { setMessageState } from "./messageState.js";
 import {
   normalizePlaywrightOutboundTrace,
@@ -521,6 +532,32 @@ export async function prepareBrainV2LiveMemorySnapshot(p) {
 export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
   if (!p.shadowEligible) return null;
   return loadBrainV2SessionMemorySnapshot(p);
+}
+
+export function resolveCloudDmOwnershipTrustedFocus({
+  memorySnapshot,
+  participantKey,
+  nowMs = Date.now(),
+} = {}) {
+  const pending = readEmilyPendingForParticipant({
+    memorySnapshot,
+    participantKey,
+    nowMs,
+  });
+  if (
+    pending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION &&
+    pending.itemId &&
+    pending.sourceTurnKey
+  ) {
+    return {
+      itemId: pending.itemId,
+      itemLabel: pending.itemLabel ?? null,
+      sourceTurnId: pending.sourceTurnKey,
+      provenance: "availability_duration_pending",
+      expiresAt: pending.expiresAt ?? null,
+    };
+  }
+  return readTrustedFreshItemFocus(memorySnapshot, nowMs);
 }
 
 /** @type {Map<string, BufferEntry>} */
@@ -2315,6 +2352,19 @@ export async function executeWhatsAppAiPipeline(p) {
 
   let skipGeneralBrainForWaitingConfirmOwnership = false;
   let postConfirmPaOwnershipHandled = false;
+  // Observability only: skipGeneralBrainForWaitingConfirmOwnership is set
+  // true by several structurally different branches below (a genuine
+  // group/Playwright waiting-confirm guard, a PA missing-info owner answer,
+  // a PENDING_AVAILABILITY_REFERENCE confirm being handled, or the Cloud DM
+  // ownership AI call itself failing). routeGate.rejectReason previously
+  // defaulted unconditionally to "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"
+  // whenever the flag was true and postConfirmPaOwnershipHandled was false,
+  // regardless of which of those actually happened -- misreporting an
+  // ownership-AI failure as a waiting-confirm-ownership rejection. This
+  // variable records the real reason at the exact site that sets the skip
+  // flag; it changes only what gets logged as brainRouteRejectReason, never
+  // routing/reply/retry behavior.
+  let skipGeneralBrainReason = null;
 
   if (
     !skipGeneralBrainForWaitingConfirmOwnership &&
@@ -2336,6 +2386,7 @@ export async function executeWhatsAppAiPipeline(p) {
   });
   if (ownershipGuard.block) {
     skipGeneralBrainForWaitingConfirmOwnership = true;
+    skipGeneralBrainReason = "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP";
     console.log("[availability_waiting_confirm_ownership_guard]", {
       traceId,
       businessId: ownerUserId,
@@ -2395,6 +2446,7 @@ export async function executeWhatsAppAiPipeline(p) {
       });
       if (ownerAnswerResult) {
         skipGeneralBrainForWaitingConfirmOwnership = true;
+        skipGeneralBrainReason = "PA_MISSING_INFO_OWNER_ANSWER_HANDLED";
         console.log("[pa_missing_info_owner_answer_handled]", {
           traceId,
           businessId: ownerUserId,
@@ -2449,14 +2501,49 @@ export async function executeWhatsAppAiPipeline(p) {
         });
       } else {
         const currentOwnershipTurnId = `user:${String(messageId ?? "").trim()}`;
-        const trustedFreshItemFocus = readTrustedFreshItemFocus(
-          shadowPreTurnMemorySnapshot
+        const trustedFreshItemFocus = resolveCloudDmOwnershipTrustedFocus({
+          memorySnapshot: shadowPreTurnMemorySnapshot,
+          participantKey: normalizedParticipantKey,
+        });
+        const lastAvailabilityAssist = readFreshLastAvailabilityAssist(
+          shadowPreTurnMemorySnapshot?.lastAvailabilityAssist
         );
+        let catalogItemsForOwnership = Array.isArray(
+          preResolvedPostConfirmBookingFacts?.facts?.catalogItems
+        )
+          ? preResolvedPostConfirmBookingFacts.facts.catalogItems
+          : [];
+        if (catalogItemsForOwnership.length === 0 && ownerUserId) {
+          try {
+            const inventoryMod = await import("./inventoryService.js");
+            catalogItemsForOwnership = await inventoryMod.getCachedItemsForUser(
+              ownerUserId
+            );
+          } catch {
+            catalogItemsForOwnership = [];
+          }
+        }
+        let pendingOwnerCheckRequests = [];
+        if (db && ownerUserId && cloudConfirmPhone) {
+          try {
+            pendingOwnerCheckRequests =
+              await findOpenOwnerCheckCloudAvailabilityRequestsByPhone({
+                db,
+                businessId: ownerUserId,
+                customerPhone: cloudConfirmPhone,
+              });
+          } catch {
+            pendingOwnerCheckRequests = [];
+          }
+        }
         const baseOwnershipFacts = {
           ...(preResolvedPostConfirmBookingFacts?.facts ?? {}),
           ownershipReferenceContext: conversationReferenceContext,
           currentOwnershipTurnId,
           trustedFreshItemFocus,
+          lastAvailabilityAssist,
+          catalogItems: catalogItemsForOwnership,
+          pendingOwnerCheckRequests,
         };
         const decided =
           typeof p.__executeCloudDmOwnershipDecisionFn === "function"
@@ -2475,21 +2562,68 @@ export async function executeWhatsAppAiPipeline(p) {
                   p.__chatCompletionsCreateForTests,
               });
         if (decided?.ok !== true || decided?.source !== "openai") {
-          cloudLifecycleClaimed = Boolean(cloudLifecycleIdentity?.guaranteeKey);
-          throw new Error(
+          if (
+            decided?.retryable === false ||
+            Number(decided?.ownershipCompletionCount ?? 0) >= 2 ||
+            decided?.customerTurnOutcome === "TECHNICAL_RECOVERY"
+          ) {
+            skipGeneralBrainForWaitingConfirmOwnership = true;
+            skipGeneralBrainReason = "CLOUD_DM_OWNERSHIP_DECISION_UNUSABLE";
+            cloudLifecycleClaimed = Boolean(cloudLifecycleIdentity?.guaranteeKey);
+            reply = POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK;
+            sendVia = "CLOUD_API";
+            // Observability only: this reason previously reached only
+            // messageMeta.outboundTrace.reason, which is never printed to
+            // the console anywhere -- making the actual ownership failure
+            // invisible in logs even though it was already computed. No
+            // return value, routing, or reply behavior changes here.
+            console.warn("[cloud_semantic_technical_recovery]", {
+              traceId,
+              messageId,
+              guaranteeKey: cloudLifecycleIdentity?.guaranteeKey ?? null,
+              decidedReason: String(decided?.reason ?? "CLOUD_DM_OWNERSHIP_UNUSABLE").slice(0, 160),
+              ownershipCorrectionReason: decided?.ownershipCorrectionReason ?? null,
+              customerTurnOutcome: decided?.customerTurnOutcome ?? null,
+              ownershipCompletionCount: Number.isFinite(Number(decided?.ownershipCompletionCount))
+                ? Number(decided.ownershipCompletionCount)
+                : null,
+              retryable: decided?.retryable ?? null,
+            });
+            messageMeta = {
+              customerTurnOutcome: "TECHNICAL_RECOVERY",
+              handledWithoutOutbound: false,
+              outboundTrace: {
+                kind: "cloud_semantic_technical_recovery",
+                finalReplySource: "CLOUD_SEMANTIC_TECHNICAL_RECOVERY",
+                reason: String(decided?.reason ?? "CLOUD_DM_OWNERSHIP_UNUSABLE").slice(0, 160),
+              },
+            };
+          } else {
+            cloudLifecycleClaimed = Boolean(cloudLifecycleIdentity?.guaranteeKey);
+            throw new Error(
+              String(
+                decided?.reason ??
+                  decided?.failureReason ??
+                  "CLOUD_DM_OWNERSHIP_OPENAI_FAILED"
+              )
+            );
+          }
+        } else {
+        const ownershipFacts = {
+          ...buildNeutralCloudDmOwnershipFacts(
+            decided.facts && typeof decided.facts === "object"
+              ? decided.facts
+              : baseOwnershipFacts,
+            preResolvedFreshWaitingConfirmRequest
+          ),
+          currentOwnershipTurnId:
             String(
-              decided?.reason ??
-                decided?.failureReason ??
-                "CLOUD_DM_OWNERSHIP_OPENAI_FAILED"
-            )
-          );
-        }
-        const ownershipFacts = buildNeutralCloudDmOwnershipFacts(
-          decided.facts && typeof decided.facts === "object"
-            ? decided.facts
-            : baseOwnershipFacts,
-          preResolvedFreshWaitingConfirmRequest
-        );
+              (decided.facts && decided.facts.currentOwnershipTurnId) ||
+                baseOwnershipFacts.currentOwnershipTurnId ||
+                ""
+            ).trim() || `user:${String(messageId ?? "").trim()}`,
+          currentCustomerMessage: String(latestMessage ?? ""),
+        };
         const canonicalDecision = applyPostConfirmDerivedOwnershipMechanics(
           decided.decision,
           ownershipFacts
@@ -2528,9 +2662,10 @@ export async function executeWhatsAppAiPipeline(p) {
         if (!snapshot) {
           throw new Error("CANONICAL_SEMANTIC_DECISION_MISSING");
         }
+        }
       }
 
-      if (snapshot.turnScope === "PENDING_AVAILABILITY_REFERENCE") {
+      if (snapshot?.turnScope === "PENDING_AVAILABILITY_REFERENCE") {
         const handleCloudConfirmFn =
           typeof p.__tryHandleAvailabilityCustomerCloudInboundFn === "function"
             ? p.__tryHandleAvailabilityCustomerCloudInboundFn
@@ -2554,6 +2689,9 @@ export async function executeWhatsAppAiPipeline(p) {
         });
         if (cloudConfirmResult?.handled === true) {
           skipGeneralBrainForWaitingConfirmOwnership = true;
+          // This is the one branch the label was originally accurate for: a
+          // real PENDING_AVAILABILITY_REFERENCE confirm was actually handled.
+          skipGeneralBrainReason = "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP";
           cloudLifecycleClaimed = true;
           console.log("[availability_cloud_confirm_ownership_handled]", {
             traceId,
@@ -2596,7 +2734,7 @@ export async function executeWhatsAppAiPipeline(p) {
               "CANONICAL_PENDING_EXECUTOR_UNHANDLED"
           );
         }
-      } else if (snapshot.turnScope === "OLD_BOOKING_REFERENCE") {
+      } else if (snapshot?.turnScope === "OLD_BOOKING_REFERENCE") {
         const tryBusinessPaFn =
           typeof p.__tryHandleCustomerBusinessPaInboundFn === "function"
             ? p.__tryHandleCustomerBusinessPaInboundFn
@@ -2653,6 +2791,7 @@ export async function executeWhatsAppAiPipeline(p) {
         }
         skipGeneralBrainForWaitingConfirmOwnership = true;
         postConfirmPaOwnershipHandled = true;
+        skipGeneralBrainReason = "POST_CONFIRM_PA_OWNERSHIP_HANDLED";
         console.log("[customer_business_pa_ownership_handled]", {
           traceId,
           businessId: ownerUserId,
@@ -2695,7 +2834,7 @@ export async function executeWhatsAppAiPipeline(p) {
             finalReplySource: paFinalReplySource,
           },
         };
-      } else {
+      } else if (snapshot) {
         if (!cloudNormalRoutingClaimed) {
           markCloudInboundTurnNormalRouting({
             identity: cloudLifecycleIdentity,
@@ -2720,10 +2859,16 @@ export async function executeWhatsAppAiPipeline(p) {
   let routeGate = {
     selected: "legacy",
     route: "ownership_skipped",
+    // Reports the specific reason recorded at the exact branch that set
+    // skipGeneralBrainForWaitingConfirmOwnership (see declaration above).
+    // Falls back to the prior generic default only if the flag somehow
+    // became true without recording a reason -- routing itself is
+    // unchanged either way.
     rejectReason:
-      postConfirmPaOwnershipHandled
+      skipGeneralBrainReason ??
+      (postConfirmPaOwnershipHandled
         ? "POST_CONFIRM_PA_OWNERSHIP_HANDLED"
-        : "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP",
+        : "AVAILABILITY_WAITING_CONFIRM_OWNERSHIP"),
     businessAllowlisted: false,
     hasV2LivePipeline: false,
     allowlistConfigError: false,
@@ -3429,52 +3574,28 @@ export async function executeWhatsAppAiPipeline(p) {
       if (outboundReplyDelivered) {
         try {
           const actionPlan = messageMeta?.actionPlan;
-          const persistence = actionPlan?.persistenceIntent;
-          const presentedItemId =
-            persistence?.rememberPresentedItemFocus === true
-              ? String(persistence?.presentedItemId ?? "").trim()
-              : "";
-          const verifiedAlternativeIds = new Set(
-            (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
-              .flatMap((action) =>
-                Array.isArray(action?.payload?.verifiedAlternatives)
-                  ? action.payload.verifiedAlternatives
-                  : []
-              )
-              .map((row) => String(row?.itemId ?? "").trim())
-              .filter(Boolean)
-          );
-          const declaredPresentedIds = new Set(
-            (Array.isArray(actionPlan?.actions) ? actionPlan.actions : [])
-              .flatMap((action) =>
-                Array.isArray(action?.payload?.presentedItemIds)
-                  ? action.payload.presentedItemIds
-                  : []
-              )
-              .map((id) => String(id ?? "").trim())
-              .filter(Boolean)
-          );
+          const presented = readVerifiedSinglePresentedItemFromActionPlan(actionPlan);
           const verifiedReferences =
-            presentedItemId &&
-            declaredPresentedIds.size === 1 &&
-            declaredPresentedIds.has(presentedItemId) &&
-            verifiedAlternativeIds.has(presentedItemId)
+            presented?.itemId
               ? [{
                   kind: "catalog_item",
-                  targetId: presentedItemId,
+                  targetId: presented.itemId,
                   provenance: "verified_assistant_presented_item",
                   expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
                 }]
               : [];
-          const postConfirmBookingId =
-            messageMeta?.customerBusinessPaHandled === true
+          const verifiedBookingId =
+            bookingIdMeta ||
+            (messageMeta?.customerBusinessPaHandled === true
               ? String(messageMeta?.bookingId ?? "").trim()
-              : "";
-          if (postConfirmBookingId) {
+              : "");
+          if (verifiedBookingId) {
             verifiedReferences.push({
               kind: "historical_booking",
-              targetId: postConfirmBookingId,
-              provenance: "verified_post_confirm_reply",
+              targetId: verifiedBookingId,
+              provenance: bookingIdMeta
+                ? "verified_booking_created_reply"
+                : "verified_post_confirm_reply",
               expiresAt: null,
             });
           }
@@ -3486,12 +3607,18 @@ export async function executeWhatsAppAiPipeline(p) {
               outboundDelivered: true,
             });
           }
+          const recoveryHistory = conversationHistoryFieldsForOutbound(
+            messageMeta?.outboundTrace?.finalReplySource
+          );
           await appendConversationMessage(db, {
             ownerUserId,
             customerNumber: conversationCustomerNumber,
             role: "assistant",
             text: replyText,
-            verifiedReferences,
+            verifiedReferences: recoveryHistory.excludeFromSemanticHistory
+              ? []
+              : verifiedReferences,
+            ...recoveryHistory,
             ...(persistCloudDmConversationIdentity
               ? {
                   sourceMessageId: messageId || null,

@@ -216,7 +216,7 @@ test("PR1A: BookingRequestWorkflow — no false Theek hai when CREATE_BOOKING.ex
     },
   });
   assert.equal(
-    plan.actions.find((a) => a.type === "CREATE_BOOKING")?.payload?.execute,
+    (plan.actions || []).some((a) => a.type === "CREATE_BOOKING"),
     false
   );
   assert.equal(String(plan.replyDraft ?? "").trim(), "");
@@ -250,8 +250,8 @@ test("PR1A: BookingRequestWorkflow — execute true may still draft ack (gates u
     },
   });
   assert.equal(
-    plan.actions.find((a) => a.type === "CREATE_BOOKING")?.payload?.execute,
-    true
+    (plan.actions || []).some((a) => a.type === "CREATE_BOOKING"),
+    false
   );
-  assert.match(String(plan.replyDraft ?? ""), FALSE_ACK);
+  assert.doesNotMatch(String(plan.replyDraft ?? ""), FALSE_ACK);
 });

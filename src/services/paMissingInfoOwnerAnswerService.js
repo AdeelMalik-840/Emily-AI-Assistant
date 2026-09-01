@@ -20,6 +20,8 @@ import {
   applyPaMissingInfoCustomerClarificationAnswer,
   findPaMissingInfoRequestByOwnerNotifyProviderMessageId,
   getPaMissingInfoRequest,
+  isCatalogLaunchMissingInfoScope,
+  isPaMissingInfoRequestExpired,
   isPaMissingInfoOwnerNotifiedEligibleForTokenlessFallback,
   listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests,
   listAwaitingCustomerClarificationRequestsForCustomer,
@@ -54,6 +56,10 @@ export const PA_MISSING_INFO_OWNER_QUOTE_NUDGE =
 /** Owner-facing nudge when multiple eligible owner_notified requests exist. */
 export const PA_MISSING_INFO_OWNER_AMBIGUOUS_NUDGE =
   "Multiple customer questions are waiting for your answer. Please reply directly to the correct customer question notification (swipe/reply on that message) so Emily can match your answer.";
+
+/** Owner-facing nudge when the quoted notification is past expiry. */
+export const PA_MISSING_INFO_OWNER_EXPIRED_NUDGE =
+  "That customer question is no longer current. Please reply to a newer notification if you still need to answer.";
 
 /**
  * Owner-facing instruction when classifier cannot safely choose final vs clarification.
@@ -211,9 +217,7 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
   __listOwnerNotifiedEligibleForTokenlessFallbackFn =
     listOwnerNotifiedEligibleForTokenlessFallbackPaMissingInfoRequests,
 } = {}) {
-  if (!missingInfoEnabled || !ownerAnswerEnabled) {
-    return { handled: false, reason: "FLAG_OFF" };
-  }
+  const flagsOn = missingInfoEnabled && ownerAnswerEnabled;
   if (isGroupInbound || playwrightWebInbound) {
     return { handled: false, reason: "NOT_CLOUD_DM" };
   }
@@ -250,6 +254,9 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
     matchReason = request ? "CONTEXT_ID" : null;
 
     if (!request) {
+      if (!flagsOn) {
+        return { handled: false, reason: "FLAG_OFF" };
+      }
       await sendOwnerQuoteNudge({
         sendWhatsAppMessageFn,
         ownerPhone: ownerTarget,
@@ -265,17 +272,21 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
         debugTokenPresent: Boolean(parsed.requestId),
       };
     }
+    if (!flagsOn && !isCatalogLaunchMissingInfoScope(request)) {
+      return { handled: false, reason: "FLAG_OFF" };
+    }
   } else {
     const eligible =
       await __listOwnerNotifiedEligibleForTokenlessFallbackFn({
         db: connection,
         businessId: uid,
       });
-
+    // Never prefer catalog over booking (or vice versa). Resolve only when
+    // exactly one eligible notified request exists across all scopes.
     if (eligible.length === 0) {
       return {
         handled: false,
-        reason: "NO_ELIGIBLE_OWNER_NOTIFIED_REQUEST",
+        reason: flagsOn ? "NO_ELIGIBLE_OWNER_NOTIFIED_REQUEST" : "FLAG_OFF",
         customerFollowupSent: false,
         matchReason: null,
         debugTokenPresent: Boolean(parsed.requestId),
@@ -302,6 +313,9 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
 
     request = eligible[0];
     matchReason = "SINGLE_OWNER_NOTIFIED";
+    if (!flagsOn && !isCatalogLaunchMissingInfoScope(request)) {
+      return { handled: false, reason: "FLAG_OFF" };
+    }
   }
 
   const requestId =
@@ -346,6 +360,24 @@ export async function handlePaMissingInfoOwnerAnswerInbound({
       handled: true,
       reason: sameMessage ? "IDEMPOTENT_SAME_MESSAGE" : "ALREADY_ANSWERED",
       action: "owner_answer_skipped",
+      requestId,
+      customerFollowupSent: false,
+      matchReason,
+      status,
+    };
+  }
+
+  if (isPaMissingInfoRequestExpired(request)) {
+    await sendOwnerQuoteNudge({
+      sendWhatsAppMessageFn,
+      ownerPhone: ownerTarget,
+      sendCredentials,
+      text: PA_MISSING_INFO_OWNER_EXPIRED_NUDGE,
+    });
+    return {
+      handled: true,
+      reason: "REQUEST_EXPIRED",
+      action: "owner_answer_unmatched",
       requestId,
       customerFollowupSent: false,
       matchReason,

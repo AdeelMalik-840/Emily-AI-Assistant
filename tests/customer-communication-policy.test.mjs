@@ -186,6 +186,8 @@ test("2: waiting_confirm_dm keeps action schema and includes shared DM policy", 
       shouldReply: false,
       customerReply: "",
       action: "confirm_booking",
+      targetContext: "pending_availability",
+      targetId: "avr-wait-1",
       confidence: 0.95,
       safetyNotes: null,
       reason: "natural_confirm",
@@ -216,21 +218,40 @@ test("2: waiting_confirm_dm keeps action schema and includes shared DM policy", 
   );
   assert.match(
     systems[0],
-    /Natural confirm after Emily's book-confirm prompt[\s\S]*action=confirm_booking/
+    /clear semantic confirmation of the pending transaction uses action=confirm_booking/
   );
 });
 
 test("3: post_confirm_pa keeps escalation schema and includes shared DM policy", async () => {
   const { create, systems, getCalls } = captureSystem(
     JSON.stringify({
+      turnScope: "SOCIAL_GENERAL",
+      semanticIntent: "social",
+      itemScope: "none",
+      itemReferents: [],
+      targetContext: "NONE",
+      targetId: null,
+      selectedBookingId: null,
+      targetReference: {
+        source: "none",
+        sourceTurnId: null,
+        targetType: "none",
+        targetId: null,
+      },
       situation: "conversation_closing",
       conversationAct: "chit_chat",
       customerIntent: "farewell",
       customerIsAskingQuestion: false,
       requestedInfoType: null,
+      factKind: "non_business",
+      capability: "social",
+      evidenceNeeds: [],
       shouldReply: false,
       customerReply: "",
       action: "silence",
+      mutationIntent: "none",
+      bookingSelectionMode: "none",
+      selectedBookingIndex: null,
       replySemantics: {
         claims: [],
         languageStyle: "roman_urdu",
@@ -247,7 +268,7 @@ test("3: post_confirm_pa keeps escalation schema and includes shared DM policy",
     missingInfoLoopFullyEnabled: true,
     __chatCompletionsCreateForTests: create,
   });
-  assert.equal(getCalls(), 1);
+  assert.equal(getCalls(), 2);
   assert.ok(result);
   assert.match(systems[0], new RegExp(CUSTOMER_COMMUNICATION_POLICY_MARKER));
   assert.match(systems[0], /escalate_missing_info/);

@@ -37,6 +37,7 @@
  * @property {Record<string, unknown>} [pendingActionPayload]
  * @property {string} [unlistedMentionLabel]
  * @property {string} [authoritativeSemanticIntent]
+ * @property {string} [authoritativeWorkflowType]
  * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemReferents]
  * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemResolutions]
  */

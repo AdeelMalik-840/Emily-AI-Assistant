@@ -187,6 +187,7 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
     "semanticIntent",
     "itemScope",
     "itemReferents",
+    "itemReferenceMode",
     "targetReference",
     "targetId",
     "mutationIntent",
@@ -194,6 +195,7 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
     "factKind",
     "capability",
     "evidenceNeeds",
+    "temporalRequest",
   ]);
 });
 
@@ -363,7 +365,7 @@ test("D13-D14 hello and unclear do not take a historical owner", async () => {
   assert.equal(unclear.result.decision.targetId, null);
 });
 
-test("E15 malformed ownership JSON is one completion and not accepted", async () => {
+test("E15 malformed ownership JSON retries the same Brain once then technical recovery", async () => {
   const { create, state } = countingCreate(async () => ({
     choices: [{ message: { content: "{not-json" } }],
   }));
@@ -372,14 +374,15 @@ test("E15 malformed ownership JSON is one completion and not accepted", async ()
     userMessage: PROD_CIVIC_SAME_ITEM_NEW_DURATION,
     __chatCompletionsCreateForTests: create,
   });
-  assert.equal(state.calls, 1);
-  assert.equal(result.ownershipCompletionCount, 1);
+  assert.equal(state.calls, 2);
+  assert.equal(result.ownershipCompletionCount, 2);
   assert.equal(result.ok, false);
-  assert.equal(result.retryable, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.customerTurnOutcome, "TECHNICAL_RECOVERY");
   assert.equal(result.reason, CLOUD_DM_OWNERSHIP_UNUSABLE_REASON);
 });
 
-test("E16 empty ownership response is one completion and not accepted", async () => {
+test("E16 empty ownership response retries the same Brain once then technical recovery", async () => {
   const { create, state } = countingCreate(async () => ({
     choices: [{ message: { content: "" } }],
   }));
@@ -388,9 +391,10 @@ test("E16 empty ownership response is one completion and not accepted", async ()
     userMessage: PROD_CIVIC_SAME_ITEM_NEW_DURATION,
     __chatCompletionsCreateForTests: create,
   });
-  assert.equal(state.calls, 1);
+  assert.equal(state.calls, 2);
   assert.equal(result.ok, false);
-  assert.equal(result.retryable, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.customerTurnOutcome, "TECHNICAL_RECOVERY");
 });
 
 test("E17 timeout before acceptance is one completion and not accepted", async () => {
@@ -823,7 +827,7 @@ test("parseCloudDmOwnershipDecision never requires customerReply", () => {
   assert.equal(parseCloudDmOwnershipDecision("{}"), null);
 });
 
-test("structurally invalid OLD_BOOKING is not accepted after the single completion", async () => {
+test("structurally invalid OLD_BOOKING retries the same Brain once then technical recovery", async () => {
   const { result, state } = await resolveWithDecision(
     {
       turnScope: "OLD_BOOKING_REFERENCE",
@@ -838,9 +842,10 @@ test("structurally invalid OLD_BOOKING is not accepted after the single completi
     productionRichCivicStonicFacts(),
     "booking?"
   );
-  assert.equal(state.calls, 1);
+  assert.equal(state.calls, 2);
   assert.equal(result.ok, false);
-  assert.equal(result.retryable, true);
+  assert.equal(result.retryable, false);
+  assert.equal(result.customerTurnOutcome, "TECHNICAL_RECOVERY");
   assert.match(String(result.reason), /OLD_BOOKING/);
 });
 

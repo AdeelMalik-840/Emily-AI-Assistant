@@ -6,6 +6,12 @@ process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || "test-key";
 const {
   executePostConfirmPaLaneDecision,
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
+const {
+  canonicalOldBookingOwnership,
+  canonicalSocialOwnership,
+  noneTargetReference,
+  CANONICAL_OWNERSHIP_TURN_ID,
+} = await import("./helpers/canonicalPostConfirmFixture.mjs");
 
 const STONIC_ITEM_ID = "test-stonic-item";
 const CIVIC_ITEM_ID = "test-civic-item";
@@ -82,6 +88,25 @@ function focusedFacts() {
       doNotMutateBooking: true,
       ambiguousBookingSelection: false,
     },
+    currentOwnershipTurnId: CANONICAL_OWNERSHIP_TURN_ID,
+  };
+}
+
+function socialLaneFacts() {
+  const facts = focusedFacts();
+  const stonic = facts.booking;
+  return {
+    ...facts,
+    bookingCandidates: [stonic],
+    activeBookings: Array.isArray(facts.activeBookings)
+      ? facts.activeBookings.slice(0, 1)
+      : [stonic],
+    replyGuardFacts: {
+      ...facts.replyGuardFacts,
+      activeBookings: Array.isArray(facts.replyGuardFacts?.activeBookings)
+        ? facts.replyGuardFacts.activeBookings.slice(0, 1)
+        : [stonic],
+    },
   };
 }
 
@@ -147,6 +172,7 @@ function inferTestOnlyFactKind(d) {
 
 function decision(overrides = {}) {
   const payload = {
+    ...canonicalOldBookingOwnership({ bookingId: "test-booking-stonic" }),
     situation: "new_question",
     conversationAct: "information_request",
     customerIntent: "ask_fact",
@@ -219,6 +245,7 @@ function silenceFactualWithoutTurnPlan() {
 
 function acknowledgementSilenceDecision() {
   return decision({
+    ...canonicalSocialOwnership(),
     situation: "acknowledgement_after_answer",
     conversationAct: "acknowledgement",
     customerIntent: "ack",
@@ -237,6 +264,7 @@ function acknowledgementSilenceDecision() {
 
 function socialSilenceDecision(overrides = {}) {
   return decision({
+    ...canonicalSocialOwnership(),
     situation: "conversation_closing",
     conversationAct: "thanks",
     customerIntent: "thanks",
@@ -359,7 +387,7 @@ test("social silence remains a valid no-outbound result", async () => {
   const socialSilence = socialSilenceDecision();
   const { result, calls } = await runWithResponses(
     [socialSilence, socialSilence],
-    { userMessage: "Thanks" }
+    { userMessage: "Thanks", facts: socialLaneFacts() }
   );
 
   assert.equal(calls.length, 2);
@@ -384,6 +412,7 @@ for (const [label, message, act, intent, situation] of [
     });
     const { result, calls } = await runWithResponses([social, social, decision()], {
       userMessage: message,
+      facts: socialLaneFacts(),
     });
     assert.equal(calls.length, 2);
     assert.equal(result.ok, true);
@@ -410,6 +439,9 @@ test("trusted focus does not turn an ambiguous mutation into focused execution",
     action: "request_booking_mutation",
     mutationIntent: "cancel_booking",
     mutationExecutionRequested: true,
+    targetId: null,
+    selectedBookingId: null,
+    targetReference: noneTargetReference(),
     bookingSelectionMode: "none",
     selectedBookingIndex: null,
     groundedFacts: groundedFacts(),
@@ -510,6 +542,9 @@ test("duration-extension mutation does not use trusted-focus required-reply extr
     action: "request_booking_mutation",
     mutationIntent: "extend_booking",
     mutationExecutionRequested: true,
+    targetId: null,
+    selectedBookingId: null,
+    targetReference: noneTargetReference(),
     bookingSelectionMode: "none",
     selectedBookingIndex: null,
     groundedFacts: groundedFacts(),
@@ -606,16 +641,13 @@ test("pending-availability confirm/decline do not use trusted-focus required-rep
 test("invalid or malformed OpenAI output gets one informational recovery then retryable failure", async () => {
   const { result, calls } = await runWithResponses(["", "", ""]);
 
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(result.ok, false);
   assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
-  assert.equal(result.retryable, true);
+  assert.equal(result.retryable, false);
   assert.equal(result.silenceRecoveryAttempts, 0);
-  assert.equal(result.contentSafetyAttempts, 3);
+  assert.equal(result.contentSafetyAttempts, 2);
   assert.equal(result.usabilityClassification, "empty_content");
-  const recoveryPrompt = String(calls[2]?.messages?.[1]?.content || "");
-  assert.match(recoveryPrompt, /empty\/invalid output recovery/i);
-  assert.match(recoveryPrompt, /Do NOT use action=silence/i);
 });
 
 test("empty/invalid then deferred factual recovery stays retryable", async () => {
@@ -664,10 +696,10 @@ test("empty/invalid then deferred factual recovery stays retryable", async () =>
     },
   });
 
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(result.ok, false);
   assert.equal(result.source, "technical_fallback");
   assert.equal(result.reason, "EMPTY_OR_INVALID_OPENAI_REPLY");
-  assert.equal(result.retryable, true);
-  assert.equal(result.usabilityClassification, "schema_or_parse_failure");
+  assert.equal(result.retryable, false);
+  assert.equal(result.usabilityClassification, "malformed_json");
 });

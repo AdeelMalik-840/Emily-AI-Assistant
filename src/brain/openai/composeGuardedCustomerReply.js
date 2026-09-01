@@ -76,7 +76,7 @@ export function parseCustomerReplyComposeJson(raw) {
  *   maxTokens?: number,
  *   __chatCompletionsCreateForTests?: Function | null,
  * }} p
- * @returns {Promise<{ ok: boolean, reply: string, source: string, reason: string | null }>}
+ * @returns {Promise<{ ok: boolean, reply: string, source: string, reason: string | null, attemptCount: number }>}
  */
 export async function composeGuardedCustomerReply({
   system,
@@ -106,6 +106,7 @@ export async function composeGuardedCustomerReply({
       reply: fallbackReply,
       source: "technical_fallback",
       reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+      attemptCount: 0,
     };
   }
 
@@ -114,10 +115,12 @@ export async function composeGuardedCustomerReply({
       ? responseFormat
       : buildCustomerReplyOnlyResponseFormat(responseFormatName);
   const fallback = String(fallbackReply ?? "");
+  let attemptCount = 0;
 
   try {
     let lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
     for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
+      attemptCount = attempt;
       const userContent =
         attempt === 1
           ? `${userBase}\n\n${firstAttemptReminder}`
@@ -195,6 +198,7 @@ export async function composeGuardedCustomerReply({
         reply: customerReply.slice(0, 500),
         source: "openai",
         reason: null,
+        attemptCount,
       };
     }
 
@@ -203,6 +207,7 @@ export async function composeGuardedCustomerReply({
       reply: fallback,
       source: "technical_fallback",
       reason: lastReason,
+      attemptCount,
     };
   } catch (err) {
     return {
@@ -210,6 +215,7 @@ export async function composeGuardedCustomerReply({
       reply: fallback,
       source: "technical_fallback",
       reason: String(err?.message ?? err ?? "COMPOSE_FAILED").slice(0, 160) || null,
+      attemptCount,
     };
   }
 }
