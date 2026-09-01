@@ -19,6 +19,7 @@ const {
   buildExtractedMessageId,
   buildParticipantForwardCandidate,
   buildStableMessageKey,
+  commitDurableFreshSessionSeen,
   evaluateReplyAfterGuard,
   isPlaywrightGuaranteeFirstAdmissionEnabled,
   resolveFreshAdmittedTurns,
@@ -205,13 +206,27 @@ test("I: admitted reused-index ID forwards in the same poll without index-drift 
 test("B: the same WhatsApp stable ID is never admitted twice in one session", () => {
   const row = mkRow({ dataId: "SAME_SESSION_ID" });
   const freshState = mkFreshState();
-  const first = resolveRows([row], freshState);
-  const second = resolveRows([row], freshState);
 
-  assert.equal(first.survivors.length, 1);
-  assert.equal(second.survivors.length, 0);
+  // Same tick: tick-local admission still drops a duplicate row.
+  const sameTick = resolveRows([row, { ...row }], freshState);
+  assert.equal(sameTick.survivors.length, 1);
   assert.ok(
-    second.rejectedTurns.some(
+    sameTick.rejectedTurns.some(
+      (turn) => turn.dropReason === "session_seen_stable_id"
+    )
+  );
+  assert.equal(freshState.admittedFreshStableIds.has("wa::SAME_SESSION_ID"), false);
+
+  // Next tick without a successful forward: still eligible (no durable session-seen).
+  const retryTick = resolveRows([row], freshState);
+  assert.equal(retryTick.survivors.length, 1);
+
+  // After the successful-forward commit, the same ID is permanently session-seen.
+  commitDurableFreshSessionSeen(freshState, ["wa::SAME_SESSION_ID"]);
+  const afterForward = resolveRows([row], freshState);
+  assert.equal(afterForward.survivors.length, 0);
+  assert.ok(
+    afterForward.rejectedTurns.some(
       (turn) => turn.dropReason === "session_seen_stable_id"
     )
   );

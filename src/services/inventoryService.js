@@ -1423,9 +1423,11 @@ export async function createBooking(
             }
           : {}),
         ...(dmTargetIsRoutable ? { originalCustomerPhone: dmTargetRaw } : {}),
-        ...(String(originalUserMessageText ?? sourceText ?? "").trim()
-          ? { originalUserMessageText: String(originalUserMessageText ?? sourceText).trim() }
-          : {}),
+        ...(originalUserMessageText != null
+          ? { originalUserMessageText: String(originalUserMessageText).trim() }
+          : String(sourceText ?? "").trim()
+            ? { originalUserMessageText: String(sourceText).trim() }
+            : {}),
         ...(sourceTimestamp != null && Number.isFinite(Number(sourceTimestamp))
           ? { originalMessageTimestamp: Number(sourceTimestamp) }
           : {}),

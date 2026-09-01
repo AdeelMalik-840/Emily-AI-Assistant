@@ -166,6 +166,11 @@ test("PLAYWRIGHT_GROUP booking persists clean source text and structured partici
 
   assert.equal(result.ok, true);
   assert.equal(result.booking.sourceText, "Honda Civic 1 din k lye book karni hai");
+  assert.equal(result.booking.originalUserMessageText, "Honda Civic 1 din k lye book karni hai");
+  assert.equal(
+    result.booking.sourceIdentity.sourceTextPreview,
+    "Honda Civic 1 din k lye book karni hai"
+  );
   assertNotDecorated(result.booking.sourceText);
   assertNotDecorated(result.booking.sourceIdentity.sourceTextPreview);
   assertNotDecorated(result.booking.originalUserMessageText);
