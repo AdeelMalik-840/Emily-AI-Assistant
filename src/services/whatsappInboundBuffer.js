@@ -1403,6 +1403,7 @@ export async function executeWhatsAppAiPipeline(p) {
     participantName: participantNameRaw,
     participantDisplayName: participantDisplayNameRaw,
     participantKey: participantKeyRaw,
+    participantWaId: participantWaIdRaw,
     sourceParticipantKey: sourceParticipantKeyRaw,
     senderScope: senderScopeRaw,
     sessionKey: sessionKeyRaw,
@@ -2916,6 +2917,7 @@ export async function executeWhatsAppAiPipeline(p) {
     sourceParticipantDisplayName: normalizedParticipantDisplayName,
     senderScope: normalizedSenderScope,
     sourceSenderScope: normalizedSenderScope,
+    participantWaId: String(participantWaIdRaw ?? "").trim().toLowerCase() || null,
     participantPhoneForDm:
       String(participantPhoneForDmRaw ?? "").trim() || null,
     playwrightChatKey: playwrightChatKeyRaw,
@@ -2949,6 +2951,7 @@ export async function executeWhatsAppAiPipeline(p) {
       sourceParticipantDisplayName: normalizedParticipantDisplayName,
       senderScope: normalizedSenderScope,
       sourceSenderScope: normalizedSenderScope,
+      participantWaId: String(participantWaIdRaw ?? "").trim().toLowerCase() || null,
       participantPhoneForDm:
         String(participantPhoneForDmRaw ?? "").trim() || null,
       sourceMessageIndex: normalizedSourceMessageIndex,
@@ -4224,6 +4227,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     participantPhoneForDm: participantPhoneForDmPayload,
     participantName: participantNamePayload,
     participantKey: participantKeyPayload,
+    participantWaId: participantWaIdPayload,
     messageId: messageIdPayload,
     messageTimestamp,
     contextMessageId: contextMessageIdPayload,
@@ -4321,6 +4325,9 @@ export function scheduleBufferedWhatsAppInbound(payload) {
   const participantKeyMerged =
     String(participantKeyPayload ?? "").trim() ||
     String(entry.context?.participantKey ?? "").trim();
+  const participantWaIdMerged =
+    String(participantWaIdPayload ?? "").trim().toLowerCase() ||
+    String(entry.context?.participantWaId ?? "").trim().toLowerCase();
 
   const normalizeParticipantName = (value) => {
     const raw = String(value ?? "").replace(/\s+/g, " ").trim();
@@ -4360,6 +4367,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
       ? { participantPhoneForDm: participantPhoneDmMerged }
       : {}),
     ...(participantKeyMerged ? { participantKey: participantKeyMerged } : {}),
+    ...(participantWaIdMerged ? { participantWaId: participantWaIdMerged } : {}),
     ...(participantNameMerged ? { participantName: participantNameMerged } : {}),
     messageId:
       messageIdPayload != null

@@ -10,6 +10,7 @@ import {
   buildInitialAvailabilityPhoneExtractionFields,
   isRetryablePhoneExtractionError,
 } from "./availabilityCustomerPhone.js";
+import { resolveTrustedParticipantWaIdFromSource } from "./whatsappParticipantIdentityResolver.js";
 import { assertExecutionOwnership } from "./executors/executionOwnershipGuard.js";
 import { toValidBookingDate } from "../brain/facts/bookingDateUtils.js";
 
@@ -398,6 +399,11 @@ function buildSourceIdentity(payload = {}, executionContext = {}, sourceTurnKey 
       clean(payload.sourceParticipantPhone) ||
       clean(executionContext.participantPhoneForDm) ||
       null,
+    participantWaId:
+      clean(sourceIdentity.participantWaId) ||
+      clean(payload.participantWaId) ||
+      clean(executionContext.participantWaId) ||
+      null,
     sourceTextPreview:
       clean(sourceIdentity.sourceTextPreview ?? payload.sourceTextPreview ?? executionContext.message).slice(
         0,
@@ -631,6 +637,7 @@ export async function createAvailabilityRequest({ db: connection, payload, execu
 
   const phoneExtractionFields = buildInitialAvailabilityPhoneExtractionFields({
     participantPhone: normalized.sourceIdentity?.participantPhone,
+    participantWaId: normalized.sourceIdentity?.participantWaId,
   });
 
   const request = {
@@ -2543,6 +2550,25 @@ export async function evaluateAvailabilityWaitingConfirmOwnershipGuard({
 
 export const MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS = 3;
 
+const TRUSTED_IDENTITY_RECOVERABLE_PHONE_ERRORS = new Set([
+  "CLUSTER_SENDER_AMBIGUOUS",
+  "SENDER_TARGET_NOT_FOUND",
+  "NO_TRUSTED_JID",
+]);
+
+function isTrustedIdentityPhoneRecoveryCandidate(request = {}) {
+  const trusted = resolveTrustedParticipantWaIdFromSource(request);
+  if (!trusted.ok) return false;
+  if (clean(request?.approvalCustomerNotificationStatus) !== "skipped") return false;
+  if (clean(request?.approvalCustomerNotificationMethod) !== "skipped_manual_required") {
+    return false;
+  }
+  if (request?.trustedIdentityRecoveryAttemptedAt) return false;
+  return TRUSTED_IDENTITY_RECOVERABLE_PHONE_ERRORS.has(
+    clean(request?.phoneExtractionError)
+  );
+}
+
 /**
  * @param {Record<string, unknown>} request
  * @returns {boolean}
@@ -2554,14 +2580,18 @@ export function availabilityRequestNeedsGroupContactPhoneExtraction(request) {
   const attemptsSafe =
     !Number.isFinite(attempts) || attempts < MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS;
 
-  if (status === "resolved" || status === "ambiguous") {
+  const trustedRecovery = isTrustedIdentityPhoneRecoveryCandidate(request);
+  if (status === "resolved") {
     return false;
   }
+  if (status === "ambiguous" && !trustedRecovery) return false;
   if (status === "failed") {
     // Temporary lock/page busy must remain reclaimable.
-    if (!isRetryablePhoneExtractionError(errorCode) || !attemptsSafe) {
+    if ((!isRetryablePhoneExtractionError(errorCode) || !attemptsSafe) && !trustedRecovery) {
       return false;
     }
+  } else if (status === "ambiguous" && trustedRecovery) {
+    // One identity-anchored recovery pass may replace the legacy name-only ambiguity.
   } else if (status !== "pending" && status !== "resolving") {
     return false;
   } else if (!attemptsSafe) {
@@ -2612,6 +2642,11 @@ export async function findPendingAvailabilityPhoneExtractionRequests({
     .limit(Math.max(capped, 5))
     .get()
     .catch(() => null);
+  const ambiguousSnap = await collection
+    .where("phoneExtractionStatus", "==", "ambiguous")
+    .limit(Math.max(capped, 5))
+    .get()
+    .catch(() => null);
 
   const rows = [
     ...(pendingSnap?.docs ?? []).map((doc) => ({
@@ -2619,6 +2654,10 @@ export async function findPendingAvailabilityPhoneExtractionRequests({
       ...(doc.data() || {}),
     })),
     ...(failedSnap?.docs ?? []).map((doc) => ({
+      requestId: doc.id,
+      ...(doc.data() || {}),
+    })),
+    ...(ambiguousSnap?.docs ?? []).map((doc) => ({
       requestId: doc.id,
       ...(doc.data() || {}),
     })),
@@ -2664,18 +2703,19 @@ export async function claimAvailabilityPhoneExtractionResolving({
   }
   const retryableFailed =
     status === "failed" && isRetryablePhoneExtractionError(data.phoneExtractionError);
-  if (status !== "pending" && !retryableFailed) {
+  const trustedRecovery = isTrustedIdentityPhoneRecoveryCandidate({ requestId, ...data });
+  if (status !== "pending" && !retryableFailed && !trustedRecovery) {
     return { ok: false, reason: "NOT_PENDING", request: { requestId, ...data } };
   }
   if (!availabilityRequestNeedsGroupContactPhoneExtraction({
     ...data,
-    phoneExtractionStatus: retryableFailed ? "failed" : "pending",
+    phoneExtractionStatus: retryableFailed || trustedRecovery ? status : "pending",
   })) {
     return { ok: false, reason: "NOT_ELIGIBLE", request: { requestId, ...data } };
   }
   const attempts = Number(data.phoneExtractionAttemptCount);
   const nextAttempts = (Number.isFinite(attempts) ? Math.floor(attempts) : 0) + 1;
-  if (nextAttempts > MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS) {
+  if (nextAttempts > MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS && !trustedRecovery) {
     await updateAvailabilityRequestFields({
       db: connection,
       businessId,
@@ -2698,6 +2738,7 @@ export async function claimAvailabilityPhoneExtractionResolving({
       customerDmTransport: "none",
       phoneExtractionError: null,
       phoneExtractionAttemptCount: nextAttempts,
+      ...(trustedRecovery ? { trustedIdentityRecoveryAttemptedAt: new Date() } : {}),
     },
   });
   if (!updated) return { ok: false, reason: "CLAIM_FAILED" };

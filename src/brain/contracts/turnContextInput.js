@@ -31,6 +31,7 @@
  * @property {string} chatId
  * @property {TurnContextParticipantIdentity} participantIdentity
  * @property {string | null} participantKey
+ * @property {string | null} [participantWaId]
  * @property {boolean} memoryAllowed
  * @property {string} messageText
  * @property {string} turnShape

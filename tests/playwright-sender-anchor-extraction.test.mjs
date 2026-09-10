@@ -112,6 +112,8 @@ test("D: same JID across display-name changes yields same participant/session id
     senderName: "Adeel",
   });
   assert.equal(first.participantKey, second.participantKey);
+  assert.equal(first.participantWaId, JID_A);
+  assert.equal(second.participantWaId, JID_A);
   assert.equal(first.sessionKey, second.sessionKey);
   assert.match(first.participantKey, /^scope::/);
 });

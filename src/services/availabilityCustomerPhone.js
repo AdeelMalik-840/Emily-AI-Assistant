@@ -3,6 +3,12 @@
  * phone-extraction field helpers (pure; no Playwright / Cloud send).
  */
 
+import {
+  isCusParticipantJid,
+  phoneDigitsFromCusParticipantJid,
+  resolveTrustedParticipantWaIdFromSource,
+} from "./whatsappParticipantIdentityResolver.js";
+
 /** @typedef {"group_row" | "group_contact_info" | "manual"} CustomerPhoneSource */
 /** @typedef {"high" | "medium" | "low"} CustomerPhoneConfidence */
 /** @typedef {"not_started" | "pending" | "resolving" | "resolved" | "failed" | "ambiguous"} PhoneExtractionStatus */
@@ -61,6 +67,50 @@ export function normalizeCustomerPhoneDigits(value) {
 
   if (digits.length < MIN_DIGITS || digits.length > MAX_DIGITS) return "";
   return digits;
+}
+
+/**
+ * Resolve a phone-bearing exact-message participant JID without opening WhatsApp UI.
+ * Conflicting or absent trusted JIDs fail closed.
+ *
+ * @param {Record<string, unknown> | null | undefined} source
+ * @returns {{ ok: boolean, phone: string, participantWaId: string, reason: string | null }}
+ */
+export function resolveTrustedCusJidPhone(source = {}) {
+  const trusted = resolveTrustedParticipantWaIdFromSource(source);
+  if (!trusted.ok) {
+    return {
+      ok: false,
+      phone: "",
+      participantWaId: "",
+      reason: trusted.reason,
+    };
+  }
+  if (!isCusParticipantJid(trusted.participantWaId)) {
+    return {
+      ok: false,
+      phone: "",
+      participantWaId: trusted.participantWaId,
+      reason: "TRUSTED_JID_NOT_PHONE_BEARING",
+    };
+  }
+  const phone = normalizeCustomerPhoneDigits(
+    phoneDigitsFromCusParticipantJid(trusted.participantWaId)
+  );
+  if (!phone) {
+    return {
+      ok: false,
+      phone: "",
+      participantWaId: trusted.participantWaId,
+      reason: "INVALID_TRUSTED_CUS_JID_PHONE",
+    };
+  }
+  return {
+    ok: true,
+    phone,
+    participantWaId: trusted.participantWaId,
+    reason: null,
+  };
 }
 
 /**
@@ -163,7 +213,7 @@ export function isDeferredPhoneExtractionError(errorCode) {
  * Initial phone-extraction fields at availabilityRequest creation.
  * participantPhone present → resolved from group_row; else pending for Contact-info resolver.
  *
- * @param {{ participantPhone?: unknown }} [input]
+ * @param {{ participantPhone?: unknown, participantWaId?: unknown }} [input]
  * @returns {Record<string, unknown>}
  */
 export function buildInitialAvailabilityPhoneExtractionFields(input = {}) {
@@ -171,14 +221,25 @@ export function buildInitialAvailabilityPhoneExtractionFields(input = {}) {
     input.participantPhone != null && String(input.participantPhone).trim()
       ? String(input.participantPhone).trim()
       : "";
-  const normalized = normalizeCustomerPhoneDigits(raw);
+  const jidPhone = resolveTrustedCusJidPhone({ participantWaId: input.participantWaId });
+  const rawNormalized = normalizeCustomerPhoneDigits(raw);
+  if (rawNormalized && jidPhone.ok && rawNormalized !== jidPhone.phone) {
+    return {
+      phoneExtractionStatus: "ambiguous",
+      phoneExtractionError: "JID_PHONE_CONFLICT",
+      phoneExtractionAttemptCount: 0,
+      customerDmTransport: "none",
+    };
+  }
+  const normalized = rawNormalized || (jidPhone.ok ? jidPhone.phone : "");
   if (normalized) {
     const built = buildAvailabilityPhoneExtractionFields({
       phoneExtractionStatus: "resolved",
       customerPhone: normalized,
-      customerPhoneRaw: raw,
+      customerPhoneRaw: raw || normalized,
       customerPhoneSource: "group_row",
       customerPhoneConfidence: "high",
+      customerWaId: normalized,
       incrementAttempt: false,
     });
     return built.patch;
