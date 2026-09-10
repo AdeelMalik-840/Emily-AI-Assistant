@@ -20,6 +20,7 @@ function baseRequest(overrides = {}) {
       sourceTextPreview: "Honda Civic available?",
       participantName: "Adeel",
       participantKey: "adeel",
+      participantWaId: "123456789012345@lid",
       ...overrides.sourceIdentity,
     },
     ...overrides,
@@ -146,6 +147,83 @@ test("resolveGroupPhoneExtractionSource reads sourceIdentity fields", () => {
   assert.equal(source.sourceTextPreview, "Honda Civic available?");
 });
 
+test("trusted @c.us JID resolves without row lookup, click, or Contact Info", async () => {
+  let uiCalls = 0;
+  const result = await extractCustomerPhoneFromGroupSourceMessage(
+    null,
+    baseRequest({
+      sourceIdentity: {
+        participantWaId: "923365149142@c.us",
+      },
+    }),
+    {
+      acquireLockFn: () => {
+        uiCalls += 1;
+        return { ok: true, acquired: true };
+      },
+      locateSourceRowFn: async () => {
+        uiCalls += 1;
+        throw new Error("row lookup must not run");
+      },
+      clickSenderFn: async () => {
+        uiCalls += 1;
+        throw new Error("click must not run");
+      },
+    }
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.phone, "923365149142");
+  assert.equal(result.source, "group_row");
+  assert.equal(result.confidence, "high");
+  assert.equal(result.locatorUsed, "trusted_participant_jid");
+  assert.equal(uiCalls, 0);
+});
+
+test("trusted JID conflict fails closed before DOM target selection", async () => {
+  let locateCalls = 0;
+  const result = await extractCustomerPhoneFromGroupSourceMessage(
+    {},
+    {
+      ...baseRequest(),
+      participantWaId: "923001112233@c.us",
+      sourceIdentity: {
+        ...baseRequest().sourceIdentity,
+        participantWaId: "123456789012345@lid",
+      },
+    },
+    {
+      acquireLockFn: () => ({ ok: true, acquired: true }),
+      releaseLockFn: () => {},
+      locateSourceRowFn: async () => {
+        locateCalls += 1;
+        return null;
+      },
+      refocusFn: async () => true,
+      ensureChatViewFn: async () => true,
+    }
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "TIER_CONFLICT");
+  assert.equal(locateCalls, 0);
+});
+
+test("trusted @lid conflicts with located DOM row identity and fails closed", async () => {
+  const { page, options, calls } = createHarness();
+  options.verifyRowParticipantFn = async (_locator, trustedJid) => {
+    assert.equal(trustedJid, "123456789012345@lid");
+    return { ok: false, reason: "JID_DOM_CANDIDATE_CONFLICT" };
+  };
+  const result = await extractCustomerPhoneFromGroupSourceMessage(
+    page,
+    baseRequest(),
+    options
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "JID_DOM_CANDIDATE_CONFLICT");
+  assert.equal(calls.click.length, 0);
+  assert.equal(calls.extract.length, 0);
+});
+
 test("1. locates row by sourceMessageId/data-id and clicks sender", async () => {
   const { page, options, calls } = createHarness({ locateReason: "sourceMessageId" });
   const result = await extractCustomerPhoneFromGroupSourceMessage(
@@ -186,6 +264,7 @@ test("3. falls back to participantName + sourceTextPreview when unique", async (
       sourceRowKey: "",
       sourceTextPreview: "unique text only once",
       participantName: "Adeel",
+      participantWaId: "123456789012345@lid",
     },
   });
   const result = await extractCustomerPhoneFromGroupSourceMessage(page, request, options);
@@ -224,6 +303,7 @@ test("5. fails when fallback matches multiple rows", async () => {
         sourceRowKey: "",
         sourceTextPreview: "duplicate text",
         participantName: "Adeel",
+        participantWaId: "123456789012345@lid",
       },
     }),
     options
@@ -473,6 +553,7 @@ test("4D.1 normal row opens via in-row sender label when avatar absent", async (
   };
   const result = await clickSenderControlInGroupMessageRow(row, {
     participantName: "Adeel",
+    participantWaId: "123456789012345@lid",
     page: { waitForTimeout: async () => {} },
     requirePanelVerification: true,
     verifyPanelOpenFn: async () => ({
@@ -531,6 +612,7 @@ test("4D.2 continuation row uses cluster fallback when previous same-participant
   };
   const result = await clickSenderControlInGroupMessageRow(row, {
     participantName: "Mi",
+    participantWaId: "123456789012345@lid",
     page: { waitForTimeout: async () => {} },
     requirePanelVerification: true,
     verifyPanelOpenFn: async () => ({
@@ -644,7 +726,7 @@ test("4D.7 cluster evaluate outside message list fails closed", async () => {
         };
       },
     },
-    { participantName: "Mi" }
+    { participantName: "Mi", participantWaId: "123456789012345@lid" }
   );
   assert.equal(result.ok, false);
   assert.equal(result.errorCode, "SENDER_CONTROL_NOT_FOUND");
@@ -770,6 +852,7 @@ test("stable open: strategy order prefers avatar before label", async () => {
 
   const result = await clickSenderControlInGroupMessageRow(row, {
     participantName: "Adeel",
+    participantWaId: "123456789012345@lid",
     page: { waitForTimeout: async () => {} },
     requirePanelVerification: true,
     verifyPanelOpenFn: async () => ({
@@ -942,6 +1025,7 @@ test("stable open: all scoped strategies fail panel verification → PANEL_NOT_O
 
   const result = await clickSenderControlInGroupMessageRow(row, {
     participantName: "Adeel",
+    participantWaId: "123456789012345@lid",
     page: { waitForTimeout: async () => {} },
     requirePanelVerification: true,
     verifyPanelOpenFn: async () => ({

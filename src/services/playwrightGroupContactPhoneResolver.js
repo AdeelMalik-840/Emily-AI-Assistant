@@ -12,7 +12,14 @@ import {
   extractPhoneFromContactInfoPanel,
   waitForContactInfoPanelOpen,
 } from "./playwrightContactInfoPhoneExtractor.js";
-import { maskCustomerPhone } from "./availabilityCustomerPhone.js";
+import {
+  maskCustomerPhone,
+  normalizeCustomerPhoneDigits,
+  resolveTrustedCusJidPhone,
+} from "./availabilityCustomerPhone.js";
+import {
+  resolveTrustedParticipantWaIdFromSource,
+} from "./whatsappParticipantIdentityResolver.js";
 import { isReplyPrivateLockActive } from "./replyPrivateUiController.js";
 
 const SOURCE = "group_contact_info";
@@ -45,6 +52,13 @@ export function resolveGroupPhoneExtractionSource(request = {}, options = {}) {
     clean(identity.groupName) ||
     "";
 
+  const trusted = resolveTrustedParticipantWaIdFromSource({
+    ...request,
+    sourceIdentity: {
+      ...identity,
+      ...(options.participantWaId ? { participantWaId: options.participantWaId } : {}),
+    },
+  });
   return {
     sourceChatId,
     sourceMessageId:
@@ -79,6 +93,8 @@ export function resolveGroupPhoneExtractionSource(request = {}, options = {}) {
       clean(identity.participantPhone) ||
       clean(request.participantPhone) ||
       "",
+    participantWaId: trusted.ok ? trusted.participantWaId : "",
+    participantWaIdError: trusted.ok ? null : trusted.reason,
   };
 }
 
@@ -147,7 +163,7 @@ function buildResult(partial = {}) {
     rawPhone,
     normalizedPhone,
     confidence: partial.confidence ?? null,
-    source: SOURCE,
+    source: clean(partial.source) || SOURCE,
     errorCode: partial.errorCode ?? null,
     candidates: Array.isArray(partial.candidates) ? partial.candidates : [],
     maskedPhone: maskCustomerPhone(normalizedPhone || rawPhone),
@@ -251,15 +267,57 @@ export function decideClusterSenderClick(candidates = [], expectedParticipantNam
   };
 }
 
+/** Exact-row DOM JID, when present, must agree with the persisted exact-message JID. */
+export async function verifyLocatedRowParticipantJid(rowLocator, participantWaId) {
+  const expected = clean(participantWaId).toLowerCase();
+  if (!expected) return { ok: true, observed: [], reason: "NO_TRUSTED_JID_TO_CROSS_CHECK" };
+  if (!rowLocator || typeof rowLocator.evaluate !== "function") {
+    return { ok: true, observed: [], reason: "ROW_JID_NOT_EXPOSED" };
+  }
+  const observed = await rowLocator
+    .evaluate((root) => {
+      const values = [];
+      let cursor = root;
+      let hops = 0;
+      while (cursor && hops < 6) {
+        const dataId = String(cursor.getAttribute?.("data-id") || "").trim();
+        const match = dataId.match(/(?:^|_)([^\s_@]+@(?:c\.us|lid))$/i);
+        if (match?.[1]) values.push(match[1].toLowerCase());
+        cursor = cursor.parentElement;
+        hops += 1;
+      }
+      return [...new Set(values)];
+    })
+    .catch(() => []);
+  const unique = Array.isArray(observed)
+    ? [...new Set(observed.map((value) => clean(value).toLowerCase()).filter(Boolean))]
+    : [];
+  if (unique.length === 0) return { ok: true, observed: [], reason: "ROW_JID_NOT_EXPOSED" };
+  if (unique.length === 1 && unique[0] === expected) {
+    return { ok: true, observed: unique, reason: "ROW_JID_MATCH" };
+  }
+  return { ok: false, observed: unique, reason: "JID_DOM_CANDIDATE_CONFLICT" };
+}
+
 /**
  * Cluster-scoped fallback: find exactly one sender control near the source row.
  * Starts from the located row; never page-wide name search.
  *
  * @param {import("playwright").Locator | { evaluate?: Function }} rowLocator
- * @param {{ participantName?: string | null }} [opts]
+ * @param {{ participantName?: string | null, participantWaId?: string | null }} [opts]
  */
 export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
   const participantName = clean(opts.participantName);
+  const participantWaId = clean(opts.participantWaId).toLowerCase();
+  if (!participantWaId) {
+    return {
+      ok: false,
+      errorCode: "NO_TRUSTED_JID",
+      clusterFallbackUsed: true,
+      clusterCandidateCount: 0,
+      clusterRejectedReason: "NO_TRUSTED_JID",
+    };
+  }
   if (!rowLocator || typeof rowLocator.evaluate !== "function") {
     return {
       ok: false,
@@ -279,10 +337,11 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
    * }} */
   let outcome = null;
   try {
-    outcome = await rowLocator.evaluate((root, expected) => {
+    outcome = await rowLocator.evaluate((root, input) => {
       /* __CLUSTER_SENDER_FALLBACK__ */
       const cleanLocal = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
-      const expectedName = cleanLocal(expected).toLowerCase();
+      const expectedName = cleanLocal(input?.expectedName).toLowerCase();
+      const expectedJid = cleanLocal(input?.expectedJid).toLowerCase();
       if (!(root instanceof Element)) {
         return {
           ok: false,
@@ -341,6 +400,20 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
         el?.closest?.(
           "[data-testid='msg-container'], .message-in, .message-out, [class*='message-in'], [class*='message-out']"
         ) || el;
+
+      const participantJidsFor = (el) => {
+        const values = [];
+        let cursor = messageRootOf(el);
+        let hops = 0;
+        while (cursor && cursor !== messageList && hops < 6) {
+          const dataId = cleanLocal(cursor.getAttribute?.("data-id"));
+          const match = dataId.match(/(?:^|_)([^\s_@]+@(?:c\.us|lid))$/i);
+          if (match?.[1]) values.push(match[1].toLowerCase());
+          cursor = cursor.parentElement;
+          hops += 1;
+        }
+        return [...new Set(values)];
+      };
 
       const sourceMsg = messageRootOf(root);
       if (isOutbound(sourceMsg)) {
@@ -411,6 +484,7 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
       /** @type {Array<{ el: Element, kind: string, participantLabel: string }>} */
       const found = [];
       const seen = new Set();
+      let identityConflict = false;
 
       const consider = (el, kind) => {
         if (!(el instanceof Element) || isBodyText(el)) return;
@@ -444,12 +518,19 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
             }
           }
         }
+        const candidateJids = participantJidsFor(host);
+        if (!candidateJids.includes(expectedJid)) {
+          if (candidateJids.length > 0) identityConflict = true;
+          return;
+        }
         if (seen.has(el)) return;
         seen.add(el);
         found.push({
           el,
           kind,
-          participantLabel: expectedName ? expected : participantLabel,
+          participantLabel: expectedName
+            ? cleanLocal(input?.expectedName)
+            : participantLabel,
         });
       };
 
@@ -475,22 +556,23 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
           ok: false,
           clicked: false,
           candidateCount: 0,
-          rejectedReason: clusterBroken
+          rejectedReason: identityConflict
+            ? "JID_DOM_CANDIDATE_CONFLICT"
+            : clusterBroken
             ? "CLUSTER_BOUNDARY_UNCLEAR_OR_MISMATCH"
             : "CLUSTER_SENDER_NOT_FOUND",
           target: null,
         };
       }
-      if (found.length > 1) {
-        return {
-          ok: false,
-          clicked: false,
-          candidateCount: found.length,
-          rejectedReason: "CLUSTER_SENDER_AMBIGUOUS",
-          target: null,
-        };
-      }
-
+      // Every retained node is independently tied to the same trusted JID.
+      // Prefer an avatar, then the nearest node above the exact source row.
+      found.sort((a, b) => {
+        const kindDelta = (a.kind === "avatar" ? 0 : 1) - (b.kind === "avatar" ? 0 : 1);
+        if (kindDelta) return kindDelta;
+        const aTop = a.el.getBoundingClientRect?.().top ?? 0;
+        const bTop = b.el.getBoundingClientRect?.().top ?? 0;
+        return Math.abs(sourceTop - aTop) - Math.abs(sourceTop - bTop);
+      });
       const chosen = found[0];
       if (typeof chosen.el.click !== "function") {
         return {
@@ -510,7 +592,7 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
         target:
           chosen.kind === "avatar" ? "cluster_sender_avatar" : "cluster_sender_label",
       };
-    }, participantName);
+    }, { expectedName: participantName, expectedJid: participantWaId });
   } catch {
     outcome = {
       ok: false,
@@ -538,6 +620,8 @@ export async function clickClusterScopedSenderNearRow(rowLocator, opts = {}) {
       ? "OUTBOUND_ROW_REJECTED"
       : rejectedReason === "CLUSTER_SENDER_AMBIGUOUS"
         ? "CLUSTER_SENDER_AMBIGUOUS"
+        : rejectedReason === "JID_DOM_CANDIDATE_CONFLICT"
+          ? "JID_DOM_CANDIDATE_CONFLICT"
         : "SENDER_CONTROL_NOT_FOUND";
 
   return {
@@ -604,6 +688,7 @@ async function scrollGroupSourceRowIntoView(rowLocator) {
  * }} rowLocator
  * @param {{
  *   participantName?: string | null,
+ *   participantWaId?: string | null,
  *   page?: import("playwright").Page | { waitForTimeout?: Function, keyboard?: { press?: Function } } | null,
  *   verifyPanelOpenFn?: Function,
  *   closePanelFn?: typeof closeContactInfoPanel,
@@ -644,6 +729,7 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
   }
 
   const participantName = clean(opts.participantName);
+  const participantWaId = clean(opts.participantWaId).toLowerCase();
   const page = opts.page ?? null;
   const groupTitle = clean(opts.groupTitle);
   const closePanelFn = opts.closePanelFn || closeContactInfoPanel;
@@ -948,6 +1034,7 @@ export async function clickSenderControlInGroupMessageRow(rowLocator, opts = {})
 
   const cluster = await clickClusterScopedSenderNearRow(rowLocator, {
     participantName,
+    participantWaId,
   });
   lastClusterCandidateCount =
     cluster.clusterCandidateCount == null ? null : Number(cluster.clusterCandidateCount);
@@ -1082,6 +1169,29 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
   options = {}
 ) {
   const source = resolveGroupPhoneExtractionSource(request, options);
+  const trustedCusPhone = resolveTrustedCusJidPhone(request);
+  if (trustedCusPhone.ok) {
+    const sourcePhone = normalizeCustomerPhoneDigits(source.participantPhone);
+    if (sourcePhone && sourcePhone !== trustedCusPhone.phone) {
+      return buildResult({
+        ok: false,
+        status: "ambiguous",
+        errorCode: "JID_PHONE_CONFLICT",
+      });
+    }
+    return buildResult({
+      ok: true,
+      status: "resolved",
+      phone: trustedCusPhone.phone,
+      rawPhone: trustedCusPhone.phone,
+      normalizedPhone: trustedCusPhone.phone,
+      confidence: "high",
+      source: "group_row",
+      locatorUsed: "trusted_participant_jid",
+      panelVerified: false,
+      clusterFallbackUsed: false,
+    });
+  }
   const acquireLockFn = options.acquireLockFn || tryAcquireGroupPhoneExtractionUiLock;
   const releaseLockFn = options.releaseLockFn || releaseGroupPhoneExtractionUiLock;
   const locateSourceRowFn =
@@ -1093,6 +1203,8 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
         bookingId: args.requestId || null,
       }));
   const clickSenderFn = options.clickSenderFn || clickSenderControlInGroupMessageRow;
+  const verifyRowParticipantFn =
+    options.verifyRowParticipantFn || verifyLocatedRowParticipantJid;
   const extractPhoneFn = options.extractPhoneFn || extractPhoneFromContactInfoPanel;
   const refocusFn = options.refocusFn || refocusChatRowForTitle;
   const ensureChatViewFn = options.ensureChatViewFn || ensureChatView;
@@ -1143,6 +1255,10 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
   uiLockAcquired = lock.acquired === true;
 
   try {
+    if (source.participantWaIdError === "TIER_CONFLICT") {
+      result = finish({ ok: false, status: "failed", errorCode: "TIER_CONFLICT" });
+      return result;
+    }
     if (!page) {
       result = finish({ ok: false, status: "failed", errorCode: "NO_ACTIVE_PAGE" });
       return result;
@@ -1161,6 +1277,14 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
         ok: false,
         status: "failed",
         errorCode: "MISSING_SOURCE_ANCHORS",
+      });
+      return result;
+    }
+    if (!hasStrongAnchor && hasFallbackAnchor && !source.participantWaId) {
+      result = finish({
+        ok: false,
+        status: "failed",
+        errorCode: "NO_TRUSTED_JID",
       });
       return result;
     }
@@ -1190,6 +1314,7 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
       participantKey: source.participantKey || null,
       sourceParticipantPhone: source.participantPhone || null,
       participantPhone: source.participantPhone || null,
+      participantWaId: source.participantWaId || null,
       groupChatKey: source.sourceChatId || null,
       sourceGroupName: source.sourceChatId || null,
     };
@@ -1214,8 +1339,22 @@ export async function extractCustomerPhoneFromGroupSourceMessage(
 
     locatorUsed = clean(located.reason) || "source_row";
 
+    const rowIdentity = await verifyRowParticipantFn(
+      located.locator,
+      source.participantWaId
+    );
+    if (rowIdentity?.ok === false) {
+      result = finish({
+        ok: false,
+        status: "failed",
+        errorCode: clean(rowIdentity.reason) || "JID_DOM_CANDIDATE_CONFLICT",
+      });
+      return result;
+    }
+
     const clickResult = await clickSenderFn(located.locator, {
       participantName: source.participantName,
+      participantWaId: source.participantWaId,
       page,
       requirePanelVerification: true,
       groupTitle: source.sourceChatId,

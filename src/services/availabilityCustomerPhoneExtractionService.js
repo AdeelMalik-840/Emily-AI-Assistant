@@ -9,7 +9,9 @@ import {
   isSoftRetryablePhoneExtractionError,
   maskCustomerPhone,
   normalizeCustomerPhoneDigits,
+  resolveTrustedCusJidPhone,
 } from "./availabilityCustomerPhone.js";
+import { resolveTrustedParticipantWaIdFromSource } from "./whatsappParticipantIdentityResolver.js";
 import {
   MAX_AVAILABILITY_PHONE_EXTRACTION_ATTEMPTS,
   claimAvailabilityPhoneExtractionResolving,
@@ -211,15 +213,21 @@ export async function extractAndPersistAvailabilityCustomerPhone({
   }
 
   const status = clean(existing.phoneExtractionStatus);
+  const trustedIdentity = resolveTrustedParticipantWaIdFromSource(existing);
+  const trustedRecovery =
+    trustedIdentity.ok &&
+    clean(existing.approvalCustomerNotificationStatus) === "skipped" &&
+    clean(existing.approvalCustomerNotificationMethod) === "skipped_manual_required";
   if (status === "resolved") {
     return { ok: true, skipped: true, reason: "ALREADY_RESOLVED", request: existing };
   }
-  if (status === "ambiguous") {
+  if (status === "ambiguous" && !trustedRecovery) {
     return { ok: true, skipped: true, reason: "ALREADY_AMBIGUOUS", request: existing };
   }
   if (
     status === "failed" &&
-    !isRetryablePhoneExtractionError(existing.phoneExtractionError)
+    !isRetryablePhoneExtractionError(existing.phoneExtractionError) &&
+    !trustedRecovery
   ) {
     return { ok: true, skipped: true, reason: "ALREADY_FAILED", request: existing };
   }
@@ -246,6 +254,68 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     status: "resolving",
     source: "group_contact_info",
   });
+
+  const trustedCusPhone = resolveTrustedCusJidPhone(claimed);
+  if (trustedCusPhone.ok) {
+    const existingPhoneEvidence =
+      normalizeCustomerPhoneDigits(claimed.customerPhoneNormalized) ||
+      normalizeCustomerPhoneDigits(claimed.customerPhone) ||
+      normalizeCustomerPhoneDigits(claimed.sourceIdentity?.participantPhone) ||
+      "";
+    if (existingPhoneEvidence && existingPhoneEvidence !== trustedCusPhone.phone) {
+      const conflict = buildAvailabilityPhoneExtractionFields({
+        existing: claimed,
+        phoneExtractionStatus: "ambiguous",
+        phoneExtractionError: "JID_PHONE_CONFLICT",
+        incrementAttempt: false,
+      });
+      await updateAvailabilityRequestFields({
+        db: firestore,
+        businessId: uid,
+        requestId: id,
+        patch: conflict.patch,
+      });
+      return {
+        ok: false,
+        status: "ambiguous",
+        reason: "JID_PHONE_CONFLICT",
+        patch: conflict.patch,
+      };
+    }
+    const built = buildAvailabilityPhoneExtractionFields({
+      existing: claimed,
+      phoneExtractionStatus: "resolved",
+      customerPhone: trustedCusPhone.phone,
+      customerPhoneRaw: trustedCusPhone.phone,
+      customerPhoneSource: "group_row",
+      customerPhoneConfidence: "high",
+      customerWaId: trustedCusPhone.phone,
+      incrementAttempt: false,
+    });
+    const recoveryPatch = trustedRecovery
+      ? {
+          approvalCustomerNotificationStatus: "pending",
+          approvalCustomerNotificationMethod: null,
+          approvalCustomerNotificationError: null,
+          trustedIdentityRecoveredAt: new Date(),
+        }
+      : {};
+    const patch = { ...built.patch, ...recoveryPatch };
+    await updateAvailabilityRequestFields({
+      db: firestore,
+      businessId: uid,
+      requestId: id,
+      patch,
+    });
+    return {
+      ok: true,
+      status: "resolved",
+      patch,
+      maskedPhone: maskCustomerPhone(trustedCusPhone.phone),
+      locatorUsed: "trusted_participant_jid",
+      zeroUiResolution: true,
+    };
+  }
 
   const persistDeferred = async (errorCode, { undoAttempt = false, extraction = null } = {}) => {
     const attemptsNow = Number.isFinite(claimedAttempts)
@@ -323,13 +393,23 @@ export async function extractAndPersistAvailabilityCustomerPhone({
       customerPhoneRaw: extraction.rawPhone || extraction.phone,
       customerPhoneSource: "group_contact_info",
       customerPhoneConfidence: extraction.confidence || "medium",
+      customerWaId: extraction.phone,
       incrementAttempt: false,
     });
+    const recoveryPatch = trustedRecovery
+      ? {
+          approvalCustomerNotificationStatus: "pending",
+          approvalCustomerNotificationMethod: null,
+          approvalCustomerNotificationError: null,
+          trustedIdentityRecoveredAt: new Date(),
+        }
+      : {};
+    const resolvedPatch = { ...built.patch, ...recoveryPatch };
     await updateAvailabilityRequestFields({
       db: firestore,
       businessId: uid,
       requestId: id,
-      patch: built.patch,
+      patch: resolvedPatch,
     });
     const masked =
       extraction.maskedPhone ||
@@ -349,7 +429,7 @@ export async function extractAndPersistAvailabilityCustomerPhone({
     return {
       ok: true,
       status: "resolved",
-      patch: built.patch,
+      patch: resolvedPatch,
       maskedPhone: masked,
       locatorUsed: extraction.locatorUsed || null,
     };

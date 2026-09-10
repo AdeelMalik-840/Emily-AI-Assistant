@@ -17,6 +17,7 @@ import {
 } from "../participantIdentity.js";
 import { chatSessionKey } from "../memory.js";
 import { INBOUND_SOURCE_REAL_CUSTOMER } from "../inboundOriginGuard.js";
+import { normalizeTrustedParticipantJid } from "../whatsappParticipantIdentityResolver.js";
 
 /** Set PLAYWRIGHT_DISABLE_PIPELINE_FORWARD=true to no-op inbound forwarding (debug only; disables AI pipeline). */
 const PIPELINE_FORWARD_DISABLED = /^true$/i.test(
@@ -116,6 +117,7 @@ function unresolvedParticipantTurnScope(groupKey, adapted) {
  *   cursorLastAssistantOutboundTrace?: Record<string, unknown> | null,
  *   participantPhoneForDm?: string,
  *   participantKey?: string,
+ *   participantWaId?: string,
  *   messageSender?: string,
  *   userPhone?: string,
  *   conversationCustomerNumber?: string,
@@ -315,6 +317,10 @@ async function buildPlaywrightSchedulePayload(adapted) {
       sourceParticipantKey: participantKey || undefined,
       senderScope,
       sourceSenderScope: senderScope || undefined,
+      participantWaId:
+        normalizeTrustedParticipantJid(
+          adapted?.participantWaId ?? adapted?.senderAnchor
+        ) || undefined,
       ...(participantPhoneForDm
         ? { participantPhoneForDm }
         : {}),
@@ -427,6 +433,7 @@ export async function forwardPlaywrightGroupToPipeline(adapted) {
         participantPhoneForDm: built.payload.participantPhoneForDm,
         participantName: built.payload.participantName,
         participantKey: built.payload.participantKey,
+        participantWaId: built.payload.participantWaId,
         senderScope: built.payload.senderScope,
         sessionKey: built.payload.sessionKey,
         combinedMessage: built.line,

@@ -134,6 +134,114 @@ test("2. missing participantPhone initializes pending/none", () => {
   assert.equal(patch.customerPhone, undefined);
 });
 
+test("trusted @c.us JID initializes resolved without waiting for UI poller", () => {
+  const patch = buildInitialAvailabilityPhoneExtractionFields({
+    participantWaId: "923365149142@c.us",
+  });
+  assert.equal(patch.phoneExtractionStatus, "resolved");
+  assert.equal(patch.customerPhone, "923365149142");
+  assert.equal(patch.customerPhoneSource, "group_row");
+  assert.equal(patch.customerPhoneConfidence, "high");
+  assert.equal(patch.customerDmTransport, "cloud_api");
+});
+
+test("participant phone conflicting with trusted @c.us JID fails closed", () => {
+  const patch = buildInitialAvailabilityPhoneExtractionFields({
+    participantPhone: "923001112233",
+    participantWaId: "923365149142@c.us",
+  });
+  assert.equal(patch.phoneExtractionStatus, "ambiguous");
+  assert.equal(patch.phoneExtractionError, "JID_PHONE_CONFLICT");
+  assert.equal(patch.customerDmTransport, "none");
+});
+
+test("trusted @c.us JID resolves with high confidence without page or DOM extraction", async () => {
+  const fakeDb = new FakeDb();
+  seedPending(fakeDb, "avr_cus_jid", {
+    sourceIdentity: {
+      sourceMessageId: "MSG-CUS",
+      sourceRowKey: "row-cus",
+      participantName: "Adeel",
+      participantWaId: "923365149142@c.us",
+      sourceTextPreview: "stonic 2 din",
+    },
+  });
+  let pageCalls = 0;
+  let domCalls = 0;
+  const result = await extractAndPersistAvailabilityCustomerPhone({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_cus_jid",
+    enabled: true,
+    getPageFn: () => {
+      pageCalls += 1;
+      return null;
+    },
+    extractFn: async () => {
+      domCalls += 1;
+      throw new Error("DOM must not run");
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.zeroUiResolution, true);
+  assert.equal(pageCalls, 0);
+  assert.equal(domCalls, 0);
+  const saved = fakeDb.docs.get(avrKey("avr_cus_jid"));
+  assert.equal(saved.phoneExtractionStatus, "resolved");
+  assert.equal(saved.customerPhone, "923365149142");
+  assert.equal(saved.customerPhoneSource, "group_row");
+  assert.equal(saved.customerPhoneConfidence, "high");
+  assert.equal(saved.customerDmTransport, "cloud_api");
+});
+
+test("approved skipped_manual_required AVR recovers once trusted identity resolves", async () => {
+  const fakeDb = new FakeDb();
+  seedPending(fakeDb, "avr_recovery", {
+    status: "approved",
+    phoneExtractionStatus: "failed",
+    phoneExtractionError: "CLUSTER_SENDER_AMBIGUOUS",
+    phoneExtractionAttemptCount: 3,
+    approvalCustomerNotificationStatus: "skipped",
+    approvalCustomerNotificationMethod: "skipped_manual_required",
+    approvalCustomerNotificationError: "manual_required",
+    customerConfirmationStatus: "waiting_customer_confirmation",
+    sourceIdentity: {
+      sourceMessageId: "MSG-RECOVER",
+      sourceRowKey: "row-recover",
+      participantName: "Adeel",
+      participantWaId: "923365149142@c.us",
+      sourceTextPreview: "stonic 2 din",
+    },
+  });
+  const first = await extractAndPersistAvailabilityCustomerPhone({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_recovery",
+    enabled: true,
+    getPageFn: () => null,
+  });
+  assert.equal(first.ok, true);
+  const saved = fakeDb.docs.get(avrKey("avr_recovery"));
+  assert.equal(saved.phoneExtractionStatus, "resolved");
+  assert.equal(saved.approvalCustomerNotificationStatus, "pending");
+  assert.equal(saved.approvalCustomerNotificationMethod, null);
+  assert.equal(saved.customerConfirmationStatus, "waiting_customer_confirmation");
+
+  const second = await extractAndPersistAvailabilityCustomerPhone({
+    db: fakeDb,
+    businessId: BUSINESS_ID,
+    requestId: "avr_recovery",
+    enabled: true,
+    getPageFn: () => null,
+  });
+  assert.equal(second.skipped, true);
+  assert.equal(second.reason, "ALREADY_RESOLVED");
+  assert.equal(
+    fakeDb.docs.get(avrKey("avr_recovery")).approvalCustomerNotificationStatus,
+    "pending"
+  );
+});
+
 test("3–6. pending calls resolver; success/failure/ambiguous write correctly", async () => {
   const fakeDb = new FakeDb();
   seedPending(fakeDb, "avr_pending_1");

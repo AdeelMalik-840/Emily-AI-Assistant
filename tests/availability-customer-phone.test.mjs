@@ -7,7 +7,29 @@ import {
   resolveCustomerDmTransport,
   buildAvailabilityPhoneExtractionFields,
   isDisallowedCustomerPhone,
+  resolveTrustedCusJidPhone,
 } from "../src/services/availabilityCustomerPhone.js";
+
+test("trusted @c.us JID resolves deterministically and conflicts fail closed", () => {
+  assert.deepEqual(
+    resolveTrustedCusJidPhone({
+      sourceIdentity: { participantWaId: "923365149142@c.us" },
+    }),
+    {
+      ok: true,
+      phone: "923365149142",
+      participantWaId: "923365149142@c.us",
+      reason: null,
+    }
+  );
+  assert.equal(
+    resolveTrustedCusJidPhone({
+      participantWaId: "923365149142@c.us",
+      sourceIdentity: { participantWaId: "50616374145214@lid" },
+    }).reason,
+    "TIER_CONFLICT"
+  );
+});
 
 test("normalize: +92 336 5149142 → 923365149142", () => {
   assert.equal(normalizeCustomerPhoneDigits("+92 336 5149142"), "923365149142");

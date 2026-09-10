@@ -9486,6 +9486,7 @@ export async function runPlaywrightForwardPass(p = {}) {
         participantPhoneForDm: msg.participantPhone || undefined,
         participantKey: msg.participantKey || undefined,
         senderAnchor: msg.senderAnchor || undefined,
+        participantWaId: msg.senderAnchor || undefined,
         timestamp: msg.timestamp,
         groupName: String(
           globalThis.__currentOpenChatTitle ?? activeChat ?? ""

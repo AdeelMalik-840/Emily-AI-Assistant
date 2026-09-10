@@ -37,6 +37,73 @@ function normalizeJid(value) {
     .toLowerCase();
 }
 
+export function normalizeTrustedParticipantJid(value) {
+  const jid = normalizeJid(value);
+  return isTrustedParticipantJid(jid) ? jid : "";
+}
+
+export function isLidParticipantJid(value) {
+  return /@lid$/i.test(normalizeTrustedParticipantJid(value));
+}
+
+export function isCusParticipantJid(value) {
+  return /@c\.us$/i.test(normalizeTrustedParticipantJid(value));
+}
+
+/**
+ * Phone-bearing WhatsApp user JID → digits only. Empty for @lid / untrusted.
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function phoneDigitsFromCusParticipantJid(value) {
+  const jid = normalizeTrustedParticipantJid(value);
+  const match = jid.match(/^(\d{10,15})@c\.us$/i);
+  return match ? String(match[1]) : "";
+}
+
+function asIdentityObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? /** @type {Record<string, unknown>} */ (value)
+    : {};
+}
+
+/**
+ * Collect trusted participant JIDs already stored on a request / source identity.
+ * Display names are ignored.
+ * @param {Record<string, unknown> | null | undefined} source
+ * @returns {string[]}
+ */
+export function collectTrustedParticipantJidsFromSource(source = {}) {
+  const row = asIdentityObject(source);
+  const identity = asIdentityObject(row.sourceIdentity);
+  const values = [
+    row.participantWaId,
+    row.participantJid,
+    row.senderAnchor,
+    identity.participantWaId,
+    identity.participantJid,
+    identity.senderAnchor,
+    identity.sourceSenderAnchor,
+  ];
+  return [...new Set(values.map((value) => normalizeTrustedParticipantJid(value)).filter(Boolean))];
+}
+
+/**
+ * Single trusted exact-message participant JID, or fail closed on conflict/absence.
+ * @param {Record<string, unknown> | null | undefined} source
+ * @returns {{ ok: boolean, participantWaId: string, reason: string | null }}
+ */
+export function resolveTrustedParticipantWaIdFromSource(source = {}) {
+  const unique = collectTrustedParticipantJidsFromSource(source);
+  if (unique.length > 1) {
+    return { ok: false, participantWaId: "", reason: "TIER_CONFLICT" };
+  }
+  if (unique.length === 1) {
+    return { ok: true, participantWaId: unique[0], reason: null };
+  }
+  return { ok: false, participantWaId: "", reason: "NO_TRUSTED_JID" };
+}
+
 function unresolvedResult(reason, extra = {}) {
   return {
     status: "unresolved",

@@ -81,6 +81,7 @@ export async function tryBrainV2InfoLiveTurn(params) {
     chatId: String(params.chatId ?? params.playwrightChatKey ?? "").trim(),
     messageText: message,
     participantKey: params.participantKey,
+    participantWaId: params.participantWaId,
     sessionKey: params.sessionKey,
     playwrightChatKey: params.playwrightChatKey,
     isGroupInbound: params.isGroupInbound,

@@ -815,6 +815,8 @@ export async function resolveBusinessTurnContext(params) {
   const sourceIdentity = {
     participantKey: participantFacts.participant.key,
     participantIdentity: participantFacts.participant.identity,
+    participantWaId:
+      String(turnContextInput?.participantWaId ?? "").trim().toLowerCase() || null,
     chatId: String(turnContextInput?.chatId ?? "").trim() || null,
     chatType: turnContextInput?.chatType ?? null,
     sourceMessageId,
