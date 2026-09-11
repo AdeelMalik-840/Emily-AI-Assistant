@@ -166,6 +166,12 @@ function readSourceIdentity(canonical) {
  * @returns {boolean}
  */
 function hasCanonicalOwnerCheckContext(canonical) {
+  if (
+    canonical?.validatedGroupCanonicalAuthority === true &&
+    canonical?.resolvedItem?.status !== "resolved"
+  ) {
+    return false;
+  }
   const itemId = String(canonical?.resolvedItem?.id ?? "").trim();
   return Boolean(itemId);
 }
@@ -1253,6 +1259,26 @@ export function buildAvailabilityInquiryActionPlan({
 }) {
   const message = String(admittedTurn?.turn?.text ?? "");
   const canonical = readResolvedBusinessTurnContext(businessContext);
+  if (
+    canonical?.validatedGroupCanonicalAuthority === true &&
+    canonical?.resolvedItem?.status !== "resolved"
+  ) {
+    return Object.freeze({
+      planId: randomUUID(),
+      replyDraft: "",
+      actions: Object.freeze([
+        Object.freeze({
+          type: "NO_OP",
+          payload: Object.freeze({
+            intentionallySilent: true,
+            reason: "validated_group_item_not_resolved",
+            execute: false,
+          }),
+        }),
+      ]),
+      persistenceIntent: Object.freeze({ execute: false }),
+    });
+  }
   const canonicalAuthorityActive = Boolean(
     String(understanding?.authoritativeSemanticIntent ?? "").trim()
   );

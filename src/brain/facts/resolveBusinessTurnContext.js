@@ -392,13 +392,21 @@ function buildContextToPersist(p) {
  *   memoryPendingAction?: unknown,
  *   canonicalDurationDays?: number | null,
  *   turnShape?: string | null,
+ *   validatedGroupCanonicalAuthority?: boolean,
  * }} p
  */
 function resolveBusinessDecision(p) {
   const signals = p.signals ?? {};
   const understanding = p.understanding ?? {};
   const turnShape = String(p.turnShape ?? "").trim();
-  const resolvedItemId = hasValue(p.itemFacts?.id) ? String(p.itemFacts.id) : null;
+  const candidateItemId = hasValue(p.itemFacts?.id)
+    ? String(p.itemFacts.id)
+    : null;
+  const resolvedItemId =
+    p.validatedGroupCanonicalAuthority === true &&
+    p.itemFacts?.status !== "resolved"
+      ? null
+      : candidateItemId;
   const understandingDuration =
     understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
       ? Math.max(1, Math.floor(Number(understanding.durationDays)))
@@ -458,6 +466,28 @@ function resolveBusinessDecision(p) {
     const boundedExplicitItemIds = Array.isArray(understanding?.resolvedItemIds)
       ? understanding.resolvedItemIds.map((id) => String(id ?? "").trim()).filter(Boolean)
       : [];
+    if (
+      p.validatedGroupCanonicalAuthority === true &&
+      authoritativeItemScope === "specific" &&
+      !hasResolvedItem
+    ) {
+      return Object.freeze({
+        primaryIntent: authoritativeSemanticIntent,
+        secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
+        workflowType: "clarification",
+        replyType: "clarification",
+        requestedField: canonicalRequestedField,
+        resolvedItemId: null,
+        boundedExplicitItemIds: Object.freeze([...boundedExplicitItemIds]),
+        durationDays,
+        strongBookingCommand: authoritativeSemanticIntent === "booking_request",
+        weakContextSignals: Object.freeze(weakContextSignals),
+        sideEffectsAllowed: Object.freeze([]),
+        contextToPersist: Object.freeze({}),
+        confidence: "high",
+        reason: "validated_group_item_not_resolved",
+      });
+    }
     if (authoritativeItemScope === "specific" && canonicalItemReferents.length > 1) {
       return Object.freeze({
         primaryIntent: authoritativeSemanticIntent,
@@ -1127,7 +1157,13 @@ export async function resolveBusinessTurnContext(params) {
     String(turnContextInput?.chatType ?? params.turnContext?.chatType ?? "") !==
       "group" &&
     Boolean(authoritativeSemanticIntent);
-  if (lastAvailabilityAssist && !canonicalCloudDm) {
+  const validatedGroupCanonical =
+    turnContextInput?.validatedGroupCanonicalAuthority === true;
+  if (
+    lastAvailabilityAssist &&
+    !canonicalCloudDm &&
+    !validatedGroupCanonical
+  ) {
     try {
       availabilityAssistFollowUp = await decideAvailabilityAssistFollowUp({
         customerText: rawMessage,
@@ -1257,6 +1293,8 @@ export async function resolveBusinessTurnContext(params) {
     availabilityAssistFollowUp,
     unavailableCustomerReply,
     presentedAlternativeItemIds: Object.freeze([...presentedAlternativeItemIds]),
+    validatedGroupCanonicalAuthority:
+      turnContextInput?.validatedGroupCanonicalAuthority === true,
 
     resolvedItem: {
       status: itemFacts.status,
@@ -1336,6 +1374,8 @@ export async function resolveBusinessTurnContext(params) {
     turnShape: turnContextInput?.turnShape ?? null,
     authoritativeSemanticIntent,
     authoritativeItemScope,
+    validatedGroupCanonicalAuthority:
+      turnContextInput?.validatedGroupCanonicalAuthority === true,
   });
 
   resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);

@@ -30,6 +30,10 @@ import { composeBrowseOptionsCustomerReply } from "../openai/composeBrowseOption
 import { composeUnknownItemCustomerReply } from "../openai/composeUnknownItemCustomerReply.js";
 import { composeMissingCatalogFactCustomerReply } from "../openai/composeMissingCatalogFactCustomerReply.js";
 import { composeCloudCanonicalCustomerReply } from "../openai/composeCloudCanonicalCustomerReply.js";
+import {
+  VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE,
+  validateGroupCanonicalSemanticDecision,
+} from "../decisions/resolveGroupCanonicalSemanticDecision.js";
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 import {
   CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY,
@@ -78,6 +82,36 @@ function resolveFrozenCanonicalDecision(params) {
   const turnScope = String(decision.turnScope ?? "").trim();
   if (!CANONICAL_RELEASED_SCOPES.has(turnScope)) {
     return { ...decision, turnScope, _ownershipBlockedForBrainV2: true };
+  }
+  return decision;
+}
+
+function resolveValidatedGroupCanonicalDecision(params) {
+  if (params?.isGroupInbound !== true && params?.chatType !== "group") {
+    return null;
+  }
+  const decision =
+    params?.validatedGroupCanonicalSemanticDecision &&
+    typeof params.validatedGroupCanonicalSemanticDecision === "object"
+      ? params.validatedGroupCanonicalSemanticDecision
+      : null;
+  if (!decision) return null;
+  if (
+    decision.semanticDecisionProvenance !==
+    VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE
+  ) {
+    return null;
+  }
+  const validation = validateGroupCanonicalSemanticDecision(decision, {
+    customerMessage: params?.message,
+  });
+  if (!validation.ok || decision.semanticDecisionStatus !== "released") {
+    return {
+      ...decision,
+      _validatedGroupSemanticRejected: true,
+      _validatedGroupSemanticRejectReason:
+        validation.reason || "GROUP_SEMANTIC_DECISION_NOT_RELEASED",
+    };
   }
   return decision;
 }
@@ -161,7 +195,23 @@ export async function runBrainV2LivePipeline(params) {
 
   try {
     assertBrainV2ExecutionActive(params);
-    const canonicalReleased = resolveFrozenCanonicalDecision(params);
+    const existingCloudCanonicalReleased = resolveFrozenCanonicalDecision(params);
+    const validatedGroupCanonicalReleased =
+      resolveValidatedGroupCanonicalDecision(params);
+    const canonicalReleased =
+      existingCloudCanonicalReleased ?? validatedGroupCanonicalReleased;
+    if (canonicalReleased?._validatedGroupSemanticRejected === true) {
+      return buildClarificationResult({
+        params,
+        turnContextInput: null,
+        channel,
+        chatType,
+        reason:
+          canonicalReleased._validatedGroupSemanticRejectReason ||
+          "GROUP_CANONICAL_SEMANTIC_INVALID",
+        reply: SAFE_APOLOGY,
+      });
+    }
     if (canonicalReleased?._ownershipBlockedForBrainV2 === true) {
     return buildSilentPipelineResult({
       traceId,
@@ -213,6 +263,8 @@ export async function runBrainV2LivePipeline(params) {
       authoritativeSemanticIntent,
       canonicalItemReferents: canonicalReleased?.itemReferents ?? null,
       authoritativeItemScope: canonicalReleased?.itemScope ?? null,
+      validatedGroupCanonicalAuthority:
+        validatedGroupCanonicalReleased != null,
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
@@ -241,6 +293,24 @@ export async function runBrainV2LivePipeline(params) {
         targetId: canonicalReleased.targetId ?? null,
         semanticDecisionStatus: canonicalReleased.semanticDecisionStatus,
       });
+      if (validatedGroupCanonicalReleased) {
+        console.log("[brain_v2_group_canonical_semantic_bound]", {
+          traceId,
+          canonicalTurnId: String(params.messageId ?? traceId).trim() || null,
+          semanticDecisionSource:
+            validatedGroupCanonicalReleased.semanticDecisionProvenance,
+          semanticIntent: authoritativeSemanticIntent,
+          itemScope: validatedGroupCanonicalReleased.itemScope ?? null,
+          itemReferenceMode: turnContextInput.itemReferenceMode ?? null,
+          resolvedItemState:
+            turnContextInput.canonicalItemResolutions?.[0]?.status ??
+            (turnContextInput.canonicalItemResolutions?.length > 1
+              ? "MULTIPLE"
+              : "NONE"),
+          priorItemUsed:
+            turnContextInput.itemReferenceMode === "CONTEXTUAL",
+        });
+      }
     }
 
     // Unsafe continuation: fail closed — no generic routing, no mutation.
@@ -1031,9 +1101,29 @@ export async function runBrainV2LivePipeline(params) {
       traceId,
       businessId,
       workflowType,
+      routingReason: result.workflowDecision?.reason ?? null,
       turnShape: turnContextInput.turnShape,
       participantIdentity: turnContextInput.participantIdentity,
       authoritativeItemId: turnContextInput.authoritativeItem?.id ?? null,
+      ...(validatedGroupCanonicalReleased
+        ? {
+            canonicalTurnId: String(params.messageId ?? traceId).trim() || null,
+            semanticDecisionSource:
+              validatedGroupCanonicalReleased.semanticDecisionProvenance,
+            semanticIntent: authoritativeSemanticIntent,
+            itemScope: validatedGroupCanonicalReleased.itemScope ?? null,
+            itemReferenceMode: turnContextInput.itemReferenceMode ?? null,
+            resolvedItemState:
+              resolvedBusinessTurnContext?.resolvedItem?.status ?? null,
+            priorItemUsed:
+              turnContextInput.itemReferenceMode === "CONTEXTUAL",
+            priorItemReason:
+              turnContextInput.itemReferenceMode === "CONTEXTUAL"
+                ? "validated_contextual_referent"
+                : "canonical_reference_not_contextual",
+            finalReplySource,
+          }
+        : {}),
       blockedSideEffects: routed.blockedSideEffects,
       replyPreview: finalReply.slice(0, 120),
     });

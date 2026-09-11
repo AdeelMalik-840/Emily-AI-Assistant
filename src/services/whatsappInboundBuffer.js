@@ -87,6 +87,7 @@ import {
   resolveCloudDmCanonicalOwnership,
   validatePostConfirmSemanticOwnership,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
+import { resolveGroupCanonicalSemanticDecision } from "../brain/decisions/resolveGroupCanonicalSemanticDecision.js";
 import { readFreshLastAvailabilityAssist } from "../brain/availability/availabilityAssistContext.js";
 import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
@@ -2400,6 +2401,8 @@ export async function executeWhatsAppAiPipeline(p) {
   let handledByBrainV2Live = false;
   let handledByBrainV2InfoLive = false;
   let handledByBrainV2HardBlock = false;
+  let validatedGroupCanonicalSemanticDecision = null;
+  let groupSemanticCatalogItems = null;
 
   const pipelineChatId =
     String(playwrightChatKeyRaw ?? "").trim() ||
@@ -2937,6 +2940,92 @@ export async function executeWhatsAppAiPipeline(p) {
     }
   }
 
+  // Group-only semantic seam. Cloud ownership coordination above is unchanged
+  // and cannot enter this branch. The adapter exposes no booking/pending
+  // candidates and accepts only a validated, non-mutating neutral decision.
+  if (
+    !skipGeneralBrainForWaitingConfirmOwnership &&
+    isGroupInbound &&
+    p.canonicalGroupBuffer === true
+  ) {
+    try {
+      const suppliedCatalog = Array.isArray(p.catalogItems) ? p.catalogItems : [];
+      if (suppliedCatalog.length > 0) {
+        groupSemanticCatalogItems = suppliedCatalog;
+      } else {
+        const inventoryMod = await import("./inventoryService.js");
+        groupSemanticCatalogItems = await inventoryMod.getCachedItemsForUser(
+          ownerUserId
+        );
+      }
+    } catch {
+      groupSemanticCatalogItems = [];
+    }
+    const trustedFreshItemFocus = resolveCloudDmOwnershipTrustedFocus({
+      memorySnapshot: shadowPreTurnMemorySnapshot,
+      participantKey: normalizedParticipantKey,
+    });
+    const groupSemantic = await resolveGroupCanonicalSemanticDecision({
+      business: preResolvedPostConfirmBookingFacts?.facts?.business ?? null,
+      catalogItems: groupSemanticCatalogItems,
+      trustedFreshItemFocus,
+      userMessage: canonicalMessage,
+      conversationHistory,
+      timeoutMs: Number.isFinite(Number(p.__groupSemanticTimeoutMsForTests))
+        ? Number(p.__groupSemanticTimeoutMsForTests)
+        : 8000,
+      __executeCloudDmOwnershipDecisionFn:
+        p.__executeGroupCanonicalSemanticDecisionFn ?? null,
+      __chatCompletionsCreateForTests:
+        p.__groupSemanticChatCompletionsCreateForTests ?? null,
+    });
+    if (groupSemantic.ok === true && groupSemantic.decision) {
+      validatedGroupCanonicalSemanticDecision = groupSemantic.decision;
+      console.log("[group_canonical_semantic_decided]", {
+        traceId,
+        canonicalTurnId: String(messageId ?? "").trim() || null,
+        semanticDecisionSource: groupSemantic.source,
+        semanticIntent: groupSemantic.decision.semanticIntent,
+        itemScope: groupSemantic.decision.itemScope,
+        itemReferenceMode: groupSemantic.decision.itemReferenceMode,
+        priorItemUsed:
+          groupSemantic.decision.itemReferenceMode === "CONTEXTUAL",
+        priorItemReason:
+          groupSemantic.decision.itemReferenceMode === "CONTEXTUAL"
+            ? "trusted_fresh_focus"
+            : "semantic_reference_not_contextual",
+        ownershipCompletionCount:
+          groupSemantic.ownershipCompletionCount ?? null,
+      });
+    } else {
+      skipGeneralBrainForWaitingConfirmOwnership = true;
+      skipGeneralBrainReason = "GROUP_CANONICAL_SEMANTIC_UNUSABLE";
+      reply = BRAIN_V2_HARD_BLOCKED_CUSTOMER_REPLY;
+      sendVia = "GROUP";
+      messageMeta = {
+        customerTurnOutcome: "TECHNICAL_RECOVERY",
+        groupCanonicalSemanticFailure: true,
+        outboundTrace: {
+          kind: "group_canonical_semantic_technical_recovery",
+          finalReplySource: "GROUP_CANONICAL_SEMANTIC_TECHNICAL_RECOVERY",
+          reason: String(
+            groupSemantic.reason ?? "GROUP_SEMANTIC_DECISION_UNUSABLE"
+          ).slice(0, 160),
+        },
+      };
+      console.warn("[group_canonical_semantic_rejected]", {
+        traceId,
+        canonicalTurnId: String(messageId ?? "").trim() || null,
+        reason: String(
+          groupSemantic.reason ?? "GROUP_SEMANTIC_DECISION_UNUSABLE"
+        ).slice(0, 160),
+        ownershipCompletionCount:
+          groupSemantic.ownershipCompletionCount ?? null,
+        finalReplySource: "GROUP_CANONICAL_SEMANTIC_TECHNICAL_RECOVERY",
+      });
+    }
+  }
+
   let routeGate = {
     selected: "legacy",
     route: "ownership_skipped",
@@ -3016,6 +3105,11 @@ export async function executeWhatsAppAiPipeline(p) {
     canonicalSemanticDecision: cloudLifecycleIdentity?.guaranteeKey
       ? getCloudInboundSemanticDecision({ identity: cloudLifecycleIdentity })
       : null,
+    validatedGroupCanonicalSemanticDecision,
+    ...(Array.isArray(groupSemanticCatalogItems) &&
+    groupSemanticCatalogItems.length > 0
+      ? { catalogItems: groupSemanticCatalogItems }
+      : {}),
     cloudLifecycleIdentity,
     executionContext: {
       traceId,
