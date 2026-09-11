@@ -141,6 +141,36 @@ const DEBOUNCE_MS = Math.max(
   )
 );
 
+const PLAYWRIGHT_POLL_INTERVAL_MS = Math.max(
+  500,
+  Math.min(
+    60_000,
+    Number.parseInt(String(process.env.PLAYWRIGHT_POLL_INTERVAL_MS ?? "4000"), 10) ||
+      4000
+  )
+);
+
+// Source-confirmed quiet is authoritative for canonical Group turns. This is
+// only a stalled-source backstop, defaulting to three completed-scan intervals.
+const CANONICAL_GROUP_SAFETY_CEILING_MS = Math.max(
+  2000,
+  Math.min(
+    180_000,
+    Number.parseInt(
+      String(
+        process.env.PLAYWRIGHT_GROUP_BUFFER_SAFETY_CEILING_MS ??
+          PLAYWRIGHT_POLL_INTERVAL_MS * 3
+      ),
+      10
+    ) || PLAYWRIGHT_POLL_INTERVAL_MS * 3
+  )
+);
+
+// A missed source read is operational uncertainty, not customer quiet. After
+// this bounded age the listener may release its navigation pin so unrelated
+// chats are not monopolized; the buffered physical IDs remain retryable.
+const CANONICAL_GROUP_SOURCE_OBSERVATION_MAX_AGE_MS = 120_000;
+
 /** Flush immediately when buffered part count exceeds this (avoids long debounce stacks). */
 const FRAGMENT_COUNT_IMMEDIATE_FLUSH = Math.max(
   2,
@@ -1078,6 +1108,10 @@ export function shouldOutboundLockPlaywrightGroupSend({
  *   messageTimestamp?: string | number | null,
  *   messageSender?: string,
  *   playwrightWebInbound?: boolean,
+ *   canonicalGroupBuffer?: boolean,
+ *   bufferedMessageIds?: string[],
+ *   scanGeneration?: number | null,
+ *   __executePipelineForTests?: (payload: Record<string, unknown>) => Promise<unknown>,
  *   trackingKey?: string,
  *   chatName?: string,
  *   groupName?: string,
@@ -1090,8 +1124,21 @@ export function shouldOutboundLockPlaywrightGroupSend({
  *   timer: ReturnType<typeof setTimeout> | null,
  *   context: FlushContext | null,
  *   scheduleGen: number,
+ *   seenMessageIds?: Set<string>,
  *   lastUpdatedAt?: number,
  *   retryCount?: number,
+ *   pipelineRetryCount?: number,
+ *   state?: "EMPTY" | "OPEN_PENDING_CONFIRMATION" | "FROZEN",
+ *   openedAtMs?: number,
+ *   firstAppendedAtScanGen?: number | null,
+ *   lastAppendedAtScanGen?: number | null,
+ *   quietCandidateAtScanGen?: number | null,
+ *   appendVersion?: number,
+ *   finalObservationRequired?: boolean,
+ *   finalObservationRequestedAtMs?: number | null,
+ *   sourceObservationFailureCount?: number,
+ *   sourceObservationFailedAtMs?: number | null,
+ *   deferredCanonicalPayloads?: Array<FlushContext & { text: string }>,
  * }} BufferEntry
  */
 
@@ -1453,13 +1500,16 @@ export async function executeWhatsAppAiPipeline(p) {
   const playwrightWebInbound = Boolean(playwrightWebInboundRaw);
   const playwrightWebTitleIdentity = Boolean(playwrightWebTitleIdentityRaw);
   const groupNameResolved = String(groupNameRaw ?? chatNameRaw ?? "").trim();
+  // The frozen buffer text is the conversational contract. The latest fragment
+  // remains physical-source provenance only (messageId/sourceRowKey stay latest).
+  const latestFragmentMessage = String(latestMessageRaw ?? combinedMessage ?? "").trim();
+  const canonicalMessage = String(combinedMessage ?? "").trim() || latestFragmentMessage;
   const inboundSourceOrigin =
     inboundSourceOriginRaw != null && String(inboundSourceOriginRaw).trim() !== ""
       ? String(inboundSourceOriginRaw).trim()
       : INBOUND_SOURCE_REAL_CUSTOMER;
-  const latestMessageForOrigin = String(latestMessageRaw ?? combinedMessage ?? "").trim();
   const originCheck = resolveInboundSourceOrigin({
-    text: latestMessageForOrigin,
+    text: canonicalMessage,
     chatKey: String(playwrightChatKeyRaw ?? groupNameResolved ?? "").trim(),
     sender: "user",
     isStartupBaseline: inboundSourceOrigin === "startup_baseline",
@@ -1471,7 +1521,7 @@ export async function executeWhatsAppAiPipeline(p) {
     console.log("[inbound_pipeline_blocked_non_customer_origin]", {
       inboundSourceOrigin: effectiveInboundSourceOrigin,
       reason: originCheck.reason,
-      messagePreview: latestMessageForOrigin.slice(0, 120),
+      messagePreview: canonicalMessage.slice(0, 120),
       messageId: String(messageIdRaw ?? "").trim() || null,
     });
     if (isPlaywrightWebTabInbound(p)) {
@@ -1511,7 +1561,7 @@ export async function executeWhatsAppAiPipeline(p) {
       dmChatTitle: dmChatTitle || null,
       dmPlaywrightChatKey: dmPlaywrightChatKey || null,
       hasBookingHint: Boolean(p?.bookingHint),
-      textPreview: String(latestMessageRaw ?? combinedMessage ?? "").slice(0, 120) || null,
+      textPreview: canonicalMessage.slice(0, 120) || null,
     });
   }
 
@@ -1529,7 +1579,7 @@ export async function executeWhatsAppAiPipeline(p) {
   try {
     normalizedInbound = normalizeInboundMessage({
       source: isPlaywrightWebTabInbound(p) ? "playwright" : "cloud",
-      message: String(latestMessageRaw ?? combinedMessage ?? "").trim(),
+      message: canonicalMessage,
       messageId: messageIdRaw,
       userId: ownerUserId,
       sessionKey,
@@ -1548,6 +1598,15 @@ export async function executeWhatsAppAiPipeline(p) {
     source: normalizedInbound.source,
     messageId: normalizedInbound.messageId,
   });
+  if (typeof p.__captureNormalizedInboundForTests === "function") {
+    p.__captureNormalizedInboundForTests({
+      message: normalizedInbound.message,
+      messageId: normalizedInbound.messageId,
+      sourceRowKey: sourceRowKeyRaw,
+      latestFragmentMessage,
+    });
+    if (p.__stopAfterNormalizedInboundForTests === true) return;
+  }
   const messageId = normalizedInbound.messageId;
   const dedupeMessageKey = `${normalizedInbound.userId}_${normalizedInbound.message
     .trim()
@@ -1610,14 +1669,14 @@ export async function executeWhatsAppAiPipeline(p) {
     return;
   }
   const previewForChatKey = identityContextFromPreview(
-    String(latestMessageRaw ?? combinedMessage ?? "").trim()
+    canonicalMessage
   );
   const safeChatKey =
     playwrightWebTitleIdentity && groupNameResolved
       ? `pw-title::${normalizeTitle(groupNameResolved)}::${previewForChatKey}`
       : String(whatsappReplyTo ?? "").trim().toLowerCase() ||
         String(p.sessionKey ?? "").trim().toLowerCase();
-  const textPart = String(combinedMessage ?? "")
+  const textPart = canonicalMessage
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ")
@@ -1649,18 +1708,18 @@ export async function executeWhatsAppAiPipeline(p) {
   let cloudLifecycleClaimOwner = null;
   /** Hoisted for finally-block guarantee completion (declared inside try is TDZ in finally). */
   let messageMeta = null;
+  let processingError = null;
   const isGroupInbound =
     isGroupMessage === true && String(userPhone ?? "").trim() === "unknown";
   const persistCloudDmConversationIdentity =
     !isGroupInbound && !playwrightWebInbound;
-  const latestMessage = String(latestMessageRaw ?? combinedMessage ?? "").trim();
   const cloudConfirmPhone =
     String(conversationCustomerNumber ?? "").trim() ||
     String(userPhone ?? "").trim() ||
     String(participantPhoneForDmRaw ?? "").trim();
   const parsedAvailabilityApproval =
-    parseAvailabilityApprovalMessage(combinedMessage);
-  const parsedApproval = parseApprovalMessage(combinedMessage);
+    parseAvailabilityApprovalMessage(canonicalMessage);
+  const parsedApproval = parseApprovalMessage(canonicalMessage);
   let preResolvedPostConfirmBookingFacts = null;
   let preResolvedFreshWaitingConfirmRequest = null;
   let preResolvedConfirmedBookingReplyRecovery = null;
@@ -1693,7 +1752,7 @@ export async function executeWhatsAppAiPipeline(p) {
       recoveryContext: {
         businessId: ownerUserId,
         customerPhone: cloudConfirmPhone,
-        messageText: latestMessage,
+        messageText: canonicalMessage,
         messageId,
         userPhone,
         sessionKey,
@@ -1948,7 +2007,7 @@ export async function executeWhatsAppAiPipeline(p) {
             businessId: ownerUserId,
             customerPhone: cloudConfirmPhone,
             messageId,
-            messageText: latestMessage,
+            messageText: canonicalMessage,
             latestBookingResolutionReason:
               String(resolvedPostConfirm?.reason ?? "").trim() || null,
           })
@@ -2017,7 +2076,7 @@ export async function executeWhatsAppAiPipeline(p) {
       ? { is_group: true, is_auto_triggered: true }
       : {};
 
-  const messageHash = hashCombinedInbound(combinedMessage, sessionKey);
+  const messageHash = hashCombinedInbound(canonicalMessage, sessionKey);
   const nowMs = Date.now();
   const prevSent = lastSentReplies.get(sessionKey);
   if (
@@ -2064,7 +2123,7 @@ export async function executeWhatsAppAiPipeline(p) {
     const ledgerBlock = resolveInboundTurnAdmissionBlock({
       chatKey: groupNameResolved,
       stableId: messageId,
-      textPreview: String(combinedMessage ?? "").trim().slice(0, 120),
+      textPreview: canonicalMessage.slice(0, 120),
       currentForwardedAtMs: Number(playwrightForwardedAtRaw),
     });
     if (ledgerBlock.blocked && ledgerBlock.reason === "outbound_locked") {
@@ -2096,6 +2155,26 @@ export async function executeWhatsAppAiPipeline(p) {
         globalThis.__chatResponding[blockedChatKey] = false;
         if (globalThis.__processingChats instanceof Map) {
           globalThis.__processingChats.delete(blockedChatKey);
+        }
+      }
+      if (
+        p.canonicalGroupBuffer === true &&
+        typeof p.__settleCanonicalGroupBufferAttempt === "function"
+      ) {
+        const recoveredComplete =
+          recovery.recovered === true &&
+          (recovery.sent === true || recovery.action === "complete_ledger");
+        p.__settleCanonicalGroupBufferAttempt({
+          successful: recoveredComplete,
+          error: recoveredComplete
+            ? null
+            : new Error(recovery.reason || "outbound_locked_recovery_incomplete"),
+        });
+        if (recoveredComplete) {
+          await advancePlaywrightInboundCompletion(guaranteeKey, {
+            db,
+            ownerUserId,
+          });
         }
       }
       return;
@@ -2133,7 +2212,7 @@ export async function executeWhatsAppAiPipeline(p) {
       markAdmittedInboundTurnTimedOut({
         guaranteeKey,
         burstStableIds: pendingTimeout?.burstStableIds,
-        textPreview: String(combinedMessage ?? "").slice(0, 120),
+        textPreview: canonicalMessage.slice(0, 120),
       });
     }, 120_000);
   }
@@ -2148,7 +2227,7 @@ export async function executeWhatsAppAiPipeline(p) {
     console.log("🚀 Pipeline started");
     const { customerId, channel } = normalizeWhatsAppInboundContext(userPhone);
 
-    console.log("📩 Approval message received:", combinedMessage);
+    console.log("📩 Approval message received:", canonicalMessage);
     console.log("🧠 Parsed approval:", parsedApproval);
     if (parsedAvailabilityApproval) {
       console.log("🛠 Availability approval command detected:", parsedAvailabilityApproval);
@@ -2157,7 +2236,7 @@ export async function executeWhatsAppAiPipeline(p) {
         userId: ownerUserId,
         businessId: ownerUserId,
         senderPhone: conversationCustomerNumber,
-        messageText: combinedMessage,
+        messageText: canonicalMessage,
       });
       processingSuccess = true;
       return;
@@ -2176,7 +2255,7 @@ export async function executeWhatsAppAiPipeline(p) {
       return;
     }
 
-    const feedbackIntent = detectSimpleFeedbackIntent(combinedMessage);
+    const feedbackIntent = detectSimpleFeedbackIntent(canonicalMessage);
     if (feedbackIntent) {
       void updateLastMessageFeedback(db, {
         ownerUserId,
@@ -2192,7 +2271,7 @@ export async function executeWhatsAppAiPipeline(p) {
         ownerUserId,
         customerNumber: conversationCustomerNumber,
         role: "user",
-        text: combinedMessage,
+        text: canonicalMessage,
         ...(persistCloudDmConversationIdentity
           ? {
               sourceMessageId: messageId || null,
@@ -2216,7 +2295,7 @@ export async function executeWhatsAppAiPipeline(p) {
   }
 
   console.log("[DEBUG] isGreetingFirst:", isGreetingFirst);
-  console.log("[DEBUG] messageText (combined):", combinedMessage);
+  console.log("[DEBUG] messageText (combined):", canonicalMessage);
   console.log("[DEBUG] Brain V2 business owner:", ownerUserId);
 
   const shadowEligible = isEmilyBrainV2ShadowQuickGate(ownerUserId);
@@ -2276,7 +2355,7 @@ export async function executeWhatsAppAiPipeline(p) {
     step: "pipeline_start",
     status: "start",
     data: {
-      messageText: String(combinedMessage ?? "").slice(0, 500),
+      messageText: canonicalMessage.slice(0, 500),
       sessionKey: String(sessionKey ?? "").slice(0, 160),
       messageId,
     },
@@ -2310,7 +2389,8 @@ export async function executeWhatsAppAiPipeline(p) {
         participantKeyRaw != null && String(participantKeyRaw).trim() !== ""
           ? String(participantKeyRaw).trim()
           : null,
-      messagePreview: String(latestMessage ?? "").slice(0, 120) || null,
+      messagePreview: canonicalMessage.slice(0, 120) || null,
+      latestFragmentPreview: latestFragmentMessage.slice(0, 120) || null,
     });
   }
   const processStartedAt = Date.now();
@@ -2374,7 +2454,7 @@ export async function executeWhatsAppAiPipeline(p) {
   const ownershipGuard = await evaluateAvailabilityWaitingConfirmOwnershipGuard({
     db,
     businessId: ownerUserId,
-    messageText: latestMessage,
+    messageText: canonicalMessage,
     messageTimestampMs: Number.isFinite(tsNum) && tsNum > 0 ? tsNum : null,
     participantPhone:
       String(participantPhoneForDmRaw ?? conversationCustomerNumber ?? "").trim() || null,
@@ -2394,7 +2474,7 @@ export async function executeWhatsAppAiPipeline(p) {
       requestId: ownershipGuard.requestId,
       reason: ownershipGuard.reason,
       isGroupInbound,
-      messagePreview: String(latestMessage ?? "").slice(0, 120),
+      messagePreview: canonicalMessage.slice(0, 120),
     });
     reply = "";
     sendVia = "NONE";
@@ -2422,7 +2502,7 @@ export async function executeWhatsAppAiPipeline(p) {
       Boolean(String(ownerUserId ?? "").trim()) &&
       Boolean(cloudConfirmPhone) &&
       cloudConfirmPhone !== "unknown" &&
-      Boolean(String(latestMessage ?? "").trim());
+      Boolean(canonicalMessage);
     if (canTryOwnerAnswer) {
       const tryOwnerAnswerFn =
         typeof p.__tryHandlePaMissingInfoOwnerAnswerFn === "function"
@@ -2434,7 +2514,7 @@ export async function executeWhatsAppAiPipeline(p) {
         db,
         businessId: ownerUserId,
         senderPhone: cloudConfirmPhone,
-        messageText: latestMessage,
+        messageText: canonicalMessage,
         messageId,
         contextMessageId:
           contextMessageIdRaw != null &&
@@ -2457,7 +2537,7 @@ export async function executeWhatsAppAiPipeline(p) {
           customerFollowupSent: ownerAnswerResult.customerFollowupSent === true,
           matchReason: ownerAnswerResult.matchReason ?? null,
           isGroupInbound,
-          messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
+          messagePreview: canonicalMessage.slice(0, 120),
         });
         reply = "";
         sendVia = "NONE";
@@ -2483,7 +2563,7 @@ export async function executeWhatsAppAiPipeline(p) {
       Boolean(String(ownerUserId ?? "").trim()) &&
       Boolean(cloudConfirmPhone) &&
       cloudConfirmPhone !== "unknown" &&
-      Boolean(String(latestMessage ?? "").trim());
+      Boolean(canonicalMessage);
     if (canCoordinateCloudDmOwnership) {
       let snapshot = hasAcceptedCloudInboundSemanticDecision({
         identity: cloudLifecycleIdentity,
@@ -2551,13 +2631,13 @@ export async function executeWhatsAppAiPipeline(p) {
             ? await p.__executeCloudDmOwnershipDecisionFn({
                 facts: baseOwnershipFacts,
                 pendingRequest: preResolvedFreshWaitingConfirmRequest,
-                userMessage: latestMessage,
+                userMessage: canonicalMessage,
                 conversationHistory,
               })
             : await resolveCloudDmCanonicalOwnership({
                 facts: baseOwnershipFacts,
                 pendingRequest: preResolvedFreshWaitingConfirmRequest,
-                userMessage: latestMessage,
+                userMessage: canonicalMessage,
                 conversationHistory,
                 __chatCompletionsCreateForTests:
                   p.__chatCompletionsCreateForTests,
@@ -2623,7 +2703,7 @@ export async function executeWhatsAppAiPipeline(p) {
                 baseOwnershipFacts.currentOwnershipTurnId ||
                 ""
             ).trim() || `user:${String(messageId ?? "").trim()}`,
-          currentCustomerMessage: String(latestMessage ?? ""),
+          currentCustomerMessage: canonicalMessage,
         };
         const canonicalDecision = applyPostConfirmDerivedOwnershipMechanics(
           decided.decision,
@@ -2677,7 +2757,7 @@ export async function executeWhatsAppAiPipeline(p) {
           db,
           businessId: ownerUserId,
           customerPhone: cloudConfirmPhone,
-          messageText: latestMessage,
+          messageText: canonicalMessage,
           messageId,
           conversationHistory,
           sendCredentials,
@@ -2707,7 +2787,7 @@ export async function executeWhatsAppAiPipeline(p) {
             turnScope: snapshot.turnScope,
             targetId: snapshot.targetId ?? null,
             isGroupInbound,
-            messagePreview: String(latestMessage ?? "").slice(0, 120),
+            messagePreview: canonicalMessage.slice(0, 120),
           });
           reply = "";
           sendVia = "NONE";
@@ -2746,7 +2826,7 @@ export async function executeWhatsAppAiPipeline(p) {
           db,
           businessId: ownerUserId,
           customerPhone: cloudConfirmPhone,
-          messageText: latestMessage,
+          messageText: canonicalMessage,
           messageId,
           traceId,
           inboundReceivedAtMs,
@@ -2804,7 +2884,7 @@ export async function executeWhatsAppAiPipeline(p) {
           semanticDecisionCount:
             Number(businessPaResult.semanticDecisionCount ?? 0) || 0,
           isGroupInbound,
-          messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
+          messagePreview: canonicalMessage.slice(0, 120),
         });
         if (businessPaResult.terminalFailure === true) {
           throw new Error(
@@ -2851,7 +2931,7 @@ export async function executeWhatsAppAiPipeline(p) {
           turnScope: snapshot.turnScope ?? null,
           targetId: snapshot.targetId ?? null,
           ownershipLane: "normal_routing",
-          messagePreview: String(latestMessage ?? "").trim().slice(0, 120),
+          messagePreview: canonicalMessage.slice(0, 120),
         });
       }
     }
@@ -3202,7 +3282,7 @@ export async function executeWhatsAppAiPipeline(p) {
   }
 
   const confirmationIntent = /^(yes|y|ok|okay|confirm|confirmed|sure|haan|han|jee|ji)$/i.test(
-    String(combinedMessage ?? "").trim()
+    canonicalMessage
   );
   const isFalseProcessingResponse =
     !intentionalSilent &&
@@ -3267,7 +3347,7 @@ export async function executeWhatsAppAiPipeline(p) {
     "preview=",
     replyText.slice(0, 120),
     "| combinedInbound=",
-    combinedMessage.slice(0, 80)
+    canonicalMessage.slice(0, 80)
   );
 
   if (replyText !== "") {
@@ -3384,7 +3464,7 @@ export async function executeWhatsAppAiPipeline(p) {
           markInboundTurnLedgerOutboundLockedForGuarantee({
             guaranteeKey,
             burstStableIds: pendingLock?.burstStableIds,
-            textPreview: String(combinedMessage ?? "").slice(0, 120),
+            textPreview: canonicalMessage.slice(0, 120),
             replyPreview: replyText.slice(0, 160),
             finalReplyText: replyText,
             finalReplySource: finalReplySourceForLifecycle || null,
@@ -3506,7 +3586,7 @@ export async function executeWhatsAppAiPipeline(p) {
               chatKey: cloudLifecycleIdentity.chatKey,
               stableId: cloudLifecycleIdentity.stableId,
               guaranteeKey: cloudLifecycleIdentity.guaranteeKey,
-              textPreview: String(combinedMessage ?? "").slice(0, 120),
+              textPreview: canonicalMessage.slice(0, 120),
               providerOutboundMessageId:
                 sendResult?.providerMessageId ??
                 sendResult?.messages?.[0]?.id ??
@@ -3637,7 +3717,7 @@ export async function executeWhatsAppAiPipeline(p) {
       try {
         await db.collection("messages").add({
           from: userPhone,
-          message: combinedMessage,
+          message: canonicalMessage,
           reply: replyText,
           ownerUserId,
           phoneNumberId: phoneNumberId || null,
@@ -3659,7 +3739,7 @@ export async function executeWhatsAppAiPipeline(p) {
     try {
       await db.collection("messages").add({
         from: userPhone,
-        message: combinedMessage,
+        message: canonicalMessage,
         reply: replyText,
         ownerUserId,
         phoneNumberId: phoneNumberId || null,
@@ -3744,6 +3824,7 @@ export async function executeWhatsAppAiPipeline(p) {
     }
   }
   } catch (err) {
+    processingError = err;
     console.error("❌ Processing error:", err);
     // Historical booking context must not skip retry bookkeeping. If this inbound
     // already has a Cloud ledger identity, resume from that claim.
@@ -3765,23 +3846,49 @@ export async function executeWhatsAppAiPipeline(p) {
         lastError
       );
     }
-    if (guaranteeKey) {
+    if (guaranteeKey && p.canonicalGroupBuffer !== true) {
       setMessageState(guaranteeKey, "failed");
       const pendingFail =
         globalThis.__playwrightPendingByGuarantee?.get(guaranteeKey);
       markInboundTurnLedgerFailedForGuarantee({
         guaranteeKey,
         burstStableIds: pendingFail?.burstStableIds,
-        textPreview: String(combinedMessage ?? "").slice(0, 120),
+        textPreview: canonicalMessage.slice(0, 120),
         lastError: "processing_error",
       });
+    }
+    if (p.canonicalGroupBuffer === true) {
+      // The buffer owns retry of the exact frozen fragment set. Propagate only
+      // this path so it can restore the entry after the finally block releases
+      // UI/job locks; legacy Group, DM, and Cloud error contracts stay intact.
+      throw err;
     }
   } finally {
     const playwrightTurnCompleteFinally = playwrightInboundTurnComplete(
       outboundReplyDelivered,
       intentionalSilent
     );
-    if (guaranteeKey) {
+    const canonicalAttemptSuccessful =
+      p.canonicalGroupBuffer === true &&
+      processingSuccess &&
+      playwrightTurnCompleteFinally;
+    const hasCanonicalSettlement =
+      p.canonicalGroupBuffer === true &&
+      typeof p.__settleCanonicalGroupBufferAttempt === "function";
+    if (hasCanonicalSettlement && !canonicalAttemptSuccessful) {
+      // A restored frozen burst must not be rejected by the transient
+      // cross-source text window on its next attempt.
+      recentInboundByOwnerAndText.delete(dedupeMessageKey);
+    }
+    if (hasCanonicalSettlement) {
+      p.__settleCanonicalGroupBufferAttempt({
+        successful: canonicalAttemptSuccessful,
+        error:
+          processingError ??
+          (canonicalAttemptSuccessful ? null : new Error("canonical_pipeline_incomplete")),
+      });
+    }
+    if (guaranteeKey && !(hasCanonicalSettlement && !canonicalAttemptSuccessful)) {
       const pendingDone =
         globalThis.__playwrightPendingByGuarantee?.get(guaranteeKey);
       finalizeAdmittedInboundTurnLedger({
@@ -3791,7 +3898,7 @@ export async function executeWhatsAppAiPipeline(p) {
         outboundReplyDelivered,
         intentionalSilent,
         burstStableIds: pendingDone?.burstStableIds,
-        textPreview: String(combinedMessage ?? "").slice(0, 120),
+        textPreview: canonicalMessage.slice(0, 120),
         // Preserve catch lastError when already failed; only set for empty no-send.
         ...(processingSuccess ? { lastError: "no_outbound_incomplete" } : {}),
       });
@@ -3805,7 +3912,7 @@ export async function executeWhatsAppAiPipeline(p) {
             ownerUserId,
             messageMeta,
           });
-        } else {
+        } else if (!hasCanonicalSettlement) {
           const pending = globalThis.__playwrightPendingByGuarantee?.get(gk);
           if (pending?.chatKey) {
             globalThis.__chatResponding =
@@ -3910,6 +4017,424 @@ function releasePlaywrightChatLockFromGate(ctx) {
 }
 
 /**
+ * Reuse the existing burst lifecycle so every physical Group fragment reaches
+ * the same terminal state as the latest-message identity representing the
+ * buffered turn.
+ * @param {FlushContext} ctx
+ */
+function bindCanonicalGroupBufferGuarantees(ctx) {
+  if (ctx?.canonicalGroupBuffer !== true) return;
+  const ids = Array.isArray(ctx.bufferedMessageIds)
+    ? [...new Set(ctx.bufferedMessageIds.map((id) => String(id ?? "").trim()).filter(Boolean))]
+    : [];
+  const latestId = String(ctx.messageId ?? "").trim();
+  const groupName = String(ctx.groupName ?? ctx.chatName ?? "").trim();
+  if (!latestId || ids.length === 0 || !groupName) return;
+
+  const finalGuaranteeKey = buildPlaywrightGuaranteeKey(groupName, latestId);
+  const pendingMap = globalThis.__playwrightPendingByGuarantee;
+  const finalPending = pendingMap instanceof Map ? pendingMap.get(finalGuaranteeKey) : null;
+  if (!finalPending) return;
+  finalPending.burstStableIds = ids;
+
+  for (const id of ids) {
+    const guaranteeKey = buildPlaywrightGuaranteeKey(groupName, id);
+    if (!guaranteeKey || guaranteeKey === finalGuaranteeKey) continue;
+    pendingMap.delete(guaranteeKey);
+    globalThis.__playwrightListenerMsgIdByGuarantee?.delete?.(guaranteeKey);
+  }
+}
+
+/** @param {FlushContext} ctx */
+function canonicalGroupBufferedMessageIds(ctx) {
+  return Array.isArray(ctx?.bufferedMessageIds)
+    ? [...new Set(ctx.bufferedMessageIds.map((id) => String(id ?? "").trim()).filter(Boolean))]
+    : [];
+}
+
+/**
+ * A failed frozen turn remains independently retryable: every physical row is
+ * failed (not delivered), its pending guarantee metadata is retained, and the
+ * participant chat lock is released.
+ * @param {FlushContext} ctx
+ * @param {unknown} error
+ */
+function releaseCanonicalGroupGuaranteesForRetry(ctx, error) {
+  const groupName = String(ctx?.groupName ?? ctx?.chatName ?? "").trim();
+  const ids = canonicalGroupBufferedMessageIds(ctx);
+  const lastError = String(error?.message ?? error ?? "canonical_pipeline_failed");
+  let chatKey = normalizeTitle(groupName);
+  for (const id of ids) {
+    const guaranteeKey = buildPlaywrightGuaranteeKey(groupName, id);
+    if (!guaranteeKey) continue;
+    const pending = globalThis.__playwrightPendingByGuarantee?.get?.(guaranteeKey);
+    chatKey = String(pending?.chatKey ?? chatKey).trim();
+    setMessageState(guaranteeKey, "failed");
+    markInboundTurnLedgerFailedForGuarantee({
+      guaranteeKey,
+      burstStableIds: [id],
+      textPreview: "",
+      lastError,
+    });
+  }
+  if (chatKey && globalThis.__processingChats instanceof Map) {
+    globalThis.__processingChats.delete(chatKey);
+  }
+  if (chatKey) {
+    globalThis.__chatResponding =
+      globalThis.__chatResponding || Object.create(null);
+    globalThis.__chatResponding[chatKey] = false;
+  }
+}
+
+/**
+ * Settlement is invoked by the pipeline before its existing guarantee-finalize
+ * block. Success binds the frozen physical IDs; failure restores the exact
+ * frozen buffer and leaves guarantee metadata available for retry.
+ */
+function createCanonicalGroupBufferSettlement(bufferKey, entry, ctx) {
+  let settled = false;
+  let successful = false;
+  return {
+    get settled() {
+      return settled;
+    },
+    get successful() {
+      return successful;
+    },
+    settle(result = {}) {
+      if (settled) return successful;
+      settled = true;
+      successful = result.successful === true;
+      if (successful) {
+        bindCanonicalGroupBufferGuarantees(ctx);
+        const deferred = Array.isArray(entry.deferredCanonicalPayloads)
+          ? entry.deferredCanonicalPayloads.splice(0)
+          : [];
+        if (deferred.length > 0) {
+          queueMicrotask(() => {
+            for (const payload of deferred) scheduleBufferedWhatsAppInbound(payload);
+          });
+        }
+        return true;
+      }
+
+      releaseCanonicalGroupGuaranteesForRetry(ctx, result.error);
+      if (!messageBuffer.has(bufferKey)) {
+        entry.pipelineRetryCount = (entry.pipelineRetryCount ?? 0) + 1;
+        messageBuffer.set(bufferKey, entry);
+        const retryDelayMs = Math.min(
+          5000,
+          Math.max(DEBOUNCE_MS, 500 * entry.pipelineRetryCount)
+        );
+        entry.timer = setTimeout(() => {
+          entry.timer = null;
+          void flushBufferedWhatsAppInbound(bufferKey).catch((retryError) =>
+            console.error("[whatsappInboundBuffer] canonical retry failed:", retryError)
+          );
+        }, retryDelayMs);
+        console.warn("[whatsappInboundBuffer] canonical frozen turn restored", {
+          bufferKey,
+          fragmentCount: entry.messageParts.length,
+          retryCount: entry.pipelineRetryCount,
+          retryDelayMs,
+        });
+      }
+      return false;
+    },
+  };
+}
+
+/** @param {string} bufferKey @param {string} reason */
+function freezeCanonicalGroupBuffer(bufferKey, reason) {
+  const entry = messageBuffer.get(String(bufferKey ?? "").trim());
+  if (!entry || entry.context?.canonicalGroupBuffer !== true) return null;
+  if (entry.state === "FROZEN") return null;
+  entry.state = "FROZEN";
+  console.log("[whatsappInboundBuffer] canonical Group turn frozen", {
+    bufferKey,
+    reason,
+    fragmentCount: entry.messageParts.length,
+    firstAppendedAtScanGen: entry.firstAppendedAtScanGen ?? null,
+    lastAppendedAtScanGen: entry.lastAppendedAtScanGen ?? null,
+  });
+  return flushBufferedWhatsAppInbound(bufferKey);
+}
+
+function canonicalEntryChatKey(entry) {
+  const ctx = entry?.context;
+  return normalizeTitle(
+    String(ctx?.playwrightChatKey ?? ctx?.groupName ?? ctx?.chatName ?? "").trim()
+  );
+}
+
+function armCanonicalGroupSafetyDeadline(bufferKey, entry) {
+  if (!entry || entry.context?.canonicalGroupBuffer !== true) return;
+  if (entry.state !== "OPEN_PENDING_CONFIRMATION" || entry.timer) return;
+  const lastAppendAt = Number(entry.lastUpdatedAt ?? entry.openedAtMs ?? Date.now());
+  const elapsedMs = Math.max(0, Date.now() - lastAppendAt);
+  const remainingMs = Math.max(0, CANONICAL_GROUP_SAFETY_CEILING_MS - elapsedMs);
+  entry.timer = setTimeout(() => {
+    entry.timer = null;
+    if (entry.state !== "OPEN_PENDING_CONFIRMATION") return;
+    entry.finalObservationRequired = true;
+    entry.finalObservationRequestedAtMs = Date.now();
+    console.warn("[whatsappInboundBuffer] canonical Group final observation required", {
+      bufferKey,
+      fragmentCount: entry.messageParts.length,
+      appendVersion: entry.appendVersion ?? 0,
+      lastAppendedAtScanGen: entry.lastAppendedAtScanGen ?? null,
+    });
+  }, remainingMs);
+}
+
+/**
+ * Read-only listener query. It exposes only collection lifecycle identity;
+ * callers cannot mutate the buffer through the returned snapshots.
+ */
+export function getOpenCanonicalGroupBufferSnapshots(chatKey) {
+  const normalizedChatKey = normalizeTitle(String(chatKey ?? "").trim());
+  if (!normalizedChatKey) return [];
+  const snapshots = [];
+  for (const [bufferKey, entry] of messageBuffer) {
+    if (entry?.context?.canonicalGroupBuffer !== true) continue;
+    if (entry.state !== "OPEN_PENDING_CONFIRMATION") continue;
+    if (canonicalEntryChatKey(entry) !== normalizedChatKey) continue;
+    snapshots.push(Object.freeze({
+      bufferKey,
+      chatKey: normalizedChatKey,
+      participantKey: String(entry.context?.participantKey ?? "").trim(),
+      appendVersion: Number(entry.appendVersion ?? 0),
+      lastAppendedAtScanGen: entry.lastAppendedAtScanGen ?? null,
+      finalObservationRequired: entry.finalObservationRequired === true,
+    }));
+  }
+  return snapshots;
+}
+
+/** Exact continuation proof for a later physical Group row. */
+export function canAcceptOpenCanonicalGroupFragment({
+  chatKey,
+  participantKey,
+  messageId,
+} = {}) {
+  const normalizedChatKey = normalizeTitle(String(chatKey ?? "").trim());
+  const trustedParticipantKey = String(participantKey ?? "").trim();
+  const stableId = String(messageId ?? "").trim();
+  if (!normalizedChatKey || !trustedParticipantKey || !stableId) return false;
+  for (const [, entry] of messageBuffer) {
+    if (entry?.context?.canonicalGroupBuffer !== true) continue;
+    if (entry.state !== "OPEN_PENDING_CONFIRMATION") continue;
+    if (canonicalEntryChatKey(entry) !== normalizedChatKey) continue;
+    if (String(entry.context?.participantKey ?? "").trim() !== trustedParticipantKey) {
+      continue;
+    }
+    if (entry.seenMessageIds instanceof Set && entry.seenMessageIds.has(stableId)) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Finish a deadline-requested read-only observation. Wall time never freezes
+ * the entry by itself: an exact, conclusive, version-stable source read must
+ * prove participant absence first.
+ */
+export async function completeCanonicalGroupFinalObservation({
+  chatKey,
+  scanGeneration,
+  expectedBufferVersions = [],
+  admittedParticipantKeys = [],
+  sourceObservationComplete = false,
+  exactGroupVerified = false,
+} = {}) {
+  const normalizedChatKey = normalizeTitle(String(chatKey ?? "").trim());
+  const generation = Number(scanGeneration);
+  const admitted = new Set(
+    (admittedParticipantKeys && typeof admittedParticipantKeys[Symbol.iterator] === "function"
+      ? [...admittedParticipantKeys]
+      : []
+    ).map((value) => String(value ?? "").trim()).filter(Boolean)
+  );
+  const expected = new Map(
+    (Array.isArray(expectedBufferVersions) ? expectedBufferVersions : [])
+      .map((row) => [String(row?.bufferKey ?? "").trim(), Number(row?.appendVersion)])
+      .filter(([bufferKey, version]) => bufferKey && Number.isFinite(version))
+  );
+  const frozen = [];
+  for (const [bufferKey, expectedVersion] of expected) {
+    const entry = messageBuffer.get(bufferKey);
+    if (!entry || entry.state !== "OPEN_PENDING_CONFIRMATION") continue;
+    if (entry.context?.canonicalGroupBuffer !== true) continue;
+    if (canonicalEntryChatKey(entry) !== normalizedChatKey) continue;
+    if (entry.finalObservationRequired !== true) continue;
+    if (sourceObservationComplete !== true || exactGroupVerified !== true) continue;
+    if (!Number.isFinite(generation) || generation <= Number(entry.lastAppendedAtScanGen)) {
+      continue;
+    }
+    const currentVersion = Number(entry.appendVersion ?? 0);
+    const participantKey = String(entry.context?.participantKey ?? "").trim();
+    if (currentVersion !== expectedVersion || admitted.has(participantKey)) {
+      entry.finalObservationRequired = false;
+      entry.finalObservationRequestedAtMs = null;
+      entry.sourceObservationFailureCount = 0;
+      entry.sourceObservationFailedAtMs = null;
+      armCanonicalGroupSafetyDeadline(bufferKey, entry);
+      continue;
+    }
+    entry.finalObservationRequired = false;
+    const flush = freezeCanonicalGroupBuffer(
+      bufferKey,
+      "source_confirmed_deadline_observation"
+    );
+    if (flush) {
+      frozen.push(bufferKey);
+      await flush;
+    }
+  }
+  return frozen;
+}
+
+/** Record an inconclusive final observation and bound navigation-pin ownership. */
+export function recordCanonicalGroupObservationFailure(chatKey) {
+  const normalizedChatKey = normalizeTitle(String(chatKey ?? "").trim());
+  let releaseChatLock = false;
+  for (const [bufferKey, entry] of messageBuffer) {
+    if (entry?.context?.canonicalGroupBuffer !== true) continue;
+    if (entry.state !== "OPEN_PENDING_CONFIRMATION") continue;
+    if (canonicalEntryChatKey(entry) !== normalizedChatKey) continue;
+    if (entry.finalObservationRequired !== true) continue;
+    entry.sourceObservationFailureCount = Number(entry.sourceObservationFailureCount ?? 0) + 1;
+    if (!entry.sourceObservationFailedAtMs) entry.sourceObservationFailedAtMs = Date.now();
+    const unavailableAgeMs = Date.now() - Number(entry.sourceObservationFailedAtMs);
+    console.warn("[whatsappInboundBuffer] canonical Group observation inconclusive", {
+      bufferKey,
+      attemptCount: entry.sourceObservationFailureCount,
+      unavailableAgeMs,
+    });
+    if (unavailableAgeMs >= CANONICAL_GROUP_SOURCE_OBSERVATION_MAX_AGE_MS) {
+      releaseChatLock = true;
+      continue;
+    }
+    if (!entry.timer) {
+      entry.timer = setTimeout(() => {
+        entry.timer = null;
+        // Keep the request observable to the listener; never freeze here.
+        entry.finalObservationRequired = true;
+      }, PLAYWRIGHT_POLL_INTERVAL_MS);
+    }
+  }
+  return { releaseChatLock };
+}
+
+/**
+ * Completed Playwright scan notification. Quiet is participant-specific;
+ * assistant boundaries are tied to exact physical inbound message IDs.
+ */
+export async function confirmCanonicalGroupScanCompleted({
+  chatKey,
+  scanGeneration,
+  admittedParticipantKeys = [],
+  assistantReplyAfterMessageIds = [],
+  sourceObservationComplete = true,
+} = {}) {
+  // A blocked, failed, partial, or otherwise inconclusive read is not evidence
+  // of source quiet and must not advance the close protocol.
+  if (sourceObservationComplete !== true) return [];
+  const normalizedChatKey = normalizeTitle(String(chatKey ?? "").trim());
+  const generation = Number(scanGeneration);
+  if (!normalizedChatKey || !Number.isFinite(generation) || generation < 1) {
+    return [];
+  }
+  const admitted = new Set(
+    (admittedParticipantKeys && typeof admittedParticipantKeys[Symbol.iterator] === "function"
+      ? [...admittedParticipantKeys]
+      : []
+    ).map((value) => String(value ?? "").trim()).filter(Boolean)
+  );
+  const replyBoundaries = new Set(
+    (assistantReplyAfterMessageIds &&
+    typeof assistantReplyAfterMessageIds[Symbol.iterator] === "function"
+      ? [...assistantReplyAfterMessageIds]
+      : []
+    ).map((value) => String(value ?? "").trim()).filter(Boolean)
+  );
+  const frozen = [];
+  const pendingFlushes = [];
+  for (const [bufferKey, entry] of messageBuffer) {
+    const ctx = entry?.context;
+    if (ctx?.canonicalGroupBuffer !== true) continue;
+    if (entry.state !== "OPEN_PENDING_CONFIRMATION") continue;
+    const entryChatKey = normalizeTitle(
+      String(ctx.playwrightChatKey ?? ctx.groupName ?? ctx.chatName ?? "").trim()
+    );
+    if (!entryChatKey || entryChatKey !== normalizedChatKey) continue;
+    const ids = canonicalGroupBufferedMessageIds(ctx);
+    const hasAssistantBoundary = ids.some((id) => replyBoundaries.has(id));
+    const participantKey = String(ctx.participantKey ?? "").trim();
+    const lastGeneration = Number(entry.lastAppendedAtScanGen);
+    const participantAdmitted = participantKey && admitted.has(participantKey);
+    if (participantAdmitted) {
+      entry.quietCandidateAtScanGen = null;
+    }
+    const quietCandidateGeneration =
+      entry.quietCandidateAtScanGen != null
+        ? Number(entry.quietCandidateAtScanGen)
+        : Number.NaN;
+    const cleanParticipantAbsence =
+      participantKey &&
+      !participantAdmitted &&
+      Number.isFinite(lastGeneration) &&
+      generation > lastGeneration;
+    const sourceConfirmedQuiet =
+      cleanParticipantAbsence &&
+      Number.isFinite(quietCandidateGeneration) &&
+      generation > quietCandidateGeneration;
+    if (!hasAssistantBoundary && !sourceConfirmedQuiet) {
+      if (cleanParticipantAbsence && !Number.isFinite(quietCandidateGeneration)) {
+        // One point-in-time absence is only a close candidate. Requiring a
+        // second later clean scan creates one fully observed polling interval
+        // in which a trailing physical fragment can still be admitted.
+        entry.quietCandidateAtScanGen = generation;
+        console.log("[whatsappInboundBuffer] canonical Group quiet candidate", {
+          bufferKey,
+          scanGeneration: generation,
+          lastAppendedAtScanGen: entry.lastAppendedAtScanGen ?? null,
+        });
+      }
+      continue;
+    }
+    const flush = freezeCanonicalGroupBuffer(
+      bufferKey,
+      hasAssistantBoundary ? "assistant_reply_boundary" : "source_confirmed_quiet"
+    );
+    if (flush) pendingFlushes.push(flush);
+    frozen.push(bufferKey);
+  }
+  await Promise.all(pendingFlushes);
+  return frozen;
+}
+
+/** For deterministic safety-ceiling tests. */
+export async function __triggerCanonicalGroupSafetyCeilingForTests(bufferKey) {
+  const entry = messageBuffer.get(String(bufferKey ?? "").trim());
+  if (!entry || entry.state !== "OPEN_PENDING_CONFIRMATION") return;
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  entry.finalObservationRequired = true;
+  entry.finalObservationRequestedAtMs = Date.now();
+}
+
+/** For tests/reporting. */
+export function __canonicalGroupSafetyCeilingMsForTests() {
+  return CANONICAL_GROUP_SAFETY_CEILING_MS;
+}
+
+/**
  * @param {string} bufferKey
  */
 async function flushBufferedWhatsAppInbound(bufferKey) {
@@ -3922,9 +4447,12 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
     entry.timer = null;
   }
 
+  const canonicalFrozenTurn = entry.context?.canonicalGroupBuffer === true;
+  if (canonicalFrozenTurn) entry.state = "FROZEN";
+
   releaseStaleActiveJobIfNeeded();
 
-  if (globalThis.__activeJob) {
+  if (globalThis.__activeJob && !canonicalFrozenTurn) {
     entry.retryCount = (entry.retryCount ?? 0) + 1;
     if (entry.retryCount > 20) {
       console.warn("⚠️ retry exceeded — forcing flush");
@@ -3961,6 +4489,10 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
 
   const { combined, structured } = normalizeBufferedMessages(parts);
   if (!combined) return;
+  const canonicalSettlement =
+    ctx.canonicalGroupBuffer === true
+      ? createCanonicalGroupBufferSettlement(bufferKey, entry, ctx)
+      : null;
   const userMessages = parts
     .map((p) => String(p ?? "").replace(/^\[user\]\s*/i, "").trim())
     .filter(Boolean);
@@ -3994,6 +4526,23 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
     fragmentCount,
     hasMultipleFragments,
   });
+
+  if (typeof ctx.__onFlushForTests === "function") {
+    try {
+      await ctx.__onFlushForTests({
+        bufferKey,
+        combinedMessage: combined,
+        structuredSnapshot: structured,
+        messageParts: [...parts],
+        context: { ...ctx },
+      });
+      canonicalSettlement?.settle({ successful: true });
+    } catch (error) {
+      canonicalSettlement?.settle({ successful: false, error });
+      throw error;
+    }
+    return;
+  }
 
   const { customerId, channel } = normalizeWhatsAppInboundContext(ctx.userPhone);
   const gateLogFields = buildMessagesOptionalFields({
@@ -4128,17 +4677,43 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
 
   const traceId = randomUUID();
   const pipelineStartedAt = Date.now();
-  await executeWhatsAppAiPipeline({
-    ...ctx,
-    traceId,
-    combinedMessage: combined,
-    latestMessage,
-    contextMessages,
-    structuredSnapshot: structured,
-    fragmentCount,
-    hasMultipleFragments,
-    isGreetingFirst,
-  });
+  const executePipeline =
+    typeof ctx.__executePipelineForTests === "function"
+      ? ctx.__executePipelineForTests
+      : executeWhatsAppAiPipeline;
+  try {
+    await executePipeline({
+      ...ctx,
+      traceId,
+      combinedMessage: combined,
+      latestMessage,
+      contextMessages,
+      structuredSnapshot: structured,
+      fragmentCount,
+      hasMultipleFragments,
+      isGreetingFirst,
+      __settleCanonicalGroupBufferAttempt: canonicalSettlement?.settle,
+    });
+    if (
+      canonicalSettlement &&
+      !canonicalSettlement.settled &&
+      executePipeline !== executeWhatsAppAiPipeline
+    ) {
+      const error = new Error("CANONICAL_PIPELINE_SETTLEMENT_MISSING");
+      canonicalSettlement.settle({ successful: false, error });
+      throw error;
+    }
+    if (
+      canonicalSettlement &&
+      canonicalSettlement.settled &&
+      !canonicalSettlement.successful
+    ) {
+      throw new Error("CANONICAL_PIPELINE_INCOMPLETE");
+    }
+  } catch (error) {
+    canonicalSettlement?.settle({ successful: false, error });
+    throw error;
+  }
   console.log("[latency]", {
     traceId,
     stage: "buffer flush pipeline handoff",
@@ -4234,6 +4809,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     messageSender: messageSenderPayload,
     playwrightWebInbound: playwrightWebInboundPayload = false,
     playwrightWebTitleIdentity: playwrightWebTitleIdentityPayload = false,
+    canonicalGroupBuffer: canonicalGroupBufferPayload = false,
     groupName: groupNamePayload,
     chatName: chatNamePayload,
     inboundIntent: inboundIntentPayload = null,
@@ -4243,6 +4819,7 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     playwrightForwardedAt: playwrightForwardedAtPayload = null,
     sourceRowKey: sourceRowKeyPayload = null,
     sourceMessageIndex: sourceMessageIndexPayload = null,
+    scanGeneration: scanGenerationPayload = null,
   } = payload;
 
   const sessionKeyResolved =
@@ -4251,6 +4828,13 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     isGroupMessage === true ||
     whatsappRecipientType === "group" ||
     String(whatsappReplyTo ?? "").trim().endsWith("@g.us");
+  const trustedParticipantKey = String(participantKeyPayload ?? "").trim();
+  const useCanonicalGroupBuffer =
+    canonicalGroupBufferPayload === true &&
+    isGroupChat &&
+    String(userPhone ?? "").trim() === "unknown" &&
+    playwrightWebInboundPayload === true &&
+    Boolean(trustedParticipantKey);
   const senderId =
     String(
       conversationCustomerNumber ??
@@ -4269,7 +4853,8 @@ export function scheduleBufferedWhatsAppInbound(payload) {
   }
   const isPlaywrightImmediate =
     String(userPhone ?? "").trim() === "unknown" &&
-    (isGroupMessage === true || playwrightWebInboundPayload === true);
+    (isGroupMessage === true || playwrightWebInboundPayload === true) &&
+    !useCanonicalGroupBuffer;
   const playwrightImmediateBufferKey =
     isPlaywrightImmediate && String(messageIdPayload ?? "").trim()
       ? `${sessionKeyResolved}::${String(messageIdPayload).trim()}`
@@ -4282,11 +4867,58 @@ export function scheduleBufferedWhatsAppInbound(payload) {
       timer: null,
       context: null,
       scheduleGen: 0,
+      seenMessageIds: new Set(),
+      state: "EMPTY",
+      openedAtMs: null,
+      firstAppendedAtScanGen: null,
+      lastAppendedAtScanGen: null,
+      quietCandidateAtScanGen: null,
+      appendVersion: 0,
+      finalObservationRequired: false,
+      finalObservationRequestedAtMs: null,
+      sourceObservationFailureCount: 0,
+      sourceObservationFailedAtMs: null,
     };
     messageBuffer.set(key, entry);
   }
 
-  if (entry.timer) {
+  const incomingMessageId = String(messageIdPayload ?? "").trim();
+  if (useCanonicalGroupBuffer && entry.state === "FROZEN") {
+    if (
+      incomingMessageId &&
+      entry.seenMessageIds instanceof Set &&
+      entry.seenMessageIds.has(incomingMessageId)
+    ) {
+      return;
+    }
+    if (!Array.isArray(entry.deferredCanonicalPayloads)) {
+      entry.deferredCanonicalPayloads = [];
+    }
+    entry.deferredCanonicalPayloads.push({ ...payload });
+    console.log("[whatsappInboundBuffer] fragment deferred behind frozen retry", {
+      bufferKey: key,
+      messageId: incomingMessageId || null,
+    });
+    return;
+  }
+  if (
+    useCanonicalGroupBuffer &&
+    incomingMessageId &&
+    entry.seenMessageIds instanceof Set &&
+    entry.seenMessageIds.has(incomingMessageId)
+  ) {
+    console.log("[whatsappInboundBuffer] duplicate Group fragment ignored", {
+      bufferKey: key,
+      messageId: incomingMessageId,
+    });
+    return;
+  }
+  if (useCanonicalGroupBuffer && incomingMessageId) {
+    if (!(entry.seenMessageIds instanceof Set)) entry.seenMessageIds = new Set();
+    entry.seenMessageIds.add(incomingMessageId);
+  }
+
+  if (entry.timer && !useCanonicalGroupBuffer) {
     clearTimeout(entry.timer);
     entry.timer = null;
   }
@@ -4304,6 +4936,29 @@ export function scheduleBufferedWhatsAppInbound(payload) {
       key,
       partCount: entry.messageParts.length,
     });
+  }
+  if (useCanonicalGroupBuffer) {
+    const observedGeneration = Number(scanGenerationPayload);
+    const validGeneration =
+      Number.isFinite(observedGeneration) && observedGeneration >= 1
+        ? Math.trunc(observedGeneration)
+        : null;
+    if (entry.state !== "OPEN_PENDING_CONFIRMATION") {
+      entry.state = "OPEN_PENDING_CONFIRMATION";
+      entry.openedAtMs = nowForBurst;
+      entry.firstAppendedAtScanGen = validGeneration;
+    }
+    entry.lastAppendedAtScanGen = validGeneration;
+    entry.quietCandidateAtScanGen = null;
+    entry.appendVersion = Number(entry.appendVersion ?? 0) + 1;
+    entry.finalObservationRequired = false;
+    entry.finalObservationRequestedAtMs = null;
+    entry.sourceObservationFailureCount = 0;
+    entry.sourceObservationFailedAtMs = null;
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = null;
+    }
   }
 
   let replyToMerged =
@@ -4328,6 +4983,14 @@ export function scheduleBufferedWhatsAppInbound(payload) {
   const participantWaIdMerged =
     String(participantWaIdPayload ?? "").trim().toLowerCase() ||
     String(entry.context?.participantWaId ?? "").trim().toLowerCase();
+  const bufferedMessageIdsMerged = useCanonicalGroupBuffer
+    ? [
+        ...(Array.isArray(entry.context?.bufferedMessageIds)
+          ? entry.context.bufferedMessageIds
+          : []),
+        incomingMessageId,
+      ].filter(Boolean)
+    : [];
 
   const normalizeParticipantName = (value) => {
     const raw = String(value ?? "").replace(/\s+/g, " ").trim();
@@ -4389,6 +5052,21 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     playwrightWebInbound:
       Boolean(playwrightWebInboundPayload) ||
       Boolean(entry.context?.playwrightWebInbound),
+    canonicalGroupBuffer:
+      useCanonicalGroupBuffer || Boolean(entry.context?.canonicalGroupBuffer),
+    ...(bufferedMessageIdsMerged.length > 0
+      ? { bufferedMessageIds: bufferedMessageIdsMerged }
+      : {}),
+    ...(typeof payload?.__onFlushForTests === "function"
+      ? { __onFlushForTests: payload.__onFlushForTests }
+      : typeof entry.context?.__onFlushForTests === "function"
+        ? { __onFlushForTests: entry.context.__onFlushForTests }
+        : {}),
+    ...(typeof payload?.__executePipelineForTests === "function"
+      ? { __executePipelineForTests: payload.__executePipelineForTests }
+      : typeof entry.context?.__executePipelineForTests === "function"
+        ? { __executePipelineForTests: entry.context.__executePipelineForTests }
+        : {}),
     playwrightWebTitleIdentity:
       Boolean(playwrightWebTitleIdentityPayload) ||
       Boolean(entry.context?.playwrightWebTitleIdentity),
@@ -4433,6 +5111,13 @@ export function scheduleBufferedWhatsAppInbound(payload) {
             Number.isFinite(Number(entry.context.playwrightForwardedAt))
           ? Number(entry.context.playwrightForwardedAt)
           : null,
+    scanGeneration:
+      scanGenerationPayload != null && Number.isFinite(Number(scanGenerationPayload))
+        ? Math.trunc(Number(scanGenerationPayload))
+        : entry.context?.scanGeneration != null &&
+            Number.isFinite(Number(entry.context.scanGeneration))
+          ? Math.trunc(Number(entry.context.scanGeneration))
+          : null,
     sourceRowKey:
       sourceRowKeyPayload != null && String(sourceRowKeyPayload).trim() !== ""
         ? String(sourceRowKeyPayload).trim()
@@ -4472,12 +5157,26 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     return;
   }
 
+  if (useCanonicalGroupBuffer) {
+    armCanonicalGroupSafetyDeadline(key, entry);
+    console.log("[whatsappInboundBuffer] canonical Group awaiting source confirmation", {
+      bufferKey: key,
+      fragmentCount: entry.messageParts.length,
+      firstAppendedAtScanGen: entry.firstAppendedAtScanGen,
+      lastAppendedAtScanGen: entry.lastAppendedAtScanGen,
+      quietCandidateAtScanGen: entry.quietCandidateAtScanGen,
+      safetyCeilingMs: CANONICAL_GROUP_SAFETY_CEILING_MS,
+    });
+    return;
+  }
+
   const fragmentCount = entry.messageParts.length;
   const rapidBurst =
     prevFragmentAt != null &&
     nowForBurst - prevFragmentAt < FRAGMENT_BURST_WINDOW_MS;
 
   if (
+    !useCanonicalGroupBuffer &&
     fragmentCount > FRAGMENT_COUNT_IMMEDIATE_FLUSH &&
     rapidBurst
   ) {
@@ -4515,12 +5214,30 @@ export function __clearWhatsAppInboundBufferForTests() {
   lastPlaywrightTextSends.clear();
 }
 
+/** For tests: synchronously flush a known buffer key. */
+export async function __flushWhatsAppInboundBufferForTests(bufferKey) {
+  await flushBufferedWhatsAppInbound(String(bufferKey ?? "").trim());
+}
+
 /** For tests: peek current buffer context (readonly). */
 export function __peekWhatsAppInboundBufferForTests(bufferKey) {
   const key = String(bufferKey ?? "").trim();
   const entry = key ? messageBuffer.get(key) : null;
   const ctx = entry?.context && typeof entry.context === "object" ? entry.context : null;
-  return ctx ? { ...ctx } : null;
+  return ctx
+    ? {
+        ...ctx,
+        __bufferState: entry.state ?? null,
+        __openedAtMs: entry.openedAtMs ?? null,
+        __firstAppendedAtScanGen: entry.firstAppendedAtScanGen ?? null,
+        __lastAppendedAtScanGen: entry.lastAppendedAtScanGen ?? null,
+        __quietCandidateAtScanGen: entry.quietCandidateAtScanGen ?? null,
+        __appendVersion: entry.appendVersion ?? 0,
+        __finalObservationRequired: entry.finalObservationRequired === true,
+        __sourceObservationFailureCount: entry.sourceObservationFailureCount ?? 0,
+        __messageParts: [...(entry.messageParts ?? [])],
+      }
+    : null;
 }
 
 /** @param {Parameters<typeof isIntentionalSilentInboundResult>[0]} p */

@@ -353,6 +353,18 @@ export function logForwardDecision(payload) {
  * @param {object} p
  * @returns {ParticipantForwardDecision}
  */
+export function shouldSkipReplyGuardForCanonicalBuffer(
+  guard,
+  allowCanonicalBufferSuccessor = false
+) {
+  const isUnrepliedCanonicalBufferSuccessor =
+    allowCanonicalBufferSuccessor === true &&
+    guard?.reason === "superseded_by_newer_same_participant" &&
+    guard?.hasNewerSameParticipantUserAfter === true &&
+    guard?.hasReplyAfter !== true;
+  return guard?.skip === true && !isUnrepliedCanonicalBufferSuccessor;
+}
+
 export function decideParticipantForwardTurn(p) {
   const {
     chatKey,
@@ -371,6 +383,7 @@ export function decideParticipantForwardTurn(p) {
     tickFirstSeenByStableId,
     currentFreshAdmittedStableIds,
     baselineSeenStableIds,
+    allowCanonicalBufferSuccessor = false,
     now = Date.now(),
     deps,
   } = p;
@@ -605,7 +618,7 @@ export function decideParticipantForwardTurn(p) {
     sorted,
     normalizedGroupChatKeyForCompare
   );
-  if (guard.skip) {
+  if (shouldSkipReplyGuardForCanonicalBuffer(guard, allowCanonicalBufferSuccessor)) {
     if (guard.reason === "reply_after") {
       maybeSuppressGroupMessageSelection(
         cursorKey,
