@@ -50,6 +50,7 @@
  * @property {string | null} [authoritativeSemanticIntent]
  * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemReferents]
  * @property {ReadonlyArray<Record<string, unknown>>} [canonicalItemResolutions]
+ * @property {boolean} [validatedGroupCanonicalAuthority]
  */
 
 /**

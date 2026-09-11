@@ -28,6 +28,8 @@ import { requestedFieldForCustomerSemanticIntent } from "../decisions/projectSem
  *   traceId?: string | null,
  *   authoritativeSemanticIntent?: string | null,
  *   canonicalItemReferents?: unknown[] | null,
+ *   authoritativeItemScope?: string | null,
+ *   validatedGroupCanonicalAuthority?: boolean,
  *   resolveTrustedSessionItem?: (p: {
  *     memory: Record<string, unknown> | null,
  *     catalogItems: unknown[],
@@ -67,6 +69,7 @@ export function buildTurnContextInput(p) {
     authoritativeSemanticIntent: p.authoritativeSemanticIntent,
     canonicalItemReferents: p.canonicalItemReferents,
     authoritativeItemScope: p.authoritativeItemScope,
+    validatedGroupCanonicalAuthority: p.validatedGroupCanonicalAuthority === true,
     resolveTrustedSessionItem:
       typeof p.resolveTrustedSessionItem === "function"
         ? (inner) =>
@@ -128,6 +131,8 @@ export function buildTurnContextInput(p) {
     canonicalItemReferents: Object.freeze([...(authority.canonicalItemReferents ?? [])]),
     canonicalItemResolutions: Object.freeze([...(authority.canonicalItemResolutions ?? [])]),
     itemReferenceMode: authority.itemReferenceMode ?? null,
+    validatedGroupCanonicalAuthority:
+      authority.validatedGroupCanonicalAuthorityActive === true,
     /** @internal bridge */
     _emilySessionKey: emilySessionKey,
     /** @internal bridge */

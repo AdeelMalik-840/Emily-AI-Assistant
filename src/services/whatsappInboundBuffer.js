@@ -87,6 +87,7 @@ import {
   resolveCloudDmCanonicalOwnership,
   validatePostConfirmSemanticOwnership,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
+import { resolveGroupCanonicalSemanticDecision } from "../brain/decisions/resolveGroupCanonicalSemanticDecision.js";
 import { readFreshLastAvailabilityAssist } from "../brain/availability/availabilityAssistContext.js";
 import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
@@ -2446,6 +2447,14 @@ export async function executeWhatsAppAiPipeline(p) {
   // flag; it changes only what gets logged as brainRouteRejectReason, never
   // routing/reply/retry behavior.
   let skipGeneralBrainReason = null;
+  // Validated Group semantic authority for this turn only. Populated at
+  // most once per frozen canonical turn (see the Group semantic block
+  // below), never per physical fragment. Cloud DM never sets this.
+  let validatedGroupCanonicalSemanticDecision = null;
+  // Catalog snapshot the Group semantic call (if any) was grounded against.
+  // Declared here (not inside the Group-only block below) so it is still
+  // in scope when sharedBrainParams is built further down for every turn.
+  let groupSemanticCatalogItems = [];
 
   if (
     !skipGeneralBrainForWaitingConfirmOwnership &&
@@ -2937,6 +2946,94 @@ export async function executeWhatsAppAiPipeline(p) {
     }
   }
 
+  // Group: one canonical semantic authority per frozen turn. Reuses the
+  // same low-level OpenAI ownership call Cloud DM uses (bypassing Cloud's
+  // ownership/lifecycle wrapper entirely, so Group carries zero Cloud
+  // booking/AVR/ownership state into the model). Reached only for an
+  // already-frozen canonical buffer entry (canonicalGroupBuffer===true) --
+  // the buffer's own freeze/quiet-scan protocol guarantees this runs
+  // against one immutable, fully-assembled message per attempt, never a
+  // still-accumulating fragment and never once per physical fragment.
+  if (
+    !skipGeneralBrainForWaitingConfirmOwnership &&
+    isGroupInbound &&
+    p.canonicalGroupBuffer === true
+  ) {
+    groupSemanticCatalogItems = Array.isArray(p.catalogItems)
+      ? p.catalogItems
+      : [];
+    if (groupSemanticCatalogItems.length === 0 && ownerUserId) {
+      try {
+        const inventoryMod = await import("./inventoryService.js");
+        groupSemanticCatalogItems = await inventoryMod.getCachedItemsForUser(
+          ownerUserId
+        );
+      } catch {
+        groupSemanticCatalogItems = [];
+      }
+    }
+    const groupTrustedFreshItemFocus = resolveCloudDmOwnershipTrustedFocus({
+      memorySnapshot: shadowPreTurnMemorySnapshot,
+      participantKey: normalizedParticipantKey,
+    });
+    const groupSemantic = await resolveGroupCanonicalSemanticDecision({
+      business: null,
+      catalogItems: groupSemanticCatalogItems,
+      trustedFreshItemFocus: groupTrustedFreshItemFocus,
+      userMessage: canonicalMessage,
+      conversationHistory,
+      timeoutMs: Number.isFinite(Number(p.__groupSemanticTimeoutMsForTests))
+        ? Number(p.__groupSemanticTimeoutMsForTests)
+        : 8000,
+      __executeCloudDmOwnershipDecisionFn:
+        p.__executeGroupCanonicalSemanticDecisionFn ??
+        p.__executeCloudDmOwnershipDecisionFn ??
+        null,
+      __chatCompletionsCreateForTests:
+        p.__groupSemanticChatCompletionsCreateForTests ??
+        p.__chatCompletionsCreateForTests,
+    });
+    if (groupSemantic.ok === true && groupSemantic.decision) {
+      validatedGroupCanonicalSemanticDecision = groupSemantic.decision;
+      console.log("[group_canonical_semantic_decided]", {
+        traceId,
+        messageId,
+        semanticDecisionSource: groupSemantic.source,
+        semanticIntent: groupSemantic.decision.semanticIntent,
+        itemScope: groupSemantic.decision.itemScope,
+        itemReferenceMode: groupSemantic.decision.itemReferenceMode,
+        referentCount: groupSemantic.decision.itemReferents.length,
+        ownershipCompletionCount: groupSemantic.ownershipCompletionCount ?? null,
+      });
+    } else {
+      // Fail closed: no legacy regex/signal takeover, no AVR, no booking,
+      // no owner notification. Technical recovery only.
+      skipGeneralBrainForWaitingConfirmOwnership = true;
+      skipGeneralBrainReason = "GROUP_CANONICAL_SEMANTIC_UNUSABLE";
+      reply = BRAIN_V2_HARD_BLOCKED_CUSTOMER_REPLY;
+      sendVia = "GROUP";
+      messageMeta = {
+        customerTurnOutcome: "TECHNICAL_RECOVERY",
+        groupCanonicalSemanticFailure: true,
+        outboundTrace: {
+          kind: "group_canonical_semantic_technical_recovery",
+          finalReplySource: "GROUP_CANONICAL_SEMANTIC_TECHNICAL_RECOVERY",
+          reason: String(
+            groupSemantic.reason ?? "GROUP_SEMANTIC_DECISION_UNUSABLE"
+          ).slice(0, 160),
+        },
+      };
+      console.warn("[group_canonical_semantic_rejected]", {
+        traceId,
+        messageId,
+        reason: String(
+          groupSemantic.reason ?? "GROUP_SEMANTIC_DECISION_UNUSABLE"
+        ).slice(0, 160),
+        ownershipCompletionCount: groupSemantic.ownershipCompletionCount ?? null,
+      });
+    }
+  }
+
   let routeGate = {
     selected: "legacy",
     route: "ownership_skipped",
@@ -3008,6 +3105,21 @@ export async function executeWhatsAppAiPipeline(p) {
     hasBookingHint: Boolean(p?.bookingHint),
     memorySnapshot: shadowPreTurnMemorySnapshot,
     conversationHistory,
+    // Existing Brain V2 dependency seams. Production leaves these undefined;
+    // local production-path tests supply pure readers to avoid live Firestore.
+    getBookingsForItemFn: p.getBookingsForItemFn,
+    getBusinessProfileFn: p.getBusinessProfileFn,
+    // Same catalog snapshot the Group semantic call (if any) was grounded
+    // against -- avoids a second, independent Firestore catalog fetch that
+    // could drift from what the semantic decision actually validated, and
+    // is required for runBrainV2LivePipeline's own re-validation
+    // (resolveValidatedGroupCanonicalDecision) to see the same items.
+    catalogItems:
+      Array.isArray(groupSemanticCatalogItems) && groupSemanticCatalogItems.length > 0
+        ? groupSemanticCatalogItems
+        : Array.isArray(p.catalogItems)
+          ? p.catalogItems
+          : undefined,
     sourceRowKey: sourceRowKeyRaw,
     sourceMessageIndex: normalizedSourceMessageIndex,
     guaranteeKey: buildPlaywrightGuaranteeKey(groupNameResolved, messageIdRaw),
@@ -3016,6 +3128,7 @@ export async function executeWhatsAppAiPipeline(p) {
     canonicalSemanticDecision: cloudLifecycleIdentity?.guaranteeKey
       ? getCloudInboundSemanticDecision({ identity: cloudLifecycleIdentity })
       : null,
+    validatedGroupCanonicalSemanticDecision,
     cloudLifecycleIdentity,
     executionContext: {
       traceId,
@@ -5212,6 +5325,7 @@ export function __clearWhatsAppInboundBufferForTests() {
   pendingPlaywrightPipelineBySession.clear();
   lastSentReplies.clear();
   lastPlaywrightTextSends.clear();
+  recentInboundByOwnerAndText.clear();
 }
 
 /** For tests: synchronously flush a known buffer key. */

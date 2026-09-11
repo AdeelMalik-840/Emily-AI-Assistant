@@ -4139,6 +4139,180 @@ function rejectCloudDmOwnershipParse(opts, rejectionCode, metadata = {}) {
   return null;
 }
 
+/**
+ * Shared boundary for an optional preprocessDecisionBeforeValidation callback
+ * (e.g. Group's deterministic current-turn offset-repair adapter). No caller
+ * of executeCloudDmOwnershipDecision may rewrite meaning through this
+ * callback — only itemReferents[i].start/end, and only for a referent whose
+ * ORIGINAL source is "current_turn", may differ from what the model
+ * actually returned. Everything below fails closed on any deviation and on
+ * any inability to establish the original candidate.
+ */
+
+/**
+ * Shape-only JSON extraction: fence-strip, brace-slice, parse. Deliberately
+ * skips every structural/business rule parseCloudDmOwnershipDecision applies
+ * (turnScope enum, item-referent offset exactness, etc.) — those are exactly
+ * what a grounding callback exists to repair, so gating extraction on them
+ * would defeat the callback before it runs.
+ */
+function extractOwnershipJsonSyntaxCandidate(raw) {
+  let text = String(raw ?? "").trim();
+  if (!text) return null;
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) text = text.slice(start, end + 1);
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isOwnershipPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function ownershipValuesDeepEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    return a.every((value, i) => ownershipValuesDeepEqual(value, b[i]));
+  }
+  if (isOwnershipPlainObject(a) || isOwnershipPlainObject(b)) {
+    if (!isOwnershipPlainObject(a) || !isOwnershipPlainObject(b)) return false;
+    const aKeys = Object.keys(a).sort();
+    const bKeys = Object.keys(b).sort();
+    if (aKeys.length !== bKeys.length) return false;
+    return aKeys.every(
+      (key, i) => key === bKeys[i] && ownershipValuesDeepEqual(a[key], b[key])
+    );
+  }
+  if (typeof a === "number" && typeof b === "number") {
+    return Number.isNaN(a) && Number.isNaN(b);
+  }
+  return false;
+}
+
+function ownershipSameKeySet(a, b) {
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  return (
+    aKeys.length === bKeys.length && aKeys.every((key, i) => key === bKeys[i])
+  );
+}
+
+function isAllowedGroupRuntimeOwnedCanonicalization(key, groundedValue) {
+  if (key === "targetReference") {
+    return ownershipValuesDeepEqual(groundedValue, {
+      source: "none",
+      sourceTurnId: null,
+      targetType: "none",
+      targetId: null,
+    });
+  }
+  if (
+    key === "targetId" ||
+    key === "selectedBookingId" ||
+    key === "pendingAvailabilitySelectionIndex"
+  ) {
+    return groundedValue == null;
+  }
+  if (key === "mutationIntent") return groundedValue === "none";
+  if (key === "action") return groundedValue === "reply";
+  return false;
+}
+
+/**
+ * Enforce: a Group preprocessor may normalize the Group lane's fixed runtime
+ * policy fields, repair current-turn offsets, and clear contextual runtime
+ * IDs when a real trusted focus exists. Referent count/order, semantic
+ * source/mode, and every model-owned semantic field remain byte-identical.
+ */
+function assertGroupGroundingOnlyChangedOffsets(
+  originalCandidate,
+  groundedCandidate,
+  { allowContextualRuntimeIdClearing = false } = {}
+) {
+  if (
+    !isOwnershipPlainObject(originalCandidate) ||
+    !isOwnershipPlainObject(groundedCandidate)
+  ) {
+    return { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+  }
+  if (!ownershipSameKeySet(originalCandidate, groundedCandidate)) {
+    return { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+  }
+  for (const key of Object.keys(originalCandidate)) {
+    if (key === "itemReferents") continue;
+    if (
+      isAllowedGroupRuntimeOwnedCanonicalization(key, groundedCandidate[key])
+    ) {
+      continue;
+    }
+    if (!ownershipValuesDeepEqual(originalCandidate[key], groundedCandidate[key])) {
+      return { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+    }
+  }
+
+  const originalRefs = originalCandidate.itemReferents;
+  const groundedRefs = groundedCandidate.itemReferents;
+  if (!Array.isArray(originalRefs) || !Array.isArray(groundedRefs)) {
+    return ownershipValuesDeepEqual(originalRefs, groundedRefs)
+      ? { ok: true }
+      : { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+  }
+  if (originalRefs.length !== groundedRefs.length) {
+    return { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+  }
+  for (let i = 0; i < originalRefs.length; i += 1) {
+    const originalRef = originalRefs[i];
+    const groundedRef = groundedRefs[i];
+    if (!isOwnershipPlainObject(originalRef) || !isOwnershipPlainObject(groundedRef)) {
+      if (!ownershipValuesDeepEqual(originalRef, groundedRef)) {
+        return { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+      }
+      continue;
+    }
+    if (!ownershipSameKeySet(originalRef, groundedRef)) {
+      return { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+    }
+    const allowOffsetChange = originalRef.source === "current_turn";
+    const allowRuntimeIdClearing =
+      allowContextualRuntimeIdClearing &&
+      originalCandidate.itemReferenceMode === "CONTEXTUAL" &&
+      originalRef.source === "trusted_fresh_focus" &&
+      groundedRef.source === "trusted_fresh_focus" &&
+      originalRef.surfaceText == null &&
+      originalRef.start == null &&
+      originalRef.end == null &&
+      groundedRef.surfaceText == null &&
+      groundedRef.start == null &&
+      groundedRef.end == null;
+    for (const key of Object.keys(originalRef)) {
+      if (allowOffsetChange && (key === "start" || key === "end")) continue;
+      if (
+        allowRuntimeIdClearing &&
+        (key === "trustedItemId" || key === "sourceTurnId") &&
+        groundedRef[key] == null
+      ) {
+        continue;
+      }
+      if (!ownershipValuesDeepEqual(originalRef[key], groundedRef[key])) {
+        return { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+      }
+    }
+  }
+  return { ok: true };
+}
+
 export function parseCloudDmOwnershipDecision(raw, opts = {}) {
   let text = String(raw ?? "").trim();
   if (!text) return rejectCloudDmOwnershipParse(opts, "OWNERSHIP_JSON_EMPTY");
@@ -4386,6 +4560,7 @@ export async function executeCloudDmOwnershipDecision({
   timeoutMs = 8000,
   __chatCompletionsCreateForTests = null,
   correctionFeedback = null,
+  preprocessDecisionBeforeValidation = null,
 } = {}) {
   const userLine = String(userMessage ?? "")
     .replace(/\s+/g, " ")
@@ -4645,15 +4820,30 @@ export async function executeCloudDmOwnershipDecision({
   }
 
   async function completeOnce(feedback) {
+    const feedbackCode = String(feedback ?? "").trim();
+    const surfaceMissingWithTrustedFocus =
+      feedbackCode === "GROUP_CURRENT_ITEM_SURFACE_MISSING" &&
+      Boolean(clean(facts?.trustedFreshItemFocus?.itemId, 160));
+    const contextualUntrustedWithTrustedFocus =
+      feedbackCode === "GROUP_CONTEXTUAL_ITEM_REFERENT_UNTRUSTED" &&
+      Boolean(clean(facts?.trustedFreshItemFocus?.itemId, 160));
     const messages = [
       { role: "system", content: system },
       { role: "user", content: userPayload },
     ];
-    if (feedback) {
+    if (feedbackCode) {
+      // Structural, rejection-code-keyed correction only (never customer
+      // wording/regex): GROUP_CURRENT_ITEM_SURFACE_MISSING fires when a
+      // current_turn referent's surfaceText is not a literal substring of
+      // CUSTOMER_MESSAGE at all -- the most common cause is the model
+      // recalling a previously-discussed item and spanning its name as if
+      // newly said, instead of using trusted_fresh_focus. Only add this line
+      // when a trusted focus actually exists to route to, so the correction
+      // never invents context that was not there.
       messages.push({
         role: "user",
         content: [
-          `PREVIOUS_OUTPUT_REJECTED: ${String(feedback).slice(0, 200)}`,
+          `PREVIOUS_OUTPUT_REJECTED: ${feedbackCode.slice(0, 200)}`,
           "Return corrected ownership JSON for the SAME customer message.",
           "Do not copy trusted IDs. Do not invent IDs.",
           "Named items in CUSTOMER_MESSAGE use source=current_turn spans with null IDs.",
@@ -4662,7 +4852,15 @@ export async function executeCloudDmOwnershipDecision({
           "UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN, NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN, and OLD_BOOKING_EXPLICIT_CURRENT_CATALOG_SPAN mean CUSTOMER_MESSAGE names a catalog item for a new informational ask: emit NEW_TRANSACTION with a current_turn span of that named item. Do not keep OLD_BOOKING_REFERENCE unless the customer refers to an existing booking's booking facts (conversation_turn historical provenance or booking_fact). Do not use trusted_fresh_focus and do not span a non-catalog phrase. Runtime will not pick the intent.",
           "ITEM_REFERENT_SURFACE_MISMATCH means start/end must be the exact end-exclusive offsets of surfaceText in CUSTOMER_MESSAGE.",
           "CONTEXTUAL_FRESH_FOCUS_MISSING means no trusted presented item and no unique pending owner-check request. CONTEXTUAL_PENDING_AVR_AMBIGUOUS means more than one pending owner-check could bind: do not guess; use UNCLEAR unless CUSTOMER_MESSAGE names a catalog item (then NEW_TRANSACTION current_turn).",
-        ].join(" "),
+          surfaceMissingWithTrustedFocus
+            ? "GROUP_CURRENT_ITEM_SURFACE_MISSING means a current_turn surfaceText you proposed is not a literal substring of CUSTOMER_MESSAGE. TRUSTED_FRESH_ITEM_FOCUS is present: if CUSTOMER_MESSAGE does not itself name any item, this is a contextual continuation of that trusted item -- use source=trusted_fresh_focus with surfaceText/start/end/trustedItemId/sourceTurnId all null, itemScope=specific, itemReferenceMode=CONTEXTUAL. Never span a remembered item's name as current_turn merely because you recall it from context."
+            : "",
+          contextualUntrustedWithTrustedFocus
+            ? "GROUP_CONTEXTUAL_ITEM_REFERENT_UNTRUSTED means your contextual referent asserted fields owned by deterministic runtime trust. Preserve itemReferenceMode=CONTEXTUAL and source=trusted_fresh_focus, but set surfaceText, start, end, trustedItemId, and sourceTurnId all to null. Runtime will bind the already-trusted focus; never copy its itemId or sourceTurnId into model output."
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" "),
       });
     }
     const createPromise = Promise.resolve(
@@ -4688,9 +4886,68 @@ export async function executeCloudDmOwnershipDecision({
         : createPromise;
     const resp = await timed;
     const raw = resp?.choices?.[0]?.message?.content ?? "";
+    let validationInput = raw;
+    let validationCustomerMessage = userLine;
     let parseRejection = null;
-    const parsed = parseCloudDmOwnershipDecision(raw, {
-      customerMessage: userLine,
+    if (typeof preprocessDecisionBeforeValidation === "function") {
+      const originalCandidate = extractOwnershipJsonSyntaxCandidate(raw);
+      const preprocessed = preprocessDecisionBeforeValidation({
+        rawDecision: raw,
+        customerMessage: userLine,
+      });
+      if (!preprocessed?.ok) {
+        const rejection = {
+          rejectionCode:
+            String(preprocessed?.reason ?? "DECISION_PREPROCESSING_REJECTED").trim() ||
+            "DECISION_PREPROCESSING_REJECTED",
+        };
+        return {
+          parsed: null,
+          parseRejection: rejection,
+          raw,
+        };
+      }
+      // A callback has no authority over which message offsets are
+      // validated against — CUSTOMER_MESSAGE, the callback's own literal
+      // search, and structural validation must all share the exact same
+      // normalized userLine. A callback may omit the field; it may not
+      // substitute a different value.
+      if (
+        preprocessed.validationCustomerMessage != null &&
+        String(preprocessed.validationCustomerMessage) !== userLine
+      ) {
+        const rejection = {
+          rejectionCode: "GROUP_GROUNDING_VALIDATION_MESSAGE_REJECTED",
+        };
+        return {
+          parsed: null,
+          parseRejection: rejection,
+          raw,
+        };
+      }
+      const invariant = assertGroupGroundingOnlyChangedOffsets(
+        originalCandidate,
+        preprocessed.decision,
+        {
+          allowContextualRuntimeIdClearing: Boolean(
+            clean(facts?.trustedFreshItemFocus?.itemId, 160) &&
+              clean(facts?.trustedFreshItemFocus?.sourceTurnId, 320)
+          ),
+        }
+      );
+      if (!invariant.ok) {
+        const rejection = { rejectionCode: invariant.reason };
+        return {
+          parsed: null,
+          parseRejection: rejection,
+          raw,
+        };
+      }
+      validationInput = JSON.stringify(preprocessed.decision);
+      validationCustomerMessage = userLine;
+    }
+    const parsed = parseCloudDmOwnershipDecision(validationInput, {
+      customerMessage: validationCustomerMessage,
       trustedFreshItemFocus: facts?.trustedFreshItemFocus,
       catalogItems: facts?.catalogItems,
       pendingOwnerCheckRequests: facts?.pendingOwnerCheckRequests,
