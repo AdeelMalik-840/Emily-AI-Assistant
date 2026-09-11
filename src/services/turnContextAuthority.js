@@ -245,6 +245,7 @@ export function classifyTurnShape(p) {
  *     participantKey: string | null,
  *   }) => { ok: boolean, item?: Record<string, unknown> | null, reason?: string | null, proofSource?: string | null },
  *   traceId?: string | null,
+ *   validatedGroupCanonicalAuthority?: boolean,
  * }} opts
  */
 export function resolveTurnContext(opts = {}) {
@@ -259,10 +260,26 @@ export function resolveTurnContext(opts = {}) {
   const canonicalItemReferents = Array.isArray(opts.canonicalItemReferents)
     ? opts.canonicalItemReferents
     : null;
-  const canonicalAuthorityActive =
+  const authoritativeSemanticIntentPresent = Boolean(
+    String(opts.authoritativeSemanticIntent ?? "").trim()
+  );
+  // Cloud's own condition, byte-identical to before this split — Cloud
+  // behavior is unaffected by the Group branch below.
+  const cloudCanonicalAuthorityActive =
     !isGroupInbound &&
-    Boolean(String(opts.authoritativeSemanticIntent ?? "").trim()) &&
+    authoritativeSemanticIntentPresent &&
     canonicalItemReferents !== null;
+  // Group-only: requires the validated-Group marker in addition to the
+  // same shape Cloud requires. Structurally mutually exclusive with the
+  // Cloud condition via isGroupInbound, so a single turn can never satisfy
+  // both.
+  const validatedGroupCanonicalAuthorityActive =
+    isGroupInbound &&
+    opts.validatedGroupCanonicalAuthority === true &&
+    authoritativeSemanticIntentPresent &&
+    canonicalItemReferents !== null;
+  const canonicalAuthorityActive =
+    cloudCanonicalAuthorityActive || validatedGroupCanonicalAuthorityActive;
   const canonicalItemResolutions = canonicalAuthorityActive
     ? resolveCanonicalItemReferents(canonicalItemReferents, catalogItems)
     : [];
@@ -417,7 +434,16 @@ export function resolveTurnContext(opts = {}) {
     canonicalItemReferents: canonicalItemReferents ?? [],
     canonicalItemResolutions,
     canonicalAuthorityActive,
+    cloudCanonicalAuthorityActive,
+    validatedGroupCanonicalAuthorityActive,
     itemReferenceMode,
+    priorItemUsed:
+      validatedGroupCanonicalAuthorityActive && itemReferenceMode === "CONTEXTUAL",
+    priorItemReason: validatedGroupCanonicalAuthorityActive
+      ? itemReferenceMode === "CONTEXTUAL"
+        ? "validated_contextual_referent"
+        : "canonical_reference_not_contextual"
+      : null,
   };
 
   console.log("[turn_context_resolved]", {
@@ -435,6 +461,16 @@ export function resolveTurnContext(opts = {}) {
     suppressFuzzyCatalog,
     shouldClarifyItem,
     clarificationReason,
+    semanticDecisionSource: validatedGroupCanonicalAuthorityActive
+      ? "validated_group_canonical"
+      : cloudCanonicalAuthorityActive
+        ? "cloud_canonical"
+        : "legacy",
+    semanticIntent: String(opts.authoritativeSemanticIntent ?? "").trim() || null,
+    itemScope: String(opts.authoritativeItemScope ?? "").trim() || null,
+    itemReferenceMode,
+    priorItemUsed: result.priorItemUsed,
+    priorItemReason: result.priorItemReason,
     messagePreview: message.slice(0, 120) || null,
   });
 

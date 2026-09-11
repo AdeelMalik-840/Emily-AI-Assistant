@@ -52,9 +52,14 @@ function hasDuration(value) {
  */
 function canPlanOwnerCheckForBookingRequest(canonical, payload) {
   const decision = asObject(canonical?.decision);
+  const resolvedItem = asObject(canonical?.resolvedItem);
   return (
     canonical != null &&
     decision?.workflowType === "booking_request" &&
+    // Under validated Group canonical authority, an unresolved/ambiguous
+    // item must never gain owner-check/booking permission.
+    (canonical?.validatedGroupCanonicalAuthority !== true ||
+      resolvedItem?.status === "resolved") &&
     hasValue(payload.businessId) &&
     hasValue(payload.itemId) &&
     hasDuration(payload.durationDays)
@@ -228,12 +233,15 @@ export function buildBookingRequestActionPlan({
         canonical?.businessId ??
         ""
     ).trim() || null;
-  const itemId =
-    String(
-      asObject(canonical?.resolvedItem)?.id ??
-        understanding.resolvedItemId ??
-        ""
-    ).trim() || null;
+  const canonicalResolvedItem = asObject(canonical?.resolvedItem);
+  const groupItemActionable =
+    canonical?.validatedGroupCanonicalAuthority !== true ||
+    canonicalResolvedItem?.status === "resolved";
+  const itemId = groupItemActionable
+    ? String(
+        canonicalResolvedItem?.id ?? understanding.resolvedItemId ?? ""
+      ).trim() || null
+    : null;
 
   // Canonical rental duration only — never re-parse message or read session here.
   const canonicalDuration = asObject(canonical?.duration);

@@ -398,7 +398,15 @@ function resolveBusinessDecision(p) {
   const signals = p.signals ?? {};
   const understanding = p.understanding ?? {};
   const turnShape = String(p.turnShape ?? "").trim();
-  const resolvedItemId = hasValue(p.itemFacts?.id) ? String(p.itemFacts.id) : null;
+  const candidateItemId = hasValue(p.itemFacts?.id) ? String(p.itemFacts.id) : null;
+  // Under validated Group canonical authority, an item that is not fully
+  // resolved (e.g. "ambiguous") must never become actionable, even though a
+  // candidate ID/status exists — this scoping applies only when the marker
+  // is set; legacy/Cloud/status-less callers are unaffected.
+  const resolvedItemId =
+    p.validatedGroupCanonicalAuthority === true && p.itemFacts?.status !== "resolved"
+      ? null
+      : candidateItemId;
   const understandingDuration =
     understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
       ? Math.max(1, Math.floor(Number(understanding.durationDays)))
@@ -458,6 +466,28 @@ function resolveBusinessDecision(p) {
     const boundedExplicitItemIds = Array.isArray(understanding?.resolvedItemIds)
       ? understanding.resolvedItemIds.map((id) => String(id ?? "").trim()).filter(Boolean)
       : [];
+    if (
+      p.validatedGroupCanonicalAuthority === true &&
+      authoritativeItemScope === "specific" &&
+      !hasResolvedItem
+    ) {
+      return Object.freeze({
+        primaryIntent: authoritativeSemanticIntent,
+        secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
+        workflowType: "clarification",
+        replyType: "clarification",
+        requestedField: canonicalRequestedField,
+        resolvedItemId: null,
+        boundedExplicitItemIds: Object.freeze([...boundedExplicitItemIds]),
+        durationDays,
+        strongBookingCommand: authoritativeSemanticIntent === "booking_request",
+        weakContextSignals: Object.freeze(weakContextSignals),
+        sideEffectsAllowed: Object.freeze([]),
+        contextToPersist: Object.freeze({}),
+        confidence: "high",
+        reason: "validated_group_item_not_resolved",
+      });
+    }
     if (authoritativeItemScope === "specific" && canonicalItemReferents.length > 1) {
       return Object.freeze({
         primaryIntent: authoritativeSemanticIntent,
@@ -707,12 +737,16 @@ export async function resolveBusinessTurnContext(params) {
   )
     ? params.turnContext.canonicalSemanticDecision.itemScope
     : null;
-  // A frozen Cloud ownership decision exists for this turn (Cloud DM path).
+  const validatedGroupCanonicalAuthority =
+    turnContextInput?.validatedGroupCanonicalAuthority === true;
+  // A frozen canonical semantic decision exists for this turn — Cloud's own
+  // ownership decision, or (once validated) Group's canonical decision via
+  // the same generic params.turnContext.canonicalSemanticDecision slot.
   // When present, its temporalRequest is the single authoritative temporal
   // owner (kal/tomorrow/parson/explicit dates all included) — the legacy
   // regex signal below is never consulted, avoiding dual-source ambiguity.
-  // When absent (Group/legacy/non-canonical callers), the legacy regex
-  // remains the sole fallback, unchanged.
+  // When absent (legacy/non-canonical callers), the legacy regex remains
+  // the sole fallback, unchanged.
   const hasCanonicalSemanticDecision = params.turnContext?.canonicalSemanticDecision != null;
   // AI-proposed structured temporal meaning. Deterministic code below still
   // owns date validity, timezone conversion, year resolution, and the exact
@@ -1257,6 +1291,7 @@ export async function resolveBusinessTurnContext(params) {
     availabilityAssistFollowUp,
     unavailableCustomerReply,
     presentedAlternativeItemIds: Object.freeze([...presentedAlternativeItemIds]),
+    validatedGroupCanonicalAuthority,
 
     resolvedItem: {
       status: itemFacts.status,
@@ -1336,6 +1371,7 @@ export async function resolveBusinessTurnContext(params) {
     turnShape: turnContextInput?.turnShape ?? null,
     authoritativeSemanticIntent,
     authoritativeItemScope,
+    validatedGroupCanonicalAuthority,
   });
 
   resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);

@@ -19,6 +19,10 @@ import { decideCustomerTurn } from "../decisions/decideCustomerTurn.js";
 import { GROUP_POST_EXECUTE_LANE } from "../decisions/groupPostExecuteLane.js";
 import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
 import { POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK } from "../decisions/decidePostConfirmCustomerDm.js";
+import {
+  VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE,
+  validateGroupCanonicalSemanticDecision,
+} from "../decisions/resolveGroupCanonicalSemanticDecision.js";
 import { buildContinuationContext } from "../continuation/buildContinuationContext.js";
 import {
   ONBOARDING_CLARIFICATION_REPLY,
@@ -78,6 +82,48 @@ function resolveFrozenCanonicalDecision(params) {
   const turnScope = String(decision.turnScope ?? "").trim();
   if (!CANONICAL_RELEASED_SCOPES.has(turnScope)) {
     return { ...decision, turnScope, _ownershipBlockedForBrainV2: true };
+  }
+  return decision;
+}
+
+/**
+ * Group's structural mirror of resolveFrozenCanonicalDecision. Guard is the
+ * exact inverse (Cloud can never enter here, Group can never enter the
+ * function above), and — unlike Cloud, which only needs to check the
+ * already-persisted decision's status/scope — this independently
+ * re-verifies the provenance marker AND re-runs the Group validator against
+ * a fresh catalog snapshot, rather than trusting a single validation pass
+ * that already happened upstream in the Group adapter. Any caller that
+ * hands this function an arbitrary object without the exact provenance
+ * string, or one that fails re-validation, gets nothing trusted back.
+ */
+function resolveValidatedGroupCanonicalDecision(params, catalogItems) {
+  if (params?.isGroupInbound !== true && params?.chatType !== "group") {
+    return null;
+  }
+  const decision =
+    params?.validatedGroupCanonicalSemanticDecision &&
+    typeof params.validatedGroupCanonicalSemanticDecision === "object"
+      ? params.validatedGroupCanonicalSemanticDecision
+      : null;
+  if (!decision) return null;
+  if (
+    decision.semanticDecisionProvenance !==
+    VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE
+  ) {
+    return null;
+  }
+  const validation = validateGroupCanonicalSemanticDecision(decision, {
+    customerMessage: String(params?.message ?? ""),
+    catalogItems: Array.isArray(catalogItems) ? catalogItems : [],
+  });
+  if (!validation.ok || decision.semanticDecisionStatus !== "released") {
+    return {
+      ...decision,
+      _validatedGroupSemanticRejected: true,
+      _validatedGroupSemanticRejectReason:
+        validation.reason || "GROUP_SEMANTIC_DECISION_NOT_RELEASED",
+    };
   }
   return decision;
 }
@@ -161,7 +207,33 @@ export async function runBrainV2LivePipeline(params) {
 
   try {
     assertBrainV2ExecutionActive(params);
-    const canonicalReleased = resolveFrozenCanonicalDecision(params);
+    let catalogItems = Array.isArray(params.catalogItems) ? params.catalogItems : [];
+    if (catalogItems.length === 0) {
+      const catalogMod = await import("../../services/inventoryService.js");
+      catalogItems = await catalogMod.getCachedItemsForUser(businessId);
+      assertBrainV2ExecutionActive(params);
+    }
+    const existingCloudCanonicalReleased = resolveFrozenCanonicalDecision(params);
+    const validatedGroupCanonicalReleased = resolveValidatedGroupCanonicalDecision(
+      params,
+      catalogItems
+    );
+    const canonicalReleased =
+      existingCloudCanonicalReleased ?? validatedGroupCanonicalReleased;
+    if (canonicalReleased?._validatedGroupSemanticRejected === true) {
+      // Fail closed: an arbitrary or re-validation-failing Group decision
+      // never becomes authoritative. No AVR/booking/owner-notification side
+      // effect can follow from here — this returns before any workflow runs.
+      return buildSilentPipelineResult({
+        traceId,
+        channel,
+        chatType,
+        isGroupInbound: params.isGroupInbound,
+        reason:
+          canonicalReleased._validatedGroupSemanticRejectReason ||
+          "GROUP_CANONICAL_SEMANTIC_INVALID",
+      });
+    }
     if (canonicalReleased?._ownershipBlockedForBrainV2 === true) {
     return buildSilentPipelineResult({
       traceId,
@@ -186,12 +258,6 @@ export async function runBrainV2LivePipeline(params) {
       reason: "CANONICAL_SEMANTIC_INTENT_INVALID",
       });
     }
-    let catalogItems = Array.isArray(params.catalogItems) ? params.catalogItems : [];
-    if (catalogItems.length === 0) {
-      const catalogMod = await import("../../services/inventoryService.js");
-      catalogItems = await catalogMod.getCachedItemsForUser(businessId);
-      assertBrainV2ExecutionActive(params);
-    }
 
     const turnContextInput = buildTurnContextInput({
       channel,
@@ -213,6 +279,7 @@ export async function runBrainV2LivePipeline(params) {
       authoritativeSemanticIntent,
       canonicalItemReferents: canonicalReleased?.itemReferents ?? null,
       authoritativeItemScope: canonicalReleased?.itemScope ?? null,
+      validatedGroupCanonicalAuthority: validatedGroupCanonicalReleased != null,
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
@@ -241,6 +308,21 @@ export async function runBrainV2LivePipeline(params) {
         targetId: canonicalReleased.targetId ?? null,
         semanticDecisionStatus: canonicalReleased.semanticDecisionStatus,
       });
+      if (validatedGroupCanonicalReleased) {
+        console.log("[brain_v2_group_canonical_semantic_bound]", {
+          traceId,
+          semanticDecisionSource:
+            validatedGroupCanonicalReleased.semanticDecisionProvenance,
+          semanticIntent: authoritativeSemanticIntent,
+          itemScope: validatedGroupCanonicalReleased.itemScope ?? null,
+          itemReferenceMode: turnContextInput.itemReferenceMode ?? null,
+          referentCount: Array.isArray(
+            validatedGroupCanonicalReleased.itemReferents
+          )
+            ? validatedGroupCanonicalReleased.itemReferents.length
+            : 0,
+        });
+      }
     }
 
     // Unsafe continuation: fail closed — no generic routing, no mutation.
