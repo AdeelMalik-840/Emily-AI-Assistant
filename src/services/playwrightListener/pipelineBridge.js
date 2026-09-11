@@ -112,6 +112,7 @@ function unresolvedParticipantTurnScope(groupKey, adapted) {
  *   playwrightChatKey?: string,
  *   sourceRowKey?: string,
  *   sourceMessageIndex?: number,
+ *   scanGeneration?: number | null,
  *   startupCatchup?: boolean,
  *   suppressAckNoopOutbound?: boolean,
  *   cursorLastAssistantOutboundTrace?: Record<string, unknown> | null,
@@ -196,6 +197,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
   // (DOM/JID senderAnchor or verified phone → senderScope). Extracted
   // first-seen / display-name keys are not durable and must not be preserved.
   const participantKey = senderScope ? `scope::${senderScope}` : "";
+  const canonicalGroupBuffer = Boolean(participantKey);
   if (participantKey) {
     console.log("[participant_identity_stable_key_selected]", {
       groupChatKey: String(normalizedGroupChatKey ?? "").trim() || null,
@@ -253,23 +255,25 @@ async function buildPlaywrightSchedulePayload(adapted) {
   let inboundIntent = null;
   let inboundEntity = null;
   let resetTopicContext = false;
-  try {
-    const mod = await import("../intentEntityClassifier.js");
-    const classifyIntentWithAI = mod?.classifyIntentWithAI;
-    const applyPlaywrightClassifierToSession = mod?.applyPlaywrightClassifierToSession;
-    if (typeof classifyIntentWithAI === "function" && typeof applyPlaywrightClassifierToSession === "function") {
-      const classified = await classifyIntentWithAI({
-        message: String(adapted?.text ?? "").trim(),
-        context: recentForClassifier,
-      });
-      const classifierSessionKey = sessionKey || playwrightChatKey;
-      const applied = applyPlaywrightClassifierToSession(classifierSessionKey, classified) || {};
-      resetTopicContext = Boolean(applied.resetTopicContext);
-      inboundEntity = applied.inboundEntity ?? null;
-      inboundIntent = applied.inboundIntent ?? null;
+  if (!canonicalGroupBuffer) {
+    try {
+      const mod = await import("../intentEntityClassifier.js");
+      const classifyIntentWithAI = mod?.classifyIntentWithAI;
+      const applyPlaywrightClassifierToSession = mod?.applyPlaywrightClassifierToSession;
+      if (typeof classifyIntentWithAI === "function" && typeof applyPlaywrightClassifierToSession === "function") {
+        const classified = await classifyIntentWithAI({
+          message: String(adapted?.text ?? "").trim(),
+          context: recentForClassifier,
+        });
+        const classifierSessionKey = sessionKey || playwrightChatKey;
+        const applied = applyPlaywrightClassifierToSession(classifierSessionKey, classified) || {};
+        resetTopicContext = Boolean(applied.resetTopicContext);
+        inboundEntity = applied.inboundEntity ?? null;
+        inboundIntent = applied.inboundIntent ?? null;
+      }
+    } catch {
+      // Classifier is optional; continue without it (preserves existing fallback behavior).
     }
-  } catch {
-    // Classifier is optional; continue without it (preserves existing fallback behavior).
   }
 
   const conversationCustomerNumber = `grp${createHash("sha256")
@@ -332,6 +336,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
       phoneNumberId: sendCredentials?.phoneNumberId || null,
       text: line,
       isGroupMessage: true,
+      canonicalGroupBuffer,
       playwrightWebInbound: true,
       playwrightWebTitleIdentity: true,
       whatsappReplyTo: null,
@@ -356,6 +361,11 @@ async function buildPlaywrightSchedulePayload(adapted) {
         adapted?.sourceMessageIndex != null &&
         Number.isFinite(Number(adapted.sourceMessageIndex))
           ? Number(adapted.sourceMessageIndex)
+          : null,
+      scanGeneration:
+        adapted?.scanGeneration != null &&
+        Number.isFinite(Number(adapted.scanGeneration))
+          ? Math.trunc(Number(adapted.scanGeneration))
           : null,
       inboundSourceOrigin:
         adapted?.inboundSourceOrigin != null &&

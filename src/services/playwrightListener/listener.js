@@ -49,7 +49,14 @@ import {
   resolveInboundTurnAdmissionBlock,
 } from "../inboundTurnLedger.js";
 import { scheduleOutboundLockedRecovery } from "../outboundLockedRecovery.js";
-import { clearWhatsAppInboundMessageCaches } from "../whatsappInboundBuffer.js";
+import {
+  canAcceptOpenCanonicalGroupFragment,
+  clearWhatsAppInboundMessageCaches,
+  completeCanonicalGroupFinalObservation,
+  confirmCanonicalGroupScanCompleted,
+  getOpenCanonicalGroupBufferSnapshots,
+  recordCanonicalGroupObservationFailure,
+} from "../whatsappInboundBuffer.js";
 import { pollLocalApprovalContinuations } from "../localApprovalContinuationPoller.js";
 import { pollLocalAvailabilityContinuations } from "../localAvailabilityContinuationPoller.js";
 import { isReplyPrivateLockActive } from "../replyPrivateUiController.js";
@@ -2627,6 +2634,31 @@ export function __buildActiveGroupSelectionSignalForTests({
 }
 
 /**
+ * Proves that the listener may inspect the already-visible locked Group
+ * without navigating or mutating WhatsApp UI. This is intentionally narrower
+ * than permission to run the normal chat-selection loop.
+ */
+export function evaluateCanonicalGroupReadOnlyObservation({
+  lockedChatKey = "",
+  visibleChatTitle = "",
+  openBufferSnapshots = [],
+  uiMutationActive = false,
+} = {}) {
+  const lockedKey = normalizeTitle(String(lockedChatKey ?? "").trim());
+  const visibleKey = normalizeTitle(String(visibleChatTitle ?? "").trim());
+  if (!lockedKey || !Array.isArray(openBufferSnapshots) || openBufferSnapshots.length === 0) {
+    return { allowed: false, reason: "no_open_locked_group_buffer" };
+  }
+  if (uiMutationActive === true) {
+    return { allowed: false, reason: "ui_mutation_active" };
+  }
+  if (!visibleKey || visibleKey !== lockedKey) {
+    return { allowed: false, reason: "active_group_not_verified" };
+  }
+  return { allowed: true, reason: "exact_active_group_read_only" };
+}
+
+/**
  * @param {string | null | undefined} text
  */
 function isBusinessMessage(text) {
@@ -5032,6 +5064,26 @@ export function isPlaywrightGroupFreshDeltaOnlyEnabled() {
   return String(process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY ?? "").trim().toLowerCase() === "true";
 }
 
+/**
+ * Phase 1: trusted fresh Group rows cross the Playwright boundary one by one;
+ * the canonical inbound buffer, not listener semantics, assembles the turn.
+ */
+export function buildCanonicalGroupBufferDecisionBatches(
+  participantKey,
+  participantMessages,
+  enabled = isPlaywrightGroupFreshDeltaOnlyEnabled()
+) {
+  const rows = Array.isArray(participantMessages) ? participantMessages : [];
+  const canonicalGroupBuffering =
+    enabled === true && Boolean(reusableGroupParticipantKey(participantKey));
+  return {
+    canonicalGroupBuffering,
+    batches: canonicalGroupBuffering
+      ? [...rows].sort(compareRowsByWhatsAppTimeThenSource).map((row) => [row])
+      : [rows],
+  };
+}
+
 /** Group chats must not use legacy burst-merge when fresh-delta flag is off. */
 export function shouldBlockPlaywrightGroupLegacyProcessing() {
   return !isPlaywrightGroupFreshDeltaOnlyEnabled();
@@ -5443,9 +5495,70 @@ function getFreshDeltaChatState(chatKey) {
     pinnedRowKeyByIdentityPin: new Map(),
     pinnedRowKeyByStableId: new Map(),
     tickFirstSeenByStableId: new Map(),
+    scanGeneration: 0,
   };
   globalThis.__playwrightFreshDeltaState[key] = next;
   return next;
+}
+
+/**
+ * Complete exactly one deterministic admission scan for a chat. Rows admitted
+ * by this scan are stamped before forwarding; quiet and reply boundaries are
+ * then delivered to the participant-scoped canonical buffer.
+ */
+export function completeCanonicalFreshAdmissionScan({
+  freshState,
+  chatKey,
+  admittedTurns = [],
+  userMessages = [],
+  sortedWithPos = [],
+  notifyScanCompleted = confirmCanonicalGroupScanCompleted,
+} = {}) {
+  if (!freshState || typeof freshState !== "object") return null;
+  const scanGeneration = Math.max(0, Number(freshState.scanGeneration) || 0) + 1;
+  freshState.scanGeneration = scanGeneration;
+
+  const admittedParticipantKeys = new Set();
+  for (const turn of Array.isArray(admittedTurns) ? admittedTurns : []) {
+    const row = turn?.originalRow;
+    const participantKey = reusableGroupParticipantKey(
+      turn?.participantKey ?? row?.participantKey
+    );
+    if (participantKey) admittedParticipantKeys.add(participantKey);
+    if (row && typeof row === "object") row.scanGeneration = scanGeneration;
+  }
+
+  const assistantReplyAfterMessageIds = new Set();
+  for (const row of Array.isArray(userMessages) ? userMessages : []) {
+    const guard = evaluateReplyAfterGuard(row, sortedWithPos, chatKey);
+    if (guard.hasReplyAfter !== true) continue;
+    const { messageId } = resolvePlaywrightForwardIdentity(
+      chatKey,
+      row,
+      Number(row?.__position) || 0,
+      sortedWithPos
+    );
+    if (messageId) assistantReplyAfterMessageIds.add(String(messageId));
+  }
+
+  try {
+    const pending = notifyScanCompleted({
+      chatKey,
+      scanGeneration,
+      admittedParticipantKeys,
+      assistantReplyAfterMessageIds,
+    });
+    Promise.resolve(pending).catch((error) =>
+      console.error("[canonical_group_scan_completion] failed:", error)
+    );
+  } catch (error) {
+    console.error("[canonical_group_scan_completion] failed:", error);
+  }
+  return {
+    scanGeneration,
+    admittedParticipantKeys,
+    assistantReplyAfterMessageIds,
+  };
 }
 
 /**
@@ -7462,15 +7575,33 @@ async function runListenerBody() {
 
   const runChatLoop = async () => {
     let restartAfterInterrupt = false;
+    const lockedChatAtStart = activeChatLockKey();
+    const canonicalObservationSnapshots = lockedChatAtStart
+      ? getOpenCanonicalGroupBufferSnapshots(lockedChatAtStart)
+      : [];
+    const canonicalObservationOnly = canonicalObservationSnapshots.length > 0;
+    let canonicalObservationOutcome = null;
+    const recordBlockedCanonicalObservation = () => {
+      if (!canonicalObservationOnly) return;
+      const failure = recordCanonicalGroupObservationFailure(lockedChatAtStart);
+      if (
+        failure.releaseChatLock === true &&
+        normalizeTitle(activeChatLockKey()) === normalizeTitle(lockedChatAtStart)
+      ) {
+        releaseChatLock();
+      }
+    };
     globalThis.__visitedChatsThisCycle = new Set();
     if (isReplyPrivateLockActive()) {
       console.log("⛔ Skip switching — reply private flow active");
+      recordBlockedCanonicalObservation();
       return;
     }
     if (globalThis.__WA_MEDIA_SEND__) {
       console.log(
         "⏸ Skip switching — WA media send in progress (action: switch_chat deferred)"
       );
+      recordBlockedCanonicalObservation();
       return;
     }
     const isBusy =
@@ -7484,22 +7615,27 @@ async function runListenerBody() {
         outboundBusy: globalThis.__OUTBOUND_BUSY__ === true,
         loopRunning: globalThis.__loopRunning === true,
       });
+      recordBlockedCanonicalObservation();
       return;
     }
     if (globalThis.__UI_SEND_LOCK) {
       console.log("⛔ UI SEND LOCK ACTIVE — blocking chat switch");
+      recordBlockedCanonicalObservation();
       return;
     }
     if (globalThis.__UI_HARD_LOCK) {
       console.log("🔒 UI HARD LOCK — skipping rotation");
+      recordBlockedCanonicalObservation();
       return;
     }
     if (globalThis.__ACTIVE_PIPELINE__) {
       console.log("⏳ Active pipeline — skipping rotation");
+      recordBlockedCanonicalObservation();
       return;
     }
     if (globalThis.__OUTBOUND_BUSY__) {
       console.log("⛔ Outbound in progress — blocking chat switch");
+      recordBlockedCanonicalObservation();
       return;
     }
     if (
@@ -7521,10 +7657,11 @@ async function runListenerBody() {
     }
     if (globalThis.__activeJob) {
       console.log("⏳ Processing in progress — skip switching");
+      recordBlockedCanonicalObservation();
       return;
     }
     const lockedChatKey = activeChatLockKey();
-    if (lockedChatKey) {
+    if (lockedChatKey && !canonicalObservationOnly) {
       // Stale-lock failsafe: if something went wrong mid-pipeline, release and recover.
       if (maybeReleaseStaleChatLock()) {
         return;
@@ -7536,8 +7673,20 @@ async function runListenerBody() {
       });
       return;
     }
+    if (canonicalObservationOnly) {
+      console.log("[canonical_group_read_only_observation_started]", {
+        chatKey: lockedChatAtStart,
+        openBufferCount: canonicalObservationSnapshots.length,
+        finalObservationRequired: canonicalObservationSnapshots.some(
+          (row) => row.finalObservationRequired === true
+        ),
+      });
+    }
     console.log("[Loop] Running chat loop");
-    if (chatLoopRunning) return;
+    if (chatLoopRunning) {
+      recordBlockedCanonicalObservation();
+      return;
+    }
     chatLoopRunning = true;
     globalThis.__loopRunning = true;
     try {
@@ -7595,7 +7744,21 @@ async function runListenerBody() {
           });
         }
 
-        const conversationOpen = await ensureWhatsAppConversationOpen(page);
+        const readOnlyVisibleTitle = canonicalObservationOnly
+          ? String((await getActiveChatName(page).catch(() => "")) ?? "").trim()
+          : "";
+        const readOnlyObservationDecision =
+          evaluateCanonicalGroupReadOnlyObservation({
+            lockedChatKey: lockedChatAtStart,
+            visibleChatTitle: readOnlyVisibleTitle,
+            openBufferSnapshots: canonicalObservationSnapshots,
+            uiMutationActive: false,
+          });
+        const readOnlyExactGroupVerified =
+          canonicalObservationOnly && readOnlyObservationDecision.allowed === true;
+        const conversationOpen = canonicalObservationOnly
+          ? readOnlyExactGroupVerified
+          : await ensureWhatsAppConversationOpen(page);
         if (!conversationOpen) {
           console.warn(
             "[Loop] WhatsApp main pane not open after recovery — skip tick"
@@ -7626,7 +7789,19 @@ async function runListenerBody() {
         let dmProbeRestoreTarget = null;
         let selectedGroupLiveSignal = false;
 
-        if (globalThis.__forceNextChat) {
+        if (canonicalObservationOnly) {
+          chatName = readOnlyVisibleTitle;
+          skipRotation = true;
+          canonicalObservationOutcome = {
+            chatKey: lockedChatAtStart,
+            exactGroupVerified: true,
+            sourceObservationComplete: false,
+            scanGeneration: null,
+            admittedParticipantKeys: new Set(),
+          };
+        }
+
+        if (!canonicalObservationOnly && globalThis.__forceNextChat) {
           const forcedChatId = String(globalThis.__forceNextChat).trim();
           const topChatsForForce = await getTopChats(page, 30);
           const forcedChatName = topChatsForForce.find(
@@ -7647,7 +7822,11 @@ async function runListenerBody() {
           }
         }
 
-        if (!chatName && globalThis.__pendingChats instanceof Set) {
+        if (
+          !canonicalObservationOnly &&
+          !chatName &&
+          globalThis.__pendingChats instanceof Set
+        ) {
           const pendingIds = Array.from(globalThis.__pendingChats);
           if (pendingIds.length > 0) {
             const topChatsForPending = await getTopChats(page, 30);
@@ -7938,7 +8117,11 @@ async function runListenerBody() {
           }
 
           let opened = false;
-          if (viewing === chatName) {
+          if (canonicalObservationOnly) {
+            opened =
+              Boolean(viewing) &&
+              normalizeTitle(viewing) === normalizeTitle(lockedChatAtStart);
+          } else if (viewing === chatName) {
             const activeRow = page
               .locator(`#pane-side div[role="row"]`, {
                 has: page.locator(`span[title="${chatName}"]`),
@@ -7959,7 +8142,10 @@ async function runListenerBody() {
             return;
           }
 
-          const headerMatches = await ensureHeaderMatches(page, chatName);
+          const headerMatches = canonicalObservationOnly
+            ? normalizeTitle(String((await getActiveChatName(page).catch(() => "")) ?? "")) ===
+              normalizeTitle(lockedChatAtStart)
+            : await ensureHeaderMatches(page, chatName);
           if (!headerMatches) {
             console.log("⛔ SKIP: Header does not match target chat");
             return;
@@ -7998,8 +8184,12 @@ async function runListenerBody() {
 
           let headerOk = false;
           try {
-            const title = await ensureChatView(page);
-            headerOk = !!title;
+            const title = canonicalObservationOnly
+              ? await getActiveChatName(page)
+              : await ensureChatView(page);
+            headerOk = canonicalObservationOnly
+              ? normalizeTitle(String(title ?? "")) === normalizeTitle(lockedChatAtStart)
+              : !!title;
           } catch {
             console.warn("🚫 UI NOT READY — skipping loop");
             return;
@@ -8505,6 +8695,25 @@ async function runListenerBody() {
             );
           }
 
+          const completedFreshScan = freshState
+            ? completeCanonicalFreshAdmissionScan({
+                freshState,
+                chatKey,
+                admittedTurns: freshAdmittedTurns,
+                userMessages,
+                sortedWithPos,
+              })
+            : null;
+          if (canonicalObservationOnly && completedFreshScan) {
+            canonicalObservationOutcome = {
+              chatKey,
+              exactGroupVerified: true,
+              sourceObservationComplete: true,
+              scanGeneration: completedFreshScan.scanGeneration,
+              admittedParticipantKeys: completedFreshScan.admittedParticipantKeys,
+            };
+          }
+
           const participantBuckets = new Map();
           const allParticipantBuckets = new Map();
           const currentFreshAdmittedStableIds =
@@ -8578,7 +8787,10 @@ async function runListenerBody() {
             );
             return;
           }
-          if (globalThis.__chatResponding?.[chatKey] === true) {
+          if (
+            globalThis.__chatResponding?.[chatKey] === true &&
+            !canonicalObservationOnly
+          ) {
             console.log("⏳ Chat response in progress — skipping chat:", chatKey);
             return;
           }
@@ -8704,69 +8916,81 @@ async function runListenerBody() {
               globalThis.__lastProcessedUserMsg?.[cursorKey] ?? ""
             ).trim();
 
-            const forwardDecision = decideParticipantForwardTurn({
-              chatKey,
-              cursorKey,
-              participantKey,
-              participantMessages,
-              allParticipantUserRows: guaranteeFirst
-                ? allParticipantBuckets.get(participantKey) || participantMessages
-                : undefined,
-              extractedMessages,
-              sorted: sortedWithPos,
-              persistedCursor,
-              lastProcessedUserMsgId,
-              sidebarHasSignal: sidebarHasSignalForSelection,
-              normalizedGroupChatKeyForCompare,
-              guaranteeFirst,
-              anchorIndex: freshDeltaAcknowledgedAnchorIndex,
-              tickFirstSeenByStableId: freshState?.tickFirstSeenByStableId,
-              currentFreshAdmittedStableIds:
-                currentFreshAdmittedStableIdsByParticipant.get(participantKey) ||
-                currentFreshAdmittedStableIds,
-              baselineSeenStableIds:
-                freshState?.baselineSeenStableIds instanceof Set
-                  ? freshState.baselineSeenStableIds
-                  : null,
-              deps: {
-                buildExtractedMessageId,
-                buildStableMessageKey,
-                buildParticipantForwardCandidate,
-                evaluateReplyAfterGuard,
-                collapseRowsForForward,
-                isGroupMessageSuppressed,
-                suppressGroupMessageSelection,
-                maybeSuppressGroupMessageSelection,
-                isParticipantMessageInflightOrDone,
-                isRegisteredPlaywrightOutboundEcho,
-              },
-            });
+            const { canonicalGroupBuffering, batches: decisionBatches } =
+              buildCanonicalGroupBufferDecisionBatches(
+                participantKey,
+                participantMessages
+              );
 
-            if (forwardDecision.action !== "forward" || !forwardDecision.candidate) {
-              continue;
+            for (const decisionRows of decisionBatches) {
+              const forwardDecision = decideParticipantForwardTurn({
+                chatKey,
+                cursorKey,
+                participantKey,
+                participantMessages: decisionRows,
+                allParticipantUserRows: guaranteeFirst
+                  ? canonicalGroupBuffering
+                    ? decisionRows
+                    : allParticipantBuckets.get(participantKey) || participantMessages
+                  : undefined,
+                extractedMessages,
+                sorted: sortedWithPos,
+                persistedCursor,
+                lastProcessedUserMsgId,
+                sidebarHasSignal: sidebarHasSignalForSelection,
+                normalizedGroupChatKeyForCompare,
+                guaranteeFirst,
+                anchorIndex: freshDeltaAcknowledgedAnchorIndex,
+                tickFirstSeenByStableId: freshState?.tickFirstSeenByStableId,
+                currentFreshAdmittedStableIds:
+                  currentFreshAdmittedStableIdsByParticipant.get(participantKey) ||
+                  currentFreshAdmittedStableIds,
+                baselineSeenStableIds:
+                  freshState?.baselineSeenStableIds instanceof Set
+                    ? freshState.baselineSeenStableIds
+                    : null,
+                allowCanonicalBufferSuccessor: canonicalGroupBuffering,
+                deps: {
+                  buildExtractedMessageId,
+                  buildStableMessageKey,
+                  buildParticipantForwardCandidate,
+                  evaluateReplyAfterGuard,
+                  collapseRowsForForward,
+                  isGroupMessageSuppressed,
+                  suppressGroupMessageSelection,
+                  maybeSuppressGroupMessageSelection,
+                  isParticipantMessageInflightOrDone,
+                  isRegisteredPlaywrightOutboundEcho,
+                },
+              });
+
+              if (forwardDecision.action !== "forward" || !forwardDecision.candidate) {
+                continue;
+              }
+
+              const candidate = forwardDecision.candidate;
+              const lastUserMsgId = String(forwardDecision.stableId ?? "").trim();
+              const idStrategy = forwardDecision.idStrategy || "UNKNOWN";
+
+              newUserMessages.push(candidate);
+              console.log("[participant_new_message_selected]", {
+                chatKey,
+                participantKey: candidate.participantKey || null,
+                cursorKey,
+                lastUserMsgId,
+                idStrategy,
+                forwardDecisionReason: forwardDecision.reason,
+                canonicalGroupBuffering,
+                burstMerged: Boolean(candidate.__burstMerged),
+                burstCount: candidate.__burstMergedCount ?? 1,
+                mergedRowCount: candidate.__catchupMergedRowCount || 1,
+                persistedCursorPresent: Boolean(
+                  forwardDecision.normalizedCursor || persistedCursor
+                ),
+                indexDriftRecovered: Boolean(forwardDecision.indexDriftRecovered),
+                textPreview: String(candidate.text ?? "").slice(0, 120),
+              });
             }
-
-            const candidate = forwardDecision.candidate;
-            const lastUserMsgId = String(forwardDecision.stableId ?? "").trim();
-            const idStrategy = forwardDecision.idStrategy || "UNKNOWN";
-
-            newUserMessages.push(candidate);
-            console.log("[participant_new_message_selected]", {
-              chatKey,
-              participantKey: candidate.participantKey || null,
-              cursorKey,
-              lastUserMsgId,
-              idStrategy,
-              forwardDecisionReason: forwardDecision.reason,
-              burstMerged: Boolean(candidate.__burstMerged),
-              burstCount: candidate.__burstMergedCount ?? 1,
-              mergedRowCount: candidate.__catchupMergedRowCount || 1,
-              persistedCursorPresent: Boolean(
-                forwardDecision.normalizedCursor || persistedCursor
-              ),
-              indexDriftRecovered: Boolean(forwardDecision.indexDriftRecovered),
-              textPreview: String(candidate.text ?? "").slice(0, 120),
-            });
           }
           newUserMessages.sort(compareRowsByWhatsAppTimeThenSource);
 
@@ -8908,7 +9132,19 @@ async function runListenerBody() {
             freshState,
             sortedWithPos,
             ownerUserIdForCursor,
+            scanGeneration: completedFreshScan?.scanGeneration ?? null,
             page,
+            ensureActiveChat: canonicalObservationOnly
+              ? async (activePage, _chatName, expectedChatKey) => {
+                  const visibleTitle = await getActiveChatName(activePage).catch(
+                    () => null
+                  );
+                  return (
+                    normalizeTitle(String(visibleTitle ?? "").trim()) ===
+                    normalizeTitle(expectedChatKey)
+                  );
+                }
+              : undefined,
           });
 
           const updatedSeen = new Set(prevSeenBase);
@@ -8942,6 +9178,30 @@ async function runListenerBody() {
         }
       }
     } finally {
+      if (canonicalObservationOnly) {
+        if (
+          canonicalObservationOutcome?.sourceObservationComplete === true &&
+          canonicalObservationOutcome?.exactGroupVerified === true
+        ) {
+          await completeCanonicalGroupFinalObservation({
+            chatKey: canonicalObservationOutcome.chatKey,
+            scanGeneration: canonicalObservationOutcome.scanGeneration,
+            expectedBufferVersions: canonicalObservationSnapshots,
+            admittedParticipantKeys:
+              canonicalObservationOutcome.admittedParticipantKeys,
+            sourceObservationComplete: true,
+            exactGroupVerified: true,
+          });
+        } else {
+          const failure = recordCanonicalGroupObservationFailure(lockedChatAtStart);
+          if (
+            failure.releaseChatLock === true &&
+            normalizeTitle(activeChatLockKey()) === normalizeTitle(lockedChatAtStart)
+          ) {
+            releaseChatLock();
+          }
+        }
+      }
       chatLoopRunning = false;
       globalThis.__loopRunning = false;
       if (restartAfterInterrupt && !isStopping) {
@@ -9263,6 +9523,13 @@ export async function runPlaywrightForwardPass(p = {}) {
   const freshState = p.freshState ?? null;
   const sortedWithPos = Array.isArray(p.sortedWithPos) ? p.sortedWithPos : [];
   const ownerUserIdForCursor = p.ownerUserIdForCursor;
+  const scanGeneration =
+    p.scanGeneration != null && Number.isFinite(Number(p.scanGeneration))
+      ? Math.trunc(Number(p.scanGeneration))
+      : freshState?.scanGeneration != null &&
+          Number.isFinite(Number(freshState.scanGeneration))
+        ? Math.trunc(Number(freshState.scanGeneration))
+        : null;
   const page = p.page ?? null;
   const ensureActiveChatFn =
     typeof p.ensureActiveChat === "function"
@@ -9275,6 +9542,11 @@ export async function runPlaywrightForwardPass(p = {}) {
 
   const scheduledStableIds = [];
   const lockSkippedStableIds = [];
+  let acquiredChatLockHere = false;
+  const processingLockPreexisted =
+    globalThis.__processingChats instanceof Map &&
+    globalThis.__processingChats.get(chatKey) === true;
+  let canonicalBufferHandoffStarted = false;
 
   // Durable session-seen is committed only after forwardToPipeline === true.
   // That return is the irreversible handoff: later listener bookkeeping
@@ -9305,6 +9577,7 @@ export async function runPlaywrightForwardPass(p = {}) {
   // Acquire hard chat lock for this chatKey before forwarding (prevents any chat switching).
   if (!activeChatLockKey()) {
     globalThis.__activeChatLock = { chatKey, inProgress: true, startedAtMs: Date.now() };
+    acquiredChatLockHere = true;
     console.log("[chat_lock_acquired]", { chatKey });
   }
   globalThis.__ACTIVE_PROCESSING_CHAT = chatKey;
@@ -9427,7 +9700,24 @@ export async function runPlaywrightForwardPass(p = {}) {
       globalThis.__processingChats instanceof Map
         ? globalThis.__processingChats.get(chatKey) === true
         : false;
-    if (chatLocked) {
+    const canJoinCanonicalBufferBatch =
+      canonicalBufferHandoffStarted &&
+      !processingLockPreexisted &&
+      isPlaywrightGroupFreshDeltaOnlyEnabled() &&
+      Boolean(reusableGroupParticipantKey(msg?.participantKey));
+    const canJoinExistingOpenCanonicalBuffer =
+      isPlaywrightGroupFreshDeltaOnlyEnabled() &&
+      normalizeTitle(activeChatLockKey()) === normalizeTitle(chatKey) &&
+      canAcceptOpenCanonicalGroupFragment({
+        chatKey,
+        participantKey: reusableGroupParticipantKey(msg?.participantKey),
+        messageId,
+      });
+    if (
+      chatLocked &&
+      !canJoinCanonicalBufferBatch &&
+      !canJoinExistingOpenCanonicalBuffer
+    ) {
       console.log("⏳ Chat processing lock active — skipping for retry:", {
         chatKey,
       });
@@ -9504,6 +9794,10 @@ export async function runPlaywrightForwardPass(p = {}) {
         suppressAckNoopOutbound: Boolean(msg.__suppressAckNoopOutbound),
         cursorLastAssistantOutboundTrace:
           msg.__persistedCursor?.lastAssistantOutboundTrace || null,
+        scanGeneration:
+          msg.scanGeneration != null && Number.isFinite(Number(msg.scanGeneration))
+            ? Math.trunc(Number(msg.scanGeneration))
+            : scanGeneration,
       });
     } catch (fwdErr) {
       globalThis.__chatResponding[chatKey] = false;
@@ -9575,6 +9869,12 @@ export async function runPlaywrightForwardPass(p = {}) {
 
     // Irreversible handoff: pipeline already accepted this inbound.
     anyForwarded = true;
+    if (
+      isPlaywrightGroupFreshDeltaOnlyEnabled() &&
+      reusableGroupParticipantKey(msg?.participantKey)
+    ) {
+      canonicalBufferHandoffStarted = true;
+    }
     for (const sid of claimIds) {
       if (sid) scheduledStableIds.push(sid);
     }
@@ -9664,7 +9964,11 @@ export async function runPlaywrightForwardPass(p = {}) {
     globalThis.__ACTIVE_PROCESSING_CHAT = null;
     // Release lock if nothing was forwarded (pipeline errored before any send could happen).
     // If at least one forward succeeded, Playwright outbound releases after send completes.
-    if (!anyForwarded && activeChatLockKey() === chatKey) {
+    if (
+      !anyForwarded &&
+      acquiredChatLockHere &&
+      activeChatLockKey() === chatKey
+    ) {
       releaseChatLock();
     }
     if (globalThis.__pendingChats && globalThis.__pendingChats.size > 0) {

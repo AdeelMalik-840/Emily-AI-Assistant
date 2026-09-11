@@ -192,8 +192,8 @@ test("lock-busy lifecycle: distinct WA IDs stay independent through production l
   assert.match(String(firstCandidate.text), /Civic/i);
   assert.doesNotMatch(String(firstCandidate.text), /Corolla/i);
 
-  // Both independent turns enter the production forward batch (as after unlock
-  // when multiple processable messages are present). Lock branch must keep B pending.
+  // Both physical rows enter the production forward batch. Phase 1 allows rows
+  // accepted by this pass to join the still-open canonical Group buffer.
   const messagesToForward = [msgA, msgB].sort((a, b) => a.timestamp - b.timestamp);
 
   /** @type {object[]} */
@@ -218,52 +218,28 @@ test("lock-busy lifecycle: distinct WA IDs stay independent through production l
   });
 
   assert.equal(pass1.anyForwarded, true);
-  assert.equal(pipelineCalls.length, 1, "only first turn schedules while lock free");
+  assert.equal(pipelineCalls.length, 2, "both fragments schedule before buffer freeze");
   assert.equal(String(pipelineCalls[0].messageId), idA);
-  assert.deepEqual(pass1.scheduledStableIds, [idA]);
-  assert.deepEqual(pass1.lockSkippedStableIds, [idB]);
+  assert.equal(String(pipelineCalls[1].messageId), idB);
+  assert.deepEqual(pass1.scheduledStableIds, [idA, idB]);
+  assert.deepEqual(pass1.lockSkippedStableIds, []);
 
   const gkA = playwrightGuaranteeKey(idA);
   const gkB = playwrightGuaranteeKey(idB);
   assert.equal(getMessageState(gkA)?.state, "processing");
-  assert.equal(
-    getMessageState(gkB)?.state == null || getMessageState(gkB)?.state === "idle",
-    true,
-    "lock-skipped B must not be marked processing/done"
-  );
+  assert.equal(getMessageState(gkB)?.state, "processing");
   assert.equal(globalThis.__processingChats.get(CHAT), true);
 
   const ledgerA = getInboundTurnLedgerEntry(CHAT, idA);
   const ledgerB = getInboundTurnLedgerEntry(CHAT, idB);
   assert.equal(ledgerA?.state, "processing");
-  assert.notEqual(ledgerB?.state, "done");
-  assert.notEqual(ledgerB?.state, "processing");
+  assert.equal(ledgerB?.state, "processing");
 
-  // Production outbound completion unlocks the chat (do not manually delete the lock).
+  // This test injects the pipeline boundary; canonical-buffer lifecycle binding
+  // of both IDs to one final guarantee is covered by the Phase 1 buffer tests.
   notifyPlaywrightGuaranteeDelivered(gkA);
   assert.equal(globalThis.__processingChats.get(CHAT), undefined);
   assert.equal(getMessageState(gkA)?.state, "done");
-
-  const pass2 = await runPlaywrightForwardPass({
-    messagesToForward: [msgB],
-    chatKey: CHAT,
-    chatName: OPEN_TITLE,
-    openTitle: OPEN_TITLE,
-    activeChat: OPEN_TITLE,
-    extractedMessages: sorted,
-    freshState,
-    sortedWithPos: sorted,
-    ownerUserIdForCursor: "owner-test",
-    ensureActiveChat: async () => true,
-    forwardToPipeline,
-  });
-
-  assert.equal(pass2.anyForwarded, true);
-  assert.equal(pipelineCalls.length, 2, "exactly one pipeline call per durable ID");
-  assert.equal(String(pipelineCalls[1].messageId), idB);
-  assert.deepEqual(pass2.scheduledStableIds, [idB]);
-  assert.deepEqual(pass2.lockSkippedStableIds, []);
-
   notifyPlaywrightGuaranteeDelivered(gkB);
   assert.equal(getMessageState(gkA)?.state, "done");
   assert.equal(getMessageState(gkB)?.state, "done");
