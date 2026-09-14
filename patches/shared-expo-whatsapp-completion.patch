@@ -1,0 +1,1805 @@
+diff --git a/mobile-app/services/whatsappConnection.ts b/mobile-app/services/whatsappConnection.ts
+new file mode 100644
+index 0000000..cbd5811
+--- /dev/null
++++ b/mobile-app/services/whatsappConnection.ts
+@@ -0,0 +1,169 @@
++/**
++ * Backend-authoritative WhatsApp connection API. This is the server-owned
++ * whatsapp_connections / whatsapp_link_attempts model (Codex multi-business
++ * architecture) -- the frontend never reads or writes those collections
++ * directly, it only calls these authenticated endpoints.
++ */
++import { auth } from "@/firebase";
++
++const API_BASE_URL = process.env.EXPO_PUBLIC_EMILY_API_URL;
++
++function requireApiOrigin(): string {
++  if (API_BASE_URL == null || String(API_BASE_URL).trim() === "") {
++    throw new Error("Missing EXPO_PUBLIC_EMILY_API_URL");
++  }
++  return String(API_BASE_URL).replace(/\/$/, "");
++}
++
++async function authHeaders(): Promise<Record<string, string>> {
++  const u = auth.currentUser;
++  if (!u) throw new Error("Sign in required");
++  const idToken = await u.getIdToken();
++  return {
++    Authorization: `Bearer ${idToken}`,
++    "Content-Type": "application/json",
++  };
++}
++
++export type WhatsAppGroupStatus =
++  | "disconnected"
++  | "linking"
++  | "connected"
++  | "degraded"
++  | "reconnect_required";
++
++export type WhatsAppDmStatus =
++  | "disconnected"
++  | "pending"
++  | "connected"
++  | "degraded";
++
++export type WhatsAppOverallStatus =
++  | "not_connected"
++  | "connecting"
++  | "ready"
++  | "degraded"
++  | "reconnect_required";
++
++export type WhatsAppConnection = {
++  schemaVersion: number;
++  group: {
++    status: WhatsAppGroupStatus;
++    linkedPhoneE164: string | null;
++    reconnectRequired: boolean;
++    lastErrorCode: string | null;
++  };
++  dm: {
++    status: WhatsAppDmStatus;
++    displayPhoneNumber: string | null;
++    lastErrorCode: string | null;
++  };
++  overallStatus: WhatsAppOverallStatus;
++};
++
++export type LinkAttemptStatus =
++  | "preparing"
++  | "code_ready"
++  | "waiting"
++  | "connected"
++  | "failed"
++  | "expired"
++  | "cancelled";
++
++export type LinkAttempt = {
++  attemptId: string;
++  status: LinkAttemptStatus;
++  requestedPhoneE164: string | null;
++  failureCode: string | null;
++  linkingCode?: string;
++};
++
++async function parseJsonOrThrow<T>(
++  res: Response,
++  fallbackMessage: string
++): Promise<T> {
++  const body = (await res.json().catch(() => ({}))) as { error?: string } &
++    Record<string, unknown>;
++  if (!res.ok) {
++    throw new Error(body.error || `${fallbackMessage} (${res.status})`);
++  }
++  return body as T;
++}
++
++export async function getConnectionStatus(): Promise<WhatsAppConnection | null> {
++  const origin = requireApiOrigin();
++  const headers = await authHeaders();
++  const res = await fetch(`${origin}/api/whatsapp/connection`, { headers });
++  const body = await parseJsonOrThrow<{ connection: WhatsAppConnection | null }>(
++    res,
++    "Could not load connection status"
++  );
++  return body.connection;
++}
++
++export async function startLinkAttempt(phone: string): Promise<LinkAttempt> {
++  const origin = requireApiOrigin();
++  const headers = await authHeaders();
++  const res = await fetch(`${origin}/api/whatsapp/link-attempt`, {
++    method: "POST",
++    headers,
++    body: JSON.stringify({ phone }),
++  });
++  const body = await parseJsonOrThrow<{ attempt: LinkAttempt }>(
++    res,
++    "Could not start connection"
++  );
++  return body.attempt;
++}
++
++export async function getLinkAttemptStatus(
++  attemptId: string
++): Promise<LinkAttempt | null> {
++  const origin = requireApiOrigin();
++  const headers = await authHeaders();
++  const res = await fetch(
++    `${origin}/api/whatsapp/link-attempt/${encodeURIComponent(attemptId)}`,
++    { headers }
++  );
++  if (res.status === 404) return null;
++  const body = await parseJsonOrThrow<{ attempt: LinkAttempt }>(
++    res,
++    "Could not check connection status"
++  );
++  return body.attempt;
++}
++
++export async function cancelLinkAttempt(attemptId: string): Promise<void> {
++  const origin = requireApiOrigin();
++  const headers = await authHeaders();
++  const res = await fetch(
++    `${origin}/api/whatsapp/link-attempt/${encodeURIComponent(attemptId)}/cancel`,
++    { method: "POST", headers }
++  );
++  await parseJsonOrThrow(res, "Could not cancel connection attempt");
++}
++
++export async function reconnectWhatsApp(phone: string): Promise<LinkAttempt> {
++  const origin = requireApiOrigin();
++  const headers = await authHeaders();
++  const res = await fetch(`${origin}/api/whatsapp/reconnect`, {
++    method: "POST",
++    headers,
++    body: JSON.stringify({ phone }),
++  });
++  const body = await parseJsonOrThrow<{ attempt: LinkAttempt }>(
++    res,
++    "Could not reconnect"
++  );
++  return body.attempt;
++}
++
++export async function disconnectWhatsAppConnection(): Promise<void> {
++  const origin = requireApiOrigin();
++  const headers = await authHeaders();
++  const res = await fetch(`${origin}/api/whatsapp/disconnect`, {
++    method: "POST",
++    headers,
++  });
++  await parseJsonOrThrow(res, "Could not disconnect");
++}
+diff --git a/mobile-app/hooks/useWhatsAppConnection.ts b/mobile-app/hooks/useWhatsAppConnection.ts
+new file mode 100644
+index 0000000..0ade481
+--- /dev/null
++++ b/mobile-app/hooks/useWhatsAppConnection.ts
+@@ -0,0 +1,298 @@
++import AsyncStorage from "@react-native-async-storage/async-storage";
++import { useCallback, useEffect, useRef, useState } from "react";
++import { AppState } from "react-native";
++
++import {
++  cancelLinkAttempt,
++  disconnectWhatsAppConnection,
++  getConnectionStatus,
++  getLinkAttemptStatus,
++  reconnectWhatsApp,
++  startLinkAttempt,
++  type WhatsAppConnection,
++} from "@/services/whatsappConnection";
++import { parseAndValidateManualWhatsAppPhone } from "@/utils/validateManualWhatsAppPhone";
++
++const LINK_ATTEMPT_POLL_MS = 2500;
++const CONNECTION_POLL_MS = 3000;
++
++export type WhatsAppConnectionPhase =
++  | { kind: "loading" }
++  | { kind: "phone_entry" }
++  | { kind: "preparing" }
++  | { kind: "code_ready"; linkingCode: string }
++  | { kind: "setting_up" }
++  | { kind: "ready"; displayPhoneNumber: string | null }
++  | { kind: "reconnect_required" }
++  | { kind: "error" };
++
++function attemptStorageKey(businessId: string): string {
++  return `emily.whatsapp.activeLinkAttemptId.${businessId}`;
++}
++
++/**
++ * Drives the Connect WhatsApp UX against the backend-authoritative
++ * whatsapp_connections / whatsapp_link_attempts model. The frontend never
++ * decides "connected" on its own -- it only reflects what the server
++ * reports (overallStatus === "ready" requires group AND dm connected).
++ */
++export function useWhatsAppConnection(businessId: string | null) {
++  const [phase, setPhase] = useState<WhatsAppConnectionPhase>({
++    kind: "loading",
++  });
++  const [connection, setConnection] = useState<WhatsAppConnection | null>(
++    null
++  );
++
++  const attemptIdRef = useRef<string | null>(null);
++  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++  const mountedRef = useRef(true);
++  const businessIdRef = useRef(businessId);
++  businessIdRef.current = businessId;
++
++  const clearPollTimer = useCallback(() => {
++    if (pollTimerRef.current) {
++      clearTimeout(pollTimerRef.current);
++      pollTimerRef.current = null;
++    }
++  }, []);
++
++  const persistAttemptId = useCallback(async (attemptId: string | null) => {
++    attemptIdRef.current = attemptId;
++    const uid = businessIdRef.current;
++    if (!uid) return;
++    try {
++      if (attemptId) {
++        await AsyncStorage.setItem(attemptStorageKey(uid), attemptId);
++      } else {
++        await AsyncStorage.removeItem(attemptStorageKey(uid));
++      }
++    } catch {
++      // Best-effort only; losing this cache just means the app falls back
++      // to the plain connection-status view after a kill+reopen mid-link.
++    }
++  }, []);
++
++  const applyConnection = useCallback((next: WhatsAppConnection | null) => {
++    if (!mountedRef.current) return;
++    setConnection(next);
++    if (!next) return "not_connected" as const;
++    return next.overallStatus;
++  }, []);
++
++  const pollConnectionUntilReady = useCallback(() => {
++    clearPollTimer();
++    const tick = async () => {
++      try {
++        const next = await getConnectionStatus();
++        if (!mountedRef.current) return;
++        const status = applyConnection(next);
++        if (status === "ready") {
++          await persistAttemptId(null);
++          setPhase({
++            kind: "ready",
++            displayPhoneNumber: next?.dm.displayPhoneNumber ?? null,
++          });
++          return;
++        }
++        if (status === "reconnect_required") {
++          await persistAttemptId(null);
++          setPhase({ kind: "reconnect_required" });
++          return;
++        }
++        setPhase({ kind: "setting_up" });
++        pollTimerRef.current = setTimeout(tick, CONNECTION_POLL_MS);
++      } catch {
++        if (!mountedRef.current) return;
++        pollTimerRef.current = setTimeout(tick, CONNECTION_POLL_MS);
++      }
++    };
++    void tick();
++  }, [applyConnection, clearPollTimer, persistAttemptId]);
++
++  const pollLinkAttempt = useCallback(
++    (attemptId: string) => {
++      clearPollTimer();
++      const tick = async () => {
++        try {
++          const attempt = await getLinkAttemptStatus(attemptId);
++          if (!mountedRef.current) return;
++          if (!attempt) {
++            await persistAttemptId(null);
++            setPhase({ kind: "error" });
++            return;
++          }
++          if (attempt.status === "preparing") {
++            setPhase({ kind: "preparing" });
++            pollTimerRef.current = setTimeout(tick, LINK_ATTEMPT_POLL_MS);
++            return;
++          }
++          if (attempt.status === "code_ready" || attempt.status === "waiting") {
++            if (attempt.linkingCode) {
++              setPhase({
++                kind: "code_ready",
++                linkingCode: attempt.linkingCode,
++              });
++            } else {
++              setPhase({ kind: "setting_up" });
++            }
++            pollTimerRef.current = setTimeout(tick, LINK_ATTEMPT_POLL_MS);
++            return;
++          }
++          if (attempt.status === "connected") {
++            setPhase({ kind: "setting_up" });
++            pollConnectionUntilReady();
++            return;
++          }
++          // failed | expired | cancelled
++          await persistAttemptId(null);
++          setPhase({ kind: "error" });
++        } catch {
++          if (!mountedRef.current) return;
++          pollTimerRef.current = setTimeout(tick, LINK_ATTEMPT_POLL_MS);
++        }
++      };
++      void tick();
++    },
++    [clearPollTimer, persistAttemptId, pollConnectionUntilReady]
++  );
++
++  const refresh = useCallback(async () => {
++    if (!businessIdRef.current) {
++      setPhase({ kind: "phone_entry" });
++      return;
++    }
++    try {
++      const next = await getConnectionStatus();
++      if (!mountedRef.current) return;
++      const status = applyConnection(next);
++
++      if (status === "ready") {
++        await persistAttemptId(null);
++        setPhase({
++          kind: "ready",
++          displayPhoneNumber: next?.dm.displayPhoneNumber ?? null,
++        });
++        return;
++      }
++      if (status === "reconnect_required") {
++        await persistAttemptId(null);
++        setPhase({ kind: "reconnect_required" });
++        return;
++      }
++
++      const cachedAttemptId = await AsyncStorage.getItem(
++        attemptStorageKey(businessIdRef.current)
++      ).catch(() => null);
++      if (cachedAttemptId) {
++        attemptIdRef.current = cachedAttemptId;
++        pollLinkAttempt(cachedAttemptId);
++        return;
++      }
++
++      if (status === "connecting") {
++        setPhase({ kind: "setting_up" });
++        pollConnectionUntilReady();
++        return;
++      }
++
++      setPhase({ kind: "phone_entry" });
++    } catch {
++      if (!mountedRef.current) return;
++      setPhase({ kind: "phone_entry" });
++    }
++  }, [applyConnection, persistAttemptId, pollConnectionUntilReady, pollLinkAttempt]);
++
++  useEffect(() => {
++    mountedRef.current = true;
++    void refresh();
++    return () => {
++      mountedRef.current = false;
++      clearPollTimer();
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [businessId]);
++
++  useEffect(() => {
++    const sub = AppState.addEventListener("change", (state) => {
++      if (state !== "active") return;
++      if (phase.kind === "code_ready" || phase.kind === "preparing") {
++        if (attemptIdRef.current) pollLinkAttempt(attemptIdRef.current);
++      } else if (phase.kind === "setting_up") {
++        pollConnectionUntilReady();
++      }
++    });
++    return () => sub.remove();
++  }, [phase.kind, pollLinkAttempt, pollConnectionUntilReady]);
++
++  const submitPhone = useCallback(
++    async (rawPhone: string) => {
++      const parsed = parseAndValidateManualWhatsAppPhone(rawPhone);
++      if (!parsed.ok) {
++        throw new Error(parsed.error);
++      }
++      setPhase({ kind: "preparing" });
++      try {
++        const attempt = await startLinkAttempt(parsed.phone);
++        await persistAttemptId(attempt.attemptId);
++        pollLinkAttempt(attempt.attemptId);
++      } catch (err) {
++        setPhase({ kind: "phone_entry" });
++        throw err;
++      }
++    },
++    [persistAttemptId, pollLinkAttempt]
++  );
++
++  const cancelLinking = useCallback(async () => {
++    clearPollTimer();
++    const attemptId = attemptIdRef.current;
++    await persistAttemptId(null);
++    setPhase({ kind: "phone_entry" });
++    if (attemptId) {
++      await cancelLinkAttempt(attemptId).catch(() => {});
++    }
++  }, [clearPollTimer, persistAttemptId]);
++
++  const retryAfterError = useCallback(() => {
++    void refresh();
++  }, [refresh]);
++
++  const reconnect = useCallback(
++    async (rawPhone: string) => {
++      const parsed = parseAndValidateManualWhatsAppPhone(rawPhone);
++      if (!parsed.ok) {
++        throw new Error(parsed.error);
++      }
++      setPhase({ kind: "preparing" });
++      try {
++        const attempt = await reconnectWhatsApp(parsed.phone);
++        await persistAttemptId(attempt.attemptId);
++        pollLinkAttempt(attempt.attemptId);
++      } catch (err) {
++        setPhase({ kind: "reconnect_required" });
++        throw err;
++      }
++    },
++    [persistAttemptId, pollLinkAttempt]
++  );
++
++  const disconnect = useCallback(async () => {
++    clearPollTimer();
++    await disconnectWhatsAppConnection();
++    await persistAttemptId(null);
++    setConnection(null);
++    setPhase({ kind: "phone_entry" });
++  }, [clearPollTimer, persistAttemptId]);
++
++  return {
++    phase,
++    connection,
++    submitPhone,
++    cancelLinking,
++    retryAfterError,
++    reconnect,
++    disconnect,
++    refresh,
++  };
++}
+diff --git a/mobile-app/components/WhatsAppConnectModal.tsx b/mobile-app/components/WhatsAppConnectModal.tsx
+index ea071cf..0399be3 100644
+--- a/mobile-app/components/WhatsAppConnectModal.tsx
++++ b/mobile-app/components/WhatsAppConnectModal.tsx
+@@ -1,8 +1,7 @@
+-import { useCallback, useEffect, useRef, useState } from "react";
++import { useCallback, useEffect, useState } from "react";
+ import {
+   ActivityIndicator,
+   KeyboardAvoidingView,
+-  Linking,
+   Modal,
+   Platform,
+   Pressable,
+@@ -14,34 +13,34 @@ import {
+ import PhoneInput from "react-native-phone-number-input";
+ import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+-import {
+-  disconnectWhatsApp,
+-  submitManualWhatsAppConnect,
+-} from "../services/whatsappConnect";
++import { useWhatsAppConnection } from "@/hooks/useWhatsAppConnection";
++import type { WhatsAppConnection } from "@/services/whatsappConnection";
+
+ const BG = "#FFFFFF";
+
+-type ConnectPhase = "idle" | "pending" | "success" | "error";
+-
+-type ManageStep = "info" | "confirm" | "disconnecting" | "disconnected";
+-
+-export type WhatsAppConnectOptions = { fromManual?: boolean };
+-
+ type Props = {
+   visible: boolean;
+   onClose: () => void;
+-  onConnected: (phoneNumber: string, options?: WhatsAppConnectOptions) => void;
+-  onDisconnected?: () => void;
++  businessId: string | null;
++  /** Prefill only -- the user must confirm/edit before it is used. */
++  suggestedPhone?: string | null;
++  onConnectionChange?: (connection: WhatsAppConnection | null) => void;
++  /** Opens straight into the manage/disconnect view instead of the connect flow. */
+   manageOnly?: boolean;
+-  connectedPhone?: string | null;
+ };
+
+-function friendlyConnectError(message: string | undefined): string {
++function friendlyError(message: string | undefined): string {
+   const m = String(message ?? "").trim();
+   return m !== "" ? m : "Something went wrong. Please try again.";
+ }
+
+-/** ISO 3166-1 alpha-2 → regional-indicator flag emoji (works without node-emoji / image fetch). */
++function formatLinkingCode(code: string): string {
++  const digits = code.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
++  if (digits.length !== 8) return code;
++  return `${digits.slice(0, 4)}-${digits.slice(4)}`;
++}
++
++/** ISO 3166-1 alpha-2 -> regional-indicator flag emoji. */
+ function regionalIndicatorFlagEmoji(iso2: string): string {
+   const u = String(iso2)
+     .toUpperCase()
+@@ -57,94 +56,94 @@ function regionalIndicatorFlagEmoji(iso2: string): string {
+ export function WhatsAppConnectModal({
+   visible,
+   onClose,
+-  onConnected,
+-  onDisconnected,
++  businessId,
++  suggestedPhone,
++  onConnectionChange,
+   manageOnly = false,
+-  connectedPhone,
+ }: Props) {
+   const insets = useSafeAreaInsets();
+   const actionsBottomPad = Math.max(20, insets.bottom);
+-  const phoneInputRef = useRef<InstanceType<typeof PhoneInput>>(null);
+
+-  const [phase, setPhase] = useState<ConnectPhase>("idle");
+-  const [manageStep, setManageStep] = useState<ManageStep>("info");
+-  const [phoneInput, setPhoneInput] = useState("");
+-  const [phoneInputMountKey, setPhoneInputMountKey] = useState(0);
+-  const [submittedPhone, setSubmittedPhone] = useState("");
+-  const [connectErrorMessage, setConnectErrorMessage] = useState<string | null>(
+-    null
+-  );
++  const {
++    phase,
++    connection,
++    submitPhone,
++    cancelLinking,
++    retryAfterError,
++    reconnect,
++    disconnect,
++  } = useWhatsAppConnection(businessId);
+
+-  const reset = useCallback(() => {
+-    setPhase("idle");
+-    setManageStep("info");
+-    setPhoneInput("");
+-    setPhoneInputMountKey((k) => k + 1);
+-    setSubmittedPhone("");
+-    setConnectErrorMessage(null);
+-  }, []);
++  const [phoneInput, setPhoneInput] = useState(suggestedPhone ?? "");
++  const [phoneInputMountKey, setPhoneInputMountKey] = useState(0);
++  const [submitError, setSubmitError] = useState<string | null>(null);
++  const [submitting, setSubmitting] = useState(false);
++  const [confirmingDisconnect, setConfirmingDisconnect] = useState(false);
++  const [disconnecting, setDisconnecting] = useState(false);
+
+   useEffect(() => {
+-    if (!visible) {
+-      reset();
++    if (visible) {
++      setPhoneInput(suggestedPhone ?? "");
++      setPhoneInputMountKey((k) => k + 1);
++      setSubmitError(null);
++      setConfirmingDisconnect(false);
++      setDisconnecting(false);
+     }
+-  }, [visible, reset]);
+-
+-  const manageBlocking =
+-    manageOnly && (manageStep === "disconnecting" || manageStep === "confirm");
++  }, [visible, suggestedPhone]);
+
+-  const handleBackdrop = () => {
+-    if (phase === "pending" || manageBlocking) return;
+-    onClose();
+-  };
++  useEffect(() => {
++    onConnectionChange?.(connection);
++  }, [connection, onConnectionChange]);
+
+-  const onErrorTryAgain = () => {
+-    setConnectErrorMessage(null);
+-    setPhase("idle");
+-  };
++  const blockingBackdrop =
++    phase.kind === "preparing" ||
++    phase.kind === "code_ready" ||
++    phase.kind === "setting_up" ||
++    disconnecting ||
++    confirmingDisconnect;
+
+-  const onErrorDismissModal = () => {
++  const handleBackdrop = () => {
++    if (blockingBackdrop) return;
+     onClose();
+   };
+
+-  const runDisconnect = async () => {
+-    setManageStep("disconnecting");
++  const handleSubmit = useCallback(async () => {
++    setSubmitError(null);
++    setSubmitting(true);
+     try {
+-      await disconnectWhatsApp();
+-      onDisconnected?.();
+-      setManageStep("disconnected");
+-    } catch {
+-      setManageStep("info");
++      await submitPhone(phoneInput);
++    } catch (err) {
++      setSubmitError(friendlyError(err instanceof Error ? err.message : undefined));
++    } finally {
++      setSubmitting(false);
+     }
+-  };
++  }, [phoneInput, submitPhone]);
+
+-  const onDisconnectedDone = () => {
+-    onClose();
+-    reset();
+-  };
+-
+-  const runManualSubmit = useCallback(async () => {
+-    setConnectErrorMessage(null);
+-    setPhase("pending");
++  const handleReconnect = useCallback(async () => {
++    setSubmitError(null);
++    setSubmitting(true);
+     try {
+-      const normalized = await submitManualWhatsAppConnect(phoneInput);
+-      setSubmittedPhone(normalized);
+-      setPhase("success");
++      await reconnect(phoneInput);
+     } catch (err) {
+-      setConnectErrorMessage(
+-        friendlyConnectError(err instanceof Error ? err.message : undefined)
+-      );
+-      setPhase("error");
++      setSubmitError(friendlyError(err instanceof Error ? err.message : undefined));
++    } finally {
++      setSubmitting(false);
+     }
+-  }, [phoneInput]);
++  }, [phoneInput, reconnect]);
+
+-  const onDone = () => {
+-    if (!manageOnly && phase === "success" && submittedPhone) {
+-      onConnected(submittedPhone, { fromManual: true });
++  const handleDisconnect = useCallback(async () => {
++    setSubmitError(null);
++    setDisconnecting(true);
++    try {
++      await disconnect();
++      onClose();
++    } catch (err) {
++      setSubmitError(friendlyError(err instanceof Error ? err.message : undefined));
++    } finally {
++      setDisconnecting(false);
++      setConfirmingDisconnect(false);
+     }
+-    onClose();
+-    reset();
+-  };
++  }, [disconnect, onClose]);
+
+   const renderPhonePickerFlag = useCallback(
+     (pickerProps: { countryCode: string }) => (
+@@ -157,34 +156,310 @@ export function WhatsAppConnectModal({
+     []
+   );
+
+-  const openWhatsApp = useCallback(async () => {
+-    const e164 = String(
+-      process.env.EXPO_PUBLIC_WHATSAPP_BOT_E164 ?? ""
+-    ).trim();
+-    const phone = e164.replace(/\D/g, "");
+-    const message = "Hi";
+-    if (!phone) {
+-      console.log(
+-        "Failed to open WhatsApp: set EXPO_PUBLIC_WHATSAPP_BOT_E164 (E.164, e.g. +923001234567)"
++  const renderManage = () => {
++    if (confirmingDisconnect) {
++      return (
++        <>
++          <View style={styles.sheetContent}>
++            <Text style={styles.title}>Disconnect WhatsApp?</Text>
++            <Text style={styles.subtitle}>
++              Emily will stop responding on this number. You can reconnect
++              anytime.
++            </Text>
++          </View>
++          <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
++            <View style={styles.manageActions}>
++              <Pressable
++                onPress={() => setConfirmingDisconnect(false)}
++                style={({ pressed }) => [styles.secondaryCta, pressed && styles.secondaryCtaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Cancel"
++              >
++                <Text style={styles.secondaryCtaText}>Cancel</Text>
++              </Pressable>
++              <Pressable
++                onPress={() => void handleDisconnect()}
++                style={({ pressed }) => [styles.destructiveCta, pressed && styles.destructiveCtaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Disconnect WhatsApp"
++              >
++                <Text style={styles.destructiveCtaText}>Disconnect</Text>
++              </Pressable>
++            </View>
++          </View>
++        </>
+       );
+-      return;
+     }
+-    const url = `https://wa.me/${phone}?text=${encodeURIComponent(message)}`;
+-    try {
+-      await Linking.openURL(url);
+-    } catch (e) {
+-      console.log("Failed to open WhatsApp", e);
++
++    if (disconnecting) {
++      return (
++        <View style={styles.sheetContent}>
++          <View style={styles.centerBlock} pointerEvents="none">
++            <ActivityIndicator size="large" color="#3A3A3C" />
++            <Text style={styles.loadingTitle}>Disconnecting…</Text>
++          </View>
++        </View>
++      );
+     }
+-  }, []);
++
++    const displayPhone =
++      connection?.dm.displayPhoneNumber ?? connection?.group.linkedPhoneE164 ?? null;
++
++    return (
++      <>
++        <View style={styles.sheetContent}>
++          <Text style={styles.title}>WhatsApp</Text>
++          <Text style={styles.subtitle}>
++            {displayPhone ? "Your business number" : "No number on file"}
++          </Text>
++          {displayPhone ? <Text style={styles.phoneDisplay}>{displayPhone}</Text> : null}
++          {submitError ? <Text style={styles.errorInline}>{submitError}</Text> : null}
++          <Pressable
++            onPress={() => setConfirmingDisconnect(true)}
++            style={({ pressed }) => [styles.disconnectLink, pressed && styles.disconnectLinkPressed]}
++            accessibilityRole="button"
++            accessibilityLabel="Disconnect WhatsApp"
++          >
++            <Text style={styles.disconnectLinkText}>Disconnect WhatsApp</Text>
++          </Pressable>
++        </View>
++        <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
++          <Pressable
++            onPress={onClose}
++            style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
++            accessibilityRole="button"
++            accessibilityLabel="Done"
++          >
++            <Text style={styles.ctaText}>Done</Text>
++          </Pressable>
++        </View>
++      </>
++    );
++  };
++
++  const renderConnectFlow = () => {
++    switch (phase.kind) {
++      case "loading":
++        return (
++          <View style={styles.sheetContent}>
++            <View style={styles.centerBlock} pointerEvents="none">
++              <ActivityIndicator size="large" color="#3A3A3C" />
++            </View>
++          </View>
++        );
++
++      case "reconnect_required":
++        return (
++          <>
++            <View style={styles.sheetContent}>
++              <Text style={styles.title}>WhatsApp needs to be reconnected</Text>
++              <Text style={styles.subtitle}>
++                Your connection was interrupted. Reconnect to keep Emily
++                responding to customers.
++              </Text>
++              {submitError ? <Text style={styles.errorInline}>{submitError}</Text> : null}
++              <PhoneInput
++                key={phoneInputMountKey}
++                defaultCode="PK"
++                defaultValue={suggestedPhone ?? undefined}
++                layout="first"
++                placeholder="Enter your WhatsApp number"
++                onChangeFormattedText={setPhoneInput}
++                containerStyle={styles.phoneInputContainer}
++                textContainerStyle={styles.phoneInputTextContainer}
++                textInputStyle={styles.phoneInputText}
++                flagButtonStyle={styles.phoneInputFlagButton}
++                countryPickerProps={{ renderFlagButton: renderPhonePickerFlag }}
++                textInputProps={{
++                  placeholderTextColor: "#8E8E93",
++                  keyboardType: "phone-pad",
++                  autoComplete: "tel",
++                  textContentType: "telephoneNumber",
++                  accessibilityLabel: "WhatsApp phone number",
++                }}
++              />
++            </View>
++            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
++              <Pressable
++                onPress={() => void handleReconnect()}
++                disabled={submitting}
++                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Reconnect"
++              >
++                <Text style={styles.ctaText}>Reconnect</Text>
++              </Pressable>
++            </View>
++          </>
++        );
++
++      case "phone_entry":
++        return (
++          <>
++            <View style={styles.sheetContent}>
++              <Text style={styles.title}>Connect WhatsApp</Text>
++              <Text style={styles.subtitle}>
++                Connect the WhatsApp number you use for your business.
++              </Text>
++              {submitError ? <Text style={styles.errorInline}>{submitError}</Text> : null}
++              <PhoneInput
++                key={phoneInputMountKey}
++                defaultCode="PK"
++                defaultValue={suggestedPhone ?? undefined}
++                layout="first"
++                placeholder="Enter your WhatsApp number"
++                onChangeFormattedText={setPhoneInput}
++                containerStyle={styles.phoneInputContainer}
++                textContainerStyle={styles.phoneInputTextContainer}
++                textInputStyle={styles.phoneInputText}
++                flagButtonStyle={styles.phoneInputFlagButton}
++                countryPickerProps={{ renderFlagButton: renderPhonePickerFlag }}
++                textInputProps={{
++                  placeholderTextColor: "#8E8E93",
++                  keyboardType: "phone-pad",
++                  autoComplete: "tel",
++                  textContentType: "telephoneNumber",
++                  accessibilityLabel: "WhatsApp phone number",
++                }}
++              />
++              {suggestedPhone ? (
++                <Text style={styles.suggestionHint}>
++                  We prefilled the number from your business profile -- confirm
++                  or edit it above.
++                </Text>
++              ) : null}
++            </View>
++            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
++              <Pressable
++                onPress={() => void handleSubmit()}
++                disabled={submitting}
++                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Continue"
++              >
++                <Text style={styles.ctaText}>Continue</Text>
++              </Pressable>
++            </View>
++          </>
++        );
++
++      case "preparing":
++        return (
++          <View style={styles.sheetContent}>
++            <View style={styles.centerBlock} pointerEvents="none">
++              <ActivityIndicator size="large" color="#3A3A3C" />
++              <Text style={styles.loadingTitle}>Preparing your connection…</Text>
++            </View>
++          </View>
++        );
++
++      case "code_ready":
++        return (
++          <>
++            <View style={styles.sheetContent}>
++              <Text style={styles.title}>Connect your WhatsApp</Text>
++              <View style={styles.codeBlock}>
++                <Text style={styles.codeText} selectable>
++                  {formatLinkingCode(phase.linkingCode)}
++                </Text>
++              </View>
++              <Text style={styles.codeInstructions}>
++                WhatsApp{"\n"}
++                → Linked Devices{"\n"}
++                → Link a Device{"\n"}
++                → Link with phone number instead
++              </Text>
++              <View style={styles.waitingRow}>
++                <ActivityIndicator size="small" color="#8E8E93" />
++                <Text style={styles.waitingText}>Waiting for connection…</Text>
++              </View>
++            </View>
++            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
++              <Pressable
++                onPress={() => void cancelLinking()}
++                style={({ pressed }) => [styles.secondaryCtaFull, pressed && styles.secondaryCtaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Cancel"
++              >
++                <Text style={styles.secondaryCtaText}>Cancel</Text>
++              </Pressable>
++            </View>
++          </>
++        );
++
++      case "setting_up":
++        return (
++          <View style={styles.sheetContent}>
++            <View style={styles.centerBlock} pointerEvents="none">
++              <ActivityIndicator size="large" color="#3A3A3C" />
++              <Text style={styles.loadingTitle}>Setting up Emily…</Text>
++            </View>
++          </View>
++        );
++
++      case "ready":
++        return (
++          <>
++            <View style={styles.sheetContent}>
++              <Text style={styles.successHeadline}>{"✓ WhatsApp connected"}</Text>
++              <Text style={styles.subtitle}>
++                Emily is ready to handle your customer conversations.
++              </Text>
++            </View>
++            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
++              <Pressable
++                onPress={onClose}
++                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Continue"
++              >
++                <Text style={styles.ctaText}>Continue</Text>
++              </Pressable>
++            </View>
++          </>
++        );
++
++      case "error":
++        return (
++          <>
++            <View style={styles.sheetContent}>
++              <Text style={styles.title}>We couldn’t finish the connection</Text>
++              <Text style={styles.subtitle}>
++                Something interrupted the connection. Please try again.
++              </Text>
++            </View>
++            <View style={[styles.sheetActions, styles.sheetActionsColumn, { paddingBottom: actionsBottomPad }]}>
++              <Pressable
++                onPress={retryAfterError}
++                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Try again"
++              >
++                <Text style={styles.ctaText}>Try again</Text>
++              </Pressable>
++              <Pressable
++                onPress={onClose}
++                style={({ pressed }) => [styles.secondaryCtaFull, pressed && styles.secondaryCtaPressed]}
++                accessibilityRole="button"
++                accessibilityLabel="Close"
++              >
++                <Text style={styles.secondaryCtaText}>Close</Text>
++              </Pressable>
++            </View>
++          </>
++        );
++
++      default:
++        return null;
++    }
++  };
+
+   return (
+     <Modal
+       visible={visible}
+       animationType="fade"
+       transparent
+-      onRequestClose={
+-        phase === "pending" || manageBlocking ? () => {} : onClose
+-      }
++      onRequestClose={blockingBackdrop ? () => {} : onClose}
+     >
+       <KeyboardAvoidingView
+         style={styles.overlay}
+@@ -203,290 +478,7 @@ export function WhatsAppConnectModal({
+               showsVerticalScrollIndicator={false}
+               bounces={false}
+             >
+-              {manageOnly ? (
+-                manageStep === "confirm" ? (
+-                  <>
+-                    <View style={styles.sheetContent}>
+-                      <Text style={styles.title}>Disconnect WhatsApp?</Text>
+-                      <Text style={styles.subtitle}>
+-                        Emily will stop responding on this number. You can
+-                        reconnect anytime.
+-                      </Text>
+-                    </View>
+-                    <View
+-                      style={[
+-                        styles.sheetActions,
+-                        { paddingBottom: actionsBottomPad },
+-                      ]}
+-                    >
+-                      <View style={styles.manageActions}>
+-                        <Pressable
+-                          onPress={() => setManageStep("info")}
+-                          style={({ pressed }) => [
+-                            styles.secondaryCta,
+-                            pressed && styles.secondaryCtaPressed,
+-                          ]}
+-                          accessibilityRole="button"
+-                          accessibilityLabel="Cancel"
+-                        >
+-                          <Text style={styles.secondaryCtaText}>Cancel</Text>
+-                        </Pressable>
+-                        <Pressable
+-                          onPress={runDisconnect}
+-                          style={({ pressed }) => [
+-                            styles.destructiveCta,
+-                            pressed && styles.destructiveCtaPressed,
+-                          ]}
+-                          accessibilityRole="button"
+-                          accessibilityLabel="Disconnect WhatsApp"
+-                        >
+-                          <Text style={styles.destructiveCtaText}>
+-                            Disconnect
+-                          </Text>
+-                        </Pressable>
+-                      </View>
+-                    </View>
+-                  </>
+-                ) : manageStep === "disconnecting" ? (
+-                  <View style={styles.sheetContent}>
+-                    <View style={styles.centerBlock} pointerEvents="none">
+-                      <ActivityIndicator size="large" color="#3A3A3C" />
+-                      <Text style={styles.loadingTitle}>Disconnecting…</Text>
+-                      <Text style={styles.loadingSub}>
+-                        Removing this number from Emily
+-                      </Text>
+-                    </View>
+-                  </View>
+-                ) : manageStep === "disconnected" ? (
+-                  <>
+-                    <View style={styles.sheetContent}>
+-                      <Text style={styles.title}>WhatsApp disconnected</Text>
+-                      <Text style={styles.subtitle}>
+-                        You can connect a number again whenever you’re ready.
+-                      </Text>
+-                    </View>
+-                    <View
+-                      style={[
+-                        styles.sheetActions,
+-                        { paddingBottom: actionsBottomPad },
+-                      ]}
+-                    >
+-                      <Pressable
+-                        onPress={onDisconnectedDone}
+-                        style={({ pressed }) => [
+-                          styles.cta,
+-                          pressed && styles.ctaPressed,
+-                        ]}
+-                        accessibilityRole="button"
+-                        accessibilityLabel="Done"
+-                      >
+-                        <Text style={styles.ctaText}>Done</Text>
+-                      </Pressable>
+-                    </View>
+-                  </>
+-                ) : (
+-                  <>
+-                    <View style={styles.sheetContent}>
+-                      <Text style={styles.title}>WhatsApp</Text>
+-                      <Text style={styles.subtitle}>
+-                        {connectedPhone?.trim()
+-                          ? "Your business number"
+-                          : "No number on file"}
+-                      </Text>
+-                      {connectedPhone?.trim() ? (
+-                        <Text style={styles.phoneDisplay}>
+-                          {connectedPhone}
+-                        </Text>
+-                      ) : null}
+-                      {connectedPhone?.trim() ? (
+-                        <Pressable
+-                          onPress={() => setManageStep("confirm")}
+-                          style={({ pressed }) => [
+-                            styles.disconnectLink,
+-                            pressed && styles.disconnectLinkPressed,
+-                          ]}
+-                          accessibilityRole="button"
+-                          accessibilityLabel="Disconnect WhatsApp"
+-                        >
+-                          <Text style={styles.disconnectLinkText}>
+-                            Disconnect WhatsApp
+-                          </Text>
+-                        </Pressable>
+-                      ) : null}
+-                    </View>
+-                    <View
+-                      style={[
+-                        styles.sheetActions,
+-                        { paddingBottom: actionsBottomPad },
+-                      ]}
+-                    >
+-                      <Pressable
+-                        onPress={onDone}
+-                        style={({ pressed }) => [
+-                          styles.cta,
+-                          pressed && styles.ctaPressed,
+-                        ]}
+-                        accessibilityRole="button"
+-                        accessibilityLabel="Done"
+-                      >
+-                        <Text style={styles.ctaText}>Done</Text>
+-                      </Pressable>
+-                    </View>
+-                  </>
+-                )
+-              ) : phase === "idle" ? (
+-                <>
+-                  <View style={styles.sheetContent}>
+-                    <Text style={styles.title}>Connect your WhatsApp</Text>
+-                    <Text style={styles.subtitle}>
+-                      Choose your country and enter the WhatsApp number you use
+-                      for your business.
+-                    </Text>
+-                    <PhoneInput
+-                      ref={phoneInputRef}
+-                      key={phoneInputMountKey}
+-                      defaultCode="PK"
+-                      layout="first"
+-                      placeholder="Enter your WhatsApp number"
+-                      onChangeFormattedText={setPhoneInput}
+-                      containerStyle={styles.phoneInputContainer}
+-                      textContainerStyle={styles.phoneInputTextContainer}
+-                      textInputStyle={styles.phoneInputText}
+-                      flagButtonStyle={styles.phoneInputFlagButton}
+-                      countryPickerProps={{
+-                        renderFlagButton: renderPhonePickerFlag,
+-                      }}
+-                      textInputProps={{
+-                        placeholderTextColor: "#8E8E93",
+-                        keyboardType: "phone-pad",
+-                        autoComplete: "tel",
+-                        textContentType: "telephoneNumber",
+-                        accessibilityLabel: "WhatsApp phone number",
+-                      }}
+-                    />
+-                  </View>
+-                  <View
+-                    style={[
+-                      styles.sheetActions,
+-                      { paddingBottom: actionsBottomPad },
+-                    ]}
+-                  >
+-                    <Pressable
+-                      onPress={() => void runManualSubmit()}
+-                      style={({ pressed }) => [
+-                        styles.cta,
+-                        pressed && styles.ctaPressed,
+-                      ]}
+-                      accessibilityRole="button"
+-                      accessibilityLabel="Submit phone number"
+-                    >
+-                      <Text style={styles.ctaText}>Submit</Text>
+-                    </Pressable>
+-                  </View>
+-                </>
+-              ) : phase === "pending" ? (
+-                <View style={styles.sheetContent}>
+-                  <View style={styles.centerBlock} pointerEvents="none">
+-                    <ActivityIndicator size="large" color="#3A3A3C" />
+-                    <Text style={styles.loadingTitle}>
+-                      Setting up your AI assistant...
+-                    </Text>
+-                  </View>
+-                </View>
+-              ) : phase === "error" ? (
+-                <>
+-                  <View style={styles.sheetContent}>
+-                    <Text style={styles.title}>Couldn’t save your number</Text>
+-                    <Text style={styles.subtitle}>
+-                      {connectErrorMessage ??
+-                        friendlyConnectError(undefined)}
+-                    </Text>
+-                  </View>
+-                  <View
+-                    style={[
+-                      styles.sheetActions,
+-                      styles.sheetActionsColumn,
+-                      { paddingBottom: actionsBottomPad },
+-                    ]}
+-                  >
+-                    <Pressable
+-                      onPress={onErrorTryAgain}
+-                      style={({ pressed }) => [
+-                        styles.cta,
+-                        pressed && styles.ctaPressed,
+-                      ]}
+-                      accessibilityRole="button"
+-                      accessibilityLabel="Edit phone number and try again"
+-                    >
+-                      <Text style={styles.ctaText}>Try again</Text>
+-                    </Pressable>
+-                    <Pressable
+-                      onPress={onErrorDismissModal}
+-                      style={({ pressed }) => [
+-                        styles.secondaryCtaFull,
+-                        pressed && styles.secondaryCtaPressed,
+-                      ]}
+-                      accessibilityRole="button"
+-                      accessibilityLabel="Close"
+-                    >
+-                      <Text style={styles.secondaryCtaText}>Close</Text>
+-                    </Pressable>
+-                  </View>
+-                </>
+-              ) : (
+-                <>
+-                  <View style={styles.sheetContent}>
+-                    <Text style={styles.successHeadline}>
+-                      {"\uD83C\uDF89 You're all set!"}
+-                    </Text>
+-                    <Text style={styles.subtitle}>
+-                      Emily is ready to help with your business.
+-                      {"\n\n"}
+-                      Next step:{"\n"}
+-                      Open WhatsApp and send a message to start testing your
+-                      assistant.
+-                    </Text>
+-                    <Text style={styles.exampleHint}>
+-                      {`Try sending:\n'Civic available?'`}
+-                    </Text>
+-                    <Text style={styles.openWhatsAppHelper}>
+-                      {
+-                        "Make sure you’ve saved Emily’s number before opening WhatsApp."
+-                      }
+-                    </Text>
+-                  </View>
+-                  <View
+-                    style={[
+-                      styles.sheetActions,
+-                      styles.sheetActionsColumn,
+-                      { paddingBottom: actionsBottomPad },
+-                    ]}
+-                  >
+-                    <Pressable
+-                      onPress={() => void openWhatsApp()}
+-                      style={({ pressed }) => [
+-                        styles.secondaryCtaFull,
+-                        pressed && styles.secondaryCtaPressed,
+-                      ]}
+-                      accessibilityRole="button"
+-                      accessibilityLabel="Message Emily on WhatsApp"
+-                    >
+-                      <Text style={styles.secondaryCtaText}>Message Emily</Text>
+-                    </Pressable>
+-                    <Pressable
+-                      onPress={onDone}
+-                      style={({ pressed }) => [
+-                        styles.cta,
+-                        pressed && styles.ctaPressed,
+-                      ]}
+-                      accessibilityRole="button"
+-                      accessibilityLabel="Done"
+-                    >
+-                      <Text style={styles.ctaText}>Done</Text>
+-                    </Pressable>
+-                  </View>
+-                </>
+-              )}
++              {manageOnly ? renderManage() : renderConnectFlow()}
+             </ScrollView>
+           </View>
+         </View>
+@@ -496,17 +488,12 @@ export function WhatsAppConnectModal({
+ }
+
+ const styles = StyleSheet.create({
+-  overlay: {
+-    flex: 1,
+-  },
++  overlay: { flex: 1 },
+   backdrop: {
+     ...StyleSheet.absoluteFillObject,
+     backgroundColor: "rgba(0,0,0,0.4)",
+   },
+-  sheetEnd: {
+-    flex: 1,
+-    justifyContent: "flex-end",
+-  },
++  sheetEnd: { flex: 1, justifyContent: "flex-end" },
+   sheetCard: {
+     width: "100%",
+     backgroundColor: BG,
+@@ -514,17 +501,9 @@ const styles = StyleSheet.create({
+     borderTopRightRadius: 20,
+     maxHeight: "92%",
+   },
+-  sheetContent: {
+-    paddingHorizontal: 20,
+-    paddingTop: 20,
+-  },
+-  sheetActions: {
+-    paddingHorizontal: 20,
+-    paddingTop: 12,
+-  },
+-  sheetActionsColumn: {
+-    gap: 12,
+-  },
++  sheetContent: { paddingHorizontal: 20, paddingTop: 20 },
++  sheetActions: { paddingHorizontal: 20, paddingTop: 12 },
++  sheetActionsColumn: { gap: 12 },
+   title: {
+     fontSize: 20,
+     fontWeight: "600",
+@@ -539,6 +518,20 @@ const styles = StyleSheet.create({
+     lineHeight: 22,
+     marginBottom: 20,
+   },
++  suggestionHint: {
++    fontSize: 13,
++    fontWeight: "400",
++    color: "#8E8E93",
++    lineHeight: 18,
++    marginTop: -8,
++    marginBottom: 12,
++  },
++  errorInline: {
++    fontSize: 14,
++    fontWeight: "500",
++    color: "#DC2626",
++    marginBottom: 12,
++  },
+   successHeadline: {
+     fontSize: 22,
+     fontWeight: "600",
+@@ -546,23 +539,37 @@ const styles = StyleSheet.create({
+     letterSpacing: -0.3,
+     marginBottom: 12,
+   },
+-  exampleHint: {
++  codeBlock: {
++    alignItems: "center",
++    justifyContent: "center",
++    backgroundColor: "#F2F2F7",
++    borderRadius: 12,
++    paddingVertical: 20,
++    marginBottom: 16,
++  },
++  codeText: {
++    fontSize: 30,
++    fontWeight: "700",
++    letterSpacing: 4,
++    color: "#000000",
++  },
++  codeInstructions: {
+     fontSize: 15,
+     fontWeight: "500",
+-    color: "#000000",
+-    lineHeight: 22,
+-    marginBottom: 12,
+-    paddingVertical: 12,
+-    paddingHorizontal: 14,
+-    backgroundColor: "#F2F2F7",
+-    borderRadius: 10,
++    color: "#3A3A3C",
++    lineHeight: 24,
++    marginBottom: 20,
+   },
+-  openWhatsAppHelper: {
+-    fontSize: 13,
++  waitingRow: {
++    flexDirection: "row",
++    alignItems: "center",
++    gap: 10,
++    marginBottom: 4,
++  },
++  waitingText: {
++    fontSize: 14,
+     fontWeight: "500",
+     color: "#8E8E93",
+-    lineHeight: 18,
+-    marginBottom: 0,
+   },
+   phoneInputContainer: {
+     width: "100%",
+@@ -589,19 +596,13 @@ const styles = StyleSheet.create({
+     minWidth: 36,
+     minHeight: 28,
+   },
+-  phoneFlagEmoji: {
+-    fontSize: 26,
+-    lineHeight: 30,
+-  },
++  phoneFlagEmoji: { fontSize: 26, lineHeight: 30 },
+   phoneInputTextContainer: {
+     borderRadius: 12,
+     backgroundColor: "#FFFFFF",
+     paddingVertical: Platform.OS === "ios" ? 10 : 8,
+   },
+-  phoneInputText: {
+-    fontSize: 17,
+-    color: "#000000",
+-  },
++  phoneInputText: { fontSize: 17, color: "#000000" },
+   cta: {
+     backgroundColor: "#3A3A3C",
+     borderRadius: 12,
+@@ -610,14 +611,8 @@ const styles = StyleSheet.create({
+     justifyContent: "center",
+     width: "100%",
+   },
+-  ctaPressed: {
+-    opacity: 0.88,
+-  },
+-  ctaText: {
+-    fontSize: 17,
+-    fontWeight: "600",
+-    color: "#FFFFFF",
+-  },
++  ctaPressed: { opacity: 0.88 },
++  ctaText: { fontSize: 17, fontWeight: "600", color: "#FFFFFF" },
+   centerBlock: {
+     alignItems: "center",
+     paddingVertical: 32,
+@@ -630,13 +625,6 @@ const styles = StyleSheet.create({
+     color: "#000000",
+     textAlign: "center",
+   },
+-  loadingSub: {
+-    marginTop: 8,
+-    fontSize: 15,
+-    fontWeight: "500",
+-    color: "#8E8E93",
+-    textAlign: "center",
+-  },
+   phoneDisplay: {
+     fontSize: 20,
+     fontWeight: "600",
+@@ -648,21 +636,10 @@ const styles = StyleSheet.create({
+     alignSelf: "flex-start",
+     paddingVertical: 12,
+     paddingHorizontal: 4,
+-    marginBottom: 0,
+-  },
+-  disconnectLinkPressed: {
+-    opacity: 0.65,
+-  },
+-  disconnectLinkText: {
+-    fontSize: 17,
+-    fontWeight: "600",
+-    color: "#FF3B30",
+-  },
+-  manageActions: {
+-    flexDirection: "row",
+-    gap: 12,
+-    width: "100%",
+   },
++  disconnectLinkPressed: { opacity: 0.65 },
++  disconnectLinkText: { fontSize: 17, fontWeight: "600", color: "#FF3B30" },
++  manageActions: { flexDirection: "row", gap: 12, width: "100%" },
+   secondaryCta: {
+     flex: 1,
+     minHeight: 50,
+@@ -683,14 +660,8 @@ const styles = StyleSheet.create({
+     justifyContent: "center",
+     backgroundColor: BG,
+   },
+-  secondaryCtaPressed: {
+-    opacity: 0.85,
+-  },
+-  secondaryCtaText: {
+-    fontSize: 17,
+-    fontWeight: "600",
+-    color: "#000000",
+-  },
++  secondaryCtaPressed: { opacity: 0.85 },
++  secondaryCtaText: { fontSize: 17, fontWeight: "600", color: "#000000" },
+   destructiveCta: {
+     flex: 1,
+     minHeight: 50,
+@@ -699,12 +670,6 @@ const styles = StyleSheet.create({
+     justifyContent: "center",
+     backgroundColor: "#FF3B30",
+   },
+-  destructiveCtaPressed: {
+-    opacity: 0.9,
+-  },
+-  destructiveCtaText: {
+-    fontSize: 17,
+-    fontWeight: "600",
+-    color: "#FFFFFF",
+-  },
++  destructiveCtaPressed: { opacity: 0.9 },
++  destructiveCtaText: { fontSize: 17, fontWeight: "600", color: "#FFFFFF" },
+ });
+diff --git a/mobile-app/app/(tabs)/index.tsx b/mobile-app/app/(tabs)/index.tsx
+index ae558b0..1d95dcb 100644
+--- a/mobile-app/app/(tabs)/index.tsx
++++ b/mobile-app/app/(tabs)/index.tsx
+@@ -1,12 +1,6 @@
+ import FontAwesome from "@expo/vector-icons/FontAwesome";
+ import { useFocusEffect } from "expo-router";
+-import {
+-  deleteField,
+-  doc,
+-  getDoc,
+-  serverTimestamp,
+-  setDoc,
+-} from "firebase/firestore";
++import { doc, getDoc } from "firebase/firestore";
+ import { useCallback, useState } from "react";
+ import {
+   ActivityIndicator,
+@@ -22,147 +16,75 @@ import { WhatsAppConnectModal } from "@/components/WhatsAppConnectModal";
+ import { DS } from "@/constants/designSystem";
+ import { useAuth } from "@/contexts/AuthContext";
+ import { db } from "@/firebase";
++import type { WhatsAppConnection } from "@/services/whatsappConnection";
+
+ export default function HomeScreen() {
+   const { user, loading: authLoading } = useAuth();
+-  const userId = user?.uid;
++  const userId = user?.uid ?? null;
+
+-  const [loading, setLoading] = useState(true);
+-  const [whatsappConnected, setWhatsappConnected] = useState(false);
+-  const [whatsappPhone, setWhatsappPhone] = useState<string | null>(null);
++  const [profileLoading, setProfileLoading] = useState(true);
++  const [suggestedPhone, setSuggestedPhone] = useState<string | null>(null);
++  const [connection, setConnection] = useState<WhatsAppConnection | null>(
++    null
++  );
+   const [waModal, setWaModal] = useState<"closed" | "connect" | "manage">(
+     "closed"
+   );
+
+-  const load = useCallback(async () => {
++  // Business-profile prefill only -- never treated as connection truth. The
++  // backend (whatsapp_connections.overallStatus) is the only source of
++  // "connected" state; see WhatsAppConnectModal / useWhatsAppConnection.
++  const loadProfileSuggestion = useCallback(async () => {
+     if (!userId) {
+-      setWhatsappConnected(false);
+-      setWhatsappPhone(null);
+-      setLoading(false);
++      setSuggestedPhone(null);
++      setProfileLoading(false);
+       return;
+     }
+-
+-    setLoading(true);
++    setProfileLoading(true);
+     try {
+-      const ref = doc(db, "businesses", userId);
+-      const snap = await getDoc(ref);
++      const snap = await getDoc(doc(db, "businesses", userId));
+       const data = snap.data() as
+         | {
+-            whatsappConnected?: boolean;
+-            whatsappPhone?: string;
+-            whatsapp?: {
+-              connected?: boolean;
+-              displayPhoneNumber?: string;
+-              phoneNumberId?: string;
+-            };
++            ownerNotificationPhone?: string;
++            businessProfile?: { ownerNotificationPhone?: string };
+           }
+         | undefined;
+-
+-      const w = data?.whatsapp;
+-      const nestedOk =
+-        w != null &&
+-        typeof w === "object" &&
+-        w.connected === true &&
+-        Boolean(
+-          (typeof w.phoneNumberId === "string" && w.phoneNumberId.trim()) ||
+-            (typeof w.displayPhoneNumber === "string" &&
+-              w.displayPhoneNumber.trim())
+-        );
+-      const phoneOk = (data?.whatsappPhone?.trim().length ?? 0) > 0;
+-      const connected = Boolean(
+-        data?.whatsappConnected ||
+-          phoneOk ||
+-          nestedOk
+-      );
+-      setWhatsappConnected(connected);
+-      const display =
+-        data?.whatsappPhone?.trim() ||
+-        (typeof w?.displayPhoneNumber === "string"
+-          ? w.displayPhoneNumber.trim()
+-          : "") ||
+-        (typeof w?.phoneNumberId === "string" ? w.phoneNumberId.trim() : "") ||
++      const suggestion =
++        data?.businessProfile?.ownerNotificationPhone?.trim() ||
++        data?.ownerNotificationPhone?.trim() ||
+         null;
+-      setWhatsappPhone(display || null);
++      setSuggestedPhone(suggestion || null);
+     } catch {
+-      setWhatsappConnected(false);
+-      setWhatsappPhone(null);
++      setSuggestedPhone(null);
+     } finally {
+-      setLoading(false);
++      setProfileLoading(false);
+     }
+   }, [userId]);
+
+   useFocusEffect(
+     useCallback(() => {
+-      void load();
+-    }, [load])
++      void loadProfileSuggestion();
++    }, [loadProfileSuggestion])
+   );
+
+-  const persistWhatsApp = useCallback(
+-    async (phone: string) => {
+-      if (!userId) return;
+-      try {
+-        await setDoc(
+-          doc(db, "businesses", userId),
+-          {
+-            whatsappConnected: true,
+-            whatsappPhone: phone,
+-            updatedAt: serverTimestamp(),
+-          },
+-          { merge: true }
+-        );
+-      } catch (e) {
+-        console.warn("[home] persist WhatsApp failed:", e);
+-      }
+-    },
+-    [userId]
+-  );
++  const overallStatus = connection?.overallStatus ?? "not_connected";
++  const whatsappConnected = overallStatus === "ready";
++  const reconnectRequired = overallStatus === "reconnect_required";
++  const displayPhone =
++    connection?.dm.displayPhoneNumber ?? connection?.group.linkedPhoneE164 ?? null;
+
+-  const handleWhatsAppConnected = useCallback(
+-    (
+-      phone: string,
+-      options?: { fromOAuth?: boolean; fromManual?: boolean }
+-    ) => {
+-      if (options?.fromOAuth || options?.fromManual) {
+-        void load();
+-        return;
+-      }
+-      setWhatsappConnected(true);
+-      setWhatsappPhone(phone);
+-      void persistWhatsApp(phone);
+-    },
+-    [load, persistWhatsApp]
+-  );
+-
+-  const handleWhatsAppDisconnected = useCallback(async () => {
+-    setWhatsappConnected(false);
+-    setWhatsappPhone(null);
+-    if (!userId) return;
+-    try {
+-      await setDoc(
+-        doc(db, "businesses", userId),
+-        {
+-          whatsappConnected: false,
+-          whatsappPhone: deleteField(),
+-          whatsappPhoneNumberId: deleteField(),
+-          whatsapp: deleteField(),
+-          updatedAt: serverTimestamp(),
+-        },
+-        { merge: true }
+-      );
+-    } catch (e) {
+-      console.warn("[home] disconnect WhatsApp persist failed:", e);
+-    }
+-  }, [userId]);
++  const loading = authLoading || profileLoading;
+
+   return (
+     <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
+       <WhatsAppConnectModal
++        key={userId ?? "signed-out"}
+         visible={waModal !== "closed"}
++        businessId={userId}
++        suggestedPhone={suggestedPhone}
+         manageOnly={waModal === "manage"}
+-        connectedPhone={whatsappPhone}
+         onClose={() => setWaModal("closed")}
+-        onConnected={handleWhatsAppConnected}
+-        onDisconnected={handleWhatsAppDisconnected}
++        onConnectionChange={setConnection}
+       />
+       <ScrollView
+         contentContainerStyle={styles.scroll}
+@@ -174,7 +96,7 @@ export default function HomeScreen() {
+           <Text style={styles.pageSubtitle}>Emily is ready</Text>
+         </View>
+
+-        {!authLoading && !loading ? (
++        {!loading ? (
+           <>
+             <View style={styles.statusBlock}>
+               <Text style={styles.instruction}>
+@@ -211,7 +133,24 @@ export default function HomeScreen() {
+                 </View>
+               </View>
+
+-              {!whatsappConnected ? (
++              {reconnectRequired ? (
++                <>
++                  <Text style={styles.reconnectNotice}>
++                    WhatsApp needs to be reconnected.
++                  </Text>
++                  <Pressable
++                    onPress={() => setWaModal("connect")}
++                    style={({ pressed }) => [
++                      styles.btnPrimary,
++                      pressed && styles.pressed,
++                    ]}
++                    accessibilityRole="button"
++                    accessibilityLabel="Reconnect WhatsApp"
++                  >
++                    <Text style={styles.btnPrimaryText}>Reconnect</Text>
++                  </Pressable>
++                </>
++              ) : !whatsappConnected ? (
+                 <>
+                   <Pressable
+                     onPress={() => setWaModal("connect")}
+@@ -232,7 +171,7 @@ export default function HomeScreen() {
+                 </>
+               ) : (
+                 <View style={styles.connected}>
+-                  <Text style={styles.phone}>{whatsappPhone || "—"}</Text>
++                  <Text style={styles.phone}>{displayPhone || "—"}</Text>
+                   <Pressable
+                     onPress={() => setWaModal("manage")}
+                     style={({ pressed }) => [
+@@ -390,6 +329,12 @@ const styles = StyleSheet.create({
+     color: "#6B6B6B",
+     lineHeight: 20,
+   },
++  reconnectNotice: {
++    fontSize: 13,
++    fontWeight: "500",
++    color: DS.color.destructive,
++    marginBottom: DS.space.sm,
++  },
+   btnPrimary: {
+     backgroundColor: "#3A3A3C",
+     borderRadius: 8,
