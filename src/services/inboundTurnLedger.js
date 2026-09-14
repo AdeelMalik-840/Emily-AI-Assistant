@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeFileAtomic } from "./atomicFileWrite.js";
 import { setMessageState } from "./messageState.js";
 import { normalizeTitle } from "./playwrightTitleNormalize.js";
 import { normalizePhoneE164 } from "./connections.js";
@@ -171,7 +172,7 @@ function persistLedger(force = false) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     pruneLedger();
     const out = Object.fromEntries(ledgerByKey.entries());
-    writeFileSync(ledgerPath, JSON.stringify(out), "utf8");
+    writeFileAtomic(ledgerPath, JSON.stringify(out));
   } catch (err) {
     console.warn("[inbound_turn_ledger_persist_failed]", {
       error: String(err?.message ?? err ?? "").slice(0, 160),

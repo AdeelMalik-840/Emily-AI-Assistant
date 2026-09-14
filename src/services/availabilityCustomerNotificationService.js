@@ -14,6 +14,7 @@ import {
   shouldUseAvailabilityCustomerTemplateNotify,
 } from "./availabilityCustomerTemplateNotify.js";
 import { sendWhatsAppMessage, sendWhatsAppTemplateMessage } from "./whatsappCloud.js";
+import { resolveBusinessCloudCredentials } from "./whatsappCredentialResolver.js";
 import {
   buildApprovedAvailabilityCustomerMessage,
   buildApprovedAvailabilityCustomerMessageWithoutPrice,
@@ -662,6 +663,7 @@ export async function sendAvailabilityCustomerNotification({
   getBookingsForItemFn = null,
   __cloudComposeChatCreate = null,
   __cloudComposeTimeoutMs,
+  resolveCredentialsFn = resolveBusinessCloudCredentials,
 }) {
   const firestore = connection ?? db;
   const uid = clean(businessId ?? executionContext.businessId ?? executionContext.userId);
@@ -777,6 +779,29 @@ export async function sendAvailabilityCustomerNotification({
     normalizeCustomerPhoneDigits(current.customerPhone) ||
     normalizeCustomerPhoneDigits(current.customerDmTarget);
   const legacyPhone = normalizePhone(current.customerDmTarget ?? current.customerPhone);
+  let tenantCredentials = executionContext?.sendCredentials ?? null;
+  const strictTenantCredentials =
+    String(process.env.MULTI_BUSINESS_WHATSAPP_ENABLED ?? "").toLowerCase() === "true" ||
+    String(process.env.WHATSAPP_STRICT_TENANT_CREDENTIALS ?? "").toLowerCase() === "true";
+  if (strictTenantCredentials && phase4Managed) {
+    const authoritativeCredentials = await resolveCredentialsFn(firestore, uid).catch(() => null);
+    const providedConflicts = tenantCredentials && (
+      tenantCredentials.businessId !== authoritativeCredentials?.businessId ||
+      tenantCredentials.phoneNumberId !== authoritativeCredentials?.phoneNumberId ||
+      tenantCredentials.connectionVersion !== authoritativeCredentials?.connectionVersion
+    );
+    tenantCredentials = authoritativeCredentials;
+    if (!tenantCredentials?.accessToken || providedConflicts) {
+    await markAvailabilityRequestCustomerNotificationFailed({
+      db: firestore,
+      businessId: uid,
+      requestId: rid,
+      approvalCustomerNotificationError: "TENANT_CREDENTIAL_MISMATCH",
+      approvalCustomerNotificationMethod: null,
+    });
+    return { ok: false, reason: "TENANT_CREDENTIAL_MISMATCH", requestId: rid, method: null, sent: false };
+    }
+  }
 
   // --- Phase 4 managed path ---
   if (phase4Managed) {
@@ -868,7 +893,7 @@ export async function sendAvailabilityCustomerNotification({
           languageCode: templatePlan.languageCode,
           bodyParameters: templatePlan.bodyParameters,
           sendWhatsAppTemplateMessageFn,
-          sendCredentials: executionContext?.sendCredentials ?? null,
+          sendCredentials: tenantCredentials,
         });
         if (!cloudSend.ok) {
           await markAvailabilityRequestCustomerNotificationFailed({
@@ -997,7 +1022,7 @@ export async function sendAvailabilityCustomerNotification({
         phone: phase4Phone,
         message: built.message,
         sendWhatsAppMessageFn,
-        sendCredentials: executionContext?.sendCredentials ?? null,
+        sendCredentials: tenantCredentials,
         method: "cloud_api",
       });
       if (!cloudSend.ok) {
@@ -1212,7 +1237,7 @@ export async function sendAvailabilityCustomerNotification({
     phone: legacyPhone,
     message: built.message,
     sendWhatsAppMessageFn,
-    sendCredentials: executionContext?.sendCredentials ?? null,
+    sendCredentials: tenantCredentials,
     method: "cloud_dm",
   });
   if (!cloudSend.ok) {

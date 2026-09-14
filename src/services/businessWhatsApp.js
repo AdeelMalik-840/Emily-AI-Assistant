@@ -5,6 +5,7 @@
 import admin from "firebase-admin";
 
 import { getWhatsAppEnv } from "../utils/env.js";
+import { resolveBusinessCloudCredentials } from "./whatsappCredentialResolver.js";
 
 const FieldValue = admin.firestore.FieldValue;
 
@@ -120,9 +121,15 @@ export async function findOwnerUidByPhoneNumberId(db, phoneNumberId) {
  * @param {string} ownerUid — must be set to resolve a business profile; credentials still come from env
  */
 export async function getBusinessWhatsAppCredentials(_db, ownerUid) {
-  void _db;
   const uid = String(ownerUid ?? "").trim();
   if (!uid) return null;
+
+  if (
+    String(process.env.MULTI_BUSINESS_WHATSAPP_ENABLED ?? "").toLowerCase() === "true" ||
+    String(process.env.WHATSAPP_STRICT_TENANT_CREDENTIALS ?? "").toLowerCase() === "true"
+  ) {
+    return resolveBusinessCloudCredentials(_db, uid);
+  }
 
   const { phoneNumberId, accessToken } = getWhatsAppEnv();
   if (!phoneNumberId || !accessToken) {

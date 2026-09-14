@@ -4,13 +4,14 @@ import { sendAvailabilityCustomerNotification } from "./availabilityCustomerNoti
 import {
   markAvailabilityRequestCustomerNotificationProcessing,
 } from "./availabilityRequestService.js";
+import { resolveBusinessCloudCredentials } from "./whatsappCredentialResolver.js";
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
 }
 
-let pollRunning = false;
+const pollsRunning = new Set();
 
 function resolveOwnerUid() {
   return clean(
@@ -92,23 +93,26 @@ async function claimAvailabilityRequest(dbInstance, request) {
  */
 export async function pollLocalAvailabilityContinuations({
   db: connection,
-  ownerUserId = resolveOwnerUid(),
+  businessId,
+  ownerUserId,
   limit = 5,
   availabilityCustomerDmExecute = isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled(),
   sendWhatsAppMessageFn,
   replyPrivatelyFn,
+  resolveCredentialsFn = resolveBusinessCloudCredentials,
 } = {}) {
   const firestore = connection ?? db;
-  const uid = clean(ownerUserId);
+  const strictTenantMode = String(process.env.MULTI_BUSINESS_WHATSAPP_ENABLED ?? "").toLowerCase() === "true";
+  const uid = clean(businessId ?? ownerUserId ?? (strictTenantMode ? "" : resolveOwnerUid()));
   if (!firestore || !uid) {
     return { ok: false, processed: 0, sent: 0, skipped: 0 };
   }
-  if (pollRunning) {
+  if (pollsRunning.has(uid)) {
     return { ok: true, processed: 0, sent: 0, skipped: 0, running: true };
   }
-  pollRunning = true;
+  pollsRunning.add(uid);
   if (availabilityCustomerDmExecute !== true) {
-    pollRunning = false;
+    pollsRunning.delete(uid);
     return { ok: true, processed: 0, sent: 0, skipped: 0, disabled: true };
   }
 
@@ -126,6 +130,8 @@ export async function pollLocalAvailabilityContinuations({
       }
       processed += 1;
 
+      const sendCredentials = await resolveCredentialsFn(firestore, uid).catch(() => null);
+
       const result = await sendAvailabilityCustomerNotification({
         db: firestore,
         businessId: request.data.businessId,
@@ -134,6 +140,7 @@ export async function pollLocalAvailabilityContinuations({
         executionContext: {
           businessId: request.data.businessId,
           requestId: request.id,
+          sendCredentials,
           sendWhatsAppMessageFn,
           replyPrivatelyFn,
         },
@@ -157,6 +164,6 @@ export async function pollLocalAvailabilityContinuations({
 
     return { ok: true, processed, sent, skipped };
   } finally {
-    pollRunning = false;
+    pollsRunning.delete(uid);
   }
 }

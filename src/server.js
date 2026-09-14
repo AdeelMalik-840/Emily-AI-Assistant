@@ -3,6 +3,11 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
+import { verifyMetaWebhookSignature, metaWebhookSignatureRequired } from "./services/metaWebhookSignature.js";
+import { resolveCloudBusinessRoute } from "./services/whatsappCloudRouteRegistry.js";
+import { resolveBusinessCloudCredentials } from "./services/whatsappCredentialResolver.js";
+import { createWhatsAppConnectionRouter } from "./services/whatsappConnectionApi.js";
+import { PlaywrightWorkerManager } from "./services/playwrightWorkerManager.js";
 
 import db, { auth } from "./config/firebase.js";
 import {
@@ -89,6 +94,13 @@ function groupWebhookFallbackOwnerUid() {
   ).trim();
 }
 
+function maskWhatsAppIdentity(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, "");
+  return digits ? `***${digits.slice(-4)}` : `opaque:${createHash("sha256").update(raw).digest("hex").slice(0, 10)}`;
+}
+
 const app = express();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -100,7 +112,11 @@ console.log("[server] WhatsApp env:", {
   env: process.env.NODE_ENV,
 });
 
-app.use(express.json());
+app.use(express.json({
+  verify(req, _res, buffer) {
+    if (req.originalUrl?.split("?")[0] === "/webhook") req.rawBody = Buffer.from(buffer);
+  },
+}));
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
@@ -166,6 +182,34 @@ async function getUidFromBearer(req) {
   }
 }
 
+const multiBusinessWhatsAppEnabled =
+  String(process.env.MULTI_BUSINESS_WHATSAPP_ENABLED ?? "").toLowerCase() === "true";
+let playwrightWorkerManager = null;
+if (multiBusinessWhatsAppEnabled) {
+  try {
+    playwrightWorkerManager = new PlaywrightWorkerManager({
+      db,
+      storageRoot: process.env.PLAYWRIGHT_DATA_ROOT,
+      singleManager: String(process.env.WHATSAPP_SINGLE_MANAGER ?? "").toLowerCase() === "true",
+    });
+  } catch (error) {
+    console.error("[whatsapp_worker_manager_disabled]", {
+      reason: String(error?.message ?? "MANAGER_INITIALIZATION_FAILED"),
+    });
+    if (String(process.env.NODE_ENV ?? "").toLowerCase() === "production") {
+      throw error;
+    }
+  }
+  app.use(
+    "/api/whatsapp",
+    createWhatsAppConnectionRouter({
+      db,
+      verifyIdToken: (token) => auth.verifyIdToken(token),
+      workerManager: playwrightWorkerManager,
+    })
+  );
+}
+
 function checkSaveKnowledgeSecret(req) {
   const secret = process.env.SAVE_KNOWLEDGE_SECRET;
   if (!secret) return true;
@@ -219,7 +263,14 @@ app.get("/webhook", (req, res) => {
  * Meta expects 200 OK; replies are sent via the Send API, not this response body.
  * ================================
  */
-app.post("/webhook", async (req, res) => {
+app.post("/webhook", (req, res, next) => {
+  if (!metaWebhookSignatureRequired()) return next();
+  if (!verifyMetaWebhookSignature(req.rawBody, req.headers["x-hub-signature-256"], process.env.META_APP_SECRET)) {
+    console.warn("[webhook_signature_rejected]", { reason: "missing_or_invalid" });
+    return res.sendStatus(401);
+  }
+  return next();
+}, async (req, res) => {
   const whatsappGroupDebug = isWhatsAppGroupDebugEnabled();
   console.log("[webhook] received POST", { WHATSAPP_GROUP_DEBUG: whatsappGroupDebug });
 
@@ -233,6 +284,19 @@ app.post("/webhook", async (req, res) => {
       ? String(value.metadata.phone_number_id).trim()
       : "";
     const waEnv = getWhatsAppEnv();
+    const strictCloudRouting =
+      multiBusinessWhatsAppEnabled ||
+      String(process.env.WHATSAPP_STRICT_CLOUD_ROUTING ?? "").toLowerCase() === "true";
+    const strictRoute = strictCloudRouting
+      ? await resolveCloudBusinessRoute(db, phoneNumberId)
+      : null;
+    if (strictCloudRouting && !strictRoute?.ok) {
+      console.warn("[webhook_route_rejected]", {
+        phoneNumberId: phoneNumberId || null,
+        reason: strictRoute?.reason || "UNKNOWN_PHONE_NUMBER_ID",
+      });
+      return res.sendStatus(200);
+    }
 
     if (statuses != null) {
       console.log(
@@ -240,10 +304,13 @@ app.post("/webhook", async (req, res) => {
         stringifyWhatsAppStatusesForLog(statuses)
       );
       if (Array.isArray(statuses) && statuses.length > 0) {
-        let statusOwnerUserId = phoneNumberId
-          ? await findOwnerUidByPhoneNumberId(db, phoneNumberId)
-          : null;
+        let statusOwnerUserId = strictCloudRouting
+          ? strictRoute.businessId
+          : phoneNumberId
+            ? await findOwnerUidByPhoneNumberId(db, phoneNumberId)
+            : null;
         if (
+          !strictCloudRouting &&
           !statusOwnerUserId &&
           phoneNumberId &&
           waEnv.phoneNumberId === phoneNumberId &&
@@ -348,17 +415,27 @@ app.post("/webhook", async (req, res) => {
     const inboundMessageId = String(message.id ?? "").trim();
     const inboundContextMessageId = String(message.context?.id ?? "").trim();
 
-    console.log("WHATSAPP INCOMING:", {
-      from: message.from,
-      author: message.author,
-      sender: senderWaId,
-      isGroup,
-      text: inboundText,
-      isGroupMessage,
-      hasContextId: Boolean(inboundContextMessageId),
-    });
+    console.log("WHATSAPP INCOMING:", strictCloudRouting
+      ? {
+          from: maskWhatsAppIdentity(message.from),
+          author: maskWhatsAppIdentity(message.author),
+          sender: maskWhatsAppIdentity(senderWaId),
+          isGroup,
+          hasText: Boolean(inboundText),
+          isGroupMessage,
+          hasContextId: Boolean(inboundContextMessageId),
+        }
+      : {
+          from: message.from,
+          author: message.author,
+          sender: senderWaId,
+          isGroup,
+          text: inboundText,
+          isGroupMessage,
+          hasContextId: Boolean(inboundContextMessageId),
+        });
 
-    if (whatsappGroupDebug && isGroupMessage) {
+    if (whatsappGroupDebug && isGroupMessage && !strictCloudRouting) {
       console.log(
         "[WHATSAPP_GROUP_DEBUG] FULL webhook body:",
         JSON.stringify(req.body, null, 2)
@@ -369,9 +446,9 @@ app.post("/webhook", async (req, res) => {
       "[webhook] group detection:",
       JSON.stringify(
         {
-          "message.from": fromRaw,
-          "message.author": authorRaw || null,
-          "message.group_id": groupIdRaw || null,
+          "message.from": strictCloudRouting ? maskWhatsAppIdentity(fromRaw) : fromRaw,
+          "message.author": strictCloudRouting ? maskWhatsAppIdentity(authorRaw) : authorRaw || null,
+          "message.group_id": strictCloudRouting ? maskWhatsAppIdentity(groupIdRaw) : groupIdRaw || null,
           isGroupMessage,
         },
         null,
@@ -422,19 +499,24 @@ app.post("/webhook", async (req, res) => {
     /** Group fallbacks: prefer delivery working over strict phone_number_id match. */
     const canUseGlobalWaForGroup = Boolean(waEnv.isConfigured);
 
-    let ownerUserId = null;
-    if (participantDigits !== "") {
+    let ownerUserId = strictCloudRouting ? strictRoute.businessId : null;
+    /** @type {{ businessId?: string, accessToken: string, phoneNumberId: string, connectionVersion?: string } | null} */
+    let sendCredentials = strictCloudRouting
+      ? await resolveBusinessCloudCredentials(db, ownerUserId, { connection: strictRoute.connection })
+      : null;
+
+    if (!strictCloudRouting && participantDigits !== "") {
       ownerUserId = await findOwnerUidByManualCustomerPhone(
         db,
         participantDigits
       );
     }
-    if (!ownerUserId && phoneNumberId) {
+    if (!strictCloudRouting && !ownerUserId && phoneNumberId) {
       ownerUserId = await findOwnerUidByPhoneNumberId(db, phoneNumberId);
     }
 
     if (
-      !ownerUserId &&
+      !strictCloudRouting && !ownerUserId &&
       phoneNumberId &&
       waEnv.phoneNumberId === phoneNumberId &&
       process.env.LEGACY_BUSINESS_FIREBASE_UID
@@ -442,15 +524,12 @@ app.post("/webhook", async (req, res) => {
       ownerUserId = String(process.env.LEGACY_BUSINESS_FIREBASE_UID).trim();
     }
 
-    /** @type {{ accessToken: string, phoneNumberId: string } | null} */
-    let sendCredentials = null;
-
-    if (ownerUserId) {
+    if (!strictCloudRouting && ownerUserId) {
       sendCredentials = await getBusinessWhatsAppCredentials(db, ownerUserId);
     }
 
     if (
-      ownerUserId &&
+      !strictCloudRouting && ownerUserId &&
       (!sendCredentials?.accessToken || !sendCredentials?.phoneNumberId)
     ) {
       if (isGroupMessage && canUseGlobalWaForGroup) {
@@ -469,7 +548,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (
-      isGroupMessage &&
+      !strictCloudRouting && isGroupMessage &&
       ownerUserId &&
       (!sendCredentials?.accessToken || !sendCredentials?.phoneNumberId)
     ) {
@@ -487,7 +566,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    if (!ownerUserId && canUseGlobalWaStrict) {
+    if (!strictCloudRouting && !ownerUserId && canUseGlobalWaStrict) {
       const legacyUid = String(
         process.env.LEGACY_BUSINESS_FIREBASE_UID ?? ""
       ).trim();
@@ -505,7 +584,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (
-      !ownerUserId &&
+      !strictCloudRouting && !ownerUserId &&
       canUseGlobalWaStrict &&
       !isGroupMessage &&
       !String(process.env.LEGACY_BUSINESS_FIREBASE_UID ?? "").trim()
@@ -520,7 +599,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (
-      isGroupMessage &&
+      !strictCloudRouting && isGroupMessage &&
       (!ownerUserId ||
         !sendCredentials?.accessToken ||
         !sendCredentials?.phoneNumberId)
@@ -1028,6 +1107,13 @@ app.listen(PORT, () => {
     getCredentialsFn: getBusinessWhatsAppCredentials,
     executePipelineFn: executeWhatsAppAiPipeline,
   });
+  if (playwrightWorkerManager) {
+    void playwrightWorkerManager.restoreConnectedBusinesses(20).catch((error) => {
+      console.error("[whatsapp_worker_restore_failed]", {
+        reason: String(error?.message ?? "RESTORE_FAILED"),
+      });
+    });
+  }
   if (isWhatsAppGroupDebugEnabled()) {
     console.warn(
       "[server] WHATSAPP_GROUP_DEBUG is enabled — group inbound gate is bypassed (AI can reply to every group line). For production set WHATSAPP_GROUP_DEBUG=false or unset."
@@ -1087,6 +1173,13 @@ async function gracefulPlaywrightShutdown(signal) {
       console.warn("[server] Playwright stop error:", err?.message || err);
     }
   }
+  if (playwrightWorkerManager) {
+    try {
+      await playwrightWorkerManager.shutdown();
+    } catch (err) {
+      console.warn("[server] Playwright worker manager stop error:", err?.message || err);
+    }
+  }
 }
 
 process.once("SIGTERM", () => {
@@ -1096,7 +1189,10 @@ process.once("SIGINT", () => {
   void gracefulPlaywrightShutdown("SIGINT").finally(() => process.exit(0));
 });
 
-if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true") {
+if (
+  !multiBusinessWhatsAppEnabled &&
+  String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true"
+) {
   void import("./services/playwrightListener/index.js").then((mod) => {
     stopPlaywrightListenerFn = mod.stopPlaywrightListener;
     mod.startPlaywrightListener().catch((err) => {

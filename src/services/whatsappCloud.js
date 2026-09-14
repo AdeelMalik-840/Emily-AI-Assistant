@@ -117,8 +117,23 @@ function resolveWhatsAppCredentials(credentials, context = {}) {
   let phoneNumberId = "";
   /** @type {"per_user" | "env"} */
   let tokenSource = "env";
+  const strictTenantCredentials =
+    String(process.env.MULTI_BUSINESS_WHATSAPP_ENABLED ?? "").trim().toLowerCase() === "true" ||
+    String(process.env.WHATSAPP_STRICT_TENANT_CREDENTIALS ?? "").trim().toLowerCase() === "true";
 
-  if (forceEnvToken) {
+  if (strictTenantCredentials) {
+    if (!hasPerUserToken || !perUserPhoneNumberId) return null;
+    token = perUserToken;
+    phoneNumberId = perUserPhoneNumberId;
+    tokenSource = "per_user";
+  } else if (hasPerUserToken !== Boolean(perUserPhoneNumberId)) {
+    // A partial caller bundle is always unsafe; never complete it from environment.
+    return null;
+  } else if (hasPerUserToken && perUserPhoneNumberId) {
+    token = perUserToken;
+    phoneNumberId = perUserPhoneNumberId;
+    tokenSource = "per_user";
+  } else if (forceEnvToken) {
     token = envToken;
     phoneNumberId = envPhoneNumberId;
     tokenSource = "env";
@@ -126,10 +141,6 @@ function resolveWhatsAppCredentials(credentials, context = {}) {
       hasEnvToken,
       phoneNumberId: envPhoneNumberId || null,
     });
-  } else if (hasPerUserToken || perUserPhoneNumberId) {
-    token = perUserToken || envToken;
-    phoneNumberId = perUserPhoneNumberId || envPhoneNumberId;
-    tokenSource = hasPerUserToken ? "per_user" : "env";
   } else {
     token = envToken;
     phoneNumberId = envPhoneNumberId;
@@ -150,6 +161,10 @@ function resolveWhatsAppCredentials(credentials, context = {}) {
 
   if (!phoneNumberId || !token) return null;
   return { token, phoneNumberId, tokenSource, hasPerUserToken, hasEnvToken };
+}
+
+export function __resolveWhatsAppCredentialsForTests(credentials, context = {}) {
+  return resolveWhatsAppCredentials(credentials, context);
 }
 
 /**

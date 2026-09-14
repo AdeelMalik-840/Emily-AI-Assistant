@@ -1,8 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { writeFileAtomic } from "./atomicFileWrite.js";
 
-const LOCAL_CURSOR_FILE = path.resolve("playwrightInboundCursors.json");
+const LOCAL_CURSOR_FILE = path.resolve(
+  process.env.PLAYWRIGHT_INBOUND_CURSOR_PATH || "playwrightInboundCursors.json"
+);
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -87,7 +90,7 @@ function readLocalCursorMap() {
 
 function writeLocalCursorMap(map) {
   try {
-    fs.writeFileSync(LOCAL_CURSOR_FILE, JSON.stringify(map, null, 2));
+    writeFileAtomic(LOCAL_CURSOR_FILE, JSON.stringify(map, null, 2));
   } catch (err) {
     console.warn("[playwright_cursor_local_write_failed]", err?.message || err);
   }

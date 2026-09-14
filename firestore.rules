@@ -4,6 +4,17 @@ service cloud.firestore {
     match /businesses/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
+    // Transport authority is server-only. Firebase Admin bypasses these rules;
+    // mobile clients use authenticated, sanitized API responses instead.
+    match /whatsapp_connections/{businessId} {
+      allow read, write: if false;
+    }
+    match /whatsapp_cloud_routes/{phoneNumberId} {
+      allow read, write: if false;
+    }
+    match /whatsapp_link_attempts/{attemptId} {
+      allow read, write: if false;
+    }
     // Add other collections (e.g. messages, users) with their own rules.
   }
 }

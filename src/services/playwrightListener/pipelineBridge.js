@@ -28,6 +28,9 @@ const WHATSAPP_MODE = String(process.env.WHATSAPP_MODE ?? "hybrid")
   .toLowerCase();
 
 function resolveOwnerUid() {
+  if (process.env.PLAYWRIGHT_STRICT_BUSINESS_WORKER === "true") {
+    return String(process.env.PLAYWRIGHT_OWNER_USER_ID ?? "").trim();
+  }
   return String(
     process.env.PLAYWRIGHT_OWNER_USER_ID ||
       process.env.LEGACY_BUSINESS_FIREBASE_UID ||

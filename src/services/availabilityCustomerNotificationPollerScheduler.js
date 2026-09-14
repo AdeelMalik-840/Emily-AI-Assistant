@@ -5,6 +5,8 @@
 
 import { isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled } from "../brain/config/liveFeatureFlags.js";
 import { pollLocalAvailabilityContinuations } from "./localAvailabilityContinuationPoller.js";
+import db from "../config/firebase.js";
+import { listNotificationEligibleBusinessIds } from "./whatsappConnectionRegistry.js";
 
 export const DEFAULT_AVAILABILITY_CUSTOMER_NOTIFICATION_POLLER_INTERVAL_MS = 5_000;
 export const MIN_AVAILABILITY_CUSTOMER_NOTIFICATION_POLLER_INTERVAL_MS = 5_000;
@@ -14,6 +16,7 @@ export const AUTO_AVAILABILITY_CUSTOMER_NOTIFICATION_POLLER_LIMIT = 5;
 /** @type {ReturnType<typeof setInterval> | null} */
 let intervalHandle = null;
 let tickRunning = false;
+const tenantTicksRunning = new Set();
 
 function readEnvRaw(name) {
   const v = process.env[name];
@@ -56,6 +59,8 @@ export function isAvailabilityCustomerNotificationPollerSchedulerRunning() {
  *   clearIntervalFn?: typeof clearInterval,
  *   logFn?: (...args: unknown[]) => void,
  *   runImmediately?: boolean,
+ *   db?: unknown,
+ *   listBusinessIdsFn?: typeof listNotificationEligibleBusinessIds,
  * }} [options]
  */
 export function startAvailabilityCustomerNotificationPollerScheduler(options = {}) {
@@ -91,6 +96,8 @@ export function startAvailabilityCustomerNotificationPollerScheduler(options = {
 
   const setIntervalFn = options.setIntervalFn ?? setInterval;
   const pollFn = options.pollFn ?? pollLocalAvailabilityContinuations;
+  const firestore = options.db ?? db;
+  const listBusinessIdsFn = options.listBusinessIdsFn ?? listNotificationEligibleBusinessIds;
   const intervalMs =
     Number.isFinite(Number(options.intervalMs)) && Number(options.intervalMs) > 0
       ? Math.min(
@@ -112,12 +119,22 @@ export function startAvailabilityCustomerNotificationPollerScheduler(options = {
     }
     tickRunning = true;
     void Promise.resolve()
-      .then(() =>
-        pollFn({
-          availabilityCustomerDmExecute: true,
-          limit,
-        })
-      )
+      .then(async () => {
+        const multiTenant = String(process.env.MULTI_BUSINESS_WHATSAPP_ENABLED ?? "").toLowerCase() === "true";
+        if (!multiTenant) {
+          return pollFn({ availabilityCustomerDmExecute: true, limit });
+        }
+        const businessIds = await listBusinessIdsFn(firestore, 20);
+        await Promise.all(businessIds.map(async (businessId) => {
+          if (tenantTicksRunning.has(businessId)) return;
+          tenantTicksRunning.add(businessId);
+          try {
+            await pollFn({ businessId, availabilityCustomerDmExecute: true, limit });
+          } finally {
+            tenantTicksRunning.delete(businessId);
+          }
+        }));
+      })
       .catch((err) => {
         console.warn("[availability_customer_notification_poller_scheduler]", {
           event: "tick_error",

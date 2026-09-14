@@ -391,6 +391,9 @@ function participantComparableFromSortedRow(m, normalizedGroupChatKey) {
 }
 
 function resolveOwnerUid() {
+  if (process.env.PLAYWRIGHT_STRICT_BUSINESS_WORKER === "true") {
+    return String(process.env.PLAYWRIGHT_OWNER_USER_ID ?? "").trim();
+  }
   return clean(
     process.env.PLAYWRIGHT_OWNER_USER_ID ||
       process.env.LEGACY_BUSINESS_FIREBASE_UID ||
@@ -5759,8 +5762,8 @@ export function __resolvePlaywrightForwardIdentityForTests(
   return resolvePlaywrightForwardIdentity(chatKey, msg, index, extractedList);
 }
 
-const SESSION_FILE = path.resolve("playwright-session.json");
-const KNOWN_BUSINESS_CHATS_FILE = path.resolve("knownChats.json");
+const SESSION_FILE = path.resolve(process.env.PLAYWRIGHT_SESSION_PATH || "playwright-session.json");
+const KNOWN_BUSINESS_CHATS_FILE = path.resolve(process.env.PLAYWRIGHT_KNOWN_CHATS_PATH || "knownChats.json");
 
 /** Learned chat keys (`data-id` or normalized name), persisted in `knownChats.json`. */
 /** @type {Set<string>} */
@@ -9240,17 +9243,19 @@ async function runListenerBody() {
     });
   }, 5_000);
 
-  localAvailabilityContinuationTimer = setInterval(() => {
-    if (isStopping) return;
-    void pollLocalAvailabilityContinuations().catch((err) => {
-      if (!isStopping) {
-        console.warn(
-          "[local_availability_customer_notification_failed]",
-          { bookingId: null, reason: err?.message || String(err) }
-        );
-      }
-    });
-  }, 5_000);
+  if (process.env.PLAYWRIGHT_STRICT_BUSINESS_WORKER !== "true") {
+    localAvailabilityContinuationTimer = setInterval(() => {
+      if (isStopping) return;
+      void pollLocalAvailabilityContinuations({ businessId: resolveOwnerUid() }).catch((err) => {
+        if (!isStopping) {
+          console.warn(
+            "[local_availability_customer_notification_failed]",
+            { bookingId: null, reason: err?.message || String(err) }
+          );
+        }
+      });
+    }, 5_000);
+  }
 
   if (isPlaywrightChatLoopEnabled()) {
     if (globalThis.chatLoopInterval != null) {

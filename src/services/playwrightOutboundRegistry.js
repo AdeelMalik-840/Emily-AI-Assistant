@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { writeFileAtomic } from "./atomicFileWrite.js";
 
 /** @typedef {{
  *   kind?: "text" | "media_click",
@@ -146,7 +147,7 @@ function persistRegistry() {
     for (const [chatKey, entries] of registryByChat.entries()) {
       out[chatKey] = entries;
     }
-    writeFileSync(PERSIST_PATH, JSON.stringify(out), "utf8");
+    writeFileAtomic(PERSIST_PATH, JSON.stringify(out));
   } catch (err) {
     console.warn("[playwright_outbound_registry_persist_failed]", {
       error: String(err?.message ?? err ?? "").slice(0, 160),
