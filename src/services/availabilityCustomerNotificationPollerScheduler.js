@@ -4,8 +4,6 @@
  */
 
 import { isEmilyBrainV2AvailabilityCustomerDmExecuteEnabled } from "../brain/config/liveFeatureFlags.js";
-import { pollLocalAvailabilityContinuations } from "./localAvailabilityContinuationPoller.js";
-import db from "../config/firebase.js";
 import { listNotificationEligibleBusinessIds } from "./whatsappConnectionRegistry.js";
 
 export const DEFAULT_AVAILABILITY_CUSTOMER_NOTIFICATION_POLLER_INTERVAL_MS = 5_000;
@@ -17,6 +15,15 @@ export const AUTO_AVAILABILITY_CUSTOMER_NOTIFICATION_POLLER_LIMIT = 5;
 let intervalHandle = null;
 let tickRunning = false;
 const tenantTicksRunning = new Set();
+
+async function defaultPollFn(options) {
+  const { pollLocalAvailabilityContinuations } = await import("./localAvailabilityContinuationPoller.js");
+  return pollLocalAvailabilityContinuations(options);
+}
+
+async function loadDefaultDb() {
+  return (await import("../config/firebase.js")).default;
+}
 
 function readEnvRaw(name) {
   const v = process.env[name];
@@ -54,13 +61,13 @@ export function isAvailabilityCustomerNotificationPollerSchedulerRunning() {
  * @param {{
  *   enabled?: boolean,
  *   intervalMs?: number,
- *   pollFn?: typeof pollLocalAvailabilityContinuations,
+ *   pollFn?: (options: Record<string, unknown>) => Promise<unknown>,
  *   setIntervalFn?: typeof setInterval,
  *   clearIntervalFn?: typeof clearInterval,
  *   logFn?: (...args: unknown[]) => void,
  *   runImmediately?: boolean,
  *   db?: unknown,
- *   listBusinessIdsFn?: typeof listNotificationEligibleBusinessIds,
+ *   listBusinessIdsFn?: (db: unknown, limit: number) => Promise<string[]>,
  * }} [options]
  */
 export function startAvailabilityCustomerNotificationPollerScheduler(options = {}) {
@@ -95,8 +102,8 @@ export function startAvailabilityCustomerNotificationPollerScheduler(options = {
   }
 
   const setIntervalFn = options.setIntervalFn ?? setInterval;
-  const pollFn = options.pollFn ?? pollLocalAvailabilityContinuations;
-  const firestore = options.db ?? db;
+  const pollFn = options.pollFn ?? defaultPollFn;
+  const firestore = options.db;
   const listBusinessIdsFn = options.listBusinessIdsFn ?? listNotificationEligibleBusinessIds;
   const intervalMs =
     Number.isFinite(Number(options.intervalMs)) && Number(options.intervalMs) > 0
@@ -124,7 +131,8 @@ export function startAvailabilityCustomerNotificationPollerScheduler(options = {
         if (!multiTenant) {
           return pollFn({ availabilityCustomerDmExecute: true, limit });
         }
-        const businessIds = await listBusinessIdsFn(firestore, 20);
+        const tenantDb = firestore ?? await loadDefaultDb();
+        const businessIds = await listBusinessIdsFn(tenantDb, 20);
         await Promise.all(businessIds.map(async (businessId) => {
           if (tenantTicksRunning.has(businessId)) return;
           tenantTicksRunning.add(businessId);

@@ -223,19 +223,17 @@ test("6. server.js wires scheduler without requiring PLAYWRIGHT_ENABLED", () => 
   const playwrightBlock = serverSrc.indexOf('PLAYWRIGHT_ENABLED');
   // Scheduler call must exist outside the PLAYWRIGHT_ENABLED import block dependency.
   assert.ok(startIdx > 0);
-  assert.ok(
-    !serverSrc
-      .slice(
-        serverSrc.lastIndexOf("if (String(process.env.PLAYWRIGHT_ENABLED"),
-        startIdx
-      )
-      .includes("startAvailabilityCustomerNotificationPollerScheduler()")
-  );
-  // Confirm wiring is after playwright conditional, as a sibling startup call.
+  // Confirm wiring is after the legacy listener conditional, as a sibling
+  // startup call. Multi-business mode adds an additional guard to this block.
   const playwrightIf = serverSrc.indexOf(
-    'if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() === "true")'
+    '!multiBusinessWhatsAppEnabled &&'
   );
   assert.ok(playwrightIf > 0);
+  const listenerStart = serverSrc.indexOf("mod.startPlaywrightListener()", playwrightIf);
+  assert.ok(listenerStart > playwrightIf);
+  const listenerBlockEnd = serverSrc.indexOf("\n}\n", listenerStart);
+  assert.ok(listenerBlockEnd > listenerStart);
+  assert.ok(startIdx > listenerBlockEnd);
   assert.ok(startIdx > playwrightIf);
   void playwrightBlock;
 });
