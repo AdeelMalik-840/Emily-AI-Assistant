@@ -86,7 +86,17 @@ test("guard: accepts roman_urdu reply with conjugations and English loanwords", 
   assert.equal(ok.ok, true);
 });
 
-test("guard: rejects english customer with roman_urdu reply", () => {
+// Live production defect: "Corolla available?" (english, per
+// inferCustomerLanguageStyle) legitimately drew a Roman Urdu/mixed
+// duration_ask reply ("Corolla kitne din ke liye chahiye?") -- both
+// composer attempts were discarded into technical_fallback purely because
+// this same regex-heuristic language check had been given the same
+// {ok:false} authority as the real truth/safety checks above it in this
+// function. Language/register is now CLASS B: a soft, non-authoritative
+// signal surfaced for diagnostics/quality review, never a reason on its own
+// to fail validateCustomerReplyAgainstContract. See the CLASS B comment at
+// its definition site (src/brain/guards/customerReplyGuard.js).
+test("guard: a code-switched (Roman Urdu/mixed) reply to an English customer message is NOT a hard rejection", () => {
   const c = buildGroupPostExecutePendingAvailabilityContract({
     customerMessageText: "Is the Corolla available for two days?",
     styleKey: "neutral_english",
@@ -94,7 +104,7 @@ test("guard: rejects english customer with roman_urdu reply", () => {
     durationDays: 2,
   });
   assert.equal(c.customerLanguageStyle, "english");
-  const bad = validateCustomerReplyAgainstContract(
+  const romanUrduReply = validateCustomerReplyAgainstContract(
     "Corolla 2 din ke liye check kar leta hun",
     c,
     {
@@ -103,9 +113,12 @@ test("guard: rejects english customer with roman_urdu reply", () => {
       claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
     }
   );
-  assert.equal(bad.ok, false);
-  assert.equal(bad.reason, "customer_language_mismatch");
-  const ok = validateCustomerReplyAgainstContract(
+  assert.equal(romanUrduReply.ok, true);
+  // The mismatch is still surfaced as a non-blocking diagnostic signal --
+  // never silently dropped, never itself a failure reason.
+  assert.equal(romanUrduReply.softSignals.customerLanguageStyleMismatch, true);
+
+  const englishReply = validateCustomerReplyAgainstContract(
     "I'll check Corolla availability for two days.",
     c,
     {
@@ -114,8 +127,10 @@ test("guard: rejects english customer with roman_urdu reply", () => {
       claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
     }
   );
-  assert.equal(ok.ok, true);
-  const mixedRejected = validateCustomerReplyAgainstContract(
+  assert.equal(englishReply.ok, true);
+  assert.equal(englishReply.softSignals.customerLanguageStyleMismatch, false);
+
+  const mixedReply = validateCustomerReplyAgainstContract(
     "Corolla ke liye 2 din ka check kar raha hun",
     c,
     {
@@ -124,18 +139,18 @@ test("guard: rejects english customer with roman_urdu reply", () => {
       claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
     }
   );
-  assert.equal(mixedRejected.ok, false);
-  assert.equal(mixedRejected.reason, "customer_language_mismatch");
+  assert.equal(mixedReply.ok, true);
+  assert.equal(mixedReply.softSignals.customerLanguageStyleMismatch, true);
 });
 
-test("guard: rejects roman_urdu customer with english-only reply", () => {
+test("guard: an English-only reply to a Roman Urdu customer message is NOT a hard rejection", () => {
   const c = buildGroupPostExecutePendingAvailabilityContract({
     customerMessageText: "Corolla 2 din k liye available hai?",
     itemLabel: "Corolla",
     durationDays: 2,
   });
   assert.equal(c.customerLanguageStyle, "roman_urdu");
-  const bad = validateCustomerReplyAgainstContract(
+  const englishReply = validateCustomerReplyAgainstContract(
     "I will check Corolla availability for two days.",
     c,
     {
@@ -144,8 +159,8 @@ test("guard: rejects roman_urdu customer with english-only reply", () => {
       claims: [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED],
     }
   );
-  assert.equal(bad.ok, false);
-  assert.equal(bad.reason, "customer_language_mismatch");
+  assert.equal(englishReply.ok, true);
+  assert.equal(englishReply.softSignals.customerLanguageStyleMismatch, true);
 });
 
 test("guard: pre-execution confirm forbids booking-success wording", () => {

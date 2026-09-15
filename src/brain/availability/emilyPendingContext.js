@@ -57,7 +57,9 @@ export function normalizeEmilyPendingStage(stage) {
  *   pendingQuestion: string,
  *   itemId?: string | null,
  *   itemLabel?: string | null,
+ *   customerReference?: string | null,
  *   participantKey?: string | null,
+ *   chatScopeKey?: string | null,
  *   sourceWorkflow?: string | null,
  *   sourceTurnKey?: string | null,
  *   type?: string | null,
@@ -91,11 +93,41 @@ export function buildEmilyPending(p) {
     pendingQuestion,
     itemId,
     itemLabel: clean(p.itemLabel, 160) || null,
+    customerReference: clean(p.customerReference, 160) || null,
     participantKey: clean(p.participantKey, 160) || null,
+    chatScopeKey: clean(p.chatScopeKey, 200) || null,
     sourceWorkflow: clean(p.sourceWorkflow, 80) || null,
     sourceTurnKey: clean(p.sourceTurnKey, 160) || null,
     createdAt: new Date(nowMs).toISOString(),
     expiresAt: new Date(nowMs + ttlMs).toISOString(),
+  };
+}
+
+/**
+ * Renew an existing, still-fresh pending record instead of replacing its
+ * identity. Used when the workflow is still waiting on the same missing
+ * field for the same item/participant (alreadyWaitingForDuration) -- the
+ * live defect this fixes was the durable record's TTL never being extended
+ * while Emily kept waiting, so it silently expired mid-conversation and the
+ * next turn lost trusted continuity (trustedFreshItemFocus). Only freshness
+ * (expiresAt) and current-turn wording (itemLabel/customerReference/
+ * pendingQuestion) are renewed; the original logical transaction's identity
+ * -- createdAt (already relied on by composer context-scoping) and
+ * sourceTurnKey -- is preserved from `existing` whenever present, never
+ * rolled forward to a new turn's key.
+ *
+ * @param {ReturnType<typeof readFreshEmilyPending>} existing
+ * @param {Parameters<typeof buildEmilyPending>[0]} updates
+ * @returns {Record<string, unknown> | null}
+ */
+export function renewEmilyPending(existing, updates = {}) {
+  const fresh = buildEmilyPending(updates);
+  if (!fresh) return null;
+  if (!existing) return fresh;
+  return {
+    ...fresh,
+    createdAt: existing.createdAt || fresh.createdAt,
+    sourceTurnKey: existing.sourceTurnKey || fresh.sourceTurnKey,
   };
 }
 
@@ -129,7 +161,9 @@ export function readFreshEmilyPending(raw, nowMs = Date.now()) {
     pendingQuestion,
     itemId: clean(row.itemId, 120) || null,
     itemLabel: clean(row.itemLabel, 160) || null,
+    customerReference: clean(row.customerReference, 160) || null,
     participantKey: clean(row.participantKey, 160) || null,
+    chatScopeKey: clean(row.chatScopeKey, 200) || null,
     sourceWorkflow: clean(row.sourceWorkflow, 80) || null,
     sourceTurnKey: clean(row.sourceTurnKey, 160) || null,
     createdAt: clean(row.createdAt, 40) || null,
@@ -160,6 +194,7 @@ export function readEmilyPendingFromMemory(memorySnapshot, nowMs = Date.now()) {
  * @param {{
  *   memorySnapshot?: Record<string, unknown> | null,
  *   participantKey?: string | null,
+ *   chatScopeKey?: string | null,
  *   nowMs?: number,
  * }} p
  * @returns {Record<string, unknown> | null}
@@ -170,6 +205,11 @@ export function readEmilyPendingForParticipant(p = {}) {
   const current = clean(p.participantKey, 160);
   const owner = clean(pending.participantKey, 160);
   if (owner && current && owner !== current) return null;
+  const currentScope = clean(p.chatScopeKey, 200);
+  const pendingScope = clean(pending.chatScopeKey, 200);
+  // Group continuation is scope-bound. Legacy records without a scope cannot
+  // influence a Group turn; session scoping still protects older readers.
+  if (currentScope && (!pendingScope || pendingScope !== currentScope)) return null;
   return pending;
 }
 

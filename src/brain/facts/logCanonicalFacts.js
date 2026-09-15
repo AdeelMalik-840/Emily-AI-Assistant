@@ -23,6 +23,45 @@ export function imageUrlHash(url) {
   return createHash("sha256").update(String(url)).digest("hex").slice(0, 12);
 }
 
+function clip(value, max) {
+  const text = String(value ?? "").trim();
+  return text ? text.slice(0, max) : null;
+}
+
+/**
+ * Duration diagnostics for live RCA: values/units, evidence span, provenance.
+ * Logs only the model-copied duration span, not the full customer message.
+ *
+ * @param {Record<string, unknown>} facts
+ */
+function compactCanonicalRequestedDurationLog(facts) {
+  const row =
+    facts?.requestedDurationDiagnostics &&
+    typeof facts.requestedDurationDiagnostics === "object"
+      ? facts.requestedDurationDiagnostics
+      : null;
+  const components = Array.isArray(row?.components) ? row.components : [];
+  return {
+    status: facts?.durationSemanticStatus ?? row?.status ?? null,
+    components: components.slice(0, 4).map((entry) => ({
+      value: Number.isInteger(Number(entry?.value)) ? Number(entry.value) : null,
+      unit: clip(entry?.unit, 20),
+    })),
+    evidenceSurfaceText: clip(row?.evidenceSurfaceText, 80),
+    evidenceStart: Number.isInteger(row?.evidenceStart) ? row.evidenceStart : null,
+    evidenceEnd: Number.isInteger(row?.evidenceEnd) ? row.evidenceEnd : null,
+    provenanceRejectionReason:
+      facts?.durationProvenanceRejectionReason ?? row?.provenanceRejectionReason ?? null,
+    normalizedDays:
+      Number.isFinite(Number(row?.normalizedDays)) && Number(row.normalizedDays) >= 1
+        ? Math.floor(Number(row.normalizedDays))
+        : Number.isFinite(Number(facts?.turn?.durationDays)) &&
+            Number(facts.turn.durationDays) >= 1
+          ? Math.floor(Number(facts.turn.durationDays))
+          : null,
+  };
+}
+
 /**
  * @param {Record<string, unknown>} facts
  * @returns {Record<string, unknown>}
@@ -67,6 +106,13 @@ export function buildCanonicalFactsLogPayload(facts) {
     actions: facts?.actions ?? null,
     forbiddenClaims: facts?.forbiddenClaims ?? null,
     replyConstraints: facts?.replyConstraints ?? null,
+    availabilityConversationTransition:
+      facts?.availabilityConversationTransition ?? null,
+    durationSemanticStatus: facts?.durationSemanticStatus ?? null,
+    durationProvenanceRejectionReason:
+      facts?.durationProvenanceRejectionReason ?? null,
+    requestedDuration: compactCanonicalRequestedDurationLog(facts),
+    groupTransactionIntentSwitch: facts?.groupTransactionIntentSwitch ?? null,
     sourceEvidence: facts?.sourceEvidence ?? null,
   };
 }

@@ -130,6 +130,8 @@ export function hasDistinctDurableWhatsAppIds(rowA, rowB) {
  * @param {unknown[]} [catalogItems]
  */
 export function canMergeBurstRowPair(rowA, rowB, catalogItems = []) {
+  // catalogItems reserved for callers/tests; identity is the merge authority.
+  void catalogItems;
   const textA = String(rowA?.text ?? "").trim();
   const textB = String(rowB?.text ?? "").trim();
   if (!textA || !textB) return false;
@@ -144,31 +146,15 @@ export function canMergeBurstRowPair(rowA, rowB, catalogItems = []) {
     return false;
   }
 
-  const items = Array.isArray(catalogItems) ? catalogItems : [];
-  const idA = resolveMessageCatalogItemId(textA, items);
-  const idB = resolveMessageCatalogItemId(textB, items);
-
-  if (idA && idB && idA !== idB) return false;
-
-  if (idA && items.length) {
-    const newInB = hasExplicitNewItemMention(textB, items, idA);
-    if (newInB.found && newInB.itemId && newInB.itemId !== idA) return false;
+  const durableA = resolveDurableWhatsAppDataId(rowA);
+  const durableB = resolveDurableWhatsAppDataId(rowB);
+  // Same physical WhatsApp row (split-bubble / re-observation) may merge.
+  if (durableA && durableB && durableA === durableB) {
+    return true;
   }
 
-  if (
-    looksLikeItemAvailabilityQuestion(textA) &&
-    looksLikeItemAvailabilityQuestion(textB)
-  ) {
-    if (idA && idB && idA !== idB) return false;
-    const tokensA = primaryDistinctTokens(textA);
-    const tokensB = primaryDistinctTokens(textB);
-    if (tokensA.length && tokensB.length && !tokensOverlap(tokensA, tokensB)) {
-      return false;
-    }
-    return false;
-  }
-
-  return true;
+  // Missing identity is inconclusive. Do not glue two meaningful bodies.
+  return false;
 }
 
 /**
@@ -178,8 +164,12 @@ export function canMergeBurstRowPair(rowA, rowB, catalogItems = []) {
  * @param {unknown[]} [catalogItems]
  */
 export function shouldBurstSupersedeOlderRow(olderRow, newerRow, catalogItems = []) {
-  // Never drop an older durable WhatsApp ID in favor of a newer distinct one.
-  if (hasDistinctDurableWhatsAppIds(olderRow, newerRow)) {
+  const olderId = resolveDurableWhatsAppDataId(olderRow);
+  const newerId = resolveDurableWhatsAppDataId(newerRow);
+  // Supersession permanently discards the older physical row. That is safe
+  // only when both rows expose durable WhatsApp identity. Missing identity is
+  // inconclusive, so preserve/re-observe both instead of guessing from text.
+  if (!olderId || !newerId || olderId !== newerId) {
     return false;
   }
 

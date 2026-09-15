@@ -41,6 +41,7 @@ import {
 } from "./availabilityCustomerPhone.js";
 import { appendConversationMessage } from "./conversationStore.js";
 import { composeCloudCanonicalCustomerReply } from "../brain/openai/composeCloudCanonicalCustomerReply.js";
+import { CUSTOMER_REPLY_COMPOSE_OUTCOMES } from "../brain/contracts/customerReplyContract.js";
 import { resolveOpenAiChatModel } from "../config/aiRuntime.js";
 
 function clean(value, max = 500) {
@@ -356,6 +357,7 @@ async function applyApprovedCloudSessionCompose(built, p) {
   }
   const composed = await composeCloudCanonicalCustomerReply({
     kind: "availability_approved",
+    channel: "dm",
     semanticIntent: "availability_inquiry",
     trustedFacts: facts,
     fallbackReply: fallback,
@@ -363,11 +365,12 @@ async function applyApprovedCloudSessionCompose(built, p) {
     __chatCompletionsCreateForTests: injector ?? null,
   });
   const usedTechnicalFallback =
-    String(composed.source ?? "") !== "openai_cloud_canonical_compose";
+    composed.outcome !== CUSTOMER_REPLY_COMPOSE_OUTCOMES.AI_SUCCESS;
   console.log("[availability_customer_cloud_completion_compose]", {
     requestId: p.requestId || null,
     businessId: p.businessId || null,
     composeModel: resolveOpenAiChatModel(),
+    composeOutcome: composed.outcome ?? null,
     composeSource: composed.source ?? null,
     composeReason: String(composed.reason ?? "").slice(0, 160) || null,
     composeAttemptCount: Number.isFinite(Number(composed.attemptCount))

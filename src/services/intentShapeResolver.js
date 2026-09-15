@@ -32,9 +32,13 @@ export function hasContactInMessage(message) {
  * @param {string} text
  */
 function isRentAvailabilityCompound(text) {
+  // Shared availability-verb family (roman + English). Includes common
+  // transliterations of "mil jaye" (jye / jayega / jayege) so rental-mode
+  // availability compounds are detected without item- or duration-specific rules.
+  const availabilityVerb =
+    /\b(available|availability|maujood|milega|milegi|mil\s+jay(?:e|ega|egi|enge|en)?|mil\s+jye(?:\s+ge)?|mil\s+raha|mil\s+rahi)\b/i;
   return (
-    /\b(rent|kiraya|kiraye)\b/i.test(text) &&
-    /\b(available|availability|maujood|milega|milegi|mil\s+jaye|mil\s+raha)\b/i.test(text)
+    /\b(rent|kiraya|kiraye)\b/i.test(text) && availabilityVerb.test(text)
   );
 }
 
@@ -206,7 +210,9 @@ export function extractTurnSignals(p) {
   const availabilityAsk =
     rentAvailabilityCompound ||
     askedField === "availability" ||
-    (/\b(avail|available|availability|maujood|milega|milegi|mil\s+jaye|mil\s+raha)\b/i.test(text) &&
+    (/\b(avail|available|availability|maujood|milega|milegi|mil\s+jay(?:e|ega|egi|enge|en)?|mil\s+jye(?:\s+ge)?|mil\s+raha|mil\s+rahi)\b/i.test(
+      text
+    ) &&
       !rentAvailabilityCompound &&
       !(priceAsk && explicitlyAsksAmount(text)));
 

@@ -10,7 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** Customer-safe reply when hard v2 mode blocks legacy fallback. */
 export const BRAIN_V2_HARD_BLOCKED_CUSTOMER_REPLY =
-  "Sorry, system abhi update ho raha hai. Please thori dair baad try kar dein.";
+  "Maazrat, abhi aapki request complete nahi ho saki. Please thori dair baad dobara try karein.";
 
 /** @type {boolean | null} */
 let cachedHasV2LivePipeline = null;

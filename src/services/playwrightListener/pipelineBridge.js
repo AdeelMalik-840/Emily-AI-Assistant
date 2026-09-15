@@ -81,22 +81,6 @@ function groupSenderScopeFromAnchor(groupKey, senderAnchor) {
     .slice(0, 16);
 }
 
-function unresolvedParticipantTurnScope(groupKey, adapted) {
-  const turnIdentity = [
-    adapted?.messageId,
-    adapted?.sourceRowKey,
-    adapted?.sourceMessageIndex,
-    adapted?.timestamp,
-    adapted?.text,
-  ]
-    .map((value) => String(value ?? "").trim())
-    .join("::");
-  return createHash("sha256")
-    .update(`${String(groupKey ?? "").trim().toLowerCase()}::${turnIdentity}`, "utf8")
-    .digest("hex")
-    .slice(0, 16);
-}
-
 /**
  * Build schedule payload; returns null if forwarding cannot run.
  * @param {{
@@ -216,12 +200,6 @@ async function buildPlaywrightSchedulePayload(adapted) {
     groupChatKey: playwrightChatKey || groupName || groupSessionKey,
     participantKey,
   });
-  const unresolvedTurnScope = participantKey
-    ? ""
-    : unresolvedParticipantTurnScope(normalizedGroupChatKey, adapted);
-  const sessionKey =
-    participantSessionKey ||
-    `${groupSessionKey}::participant::unresolved::${unresolvedTurnScope}`;
   if (!participantKey) {
     console.warn("[participant_identity_unresolved_fail_closed]", {
       groupChatKey: playwrightChatKey || null,
@@ -229,6 +207,10 @@ async function buildPlaywrightSchedulePayload(adapted) {
       messageId: adapted?.messageId ?? null,
       reason: "MISSING_STABLE_SENDER_ANCHOR_OR_PHONE",
     });
+    // A message/row-derived identity is not a participant identity. Do not
+    // schedule this observation or create durable conversation/session state;
+    // the listener can retry when trusted sender evidence is available.
+    return null;
   } else if (!identityParticipantKey) {
     console.log("[participant_identity_fallback_key_used]", {
       groupChatKey: playwrightChatKey || null,
@@ -237,6 +219,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
       fallback: "senderScope",
     });
   }
+  const sessionKey = participantSessionKey;
   const normalizedInbound = normalizeInboundMessage({
     source: "playwright",
     message: String(adapted?.text ?? "").trim(),
@@ -277,7 +260,7 @@ async function buildPlaywrightSchedulePayload(adapted) {
   }
 
   const conversationCustomerNumber = `grp${createHash("sha256")
-    .update(`${groupName}::${senderScope || `unresolved::${unresolvedTurnScope}`}`, "utf8")
+    .update(`${groupName}::${senderScope}`, "utf8")
     .digest("hex")
     .slice(0, 24)}`;
   const hadPhoneLookingSenderName = looksLikePhoneLabel(senderName);

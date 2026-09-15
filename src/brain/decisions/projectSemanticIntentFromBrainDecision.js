@@ -80,6 +80,86 @@ export function workflowTypeForCustomerSemanticIntent(value) {
 }
 
 /**
+ * Structural promotion only: a pricing_inquiry that already carries a trusted
+ * exact duration day count is pricing_with_duration. Does not invent duration,
+ * does not inspect customer text, and does not touch availability/booking.
+ *
+ * @param {unknown} intent
+ * @param {unknown} durationDays
+ * @returns {string | null}
+ */
+export function promotePricingInquiryWithExactDuration(intent, durationDays) {
+  const cleaned = cleanCustomerSemanticIntent(intent);
+  if (cleaned !== "pricing_inquiry") return cleaned;
+  const days = Number(durationDays);
+  if (!Number.isFinite(days) || days < 1) return cleaned;
+  return "pricing_with_duration";
+}
+
+/**
+ * Live flake: after a delivered price, "or 3 din ka?" sometimes arrives as
+ * availability_inquiry and Emily asks kitne din instead of quoting. When the
+ * prior transactional intent was already pricing_*, this turn has a trusted
+ * item + exact days, and the caller marks the message as not availability-
+ * like, force pricing_with_duration.
+ *
+ * Does not inspect customer text (caller supplies availabilityLikeMessage).
+ *
+ * @param {{
+ *   intent?: unknown,
+ *   durationDays?: unknown,
+ *   lastTransactionalSemanticIntent?: unknown,
+ *   hasResolvedItem?: boolean,
+ *   validatedGroupCanonicalAuthority?: boolean,
+ *   canonicalTransactionRetained?: boolean,
+ *   availabilityLikeMessage?: boolean,
+ * }} p
+ * @returns {string | null}
+ */
+export function promotePricingContinuationWithExactDuration(p = {}) {
+  const days = Number(p.durationDays);
+  const hasDays = Number.isFinite(days) && days >= 1;
+  const current = cleanCustomerSemanticIntent(p.intent);
+  // Rent/availability compounds must never become duration quotes — even when
+  // Brain labeled pricing_* or a prior turn was pricing (live mil-jye after price).
+  if (p.availabilityLikeMessage === true) {
+    if (current === "pricing_inquiry" || current === "pricing_with_duration") {
+      return "availability_inquiry";
+    }
+    return current;
+  }
+  const base = promotePricingInquiryWithExactDuration(p.intent, p.durationDays);
+  if (
+    p.validatedGroupCanonicalAuthority !== true ||
+    p.hasResolvedItem !== true ||
+    p.canonicalTransactionRetained === true ||
+    !hasDays
+  ) {
+    return base;
+  }
+  const remappable =
+    current === "availability_inquiry" ||
+    current === "pricing_inquiry" ||
+    current === "pricing_with_duration" ||
+    current === "clarification" ||
+    current === "unclear";
+  if (!remappable) return base;
+
+  // Explicit monetary ask in THIS message (kitna/rate/cost…) with exact days
+  // must quote — even right after an availability/AVR turn whose last
+  // transactional intent is still availability_inquiry.
+  if (p.explicitPriceAskMessage === true) {
+    return "pricing_with_duration";
+  }
+
+  const last = cleanCustomerSemanticIntent(p.lastTransactionalSemanticIntent);
+  if (last !== "pricing_inquiry" && last !== "pricing_with_duration") {
+    return base;
+  }
+  return "pricing_with_duration";
+}
+
+/**
  * Canonical requested-field family for trusted fact resolution. A compatible
  * finer price field already extracted from the turn may be retained.
  *

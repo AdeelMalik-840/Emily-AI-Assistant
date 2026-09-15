@@ -23,9 +23,14 @@ import {
 } from "../src/brain/availability/availabilityAssistContext.js";
 import { decideAvailabilityAssistFollowUp } from "../src/brain/availability/decideAvailabilityAssistFollowUp.js";
 import { runBrainV2LivePipeline } from "../src/brain/live/brainV2LivePipeline.js";
+import { composeCloudCanonicalCustomerReply } from "../src/brain/openai/composeCloudCanonicalCustomerReply.js";
 import { resolveShadowEmilySessionKey } from "../src/brain/shadow/brainShadowHook.js";
 import { selectWorkflow } from "../src/brain/workflow/WorkflowEngine.js";
-import { buildAvailabilityInquiryActionPlan } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import {
+  AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION,
+  applyAvailabilityCustomerResponse,
+  buildAvailabilityInquiryActionPlan,
+} from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import { applySessionMemoryFromActionPlan } from "../src/services/executors/sessionMemoryExecutor.js";
 import { loadBrainV2SessionMemorySnapshot } from "../src/services/whatsappInboundBuffer.js";
 import {
@@ -189,6 +194,29 @@ function mockLiveAssistClassifier() {
   };
 }
 
+function mockCanonicalCustomerComposer() {
+  return async (args) => {
+    const system = String(args?.messages?.[0]?.content ?? "");
+    const alternatives = unavailableCanonical().verified.availability.verifiedAlternatives;
+    const listing = system.includes("KIND=availability_alternatives");
+    return {
+      choices: [{ message: { content: JSON.stringify({
+        customerReply: listing
+          ? `${alternatives.map((row) => row.itemLabel).join(", ")} available hain. Kaunsa option chahiye?`
+          : "Yeh available nahi hai. Kya available alternatives dekhna chahenge?",
+        presentedItemIds: listing ? alternatives.map((row) => row.itemId) : [],
+        offersAlternatives: !listing,
+        replySemantics: {
+          claims: ["resource_unavailable"],
+          languageStyle: "roman_urdu",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }) } }],
+    };
+  };
+}
+
 test("live mock smoke46: Corolla offer → empty history + ji → alternatives list → stonic owner-check", async () => {
   const memoryParams = {
     businessId: BUSINESS_ID,
@@ -218,11 +246,16 @@ test("live mock smoke46: Corolla offer → empty history + ji → alternatives l
     businessContext: { resolvedBusinessTurnContext: unavailableCanonical() },
   });
 
-  assert.match(String(offerPlan.replyDraft ?? ""), /available nahi hai/i);
-  assert.match(String(offerPlan.replyDraft ?? ""), /Koi aur option dekhun/i);
+  assert.equal(offerPlan.replyDraft, "");
+  assert.equal(offerPlan.actions[0]?.payload?.text, "");
+  assert.equal(offerPlan.customerResponseComposition?.kind, "availability_unavailable");
+  assert.deepEqual(
+    offerPlan.customerResponseComposition?.verifiedAlternatives,
+    unavailableCanonical().verified.availability.verifiedAlternatives
+  );
   assert.equal(
     offerPlan.persistenceIntent?.lastAvailabilityAssist?.pendingQuestion,
-    offerPlan.replyDraft
+    AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION
   );
   assert.equal(
     offerPlan.persistenceIntent?.lastAvailabilityAssist?.pendingPromptType,
@@ -237,9 +270,37 @@ test("live mock smoke46: Corolla offer → empty history + ji → alternatives l
     false
   );
 
+  const composedOffer = await composeCloudCanonicalCustomerReply({
+    kind: offerPlan.customerResponseComposition.kind,
+    channel: "group",
+    semanticIntent: "availability_inquiry",
+    customerMessage: "Corolla 2 din k lye available hai?",
+    trustedFacts: {
+      itemId: COROLLA_ID,
+      itemLabel: "Toyota Corolla (Metallic Grey)",
+      durationDays: 2,
+      availabilityStatus: "unavailable",
+      verifiedAlternatives:
+        offerPlan.customerResponseComposition.verifiedAlternatives,
+      verifiedAlternativesCount:
+        offerPlan.customerResponseComposition.verifiedAlternatives.length,
+    },
+    __chatCompletionsCreateForTests: mockCanonicalCustomerComposer(),
+  });
+  assert.equal(composedOffer.source, "openai_group_availability_compose");
+  const materializedOfferPlan = applyAvailabilityCustomerResponse(
+    offerPlan,
+    composedOffer
+  );
+  assert.notEqual(materializedOfferPlan.replyDraft, "");
+  assert.equal(
+    materializedOfferPlan.persistenceIntent?.lastAvailabilityAssist?.pendingQuestion,
+    materializedOfferPlan.replyDraft
+  );
+
   applySessionMemoryFromActionPlan({
     sessionKey: emilySessionKey,
-    actionPlan: offerPlan,
+    actionPlan: materializedOfferPlan,
   });
 
   const loadedAfterOffer = await loadBrainV2SessionMemorySnapshot({
@@ -250,7 +311,7 @@ test("live mock smoke46: Corolla offer → empty history + ji → alternatives l
     loadedAfterOffer?.lastAvailabilityAssist
   );
   assert.ok(assist);
-  assert.equal(assist.pendingQuestion, offerPlan.replyDraft);
+  assert.equal(assist.pendingQuestion, materializedOfferPlan.replyDraft);
   assert.equal(assist.participantKey, PARTICIPANT_KEY);
 
   // --- Turn 2: customer "ji" with EMPTY recentConversation (group Playwright) ---
@@ -297,9 +358,12 @@ test("live mock smoke46: Corolla offer → empty history + ji → alternatives l
     },
   });
 
-  assert.match(String(listPlan.replyDraft ?? ""), /Civic/i);
-  assert.match(String(listPlan.replyDraft ?? ""), /Stonic/i);
-  assert.match(String(listPlan.replyDraft ?? ""), /Kaunsa dekhna hai/i);
+  assert.equal(listPlan.replyDraft, "");
+  assert.equal(listPlan.customerResponseComposition?.kind, "availability_alternatives");
+  assert.deepEqual(
+    listPlan.customerResponseComposition?.verifiedAlternatives,
+    unavailableCanonical().verified.availability.verifiedAlternatives
+  );
   assert.equal(
     listPlan.actions[0]?.payload?.source,
     "canonical_verified_alternatives_list"
@@ -318,25 +382,7 @@ test("live mock smoke46: Corolla offer → empty history + ji → alternatives l
   );
   assert.equal(
     listPlan.persistenceIntent?.lastAvailabilityAssist?.pendingQuestion,
-    listPlan.replyDraft
-  );
-
-  applySessionMemoryFromActionPlan({
-    sessionKey: emilySessionKey,
-    actionPlan: listPlan,
-  });
-
-  const loadedAfterList = await loadBrainV2SessionMemorySnapshot({
-    ...memoryParams,
-    traceId: "smoke46-mock-load-list",
-  });
-  const assistAfterList = readFreshLastAvailabilityAssist(
-    loadedAfterList?.lastAvailabilityAssist
-  );
-  assert.ok(assistAfterList);
-  assert.equal(
-    assistAfterList.assistStage,
-    AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION
+    AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION
   );
 
   // Live pipeline would send the list reply (not silent).
@@ -351,6 +397,8 @@ test("live mock smoke46: Corolla offer → empty history + ji → alternatives l
     sessionKey: GROUP_SESSION,
     conversationHistory: "",
     memorySnapshot: loadedAfterOffer,
+    getBusinessProfileFn: async () => null,
+    getBookingsForItemFn: async () => [],
     __testOrchestratorFn: () => ({
       workflowDecision: {
         workflowType: "availability_inquiry",
@@ -360,10 +408,34 @@ test("live mock smoke46: Corolla offer → empty history + ji → alternatives l
       understanding: { signals: {} },
       trace: {},
     }),
+    __cloudComposeChatCreate: mockCanonicalCustomerComposer(),
   });
   assert.equal(liveList.handled, true);
   assert.match(String(liveList.reply ?? ""), /Civic|Stonic/i);
   assert.notEqual(liveList.sendVia, "NONE");
+  assert.notEqual(liveList.messageMeta?.actionPlan?.replyDraft, "");
+  assert.equal(
+    liveList.messageMeta?.outboundTrace?.finalReplySource,
+    "GROUP_AVAILABILITY_OPENAI_COMPOSE"
+  );
+
+  applySessionMemoryFromActionPlan({
+    sessionKey: emilySessionKey,
+    actionPlan: liveList.messageMeta.actionPlan,
+  });
+
+  const loadedAfterList = await loadBrainV2SessionMemorySnapshot({
+    ...memoryParams,
+    traceId: "smoke46-mock-load-list",
+  });
+  const assistAfterList = readFreshLastAvailabilityAssist(
+    loadedAfterList?.lastAvailabilityAssist
+  );
+  assert.ok(assistAfterList);
+  assert.equal(
+    assistAfterList.assistStage,
+    AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION
+  );
 
   // --- Turn 3: customer "stonic" → owner-check (no direct booking) ---
   const selectDecision = await decideAvailabilityAssistFollowUp({
@@ -476,6 +548,8 @@ test("live mock: without pendingQuestion in assist, empty history + ji stays sil
     sessionKey: `${GROUP_SESSION}-pre-fix`,
     conversationHistory: "",
     memorySnapshot: { lastAvailabilityAssist: staleAssist },
+    getBusinessProfileFn: async () => null,
+    getBookingsForItemFn: async () => [],
     __testOrchestratorFn: () => ({
       workflowDecision: {
         workflowType: "availability_inquiry",

@@ -40,6 +40,7 @@ export const CUSTOMER_TURN_LANES = Object.freeze([
  * @property {string | null} [customerPhone]
  * @property {string | null} [messageText]
  * @property {string | null} [messageId]
+ * @property {string | null} [traceId]
  * @property {string | null} [recentDialogue]
  * @property {string | null} [lastEmilyMessage]
  * @property {string | null} [lastCustomerDmPromptType]
@@ -59,6 +60,7 @@ export const CUSTOMER_TURN_LANES = Object.freeze([
  * @property {number | null} [timeoutMs]
  * @property {boolean | null} [missingInfoLoopFullyEnabled]
  * @property {Function | null} [__chatCompletionsCreateForTests]
+ * @property {Function | null} [__languageQualityReviewChatCreateForTests]
  */
 
 function cleanLane(value) {
@@ -136,6 +138,7 @@ export function normalizeTurnContext(raw = {}) {
           ? String(r.userMessage)
           : null,
     messageId: r.messageId != null ? String(r.messageId) : null,
+    traceId: r.traceId != null ? String(r.traceId) : null,
     recentDialogue:
       r.recentDialogue != null
         ? String(r.recentDialogue)
@@ -220,6 +223,10 @@ export function normalizeTurnContext(raw = {}) {
     __chatCompletionsCreateForTests:
       typeof r.__chatCompletionsCreateForTests === "function"
         ? r.__chatCompletionsCreateForTests
+        : null,
+    __languageQualityReviewChatCreateForTests:
+      typeof r.__languageQualityReviewChatCreateForTests === "function"
+        ? r.__languageQualityReviewChatCreateForTests
         : null,
     // group_post_execute lane extras
     postExecuteResult:
@@ -373,6 +380,8 @@ export async function decideCustomerTurn(turnContextInput = {}) {
         turnContext.timeoutMs != null ? turnContext.timeoutMs : 8000,
       __chatCompletionsCreateForTests:
         turnContext.__chatCompletionsCreateForTests,
+      __languageQualityReviewChatCreateForTests:
+        turnContext.__languageQualityReviewChatCreateForTests,
     });
     // Enrich through shared contract but force action to reply/silence only
     const enriched = enrichSharedCustomerTurnDecision(result?.decision);

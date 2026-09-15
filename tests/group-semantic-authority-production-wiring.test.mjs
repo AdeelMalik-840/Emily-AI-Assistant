@@ -361,25 +361,20 @@ test("6. multi-item referents ground correctly and do not silently collapse to o
 // --------------------------------------------------------------------
 // 7. Invalid/ambiguous item -> no AVR, no booking, no owner notification.
 //
-// A fully catalog-unknown item ("Revo", not in CATALOG at all) is already
-// rejected by the adapter's own validation before any decision object is
-// produced -- confirmed first, directly, below. The scenario that actually
-// exercises this task's NEW resolveBusinessTurnContext/workflow-layer gates
-// is a candidate that the pipeline's own (possibly catalog-state-drifted)
-// resolution marks "ambiguous"/not "resolved" despite a validated Group
-// decision -- tested via the real, unmocked workflow functions this task
-// modified, with a resolvedBusinessTurnContext shape resolveBusinessTurnContext
-// itself would produce for that case.
+// A fully catalog-unknown current-turn item is released so the existing
+// unknown-item compose lane can answer it. Workflow gates still refuse
+// AVR/booking for non-resolved items (7b).
 // --------------------------------------------------------------------
-test("7a. a fully catalog-unknown item is rejected by the adapter before any decision exists", async () => {
+test("7a. a fully catalog-unknown current-turn item is released for the unknown-item lane", async () => {
   const adapterResult = await resolveGroupCanonicalSemanticDecision({
     userMessage: "Revo available hai?",
     catalogItems: CATALOG,
     __chatCompletionsCreateForTests: async () =>
       completion(modelDecision({ itemReferents: [current("Revo", 0, 4)] })),
   });
-  assert.equal(adapterResult.ok, false);
-  assert.equal(adapterResult.decision, undefined);
+  assert.equal(adapterResult.ok, true);
+  assert.equal(adapterResult.decision.itemReferenceMode, "CURRENT_TURN");
+  assert.equal(adapterResult.decision.itemReferents[0].surfaceText, "Revo");
 });
 
 test("7b. validated Group authority with a non-resolved item grants no owner-check/booking permission", () => {

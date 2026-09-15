@@ -7,13 +7,19 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY ||= "test-key";
 process.env.NODE_ENV = "test";
 
-import {
-  buildAvailabilityInquiryActionPlan,
-  buildAvailabilityReplyFromCanonical,
-} from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import { buildAvailabilityInquiryActionPlan as buildRawAvailabilityInquiryActionPlan } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import { runConversationTurn } from "../src/brain/orchestrator/ConversationOrchestrator.js";
 import { resolveBusinessTurnContext } from "../src/brain/facts/resolveBusinessTurnContext.js";
-import { runBrainV2LivePipeline } from "../src/brain/live/brainV2LivePipeline.js";
+import { runBrainV2LivePipeline as runRawBrainV2LivePipeline } from "../src/brain/live/brainV2LivePipeline.js";
+import { materializeAvailabilityPlanForTest, availabilityComposerCompletionForTest } from "./helpers/availabilityCompositionTestHarness.mjs";
+
+const buildAvailabilityInquiryActionPlan = (args) =>
+  materializeAvailabilityPlanForTest(buildRawAvailabilityInquiryActionPlan(args));
+const runBrainV2LivePipeline = (args) => runRawBrainV2LivePipeline({
+  getBusinessProfileFn: async () => null,
+  __cloudComposeChatCreate: availabilityComposerCompletionForTest(args.message),
+  ...args,
+});
 import { loadSyntheticCarRentalCatalogFixture } from "../src/brain/golden/goldenHarness.js";
 import { getEmilyBrainV2LiveFlagSnapshot } from "../src/brain/config/liveFeatureFlags.js";
 import { buildTurnContextInput } from "../src/brain/live/buildTurnContextInput.js";
@@ -123,8 +129,11 @@ test("2+6: availability:false + empty bookings → ask duration via live pipelin
 
   assert.equal(result.handled, true);
   assert.equal(result.workflowType, "availability_inquiry");
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /Available hai/i);
+  // "Civic available?" is a clearly-English customer message, so the
+  // guarded composer must reply in English (customer-language matching is
+  // enforced by the shared reply guard) -- never a hardcoded Urdu sentence.
+  assert.match(String(result.reply ?? ""), /how many days/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /available hai/i);
 });
 
 test("3: blocking-status booking with no start/end date at all cannot prove active-now, so duration is still requested", async () => {
@@ -142,9 +151,9 @@ test("3: blocking-status booking with no start/end date at all cannot prove acti
   });
   // No start date at all — cannot prove the booking has started, so this is
   // NOT the active-now case. Must ask for the requested period normally.
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /available nahi/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+  assert.match(String(result.reply ?? ""), /how many days/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /available nahi|not available/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b|right now/i);
 });
 
 test("4: blocking booking with endAt still asks duration when date missing from ask", async () => {
@@ -167,20 +176,11 @@ test("4: blocking booking with endAt still asks duration when date missing from 
       },
     ],
   });
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.match(String(result.reply ?? ""), /how many days/i);
   assert.doesNotMatch(String(result.reply ?? ""), /Expected availability/i);
 });
 
 test("5: missing booking end date does not invent date in reply (sibling informational path unaffected)", async () => {
-  const reply = buildAvailabilityReplyFromCanonical("Honda Civic 2026 Oriel (White)", {
-    status: "unavailable",
-    isAvailable: false,
-    nextAvailableAt: null,
-    reason: "unavailable_date_unknown",
-  });
-  assert.match(reply, /Abhi available nahi hai/i);
-  assert.doesNotMatch(reply, /Expected availability/i);
-
   // No start date at all — same as test 3, cannot prove active-now, so the
   // owner-check-context branch must still ask for the requested period.
   const result = await runBrainV2LivePipeline({
@@ -195,9 +195,9 @@ test("5: missing booking end date does not invent date in reply (sibling informa
       { id: "b-no-end", itemId: CIVIC_ID, status: "approved" },
     ],
   });
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.match(String(result.reply ?? ""), /how many days/i);
   assert.doesNotMatch(String(result.reply ?? ""), /Expected availability/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b|right now/i);
 });
 
 test("fallback: orchestrator without canonical facts keeps catalog composer path", () => {
@@ -217,7 +217,13 @@ test("fallback: orchestrator without canonical facts keeps catalog composer path
     businessContext: { catalogItems: items },
   });
   assert.equal(result.workflowDecision.workflowType, "availability_inquiry");
-  assert.match(String(result.actionPlan?.replyDraft ?? ""), /available nahi/i);
+  // This path calls the raw workflow builder directly (no composer wrapper),
+  // so replyDraft is deliberately empty pending composition -- the plan's
+  // structured composition marker is what proves this went through the
+  // unavailable-availability lane, not old literal deterministic wording.
+  assert.equal(String(result.actionPlan?.replyDraft ?? ""), "");
+  assert.equal(result.actionPlan?.customerResponseComposition?.lane, "availability");
+  assert.equal(result.actionPlan?.customerResponseComposition?.kind, "availability");
 });
 
 test("7: pricing replies unchanged via live pipeline", async () => {
@@ -434,9 +440,9 @@ test("A: started yesterday, ends tomorrow -> active-now branch, currently-occupi
       },
     ],
   });
-  assert.doesNotMatch(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /available nahi/i);
-  assert.match(String(result.reply ?? ""), /\babhi\b/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /how many days/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /available nahi|not available/i);
+  assert.match(String(result.reply ?? ""), /\babhi\b|right now/i);
 });
 
 test("B: starts next week -> NOT active-now; asks for the requested period normally", async () => {
@@ -459,8 +465,8 @@ test("B: starts next week -> NOT active-now; asks for the requested period norma
     ],
   });
   // A future booking's mere existence must not suppress duration collection.
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+  assert.match(String(result.reply ?? ""), /how many days/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b|right now/i);
 });
 
 test("C: ended yesterday -> not active-now (and not even blocking)", async () => {
@@ -482,8 +488,8 @@ test("C: ended yesterday -> not active-now (and not even blocking)", async () =>
       },
     ],
   });
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+  assert.match(String(result.reply ?? ""), /how many days/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b|right now/i);
 });
 
 test("D: missing start date, future end -> cannot claim active-now; asks for the requested period", async () => {
@@ -504,8 +510,8 @@ test("D: missing start date, future end -> cannot claim active-now; asks for the
       },
     ],
   });
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
-  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b/i);
+  assert.match(String(result.reply ?? ""), /how many days/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\babhi\b|right now/i);
 });
 
 test("E: started before now, missing end -> active-now under existing conservative end semantics", async () => {
@@ -526,8 +532,8 @@ test("E: started before now, missing end -> active-now under existing conservati
       },
     ],
   });
-  assert.doesNotMatch(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
-  assert.match(String(result.reply ?? ""), /\babhi\b/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /how many days/i);
+  assert.match(String(result.reply ?? ""), /\babhi\b|right now/i);
 });
 
 test("F: a specific requested window remains governed entirely by the existing window-aware logic, unchanged", () => {

@@ -70,13 +70,19 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     memory.pendingAction && typeof memory.pendingAction === "object"
       ? /** @type {Record<string, unknown>} */ (memory.pendingAction)
       : null;
+  const groupCanonical =
+    turnContext?.validatedGroupCanonicalAuthority === true;
   const authoritativeSemanticIntent = cleanCustomerSemanticIntent(
     turnContext?.authoritativeSemanticIntent
   );
   const canonicalItemReferents = Array.isArray(turnContext?.canonicalItemReferents)
     ? turnContext.canonicalItemReferents
-    : null;
-  const canonicalAuthorityActive = Boolean(authoritativeSemanticIntent) && canonicalItemReferents !== null;
+    : groupCanonical
+      ? []
+      : null;
+  const canonicalAuthorityActive =
+    groupCanonical ||
+    (Boolean(authoritativeSemanticIntent) && canonicalItemReferents !== null);
   const canonicalItemResolutions = Array.isArray(turnContext?.canonicalItemResolutions)
     ? turnContext.canonicalItemResolutions
     : [];
@@ -94,14 +100,16 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     : listExplicitCatalogItemIds(message, items);
   const boundedExplicitSet =
     Boolean(authoritativeSemanticIntent) && canonicalItemReferents?.length > 1;
-  const durationParsed = parseUserDuration(message);
-  const durationDays =
-    durationParsed != null && Number.isFinite(Number(durationParsed.normalizedDays))
+  const durationParsed = groupCanonical ? null : parseUserDuration(message);
+  const durationDays = groupCanonical
+    ? undefined
+    : durationParsed != null && Number.isFinite(Number(durationParsed.normalizedDays))
       ? Math.max(1, Math.floor(Number(durationParsed.normalizedDays)))
       : undefined;
 
   const itemMentioned = Boolean(explicitMention.found);
-  const rawSignals = canonicalAuthorityActive
+  const rawSignals =
+    groupCanonical || canonicalAuthorityActive
     ? {
         priceAsk: false,
         availabilityAsk: false,
@@ -109,7 +117,7 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
         browseAsk: false,
         photoAsk: false,
         detailsAsk: false,
-        durationMentioned: durationDays != null,
+        durationMentioned: false,
         rentAvailabilityCompound: false,
         askedFieldRaw: null,
       }
@@ -199,16 +207,19 @@ export function understandTurn({ admittedTurn, turnContext, catalogItems = [] })
     ambiguities.push(`unlisted:${unlistedMentionLabel}`);
   }
 
-  const rawAskedField =
-    signals.askedFieldRaw && signals.askedFieldRaw !== "unknown"
+  const rawAskedField = groupCanonical
+    ? null
+    : signals.askedFieldRaw && signals.askedFieldRaw !== "unknown"
       ? signals.askedFieldRaw
       : detectAskedField(message);
-  const askedField = authoritativeSemanticIntent
-    ? requestedFieldForCustomerSemanticIntent(
-        authoritativeSemanticIntent,
-        rawAskedField
-      )
-    : rawAskedField;
+  const askedField = groupCanonical
+    ? requestedFieldForCustomerSemanticIntent(authoritativeSemanticIntent, null)
+    : authoritativeSemanticIntent
+      ? requestedFieldForCustomerSemanticIntent(
+          authoritativeSemanticIntent,
+          rawAskedField
+        )
+      : rawAskedField;
 
   return Object.freeze({
     resolvedItemId: resolvedItemId ?? undefined,

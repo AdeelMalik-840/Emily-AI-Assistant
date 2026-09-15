@@ -13,7 +13,7 @@ export const CLOUD_ITEM_REFERENCE_MODES = Object.freeze([
 
 /** Customer-facing holding line. Must not mention owner, PA, or internal process. */
 export const CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY =
-  "Main ye confirm karke aapko batati hoon.";
+  "Main availability confirm kar rahi hoon.";
 
 const CLOUD_MISSING_BUSINESS_FACT_INTENTS = new Set([
   "details_inquiry",

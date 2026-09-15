@@ -315,7 +315,9 @@ export function resolveTurnContext(opts = {}) {
     : isItemlessPriceDurationFollowup(message, catalogItems);
   const itemlessPriceDurationFollowup =
     itemlessPriceDurationFollowupRaw && !hasExplicitItem;
-  const requestedField = String(detectAskedField(message) ?? "").trim().toLowerCase();
+  const requestedField = canonicalAuthorityActive
+    ? ""
+    : String(detectAskedField(message) ?? "").trim().toLowerCase();
   const authoritativeSemanticIntent = String(
     opts.authoritativeSemanticIntent ?? ""
   ).trim();
@@ -388,9 +390,11 @@ export function resolveTurnContext(opts = {}) {
     opts.memory && typeof opts.memory === "object" ? opts.memory : null
   );
 
-  // Availability-duration pending (Civic ask-duration, etc.) outranks generic
-  // itemless-price clarification so duration answers reach Brain continuity.
-  if (
+  if (validatedGroupCanonicalAuthorityActive) {
+    shouldClarifyItem = false;
+    clarificationReply = null;
+    clarificationReason = null;
+  } else if (
     itemlessPriceDurationFollowup &&
     !authoritativeItem &&
     !openAvailabilityDurationPending

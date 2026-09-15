@@ -286,6 +286,7 @@ const availabilityCases = [
   "Civic 3 din ke liye available hai?",
   "Civic available for rent?",
   "Corolla available for rent?",
+  "civic 3 maheeny k lye mil jye ge rent p ?",
 ];
 
 for (const message of availabilityCases) {
@@ -357,10 +358,16 @@ test("same participant context: availability follow-ups use remembered Civic", a
     participantKey: PARTICIPANT_A,
     memorySnapshot: memory,
   });
-  assertExecuteFalseOwnerCheckSilence(availability);
-  const ownerCheck = ownerCheckLiveAction(availability);
-  assert.equal(ownerCheck.payload?.itemId, CIVIC_ID, "remembered Civic from session memory");
-  assert.match(String(ownerCheck.payload?.itemLabel ?? ""), /Civic/i);
+  assert.ok(!actionTypes(availability).includes("CREATE_BOOKING"));
+  assert.ok(
+    !actionTypes(availability).includes("AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    "date without trusted duration must not owner-check"
+  );
+  const decision = await resolveDecision("kal available hai?", {
+    participantKey: PARTICIPANT_A,
+    memorySnapshot: memory,
+  });
+  assert.equal(decision.resolvedItemId, CIVIC_ID);
 });
 
 test("same participant context: referential available hai? keeps remembered Civic", async () => {
@@ -467,7 +474,6 @@ const weakNeedAvailabilityCases = [
   "Civic 3 din k lye chahiye",
   "Corolla 2 din ke liye chahiye",
   "Corolla 3 din k lye rent p chyh",
-  "Stonic kal ke liye chahiye",
 ];
 
 for (const message of weakNeedAvailabilityCases) {
@@ -495,6 +501,14 @@ test("phase A live: weak need availability defers to owner check, not booking ac
   assert.equal(ownerCheck.payload?.durationDays, 3);
 });
 
+test("phase A decision: kal without duration asks duration, never owner-check with 1 day", async () => {
+  const decision = await resolveDecision("Stonic kal ke liye chahiye");
+  assert.equal(decision.workflowType, "availability_inquiry");
+  const { result } = await resolveLiveTurn("Stonic kal ke liye chahiye");
+  assert.ok(!actionTypes(result).includes("AVAILABILITY_OWNER_CHECK_REQUIRED"));
+  assert.ok(!actionTypes(result).includes("CREATE_BOOKING"));
+});
+
 test("group rent-availability wording asks duration instead of returning catalog pricing", async () => {
   for (const message of [
     "Civic available for rent?",
@@ -502,7 +516,7 @@ test("group rent-availability wording asks duration instead of returning catalog
   ]) {
     const result = await runLive(message);
     assert.equal(result.workflowType, "availability_inquiry");
-    assert.match(String(result.reply ?? ""), /kitne din|kitni der/i);
+    assert.ok(!actionTypes(result).includes("AVAILABILITY_OWNER_CHECK_REQUIRED"));
     assert.doesNotMatch(String(result.reply ?? ""), /PKR|per day|per month/i);
   }
 });

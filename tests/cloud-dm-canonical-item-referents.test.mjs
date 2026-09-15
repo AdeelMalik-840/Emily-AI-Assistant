@@ -131,13 +131,18 @@ test("authoritative unknown pricing stays pricing and cannot become unlisted", a
       return { choices: [{ message: { content: JSON.stringify({
         customerReply: "Revo ka verified rate catalog mein available nahi hai.",
         mentionedReferents: ["Revo"],
+        customerInputRequested: false,
+        requestedInput: null,
+        availabilityCheckStarted: false,
+        responseAct: "INFORM_ITEM_NOT_IN_CATALOG",
+        utteranceFunction: "inform_fact",
         replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
       }) } }] };
     },
   });
   assert.equal(composed.ok, true);
   assert.equal(composed.reply, "Revo ka verified rate catalog mein available nahi hai.");
-  assert.equal(prompt.includes('verifiedAlternatives\\":[]'), true);
+  assert.match(prompt, /verifiedAvailableAlternatives/);
   assert.doesNotMatch(prompt, /Honda Civic/);
 
   const frozen = {
@@ -161,6 +166,11 @@ test("authoritative unknown pricing stays pricing and cannot become unlisted", a
     __unknownItemComposeChatCreate: async () => ({ choices: [{ message: { content: JSON.stringify({
       customerReply: "Revo ka verified rate available facts mein nahi mila.",
       mentionedReferents: ["Revo"],
+      customerInputRequested: false,
+      requestedInput: null,
+      availabilityCheckStarted: false,
+      responseAct: "INFORM_ITEM_NOT_IN_CATALOG",
+      utteranceFunction: "inform_fact",
       replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
     }) } }] }),
     __testOrchestratorFn: () => ({
@@ -200,6 +210,11 @@ test("authoritative unknown pricing stays pricing and cannot become unlisted", a
     __unknownItemComposeChatCreate: async () => ({ choices: [{ message: { content: JSON.stringify({
       customerReply: "Revo ki availability verify nahi ho saki.",
       mentionedReferents: ["Revo"],
+      customerInputRequested: false,
+      requestedInput: null,
+      availabilityCheckStarted: false,
+      responseAct: "INFORM_ITEM_NOT_IN_CATALOG",
+      utteranceFunction: "inform_fact",
       replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
     }) } }] }),
     __testOrchestratorFn: () => ({

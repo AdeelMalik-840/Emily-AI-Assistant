@@ -157,6 +157,11 @@ test("TEST 1/7: unknown-item availability wording composer never instructs or is
               content: JSON.stringify({
                 customerReply: "Swift humare paas nahi hai, is liye ye detail nahi bata sakta.",
                 mentionedReferents: ["Swift"],
+                customerInputRequested: false,
+                requestedInput: null,
+                availabilityCheckStarted: false,
+                responseAct: "INFORM_ITEM_NOT_IN_CATALOG",
+                utteranceFunction: "inform_fact",
                 replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
               }),
             },
@@ -193,6 +198,11 @@ test("TEST 2/7: unknown-item pricing wording composer never instructs or is fed 
               content: JSON.stringify({
                 customerReply: "Swift humare paas nahi hai, is liye rate nahi bata sakta.",
                 mentionedReferents: ["Swift"],
+                customerInputRequested: false,
+                requestedInput: null,
+                availabilityCheckStarted: false,
+                responseAct: "INFORM_ITEM_NOT_IN_CATALOG",
+                utteranceFunction: "inform_fact",
                 replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
               }),
             },

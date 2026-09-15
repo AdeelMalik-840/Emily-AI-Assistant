@@ -87,15 +87,19 @@ export function buildTurnContextInput(p) {
         : undefined,
   });
 
-  const parsedDuration = parseUserDuration(messageText);
-  const duration =
-    parsedDuration != null && Number.isFinite(Number(parsedDuration.normalizedDays))
+  const groupCanonical = p.validatedGroupCanonicalAuthority === true;
+  const parsedDuration = groupCanonical ? null : parseUserDuration(messageText);
+  const duration = groupCanonical
+    ? null
+    : parsedDuration != null && Number.isFinite(Number(parsedDuration.normalizedDays))
       ? Math.max(1, Math.floor(Number(parsedDuration.normalizedDays)))
       : null;
 
   const memContact = memory?.contactPhone ?? memory?.customerPhone ?? null;
 
-  const detectedRequestedField = String(detectAskedField(messageText) ?? "").trim() || null;
+  const detectedRequestedField = groupCanonical
+    ? null
+    : String(detectAskedField(messageText) ?? "").trim() || null;
   const requestedField = p.authoritativeSemanticIntent
     ? requestedFieldForCustomerSemanticIntent(
         p.authoritativeSemanticIntent,

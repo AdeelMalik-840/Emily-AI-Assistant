@@ -19,6 +19,7 @@ import { resolveBusinessTurnContext } from "../src/brain/facts/resolveBusinessTu
 import { buildAvailabilityInquiryActionPlan } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import { runBrainV2LivePipeline } from "../src/brain/live/brainV2LivePipeline.js";
 import { composeCloudCanonicalCustomerReply } from "../src/brain/openai/composeCloudCanonicalCustomerReply.js";
+import { buildEmilyPending } from "../src/brain/availability/emilyPendingContext.js";
 
 const BUSINESS_ID = "biz-temporal-unresolved";
 const COROLLA_ID = "toyota_corolla";
@@ -26,22 +27,29 @@ const COROLLA_LABEL = "Toyota Corolla";
 const CATALOG = [{ id: COROLLA_ID, name: COROLLA_LABEL, displayLabel: COROLLA_LABEL }];
 const NOW_MS = Date.parse("2026-08-29T08:56:40.913Z");
 
-async function resolveFor(message, temporalRequest, bookings = []) {
+async function resolveFor(message, temporalRequest, bookings = [], overrides = {}) {
+  const isGroup = overrides.isGroup === true;
+  const itemId = overrides.itemId ?? COROLLA_ID;
+  const itemLabel = overrides.itemLabel ?? COROLLA_LABEL;
+  const catalogItems = overrides.catalogItems ?? [{ id: itemId, name: itemLabel, displayLabel: itemLabel }];
+  const memorySnapshot = overrides.memorySnapshot ?? {};
   return resolveBusinessTurnContext({
     traceId: "t-temporal-unresolved",
     businessId: BUSINESS_ID,
     rawMessage: message,
-    catalogItems: CATALOG,
+    catalogItems,
     nowMs: NOW_MS,
     getBookingsForItemFn: async () => bookings,
+    getBusinessProfileFn: async () => ({}),
     turnContextInput: {
-      chatType: "dm",
-      chatId: `${BUSINESS_ID}::923001234567`,
+      chatType: isGroup ? "group" : "dm",
+      chatId: isGroup ? overrides.groupKey ?? "group-a" : `${BUSINESS_ID}::923001234567`,
       participantKey: "923001234567",
       participantPhone: "923001234567",
       sourceMessageId: "m1",
       guaranteeKey: "m1",
-      authoritativeItem: { id: COROLLA_ID, name: COROLLA_LABEL },
+      authoritativeItem: { id: itemId, name: itemLabel },
+      ...(isGroup ? { validatedGroupCanonicalAuthority: true } : {}),
     },
     turnContext: {
       sessionId: "s1",
@@ -49,8 +57,14 @@ async function resolveFor(message, temporalRequest, bookings = []) {
       chatKey: `${BUSINESS_ID}::923001234567`,
       participantKey: "923001234567",
       schemaVersion: 1,
-      memorySnapshot: {},
-      canonicalSemanticDecision: { temporalRequest },
+      memorySnapshot,
+      canonicalSemanticDecision: {
+        temporalRequest,
+        ...(overrides.requestedDuration !== undefined
+          ? { requestedDuration: overrides.requestedDuration }
+          : {}),
+        ...(overrides.turnScope ? { turnScope: overrides.turnScope } : {}),
+      },
     },
     flags: { availabilityOwnerCheckExecute: true },
   });
@@ -183,6 +197,140 @@ test("D. canonical unresolved + duration -> temporal_unresolved, no fallback to 
   assert.equal(av.dateWindowConfidence, "temporal_unresolved");
   assert.equal(av.requestedStartAt, null);
   assert.equal(av.requestedEndAt, null);
+});
+
+// ---------------------------------------------------------------------------
+// D2. Group transaction-state authority: a duration continuation cannot be
+// randomly converted into a date clarification by model-only `unresolved`.
+// ---------------------------------------------------------------------------
+
+function activeDurationPending(itemId, customerReference = "vehicle", chatScopeKey = "group-a") {
+  return buildEmilyPending({
+    stage: "availability_duration",
+    pendingQuestion: "[customer_reply_pending_composition]",
+    itemId,
+    itemLabel: customerReference,
+    customerReference,
+    participantKey: "923001234567",
+    chatScopeKey,
+    sourceWorkflow: "availability_inquiry",
+    sourceTurnKey: "group-a::original",
+    nowMs: NOW_MS - 1_000,
+  });
+}
+
+test("D2. established Group NEED_DURATION + duration-only answer ignores model-only unresolved for arbitrary items and groups", async () => {
+  const cases = [
+    ["kia_stonic", "Stonic", "leads"],
+    ["honda_civic", "Civic", "leads"],
+    ["toyota_corolla", "Corolla", "car-rental-queries"],
+    ["synthetic_item_a", "Synthetic A", "group-a"],
+    ["synthetic_item_b", "Synthetic B", "group-b"],
+  ];
+
+  const durationOnly = {
+    requestedDuration: {
+      status: "exact",
+      components: [{ value: 5, unit: "days" }],
+      evidence: {
+        source: "current_turn",
+        surfaceText: "5 din",
+        start: 0,
+        end: 5,
+      },
+    },
+  };
+  for (const [itemId, itemLabel, groupKey] of cases) {
+    const canonical = await resolveFor(
+      "5 din k lye",
+      { startDateKind: "unresolved", startDate: null },
+      [],
+      {
+        isGroup: true,
+        itemId,
+        itemLabel,
+        groupKey,
+        memorySnapshot: { emilyPending: activeDurationPending(itemId, itemLabel, groupKey) },
+        ...durationOnly,
+      }
+    );
+    assert.notEqual(
+      canonical.verified.availability.dateWindowConfidence,
+      "temporal_unresolved",
+      `${itemId}/${groupKey} must not enter temporal clarification`
+    );
+    assert.equal(canonical.turn.durationDays, 5);
+    assert.deepEqual(canonical.availabilityConversationTransition, {
+      previousState: "NEED_DURATION",
+      trustedDurationPresent: true,
+      trustedTemporalConstraintPresent: false,
+      modelTemporalRequest: "unresolved",
+      resultingState: "READY_FOR_OWNER_CHECK",
+      transitionReason:
+        "group_duration_pending_duration_supplied_ignores_model_only_temporal_unresolved",
+    });
+  }
+});
+
+test("D3. established Group duration continuation reaches owner-check rather than temporal clarification", async () => {
+  const canonical = await resolveFor(
+    "5 din k lye",
+    { startDateKind: "unresolved", startDate: null },
+    [],
+    {
+      isGroup: true,
+      memorySnapshot: { emilyPending: activeDurationPending(COROLLA_ID, "Corolla") },
+      requestedDuration: {
+        status: "exact",
+        components: [{ value: 5, unit: "days" }],
+        evidence: {
+          source: "current_turn",
+          surfaceText: "5 din",
+          start: 0,
+          end: 5,
+        },
+      },
+    }
+  );
+  const plan = planFor(canonical, "5 din k lye");
+  assert.equal(
+    plan.actions.some((action) => action.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
+    true
+  );
+  assert.equal(
+    plan.actions.some((action) => action.payload?.source === "canonical_owner_check_ask_temporal_clarification"),
+    false
+  );
+});
+
+test("D4. a trusted active temporal clarification still requires a clarified start date", async () => {
+  const canonical = await resolveFor(
+    "next Friday",
+    {
+      startDateKind: "unresolved",
+      startDate: null,
+      evidence: { source: "current_turn", surfaceText: "next Friday", start: 0, end: 11 },
+    },
+    [],
+    {
+      isGroup: true,
+      memorySnapshot: {
+        emilyPending: activeDurationPending(COROLLA_ID, "Corolla"),
+        pendingTemporalClarification: {
+          itemId: COROLLA_ID,
+          durationDays: 5,
+          sourceTurnKey: "original",
+          createdAt: new Date(NOW_MS - 1_000).toISOString(),
+          expiresAt: new Date(NOW_MS + 60_000).toISOString(),
+        },
+      },
+    }
+  );
+  assert.equal(canonical.verified.availability.dateWindowConfidence, "temporal_unresolved");
+  assert.equal(
+    canonical.availabilityConversationTransition.resultingState,
+    "NEED_TEMPORAL_CLARIFICATION"
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -349,9 +497,10 @@ test("Compose-D. duration_ask remains unchanged for genuinely missing duration (
   const userContent = String(capturedArgs.messages?.[1]?.content ?? "");
   assert.match(userContent, /^KIND: duration_ask/m);
   assert.doesNotMatch(userContent, /clarifyStartDate/);
-  assert.match(systemContent, /requestedInput=rental_period/);
-  // duration_ask's own contract and example remain exactly as before.
-  assert.match(systemContent, /kitne din/i);
+  assert.doesNotMatch(userContent, /SEMANTIC_INTENT/);
+  assert.doesNotMatch(systemContent, /requestedInput=rental_period/);
+  assert.doesNotMatch(systemContent, /collect_missing_rental_period|rental_duration|for_period/);
+  assert.match(systemContent, /the availability check has not started/i);
   // The sibling temporal_clarification bullet must not leak into this prompt.
   assert.doesNotMatch(systemContent, /KIND=temporal_clarification/);
   assert.doesNotMatch(systemContent, /requestedInput=start_date/);

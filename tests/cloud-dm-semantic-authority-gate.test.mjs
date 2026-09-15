@@ -859,6 +859,7 @@ test("Cloud ownership receives the participant-bound pending duration item as tr
   assert.deepEqual(focus, {
     itemId: "civic",
     itemLabel: "Honda Civic (White)",
+    customerReference: null,
     sourceTurnId: "wamid.ask-duration",
     provenance: "availability_duration_pending",
     expiresAt: "2099-01-01T00:00:00.000Z",

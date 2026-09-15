@@ -107,7 +107,7 @@ test("clarification contract exposes verified candidate identities only", () => 
     semantics,
     emptyGrounding
   );
-  assert.deepEqual(result, { ok: true });
+  assert.equal(result.ok, true);
 });
 
 test("clarification still blocks unselected booking details", () => {

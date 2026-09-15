@@ -218,6 +218,13 @@ export function buildPricingInquiryActionPlan({
       rememberPresentedItemFocus: Boolean(itemId),
       presentedItemId: itemId,
       presentedItemLabel: itemLabel,
+      // Belts-and-suspenders with orchestrator merge: elliptical "or N din ka?"
+      // after this answer must see lastTransactionalSemanticIntent=pricing_*.
+      rememberTransactionalSemanticIntent: true,
+      transactionalSemanticIntent: "pricing_inquiry",
+      // A completed price answer ends any open availability NEED_DURATION
+      // pending for this session participant (same or stale other item).
+      clearEmilyPending: true,
       execute: false,
     }),
   });

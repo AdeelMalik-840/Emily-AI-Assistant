@@ -198,16 +198,32 @@ export function buildPricingWithDurationActionPlan({
           text: replyDraft,
           field: "price_with_duration",
           itemId,
+          itemLabel,
           durationDays: understanding.durationDays ?? null,
           source,
+          // Same as PricingInquiry: a single-item duration quote is the
+          // presented focus for a later itemless "N din ka kitna?" follow-up.
+          presentedItemIds: Object.freeze(itemId ? [itemId] : []),
           execute: false,
         }),
       }),
     ]),
+    // Orchestrator merges decision.contextToPersist.rememberResolvedItem onto
+    // this plan. Without rememberPresentedItemFocus, that merge clears
+    // lastFreshItemFocus (sessionMemoryExecutor) and the next itemless
+    // price+duration turn hard-fails Group semantic bind (B4 Maazrat).
     persistenceIntent: Object.freeze({
+      rememberResolvedItem: Boolean(itemId),
+      itemId,
+      rememberPresentedItemFocus: Boolean(itemId),
+      presentedItemId: itemId,
+      presentedItemLabel: itemLabel,
       clearPendingAction: true,
       pendingActionType: "collect_duration",
       reason: "pricing_with_duration_interrupt",
+      // Ends stale NEED_DURATION pending so a later bare duration cannot
+      // complete the wrong item's availability after a price turn.
+      clearEmilyPending: true,
       execute: false,
     }),
   });

@@ -5,6 +5,9 @@
  * customer-safe facts + allowed/forbidden claims. Internal lifecycle fields
  * (ownerNotificationSent, AVR, executor, template state) must never appear.
  */
+import { extractRecentAssistantTextsFromPromptBlock } from "../../services/conversationStore.js";
+import { CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY } from "./cloudCanonicalSemantic.js";
+import { resolveDurationAskReplyMeaning } from "../policies/durationAskReplyMeaning.js";
 
 /** @typedef {"group"|"dm"} CustomerReplyChannel */
 
@@ -45,6 +48,742 @@ export const CUSTOMER_LANGUAGE_STYLES = Object.freeze([
   "mixed",
   "unclear",
 ]);
+
+/**
+ * Kinds composeCloudCanonicalCustomerReply accepts. One canonical list so no
+ * caller/test can drift from what the composer actually supports.
+ */
+export const CLOUD_CANONICAL_COMPOSE_KINDS = Object.freeze([
+  "pricing",
+  "pricing_with_duration",
+  "availability",
+  "availability_unavailable",
+  "availability_alternatives",
+  "availability_approved",
+  "duration_ask",
+  "temporal_clarification",
+  "owner_check_holding",
+  "booking_status",
+  "clarification",
+  "image_intro",
+  "social",
+  "item_not_in_catalog",
+  "missing_catalog_price",
+  "browse_options",
+]);
+
+/**
+ * Explicit composer outcome. A non-empty reply alone never means the AI
+ * composed it -- callers must branch on this, not on `ok`/`reply` truthiness,
+ * to tell a real AI success apart from an emergency fallback sentence.
+ */
+export const CUSTOMER_REPLY_COMPOSE_OUTCOMES = Object.freeze({
+  AI_SUCCESS: "ai_success",
+  FALLBACK: "fallback",
+  FAILED: "failed",
+});
+
+/**
+ * Per-kind trusted-facts schema for the cloud canonical composer. Only
+ * duration_ask has a required-field schema right now (the kind this
+ * debugging effort concentrated on); every other kind keeps its existing
+ * loose-object behavior until a later pass defines its schema the same way.
+ * itemId is the identity key (required, used for truth/lookup); itemLabel is
+ * customer-facing wording material only -- optional, and never used by any
+ * guard as a lexical-match source of truth (the model may shorten/reword it
+ * freely without losing item identity).
+ * @param {string} kind
+ * @param {unknown} rawFacts
+ * @returns {{ ok: boolean, errors: string[], facts: Record<string, unknown> }}
+ */
+export function validateTrustedFactsForComposeKind(kind, rawFacts) {
+  const facts =
+    rawFacts && typeof rawFacts === "object" && !Array.isArray(rawFacts)
+      ? rawFacts
+      : {};
+  const errors = [];
+  if (kind === "duration_ask" && !String(facts.itemId ?? "").trim()) {
+    errors.push(
+      "duration_ask requires trustedFacts.itemId (item identity, not wording)"
+    );
+  }
+  if (kind === "item_not_in_catalog" && !String(facts.itemLabel ?? facts.requestedReferent ?? "").trim()) {
+    errors.push("item_not_in_catalog requires trustedFacts.itemLabel");
+  }
+  if (kind === "missing_catalog_price" && !String(facts.itemLabel ?? "").trim()) {
+    errors.push("missing_catalog_price requires trustedFacts.itemLabel");
+  }
+  return { ok: errors.length === 0, errors, facts };
+}
+
+/**
+ * Kinds migrated to the minimal customer-relevant-facts envelope (Stage 2/3
+ * of the generation-simplification proposal). An ALLOWLIST, not
+ * "pass everything then filter": every field a migrated kind's prompt may
+ * see is named explicitly below. Every other kind is untouched -- it keeps
+ * receiving whatever trustedFacts its own caller already builds, exactly as
+ * before, until it is migrated the same way.
+ */
+const MINIMAL_ENVELOPE_KINDS = Object.freeze(["duration_ask", "owner_check_holding"]);
+
+/**
+ * Minimal, allowlisted customer-relevant facts for a migrated compose kind.
+ * This is what actually reaches the language composer's TRUSTED_FACTS_JSON
+ * -- WHAT is known (item identity/label) and left generic on purpose;
+ * WHETHER a reply is required, WHAT claims are allowed, and the linguistic/
+ * interaction objective all continue to come from buildCustomerReplyPolicy
+ * (unaffected by this function) and the deterministic reply contract, never
+ * from here.
+ *
+ * Deliberately excludes -- by construction, never by filtering something
+ * out after the fact -- raw catalog arrays, AVR/ledger/notification state,
+ * executor details, internal disposition enums, or any other workflow-
+ * implementation terminology: none of that is ever read by this function,
+ * so it cannot leak into a prompt this function's output feeds, regardless
+ * of what an upstream caller's raw facts object happens to contain.
+ * @param {string} kind
+ * @param {Record<string, unknown>} rawFacts
+ * @returns {Record<string, unknown>}
+ */
+export function projectCustomerRelevantFacts(kind, rawFacts = {}) {
+  const f = rawFacts && typeof rawFacts === "object" ? rawFacts : {};
+  if (!MINIMAL_ENVELOPE_KINDS.includes(kind)) return f;
+  return {
+    itemId: String(f.itemId ?? "").trim() || null,
+    itemLabel: String(f.itemLabel ?? "").trim() || null,
+    // Trusted customer-facing wording for the same resolved itemId, when the
+    // customer has already used it themselves this conversation (see
+    // resolveCatalogItemFacts.js / emilyPendingContext.js). Wording material
+    // only, same as itemLabel -- never a second identity source.
+    customerReference: String(f.customerReference ?? "").trim() || null,
+  };
+}
+
+/**
+ * Allowed conversationStage values, by kind -- only for kinds where the
+ * stage actually changes composition behavior (today: duration_ask, which
+ * branches its prompt instruction on it). Every other kind's stage is
+ * informational-only text in the prompt and has no restricted set.
+ */
+export const CLOUD_CANONICAL_COMPOSE_CONVERSATION_STAGES = Object.freeze({
+  duration_ask: Object.freeze(["initial_request", "already_waiting_for_duration"]),
+});
+
+/**
+ * Normalizes conversationStage against the closed set of values production
+ * actually produces for a kind that has one. An unrecognized value is never
+ * coerced into a real stage -- it collapses to null (treated as unspecified,
+ * i.e. the safer/less-aggressive initial-request-like path) so a garbage
+ * value a test or a future caller injects can never be mistaken for a stage
+ * it did not earn. Kinds with no restricted set pass any trimmed string
+ * through unchanged, matching their existing informational-only usage.
+ * @param {string} kind
+ * @param {unknown} rawStage
+ * @returns {string | null}
+ */
+export function normalizeConversationStageForKind(kind, rawStage) {
+  const stage = String(rawStage ?? "").trim().slice(0, 80);
+  if (!stage) return null;
+  const allowed = CLOUD_CANONICAL_COMPOSE_CONVERSATION_STAGES[kind];
+  if (!allowed) return stage;
+  return allowed.includes(stage) ? stage : null;
+}
+
+/**
+ * A "continuation" conversationStage is only trustworthy when recentDialogue
+ * actually contains a prior assistant turn to continue from -- otherwise the
+ * stage claims history the composer cannot see, and the model would be told
+ * "you already asked this" with nothing behind it. When no assistant turn is
+ * present, the stage is downgraded to null (treated as a fresh/initial turn)
+ * instead of trusting the caller's label at face value. Reuses the exact
+ * same parser the duplicate/containment guards already use -- never a
+ * second, competing definition of "what counts as a previous assistant
+ * turn."
+ * @param {string} kind
+ * @param {string | null} stage
+ * @param {string | null} recentDialogue
+ * @returns {string | null}
+ */
+export function reconcileConversationStageWithRecentDialogue(kind, stage, recentDialogue) {
+  if (kind !== "duration_ask" || stage !== "already_waiting_for_duration") {
+    return stage;
+  }
+  const hasPriorAssistantTurn =
+    extractRecentAssistantTextsFromPromptBlock(recentDialogue, 1).length > 0;
+  return hasPriorAssistantTurn ? stage : null;
+}
+
+/**
+ * Explicit fallback policy -- represents "is there a safe deterministic
+ * reply to fall back to" as a first-class field instead of an implicit
+ * behavior switch inferred later from whether a string happens to be
+ * non-empty. owner_check_holding keeps its long-standing built-in default
+ * when the caller supplies none; every other kind has no implicit default.
+ * @param {string} kind
+ * @param {unknown} rawFallbackReply
+ * @returns {{ hasFallback: boolean, fallbackReply: string }}
+ */
+export function sameActFallbackReply(kind, rawFacts = {}) {
+  const facts = rawFacts && typeof rawFacts === "object" && !Array.isArray(rawFacts)
+    ? rawFacts
+    : {};
+  const label = String(
+    facts.customerReference ?? facts.itemLabel ?? facts.requestedReferent ?? ""
+  ).trim();
+  if (kind === "item_not_in_catalog") {
+    const base = label
+      ? `${label} available nahi hai.`
+      : "Woh available nahi hai.";
+    const alts = (Array.isArray(facts.verifiedAvailableAlternatives)
+      ? facts.verifiedAvailableAlternatives
+      : [])
+      .map((row) => String(row?.itemLabel ?? row?.displayLabel ?? "").trim())
+      .filter(Boolean);
+    if (alts.length > 0) {
+      return `${base} ${alts.join(", ")} bhi dekh sakte hain.`;
+    }
+    return base;
+  }
+  if (kind === "missing_catalog_price") {
+    return label
+      ? `${label} ki price abhi set nahi hai.`
+      : "Is item ki price abhi set nahi hai.";
+  }
+  if (kind === "browse_options") {
+    const items = Array.isArray(facts.availableItems) ? facts.availableItems : [];
+    const names = items
+      .map((row) => String(row?.displayLabel ?? row?.itemLabel ?? "").trim())
+      .filter(Boolean);
+    if (names.length === 0) return "Abhi koi option available nahi hai.";
+    return names.join(", ");
+  }
+  if (kind === "duration_ask") {
+    return label ? `${label} kitne din ke liye chahiye?` : "Kitne din ke liye chahiye?";
+  }
+  if (kind === "temporal_clarification") {
+    return "Kis date se chahiye?";
+  }
+  if (kind === "owner_check_holding") {
+    return CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY;
+  }
+  if (kind === "pricing_with_duration" || kind === "pricing") {
+    const currency = String(facts.currency ?? "PKR").trim() || "PKR";
+    const formatAmount = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "";
+      return `${Math.floor(n).toLocaleString("en-PK")} ${currency}`;
+    };
+    if (kind === "pricing_with_duration") {
+      const durationDays = Number(facts.durationDays);
+      const totalAmt = formatAmount(facts.totalAmount);
+      const dailyAmt = formatAmount(facts.dailyRate);
+      if (
+        Number.isFinite(durationDays) &&
+        durationDays >= 1 &&
+        totalAmt &&
+        dailyAmt
+      ) {
+        const prefix = label ? `${label} ki ` : "";
+        return `${prefix}${Math.floor(durationDays)} din ki rent ${totalAmt} hogi (${dailyAmt} per din).`;
+      }
+    }
+    const dailyAmt = formatAmount(facts.dailyRate);
+    const monthlyAmt = formatAmount(facts.monthlyRate);
+    if (dailyAmt && monthlyAmt) {
+      return label
+        ? `${label} ka rent ${dailyAmt} per day aur ${monthlyAmt} per month hai.`
+        : `Rent ${dailyAmt} per day aur ${monthlyAmt} per month hai.`;
+    }
+    if (dailyAmt) {
+      return label
+        ? `${label} ka rent ${dailyAmt} per day hai.`
+        : `${dailyAmt} per day hai.`;
+    }
+    if (monthlyAmt) {
+      return label
+        ? `${label} ka monthly rent ${monthlyAmt} hai.`
+        : `Monthly rent ${monthlyAmt} hai.`;
+    }
+    return "";
+  }
+  return "";
+}
+
+export function buildFallbackPolicyForRequest(kind, rawFallbackReply, rawFacts = {}) {
+  const suppliedFallback = String(rawFallbackReply ?? "").trim().slice(0, 500);
+  const kindKey = String(kind ?? "").trim();
+  const autoSameAct = [
+    "item_not_in_catalog",
+    "missing_catalog_price",
+    "browse_options",
+    "pricing",
+    "pricing_with_duration",
+  ].includes(kindKey)
+    ? sameActFallbackReply(kind, rawFacts)
+    : "";
+  const fallbackReply =
+    suppliedFallback ||
+    autoSameAct ||
+    (kindKey === "owner_check_holding" ? CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY : "");
+  return { hasFallback: Boolean(fallbackReply), fallbackReply };
+}
+
+/**
+ * Kind-specific linguistic policy, shared by both callers that build a
+ * reply policy for the composer: buildCustomerReplyPolicy() below (Cloud DM
+ * and any non-canonical-Group caller), and the canonical Group reply-policy
+ * builder in brainV2LivePipeline.js (which does not call
+ * buildCustomerReplyPolicy() itself -- Group's canonical decision authority
+ * bypasses it -- but must not therefore lose the same natural-language
+ * quality guidance a live defect already proved duration_ask needs).
+ *
+ * An ABSTRACT, semantic description of the intended relationship the reply
+ * must express, never a fixed example sentence, exact wording, or any
+ * language-specific vocabulary/word-order rule (grammar/naturalness is
+ * owned by the AI composition layer, not deterministic code -- see
+ * composeCloudCanonicalCustomerReply.js's language-quality review step, the
+ * sole consumer of this field). Identity-free by construction: nothing here
+ * names an item, group, business, or any specific language's
+ * words/postpositions/word order.
+ * @param {string} kind
+ * @returns {string | null}
+ */
+export const GROUP_CUSTOMER_SURFACE_REGISTER =
+  "GROUP_CUSTOMER_SURFACE_REGISTER: Sound like the same natural business assistant throughout the conversation. Prefer 1-2 short sentences. Lead with the direct answer or the one question. Match the customer's language and formality; when they write Roman Urdu or mixed, reply in everyday conversational Roman Urdu rather than formal or technical register. Emily is the speaker: use first person only when agency is needed, feminine or gender-neutral, never masculine. Do not open with an apology unless a real mistake needs one. Do not use internal or technical labels as customer words. Do not add filler, bureaucratic setup, process narration, or a restatement of the current customer message. Natural variation is expected; do not copy a fixed template.";
+
+/**
+ * Group-only, identity-free HOW for one frozen response act. Never a
+ * template, item name, or example sentence. Does not change WHAT the act is.
+ * @param {string} kind
+ * @returns {string}
+ */
+export function groupKindSurfaceGuidance(kind) {
+  switch (String(kind ?? "").trim()) {
+    case "duration_ask":
+      return "";
+    case "temporal_clarification":
+      return "Ask only for the start date, as one short natural question. If duration is already known, do not ask for it again.";
+    case "owner_check_holding":
+      return "Say in first person as Emily that you are confirming availability. Do not describe how the check works or who else is involved.";
+    case "availability_unavailable":
+      return "Say the trusted item is not available. Offer other options only when verified alternatives exist.";
+    case "availability_alternatives":
+      return "Name only the verified alternatives and ask which one they want.";
+    case "pricing":
+    case "pricing_with_duration":
+      return "State the trusted item, duration when known, and verified amount directly.";
+    case "availability_approved":
+      return "Confirm the trusted availability and invite them to book, briefly.";
+    case "availability":
+      return "Answer the trusted availability fact directly.";
+    case "booking_status":
+      return "Answer the trusted booking fact directly.";
+    case "clarification":
+      return "Ask one short clarification from trusted facts only.";
+    case "item_not_in_catalog":
+      return "Tell the customer this requested item is not currently offered, in everyday language. Name verified other options only when those facts are present. Do not apologize, ask a question, or use internal labels as customer words.";
+    case "missing_catalog_price":
+      return "Tell the customer this item is real but its price is not set. Do not invent a rate or promise a follow-up.";
+    case "browse_options":
+      return "Name only verified currently available options. With one option, do not ask the customer to choose.";
+    case "social":
+      return "Greet or acknowledge briefly in the customer's register.";
+    case "image_intro":
+      return "Introduce sending pictures in one short line.";
+    default:
+      return "Answer from trusted facts only, briefly and directly.";
+  }
+}
+
+export function linguisticGuidanceForReplyKind(kind, replyMeaning = null) {
+  const sharedEmilySurfaceVoice =
+    "Use one stable Emily voice across every group and business. Prefer natural gender-neutral phrasing when possible. If first-person gendered grammar is genuinely needed, use Emily's established feminine voice consistently; never switch to a masculine first-person form. Express the customer-facing meaning in native conversational language rather than translating internal field names or workflow terminology. Internal ontology labels describe state only and must never dictate customer wording. Prefer 1-2 short conversational sentences; lead with the answer or the one question; do not open with an apology unless a real mistake needs one; do not add filler or process narration.";
+  if (kind === "duration_ask") {
+    // Duration HOW lives in one customer-safe composer/reviewer meaning
+    // string (frozenDurationAskComposerGuidance). Repeating it here leaked
+    // internal ontology into OpenAI prompts.
+    return null;
+  }
+  if (kind === "owner_check_holding") {
+    return (
+      `${sharedEmilySurfaceVoice} ` +
+      "This is a simple customer-facing status update in Emily's first person: she is confirming availability, and nothing is confirmed yet. Prefer the shortest natural, direct WhatsApp-style response that completes the objective, normally one sentence when one is enough. " +
+      "Tell the customer only what they need to know from trusted facts; do not narrate internal process, explain the mechanics of the request, use awkward self-reference, or sound like a literal translation."
+    );
+  }
+  if (kind === "temporal_clarification") {
+    return (
+      `${sharedEmilySurfaceVoice} ` +
+      "Ask only for the missing start date in the shortest natural conversational form. Do not narrate internal process or repeat already-known rental information."
+    );
+  }
+  return null;
+}
+
+/**
+ * Kind-specific POSITIVE claim requirement, shared by both callers exactly
+ * like linguisticGuidanceForReplyKind above. A live defect proved the
+ * negative-only contract (forbiddenClaims) insufficient: "Corolla ke liye
+ * koi update nahi hai" ("no update for Corolla") violated no forbidden
+ * claim, yet failed to fulfill owner_check_holding's actual objective
+ * (acknowledge that the request is being progressed, not yet confirmed).
+ * Reuses the existing CUSTOMER_CLAIMS ontology term for this meaning
+ * (RESOURCE_AVAILABILITY_UNCONFIRMED) rather than inventing a new one.
+ * @param {string} kind
+ * @returns {string[]}
+ */
+export function requiredClaimsForReplyKind(kind) {
+  if (kind === "owner_check_holding") {
+    return [CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED];
+  }
+  return [];
+}
+
+/**
+ * Whether the delivered reply must structurally preserve a trusted
+ * customer-supplied item reference (the exact wording the customer already
+ * used for this item this conversation), as provenance -- not a linguistic
+ * "must contain this word" rule invented per item. "required" only when
+ * BOTH the kind cares (today: owner_check_holding, the kind a live defect
+ * proved needs this) AND a trusted customerReference actually exists for
+ * this turn; otherwise "optional" (no trusted wording to preserve, or the
+ * kind never asked for one). Never keyed on any specific item name/value.
+ * @param {string} kind
+ * @param {Record<string, unknown>} [facts]
+ * @returns {"required" | "optional"}
+ */
+export function itemReferenceRequirementForReplyKind(kind, facts = {}) {
+  const f = facts && typeof facts === "object" ? facts : {};
+  if (kind === "owner_check_holding" && String(f.customerReference ?? "").trim()) {
+    return "required";
+  }
+  return "optional";
+}
+
+/**
+ * Canonical reply-policy derivation: state decides what Emily is allowed to
+ * claim; AI decides only how to say it. This is the ONE place kind (+
+ * trusted facts, for the few kinds whose permissions are fact-gated, e.g.
+ * availability/availability_approved) is turned into semantic permissions --
+ * the prompt, the guard, and retry correction all consume this same object
+ * rather than each independently reconstructing the rules. Never
+ * item-specific: every branch here is keyed only by kind/fact shape, never
+ * a catalog value.
+ * @param {string} kind
+ * @param {Record<string, unknown>} [facts]
+ * @returns {{
+ *   objective: string,
+ *   customerInputRequired: boolean,
+ *   requestedInput: "rental_period" | "start_date" | null,
+ *   executionState: { availabilityCheckStarted: boolean | null },
+ *   allowedClaims: string[],
+ *   forbiddenClaims: string[],
+ *   requiredClaims: string[],
+ *   linguisticGuidance: string | null,
+ *   interactionGuidance: {
+ *     knownInformation: string[],
+ *     missingInformation: string[],
+ *     askOnlyForMissingInformation: boolean,
+ *     doNotReconfirmKnownInformation: boolean,
+ *     avoidRedundantQuestions: boolean,
+ *     responseMode: "single_missing_input" | "multiple_missing_input" | "single_status_update",
+ *   } | null,
+ * }}
+ */
+export function buildCustomerReplyPolicy(kind, facts = {}) {
+  const f = facts && typeof facts === "object" && !Array.isArray(facts) ? facts : {};
+  const forbidden = new Set([
+    CUSTOMER_CLAIMS.INTERNAL_PROCESS_DISCLOSED,
+    CUSTOMER_CLAIMS.PAYMENT_RECEIVED,
+  ]);
+  const allowed = new Set();
+  let requestedInput = null;
+  let availabilityCheckStarted = null;
+  let objective;
+  // Kind-specific linguistic policy: an ABSTRACT, semantic description of
+  // the intended relationship the reply must express, never a fixed example
+  // sentence, exact wording, or any language-specific vocabulary/word-order
+  // rule (grammar/naturalness is owned by the AI composition layer, not
+  // deterministic code -- see composeCloudCanonicalCustomerReply.js's
+  // language-quality review step, the sole consumer of this field). Only
+  // duration_ask has one today -- it is the kind a live defect proved needs
+  // it (a duration question was observed reading unnaturally). Identity-free
+  // by construction: nothing here names an item, group, business, or any
+  // specific language's words/postpositions/word order.
+  const replyMeaning = resolveDurationAskReplyMeaning({
+    kind,
+    business: f.business,
+    replyMeaning: f.replyMeaning,
+  });
+  const linguisticGuidance = linguisticGuidanceForReplyKind(kind, replyMeaning);
+
+  switch (kind) {
+    case "owner_check_holding":
+      objective = "acknowledge_and_hold";
+      // The request is genuinely already being progressed (owner-check
+      // execution has run) -- distinct from duration_ask/temporal_clarification,
+      // where it has deliberately not started yet.
+      availabilityCheckStarted = true;
+      allowed.add(CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_UNCONFIRMED);
+      break;
+    case "clarification":
+      objective = "collect_missing_clarification";
+      break;
+    case "duration_ask":
+      objective = "collect_missing_rental_period";
+      requestedInput = "rental_period";
+      availabilityCheckStarted = false;
+      break;
+    case "temporal_clarification":
+      objective = "collect_missing_start_date";
+      requestedInput = "start_date";
+      availabilityCheckStarted = false;
+      break;
+    case "social":
+      objective = "social_acknowledgement";
+      break;
+    case "image_intro":
+      objective = "introduce_trusted_images";
+      break;
+    case "availability_unavailable":
+      objective = "state_unavailable_offer_alternatives";
+      allowed.add(CUSTOMER_CLAIMS.RESOURCE_UNAVAILABLE);
+      break;
+    case "availability_alternatives":
+      objective = "present_verified_alternatives";
+      break;
+    case "availability_approved":
+      objective = "invite_booking_from_confirmed_availability";
+      break;
+    case "availability":
+      objective = "answer_availability_from_trusted_facts";
+      break;
+    case "pricing":
+    case "pricing_with_duration":
+      objective = "answer_pricing_from_trusted_facts";
+      allowed.add(CUSTOMER_CLAIMS.QUOTATION_VERIFIED);
+      break;
+    case "booking_status":
+      objective = "answer_booking_status_from_trusted_facts";
+      break;
+    case "item_not_in_catalog":
+      objective = "inform_item_not_currently_offered";
+      allowed.add(CUSTOMER_CLAIMS.RESOURCE_UNAVAILABLE);
+      break;
+    case "missing_catalog_price":
+      objective = "inform_catalog_price_not_set";
+      break;
+    case "browse_options":
+      objective = "present_verified_browse_options";
+      break;
+    default:
+      objective = "answer_from_trusted_facts";
+  }
+
+  if (
+    kind === "owner_check_holding" ||
+    kind === "clarification" ||
+    kind === "duration_ask" ||
+    kind === "temporal_clarification" ||
+    kind === "social" ||
+    kind === "image_intro" ||
+    kind === "item_not_in_catalog" ||
+    kind === "missing_catalog_price"
+  ) {
+    forbidden.add(CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_CONFIRMED);
+    forbidden.add(CUSTOMER_CLAIMS.QUOTATION_VERIFIED);
+    forbidden.add(CUSTOMER_CLAIMS.RESERVATION_CREATED);
+  }
+  // Neither the requested rental window's availability nor its
+  // unavailability is knowable before the window itself is known -- forbid
+  // asserting either direction until the customer supplies it.
+  if (kind === "duration_ask" || kind === "temporal_clarification") {
+    forbidden.add(CUSTOMER_CLAIMS.RESOURCE_UNAVAILABLE);
+  }
+
+  if (
+    kind === "availability" &&
+    f.availabilityStatus === "unavailable" &&
+    f.hasActiveBlockingBookingNow === true
+  ) {
+    allowed.add(CUSTOMER_CLAIMS.RESOURCE_UNAVAILABLE);
+  }
+  if (
+    (kind === "availability" || kind === "availability_approved") &&
+    f.availabilityConfirmed === true
+  ) {
+    allowed.add(CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_CONFIRMED);
+  }
+  if (kind === "availability_approved" && Number(f.totalAmount) > 0) {
+    allowed.add(CUSTOMER_CLAIMS.QUOTATION_VERIFIED);
+  }
+  if (kind === "booking_status" && f.bookingCreated === true) {
+    allowed.add(CUSTOMER_CLAIMS.RESERVATION_CREATED);
+  }
+
+  // Generic conversational-objective policy: WHAT is already known vs still
+  // missing, derived only from trusted state already established above
+  // (requestedInput, facts.itemId) -- never a kind/item/group name check.
+  // This is what lets the composer/reviewer tell "the item is resolved, do
+  // not re-ask about it" apart from "the rental period is missing, ask for
+  // it" without either side needing item-specific rules. Only populated
+  // when there is a genuine missing input to focus on; every other kind
+  // gets null, unchanged from before this field existed.
+  let interactionGuidance = null;
+  if (requestedInput != null) {
+    const knownInformation = ["current_intent"];
+    if (String(f.itemId ?? "").trim()) knownInformation.push("resolved_item");
+    const missingInformation = [requestedInput];
+    interactionGuidance = {
+      knownInformation,
+      missingInformation,
+      askOnlyForMissingInformation: true,
+      doNotReconfirmKnownInformation: true,
+      avoidRedundantQuestions: true,
+      responseMode:
+        missingInformation.length === 1
+          ? "single_missing_input"
+          : "multiple_missing_input",
+    };
+  } else if (kind === "owner_check_holding") {
+    const knownInformation = ["current_intent", "availability_check_started"];
+    if (String(f.itemId ?? "").trim()) knownInformation.push("resolved_item");
+    interactionGuidance = {
+      knownInformation,
+      missingInformation: [],
+      askOnlyForMissingInformation: false,
+      doNotReconfirmKnownInformation: true,
+      avoidRedundantQuestions: true,
+      responseMode: "single_status_update",
+    };
+  }
+
+  return {
+    objective,
+    customerInputRequired: requestedInput != null,
+    requestedInput,
+    executionState: { availabilityCheckStarted },
+    allowedClaims: [...allowed],
+    forbiddenClaims: [...forbidden],
+    requiredClaims: requiredClaimsForReplyKind(kind),
+    itemReferenceRequirement: itemReferenceRequirementForReplyKind(kind, f),
+    linguisticGuidance,
+    interactionGuidance,
+    replyMeaning,
+  };
+}
+
+/**
+ * Canonical composition-input assembly for composeCloudCanonicalCustomerReply.
+ * Called in exactly one production place so Group and Cloud callers are
+ * validated identically before any OpenAI call is attempted, and every
+ * conversational-input field the composer needs -- kind, channel,
+ * semanticIntent, conversationStage, customerMessage, trustedFacts,
+ * recentDialogue, fallback policy -- comes from this one assembled object.
+ * The rest of the composer must not keep reading any of these fields
+ * directly off the raw caller params after this point. Invalid input fails
+ * closed with a structured error list rather than composing against a
+ * kind/facts shape nobody actually verified.
+ * @param {Record<string, unknown>} raw
+ * @returns {{ ok: true, request: {
+ *   kind: string,
+ *   channel: CustomerReplyChannel,
+ *   channelExplicit: boolean,
+ *   semanticIntent: string,
+ *   conversationStage: string | null,
+ *   customerMessage: string | null,
+ *   trustedFacts: Record<string, unknown>,
+ *   recentDialogue: string | null,
+ *   recentDialogueHasAssistantTurn: boolean,
+ *   fallbackPolicy: { hasFallback: boolean, fallbackReply: string },
+ *   replyPolicy: ReturnType<typeof buildCustomerReplyPolicy>,
+ * } } | { ok: false, errors: string[] }}
+ */
+export function assembleCustomerReplyComposeRequest(raw = {}) {
+  const suppliedContract = raw?.responseContract && typeof raw.responseContract === "object"
+    ? raw.responseContract
+    : null;
+  const kind = String(suppliedContract?.replyKind ?? raw?.kind ?? "").trim();
+  const errors = [];
+  if (!CLOUD_CANONICAL_COMPOSE_KINDS.includes(kind)) {
+    errors.push(`unsupported compose kind: "${kind || "(empty)"}"`);
+  }
+  const suppliedFacts = suppliedContract?.trustedCustomerFacts ?? raw?.trustedFacts;
+  const { ok: factsOk, errors: factErrors, facts } =
+    validateTrustedFactsForComposeKind(kind, suppliedFacts);
+  if (!factsOk) errors.push(...factErrors);
+  if (errors.length > 0) return { ok: false, errors };
+
+  const channelExplicit = raw?.channel != null && String(raw.channel).trim() !== "";
+  const channel = normalizeCustomerReplyChannel(raw?.channel);
+  const customerMessage =
+    String(raw?.customerMessage ?? "").trim().slice(0, 300) || null;
+  const recentDialogue =
+    // Kept raw (not display-truncated) -- the continuation duplicate/
+    // containment guards must see the actual last thing Emily said,
+    // independent of however short the prompt-display slice is. Any
+    // prompt-length truncation happens where the prompt text is built, not
+    // here in the data contract. A generous cap (not the ~1200-char prompt
+    // budget) only guards against a pathological input, never a real one.
+    String(raw?.recentDialogue ?? "").trim().slice(0, 20000) || null;
+  const recentDialogueHasAssistantTurn =
+    extractRecentAssistantTextsFromPromptBlock(recentDialogue, 1).length > 0;
+  const requestedStage = normalizeConversationStageForKind(kind, raw?.conversationStage);
+  const conversationStage = reconcileConversationStageWithRecentDialogue(
+    kind,
+    requestedStage,
+    recentDialogue
+  );
+  const semanticIntent =
+    String(raw?.semanticIntent ?? "").trim().slice(0, 80) || "unknown";
+  const fallbackPolicy = buildFallbackPolicyForRequest(kind, raw?.fallbackReply, facts);
+  // Policy (WHAT is known/missing/allowed) is always derived from the full,
+  // unprojected facts -- projection only trims what actually reaches the
+  // language composer's prompt below, never what the deterministic policy
+  // layer itself is allowed to read.
+  const replyPolicy = suppliedContract
+    ? Object.freeze({
+        objective: String(suppliedContract.replyObjective ?? "").trim(),
+        customerInputRequired: suppliedContract.customerInputRequired === true,
+        requestedInput: suppliedContract.requestedInput ?? null,
+        allowedClaims: Array.isArray(suppliedContract.allowedClaims) ? [...suppliedContract.allowedClaims] : [],
+        forbiddenClaims: Array.isArray(suppliedContract.forbiddenClaims) ? [...suppliedContract.forbiddenClaims] : [],
+        requiredClaims: Array.isArray(suppliedContract.requiredClaims) ? [...suppliedContract.requiredClaims] : [],
+        itemReferenceRequirement: suppliedContract.itemReferenceRequirement === "required" ? "required" : "optional",
+        executionState: suppliedContract.executionState ?? { availabilityCheckStarted: null },
+        customerFacingPersona:
+          suppliedContract.customerFacingPersona ?? null,
+        verifiedTiming:
+          suppliedContract.verifiedTiming ?? { hasVerifiedTime: false, timeText: null },
+        linguisticGuidance: suppliedContract.linguisticGuidance ?? null,
+        interactionGuidance: suppliedContract.interactionGuidance ?? null,
+        replyMeaning: suppliedContract.replyMeaning ?? null,
+        requiredAct: suppliedContract.requiredAct ?? null,
+        utteranceFunction: suppliedContract.utteranceFunction ?? null,
+        speaker: suppliedContract.speaker ?? null,
+        target: suppliedContract.target ?? null,
+      })
+    : buildCustomerReplyPolicy(kind, facts);
+  const customerRelevantFacts = projectCustomerRelevantFacts(kind, facts);
+
+  return {
+    ok: true,
+    request: {
+      kind,
+      channel,
+      channelExplicit,
+      semanticIntent,
+      conversationStage,
+      customerMessage,
+      trustedFacts: customerRelevantFacts,
+      recentDialogue,
+      recentDialogueHasAssistantTurn,
+      fallbackPolicy,
+      replyPolicy,
+      responseContract: suppliedContract,
+    },
+  };
+}
 
 /**
  * @param {unknown} value
@@ -136,6 +875,11 @@ export function inferCustomerLanguageStyle(messageText, opts = {}) {
  *   requiredMeaning?: string | null,
  *   allowedClaims?: CustomerClaim[],
  *   forbiddenClaims?: CustomerClaim[],
+ *   requiredClaims?: CustomerClaim[],
+ *   customerInputRequired?: boolean,
+ *   requestedInput?: string | null,
+ *   executionState?: { availabilityCheckStarted?: boolean | null } | null,
+ *   customerFacingPersona?: { actor?: string, firstPersonGrammar?: string, firstPersonAgency?: string } | null,
  *   verifiedTiming?: { hasVerifiedTime?: boolean, timeText?: string | null } | null,
  *   privacyLevel?: "group_public" | "dm_private" | string | null,
  *   customerLanguageStyle?: CustomerLanguageStyle | string | null,
@@ -148,6 +892,9 @@ export function buildCustomerReplyContract(p) {
   const channel = normalizeCustomerReplyChannel(p.channel);
   const allowed = Array.isArray(p.allowedClaims)
     ? [...new Set(p.allowedClaims.map(String))]
+    : [];
+  const required = Array.isArray(p.requiredClaims)
+    ? [...new Set(p.requiredClaims.map(String))]
     : [];
   const forbidden = Array.isArray(p.forbiddenClaims)
     ? [...new Set(p.forbiddenClaims.map(String))]
@@ -170,6 +917,29 @@ export function buildCustomerReplyContract(p) {
     requiredMeaning: p.requiredMeaning != null ? String(p.requiredMeaning) : null,
     allowedClaims: allowed,
     forbiddenClaims: forbidden,
+    requiredClaims: required,
+    customerInputRequired: p.customerInputRequired === true,
+    requestedInput: p.requestedInput ?? null,
+    executionState:
+      p.executionState && typeof p.executionState === "object"
+        ? { availabilityCheckStarted: p.executionState.availabilityCheckStarted ?? null }
+        : { availabilityCheckStarted: null },
+    customerFacingPersona:
+      p.customerFacingPersona && typeof p.customerFacingPersona === "object"
+        ? {
+            actor: String(p.customerFacingPersona.actor ?? "").trim() || null,
+            firstPersonGrammar:
+              String(p.customerFacingPersona.firstPersonGrammar ?? "").trim() || null,
+            firstPersonAgency:
+              String(p.customerFacingPersona.firstPersonAgency ?? "").trim() || null,
+          }
+        : null,
+    itemReferenceRequirement: p.itemReferenceRequirement === "required" ? "required" : "optional",
+    requiredAct: p.requiredAct != null ? String(p.requiredAct).trim() || null : null,
+    utteranceFunction:
+      p.utteranceFunction != null ? String(p.utteranceFunction).trim() || null : null,
+    speaker: p.speaker != null ? String(p.speaker).trim() || null : null,
+    target: p.target != null ? String(p.target).trim() || null : null,
     verifiedTiming:
       p.verifiedTiming && typeof p.verifiedTiming === "object"
         ? {
@@ -187,6 +957,8 @@ export function buildCustomerReplyContract(p) {
           ? "group_public"
           : "dm_private",
     customerLanguageStyle,
+    customerMessageText:
+      p.customerMessageText != null ? String(p.customerMessageText) : null,
   };
 }
 

@@ -365,7 +365,7 @@ test("I: startup visible tail remains baseline_absorbed and is not admitted", ()
     tickFirstSeenByStableId: new Map(),
     admittedFreshStableIds: new Set(),
     baselineEstablishedAtMs: Date.now(),
-    baselineDeferredTailUser: null,
+    baselineDeferredLiveUsers: null,
     anchorHoldUserForward: null,
   };
   const { survivors } = filterGuaranteeFirstEligibleUserRows({

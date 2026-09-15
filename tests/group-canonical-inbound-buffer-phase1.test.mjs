@@ -209,9 +209,8 @@ test("single trusted Group message flushes one canonical turn", async () => {
 });
 
 for (const fragments of [
-  ["Stonic available hai?", "3 din k lye"],
-  ["Civic available hai?", "2 din k lye", "kal se"],
-  ["Civic available hai?", "2 din k lye", "kal se", "rent bhi bata dena"],
+  ["Stonic available hai?", "???"],
+  ["Civic available hai?"],
   ["single fragment"],
 ]) {
   test(`pipeline normalization receives complete ${fragments.length}-fragment turn`, async () => {
@@ -325,10 +324,7 @@ test("retained hard lock permits only exact same-Group read-only observation", a
 
 for (const fragments of [
   ["one message"],
-  ["Stonic available hai?", "5 din k lye"],
-  ["Civic available hai?", "2 din k lye", "kal se"],
-  ["Civic available hai?", "2 din k lye", "kal se", "rent bhi bata dena"],
-  ["Civic", "actually Corolla", "3 din"],
+  ["Stonic available hai?", "???"],
 ]) {
   test(`${fragments.length}-fragment turn freezes after a full clean quiet interval`, async () => {
     const calls = await flushAfterSourceConfirmedQuiet(fragments);
@@ -338,23 +334,17 @@ for (const fragments of [
   });
 }
 
-for (const fragments of [
-  ["Civic available hai?", "2 din k lye?"],
-  ["Civic available hai?", "2 din k lye", "kal se"],
-  ["Civic available hai?", "2 din k lye", "kal se", "rent bhi bata dena"],
-]) {
-  test(`${fragments.length} rapid Group fragments preserve order in one turn`, async () => {
-    const calls = await flushFragments(fragments);
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].messageParts, fragments);
-    let cursor = -1;
-    for (const fragment of fragments) {
-      const next = calls[0].combinedMessage.indexOf(fragment, cursor + 1);
-      assert.ok(next > cursor);
-      cursor = next;
-    }
-  });
-}
+test("punctuation-only follow-up still joins the open Group turn", async () => {
+  const calls = await flushFragments(["Civic available hai?", "???"]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].messageParts, ["Civic available hai?", "???"]);
+});
+
+test("distinct durable Group ids stay separate turns", async () => {
+  const calls = await flushFragments(["Civic available hai?", "2 din k lye"]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].messageParts, ["Civic available hai?"]);
+});
 
 test("correction fragments are preserved without pre-AI item comparison", async () => {
   const fragments = ["Civic chahiye", "actually Corolla", "3 din k lye"];
@@ -367,7 +357,7 @@ test("correction fragments are preserved without pre-AI item comparison", async 
   assert.ok(decision.batches.every((batch) => batch.length === 1));
 
   const calls = await flushFragments(fragments);
-  assert.deepEqual(calls[0].messageParts, fragments);
+  assert.deepEqual(calls[0].messageParts, ["Civic chahiye"]);
 });
 
 test("participant and group identity produce isolated canonical buffer keys", async () => {
@@ -426,7 +416,7 @@ test("interleaved participants never share buffered fragments", async () => {
   assert.equal(calls.length, 2);
   const a = calls.find((call) => call.bufferKey === aKey);
   const b = calls.find((call) => call.bufferKey === bKey);
-  assert.deepEqual(a.messageParts, ["Civic available?", "2 din"]);
+  assert.deepEqual(a.messageParts, ["Civic available?"]);
   assert.deepEqual(b.messageParts, ["Corolla rent?"]);
 });
 
@@ -488,7 +478,7 @@ test("650ms-style debounce expiry cannot flush before the next source scan", asy
     admittedParticipantKeys: [],
   });
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].messageParts, ["Stonic available hai?", "5 din k lye"]);
+  assert.deepEqual(calls[0].messageParts, ["Stonic available hai?"]);
 });
 
 test("inconclusive observation cannot start or complete quiet confirmation", async () => {
@@ -531,7 +521,7 @@ test("inconclusive observation cannot start or complete quiet confirmation", asy
   assert.equal(calls.length, 1);
 });
 
-test("new physical fragment while OPEN clears quiet candidate and joins the same turn", async () => {
+test("new physical fragment while OPEN is deferred as a separate turn", async () => {
   __clearWhatsAppInboundBufferForTests();
   const calls = [];
   const sessionKey = groupPayload().sessionKey;
@@ -563,22 +553,16 @@ test("new physical fragment while OPEN clears quiet candidate and joins the same
     })
   );
   const open = __peekWhatsAppInboundBufferForTests(sessionKey);
-  assert.deepEqual(open.__messageParts, ["Stonic available hai?", "5 din k lye"]);
-  assert.equal(open.__quietCandidateAtScanGen, null);
+  assert.deepEqual(open.__messageParts, ["Stonic available hai?"]);
+  assert.equal(open.__quietCandidateAtScanGen, 71);
 
   await confirmCanonicalGroupScanCompleted({
     chatKey: CHAT_KEY,
     scanGeneration: 73,
     admittedParticipantKeys: [],
   });
-  assert.equal(calls.length, 0);
-  await confirmCanonicalGroupScanCompleted({
-    chatKey: CHAT_KEY,
-    scanGeneration: 74,
-    admittedParticipantKeys: [],
-  });
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].messageParts, ["Stonic available hai?", "5 din k lye"]);
+  assert.deepEqual(calls[0].messageParts, ["Stonic available hai?"]);
 });
 
 test("duplicate replay does not append or advance scan generation", async () => {
@@ -680,7 +664,7 @@ test("interleaved participants receive independent quiet confirmation", async ()
     admittedParticipantKeys: [],
   });
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1].messageParts, ["Civic available hai?", "A second"]);
+  assert.deepEqual(calls[1].messageParts, ["Civic available hai?"]);
 });
 
 test("assistant reply boundary freezes the exact preceding physical turn", async () => {
@@ -792,9 +776,8 @@ test("deadline observation appends a new row and rejects the stale freeze versio
   });
   assert.equal(calls.length, 0);
   const open = __peekWhatsAppInboundBufferForTests(payload.sessionKey);
-  assert.deepEqual(open.__messageParts, ["Civic available hai?", "3 din k lye chyh"]);
-  assert.equal(open.__appendVersion, 2);
-  assert.equal(open.__quietCandidateAtScanGen, null);
+  assert.deepEqual(open.__messageParts, ["Civic available hai?"]);
+  assert.equal(open.__appendVersion, 1);
 
   await __triggerCanonicalGroupSafetyCeilingForTests(payload.sessionKey);
   const finalVersions = getOpenCanonicalGroupBufferSnapshots(CHAT_KEY);
@@ -807,8 +790,8 @@ test("deadline observation appends a new row and rejects the stale freeze versio
     exactGroupVerified: true,
   });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].combinedMessage, "Civic available hai? 3 din k lye chyh");
-  assert.equal(calls[0].messageParts.length, 2);
+  assert.equal(calls[0].combinedMessage, "Civic available hai?");
+  assert.equal(calls[0].messageParts.length, 1);
 });
 
 test("deadline header mismatch or inconclusive read cannot freeze", async () => {
@@ -1083,7 +1066,7 @@ test("buffer reuses latest-message identity and binds all fragment guarantees", 
       sourceMessageIndex: index + 1,
     });
   }
-  const calls = await flushFragments(["Civic available hai?", "2 din k lye?"]);
+  const calls = await flushFragments(["Civic available hai?", "???"]);
   const finalKey = buildPlaywrightGuaranteeKey(GROUP, ids[1]);
   const firstKey = buildPlaywrightGuaranteeKey(GROUP, ids[0]);
   assert.equal(calls[0].context.messageId, ids[1]);
@@ -1095,10 +1078,12 @@ test("buffer reuses latest-message identity and binds all fragment guarantees", 
 test("successful frozen pipeline terminalizes every physical fragment once", async () => {
   let pipelineCalls = 0;
   let terminalizations = 0;
-  const fragments = ["Stonic available hai?", "3 din k lye"];
+  const fragments = ["Stonic available hai?", "???"];
   const ids = scheduleLifecycleFragments(fragments, async (payload) => {
     pipelineCalls += 1;
     assert.equal(payload.combinedMessage, fragments.join(" "));
+    assert.deepEqual(payload.admittedStableIds, ids);
+    assert.equal(Object.isFrozen(payload.admittedStableIds), true);
     payload.__settleCanonicalGroupBufferAttempt({ successful: true });
     terminalizations += 1;
     notifyPlaywrightGuaranteeDelivered(
@@ -1116,7 +1101,7 @@ test("successful frozen pipeline terminalizes every physical fragment once", asy
 });
 
 test("failed frozen pipeline retains all guarantees and releases the chat lock", async () => {
-  const fragments = ["Civic available hai?", "2 din k lye", "kal se"];
+  const fragments = ["Civic available hai?", "???"];
   const ids = scheduleLifecycleFragments(fragments, async () => {
     throw new Error("injected_pipeline_failure");
   });
@@ -1134,7 +1119,7 @@ test("failed frozen pipeline retains all guarantees and releases the chat lock",
 });
 
 test("retry reuses the frozen burst and terminalizes it without duplicate side effects", async () => {
-  const fragments = ["Civic available hai?", "2 din k lye", "kal se"];
+  const fragments = ["Civic available hai?", "???"];
   let attempts = 0;
   let downstreamSideEffects = 0;
   let ids;

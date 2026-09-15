@@ -184,6 +184,7 @@ export async function tryBrainV2InfoLiveTurn(params) {
     sessionKey: emilySessionKey,
     actionPlan: result.actionPlan,
     authoritativeItem: turnContextInput.authoritativeItem,
+    sourceTurnId: `assistant:${String(params.messageId ?? traceId).trim()}`,
   });
 
   console.log("[emily_brain_v2_info_live_handled]", {

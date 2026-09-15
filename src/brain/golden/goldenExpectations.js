@@ -322,7 +322,7 @@ export function evaluateV2GoldenExpectations(outcome, expectations) {
   }
 
   if (expectations.finalWorkflowType === "unlisted_item") {
-    if (!/hamari list mein nahi hai|not listed/i.test(reply)) {
+    if (!/available nahi hai|hamari list mein nahi hai|not listed/i.test(reply)) {
       violations.push("reply must explain item is not in catalog");
     }
   }

@@ -4,6 +4,13 @@
 import { patchEmilySessionState } from "../conversationIntelligence.js";
 
 const FRESH_ITEM_FOCUS_TTL_MS = 15 * 60 * 1000;
+/** Soft continuation window after TTL for same presented item (Group mil-jye). */
+const PRESENTED_FOCUS_CONTINUATION_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const TRANSACTIONAL_FOCUS_CONTINUATION_INTENTS = new Set([
+  "pricing_inquiry",
+  "pricing_with_duration",
+  "availability_inquiry",
+]);
 
 export function readTrustedFreshItemFocus(memory, nowMs = Date.now()) {
   const row = memory?.lastFreshItemFocus;
@@ -24,6 +31,67 @@ export function readTrustedFreshItemFocus(memory, nowMs = Date.now()) {
     sourceTurnId: String(row.sourceTurnId ?? "").trim() || null,
     createdAt: String(row.createdAt ?? "").trim() || null,
     expiresAt: new Date(expiresAtMs).toISOString(),
+  };
+}
+
+/**
+ * When delivery-gated focus is missing/expired but this session still has a
+ * trusted resolved catalog item after a transactional answer, expose a
+ * bindable focus so itemless Group continuations (mil-jye / or N din ka?)
+ * do not fall into TECHNICAL_RECOVERY.
+ *
+ * Does not invent an item: requires lastResolvedItemId + transactional
+ * lastTransactionalSemanticIntent. Expired presented rows only renew when
+ * they match that same item and are within CONTINUATION_MAX_AGE.
+ */
+export function readSoftPresentedItemFocusContinuation(memory, nowMs = Date.now()) {
+  const snap = memory && typeof memory === "object" && !Array.isArray(memory) ? memory : null;
+  if (!snap) return null;
+  const intent = String(snap.lastTransactionalSemanticIntent ?? "").trim();
+  if (!TRANSACTIONAL_FOCUS_CONTINUATION_INTENTS.has(intent)) return null;
+  const itemId = String(snap.lastResolvedItemId ?? "").trim();
+  if (!itemId) return null;
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+  const labelFromLast =
+    String(snap.lastItem?.displayLabel ?? snap.lastItem?.name ?? "").trim() || null;
+
+  const row = snap.lastFreshItemFocus;
+  if (row && typeof row === "object" && !Array.isArray(row)) {
+    const staleId = String(row.itemId ?? "").trim();
+    if (
+      staleId === itemId &&
+      row.provenance === "verified_assistant_presented_item"
+    ) {
+      const createdAtMs = Date.parse(String(row.createdAt ?? ""));
+      if (
+        Number.isFinite(createdAtMs) &&
+        now - createdAtMs > PRESENTED_FOCUS_CONTINUATION_MAX_AGE_MS
+      ) {
+        return null;
+      }
+      const sourceTurnId =
+        String(row.sourceTurnId ?? "").trim() || `resolved:${itemId}`;
+      return {
+        itemId,
+        itemLabel: String(row.itemLabel ?? "").trim() || labelFromLast,
+        provenance: "verified_assistant_presented_item",
+        sourceTurnId,
+        createdAt: String(row.createdAt ?? "").trim() || null,
+        expiresAt: new Date(now + FRESH_ITEM_FOCUS_TTL_MS).toISOString(),
+      };
+    }
+    // Stale focus for a different item — do not guess.
+    if (staleId && staleId !== itemId) return null;
+  }
+
+  // Never-written focus (Group Playwright historically skipped delivery gate).
+  return {
+    itemId,
+    itemLabel: labelFromLast,
+    provenance: "verified_assistant_presented_item",
+    sourceTurnId: `resolved:${itemId}`,
+    createdAt: null,
+    expiresAt: new Date(now + FRESH_ITEM_FOCUS_TTL_MS).toISOString(),
   };
 }
 
@@ -340,6 +408,11 @@ export function applySessionMemoryFromActionPlan(p) {
     typeof persistence.emilyPending === "object"
   ) {
     patch.emilyPending = structuredClone(persistence.emilyPending);
+  }
+
+  if (persistence?.rememberTransactionalSemanticIntent === true) {
+    const intent = String(persistence?.transactionalSemanticIntent ?? "").trim();
+    if (intent) patch.lastTransactionalSemanticIntent = intent;
   }
 
   if (Object.keys(patch).length > 0) {

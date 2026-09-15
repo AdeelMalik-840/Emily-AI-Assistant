@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import OpenAI from "openai";
-import { composeInformationalAnswer } from "../../services/answerComposer.js";
 import {
   AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
   AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
@@ -16,29 +14,126 @@ import { PENDING_ACTION_COLLECT_AVAILABILITY_DURATION } from "../availability/av
 import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
   buildEmilyPending,
+  renewEmilyPending,
+  readEmilyPendingForParticipant,
   toSessionPendingPersistence,
 } from "../availability/emilyPendingContext.js";
 import { isConfidentInventoryUnavailable } from "../facts/resolveItemBookingAwareAvailability.js";
+import { stampCanonicalGroupResponseAct } from "../contracts/canonicalGroupTurnContract.js";
+import { resolveDurationAskReplyMeaning } from "../policies/durationAskReplyMeaning.js";
 import { resolveBookingDateWindowFromDuration } from "../facts/resolveBookingDateWindow.js";
-import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
-import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
-import {
-  buildUnavailableResourceReplyContract,
-  normalizeReplySemantics,
-} from "../contracts/customerReplyContract.js";
-import {
-  buildCustomerReplyGuardCorrection,
-  validateCustomerReplyAgainstContract,
-} from "../guards/customerReplyGuard.js";
-import {
-  buildStrictJsonSchemaResponseFormat,
-  MAX_CUSTOMER_REPLY_ATTEMPTS,
-  REPLY_SEMANTICS_SCHEMA,
-} from "../openai/strictJsonSchema.js";
 
 /** @typedef {import("../contracts/inbound.js").AdmittedTurn} AdmittedTurn */
 /** @typedef {import("../contracts/workflow.js").TurnUnderstanding} TurnUnderstanding */
 /** @typedef {import("../contracts/action.js").ActionPlan} ActionPlan */
+
+export const AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION =
+  "[customer_reply_pending_composition]";
+
+/**
+ * Materialize wording after the deterministic availability plan has already
+ * been routed/executed. This changes customer text only; action identity and
+ * persistence semantics remain owned by the workflow.
+ *
+ * @param {ActionPlan} actionPlan
+ * @param {{ reply?: string | null, presentedItemIds?: string[] | null }} result
+ * @returns {ActionPlan}
+ */
+export function applyAvailabilityCustomerResponse(actionPlan, result = {}) {
+  const reply = String(result.reply ?? "").trim();
+  if (!reply || actionPlan?.customerResponseComposition?.lane !== "availability") {
+    return actionPlan;
+  }
+  const trustedAlternatives = Array.isArray(
+    actionPlan.customerResponseComposition?.verifiedAlternatives
+  )
+    ? actionPlan.customerResponseComposition.verifiedAlternatives
+    : [];
+  const trustedAlternativeIds = new Set(
+    trustedAlternatives.map((row) => String(row?.itemId ?? "").trim()).filter(Boolean)
+  );
+  const presentedItemIds = [...new Set(
+    (Array.isArray(result.presentedItemIds) ? result.presentedItemIds : [])
+      .map((id) => String(id ?? "").trim())
+      .filter((id) => id && trustedAlternativeIds.has(id))
+  )];
+  const replacePendingQuestion = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    return {
+      ...value,
+      ...(value.pendingQuestion === AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION
+        ? { pendingQuestion: reply }
+        : {}),
+    };
+  };
+  const persistence = actionPlan.persistenceIntent ?? {};
+  const nextPersistence = {
+    ...persistence,
+    ...(persistence.emilyPending
+      ? { emilyPending: replacePendingQuestion(persistence.emilyPending) }
+      : {}),
+    ...(persistence.pendingAction
+      ? { pendingAction: replacePendingQuestion(persistence.pendingAction) }
+      : {}),
+    ...(persistence.lastAvailabilityAssist
+      ? {
+          lastAvailabilityAssist: replacePendingQuestion(
+            persistence.lastAvailabilityAssist
+          ),
+        }
+      : {}),
+  };
+  if (
+    actionPlan.customerResponseComposition?.bindPresentedItemFocus !== false &&
+    (actionPlan.customerResponseComposition?.kind === "availability_alternatives" ||
+      actionPlan.customerResponseComposition?.kind === "availability_unavailable")
+  ) {
+    const singleId = presentedItemIds.length === 1 ? presentedItemIds[0] : null;
+    nextPersistence.rememberPresentedItemFocus = Boolean(singleId);
+    nextPersistence.presentedItemId = singleId;
+    nextPersistence.presentedItemLabel = singleId
+      ? trustedAlternatives.find((row) => row.itemId === singleId)?.itemLabel ?? null
+      : null;
+    nextPersistence.sourceTurnId = singleId
+      ? actionPlan.customerResponseComposition?.sourceTurnKey ?? null
+      : null;
+    nextPersistence.clearPresentedItemFocus = !singleId;
+  }
+  // The alternatives-verified presentedItemIds rewrite below only has
+  // meaning for the two kinds that actually present a list of alternative
+  // items -- applying it unconditionally to every availability-lane kind
+  // (temporal_clarification, duration_ask, plain availability, ...) would
+  // always collapse the workflow's own already-correct single-item
+  // presentedItemIds (e.g. the exact item a temporal_clarification reply is
+  // about) down to [], because trustedAlternativeIds is empty for those
+  // kinds. That collapse is exactly what broke trusted presented-item-focus
+  // persistence for a delivered temporal-clarification reply.
+  const isAlternativesPresentationKind =
+    actionPlan.customerResponseComposition?.kind === "availability_alternatives" ||
+    actionPlan.customerResponseComposition?.kind === "availability_unavailable";
+  return Object.freeze({
+    ...actionPlan,
+    replyDraft: reply,
+    actions: Object.freeze(
+      (Array.isArray(actionPlan.actions) ? actionPlan.actions : []).map((action) =>
+        action?.type === "REPLY"
+          ? Object.freeze({
+              ...action,
+              payload: Object.freeze({
+                ...action.payload,
+                text: reply,
+                ...(isAlternativesPresentationKind &&
+                Array.isArray(action.payload?.presentedItemIds)
+                  ? { presentedItemIds: Object.freeze([...presentedItemIds]) }
+                  : {}),
+              }),
+            })
+          : action
+      )
+    ),
+    persistenceIntent: Object.freeze(nextPersistence),
+  });
+}
 
 /**
  * @param {unknown[]} catalogItems
@@ -58,47 +153,6 @@ function findCatalogItemById(catalogItems, itemId) {
  * @param {Record<string, unknown>} row
  * @returns {Record<string, unknown>}
  */
-function normalizeItemForComposer(row) {
-  const availability = row.availability;
-  const isAvailable =
-    typeof row.isAvailable === "boolean"
-      ? row.isAvailable
-      : availability !== false;
-  return { ...row, isAvailable };
-}
-
-/**
- * @param {string} label
- * @param {string} reply
- * @returns {string}
- */
-function ensureItemSpecificAvailabilityReply(label, reply) {
-  const itemLabel = String(label ?? "").trim();
-  const text = String(reply ?? "").trim();
-  if (!itemLabel || !text) return text;
-  const anchor = itemLabel.split(/\s+/).find((t) => t.length >= 4) ?? itemLabel;
-  if (new RegExp(anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(text)) {
-    return text;
-  }
-  return `${itemLabel} ${text}`;
-}
-
-/**
- * @param {string | null | undefined} iso
- * @returns {string | null}
- */
-function formatExpectedAvailabilityDate(iso) {
-  const raw = String(iso ?? "").trim();
-  if (!raw) return null;
-  const d = new Date(raw);
-  if (!Number.isFinite(d.getTime())) return null;
-  return d.toLocaleDateString("en-PK", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
-}
-
 /**
  * @param {Record<string, unknown> | null | undefined} availability
  * @returns {boolean}
@@ -230,7 +284,7 @@ function hasRequestedDuration(durationDays) {
  * @param {string} [message]
  * @returns {{ ready: boolean, durationDays: number | null, datePhrase: string | null }}
  */
-function resolveOwnerCheckTiming(canonical, message = "") {
+function resolveOwnerCheckTiming(canonical, _message = "") {
   const durationDays = canonical?.turn?.durationDays ?? null;
   if (hasRequestedDuration(durationDays)) {
     return {
@@ -240,19 +294,9 @@ function resolveOwnerCheckTiming(canonical, message = "") {
     };
   }
 
-  const weakSignals = Array.isArray(canonical?.decision?.weakContextSignals)
-    ? canonical.decision.weakContextSignals
-    : [];
-  const normalized = String(message ?? canonical?.normalizedMessage ?? "")
-    .trim()
-    .toLowerCase();
-  if (weakSignals.includes("date_context") || /\b(?:kal|tomorrow)\b/i.test(normalized)) {
-    return { ready: true, durationDays: 1, datePhrase: "kal" };
-  }
-  if (weakSignals.includes("duration_context")) {
-    return { ready: true, durationDays: 1, datePhrase: null };
-  }
-
+  // Date/context signals (kal, tomorrow, date_context, duration_context)
+  // remain on the canonical temporal/decision facts. They must never
+  // manufacture durationDays or mark owner-check ready.
   return { ready: false, durationDays: null, datePhrase: null };
 }
 
@@ -314,253 +358,6 @@ export function buildUnavailableAvailabilityFailsafeReply(
 }
 
 /**
- * @param {string} reply
- * @param {unknown[]} alternatives
- * @param {string} failsafe
- * @returns {string}
- */
-function validateUnavailableCustomerReply(reply, alternatives, failsafe) {
-  const text = String(reply ?? "").trim();
-  if (!text || text.length > 400) return failsafe;
-  const alts = Array.isArray(alternatives) ? alternatives : [];
-  if (alts.length === 0 && /koi aur option dekhun|other option|aur option/i.test(text)) {
-    return failsafe;
-  }
-  return text;
-}
-
-/**
- * AI reply from verified unavailable facts (existing workflow file — no new module).
- * Never invents cars. If alternatives empty, must not offer other options.
- *
- * @param {{
- *   conversationalLabel: string,
- *   durationDays: number,
- *   alternatives?: Array<{ itemId?: string, itemLabel?: string }>,
- *   chatCompletionsCreate?: Function | null,
- *   __chatCompletionsCreateForTests?: Function | null,
- *   __replyForTests?: string | null,
- *   __presentedItemIdsForTests?: string[] | null,
- *   returnPresentationMetadata?: boolean,
- *   timeoutMs?: number,
- * }} p
- * @returns {Promise<string | { reply: string, presentedItemIds: string[] }>}
- */
-export async function composeUnavailableCustomerReplyFromFacts(p = {}) {
-  const label = String(p.conversationalLabel ?? "").trim() || "item";
-  const durationDays = Number(p.durationDays);
-  const durationN =
-    Number.isFinite(durationDays) && durationDays >= 1 ? Math.floor(durationDays) : 1;
-  const alternatives = Array.isArray(p.alternatives) ? p.alternatives : [];
-  const failsafe = buildUnavailableAvailabilityFailsafeReply(label, durationN, alternatives);
-  const trustedAlternativeIds = new Set(
-    alternatives.map((row) => String(row?.itemId ?? "").trim()).filter(Boolean)
-  );
-  const withPresentationMetadata = (reply, proposedIds = []) => {
-    const presentedItemIds = [...new Set(
-      (Array.isArray(proposedIds) ? proposedIds : [])
-        .map((id) => String(id ?? "").trim())
-        .filter((id) => id && trustedAlternativeIds.has(id))
-    )];
-    return p.returnPresentationMetadata === true
-      ? Object.freeze({ reply: String(reply ?? "").trim(), presentedItemIds: Object.freeze(presentedItemIds) })
-      : String(reply ?? "").trim();
-  };
-
-  if (typeof p.__replyForTests === "string" && p.__replyForTests.trim()) {
-    return withPresentationMetadata(
-      validateUnavailableCustomerReply(p.__replyForTests.trim(), alternatives, failsafe),
-      p.__presentedItemIdsForTests
-    );
-  }
-
-  const create =
-    typeof p.__chatCompletionsCreateForTests === "function"
-      ? p.__chatCompletionsCreateForTests
-      : typeof p.chatCompletionsCreate === "function"
-        ? p.chatCompletionsCreate
-        : (() => {
-            const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
-            if (!apiKey) return null;
-            const client = new OpenAI({ apiKey });
-            return (args) => client.chat.completions.create(args);
-          })();
-  if (!create) return withPresentationMetadata(failsafe);
-
-  const altLabels = alternatives
-    .map((row) => String(row?.itemLabel ?? "").trim())
-    .filter(Boolean)
-    .slice(0, 5);
-
-  const verifiedFacts = {
-    itemLabel: label,
-    durationDays: durationN,
-    itemAvailable: false,
-    verifiedAlternativeLabels: altLabels,
-    verifiedAlternatives: alternatives.slice(0, 5).map((row) => ({
-      itemId: String(row?.itemId ?? "").trim() || null,
-      itemLabel: String(row?.itemLabel ?? "").trim() || null,
-    })),
-    verifiedAlternativesCount: altLabels.length,
-    customerMessageText: String(p.customerMessageText ?? "").trim() || null,
-    styleKey: p.styleKey ?? null,
-  };
-  const replyContract = buildUnavailableResourceReplyContract(verifiedFacts);
-  const responseFormat = buildStrictJsonSchemaResponseFormat(
-    "unavailable_customer_reply",
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        reply: { type: "string" },
-        presentedItemIds: {
-          type: "array",
-          items: { type: "string" },
-        },
-        replySemantics: REPLY_SEMANTICS_SCHEMA,
-      },
-      required: ["reply", "presentedItemIds", "replySemantics"],
-    }
-  );
-
-  const system = `${buildCustomerCommunicationPolicy({ channel: "group" })}
-
-LANE OBJECTIVE (unavailable availability reply):
-Write ONE short customer reply from VERIFIED FACTS only.
-Do not invent cars, prices, or availability.
-If verifiedAlternatives is empty, you MUST NOT ask to show other options.
-If verifiedAlternatives is non-empty, you may offer to show other options (do not list them unless facts say to list).
-If you present a verified alternative as the next conversational target, include its exact itemId in presentedItemIds.
-Never include an ID that is not in verifiedAlternatives. If you present no alternative, return an empty array.
-Return STRICT JSON: {"reply":"...","presentedItemIds":[],"replySemantics":{"claims":["resource_unavailable"],"languageStyle":"roman_urdu","containsTimingPromise":false,"exposesInternalProcess":false}}`;
-
-  const userBase = `FACTS_JSON: ${JSON.stringify(verifiedFacts)}
-CUSTOMER_REPLY_CONTRACT: ${JSON.stringify({
-    allowedClaims: replyContract.allowedClaims,
-    forbiddenClaims: replyContract.forbiddenClaims,
-    requiredMeaning: replyContract.requiredMeaning,
-  })}`;
-
-  try {
-    const timeoutMs =
-      Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) > 0
-        ? Number(p.timeoutMs)
-        : 8000;
-    let lastReason = null;
-    for (let attempt = 1; attempt <= MAX_CUSTOMER_REPLY_ATTEMPTS; attempt++) {
-      const userContent =
-        attempt === 1
-          ? `${userBase}\n\nStrict JSON only.`
-          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason || "validation_failed")}`;
-      const completion = await Promise.race([
-        create({
-          model: resolveOpenAiChatModel(),
-          temperature: 0.3,
-          response_format: responseFormat,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: userContent },
-          ],
-        }),
-        new Promise((_, reject) => {
-          setTimeout(() => reject(new Error("unavailable_reply_timeout")), timeoutMs);
-        }),
-      ]);
-      const raw = String(completion?.choices?.[0]?.message?.content ?? "").trim();
-      let reply = "";
-      let presentedItemIds = [];
-      let semantics = null;
-      try {
-        const parsed = JSON.parse(raw);
-        reply = String(parsed?.reply ?? "").trim();
-        presentedItemIds = Array.isArray(parsed?.presentedItemIds)
-          ? parsed.presentedItemIds.map((id) => String(id ?? "").trim()).filter(Boolean)
-          : [];
-        semantics = normalizeReplySemantics(parsed?.replySemantics);
-      } catch {
-        reply = "";
-      }
-      if (!reply) {
-        lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return withPresentationMetadata(""); // fail closed — no canned fallback after guarded attempts
-      }
-      if (presentedItemIds.some((id) => !trustedAlternativeIds.has(id))) {
-        lastReason = "untrusted_presented_item_id";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return withPresentationMetadata("");
-      }
-      const guard = validateCustomerReplyAgainstContract(
-        reply,
-        replyContract,
-        semantics
-      );
-      if (!guard.ok) {
-        lastReason = guard.reason || "customer_reply_guard_failed";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return withPresentationMetadata("");
-      }
-      // Keep existing length/alts sanity checks; empty alternatives still forbid "other option".
-      const validated = validateUnavailableCustomerReply(reply, alternatives, "");
-      if (!validated) {
-        lastReason = "unavailable_reply_failed_local_validation";
-        if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
-        return withPresentationMetadata("");
-      }
-      return withPresentationMetadata(validated, presentedItemIds);
-    }
-    return withPresentationMetadata("");
-  } catch {
-    return withPresentationMetadata(failsafe);
-  }
-}
-
-/**
- * @param {Array<{ itemId: string, itemLabel: string }>} alternatives
- * @returns {string}
- */
-export function buildVerifiedAlternativesReply(alternatives) {
-  const labels = (Array.isArray(alternatives) ? alternatives : [])
-    .map((row) => String(row?.itemLabel ?? "").trim())
-    .filter(Boolean);
-  if (labels.length === 0) {
-    return "Sorry abi koi option available nahi hai.";
-  }
-  if (labels.length === 1) {
-    return `Abhi ${labels[0]} available hai. Ye dekhna hai?`;
-  }
-  return `Abhi ye options available hain: ${labels.join(", ")}. Kaunsa dekhna hai?`;
-}
-
-/**
- * @param {string} itemLabel
- * @param {Record<string, unknown>} availability
- * @returns {string}
- */
-export function buildAvailabilityReplyFromCanonical(itemLabel, availability) {
-  const label = String(itemLabel ?? "").trim() || "item";
-  const status = String(availability?.status ?? "").trim().toLowerCase();
-  const isAvailable = availability?.isAvailable;
-  const nextAvailableAt = availability?.nextAvailableAt ?? null;
-
-  if (isAvailable === true || status === "available") {
-    return `${label} Available hai 👍`;
-  }
-
-  if (isAvailable === false || status === "unavailable") {
-    const dateLabel = formatExpectedAvailabilityDate(
-      typeof nextAvailableAt === "string" ? nextAvailableAt : null
-    );
-    if (dateLabel) {
-      return `${label} abhi available nahi hai. Expected availability ${dateLabel} se hai.`;
-    }
-    return `${label} Abhi available nahi hai.`;
-  }
-
-  return `${label} ki availability confirm karni hogi.`;
-}
-
-/**
  * @param {{
  *   itemId?: string | null,
  *   itemLabel?: string | null,
@@ -604,43 +401,6 @@ export function logAvailabilityOwnerCheckPlanned(p) {
 
 /**
  * @param {string} conversationalLabel
- * @returns {string}
- */
-export function buildAskDurationAvailabilityReply(conversationalLabel) {
-  const label = String(conversationalLabel ?? "").trim() || "item";
-  return `${label} ka mai check kar leta hun. Kitne din ke liye chahiye?`;
-}
-
-/**
- * Deterministic fallback only — the live Cloud DM channel composes this
- * question with OpenAI (reusing the existing duration_ask prompt, which
- * already covers "the missing rental period (duration or dates)"). Used
- * as the draft/fail-safe text, same convention as buildAskDurationAvailabilityReply.
- * @param {string} conversationalLabel
- * @returns {string}
- */
-export function buildAskTemporalClarificationAvailabilityReply(conversationalLabel) {
-  const label = String(conversationalLabel ?? "").trim() || "item";
-  return `${label} ke liye exact date confirm kar dein, please?`;
-}
-
-/**
- * Present-tense acknowledgement that the item is occupied right now — used
- * only when hasActiveBlockingBookingNow has been proven true by the resolver
- * from real start/end dates (start <= evaluationTime && (no end || end >
- * evaluationTime)). Says nothing about any specific future window — that
- * remains governed by isConfidentInventoryUnavailable() once a duration/date
- * is actually supplied.
- * @param {string} conversationalLabel
- * @returns {string}
- */
-export function buildCurrentlyBlockedNoDurationReply(conversationalLabel) {
-  const label = String(conversationalLabel ?? "").trim() || "item";
-  return `${label} abhi kisi booking mein hai.`;
-}
-
-/**
- * @param {string} conversationalLabel
  * @param {number} durationDays
  * @returns {string}
  */
@@ -663,7 +423,7 @@ export function buildOwnerCheckDeferralReply(conversationalLabel, durationDays, 
  *   understanding?: Record<string, unknown> | null,
  *   assist?: Record<string, unknown> | null,
  * }} p
- * @returns {number}
+ * @returns {number | null}
  */
 function resolveLatestOwnerCheckDurationDays(p = {}) {
   const candidates = [
@@ -675,7 +435,7 @@ function resolveLatestOwnerCheckDurationDays(p = {}) {
     const n = Number(raw);
     if (Number.isFinite(n) && n >= 1) return Math.max(1, Math.floor(n));
   }
-  return 1;
+  return null;
 }
 
 /**
@@ -948,6 +708,19 @@ export function buildOwnerCheckActionPlan(p) {
     ...(usePostExecuteReply
       ? { postExecuteCustomerReply: /** @type {"owner_check_result"} */ ("owner_check_result") }
       : {}),
+    // Group compose contract: even before post-execute fills wording, the
+    // required act is frozen so the lane cannot drift to silence/clarify.
+    ...(usePostExecuteReply
+      ? {
+          customerResponseComposition: stampCanonicalGroupResponseAct({
+            lane: "availability",
+            kind: "owner_check_holding",
+            conversationStage: "owner_check_planned",
+            missingField: null,
+            verifiedAlternatives: Object.freeze([]),
+          }),
+        }
+      : {}),
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",
@@ -957,6 +730,11 @@ export function buildOwnerCheckActionPlan(p) {
           field: "availability",
           itemId,
           itemLabel,
+          // Single-item owner-check holding must declare presented focus the
+          // same way pricing/availability answers do — otherwise
+          // rememberResolvedItem clears lastFreshItemFocus and the next
+          // itemless "4 din ka rent kitna?" cannot bind Corolla.
+          presentedItemIds: Object.freeze(itemId ? [itemId] : []),
           source: usePostExecuteReply
             ? "canonical_owner_check_post_execute"
             : "canonical_owner_check_not_executed",
@@ -1003,6 +781,9 @@ export function buildOwnerCheckActionPlan(p) {
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
       itemId,
+      rememberPresentedItemFocus: Boolean(itemId),
+      presentedItemId: itemId || null,
+      presentedItemLabel: itemLabel || null,
       rememberDuration: true,
       durationDays: durationN,
       ownerCheckPlanned: true,
@@ -1054,26 +835,7 @@ export function resolveOwnerCheckWindowForPlan(p = {}) {
 function buildUnavailableOfferActionPlan(p) {
   const alternatives = readVerifiedAlternatives(p.availability);
   const hasAlternatives = alternatives.length > 0;
-  const presentedItemIds = [...new Set(
-    (Array.isArray(p.canonical?.presentedAlternativeItemIds)
-      ? p.canonical.presentedAlternativeItemIds
-      : [])
-      .map((id) => String(id ?? "").trim())
-      .filter((id) => alternatives.some((row) => row.itemId === id))
-  )];
-  const composed = String(p.canonical?.unavailableCustomerReply ?? "").trim();
-  const failsafe = buildUnavailableAvailabilityFailsafeReply(
-    p.conversationalLabel,
-    p.durationN,
-    alternatives
-  );
-  const replyDraft =
-    composed &&
-    !(
-      !hasAlternatives && /koi aur option dekhun|other option|aur option/i.test(composed)
-    )
-      ? composed
-      : failsafe;
+  const replyDraft = "";
 
   const offerWindow = resolveAssistOfferWindow({
     durationN: p.durationN,
@@ -1098,7 +860,7 @@ function buildUnavailableOfferActionPlan(p) {
         windowStartAt: offerWindow.startAt,
         windowEndAt: offerWindow.endAt,
         requestedDates: offerWindow.requestedDates,
-        pendingQuestion: replyDraft,
+        pendingQuestion: AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION,
         pendingPromptType: AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
         assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
         sourceTurnKey,
@@ -1119,6 +881,18 @@ function buildUnavailableOfferActionPlan(p) {
   return Object.freeze({
     planId: randomUUID(),
     replyDraft,
+    customerResponseComposition: stampCanonicalGroupResponseAct({
+      lane: "availability",
+      kind: "availability_unavailable",
+      conversationStage: hasAlternatives
+        ? "offer_verified_alternatives"
+        : "no_verified_alternatives",
+      missingField: null,
+      sourceTurnKey,
+      verifiedAlternatives: Object.freeze(
+        alternatives.map((row) => Object.freeze({ ...row }))
+      ),
+    }),
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",
@@ -1134,7 +908,7 @@ function buildUnavailableOfferActionPlan(p) {
           verifiedAlternatives: Object.freeze(
             alternatives.map((row) => Object.freeze({ ...row }))
           ),
-          presentedItemIds: Object.freeze([...presentedItemIds]),
+          presentedItemIds: Object.freeze([]),
           execute: false,
         }),
       }),
@@ -1142,19 +916,18 @@ function buildUnavailableOfferActionPlan(p) {
     persistenceIntent: Object.freeze({
       rememberResolvedItem: true,
       itemId: p.itemId,
-      rememberPresentedItemFocus: presentedItemIds.length === 1,
-      presentedItemId: presentedItemIds.length === 1 ? presentedItemIds[0] : null,
-      presentedItemLabel:
-        presentedItemIds.length === 1
-          ? alternatives.find((row) => row.itemId === presentedItemIds[0])?.itemLabel ?? null
-          : null,
-      sourceTurnId: presentedItemIds.length === 1 ? sourceTurnKey : null,
-      clearPresentedItemFocus: presentedItemIds.length !== 1,
+      rememberPresentedItemFocus: false,
+      presentedItemId: null,
+      presentedItemLabel: null,
+      sourceTurnId: null,
+      clearPresentedItemFocus: true,
       rememberDuration: true,
       durationDays: p.durationN,
       rememberLastAvailabilityAssist: Boolean(assist),
       lastAvailabilityAssist: assist,
       clearLastAvailabilityAssist: !assist,
+      clearPendingAction: true,
+      clearEmilyPending: true,
       execute: false,
     }),
   });
@@ -1204,11 +977,11 @@ function buildAssistContextNoReplyActionPlan(p = {}) {
  * @returns {ActionPlan}
  */
 function buildAlternativesListActionPlan(p) {
-  const replyDraft = buildVerifiedAlternativesReply(p.alternatives);
+  const replyDraft = "";
   const assistForPersist =
     p.alternatives.length > 0
       ? withAvailabilityAssistPendingQuestion(p.assist, {
-          pendingQuestion: replyDraft,
+          pendingQuestion: AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION,
           pendingPromptType: AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
           assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION,
         }) || p.assist
@@ -1216,6 +989,16 @@ function buildAlternativesListActionPlan(p) {
   return Object.freeze({
     planId: randomUUID(),
     replyDraft,
+    customerResponseComposition: stampCanonicalGroupResponseAct({
+      lane: "availability",
+      kind: "availability_alternatives",
+      conversationStage: "verified_alternatives_list",
+      missingField: "item_selection",
+      sourceTurnKey: String(p.assist?.sourceTurnKey ?? "").trim() || null,
+      verifiedAlternatives: Object.freeze(
+        p.alternatives.map((row) => Object.freeze({ ...row }))
+      ),
+    }),
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",
@@ -1229,6 +1012,7 @@ function buildAlternativesListActionPlan(p) {
             p.alternatives.length > 0
               ? "canonical_verified_alternatives_list"
               : "canonical_unavailable_no_alternatives",
+          presentedItemIds: Object.freeze([]),
           execute: false,
         }),
       }),
@@ -1348,7 +1132,7 @@ export function buildAvailabilityInquiryActionPlan({
       availability?.isAvailable === true ||
       alts.some((row) => row.itemId === selectedId);
 
-    if (selectedId && selectedAvailable && canonical) {
+    if (selectedId && selectedAvailable && canonical && hasRequestedDuration(durationN)) {
       return buildOwnerCheckActionPlan({
         canonical: {
           ...canonical,
@@ -1413,8 +1197,12 @@ export function buildAvailabilityInquiryActionPlan({
     // before owner-check readiness, AVR creation, and any confident-
     // unavailable claim — never default to now, never claim availability for
     // a different window, only ask the customer to clarify.
-    if (isAvailabilityTemporalUnresolved(canonicalAvailability)) {
-      const clarifyReplyDraft = buildAskTemporalClarificationAvailabilityReply(conversationalLabel);
+    if (
+      canonical?.availabilityConversationTransition?.resultingState ===
+        "NEED_TEMPORAL_CLARIFICATION" &&
+      isAvailabilityTemporalUnresolved(canonicalAvailability)
+    ) {
+      const clarifyReplyDraft = "";
       // Duration is already known on THIS turn (canonical.turn.durationDays
       // reflects it — including a duration recovered from a still-fresh
       // matching pendingTemporalClarification on a repeated invalid date).
@@ -1429,11 +1217,23 @@ export function buildAvailabilityInquiryActionPlan({
               itemId,
               durationDays: knownDurationDaysForClarification,
               sourceTurnKey: String(canonical?.turn?.sourceTurnKey ?? "").trim() || null,
+              participantKey: String(canonical?.participant?.key ?? "").trim() || null,
+              chatScopeKey:
+                String(readSourceIdentity(canonical)?.chatType ?? "").trim() === "group"
+                  ? String(readSourceIdentity(canonical)?.chatId ?? "").trim() || null
+                  : null,
             })
           : null;
       return Object.freeze({
         planId: randomUUID(),
         replyDraft: clarifyReplyDraft,
+        customerResponseComposition: stampCanonicalGroupResponseAct({
+          lane: "availability",
+          kind: "temporal_clarification",
+          conversationStage: "awaiting_temporal_clarification",
+          missingField: "start_date",
+          verifiedAlternatives: Object.freeze([]),
+        }),
         actions: Object.freeze([
           Object.freeze({
             type: "REPLY",
@@ -1467,16 +1267,17 @@ export function buildAvailabilityInquiryActionPlan({
                 pendingTemporalClarification: freshPendingClarification,
               }
             : { clearPendingTemporalClarification: true }),
+          clearPendingAction: true,
+          clearEmilyPending: true,
           execute: false,
         }),
       });
     }
 
-    const durationDays = canonical.turn?.durationDays ?? null;
     const ownerCheckTiming = resolveOwnerCheckTiming(canonical, message);
     const execute = canonical.actions?.availabilityOwnerCheckExecute === true;
 
-    if (!ownerCheckTiming.ready) {
+    if (!ownerCheckTiming.ready || !hasRequestedDuration(ownerCheckTiming.durationDays)) {
       // Only a resolver-proven active-now blocking booking (real start/end
       // dates, not mere existence of a blocking-status row) short-circuits
       // the blind duration ask. A booking that starts in the future, or
@@ -1484,10 +1285,17 @@ export function buildAvailabilityInquiryActionPlan({
       // duration-collection flow below — the customer's requested period is
       // still needed before window-aware availability can decide anything.
       if (hasActiveBlockingBookingNowWithNoRequestedWindow(canonicalAvailability)) {
-        const activeNowReplyDraft = buildCurrentlyBlockedNoDurationReply(conversationalLabel);
+        const activeNowReplyDraft = "";
         return Object.freeze({
           planId: randomUUID(),
           replyDraft: activeNowReplyDraft,
+          customerResponseComposition: stampCanonicalGroupResponseAct({
+            lane: "availability",
+            kind: "availability",
+            conversationStage: "active_blocking_booking_now",
+            missingField: null,
+            verifiedAlternatives: Object.freeze([]),
+          }),
           actions: Object.freeze([
             Object.freeze({
               type: "REPLY",
@@ -1515,19 +1323,57 @@ export function buildAvailabilityInquiryActionPlan({
           }),
         });
       }
-      const replyDraft = buildAskDurationAvailabilityReply(conversationalLabel);
-      const emilyPending = buildEmilyPending({
+      const participantKey =
+        String(canonical?.participant?.key ?? "").trim() ||
+        String(canonical?.sourceIdentity?.participantKey ?? "").trim() ||
+        null;
+      const existingPending = readEmilyPendingForParticipant({
+        memorySnapshot: { emilyPending: canonical.emilyPending },
+        participantKey,
+        chatScopeKey:
+          canonical?.isGroup === true
+            ? canonical?.sourceIdentity?.chatId ?? null
+            : null,
+      });
+      const alreadyWaitingForDuration =
+        existingPending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION &&
+        String(existingPending?.itemId ?? "").trim() === String(itemId ?? "").trim();
+      const replyDraft = "";
+      const customerReference =
+        String(canonical?.resolvedItem?.customerReference ?? "").trim() || null;
+      const pendingBuildInput = {
         stage: EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
-        pendingQuestion: replyDraft,
+        pendingQuestion: AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION,
         itemId,
         itemLabel,
-        participantKey:
-          String(canonical?.participant?.key ?? "").trim() ||
-          String(canonical?.sourceIdentity?.participantKey ?? "").trim() ||
-          null,
+        customerReference,
+        participantKey,
+        chatScopeKey:
+          canonical?.isGroup === true
+            ? canonical?.sourceIdentity?.chatId ?? null
+            : null,
         sourceWorkflow: "availability_inquiry",
         sourceTurnKey: String(canonical?.turn?.sourceTurnKey ?? "").trim() || null,
         type: PENDING_ACTION_COLLECT_AVAILABILITY_DURATION,
+      };
+      // Live-proven defect: while still waiting on the same item/field, the
+      // durable pending record was never refreshed (persist skipped
+      // entirely) -- if the customer took long enough to reply, the record
+      // aged past EMILY_PENDING_TTL_MS between turns and trustedFreshItemFocus
+      // silently went empty on the very next turn, with no item mentioned to
+      // fall back on. Renew (extend freshness, keep original identity)
+      // instead of skipping so the same open request survives as long as
+      // Emily is genuinely still waiting on it.
+      const emilyPending = alreadyWaitingForDuration
+        ? renewEmilyPending(existingPending, pendingBuildInput)
+        : buildEmilyPending(pendingBuildInput);
+      console.log("[emily_pending_renewal]", {
+        renewalAttempted: alreadyWaitingForDuration,
+        renewed: alreadyWaitingForDuration && Boolean(emilyPending),
+        itemId,
+        customerReferencePresent: Boolean(customerReference),
+        previousExpiresAt: existingPending?.expiresAt ?? null,
+        renewedExpiresAt: emilyPending?.expiresAt ?? null,
       });
       const pendingPersist = toSessionPendingPersistence(emilyPending) || {
         setPendingAction: true,
@@ -1541,6 +1387,29 @@ export function buildAvailabilityInquiryActionPlan({
       return Object.freeze({
         planId: randomUUID(),
         replyDraft,
+        customerResponseComposition: stampCanonicalGroupResponseAct({
+          lane: "availability",
+          kind: "duration_ask",
+          conversationStage: alreadyWaitingForDuration
+            ? "already_waiting_for_duration"
+            : "initial_request",
+          missingField: "duration_or_dates",
+          replyMeaning: resolveDurationAskReplyMeaning({
+            kind: "duration_ask",
+            business: canonical?.business ?? null,
+          }),
+          verifiedAlternatives: Object.freeze([]),
+          // When this is a genuine continuation, the durable pending record
+          // that made it one also proves WHEN the active logical request
+          // began (its own createdAt) -- reused here, not a new identifier,
+          // to scope composer dialogue to that request instead of the whole
+          // conversation document. Null for a fresh/new-transaction turn:
+          // there is no active request yet for any prior dialogue to belong
+          // to.
+          activeTransactionSince: alreadyWaitingForDuration
+            ? existingPending?.createdAt ?? null
+            : null,
+        }),
         actions: Object.freeze([
           Object.freeze({
             type: "REPLY",
@@ -1564,10 +1433,7 @@ export function buildAvailabilityInquiryActionPlan({
       });
     }
 
-    const durationN = Math.max(
-      1,
-      Math.floor(Number(ownerCheckTiming.durationDays ?? durationDays ?? 1))
-    );
+    const durationN = Math.max(1, Math.floor(Number(ownerCheckTiming.durationDays)));
 
     if (
       isConfidentInventoryUnavailable(
@@ -1626,7 +1492,7 @@ export function buildAvailabilityInquiryActionPlan({
   const canonicalAvailability =
     businessContext?.resolvedBusinessTurnContext?.verified?.availability ?? null;
 
-  let replyDraft = "";
+  const replyDraft = "";
   let source = "verified_catalog";
 
   if (hasCanonicalAvailability(canonicalAvailability)) {
@@ -1635,30 +1501,19 @@ export function buildAvailabilityInquiryActionPlan({
       itemLabel,
       availability: /** @type {Record<string, unknown>} */ (canonicalAvailability),
     });
-    replyDraft = buildAvailabilityReplyFromCanonical(itemLabel, canonicalAvailability);
     source = "canonical_verified_availability";
-  } else {
-    const item = rawItem ? normalizeItemForComposer(rawItem) : null;
-    const composed = composeInformationalAnswer({
-      message,
-      draftReply: "",
-      item,
-      businessContext:
-        businessContext?.businessProfile != null
-          ? businessContext.businessProfile
-          : businessContext,
-      askedField: "availability",
-    });
-    replyDraft = ensureItemSpecificAvailabilityReply(
-      itemLabel,
-      String(composed?.reply ?? "").trim()
-    );
-    source = composed?.source ?? "verified_catalog";
   }
 
   return Object.freeze({
     planId: randomUUID(),
-    replyDraft: replyDraft || undefined,
+    replyDraft,
+    customerResponseComposition: stampCanonicalGroupResponseAct({
+      lane: "availability",
+      kind: "availability",
+      conversationStage: "verified_availability_answer",
+      missingField: null,
+      verifiedAlternatives: Object.freeze([]),
+    }),
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",

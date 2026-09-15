@@ -42,6 +42,7 @@ import {
 } from "../messageState.js";
 import {
   hydrateInboundTurnLedgerIntoMessageState,
+  getInboundTurnLedgerEntry,
   isInboundTurnLedgerEnabled,
   markInboundTurnLedgerBaselineAbsorbed,
   markInboundTurnLedgerFailed,
@@ -3329,6 +3330,13 @@ export function resolveFreshDeltaAdmissionGate(sorted, freshState, chatKey) {
     (listLength > 0 && acknowledgedAnchorIndex >= listLength);
 
   if (needsRepair) {
+    if (freshState?.windowShiftAckBeforeVisible === true) {
+      return {
+        resolvedAnchorIndex: resolvedAnchorIndex >= 0 ? resolvedAnchorIndex : 0,
+        acknowledgedAnchorIndex: -1,
+        waitForRescan: false,
+      };
+    }
     if (resolvedAnchorIndex >= 0) {
       // Restore only from trusted last-admitted identity currently in the DOM.
       // Never repair to max visible index — that row may never have been admitted.
@@ -3422,6 +3430,182 @@ function tryRestoreAnchorFromLastAdmitted(sorted, freshState, chatKey) {
 }
 
 /**
+ * Restore a vanished startup anchor before this listener has admitted its
+ * first message. WhatsApp can virtualize the exact startup-tail row while
+ * older startup rows remain visible. Those rows' WhatsApp stable IDs were
+ * already frozen into baselineSeenStableIds, so the newest visible member is
+ * trusted pre-listener history and is a safe boundary. Never use the visible
+ * tail itself, and never use this fallback after an admitted stable ID exists.
+ * @param {Array<object>} sorted
+ * @param {object} freshState
+ * @param {string} chatKey
+ * @returns {number} restored index or -1
+ */
+function tryRestoreAnchorFromVisibleStartupBaseline(sorted, freshState, chatKey) {
+  if (
+    !freshState ||
+    !Array.isArray(sorted) ||
+    sorted.length === 0 ||
+    String(freshState.lastAdmittedStableId ?? "").trim() ||
+    !(freshState.baselineSeenStableIds instanceof Set) ||
+    freshState.baselineSeenStableIds.size === 0
+  ) {
+    return -1;
+  }
+
+  let restoredIndex = -1;
+  for (let index = 0; index < sorted.length; index += 1) {
+    const stableId = String(buildStableMessageKey(sorted[index], sorted)?.id ?? "").trim();
+    if (
+      stableId.startsWith("wa::") &&
+      freshState.baselineSeenStableIds.has(stableId)
+    ) {
+      restoredIndex = index;
+    }
+  }
+  if (restoredIndex < 0) return -1;
+
+  const restoredAnchor = buildTailAnchorFromRow(
+    sorted[restoredIndex],
+    restoredIndex,
+    chatKey,
+    sorted
+  );
+  freshState.currentTailAnchor = restoredAnchor;
+  freshState.acknowledgedAnchorIndex = restoredIndex;
+  console.log("[fresh_delta_anchor_restored_from_startup_baseline]", {
+    chatKey,
+    restoredIndex,
+    stableId: restoredAnchor?.stableId ?? null,
+    currentListLength: sorted.length,
+  });
+  return restoredIndex;
+}
+
+/**
+ * Numeric bookmark cannot exist in this DOM (stale index after virtualization).
+ * In-range missing identity still waits — the row may reappear.
+ * @param {object | null | undefined} freshState
+ * @param {number} listLength
+ */
+function isFreshDeltaBookmarkIndexImpossible(freshState, listLength) {
+  const ack = Number(freshState?.acknowledgedAnchorIndex);
+  if (!Number.isFinite(listLength) || listLength <= 0) return false;
+  return !Number.isFinite(ack) || ack < 0 || ack >= listLength;
+}
+
+/**
+ * @param {object} row
+ * @param {Array<object>} sorted
+ * @param {object} freshState
+ * @param {string} chatKey
+ */
+function isVisibleRowHistoryBound(row, sorted, freshState, chatKey) {
+  const stableId = String(buildStableMessageKey(row, sorted)?.id ?? "").trim();
+  if (!stableId.startsWith("wa::")) return false;
+  if (
+    freshState?.baselineSeenStableIds instanceof Set &&
+    freshState.baselineSeenStableIds.has(stableId)
+  ) {
+    return true;
+  }
+  if (
+    freshState?.admittedFreshStableIds instanceof Set &&
+    freshState.admittedFreshStableIds.has(stableId)
+  ) {
+    return true;
+  }
+  if (String(freshState?.lastAdmittedStableId ?? "").trim() === stableId) {
+    return true;
+  }
+  const guaranteeKey = playwrightGuaranteeKeyForStableId(chatKey, stableId);
+  const st = guaranteeKey ? getMessageState(guaranteeKey) : null;
+  if (st?.state === "done" || st?.state === "processing") return true;
+  if (!isInboundTurnLedgerEnabled()) return false;
+  const ledgerBlock = resolveInboundTurnAdmissionBlock({
+    chatKey,
+    stableId,
+    textPreview: String(row?.text ?? "").slice(0, 120),
+  });
+  return Boolean(ledgerBlock?.blocked);
+}
+
+/**
+ * When the stored tail identity is gone and the numeric bookmark cannot exist
+ * in this list, rebase from currently visible rows. Ledger/guarantee/baseline
+ * ids are history. Unknown wa:: user rows stay live mail. Never park on the
+ * visible tail as if it were already admitted.
+ * @param {Array<object>} sorted
+ * @param {object} freshState
+ * @param {string} chatKey
+ * @returns {number} restored findable index, or -1 if still waiting
+ */
+function tryRestoreAnchorFromVisibleWindowShift(sorted, freshState, chatKey) {
+  if (!freshState || !Array.isArray(sorted) || sorted.length === 0) return -1;
+  if (!isFreshDeltaBookmarkIndexImpossible(freshState, sorted.length)) {
+    return -1;
+  }
+
+  freshState.windowShiftAckBeforeVisible = false;
+
+  const liveIndexes = [];
+  for (let index = 0; index < sorted.length; index += 1) {
+    const row = sorted[index];
+    const stableId = String(buildStableMessageKey(row, sorted)?.id ?? "").trim();
+    if (!stableId.startsWith("wa::")) continue;
+    if (isVisibleRowHistoryBound(row, sorted, freshState, chatKey)) {
+      if (!(freshState.baselineSeenStableIds instanceof Set)) {
+        freshState.baselineSeenStableIds = new Set();
+      }
+      freshState.baselineSeenStableIds.add(stableId);
+      continue;
+    }
+    if (
+      isVerifiedFreshDeltaUserRow(row, chatKey) &&
+      !freshDeltaAssistantLikeDetail(row, chatKey).assistantLike
+    ) {
+      liveIndexes.push(index);
+    }
+  }
+
+  const firstLiveIndex = liveIndexes.length ? liveIndexes[0] : sorted.length;
+  const parkIndex = firstLiveIndex - 1;
+
+  if (parkIndex < 0) {
+    const findable = buildTailAnchorFromRow(sorted[0], 0, chatKey, sorted);
+    freshState.currentTailAnchor = findable;
+    freshState.acknowledgedAnchorIndex = -1;
+    freshState.windowShiftAckBeforeVisible = true;
+    console.log("[fresh_delta_anchor_restored_from_window_shift]", {
+      chatKey,
+      parkIndex: -1,
+      firstLiveIndex: liveIndexes[0] ?? null,
+      currentListLength: sorted.length,
+      note: "bookmark_impossible_admit_unknown_visible",
+    });
+    return 0;
+  }
+
+  const restoredAnchor = buildTailAnchorFromRow(
+    sorted[parkIndex],
+    parkIndex,
+    chatKey,
+    sorted
+  );
+  freshState.currentTailAnchor = restoredAnchor;
+  freshState.acknowledgedAnchorIndex = parkIndex;
+  console.log("[fresh_delta_anchor_restored_from_window_shift]", {
+    chatKey,
+    parkIndex,
+    firstLiveIndex: liveIndexes[0] ?? null,
+    stableId: restoredAnchor?.stableId ?? null,
+    currentListLength: sorted.length,
+    note: "bookmark_impossible_history_or_pre_live_park",
+  });
+  return parkIndex;
+}
+
+/**
  * Test helper: mirror production missing-anchor path (wait/rescan; no reanchor to tail).
  * @param {Array<object>} sorted
  * @param {object} freshState
@@ -3432,13 +3616,33 @@ export function __freshDeltaAnchorMissingForTests(sorted, freshState, chatKey) {
   if (resolvedAnchorIndex < 0) {
     resolvedAnchorIndex = tryRestoreAnchorFromLastAdmitted(sorted, freshState, chatKey);
   }
-  if (resolvedAnchorIndex >= 0) {
+  let restoredFromBaseline = false;
+  if (resolvedAnchorIndex < 0) {
+    resolvedAnchorIndex = tryRestoreAnchorFromVisibleStartupBaseline(
+      sorted,
+      freshState,
+      chatKey
+    );
+    restoredFromBaseline = resolvedAnchorIndex >= 0;
+  }
+  let restoredFromWindowShift = false;
+  if (resolvedAnchorIndex < 0) {
+    resolvedAnchorIndex = tryRestoreAnchorFromVisibleWindowShift(
+      sorted,
+      freshState,
+      chatKey
+    );
+    restoredFromWindowShift = resolvedAnchorIndex >= 0;
+  }
+  if (resolvedAnchorIndex >= 0 || freshState?.windowShiftAckBeforeVisible === true) {
     const gate = resolveFreshDeltaAdmissionGate(sorted, freshState, chatKey);
     return {
       forwardAllowed: !gate.waitForRescan,
       reanchored: false,
       waitForRescan: Boolean(gate.waitForRescan),
       restoredFromLastAdmitted: Boolean(freshState?.lastAdmittedStableId),
+      restoredFromBaseline,
+      restoredFromWindowShift,
       resolvedAnchorIndex: gate.resolvedAnchorIndex,
       acknowledgedAnchorIndex: gate.acknowledgedAnchorIndex,
     };
@@ -3455,6 +3659,8 @@ export function __freshDeltaAnchorMissingForTests(sorted, freshState, chatKey) {
     reanchored: false,
     waitForRescan: true,
     restoredFromLastAdmitted: false,
+    restoredFromBaseline: false,
+    restoredFromWindowShift: false,
     resolvedAnchorIndex: -1,
     acknowledgedAnchorIndex: Number(freshState?.acknowledgedAnchorIndex),
   };
@@ -3917,8 +4123,8 @@ export function filterGuaranteeFirstEligibleUserRows(p) {
 
     tickLocalAdmitted.add(stableId);
     survivors.push(msg);
-    if (matchesBaselineDeferredTailUser(msg, freshState, extractedList)) {
-      console.log("[baseline_tail_user_admitted]", {
+    if (matchesBaselineDeferredLiveUser(msg, freshState, extractedList)) {
+      console.log("[baseline_live_user_admitted]", {
         chatKey,
         stableId,
         sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
@@ -4407,8 +4613,8 @@ export function resolveFreshAdmittedTurns(p) {
       ledgerState: st?.state || "idle",
       originalRow: msg,
     });
-    if (matchesBaselineDeferredTailUser(msg, freshState, extractedList)) {
-      console.log("[baseline_tail_user_admitted]", {
+    if (matchesBaselineDeferredLiveUser(msg, freshState, extractedList)) {
+      console.log("[baseline_live_user_admitted]", {
         chatKey,
         stableId,
         sortedIndex: Number.isFinite(sortedIndex) ? sortedIndex : null,
@@ -5023,6 +5229,7 @@ export function advanceTailAnchor(freshState, deliveredMsg, sorted, chatKey, ext
   const newAnchor = buildTailAnchorFromRow(anchorRow, anchorIndex, chatKey, extractedList);
   freshState.currentTailAnchor = newAnchor;
   freshState.acknowledgedAnchorIndex = anchorIndex;
+  freshState.windowShiftAckBeforeVisible = false;
   // Trusted evidence for missing-anchor restore — only set on successful admit/forward.
   if (newAnchor?.stableId) {
     freshState.lastAdmittedStableId = String(newAnchor.stableId);
@@ -5030,8 +5237,8 @@ export function advanceTailAnchor(freshState, deliveredMsg, sorted, chatKey, ext
   if (freshState.anchorHoldUserForward) {
     freshState.anchorHoldUserForward.consumed = true;
   }
-  if (freshState.baselineDeferredTailUser) {
-    freshState.baselineDeferredTailUser.consumed = true;
+  if (freshState.baselineDeferredLiveUsers) {
+    freshState.baselineDeferredLiveUsers.consumed = true;
   }
   if (!(freshState.baselineSeenStableIds instanceof Set)) {
     freshState.baselineSeenStableIds = new Set();
@@ -5141,66 +5348,130 @@ function matchesAnchorHoldUserForward(msg, hold, extractedList) {
  * @param {object | null | undefined} freshState
  * @param {Array<object>} extractedList
  */
-function matchesBaselineDeferredTailUser(msg, freshState, extractedList) {
-  const defer = freshState?.baselineDeferredTailUser;
+function matchesBaselineDeferredLiveUser(msg, freshState, extractedList) {
+  const defer = freshState?.baselineDeferredLiveUsers;
   if (!defer || defer.consumed) return false;
+  const stableId = String(getMessageIdFromExtracted(msg, extractedList) ?? "").trim();
+  if (
+    stableId &&
+    Array.isArray(defer.stableIds) &&
+    defer.stableIds.includes(stableId)
+  ) {
+    return true;
+  }
   return matchesAnchorHoldUserForward(msg, defer, extractedList);
 }
 
 /**
- * At first chat open: defer the live-signaled tail verified user row for post-baseline forward.
+ * At first chat open, defer the newest meaningful verified user row in the
+ * unanswered live suffix. WhatsApp may append punctuation/system noise after
+ * the actual customer message, so the literal DOM tail is not authoritative.
+ * Never scan across an assistant boundary and require an older row to remain
+ * as the startup anchor.
  * @param {{ anchorRow: object | null, anchorIndex: number, chatKey: string, sortedWithPos: object[], liveGroupSignal?: boolean }} p
- * @returns {{ stableId: string, hold: object } | null}
+ * @returns {{ stableId: string, stableIds: string[], hold: object } | null}
  */
-export function resolveBaselineTailUserDeferral(p) {
+export function resolveBaselineLiveUserDeferral(p) {
   const { anchorRow, anchorIndex, chatKey, sortedWithPos, liveGroupSignal = false } = p;
-  if (!liveGroupSignal) return null;
   if (!anchorRow) return null;
   if (!Array.isArray(sortedWithPos) || anchorIndex !== sortedWithPos.length - 1) {
     return null;
   }
   if (anchorIndex <= 0) return null;
-  const anchorAssistant = freshDeltaAssistantLikeDetail(anchorRow, chatKey);
-  if (!isVerifiedFreshDeltaUserRow(anchorRow, chatKey)) return null;
-  if (anchorAssistant.assistantLike) return null;
-  if (isListenerInboundNoise(anchorRow?.text)) return null;
-  const { stableId: holdStableId } = resolvePlaywrightForwardIdentity(
-    chatKey,
-    anchorRow,
-    0,
-    sortedWithPos
-  );
-  const stableId = String(holdStableId ?? "").trim();
-  if (!stableId) return null;
-  if (!stableId.startsWith("wa::")) return null;
+
+  // On restart, the durable inbound ledger is the authoritative high-water
+  // evidence. A chat that is already open may not expose an unread/sidebar
+  // signal, but a previously handled row followed by an unknown WhatsApp ID
+  // is still a real fresh delta. First-ever startup (no durable boundary and
+  // no live signal) remains conservative and absorbs visible history.
+  let durableBoundaryIndex = -1;
   if (isInboundTurnLedgerEnabled()) {
-    const ledgerBlock = resolveInboundTurnAdmissionBlock({
-      chatKey,
-      stableId,
-      textPreview: String(anchorRow?.text ?? "").slice(0, 120),
-    });
-    if (ledgerBlock.blocked) return null;
+    for (let index = 0; index <= anchorIndex; index += 1) {
+      const row = sortedWithPos[index];
+      if (!isVerifiedFreshDeltaUserRow(row, chatKey)) continue;
+      const { stableId: rawStableId } = resolvePlaywrightForwardIdentity(
+        chatKey,
+        row,
+        0,
+        sortedWithPos
+      );
+      const stableId = String(rawStableId ?? "").trim();
+      if (!stableId.startsWith("wa::")) continue;
+      if (getInboundTurnLedgerEntry(chatKey, stableId)) {
+        durableBoundaryIndex = index;
+      }
+    }
   }
-  const guaranteeKey = playwrightGuaranteeKeyForStableId(chatKey, stableId);
-  const st = guaranteeKey ? getMessageState(guaranteeKey) : null;
-  if (st?.state === "done" || st?.state === "processing") return null;
+
+  const candidates = [];
+  let assistantBoundaryFound = false;
+  const lowerBound = durableBoundaryIndex >= 0 ? durableBoundaryIndex : -1;
+  for (let index = anchorIndex; index > lowerBound; index -= 1) {
+    const row = sortedWithPos[index];
+    const assistant = freshDeltaAssistantLikeDetail(row, chatKey);
+    if (assistant.assistantLike || row?.sender === "me") {
+      assistantBoundaryFound = true;
+      break;
+    }
+    if (!isVerifiedFreshDeltaUserRow(row, chatKey)) continue;
+    if (isListenerInboundNoise(row?.text)) continue;
+    const { stableId: rawStableId } = resolvePlaywrightForwardIdentity(
+      chatKey,
+      row,
+      0,
+      sortedWithPos
+    );
+    const stableId = String(rawStableId ?? "").trim();
+    if (!stableId.startsWith("wa::")) continue;
+    if (isInboundTurnLedgerEnabled()) {
+      const ledgerBlock = resolveInboundTurnAdmissionBlock({
+        chatKey,
+        stableId,
+        textPreview: String(row?.text ?? "").slice(0, 120),
+      });
+      if (ledgerBlock.blocked) continue;
+    }
+    const guaranteeKey = playwrightGuaranteeKeyForStableId(chatKey, stableId);
+    const st = guaranteeKey ? getMessageState(guaranteeKey) : null;
+    if (st?.state === "done" || st?.state === "processing") continue;
+    candidates.push({ row, index, stableId });
+  }
+  if (candidates.length === 0) return null;
+  if (!liveGroupSignal && durableBoundaryIndex < 0 && !assistantBoundaryFound) {
+    return null;
+  }
+
+  // With an assistant boundary, every meaningful user row after it is an
+  // unanswered live suffix. A durable boundary proves the same thing without
+  // relying on an optional sidebar signal. With neither, retain the prior
+  // conservative behavior and protect only the newest live-signalled row.
+  const selectedNewestFirst = assistantBoundaryFound || durableBoundaryIndex >= 0
+    ? candidates
+    : candidates.slice(0, 1);
+  const selected = [...selectedNewestFirst].reverse();
+  const newest = selected[selected.length - 1];
+  const earliest = selected[0];
+  const stableIds = selected.map((entry) => entry.stableId);
   return {
-    stableId,
+    stableId: newest.stableId,
+    stableIds,
     hold: {
-      stableId,
-      rowKey: String(anchorRow?.__rowKey ?? buildRowKey(anchorRow)).trim(),
-      textFingerprint: buildTextFingerprint(anchorRow?.text),
-      anchorIndexAtBaseline: anchorIndex,
+      stableId: newest.stableId,
+      stableIds,
+      rowKey: String(newest.row?.__rowKey ?? buildRowKey(newest.row)).trim(),
+      textFingerprint: buildTextFingerprint(newest.row?.text),
+      anchorIndexAtBaseline: earliest.index,
       consumed: false,
     },
   };
 }
 
 /**
- * Establishes per-chat startup baseline without permanently absorbing one live-signaled tail row.
+ * Establishes per-chat startup baseline without permanently absorbing the
+ * newest meaningful live-signaled user row.
  * Older visible rows remain baseline-absorbed.
  * @param {{ freshState: object, sortedWithPos: object[], userMessages: object[], chatKey: string, liveGroupSignal?: boolean }} p
- * @returns {{ baselineSeen: Set<string>, tailAnchor: object | null, acknowledgedAnchorIndex: number, deferredTail: object | null }}
+ * @returns {{ baselineSeen: Set<string>, tailAnchor: object | null, acknowledgedAnchorIndex: number, deferredLiveUsers: object | null }}
  */
 export function establishFreshDeltaStartupBaseline(p) {
   const {
@@ -5212,18 +5483,21 @@ export function establishFreshDeltaStartupBaseline(p) {
   } = p;
   const anchorIndex = sortedWithPos.length - 1;
   const tailAnchor = establishTailAnchor(sortedWithPos, chatKey, sortedWithPos);
-  const deferral = resolveBaselineTailUserDeferral({
+  const deferral = resolveBaselineLiveUserDeferral({
     anchorRow: sortedWithPos[anchorIndex] || null,
     anchorIndex,
     chatKey,
     sortedWithPos,
     liveGroupSignal,
   });
-  const deferredStableId = deferral?.stableId || "";
+  const deferredStableIds = new Set(deferral?.stableIds || []);
+  const deferredIndex = Number(deferral?.hold?.anchorIndexAtBaseline);
   const effectiveAnchorIndex =
-    deferral && anchorIndex > 0 ? anchorIndex - 1 : anchorIndex;
+    deferral && Number.isFinite(deferredIndex) && deferredIndex > 0
+      ? deferredIndex - 1
+      : anchorIndex;
   const effectiveTailAnchor =
-    deferral && anchorIndex > 0
+    deferral && effectiveAnchorIndex >= 0
       ? buildTailAnchorFromRow(
           sortedWithPos[effectiveAnchorIndex],
           effectiveAnchorIndex,
@@ -5243,8 +5517,8 @@ export function establishFreshDeltaStartupBaseline(p) {
       0,
       sortedWithPos
     );
-    const isDeferredTail = stableId && stableId === deferredStableId;
-    if (stableId && !isDeferredTail) {
+    const isDeferredLiveUser = stableId && deferredStableIds.has(stableId);
+    if (stableId && !isDeferredLiveUser) {
       baselineSeen.add(stableId);
       if (isInboundTurnLedgerEnabled()) {
         markInboundTurnLedgerBaselineAbsorbed({
@@ -5262,8 +5536,8 @@ export function establishFreshDeltaStartupBaseline(p) {
       textPreview,
       sender,
       assistantLike: assistantDetail.assistantLike,
-      reason: isDeferredTail
-        ? "live_tail_deferred_from_baseline"
+      reason: isDeferredLiveUser
+        ? "live_user_deferred_from_baseline"
         : assistantDetail.reason || "startup_visible_row",
     });
   }
@@ -5273,7 +5547,7 @@ export function establishFreshDeltaStartupBaseline(p) {
   freshState.baselineEstablishedAtMs = Date.now();
   freshState.acknowledgedAnchorIndex = effectiveAnchorIndex;
   freshState.anchorHoldUserForward = null;
-  freshState.baselineDeferredTailUser = deferral?.hold || null;
+  freshState.baselineDeferredLiveUsers = deferral?.hold || null;
   freshState.baselineTailAnchor = effectiveTailAnchor;
   freshState.currentTailAnchor = effectiveTailAnchor;
 
@@ -5289,7 +5563,7 @@ export function establishFreshDeltaStartupBaseline(p) {
     baselineSeen,
     tailAnchor: effectiveTailAnchor,
     acknowledgedAnchorIndex: effectiveAnchorIndex,
-    deferredTail: deferral?.hold || null,
+    deferredLiveUsers: deferral?.hold || null,
   };
 }
 
@@ -5489,8 +5763,8 @@ function getFreshDeltaChatState(chatKey) {
     acknowledgedAnchorIndex: -1,
     sessionVisibilityLedger: [],
     anchorHoldUserForward: null,
-    /** Tail user row deferred at startup baseline for post-baseline forward (guarantee-first). */
-    baselineDeferredTailUser: null,
+    /** Meaningful live user row deferred at startup for post-baseline forward. */
+    baselineDeferredLiveUsers: null,
     /** Phase A: reuse __rowKey across polls (identity pin → rowKey, stableId → rowKey). */
     pinnedRowKeyByIdentityPin: new Map(),
     pinnedRowKeyByStableId: new Map(),
@@ -8510,7 +8784,7 @@ async function runListenerBody() {
                   sortedWithPos[baseline.acknowledgedAnchorIndex]?.text ?? ""
                 ).slice(0, 80),
                 baselineSeenCount: baseline.baselineSeen.size,
-                deferredTailStableId: baseline.deferredTail?.stableId ?? null,
+                deferredLiveUserStableIds: baseline.deferredLiveUsers?.stableIds ?? [],
               });
               console.log("[startup_baseline_established]", {
                 chatKey,
@@ -8518,7 +8792,7 @@ async function runListenerBody() {
                 snapshotHash: freshState.baselineSnapshotHash || null,
                 catchupMs: PLAYWRIGHT_FRESH_DELTA_CATCHUP_MS,
                 liveGroupSignal: selectedGroupLiveSignal,
-                deferredTail: Boolean(baseline.deferredTail),
+                deferredLiveUsers: Boolean(baseline.deferredLiveUsers),
               });
               return;
             }
@@ -8540,6 +8814,23 @@ async function runListenerBody() {
               );
             }
             if (resolvedAnchorIndex < 0) {
+              resolvedAnchorIndex = tryRestoreAnchorFromVisibleStartupBaseline(
+                sortedWithPos,
+                freshState,
+                chatKey
+              );
+            }
+            if (resolvedAnchorIndex < 0) {
+              resolvedAnchorIndex = tryRestoreAnchorFromVisibleWindowShift(
+                sortedWithPos,
+                freshState,
+                chatKey
+              );
+            }
+            if (
+              resolvedAnchorIndex < 0 &&
+              freshState.windowShiftAckBeforeVisible !== true
+            ) {
               // Wait/rescan — never reanchor to max visible index (may be unadmitted).
               console.log("[fresh_delta_anchor_missing_wait_rescan]", {
                 chatKey,
@@ -8628,7 +8919,7 @@ async function runListenerBody() {
               const catchupSuppress = [];
               for (const turn of freshAdmittedTurns) {
                 const msg = turn.originalRow;
-                if (matchesBaselineDeferredTailUser(msg, freshState, sortedWithPos)) {
+                if (matchesBaselineDeferredLiveUser(msg, freshState, sortedWithPos)) {
                   catchupKeep.push(msg);
                   if (turn.stableId) catchupKeepStableIds.add(turn.stableId);
                 } else {
@@ -9912,10 +10203,10 @@ export async function runPlaywrightForwardPass(p = {}) {
       });
       if (
         freshState &&
-        matchesBaselineDeferredTailUser(msg, freshState, extractedMessages)
+        matchesBaselineDeferredLiveUser(msg, freshState, extractedMessages)
       ) {
-        if (freshState.baselineDeferredTailUser) {
-          freshState.baselineDeferredTailUser.consumed = true;
+        if (freshState.baselineDeferredLiveUsers) {
+          freshState.baselineDeferredLiveUsers.consumed = true;
         }
         if (freshState.anchorHoldUserForward) {
           freshState.anchorHoldUserForward.consumed = true;

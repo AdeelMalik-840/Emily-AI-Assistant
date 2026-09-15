@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   canMergeBurstRowPair,
   isBurstMergeContinuationText,
+  shouldBurstSupersedeOlderRow,
 } from "../src/services/playwrightListener/burstMergePolicy.js";
 import {
   attachBurstMergeContinuations,
@@ -60,14 +61,56 @@ test("canMergeBurstRowPair blocks two different catalog availability questions",
   assert.equal(canMergeBurstRowPair(civic, corolla, []), false);
 });
 
-test("canMergeBurstRowPair allows same-item continuation and punctuation", () => {
-  const civic = mkRow({ text: "Civic available?", position: 1 });
-  const q = mkRow({ text: "?", position: 2 });
-  const qq = mkRow({ text: "??", position: 3 });
-  const duration = mkRow({ text: "3 din k lye", position: 4 });
+test("canMergeBurstRowPair allows punctuation and same-id split bubbles only", () => {
+  const civic = mkRow({ text: "Civic available?", position: 1, dataId: "false_civic@c.us" });
+  const q = mkRow({ text: "?", position: 2, dataId: "false_q@c.us" });
+  const qq = mkRow({ text: "??", position: 3, dataId: "false_qq@c.us" });
+  const duration = mkRow({ text: "3 din k lye", position: 4, dataId: "false_dur@c.us" });
+  const sameIdFollow = mkRow({
+    text: "Civic available? 3 din",
+    position: 5,
+    dataId: "false_civic@c.us",
+  });
   assert.equal(canMergeBurstRowPair(civic, q, CATALOG), true);
   assert.equal(canMergeBurstRowPair(civic, qq, CATALOG), true);
-  assert.equal(canMergeBurstRowPair(civic, duration, CATALOG), true);
+  assert.equal(canMergeBurstRowPair(civic, duration, CATALOG), false);
+  assert.equal(canMergeBurstRowPair(civic, duration, []), false);
+  assert.equal(canMergeBurstRowPair(civic, sameIdFollow, CATALOG), true);
+});
+
+test("canMergeBurstRowPair fails closed when durable ids are missing", () => {
+  const civic = mkRow({ text: "Civic available?", position: 1 });
+  const duration = mkRow({ text: "3 din k lye", position: 2 });
+  assert.equal(canMergeBurstRowPair(civic, duration, CATALOG), false);
+});
+
+test("canMergeBurstRowPair never glues two independent asks two minutes apart", () => {
+  const stonic = mkRow({
+    text: "Stonic rent p chyh th kal se",
+    position: 1,
+    dataId: "false_stonic@c.us",
+  });
+  const civic = mkRow({
+    text: "Civic available hai?",
+    position: 2,
+    dataId: "false_civic2@c.us",
+  });
+  assert.equal(canMergeBurstRowPair(stonic, civic, CATALOG), false);
+  assert.equal(canMergeBurstRowPair(stonic, civic, []), false);
+});
+
+test("unresolved durable IDs never supersede a distinct overlapping physical row", () => {
+  const first = mkRow({ text: "Stonic available hai?", position: 1 });
+  const second = mkRow({ text: "Stonic available hai ??????", position: 2 });
+  assert.equal(shouldBurstSupersedeOlderRow(first, second, CATALOG), false);
+  assert.equal(
+    shouldBurstSupersedeOlderRow(
+      { ...first, id: { _serialized: "false_stonic_1@c.us" } },
+      second,
+      CATALOG
+    ),
+    false
+  );
 });
 
 test("splitBurstMergeRuns splits Civic then Corolla into separate runs", () => {

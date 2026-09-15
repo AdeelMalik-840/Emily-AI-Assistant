@@ -79,12 +79,25 @@ export function resolveCatalogItemFacts(p) {
         ""
     ).trim() || null;
   const color = catalogItemColor(row) || null;
+  // Trusted customer-facing wording, kept distinct from displayLabel/name
+  // (catalog identity strings). Only ever the customer's own literal
+  // wording for a referent that has already been successfully resolved to
+  // this canonical itemId this turn -- never derived by shortening,
+  // stripping, or rewriting the catalog label. NOT_MATCHED/AMBIGUOUS
+  // referents never populate this (their surfaceText is customer wording
+  // that failed to bind to any canonical item, not a trusted reference to
+  // this one).
+  const customerReference =
+    canonicalSingle?.status === "MATCHED"
+      ? String(canonicalSingle?.referent?.surfaceText ?? "").trim() || null
+      : null;
 
   return {
     status,
     id: itemId,
     name,
     displayLabel,
+    customerReference,
     color,
     source: understanding?.itemSource ?? (authorityItem ? "authority" : "none"),
     confidence: understanding?.itemConfidence ?? "low",

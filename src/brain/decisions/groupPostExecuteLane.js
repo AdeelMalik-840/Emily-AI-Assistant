@@ -1,20 +1,16 @@
 /**
  * Group post-execute lane — Brain-owned.
- * Shared conversational authority entrypoint: decideCustomerTurn.js (lane=group_post_execute)
  *
- * Called AFTER the owner-check action executes, to generate one natural group reply
- * from verified execution facts. Reply only — actionsAllowed: false.
- *
- * Customer-facing Brain input is a projected, business-safe fact set.
- * Internal owner/notification lifecycle details stay in actionRouter only.
- *
- * No booking, no AVR creation, no owner notification, no customer template, no DM, no session mutation.
+ * LIVE SEND PATH: brainV2LivePipeline uses only
+ * deriveGroupPostExecuteCustomerReplyRequired, then composeCloudCanonicalCustomerReply.
+ * executeGroupPostExecuteLaneDecision is quarantined from live sending (tests/rollback only).
  */
 
 import OpenAI from "openai";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
 import {
+  buildCustomerReplyPolicy,
   buildGroupPostExecutePendingAvailabilityContract,
   normalizeReplySemantics,
   stripInternalReplySemantics,
@@ -28,6 +24,7 @@ import {
   MAX_CUSTOMER_REPLY_ATTEMPTS,
   REPLY_SEMANTICS_SCHEMA,
 } from "../openai/strictJsonSchema.js";
+import { reviewCustomerReplyLanguageQuality } from "../openai/composeCloudCanonicalCustomerReply.js";
 
 export const GROUP_POST_EXECUTE_LANE = "group_post_execute";
 
@@ -175,6 +172,48 @@ export function projectCustomerSafeGroupPostExecuteFacts(p = {}) {
 }
 
 /**
+ * Trusted-state authority for whether a customer-facing reply is REQUIRED
+ * from this lane. Reuses actionRouter's own owner-check post-execute state
+ * (postExecuteResult.awaitsReply / .suppress -- see routeAndExecuteLiveActionPlan,
+ * actionRouter.js) and this lane's own trusted fail-closed decision surface
+ * (FAIL_CLOSED_DISPOSITIONS and customerSafeFacts.noCustomerReplyAllowed --
+ * the SAME deterministic checks executeGroupPostExecuteLaneDecision's two
+ * early-return branches use, replicated here so the answer is known BEFORE
+ * any language-model call is made, not only after one returns).
+ *
+ * Fully deterministic: no model output participates in this decision at
+ * all (this is the Stage 4 generation-simplification change -- the
+ * function previously accepted a `brainSource` computed AFTER calling the
+ * model; now the same authority is available before the model is ever
+ * invoked, since a reply that is not required should never trigger a model
+ * call in the first place). Whatever this returns is the caller's sole
+ * authority for whether a customer reply must be produced (and, if
+ * production fails, must stay retryable) or genuine trusted silence is
+ * correct.
+ * @param {{
+ *   postExecuteResult: Record<string, unknown> | null | undefined,
+ *   responseDisposition?: string | null,
+ * }} p
+ * @returns {boolean}
+ */
+export function deriveGroupPostExecuteCustomerReplyRequired({
+  postExecuteResult,
+  responseDisposition = null,
+}) {
+  if (postExecuteResult?.awaitsReply !== true) return false;
+  if (postExecuteResult?.suppress === true) return false;
+  const disposition =
+    clean(responseDisposition ?? postExecuteResult?.responseDisposition, 80) ||
+    "";
+  if (disposition && FAIL_CLOSED_DISPOSITIONS.has(disposition)) return false;
+  const customerSafeFacts = projectCustomerSafeGroupPostExecuteFacts({
+    postExecuteResult,
+    responseDisposition: disposition || null,
+  });
+  return customerSafeFacts.noCustomerReplyAllowed !== true;
+}
+
+/**
  * Content safety guard — detects disclosure of internal lifecycle / human involvement.
  * Control plane only; not conversational intent routing.
  *
@@ -297,34 +336,54 @@ export function assertGroupPostExecuteCustomerContentSafe(decision) {
   }
 }
 
-function buildGroupPostExecuteSystemPrompt(styleKey) {
+function buildGroupPostExecuteSystemPrompt(
+  styleKey,
+  customerReplyRequired,
+  replyPolicy
+) {
   const shared = buildCustomerCommunicationPolicy({
     channel: "group",
     styleKey,
   });
   const exampleLang =
     styleKey === "neutral_english" ? "english" : "roman_urdu";
+  const replyRequirement = customerReplyRequired
+    ? `CUSTOMER_REPLY_REQUIRED: true.
+Trusted runtime state requires a customer-facing holding reply for this turn.
+Return action="reply", shouldReply=true, and a non-empty customerReply.
+Do not choose silence. Briefly acknowledge that confirmation is underway and the customer will be updated; do not narrate how it happens and do not claim an availability result.`
+    : `CUSTOMER_REPLY_REQUIRED: false.
+Return silence only when the verified facts do not require a customer-facing reply.`;
+  const outputExamples = customerReplyRequired
+    ? `{"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"...","replySemantics":{"claims":["resource_availability_unconfirmed"],"languageStyle":"${exampleLang}","containsTimingPromise":false,"exposesInternalProcess":false}}
 
-  return `${shared}
-
-LANE OBJECTIVE (group_post_execute):
-You are responding in a WhatsApp group AFTER an availability check action completed.
-Use ONLY the VERIFIED_FACTS_JSON below. Express customer-safe facts conversationally — do not recite internal status labels.
-Do not use vague wording such as "ab dekhte hain kya hota hai".
-Do not promise availability until it is verified in the facts.
-Match the customer's language in customerReply and replySemantics.languageStyle (english / roman_urdu / mixed).
-If noCustomerReplyAllowed is true, return silence.
-If dmGuidanceAllowed is true, you may give short natural guidance about checking their DM / next step — still without mentioning internal people/process details.
-actionsAllowed: false — do not instruct any action, executor, notification, booking, or session change.
-This is a reply-only pass. Your only output is a short natural customer reply or silence.
-
-OUTPUT FORMAT (JSON only, no markdown):
-{"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"...","replySemantics":{"claims":["resource_availability_unconfirmed"],"languageStyle":"${exampleLang}","containsTimingPromise":false,"exposesInternalProcess":false}}
+action must be "reply", shouldReply must be true, and customerReply must be non-empty.`
+    : `{"customerReply":"...","action":"reply","shouldReply":true,"confidence":0.9,"safetyNotes":null,"reason":"...","replySemantics":{"claims":["resource_availability_unconfirmed"],"languageStyle":"${exampleLang}","containsTimingPromise":false,"exposesInternalProcess":false}}
 or for silence:
 {"customerReply":"","action":"silence","shouldReply":false,"confidence":0.95,"safetyNotes":null,"reason":"...","replySemantics":{"claims":[],"languageStyle":"${exampleLang}","containsTimingPromise":false,"exposesInternalProcess":false}}
 
 action must be "reply" or "silence" only.
-customerReply must be empty when action is "silence".
+customerReply must be empty when action is "silence".`;
+
+  return `${shared}
+
+LANE OBJECTIVE (group_post_execute):
+You are responding in a WhatsApp group after the trusted action completed.
+Use ONLY the VERIFIED_FACTS_JSON below. Express customer-safe facts conversationally — do not recite internal status labels.
+${replyRequirement}
+CANONICAL_OBJECTIVE: ${replyPolicy.objective}
+LINGUISTIC_GUIDANCE: ${replyPolicy.linguisticGuidance}
+INTERACTION_GUIDANCE: ${JSON.stringify(replyPolicy.interactionGuidance)}
+Do not use vague wording such as "ab dekhte hain kya hota hai".
+Do not promise availability until it is verified in the facts. Do not translate internal fact names or state labels into customer wording.
+Match the customer's language in customerReply and replySemantics.languageStyle (english / roman_urdu / mixed).
+If noCustomerReplyAllowed is true, return silence.
+If dmGuidanceAllowed is true, you may give short natural guidance about checking their DM / next step — still without mentioning internal people/process details.
+actionsAllowed: false — do not instruct any action, executor, notification, booking, or session change.
+This is a reply-only pass. Your only output is the customer reply required by trusted runtime policy, or silence when that policy explicitly allows it.
+
+OUTPUT FORMAT (JSON only, no markdown):
+${outputExamples}
 replySemantics is required for validation: list only claims supported by VERIFIED_FACTS_JSON / allowedClaims.
 Do not include any field that requests an action, executor, or mutation.`;
 }
@@ -389,6 +448,7 @@ export function buildGroupPostExecuteCustomerFacingFacts(ctx = {}) {
  *   turnContext: Record<string, unknown>,
  *   timeoutMs?: number,
  *   __chatCompletionsCreateForTests?: Function | null,
+ *   __languageQualityReviewChatCreateForTests?: Function | null,
  * }} p
  * @returns {Promise<{ ok: boolean, decision: Record<string, unknown>, source: string, reason?: string, contentSafetyAttempts?: number }>}
  */
@@ -396,6 +456,7 @@ export async function executeGroupPostExecuteLaneDecision({
   turnContext,
   timeoutMs = 8000,
   __chatCompletionsCreateForTests = null,
+  __languageQualityReviewChatCreateForTests = null,
 } = {}) {
   const ctx = turnContext && typeof turnContext === "object" ? turnContext : {};
 
@@ -403,6 +464,7 @@ export async function executeGroupPostExecuteLaneDecision({
   const messageText = clean(ctx.messageText, 800);
   const recentDialogue = clean(ctx.recentDialogue, 1200);
   const styleKey = ctx.styleKey === "neutral_english" ? "neutral_english" : "casual_local";
+  const traceId = clean(ctx.traceId, 120) || null;
 
   const {
     verifiedFactsForPrompt,
@@ -436,7 +498,19 @@ export async function executeGroupPostExecuteLaneDecision({
     // Expected — this is the correct mode for this lane.
   }
 
-  const system = buildGroupPostExecuteSystemPrompt(styleKey);
+  const customerReplyRequired = deriveGroupPostExecuteCustomerReplyRequired({
+    postExecuteResult: ctx.postExecuteResult,
+    brainSource: null,
+  });
+  const replyPolicy = buildCustomerReplyPolicy(
+    "owner_check_holding",
+    replyGuardFacts
+  );
+  const system = buildGroupPostExecuteSystemPrompt(
+    styleKey,
+    customerReplyRequired,
+    replyPolicy
+  );
 
   const baseUserPayload = [
     `VERIFIED_FACTS_JSON:\n${JSON.stringify(verifiedFactsForPrompt)}`,
@@ -458,6 +532,19 @@ export async function executeGroupPostExecuteLaneDecision({
         })();
 
   if (!completionFn) {
+    console.log("[group_post_execute_reply_attempt]", {
+      traceId,
+      attempt: 0,
+      customerReplyRequired,
+      modelAction: null,
+      modelShouldReply: null,
+      modelReplyPresent: false,
+      parseStatus: "not_started",
+      validationStatus: "not_started",
+      guardRejectionReason: null,
+      brainResultReason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
+      brainOk: false,
+    });
     return {
       ok: false,
       decision: defaultDecision({ reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR" }),
@@ -479,6 +566,16 @@ export async function executeGroupPostExecuteLaneDecision({
     recentDialogue: clean(ctx.recentDialogue, 1200) || null,
     styleKey,
   });
+  const trustedReplyContract = {
+    ...replyContract,
+    replyRequired: customerReplyRequired,
+  };
+  const languageReviewCompletionFn =
+    typeof __languageQualityReviewChatCreateForTests === "function"
+      ? __languageQualityReviewChatCreateForTests
+      : typeof __chatCompletionsCreateForTests === "function"
+        ? null
+        : completionFn;
 
   const languageDirective =
     replyContract.customerLanguageStyle === "english"
@@ -523,15 +620,19 @@ export async function executeGroupPostExecuteLaneDecision({
     return String(resp?.choices?.[0]?.message?.content ?? "").trim();
   }
 
+  let activeAttempt = 0;
   try {
     let lastUnsafeReason = null;
 
     for (let attempt = 1; attempt <= MAX_CONTENT_SAFETY_ATTEMPTS; attempt++) {
+      activeAttempt = attempt;
       const contractBlock = `CUSTOMER_REPLY_CONTRACT:\n${JSON.stringify({
-        allowedClaims: replyContract.allowedClaims,
-        forbiddenClaims: replyContract.forbiddenClaims,
-        requiredMeaning: replyContract.requiredMeaning,
-        customerLanguageStyle: replyContract.customerLanguageStyle,
+        replyRequired: trustedReplyContract.replyRequired,
+        conversationalGoal: trustedReplyContract.conversationalGoal,
+        allowedClaims: trustedReplyContract.allowedClaims,
+        forbiddenClaims: trustedReplyContract.forbiddenClaims,
+        requiredMeaning: trustedReplyContract.requiredMeaning,
+        customerLanguageStyle: trustedReplyContract.customerLanguageStyle,
       })}\n\n${languageDirective}`;
       const userContent =
         attempt === 1
@@ -543,6 +644,19 @@ export async function executeGroupPostExecuteLaneDecision({
 
       if (!decision) {
         lastUnsafeReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        console.log("[group_post_execute_reply_attempt]", {
+          traceId,
+          attempt,
+          customerReplyRequired,
+          modelAction: null,
+          modelShouldReply: null,
+          modelReplyPresent: false,
+          parseStatus: "invalid",
+          validationStatus: "not_run",
+          guardRejectionReason: null,
+          brainResultReason: lastUnsafeReason,
+          brainOk: false,
+        });
         if (attempt < MAX_CONTENT_SAFETY_ATTEMPTS) continue;
         return {
           ok: false,
@@ -558,19 +672,59 @@ export async function executeGroupPostExecuteLaneDecision({
         assertGroupPostExecuteCustomerContentSafe(decision);
         const guard = validateCustomerReplyAgainstContract(
           decision.customerReply,
-          {
-            ...replyContract,
-            replyRequired:
-              decision.action === "reply" || decision.shouldReply === true,
-          },
+          trustedReplyContract,
           decision.replySemantics
         );
         if (!guard.ok) {
           throw new Error(guard.reason || "customer_reply_guard_failed");
         }
+
+        const review = await reviewCustomerReplyLanguageQuality({
+          candidateReply: decision.customerReply,
+          objective: replyPolicy.objective,
+          requestedInput: replyPolicy.requestedInput,
+          linguisticGuidance: replyPolicy.linguisticGuidance,
+          interactionGuidance: replyPolicy.interactionGuidance,
+          allowedClaims: trustedReplyContract.allowedClaims,
+          forbiddenClaims: trustedReplyContract.forbiddenClaims,
+          facts: verifiedFactsForPrompt,
+          completionFn: languageReviewCompletionFn,
+          timeoutMs: Math.min(ms, 6000),
+        });
+        if (review.status === "unavailable" || review.status === "invalid") {
+          throw new Error(`language_quality_review_${review.status}`);
+        }
+        if (review.status === "ok" && review.quality === "rewrite") {
+          assertGroupPostExecuteCustomerContentSafe({
+            ...decision,
+            customerReply: review.reply,
+          });
+          const rewriteGuard = validateCustomerReplyAgainstContract(
+            review.reply,
+            trustedReplyContract,
+            null
+          );
+          if (!rewriteGuard.ok) {
+            throw new Error(rewriteGuard.reason || "language_quality_rewrite_guard_failed");
+          }
+          decision.customerReply = review.reply;
+        }
       } catch (guardErr) {
         const reason = String(guardErr?.message ?? "OUTPUT_GUARD_FAILED");
         lastUnsafeReason = reason;
+        console.log("[group_post_execute_reply_attempt]", {
+          traceId,
+          attempt,
+          customerReplyRequired,
+          modelAction: decision.action,
+          modelShouldReply: decision.shouldReply,
+          modelReplyPresent: Boolean(decision.customerReply),
+          parseStatus: "valid",
+          validationStatus: "rejected",
+          guardRejectionReason: reason,
+          brainResultReason: reason,
+          brainOk: false,
+        });
         if (attempt < MAX_CONTENT_SAFETY_ATTEMPTS) {
           continue;
         }
@@ -582,6 +736,20 @@ export async function executeGroupPostExecuteLaneDecision({
           contentSafetyAttempts: attempt,
         };
       }
+
+      console.log("[group_post_execute_reply_attempt]", {
+        traceId,
+        attempt,
+        customerReplyRequired,
+        modelAction: decision.action,
+        modelShouldReply: decision.shouldReply,
+        modelReplyPresent: Boolean(decision.customerReply),
+        parseStatus: "valid",
+        validationStatus: "accepted",
+        guardRejectionReason: null,
+        brainResultReason: decision.reason,
+        brainOk: true,
+      });
 
       return {
         ok: true,
@@ -601,11 +769,25 @@ export async function executeGroupPostExecuteLaneDecision({
       contentSafetyAttempts: MAX_CONTENT_SAFETY_ATTEMPTS,
     };
   } catch (err) {
+    const reason = String(err?.message ?? "OPENAI_ERROR");
+    console.log("[group_post_execute_reply_attempt]", {
+      traceId,
+      attempt: activeAttempt,
+      customerReplyRequired,
+      modelAction: null,
+      modelShouldReply: null,
+      modelReplyPresent: false,
+      parseStatus: "not_available",
+      validationStatus: "not_run",
+      guardRejectionReason: null,
+      brainResultReason: reason,
+      brainOk: false,
+    });
     return {
       ok: false,
-      decision: defaultDecision({ reason: String(err?.message ?? "OPENAI_ERROR") }),
+      decision: defaultDecision({ reason }),
       source: "technical_fallback",
-      reason: String(err?.message ?? "OPENAI_ERROR"),
+      reason,
       contentSafetyAttempts: 0,
     };
   }

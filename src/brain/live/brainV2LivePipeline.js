@@ -15,14 +15,22 @@ import {
 import { buildShadowTurnContext } from "../shadow/brainShadowHook.js";
 import { runConversationTurn } from "../orchestrator/ConversationOrchestrator.js";
 import { executeOutboundReply } from "../../services/executors/outboundReplyExecutor.js";
-import { decideCustomerTurn } from "../decisions/decideCustomerTurn.js";
-import { GROUP_POST_EXECUTE_LANE } from "../decisions/groupPostExecuteLane.js";
+import {
+  recordInboundTurnLifecycleMilestoneForGuarantee,
+  recordInboundTurnLifecycleFailureForGuarantee,
+} from "../../services/inboundTurnLedger.js";
+// decideCustomerTurn/GROUP_POST_EXECUTE_LANE (the old Group post-execute
+// generation pipeline) are intentionally no longer imported here -- Stage 4
+// of the generation-simplification proposal routes the Group holding reply
+// through the same shared composer Cloud DM already uses (below). The old
+// lane's code stays in groupPostExecuteLane.js, unreferenced, for rollback.
+import { deriveGroupPostExecuteCustomerReplyRequired } from "../decisions/groupPostExecuteLane.js";
 import { resolveBusinessTurnContext } from "../facts/resolveBusinessTurnContext.js";
 import { POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK } from "../decisions/decidePostConfirmCustomerDm.js";
 import {
-  VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE,
-  validateGroupCanonicalSemanticDecision,
+  assertFrozenGroupCanonicalSemanticDecision,
 } from "../decisions/resolveGroupCanonicalSemanticDecision.js";
+export { VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE } from "../decisions/resolveGroupCanonicalSemanticDecision.js";
 import { buildContinuationContext } from "../continuation/buildContinuationContext.js";
 import {
   ONBOARDING_CLARIFICATION_REPLY,
@@ -30,10 +38,18 @@ import {
   shouldSuppressPostConfirmOnboardingClarification,
 } from "./shouldSuppressPostConfirmOnboardingClarification.js";
 import { readFreshLastAvailabilityAssist } from "../availability/availabilityAssistContext.js";
-import { composeBrowseOptionsCustomerReply } from "../openai/composeBrowseOptionsCustomerReply.js";
-import { composeUnknownItemCustomerReply } from "../openai/composeUnknownItemCustomerReply.js";
-import { composeMissingCatalogFactCustomerReply } from "../openai/composeMissingCatalogFactCustomerReply.js";
 import { composeCloudCanonicalCustomerReply } from "../openai/composeCloudCanonicalCustomerReply.js";
+import { CUSTOMER_REPLY_COMPOSE_OUTCOMES, sameActFallbackReply } from "../contracts/customerReplyContract.js";
+import {
+  buildCanonicalGroupResponseContract,
+  buildCanonicalGroupTurnContract,
+  buildTrustedGroupContinuationContext,
+  stampCanonicalGroupResponseAct,
+} from "../contracts/canonicalGroupTurnContract.js";
+import { getRecentConversationForPrompt } from "../../services/conversationStore.js";
+import { applyAvailabilityCustomerResponse } from "../workflows/AvailabilityInquiryWorkflow.js";
+import { buildItemNotInCatalogActionPlan } from "../workflows/ItemNotInCatalogWorkflow.js";
+import { validateBrowseOptionsCustomerReply } from "../openai/composeBrowseOptionsCustomerReply.js";
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 import {
   CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY,
@@ -46,6 +62,7 @@ import {
 import { missingInfoTypeForCloudCanonicalAsk } from "../../services/paMissingInfoRequestService.js";
 import { stampRememberPresentedItemFocusForSingleVerifiedItem } from "../../services/executors/sessionMemoryExecutor.js";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
+
 import {
   isTrustedVerifiedFactResolution,
   resolvePostConfirmRequestedFact,
@@ -97,7 +114,30 @@ function resolveFrozenCanonicalDecision(params) {
  * hands this function an arbitrary object without the exact provenance
  * string, or one that fails re-validation, gets nothing trusted back.
  */
-function resolveValidatedGroupCanonicalDecision(params, catalogItems) {
+export function inactiveValidatedGroupContinuation(canonicalReleased) {
+  return {
+    active: false,
+    type: null,
+    source: "validated_group_canonical",
+    participantKey: null,
+    customerNumber: null,
+    groupChatKey: null,
+    itemId: null,
+    itemLabel: null,
+    bookingId: null,
+    availabilityRequestId: null,
+    expectedFields: [],
+    trustedFacts: {},
+    stale: false,
+    rejectReason: null,
+    safeToOwn: false,
+    bypassGenericRouting: false,
+    requiredAuthority: null,
+    canonicalTurnScope: canonicalReleased?.turnScope ?? null,
+  };
+}
+
+function resolveValidatedGroupCanonicalDecision(params) {
   if (params?.isGroupInbound !== true && params?.chatType !== "group") {
     return null;
   }
@@ -107,22 +147,13 @@ function resolveValidatedGroupCanonicalDecision(params, catalogItems) {
       ? params.validatedGroupCanonicalSemanticDecision
       : null;
   if (!decision) return null;
-  if (
-    decision.semanticDecisionProvenance !==
-    VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE
-  ) {
-    return null;
-  }
-  const validation = validateGroupCanonicalSemanticDecision(decision, {
-    customerMessage: String(params?.message ?? ""),
-    catalogItems: Array.isArray(catalogItems) ? catalogItems : [],
-  });
-  if (!validation.ok || decision.semanticDecisionStatus !== "released") {
+  const assertion = assertFrozenGroupCanonicalSemanticDecision(decision);
+  if (!assertion.ok) {
     return {
       ...decision,
       _validatedGroupSemanticRejected: true,
       _validatedGroupSemanticRejectReason:
-        validation.reason || "GROUP_SEMANTIC_DECISION_NOT_RELEASED",
+        assertion.reason || "GROUP_SEMANTIC_DECISION_CORRUPT",
     };
   }
   return decision;
@@ -162,6 +193,7 @@ function constrainActionPlanToCanonicalScope(actionPlan, turnScope) {
  *   chatType?: "group" | "dm",
  *   chatId?: string | null,
  *   sessionKey?: string | null,
+ *   conversationCustomerNumber?: string | null,
  *   participantKey?: string | null,
  *   participantName?: string | null,
  *   participantDisplayName?: string | null,
@@ -215,8 +247,7 @@ export async function runBrainV2LivePipeline(params) {
     }
     const existingCloudCanonicalReleased = resolveFrozenCanonicalDecision(params);
     const validatedGroupCanonicalReleased = resolveValidatedGroupCanonicalDecision(
-      params,
-      catalogItems
+      params
     );
     const canonicalReleased =
       existingCloudCanonicalReleased ?? validatedGroupCanonicalReleased;
@@ -283,7 +314,9 @@ export async function runBrainV2LivePipeline(params) {
       resolveTrustedSessionItem: params.resolveTrustedSessionItem,
     });
 
-    let continuation = buildContinuationContext({
+    let continuation = validatedGroupCanonicalReleased
+      ? inactiveValidatedGroupContinuation(validatedGroupCanonicalReleased)
+      : buildContinuationContext({
       channel,
       chatType,
       isGroupInbound: params.isGroupInbound === true || chatType === "group",
@@ -294,7 +327,7 @@ export async function runBrainV2LivePipeline(params) {
       availabilityRequest: params.preResolvedWaitingConfirmRequest ?? null,
       waitingConfirmCandidates: params.waitingConfirmCandidates ?? null,
     });
-    if (canonicalReleased) {
+    if (canonicalReleased && !validatedGroupCanonicalReleased) {
       continuation = {
         ...continuation,
         active: false,
@@ -308,21 +341,26 @@ export async function runBrainV2LivePipeline(params) {
         targetId: canonicalReleased.targetId ?? null,
         semanticDecisionStatus: canonicalReleased.semanticDecisionStatus,
       });
-      if (validatedGroupCanonicalReleased) {
-        console.log("[brain_v2_group_canonical_semantic_bound]", {
-          traceId,
-          semanticDecisionSource:
-            validatedGroupCanonicalReleased.semanticDecisionProvenance,
-          semanticIntent: authoritativeSemanticIntent,
-          itemScope: validatedGroupCanonicalReleased.itemScope ?? null,
-          itemReferenceMode: turnContextInput.itemReferenceMode ?? null,
-          referentCount: Array.isArray(
-            validatedGroupCanonicalReleased.itemReferents
-          )
-            ? validatedGroupCanonicalReleased.itemReferents.length
-            : 0,
-        });
-      }
+    } else if (validatedGroupCanonicalReleased) {
+      console.log("[brain_v2_canonical_released_decision_bound]", {
+        traceId,
+        turnScope: canonicalReleased.turnScope,
+        targetId: canonicalReleased.targetId ?? null,
+        semanticDecisionStatus: canonicalReleased.semanticDecisionStatus,
+      });
+      console.log("[brain_v2_group_canonical_semantic_bound]", {
+        traceId,
+        semanticDecisionSource:
+          validatedGroupCanonicalReleased.semanticDecisionProvenance,
+        semanticIntent: authoritativeSemanticIntent,
+        itemScope: validatedGroupCanonicalReleased.itemScope ?? null,
+        itemReferenceMode: turnContextInput.itemReferenceMode ?? null,
+        referentCount: Array.isArray(
+          validatedGroupCanonicalReleased.itemReferents
+        )
+          ? validatedGroupCanonicalReleased.itemReferents.length
+          : 0,
+      });
     }
 
     // Unsafe continuation: fail closed — no generic routing, no mutation.
@@ -371,6 +409,13 @@ export async function runBrainV2LivePipeline(params) {
         getBusinessProfileFn: params.getBusinessProfileFn,
         getBookingsForItemFn: params.getBookingsForItemFn,
       });
+      if (params.isGroupInbound === true && params.guaranteeKey) {
+        recordInboundTurnLifecycleMilestoneForGuarantee({
+          guaranteeKey: params.guaranteeKey,
+          burstStableIds: Array.isArray(params.bufferedMessageIds) ? params.bufferedMessageIds : [],
+          stage: "canonical_decision",
+        });
+      }
       const suppressedEarly = await maybeSilentInsteadOfOnboardingClarify({
         params,
         channel,
@@ -428,6 +473,9 @@ export async function runBrainV2LivePipeline(params) {
     });
 
     brainTurnContext.continuation = continuation;
+    if (validatedGroupCanonicalReleased) {
+      brainTurnContext.validatedGroupCanonicalAuthority = true;
+    }
     if (canonicalReleased) {
       brainTurnContext.canonicalSemanticDecision = canonicalReleased;
     }
@@ -463,6 +511,13 @@ export async function runBrainV2LivePipeline(params) {
       getBusinessProfileFn: params.getBusinessProfileFn,
     });
     assertBrainV2ExecutionActive(params);
+    if (params.isGroupInbound === true && params.guaranteeKey) {
+      recordInboundTurnLifecycleMilestoneForGuarantee({
+        guaranteeKey: params.guaranteeKey,
+        burstStableIds: Array.isArray(params.bufferedMessageIds) ? params.bufferedMessageIds : [],
+        stage: "canonical_decision",
+      });
+    }
 
     const orchestratorInput = {
       traceId: `${traceId}::v2_live`,
@@ -632,6 +687,13 @@ export async function runBrainV2LivePipeline(params) {
       }
     }
 
+    if (params.isGroupInbound === true && params.guaranteeKey) {
+      recordInboundTurnLifecycleMilestoneForGuarantee({
+        guaranteeKey: params.guaranteeKey,
+        burstStableIds: Array.isArray(params.bufferedMessageIds) ? params.bufferedMessageIds : [],
+        stage: "execution_started",
+      });
+    }
     const { sideEffectResults, bookingCreated, customerReplySuppressed, ...routed } =
       await routeAndExecuteLiveActionPlan(constrainedPlan, flags, {
         ...params.executionContext,
@@ -668,6 +730,13 @@ export async function runBrainV2LivePipeline(params) {
         executionGuard: params.executionGuard,
       });
     assertBrainV2ExecutionActive(params);
+    if (params.isGroupInbound === true && params.guaranteeKey) {
+      recordInboundTurnLifecycleMilestoneForGuarantee({
+        guaranteeKey: params.guaranteeKey,
+        burstStableIds: Array.isArray(params.bufferedMessageIds) ? params.bufferedMessageIds : [],
+        stage: "execution_completed",
+      });
+    }
 
     // ── Post-execute Brain reply (PR1B) ────────────────────────────────────
     // When actionRouter signals awaitsPostExecuteBrainReply, call the existing
@@ -676,47 +745,39 @@ export async function runBrainV2LivePipeline(params) {
     let finalActionPlan = constrainedPlan;
     let finalReplySource = "BRAIN_V2_LIVE";
     let postExecuteBrainDecision = null;
+    // Safe, structured surface-generation evidence. This is deliberately
+    // metadata only: it cannot affect workflow, execution, or delivery.
+    let customerReplyGenerationDiagnostics = null;
 
-    const canonicalUnknownItem =
-      canonicalReleased?.turnScope === "NEW_TRANSACTION" &&
-      canonicalReleased?.itemScope === "specific" &&
+    const currentTurnSpecificUnmatched =
       Array.isArray(canonicalReleased?.itemReferents) &&
-      canonicalReleased.itemReferents.length === 1 &&
+      canonicalReleased.itemReferents.filter(
+        (ref) => String(ref?.source ?? "").trim() === "current_turn"
+      ).length === 1 &&
       resolvedBusinessTurnContext?.resolvedItem?.status === "not_matched";
+    const canonicalUnknownItem =
+      currentTurnSpecificUnmatched ||
+      resolvedBusinessTurnContext?.decision?.workflowType === "item_not_in_catalog";
     if (canonicalUnknownItem) {
-      const itemLabel = String(
-        resolvedBusinessTurnContext?.resolvedItem?.displayLabel ??
-          canonicalReleased.itemReferents[0]?.surfaceText ??
-          ""
-      ).trim();
-      const composedUnknown = await composeUnknownItemCustomerReply({
-        semanticIntent: authoritativeSemanticIntent,
-        itemLabel,
-        customerMessage: message,
-        timeoutMs: params.__unknownItemComposeTimeoutMs ?? 8000,
-        __chatCompletionsCreateForTests:
-          params.__unknownItemComposeChatCreate ?? null,
+      const unknownPlan = buildItemNotInCatalogActionPlan({
+        understanding: {
+          resolvedItemLabel: String(
+            resolvedBusinessTurnContext?.resolvedItem?.displayLabel ??
+              canonicalReleased.itemReferents[0]?.surfaceText ??
+              ""
+          ).trim(),
+          canonicalItemReferents: canonicalReleased.itemReferents,
+        },
+        catalogItems,
+        businessContext: { resolvedBusinessTurnContext },
       });
-      assertBrainV2ExecutionActive(params);
-      if (!composedUnknown.ok || !String(composedUnknown.reply ?? "").trim()) {
-    return buildSilentPipelineResult({
-      traceId,
-      channel,
-      chatType,
-      isGroupInbound: params.isGroupInbound,
-      reason: `UNKNOWN_ITEM_COMPOSE_FAIL_CLOSED:${composedUnknown.reason ?? "no_reply"}`,
-        });
-      }
-      finalReply = composedUnknown.reply;
-      finalReplySource = "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE";
+      finalActionPlan = {
+        ...finalActionPlan,
+        ...unknownPlan,
+        actions: unknownPlan.actions,
+      };
     }
 
-    // Item is real and matched (never overlaps canonicalUnknownItem above,
-    // which requires not_matched) but its price is a genuinely missing
-    // catalog field -- no owner-check/escalation architecture exists for
-    // catalog data, so the wording is AI-composed with the same
-    // no-fabrication, no-echo, no-fake-promise discipline as the
-    // unknown-item composer, rather than a static conversational reply.
     const canonicalKnownItemMissingPrice =
       !canonicalUnknownItem &&
       (workflowType === "pricing_inquiry" || workflowType === "pricing_with_duration") &&
@@ -728,111 +789,22 @@ export async function runBrainV2LivePipeline(params) {
           resolvedBusinessTurnContext?.resolvedItem?.name ??
           ""
       ).trim();
-      const composedMissingPrice = await composeMissingCatalogFactCustomerReply({
-        semanticIntent: authoritativeSemanticIntent,
+      const missingFacts = {
+        itemId: String(resolvedBusinessTurnContext?.resolvedItem?.id ?? "").trim() || null,
         itemLabel,
-        customerMessage: message,
-        timeoutMs: params.__missingCatalogFactComposeTimeoutMs ?? 8000,
-        __chatCompletionsCreateForTests:
-          params.__missingCatalogFactComposeChatCreate ?? null,
-      });
-      assertBrainV2ExecutionActive(params);
-      if (!composedMissingPrice.ok || !String(composedMissingPrice.reply ?? "").trim()) {
-        return buildSilentPipelineResult({
-          traceId,
-          channel,
-          chatType,
-          isGroupInbound: params.isGroupInbound,
-          reason: `MISSING_CATALOG_FACT_COMPOSE_FAIL_CLOSED:${composedMissingPrice.reason ?? "no_reply"}`,
-        });
-      }
-      finalReply = composedMissingPrice.reply;
-      finalReplySource = "BRAIN_V2_MISSING_CATALOG_FACT_OPENAI_COMPOSE";
-    }
-
-    if (workflowType === "browse_options") {
-      const browseReplyAction = (Array.isArray(constrainedPlan?.actions)
-        ? constrainedPlan.actions
-        : []
-      ).find(
-        (action) =>
-          String(action?.type ?? "").trim() === "REPLY" &&
-          String(action?.payload?.field ?? "").trim() === "browse_options"
-      );
-      const trustedBrowseFacts = browseReplyAction?.payload?.trustedBrowseFacts;
-      const composedBrowse = await composeBrowseOptionsCustomerReply({
-        trustedBrowseFacts,
-        customerMessage: message,
-        channel: chatType,
-        timeoutMs: params.__browseComposeTimeoutMs ?? 8000,
-        __chatCompletionsCreateForTests:
-          params.__browseComposeChatCreate ?? null,
-      });
-      assertBrainV2ExecutionActive(params);
-      if (!composedBrowse.ok || !String(composedBrowse.reply ?? "").trim()) {
-        const emilySessionKeyBrowse = String(
-          turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
-        ).trim();
-        applyInfoLiveSessionMemoryPatch({
-          sessionKey: emilySessionKeyBrowse,
-          actionPlan: constrainedPlan,
-          authoritativeItem: turnContextInput.authoritativeItem,
-        });
-    return buildSilentPipelineResult({
-      traceId,
-      channel,
-      chatType,
-      isGroupInbound: params.isGroupInbound,
-      reason: `BROWSE_COMPOSE_FAIL_CLOSED:${composedBrowse.reason ?? "no_reply"}`,
-        });
-      }
-      finalReply = composedBrowse.reply;
-      finalReplySource = "BRAIN_V2_BROWSE_OPENAI_COMPOSE";
-      const presentedItemIds = Array.isArray(composedBrowse.mentionedAvailableItemIds)
-        ? [...new Set(composedBrowse.mentionedAvailableItemIds.map((id) => String(id ?? "").trim()).filter(Boolean))]
-        : [];
-      const trustedAvailableItems = Array.isArray(trustedBrowseFacts?.availableItems)
-        ? trustedBrowseFacts.availableItems
-        : [];
-      const verifiedPresentedItems = presentedItemIds
-        .map((itemId) => trustedAvailableItems.find(
-          (row) => String(row?.itemId ?? "").trim() === itemId && row?.isAvailable === true
-        ))
-        .filter(Boolean)
-        .map((row) => ({
-          itemId: String(row.itemId).trim(),
-          itemLabel: String(row.displayLabel ?? "").trim() || null,
-        }));
-      const presentedOne =
-        presentedItemIds.length === 1 && verifiedPresentedItems.length === 1;
-      finalActionPlan = Object.freeze({
-        ...constrainedPlan,
-        actions: Object.freeze((Array.isArray(constrainedPlan?.actions)
-          ? constrainedPlan.actions
-          : []).map((action) =>
-          action === browseReplyAction
-            ? Object.freeze({
-                ...action,
-                payload: Object.freeze({
-                  ...action.payload,
-                  presentedItemIds: Object.freeze([...presentedItemIds]),
-                  verifiedAlternatives: Object.freeze(
-                    verifiedPresentedItems.map((row) => Object.freeze({ ...row }))
-                  ),
-                }),
-              })
-            : action
-        )),
-        persistenceIntent: Object.freeze({
-          ...(constrainedPlan?.persistenceIntent ?? {}),
-          clearItemFocus: !presentedOne,
-          rememberPresentedItemFocus: presentedOne,
-          presentedItemId: presentedOne ? verifiedPresentedItems[0].itemId : null,
-          presentedItemLabel: presentedOne ? verifiedPresentedItems[0].itemLabel : null,
-          clearPresentedItemFocus: !presentedOne,
-          execute: false,
+        customerReference: itemLabel,
+        catalogMatchStatus: "matched",
+        requestedFactStatus: "missing",
+      };
+      finalActionPlan = {
+        ...finalActionPlan,
+        replyDraft: sameActFallbackReply("missing_catalog_price", missingFacts),
+        customerResponseComposition: stampCanonicalGroupResponseAct({
+          lane: "catalog_fact",
+          kind: "missing_catalog_price",
+          requestedReferent: itemLabel,
         }),
-      });
+      };
     }
 
     if (routed.awaitsPostExecuteBrainReply === true) {
@@ -854,64 +826,40 @@ export async function runBrainV2LivePipeline(params) {
           decisionTrace: result.trace,
         });
       } else {
+      // Stage 4 (generation-simplification proposal): the trusted-state
+      // authority (deriveGroupPostExecuteCustomerReplyRequired) decides
+      // whether a reply is required BEFORE any language-model call -- the
+      // model is never given a chance to author "silence" for this lane.
+      // When a reply is required, wording is produced by the SAME shared
+      // composer Cloud DM's owner_check_holding path already uses (below),
+      // instead of a second, separate generation pipeline
+      // (groupPostExecuteLane.js's own OpenAI call/schema/reviewer wiring
+      // remains in the codebase, unreferenced, for rollback -- not deleted).
       const postExecResult =
         sideEffectResults?.OWNER_CHECK_POST_EXECUTE_RESULT &&
         typeof sideEffectResults.OWNER_CHECK_POST_EXECUTE_RESULT === "object"
           ? /** @type {Record<string, unknown>} */ (sideEffectResults.OWNER_CHECK_POST_EXECUTE_RESULT)
           : null;
-
-      const brainResult = await decideCustomerTurn({
-        lane: GROUP_POST_EXECUTE_LANE,
-        chatType,
-        channel,
-        businessId,
-        messageText: message,
-        recentDialogue: params.conversationHistory ?? null,
-        facts: {
-          ...resolvedBusinessTurnContext,
-          catalogItems,
-        },
-        activeAvailabilityRequest:
-          postExecResult?.facts?.requestId
-            ? {
-                requestId: postExecResult.facts.requestId,
-                status: postExecResult.facts.lifecycleKind ?? null,
-                ownerNotificationStatus: postExecResult.facts.ownerNotificationStatus ?? null,
-                customerDmNotificationStatus:
-                  postExecResult.facts.customerDmNotificationStatus ?? null,
-              }
-            : null,
-        conversationStageHint: "post_owner_check_group",
+      const responseDisposition = postExecResult?.responseDisposition ?? null;
+      const customerReplyRequired = deriveGroupPostExecuteCustomerReplyRequired({
         postExecuteResult: postExecResult,
-        responseDisposition: postExecResult?.responseDisposition ?? null,
-        actionsAllowed: false,
-        allowedExecutors: [],
-        styleKey: "casual_local",
-        timeoutMs: 8000,
-        __chatCompletionsCreateForTests:
-          params.executionContext?.__groupPostExecuteChatCreate ?? null,
-      });
-      assertBrainV2ExecutionActive(params);
-
-      postExecuteBrainDecision = brainResult;
-
-      const brainReply = String(brainResult?.decision?.customerReply ?? "").trim();
-      const brainOk = brainResult?.ok === true && brainReply.length > 0;
-
-      console.log("[brain_v2_group_post_execute]", {
-        traceId,
-        businessId,
-        ok: brainOk,
-        source: brainResult?.source,
-        responseDisposition: postExecResult?.responseDisposition,
-        replyPreview: brainReply.slice(0, 80),
+        responseDisposition,
       });
 
-      if (brainOk) {
-        finalReply = brainReply;
-        finalReplySource = "BRAIN_V2_GROUP_POST_EXECUTE";
-      } else {
-        // Fail closed — Brain call failed or returned empty. Suppress, no canned fallback.
+      if (!customerReplyRequired) {
+        // Trusted runtime state itself (never the model) determined no
+        // customer-facing reply is needed here -- genuine, trusted silence.
+        // No language-model call is made at all for this outcome.
+        console.log("[brain_v2_group_post_execute]", {
+          traceId,
+          businessId,
+          responseDisposition,
+          customerReplyRequired: false,
+          trustedSilenceAllowed: true,
+          modelCalled: false,
+          replyComposeSucceeded: null,
+          finalReplySource: "BRAIN_V2_LIVE_SILENT",
+        });
         const emilySessionKeyFc = String(
           turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
         ).trim();
@@ -920,12 +868,106 @@ export async function runBrainV2LivePipeline(params) {
           actionPlan: result.actionPlan,
           authoritativeItem: turnContextInput.authoritativeItem,
         });
-    return buildSilentPipelineResult({
-      traceId,
-      channel,
-      chatType,
-      isGroupInbound: params.isGroupInbound,
-      reason: `GROUP_POST_EXECUTE_BRAIN_EMPTY:${brainResult?.reason ?? "no_reply"}`,
+        return buildSilentPipelineResult({
+          traceId,
+          channel,
+          chatType,
+          isGroupInbound: params.isGroupInbound,
+          reason: `GROUP_POST_EXECUTE_NOT_REQUIRED:${responseDisposition ?? "no_reply"}`,
+        });
+      }
+
+      // Minimal customer-relevant envelope only -- item identity/label.
+      // No AVR/ledger/notification/executor/disposition fields cross into
+      // the language composer; buildCustomerReplyPolicy("owner_check_holding")
+      // already supplies the objective/claims/linguistic guidance from
+      // trusted policy, not from here.
+      const holdingFacts =
+        postExecResult?.facts && typeof postExecResult.facts === "object"
+          ? postExecResult.facts
+          : {};
+      const holdingItemId = String(holdingFacts.itemId ?? "").trim();
+      // A conversational reference is wording-only, but it is trusted only
+      // when it belongs to the exact same canonical item being owner-checked.
+      // Never reconstruct, alias, or derive it from a catalog label here.
+      // Source it from resolvedBusinessTurnContext.resolvedItem, not from
+      // turnContextInput.authoritativeItem -- authority-item normalization
+      // strips customerReference, which silently dropped it before the
+      // composer ever saw it.
+      const resolvedItemForHolding = resolvedBusinessTurnContext?.resolvedItem ?? null;
+      const resolvedItemIdForHolding = String(
+        resolvedItemForHolding?.id ?? resolvedItemForHolding?.itemId ?? ""
+      ).trim();
+      const customerReference =
+        holdingItemId && resolvedItemIdForHolding === holdingItemId
+          ? String(resolvedItemForHolding?.customerReference ?? "").trim() || null
+          : null;
+      const composedHolding = await composeCloudCanonicalCustomerReply({
+        kind: "owner_check_holding",
+        channel: "group",
+        traceId,
+        semanticIntent: authoritativeSemanticIntent,
+        customerMessage: message,
+        trustedFacts: {
+          itemId: holdingItemId || null,
+          itemLabel: String(holdingFacts.itemLabel ?? "").trim() || null,
+          customerReference,
+        },
+        responseContract: buildCanonicalGroupResponseContract({
+          replyKind: "owner_check_holding",
+          trustedCustomerFacts: {
+            itemId: holdingItemId || null,
+            itemLabel: String(holdingFacts.itemLabel ?? "").trim() || null,
+            customerReference,
+          },
+          customerMessageText: message,
+        }),
+        fallbackReply: CLOUD_OWNER_CHECK_CUSTOMER_HOLDING_REPLY,
+        timeoutMs: params.__cloudComposeTimeoutMs ?? 8000,
+        __chatCompletionsCreateForTests: params.__cloudComposeChatCreate ?? null,
+      });
+      customerReplyGenerationDiagnostics = composedHolding.generationDiagnostics ?? null;
+      assertBrainV2ExecutionActive(params);
+
+      const composedReply = String(composedHolding.reply ?? "").trim();
+      console.log("[brain_v2_group_post_execute]", {
+        traceId,
+        businessId,
+        responseDisposition,
+        customerReplyRequired: true,
+        trustedSilenceAllowed: false,
+        modelCalled: true,
+        composeOk: composedHolding.ok === true,
+        composeOutcome: composedHolding.outcome ?? null,
+        replyComposeSucceeded: Boolean(composedReply),
+        finalReplySource: composedReply
+          ? "BRAIN_V2_GROUP_POST_EXECUTE"
+          : "BRAIN_V2_GROUP_POST_EXECUTE_REQUIRED_REPLY_FAILED",
+      });
+
+      if (composedReply) {
+        finalReply = composedReply;
+        finalReplySource = "BRAIN_V2_GROUP_POST_EXECUTE";
+      } else {
+        // Required reply could not be produced even with the composer's own
+        // deterministic fallback (should not happen in practice for
+        // owner_check_holding, which always has one) -- fail closed exactly
+        // like before Stage 4: never represent this as intentional silence,
+        // keep the inbound turn retryable.
+        const emilySessionKeyFc = String(
+          turnContextInput._emilySessionKey ?? params.sessionKey ?? ""
+        ).trim();
+        applyInfoLiveSessionMemoryPatch({
+          sessionKey: emilySessionKeyFc,
+          actionPlan: result.actionPlan,
+          authoritativeItem: turnContextInput.authoritativeItem,
+        });
+        return buildRequiredReplyFailurePipelineResult({
+          traceId,
+          channel,
+          chatType,
+          isGroupInbound: params.isGroupInbound,
+          reason: `GROUP_POST_EXECUTE_COMPOSE_EMPTY:${composedHolding.reason ?? "no_reply"}`,
         });
       }
       }
@@ -977,38 +1019,147 @@ export async function runBrainV2LivePipeline(params) {
     }
 
     assertBrainV2ExecutionActive(params);
+    const responseComposition =
+      finalActionPlan?.customerResponseComposition &&
+      typeof finalActionPlan.customerResponseComposition === "object"
+        ? finalActionPlan.customerResponseComposition
+        : null;
+    const availabilityResponseComposition =
+      responseComposition?.lane === "availability" ? responseComposition : null;
     if (
-      isCloudDmChannel({ channel, chatType, params }) &&
+      (isCloudDmChannel({ channel, chatType, params }) ||
+        String(responseComposition?.kind ?? "").trim()) &&
       shouldComposeCloudCanonicalLaunchReply(params) &&
-      finalReplySource !== "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE" &&
-      finalReplySource !== "BRAIN_V2_BROWSE_OPENAI_COMPOSE" &&
       finalReplySource !== "BRAIN_V2_GROUP_POST_EXECUTE"
     ) {
-      const composeKind = cloudCanonicalComposeKind({
+      const canonicalGroupResponse =
+        turnContextInput?.validatedGroupCanonicalAuthority === true && chatType === "group";
+      const composeKind = canonicalGroupResponse
+        ? String(responseComposition?.kind ?? "").trim()
+        : String(responseComposition?.kind ?? "").trim() ||
+          cloudCanonicalComposeKind({
         workflowType,
         actionPlan: finalActionPlan,
         semanticIntent: authoritativeSemanticIntent,
         turnScope: canonicalReleased?.turnScope,
-      });
+          });
+      if (canonicalGroupResponse && responseComposition) {
+        const stampedComposition = stampCanonicalGroupResponseAct(
+          responseComposition
+        );
+        finalActionPlan = {
+          ...finalActionPlan,
+          customerResponseComposition: stampedComposition,
+          canonicalGroupTurnContract: buildCanonicalGroupTurnContract({
+            resolvedBusinessTurnContext,
+            customerResponseComposition: stampedComposition,
+            trustedGroupContinuation: buildTrustedGroupContinuationContext({
+              emilyPending: params.memorySnapshot?.emilyPending ?? null,
+              pendingTemporalClarification:
+                params.memorySnapshot?.pendingTemporalClarification ?? null,
+              trustedFreshItemFocus:
+                turnContextInput?.trustedFreshItemFocus ??
+                resolvedBusinessTurnContext?.resolvedItem ??
+                null,
+            }),
+          }),
+        };
+      }
       if (composeKind) {
         const socialCompose = composeKind === "social";
+        // Context-scoping: a genuine continuation (activeTransactionSince,
+        // set from the durable pending record that already proves this is
+        // one -- not a new identifier) is scoped to dialogue written at or
+        // after that active request began, never the whole conversation
+        // document. A fresh/new-transaction turn has no active request yet,
+        // so no prior dialogue belongs to it -- it receives none, the same
+        // way any non-availability kind already receives none below.
+        const activeTransactionSince =
+          availabilityResponseComposition?.activeTransactionSince ?? null;
+        const scopingDb = params.executionContext?.db ?? params.db ?? null;
+        const scopedRecentDialogue =
+          availabilityResponseComposition && activeTransactionSince && scopingDb
+            ? await getRecentConversationForPrompt(
+                scopingDb,
+                params.businessId,
+                params.conversationCustomerNumber ?? params.sessionKey ?? null,
+                20,
+                { sinceTimestamp: activeTransactionSince }
+              )
+            : null;
+        const launchTrustedFacts = trustedFactsForCloudCompose({
+          composeKind,
+          workflowType,
+          actionPlan: finalActionPlan,
+          semanticIntent: authoritativeSemanticIntent,
+          turnScope: canonicalReleased?.turnScope,
+          resolvedBusinessTurnContext,
+          bookingCreated,
+        });
+        const browseFacts =
+          composeKind === "browse_options"
+            ? responseComposition?.trustedBrowseFacts ??
+              (Array.isArray(finalActionPlan?.actions)
+                ? finalActionPlan.actions.find(
+                    (action) =>
+                      String(action?.payload?.field ?? "") === "browse_options"
+                  )?.payload?.trustedBrowseFacts
+                : null)
+            : null;
         const composedLaunch = await composeCloudCanonicalCustomerReply({
           kind: composeKind,
+          traceId,
           semanticIntent: authoritativeSemanticIntent,
           customerMessage: message,
-          trustedFacts: trustedFactsForCloudCompose({
-            composeKind,
-            workflowType,
-            actionPlan: finalActionPlan,
-            semanticIntent: authoritativeSemanticIntent,
-            turnScope: canonicalReleased?.turnScope,
-            resolvedBusinessTurnContext,
-            bookingCreated,
-          }),
-          fallbackReply: socialCompose ? "" : finalReply,
+          trustedFacts: launchTrustedFacts,
+          ...(canonicalGroupResponse ||
+          ["item_not_in_catalog", "missing_catalog_price", "browse_options"].includes(
+            composeKind
+          )
+            ? {
+            responseContract: buildCanonicalGroupResponseContract({
+              replyKind: composeKind,
+              trustedCustomerFacts: launchTrustedFacts,
+              customerMessageText: message,
+            }),
+          } : {}),
+          fallbackReply: socialCompose
+            ? ""
+            : sameActFallbackReply(composeKind, launchTrustedFacts) ||
+              availabilityEmergencyFallback(composeKind) ||
+              finalReply,
+          extraReject:
+            composeKind === "browse_options"
+              ? (reply, parsed) =>
+                  validateBrowseOptionsCustomerReply(
+                    reply,
+                    browseFacts,
+                    parsed?.mentionedAvailableItemIds ?? parsed?.presentedItemIds
+                  )
+              : undefined,
+          channel: chatType === "group" ? "group" : "dm",
+          recentDialogue: scopedRecentDialogue,
+          conversationStage:
+            availabilityResponseComposition?.conversationStage ?? null,
+          diagnostics:
+            chatType === "group"
+              ? {
+                  participantIdentityStatus:
+                    turnContextInput.participantIdentity ?? null,
+                  conversationKey:
+                    params.conversationCustomerNumber ?? params.sessionKey ?? null,
+                  durablePendingPresent: Boolean(params.memorySnapshot?.emilyPending),
+                }
+              : null,
           timeoutMs: params.__cloudComposeTimeoutMs ?? 8000,
-          __chatCompletionsCreateForTests: params.__cloudComposeChatCreate ?? null,
+          __chatCompletionsCreateForTests:
+            params.__cloudComposeChatCreate ??
+            params.__unknownItemComposeChatCreate ??
+            params.__browseComposeChatCreate ??
+            params.__missingCatalogFactComposeChatCreate ??
+            null,
         });
+        customerReplyGenerationDiagnostics = composedLaunch.generationDiagnostics ?? null;
         assertBrainV2ExecutionActive(params);
         console.log("[cloud_canonical_compose]", {
           traceId,
@@ -1016,6 +1167,7 @@ export async function runBrainV2LivePipeline(params) {
           semanticIntent: authoritativeSemanticIntent ?? null,
           turnScope: canonicalReleased?.turnScope ?? null,
           composeOk: composedLaunch.ok === true,
+          composeOutcome: composedLaunch.outcome ?? null,
           composeModel: resolveOpenAiChatModel(),
           composeSource: composedLaunch.source ?? null,
           composeReason: String(composedLaunch.reason ?? "").slice(0, 160) || null,
@@ -1043,14 +1195,15 @@ export async function runBrainV2LivePipeline(params) {
           );
         if (
           isActiveBlockingNowLaunch &&
-          composedLaunch.source !== "openai_cloud_canonical_compose"
+          isCloudDmChannel({ channel, chatType, params }) &&
+          composedLaunch.outcome !== CUSTOMER_REPLY_COMPOSE_OUTCOMES.AI_SUCCESS
         ) {
           // composedLaunch.ok/reply are not reliable failure signals here:
           // composeCloudCanonicalCustomerReply() falls back to fallbackReply
           // (which we set to finalReply — the deterministic draft — for
           // non-social kinds) and reports ok:true/reply:<fallback> whenever
-          // that fallback is non-empty. Only source === the real-compose
-          // marker proves OpenAI actually generated the wording.
+          // that fallback is non-empty. Only outcome === ai_success proves
+          // OpenAI actually generated the wording.
           return buildSilentPipelineResult({
             traceId,
             channel,
@@ -1061,8 +1214,26 @@ export async function runBrainV2LivePipeline(params) {
         }
         if (composedLaunch.ok && String(composedLaunch.reply ?? "").trim()) {
           finalReply = composedLaunch.reply;
-          if (composedLaunch.source === "openai_cloud_canonical_compose") {
+          if (availabilityResponseComposition) {
+            finalActionPlan = applyAvailabilityCustomerResponse(finalActionPlan, {
+              reply: finalReply,
+              presentedItemIds: composedLaunch.presentedItemIds,
+            });
+          }
+          const composeSucceeded =
+            composedLaunch.outcome === CUSTOMER_REPLY_COMPOSE_OUTCOMES.AI_SUCCESS;
+          if (!composeSucceeded) {
+            finalReplySource = "BRAIN_V2_SAME_ACT_FALLBACK";
+          } else if (composeKind === "item_not_in_catalog") {
+            finalReplySource = "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE";
+          } else if (composeKind === "browse_options") {
+            finalReplySource = "BRAIN_V2_BROWSE_OPENAI_COMPOSE";
+          } else if (composeKind === "missing_catalog_price") {
+            finalReplySource = "BRAIN_V2_MISSING_CATALOG_FACT_OPENAI_COMPOSE";
+          } else if (composedLaunch.source === "openai_cloud_canonical_compose") {
             finalReplySource = "CLOUD_CANONICAL_OPENAI_COMPOSE";
+          } else if (composedLaunch.source === "openai_group_availability_compose") {
+            finalReplySource = "GROUP_AVAILABILITY_OPENAI_COMPOSE";
           }
         } else if (socialCompose) {
           // Social wording failure is not a missing-detail technical recovery.
@@ -1135,6 +1306,8 @@ export async function runBrainV2LivePipeline(params) {
       },
       bookingCreated,
       decisionTrace: result.trace,
+      customerReplyGenerationDiagnostics,
+      resolvedBusinessTurnContext,
     });
   } catch (err) {
     if (params.abortSignal?.aborted) {
@@ -1146,6 +1319,19 @@ export async function runBrainV2LivePipeline(params) {
       error: String(err?.message ?? err ?? "").slice(0, 200),
       legacyFallbackEnabled: isEmilyBrainV2LegacyFallbackEnabled(),
     });
+    if (params.isGroupInbound === true && params.guaranteeKey) {
+      // Instrumentation only -- existing failure handling (legacy fallback /
+      // safe apology reply below) is unchanged; this only records a
+      // diagnostic marker for the lifecycle already tracked per physical id.
+      // Fixed categorical code only -- the detailed err.message stays in the
+      // console.warn above, never duplicated into lifecycle diagnostics.
+      recordInboundTurnLifecycleFailureForGuarantee({
+        guaranteeKey: params.guaranteeKey,
+        burstStableIds: Array.isArray(params.bufferedMessageIds) ? params.bufferedMessageIds : [],
+        stage: "execution",
+        code: "EXECUTION_FAILED",
+      });
+    }
 
     if (isEmilyBrainV2LegacyFallbackEnabled()) {
       return {
@@ -1215,6 +1401,7 @@ async function finalizeCloudOwnerCheckLaunchHolding(p) {
   if (shouldComposeCloudCanonicalLaunchReply(params)) {
     const composed = await composeCloudCanonicalCustomerReply({
       kind: "owner_check_holding",
+      channel: "dm",
       semanticIntent: authoritativeSemanticIntent,
       customerMessage: params.message,
       trustedFacts: {
@@ -1303,7 +1490,8 @@ function shouldStampCloudPresentedItemFocus(p) {
     workflowType === "unknown_clarification" ||
     workflowType === "greeting" ||
     workflowType === "browse_options" ||
-    workflowType === "unlisted_item"
+    workflowType === "unlisted_item" ||
+    workflowType === "item_not_in_catalog"
   ) {
     return false;
   }
@@ -1413,6 +1601,7 @@ async function maybeCloudMissingFactOwnerCheckResult(p) {
   if (shouldComposeCloudCanonicalLaunchReply(params)) {
     const composed = await composeCloudCanonicalCustomerReply({
       kind: "owner_check_holding",
+      channel: "dm",
       semanticIntent: p.authoritativeSemanticIntent,
       customerMessage: params.message,
       trustedFacts: {
@@ -1536,26 +1725,52 @@ function resolveCloudLaunchMissingFactResolution(p) {
 
 function shouldComposeCloudCanonicalLaunchReply(params) {
   if (typeof params?.__cloudComposeChatCreate === "function") return true;
+  if (typeof params?.__unknownItemComposeChatCreate === "function") return true;
+  if (typeof params?.__browseComposeChatCreate === "function") return true;
+  if (typeof params?.__missingCatalogFactComposeChatCreate === "function") return true;
   return String(process.env.NODE_ENV ?? "").trim() !== "test";
 }
 
+function availabilityEmergencyFallback(kind, facts = {}) {
+  return (
+    sameActFallbackReply(kind, facts) ||
+    (kind === "duration_ask"
+      ? "Kitne din ke liye chahiye?"
+      : kind === "temporal_clarification"
+        ? "Kis date se chahiye?"
+        : "Abhi yeh share nahi kar pa rahi.")
+  );
+}
+
 function cloudCanonicalComposeKind(p) {
+  const structuredKind = String(
+    p.actionPlan?.customerResponseComposition?.kind ?? ""
+  ).trim();
+  if (structuredKind) return structuredKind;
   const workflowType = String(p.workflowType ?? "").trim();
   const intent = String(p.semanticIntent ?? "").trim();
   const turnScope = String(p.turnScope ?? "").trim();
-  if (intent === "social" || turnScope === "SOCIAL_GENERAL") {
+  // Once a canonical workflow has already been selected, it alone authorizes
+  // reply kind -- raw semanticIntent is only consulted as a legacy fallback
+  // when no canonical workflow decision exists at all. Otherwise a stale/
+  // ungrounded raw model intent (e.g. an adversarial "pricing_with_duration"
+  // read on a message that only continues an active availability duration
+  // ask) could re-introduce, at compose time, exactly the intent-hijack the
+  // workflow layer's canonical-transaction authority already rejected.
+  const authoritativeType = workflowType || intent;
+  if (turnScope === "SOCIAL_GENERAL" || authoritativeType === "social") {
     return "social";
   }
-  if (workflowType === "image_catalog_request" || intent === "image_catalog_request") {
+  if (authoritativeType === "image_catalog_request") {
     return "image_intro";
   }
-  if (workflowType === "pricing_with_duration" || intent === "pricing_with_duration") {
+  if (authoritativeType === "pricing_with_duration") {
     return "pricing_with_duration";
   }
-  if (workflowType === "pricing_inquiry" || intent === "pricing_inquiry") {
+  if (authoritativeType === "pricing_inquiry") {
     return "pricing";
   }
-  if (workflowType === "availability_inquiry" || intent === "availability_inquiry") {
+  if (authoritativeType === "availability_inquiry") {
     const actions = Array.isArray(p.actionPlan?.actions) ? p.actionPlan.actions : [];
     // A trusted date-bearing temporal claim exists but could not be resolved
     // (see AvailabilityInquiryWorkflow's temporal-unresolved safety gate).
@@ -1567,21 +1782,32 @@ function cloudCanonicalComposeKind(p) {
         String(action?.payload?.source ?? "") === "canonical_owner_check_ask_temporal_clarification"
     );
     if (asksTemporalClarification) return "temporal_clarification";
-    const asksDuration = actions.some(
-      (action) =>
-        String(action?.payload?.pendingStage ?? "").includes("duration") ||
-        /kitne din/i.test(String(action?.payload?.text ?? p.actionPlan?.replyDraft ?? ""))
+    // The action plan's own REPLY action already records (from the actual
+    // execution outcome, not from any semantic intent) whether this turn is
+    // an owner-check launch/continuation -- buildOwnerCheckActionPlan sets
+    // this exact source regardless of workflowType/intent agreement.
+    const isOwnerCheckReply = actions.some((action) =>
+      String(action?.payload?.source ?? "").startsWith("canonical_owner_check_")
+    );
+    if (isOwnerCheckReply) return "owner_check_holding";
+    const asksDuration = actions.some((action) =>
+      String(action?.payload?.pendingStage ?? "").includes("duration")
     );
     return asksDuration ? "duration_ask" : "availability";
   }
-  if (workflowType === "booking_request" || intent === "booking_request") {
+  if (authoritativeType === "booking_request") {
     return "booking_status";
   }
+  if (authoritativeType === "item_not_in_catalog" || authoritativeType === "unlisted_item") {
+    return "item_not_in_catalog";
+  }
+  if (authoritativeType === "browse_options") {
+    return "browse_options";
+  }
   if (
-    workflowType === "clarification" ||
-    workflowType === "unknown_clarification" ||
-    intent === "clarification" ||
-    intent === "unclear"
+    authoritativeType === "clarification" ||
+    authoritativeType === "unknown_clarification" ||
+    authoritativeType === "unclear"
   ) {
     return "clarification";
   }
@@ -1593,6 +1819,50 @@ export function trustedFactsForCloudCompose(p) {
     String(p.composeKind ?? "").trim() ||
     cloudCanonicalComposeKind(p) ||
     "";
+  const composition =
+    p.actionPlan?.customerResponseComposition &&
+    typeof p.actionPlan.customerResponseComposition === "object"
+      ? p.actionPlan.customerResponseComposition
+      : {};
+  if (composeKind === "item_not_in_catalog") {
+    const itemLabel = String(
+      composition.requestedReferent ??
+        p.resolvedBusinessTurnContext?.resolvedItem?.displayLabel ??
+        ""
+    ).trim();
+    return {
+      itemLabel,
+      requestedReferent: itemLabel,
+      customerReference: itemLabel,
+      catalogMatchStatus: "not_matched",
+      verifiedAvailableAlternatives: Array.isArray(
+        composition.verifiedAvailableAlternatives
+      )
+        ? composition.verifiedAvailableAlternatives
+        : [],
+    };
+  }
+  if (composeKind === "missing_catalog_price") {
+    const item = p.resolvedBusinessTurnContext?.resolvedItem ?? null;
+    const itemLabel = String(item?.displayLabel ?? item?.name ?? "").trim();
+    return {
+      itemId: String(item?.id ?? "").trim() || null,
+      itemLabel,
+      customerReference: itemLabel,
+      catalogMatchStatus: "matched",
+      requestedFactStatus: "missing",
+    };
+  }
+  if (composeKind === "browse_options") {
+    const browse =
+      composition.trustedBrowseFacts && typeof composition.trustedBrowseFacts === "object"
+        ? composition.trustedBrowseFacts
+        : {};
+    return {
+      availableCount: Number(browse.availableCount) || 0,
+      availableItems: Array.isArray(browse.availableItems) ? browse.availableItems : [],
+    };
+  }
   if (composeKind === "social") {
     return {};
   }
@@ -1604,6 +1874,10 @@ export function trustedFactsForCloudCompose(p) {
   const item = p.resolvedBusinessTurnContext?.resolvedItem ?? null;
   const actions = Array.isArray(p.actionPlan?.actions) ? p.actionPlan.actions : [];
   const imageUrls = extractTrustedImageUrlsFromActionPlan(p.actionPlan);
+  const availabilityComposition =
+    p.actionPlan?.customerResponseComposition?.lane === "availability"
+      ? p.actionPlan.customerResponseComposition
+      : null;
   const pricing =
     verified.pricing && typeof verified.pricing === "object" ? verified.pricing : {};
   const quote =
@@ -1617,9 +1891,61 @@ export function trustedFactsForCloudCompose(p) {
   return {
     itemId: String(item?.id ?? "").trim() || null,
     itemLabel: String(item?.displayLabel ?? item?.name ?? "").trim() || null,
-    dailyRate: positiveNumber(pricing.daily ?? quote.dailyRate),
-    monthlyRate: positiveNumber(pricing.monthly ?? quote.monthlyRate),
-    totalAmount: positiveNumber(quote.total ?? pricing.total),
+    customerReference: String(item?.customerReference ?? "").trim() || null,
+    ...(availabilityComposition
+      ? {
+          durationDays:
+            Number.isFinite(Number(p.resolvedBusinessTurnContext?.turn?.durationDays)) &&
+            Number(p.resolvedBusinessTurnContext?.turn?.durationDays) >= 1
+              ? Math.floor(Number(p.resolvedBusinessTurnContext.turn.durationDays))
+              : null,
+          conversationStage: availabilityComposition.conversationStage ?? null,
+          missingField: availabilityComposition.missingField ?? null,
+          replyMeaning:
+            availabilityComposition.replyMeaning &&
+            typeof availabilityComposition.replyMeaning === "object"
+              ? availabilityComposition.replyMeaning
+              : null,
+          business:
+            p.resolvedBusinessTurnContext?.business &&
+            typeof p.resolvedBusinessTurnContext.business === "object"
+              ? {
+                  category:
+                    String(p.resolvedBusinessTurnContext.business.category ?? "").trim() ||
+                    null,
+                  businessType:
+                    String(p.resolvedBusinessTurnContext.business.businessType ?? "").trim() ||
+                    null,
+                }
+              : null,
+          verifiedAlternatives: Array.isArray(
+            availabilityComposition.verifiedAlternatives
+          )
+            ? availabilityComposition.verifiedAlternatives.map((row) => ({
+                itemId: String(row?.itemId ?? "").trim() || null,
+                itemLabel: String(row?.itemLabel ?? "").trim() || null,
+              }))
+            : [],
+          verifiedAlternativesCount: Array.isArray(
+            availabilityComposition.verifiedAlternatives
+          )
+            ? availabilityComposition.verifiedAlternatives.length
+            : 0,
+        }
+      : {}),
+    // owner_check_holding is a minimal-envelope kind (see
+    // customerReplyContract.js) whose objective is "we're checking with the
+    // owner", never a price answer -- the two hardcoded owner_check_holding
+    // call sites already hand the composer only itemId/itemLabel/
+    // customerReference, and this shared fallback path must match that, not
+    // project pricing merely because it happened to be available.
+    ...(composeKind === "owner_check_holding"
+      ? {}
+      : {
+          dailyRate: positiveNumber(pricing.daily ?? quote.dailyRate),
+          monthlyRate: positiveNumber(pricing.monthly ?? quote.monthlyRate),
+          totalAmount: positiveNumber(quote.total ?? pricing.total),
+        }),
     ...(composeKind === "pricing_with_duration"
       ? {
           durationDays:
@@ -1770,6 +2096,8 @@ function finalizeLivePipelineResult(p) {
     bookingCreated: p.bookingCreated,
     decisionTrace: p.decisionTrace,
     missingInfoRequest: p.missingInfoRequest ?? null,
+    customerReplyGenerationDiagnostics: p.customerReplyGenerationDiagnostics ?? null,
+    resolvedBusinessTurnContext: p.resolvedBusinessTurnContext ?? null,
   });
 
   const outbound = executeOutboundReply({
@@ -1976,10 +2304,78 @@ function buildSilentPipelineResult(p) {
 }
 
 /**
+ * A trusted-state-required customer reply that the composer failed to
+ * produce (model chose silence, empty/parse failure, guard rejection, or a
+ * technical error). Deliberately DISTINCT from buildSilentPipelineResult's
+ * generic silent shape -- every field here is chosen so
+ * isIntentionalSilentInboundResult (whatsappInboundBuffer.js) can never
+ * classify it as intentional silence: sendVia is never "NONE",
+ * handledWithoutOutbound is never set, and routeType/finalReplySource/
+ * reason never match any of that function's silent-signal checks. reply
+ * stays "" (there is nothing safe to send), so no outbound send is
+ * attempted either -- the inbound turn settles as a retryable failure
+ * (not done), exactly like any other failed-to-produce-a-reply outcome.
+ * @param {{ traceId: string, reason: string, channel?: string, chatType?: string, isGroupInbound?: boolean }} p
+ */
+function buildRequiredReplyFailurePipelineResult(p) {
+  const reason = String(p.reason ?? "");
+  return {
+    handled: true,
+    reply: "",
+    sendVia: p.isGroupInbound ? "GROUP" : "CLOUD_API",
+    dmRecipientPhone: null,
+    messageMeta: {
+      routeType: "BRAIN_V2_LIVE",
+      outboundTrace: {
+        finalReplySource: "BRAIN_V2_GROUP_POST_EXECUTE_REQUIRED_REPLY_FAILED",
+        reason,
+        customerReplyRequired: true,
+        intentionalSilent: false,
+      },
+      brainV2Live: true,
+      traceId: p.traceId,
+    },
+    reason,
+    legacyBypassed: true,
+  };
+}
+
+/**
  * @param {Record<string, unknown>} p
  */
 function buildLiveMessageMeta(p) {
   const imageUrls = extractTrustedImageUrlsFromActionPlan(p.actionPlan);
+  const facts =
+    p.resolvedBusinessTurnContext && typeof p.resolvedBusinessTurnContext === "object"
+      ? p.resolvedBusinessTurnContext
+      : null;
+  const composition =
+    p.actionPlan?.customerResponseComposition &&
+    typeof p.actionPlan.customerResponseComposition === "object"
+      ? p.actionPlan.customerResponseComposition
+      : null;
+  const composeDiag =
+    p.customerReplyGenerationDiagnostics &&
+    typeof p.customerReplyGenerationDiagnostics === "object"
+      ? p.customerReplyGenerationDiagnostics
+      : null;
+  const groupTurnDiagnostics =
+    facts?.validatedGroupCanonicalAuthority === true || composition?.requiredAct
+      ? {
+          durationSemanticStatus: facts?.durationSemanticStatus ?? null,
+          durationProvenanceRejectionReason:
+            facts?.durationProvenanceRejectionReason ?? null,
+          requestedDurationDiagnostics: facts?.requestedDurationDiagnostics ?? null,
+          normalizedDays:
+            Number.isFinite(Number(facts?.turn?.durationDays)) &&
+            Number(facts.turn.durationDays) >= 1
+              ? Math.floor(Number(facts.turn.durationDays))
+              : null,
+          requiredResponseAct: composition?.requiredAct ?? composeDiag?.requiredResponseAct ?? null,
+          responseActValidation: composeDiag?.responseActValidation ?? null,
+          composeKind: composeDiag?.kind ?? composition?.kind ?? null,
+        }
+      : null;
   return {
     routeType: "BRAIN_V2_LIVE",
     outboundTrace: {
@@ -1988,6 +2384,8 @@ function buildLiveMessageMeta(p) {
       participantIdentity: p.turnContextInput?.participantIdentity ?? null,
       turnShape: p.turnContextInput?.turnShape ?? null,
       authoritativeItemId: p.turnContextInput?.authoritativeItem?.id ?? null,
+      customerReplyGenerationDiagnostics: composeDiag,
+      ...(groupTurnDiagnostics ? { groupTurnDiagnostics } : {}),
     },
     brainV2Live: true,
     actionRouter: p.routed
@@ -2011,4 +2409,16 @@ function buildLiveMessageMeta(p) {
       ? { missingInfoRequest: p.missingInfoRequest }
       : {}),
   };
+}
+
+/**
+ * Test-only: exposes buildRequiredReplyFailurePipelineResult's exact output
+ * shape so a regression test can prove, against the real function, that it
+ * is never classified as intentional silence downstream (rather than
+ * duplicating the shape inline in a test and drifting from the real
+ * implementation over time).
+ * @param {Parameters<typeof buildRequiredReplyFailurePipelineResult>[0]} p
+ */
+export function __buildRequiredReplyFailurePipelineResultForTests(p) {
+  return buildRequiredReplyFailurePipelineResult(p);
 }

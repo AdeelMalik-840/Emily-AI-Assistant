@@ -19,7 +19,10 @@ import {
   withAvailabilityAssistPendingQuestion,
 } from "../src/brain/availability/availabilityAssistContext.js";
 import { decideAvailabilityAssistFollowUp } from "../src/brain/availability/decideAvailabilityAssistFollowUp.js";
-import { buildAvailabilityInquiryActionPlan } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import {
+  AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION,
+  buildAvailabilityInquiryActionPlan,
+} from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 
 const BUSINESS_ID = "biz-pending-q";
 const COROLLA_ID = "toyota_corolla";
@@ -118,13 +121,33 @@ test("A: offer assist stores pendingQuestion / promptType / stage / TTL metadata
 
   const assist = plan.persistenceIntent?.lastAvailabilityAssist;
   assert.ok(assist);
-  assert.equal(assist.pendingQuestion, plan.replyDraft);
-  assert.match(String(assist.pendingQuestion), /Koi aur option dekhun/i);
+  assert.equal(plan.replyDraft, "");
+  assert.equal(
+    assist.pendingQuestion,
+    AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION
+  );
   assert.equal(assist.pendingPromptType, AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST);
   assert.equal(assist.assistStage, AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE);
   assert.equal(assist.participantKey, "adeel-malik::first-seen-1");
+  assert.equal(assist.unavailableItemId, COROLLA_ID);
+  assert.equal(assist.durationDays, 2);
+  assert.equal(assist.sourceTurnKey, "leads::wa::offer1");
   assert.ok(assist.expiresAt);
   assert.ok(AVAILABILITY_ASSIST_TTL_MS <= 15 * 60 * 1000);
+  assert.equal(plan.customerResponseComposition?.lane, "availability");
+  assert.equal(
+    plan.customerResponseComposition?.kind,
+    "availability_unavailable"
+  );
+  assert.equal(
+    plan.customerResponseComposition?.conversationStage,
+    "offer_verified_alternatives"
+  );
+  assert.equal(plan.customerResponseComposition?.missingField, null);
+  assert.deepEqual(plan.customerResponseComposition?.verifiedAlternatives, [
+    { itemId: CIVIC_ID, itemLabel: "Honda Civic" },
+    { itemId: STONIC_ID, itemLabel: "Kia Stonic" },
+  ]);
 });
 
 test("B: resolver prompt includes pendingQuestion even when recentConversation empty", async () => {
@@ -321,7 +344,32 @@ test("G: accept path lists verified alternatives from booking-truth context", ()
       },
     },
   });
-  assert.match(String(plan.replyDraft ?? ""), /Civic|Stonic/i);
+  assert.equal(plan.replyDraft, "");
+  assert.equal(plan.customerResponseComposition?.lane, "availability");
+  assert.equal(
+    plan.customerResponseComposition?.kind,
+    "availability_alternatives"
+  );
+  assert.equal(
+    plan.customerResponseComposition?.conversationStage,
+    "verified_alternatives_list"
+  );
+  assert.equal(plan.customerResponseComposition?.missingField, "item_selection");
+  assert.deepEqual(plan.customerResponseComposition?.verifiedAlternatives, [
+    { itemId: CIVIC_ID, itemLabel: "Honda Civic" },
+    { itemId: STONIC_ID, itemLabel: "Kia Stonic" },
+  ]);
+  const replyAction = plan.actions.find((action) => action.type === "REPLY");
+  assert.equal(replyAction?.payload?.text, "");
+  assert.equal(replyAction?.payload?.field, "availability");
+  assert.equal(
+    replyAction?.payload?.source,
+    "canonical_verified_alternatives_list"
+  );
+  assert.equal(
+    plan.actions.some((action) => action.type === "CREATE_BOOKING"),
+    false
+  );
   assert.equal(
     plan.persistenceIntent?.lastAvailabilityAssist?.pendingPromptType,
     AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM
@@ -332,7 +380,7 @@ test("G: accept path lists verified alternatives from booking-truth context", ()
   );
   assert.equal(
     plan.persistenceIntent?.lastAvailabilityAssist?.pendingQuestion,
-    plan.replyDraft
+    AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION
   );
 });
 

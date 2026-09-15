@@ -32,7 +32,7 @@ test("golden E: Revo available hai → unlisted_item, no catalog resolve", () =>
   assert.equal(evaluation.ok, true, evaluation.violations.join("; "));
   assert.equal(outcome.workflowType, "unlisted_item");
   assert.equal(outcome.resolvedItemId, undefined);
-  assert.match(String(outcome.reply ?? ""), /hamari list mein nahi hai|not listed/i);
+  assert.match(String(outcome.reply ?? ""), /available nahi hai|hamari list mein nahi hai|not listed/i);
   assert.match(String(outcome.reply ?? ""), /revo/i);
 
   const types = (outcome.actionPlan?.actions ?? []).map((a) => a.type);

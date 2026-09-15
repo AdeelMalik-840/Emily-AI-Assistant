@@ -26,6 +26,10 @@ function extractCustomerMessageFromPrompt(args) {
   return content.split("CUSTOMER_MESSAGE:\n")[1].split("\n\n")[0];
 }
 
+function extractSystemPrompt(args) {
+  return args.messages.find((row) => row.role === "system")?.content ?? "";
+}
+
 /**
  * Drives the SHARED boundary (executeCloudDmOwnershipDecision) directly
  * with a hand-rolled callback, independent of the real Group adapter, to
@@ -64,6 +68,38 @@ const CATALOG = Object.freeze([
   Object.freeze({ id: "item-stonic", name: "Stonic", displayLabel: "Stonic" }),
 ]);
 
+test("semantic contract distinguishes wanting a rental for a duration from asking its monetary price", async () => {
+  let capturedArgs = null;
+  const message = "Corolla 4 din k lye rent p chyh";
+  const result = await executeCloudDmOwnershipDecision({
+    facts: { catalogItems: CATALOG },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async (args) => {
+      capturedArgs = args;
+      return completion(
+        decision({
+          semanticIntent: "availability_inquiry",
+          itemReferents: [current("Corolla", 0, 7)],
+        })
+      );
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.decision.semanticIntent, "availability_inquiry");
+  const system = extractSystemPrompt(capturedArgs);
+  assert.match(
+    system,
+    /rent(?:al)?(?:\s+mode|\s+transaction mode).*not.*pricing/i,
+    "the model contract must distinguish rental intent from a monetary pricing request"
+  );
+  assert.match(
+    system,
+    /pricing_with_duration:.*explicit monetary/i,
+    "pricing_with_duration must require an explicit monetary ask"
+  );
+});
+
 function current(surfaceText, start, end) {
   return {
     source: "current_turn",
@@ -83,6 +119,17 @@ function contextual() {
     end: null,
     trustedItemId: null,
     sourceTurnId: null,
+  };
+}
+
+function contextualHydrated(trustedItemId = "item-civic", sourceTurnId = "turn-civic") {
+  return {
+    source: "trusted_fresh_focus",
+    surfaceText: null,
+    start: null,
+    end: null,
+    trustedItemId,
+    sourceTurnId,
   };
 }
 
@@ -403,13 +450,14 @@ test("model-authored trusted IDs and invalid sources fail closed", () => {
   assert.equal(invalid.reason, "GROUP_ITEM_REFERENT_SOURCE_INVALID");
 });
 
-test("unknown, ambiguous, and duplicate catalog grounding fail closed", () => {
+test("unknown current-turn catalog grounding is unmatched, not fail-closed", () => {
   const message = "Revo";
   const unknown = validateGroupCanonicalSemanticDecision(
     decision({ itemReferents: [current("Revo", 0, 4)] }),
     { customerMessage: message, catalogItems: CATALOG }
   );
-  assert.equal(unknown.reason, "GROUP_ITEM_CATALOG_UNKNOWN");
+  assert.equal(unknown.ok, true);
+  assert.equal(unknown.reason, null);
 
   const ambiguousCatalog = [
     { id: "civic-a", name: "Civic", displayLabel: "Civic" },
@@ -419,7 +467,8 @@ test("unknown, ambiguous, and duplicate catalog grounding fail closed", () => {
     decision({ itemReferents: [current("Civic", 0, 5)] }),
     { customerMessage: "Civic", catalogItems: ambiguousCatalog }
   );
-  assert.equal(ambiguous.reason, "GROUP_ITEM_CATALOG_AMBIGUOUS");
+  assert.equal(ambiguous.ok, true);
+  assert.equal(ambiguous.reason, null);
 
   const duplicate = validateGroupCanonicalSemanticDecision(
     decision({
@@ -431,6 +480,88 @@ test("unknown, ambiguous, and duplicate catalog grounding fail closed", () => {
     }
   );
   assert.equal(duplicate.reason, "GROUP_DUPLICATE_TRUSTED_ITEM_REFERENT");
+});
+
+test("explicit current-turn item beats Civic trusted_fresh_focus; genuine continuations do not", () => {
+  const civicFocus = {
+    itemId: "item-civic",
+    name: "Civic",
+    displayLabel: "Civic",
+  };
+  const opts = {
+    catalogItems: CATALOG,
+    trustedFreshItemFocus: civicFocus,
+  };
+
+  const duration = validateGroupCanonicalSemanticDecision(
+    decision({ itemReferents: [contextualHydrated()] }),
+    { ...opts, customerMessage: "5 din" }
+  );
+  assert.equal(duration.ok, true, "5 din continues Civic");
+
+  const available = validateGroupCanonicalSemanticDecision(
+    decision({ itemReferents: [contextualHydrated()] }),
+    { ...opts, customerMessage: "available hai?" }
+  );
+  assert.equal(available.ok, true, "available hai? continues Civic");
+
+  const corolla = validateGroupCanonicalSemanticDecision(
+    decision({ itemReferents: [contextualHydrated()] }),
+    { ...opts, customerMessage: "Corolla available hai?" }
+  );
+  assert.equal(corolla.ok, false);
+  assert.equal(corolla.reason, "NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN");
+
+  const corollaCurrent = validateGroupCanonicalSemanticDecision(
+    decision({ itemReferents: [current("Corolla", 0, 7)] }),
+    { ...opts, customerMessage: "Corolla available hai?" }
+  );
+  assert.equal(corollaCurrent.ok, true);
+
+  const swiftContextual = validateGroupCanonicalSemanticDecision(
+    decision({ itemReferents: [contextualHydrated()] }),
+    { ...opts, customerMessage: "Swift rent p chyh th" }
+  );
+  assert.equal(swiftContextual.ok, false);
+  assert.equal(swiftContextual.reason, "EXPLICIT_CURRENT_OVERRIDES_FRESH_FOCUS");
+
+  const swiftCurrent = validateGroupCanonicalSemanticDecision(
+    decision({ itemReferents: [current("Swift", 0, 5)] }),
+    { ...opts, customerMessage: "Swift rent p chyh th" }
+  );
+  assert.equal(swiftCurrent.ok, true);
+});
+
+test("CONTEXTUAL Civic against an explicit off-catalog name retries once as current_turn", async () => {
+  const message = "Swift rent p chyh th";
+  let calls = 0;
+  const result = await executeCloudDmOwnershipDecision({
+    facts: {
+      catalogItems: CATALOG,
+      trustedFreshItemFocus: {
+        itemId: "item-civic",
+        name: "Civic",
+        displayLabel: "Civic",
+        sourceTurnId: "turn-civic",
+      },
+    },
+    userMessage: message,
+    __chatCompletionsCreateForTests: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return completion(decision({ itemReferents: [contextual()] }));
+      }
+      return completion(decision({ itemReferents: [current("Swift", 0, 5)] }));
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(calls, 2);
+  assert.equal(result.decision.itemReferents[0].source, "current_turn");
+  assert.equal(result.decision.itemReferents[0].surfaceText, "Swift");
+  assert.doesNotMatch(
+    JSON.stringify(result.decision.itemReferents),
+    /Civic/i
+  );
 });
 
 test("malformed model decision fails closed", () => {
@@ -773,6 +904,68 @@ test("callback boundary accepts a callback that changes several current_turn off
     result.decision.itemReferents.map((r) => [r.start, r.end]),
     [[0, 5], [9, 16]]
   );
+});
+
+test("none itemScope plus grounded current_turn referent is coerced to specific", () => {
+  const message = "or Revo ka?";
+  const grounded = groundGroupCurrentTurnItemReferents({
+    decision: decision({
+      semanticIntent: "clarification",
+      itemScope: "none",
+      itemReferents: [current("Revo", 3, 7)],
+      itemReferenceMode: "NONE",
+    }),
+    customerMessage: message,
+    catalogItems: CATALOG,
+  });
+  assert.equal(grounded.ok, true);
+  assert.equal(grounded.decision.itemScope, "specific");
+  assert.equal(grounded.decision.itemReferenceMode, "CURRENT_TURN");
+  assert.equal(grounded.decision.itemReferents[0].surfaceText, "Revo");
+});
+
+test("exact catalog-name span grounds CURRENT_TURN without a model referent", () => {
+  const message = "or Corolla ka?";
+  const grounded = groundGroupCurrentTurnItemReferents({
+    decision: decision({
+      semanticIntent: "clarification",
+      itemScope: "none",
+      itemReferents: [],
+      itemReferenceMode: "NONE",
+    }),
+    customerMessage: message,
+    catalogItems: CATALOG,
+  });
+  assert.equal(grounded.ok, true);
+  assert.equal(grounded.decision.itemScope, "specific");
+  assert.equal(grounded.decision.itemReferents.length, 1);
+  assert.equal(grounded.decision.itemReferents[0].source, "current_turn");
+  assert.equal(grounded.decision.itemReferents[0].surfaceText, "Corolla");
+});
+
+test("catalog-name CURRENT_TURN drops contextual focus instead of rejecting the turn", () => {
+  const message = "or Corolla?";
+  const grounded = groundGroupCurrentTurnItemReferents({
+    decision: decision({
+      semanticIntent: "clarification",
+      itemScope: "specific",
+      itemReferents: [contextual()],
+      itemReferenceMode: "CONTEXTUAL",
+    }),
+    customerMessage: message,
+    catalogItems: CATALOG,
+    trustedFreshItemFocus: {
+      itemId: "item-civic",
+      displayLabel: "Civic",
+      sourceTurnId: "turn-civic",
+    },
+  });
+  assert.equal(grounded.ok, true);
+  assert.deepEqual(
+    grounded.decision.itemReferents.map((ref) => ref.surfaceText),
+    ["Corolla"]
+  );
+  assert.equal(grounded.decision.itemReferenceMode, "CURRENT_TURN");
 });
 
 // "callback absent → existing Cloud behavior unchanged" is covered above by

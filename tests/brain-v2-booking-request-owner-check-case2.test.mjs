@@ -397,7 +397,12 @@ test("CASE D: confidently unavailable → Fix 1 REPLY only", () => {
     plan.actions.some((a) => a.type === "CREATE_BOOKING"),
     false
   );
-  assert.match(String(plan.replyDraft), /available nahi hai/i);
+  // Wording is composed later through the shared guarded composer, not
+  // authored by the workflow -- the structured marker proves this plan is
+  // routed to the unavailable-availability composition lane.
+  assert.equal(String(plan.replyDraft), "");
+  assert.equal(plan.customerResponseComposition?.lane, "availability");
+  assert.equal(plan.customerResponseComposition?.kind, "availability_unavailable");
 });
 
 test("CASE E: shared helper used; waiting_confirm confirmation lane untouched in workflow", () => {

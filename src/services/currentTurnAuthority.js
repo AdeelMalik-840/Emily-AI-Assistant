@@ -1,4 +1,5 @@
 import {
+  customerMessageHasNonStopResidueAfterSurface,
   extractEntity,
   getEntityConfidenceThreshold,
 } from "./entityExtraction.js";
@@ -146,6 +147,68 @@ export function hasExplicitNewItemMention(message, catalogItems, lockedItemId) {
   return { found: false, itemId: null, itemLabel: null };
 }
 
+function trustedFocusAliasTexts(trustedFreshItemFocus, catalogItems = []) {
+  const id = normalizeId(trustedFreshItemFocus?.itemId);
+  const row = id ? catalogRowById(catalogItems, id) : null;
+  return [
+    row?.name,
+    row?.displayLabel,
+    trustedFreshItemFocus?.name,
+    trustedFreshItemFocus?.displayLabel,
+    trustedFreshItemFocus?.itemLabel,
+    trustedFreshItemFocus?.customerReference,
+  ]
+    .map((value) => normalizeCatalogMatchText(value))
+    .filter(Boolean);
+}
+
+function surfaceAliasesTrustedFocus(surface, trustedFreshItemFocus, catalogItems = []) {
+  const needle = normalizeCatalogMatchText(surface);
+  if (!needle) return false;
+  return trustedFocusAliasTexts(trustedFreshItemFocus, catalogItems).some(
+    (alias) => alias === needle || alias.includes(needle) || needle.includes(alias)
+  );
+}
+
+/**
+ * Explicit current-turn item identity beats CONTEXTUAL / trusted_fresh_focus.
+ * Catalog names not equal to the trusted focus, and off-catalog named
+ * referents with leftover non-stop residue, reject contextual binding.
+ * Genuine continuations (duration, available hai?, acknowledgements) do not.
+ *
+ * @returns {"NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN" | "EXPLICIT_CURRENT_OVERRIDES_FRESH_FOCUS" | null}
+ */
+export function explicitCurrentItemBeatsContextualFocus({
+  customerMessage,
+  catalogItems = [],
+  trustedFreshItemFocus = null,
+  itemReferents = [],
+} = {}) {
+  const refs = Array.isArray(itemReferents) ? itemReferents : [];
+  const usesContextual = refs.some((row) => row?.source === "trusted_fresh_focus");
+  if (!usesContextual) return null;
+
+  const focusId = normalizeId(trustedFreshItemFocus?.itemId);
+  const knownIds = listExplicitCatalogItemIds(customerMessage, catalogItems);
+  const novelCatalogIds = knownIds.filter((id) => id !== focusId);
+  if (novelCatalogIds.length > 0) {
+    return "NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN";
+  }
+
+  const extracted = extractEntity(customerMessage);
+  const name = String(extracted?.name ?? "").trim();
+  if (!name || extracted?.entityType === "category") return null;
+  const threshold = getEntityConfidenceThreshold(name);
+  if (!(Number(extracted?.confidence) >= threshold)) return null;
+  if (!customerMessageHasNonStopResidueAfterSurface(customerMessage, name)) {
+    return null;
+  }
+  if (surfaceAliasesTrustedFocus(name, trustedFreshItemFocus, catalogItems)) {
+    return null;
+  }
+  return "EXPLICIT_CURRENT_OVERRIDES_FRESH_FOCUS";
+}
+
 /**
  * All catalog item IDs explicitly represented in THIS inbound message.
  * Reuses the same explicit matcher as hasExplicitNewItemMention.
@@ -241,6 +304,18 @@ export function resolveCanonicalItemReferents(itemReferents, catalogItems = []) 
         : { status: "NOT_MATCHED", referent: ref, itemId: null, itemLabel: null, catalogRow: null, matchSource: "trusted_item_id" };
     }
     const surfaceText = String(ref?.surfaceText ?? "").trim();
+    const explicitIds = listExplicitCatalogItemIds(surfaceText, items);
+    if (explicitIds.length > 1) {
+      return {
+        status: "AMBIGUOUS",
+        referent: ref,
+        itemId: null,
+        itemLabel: null,
+        catalogRow: null,
+        candidates: explicitIds,
+        matchSource: "canonical_surface_exact",
+      };
+    }
     const explicit = hasExplicitNewItemMention(surfaceText, items, null);
     if (explicit.found && explicit.itemId) {
       const row = catalogRowById(items, explicit.itemId);

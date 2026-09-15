@@ -135,6 +135,7 @@ function emptyBusinessFacts(extra = {}) {
   return {
     name: null,
     category: null,
+    businessType: null,
     tone: null,
     instructions: null,
     knowledgeAllowedFor: [...KNOWLEDGE_ALLOWED_FOR],
@@ -183,6 +184,7 @@ export async function resolveBusinessProfileFacts(businessId, getProfileFn = get
     const name =
       String(profileData.businessName ?? p.businessName ?? "").trim() || null;
     const category = String(p.category ?? profileData.businessType ?? "").trim() || null;
+    const businessType = String(p.businessType ?? profileData.businessType ?? "").trim() || null;
     const tone = String(profileData.tone ?? profileData.conversationStyle ?? "").trim() || null;
     const knowledge =
       typeof p.businessKnowledge === "string" && p.businessKnowledge.trim()
@@ -205,6 +207,7 @@ export async function resolveBusinessProfileFacts(businessId, getProfileFn = get
       business: {
         name,
         category,
+        businessType,
         tone,
         instructions,
         knowledgeAllowedFor: [...KNOWLEDGE_ALLOWED_FOR],

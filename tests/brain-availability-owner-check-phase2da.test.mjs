@@ -10,7 +10,6 @@ process.env.EMILY_BRAIN_V2_AVAILABILITY_OWNER_CHECK_EXECUTE = "false";
 
 import {
   buildAvailabilityInquiryActionPlan,
-  buildAskDurationAvailabilityReply,
   buildOwnerCheckDeferralReply,
 } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import { runBrainV2LivePipeline } from "../src/brain/live/brainV2LivePipeline.js";
@@ -117,11 +116,9 @@ test("1: Civic available? asks duration and creates no owner action", () => {
 
   assert.equal(plan.actions.length, 1);
   assert.equal(plan.actions[0]?.type, "REPLY");
-  assert.equal(
-    plan.replyDraft,
-    "Civic ka mai check kar leta hun. Kitne din ke liye chahiye?"
-  );
-  assert.doesNotMatch(String(plan.replyDraft ?? ""), /Available hai/i);
+  assert.equal(plan.replyDraft, "");
+  assert.equal(plan.customerResponseComposition?.kind, "duration_ask");
+  assert.equal(plan.customerResponseComposition?.conversationStage, "initial_request");
   assert.ok(!plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"));
 });
 
@@ -213,11 +210,29 @@ test("5: live pipeline — Civic available? asks duration with no side effects",
     isGroupInbound: true,
     chatType: "group",
     participantKey: "cust-1",
+    getBusinessProfileFn: async () => null,
     getBookingsForItemFn: async () => [],
+    __cloudComposeChatCreate: async () => ({
+      choices: [{ message: { content: JSON.stringify({
+        customerReply: "How many days or which dates do you need the Civic for?",
+        customerInputRequested: true,
+        requestedInput: "rental_period",
+        availabilityCheckStarted: false,
+        replySemantics: {
+          claims: [],
+          languageStyle: "english",
+          containsTimingPromise: false,
+          exposesInternalProcess: false,
+        },
+      }) } }],
+    }),
   });
 
   assert.equal(result.workflowType, "availability_inquiry");
-  assert.match(String(result.reply ?? ""), /Kitne din ke liye chahiye/i);
+  assert.equal(
+    result.reply,
+    "How many days or which dates do you need the Civic for?"
+  );
   assert.doesNotMatch(String(result.reply ?? ""), /Available hai/i);
   assert.equal(result.legacyBypassed, true);
   assert.equal(result.messageMeta?.bookingCreated, undefined);
@@ -239,6 +254,7 @@ test("6: live pipeline — duration availability creates owner-check action exec
     isGroupInbound: true,
     chatType: "group",
     participantKey: "cust-1",
+    getBusinessProfileFn: async () => null,
     getBookingsForItemFn: async () => [],
   });
 
@@ -249,11 +265,7 @@ test("6: live pipeline — duration availability creates owner-check action exec
   assert.equal(result.messageMeta?.bookingCreated, undefined);
 });
 
-test("7: reply builders match approved copy", () => {
-  assert.equal(
-    buildAskDurationAvailabilityReply("Civic"),
-    "Civic ka mai check kar leta hun. Kitne din ke liye chahiye?"
-  );
+test("7: excluded owner-check fallback builder remains unchanged", () => {
   assert.equal(
     buildOwnerCheckDeferralReply("Civic", 3),
     "Civic 3 din ke liye mai confirm kar leta hun."

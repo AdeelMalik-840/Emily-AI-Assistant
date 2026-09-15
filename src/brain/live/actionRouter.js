@@ -89,6 +89,7 @@ export const INFO_LIVE_ALLOWED_WORKFLOW_TYPES = new Set([
   "availability_inquiry",
   "pricing_with_duration",
   "browse_options",
+  "item_not_in_catalog",
   "unlisted_item",
 ]);
 
@@ -98,6 +99,7 @@ export const LIVE_ALLOWED_WORKFLOW_TYPES = new Set([
   "pricing_inquiry",
   "pricing_with_duration",
   "browse_options",
+  "item_not_in_catalog",
   "unlisted_item",
   "clarification",
   "unknown_clarification",
@@ -252,12 +254,28 @@ export function assertLiveActionPlanIsSafe(actionPlan, flags) {
       typeof a.payload.trustedBrowseFacts === "object" &&
       String(a.text ?? "").trim() === ""
     );
+  const awaitsAvailabilityCompose =
+    actionPlan?.customerResponseComposition?.lane === "availability" &&
+    [
+      "availability",
+      "availability_unavailable",
+      "availability_alternatives",
+      "duration_ask",
+      "temporal_clarification",
+    ].includes(String(actionPlan?.customerResponseComposition?.kind ?? "")) &&
+    routed.actions.some(
+      (a) =>
+        a.type === "REPLY" &&
+        String(a?.payload?.field ?? "") === "availability" &&
+        String(a.text ?? "").trim() === ""
+    );
   if (
     !routed.intentionallySilent &&
     !routed.reply &&
     !awaitsPostExecuteReply &&
     !hasOwnerCheckNotExecuted &&
-    !awaitsBrowseCompose
+    !awaitsBrowseCompose &&
+    !awaitsAvailabilityCompose
   ) {
     const hasReplyAction = routed.actions.some((a) => a.type === "REPLY" && a.text);
     if (!hasReplyAction) {
@@ -565,7 +583,27 @@ export async function executeLiveSideEffects(p) {
  * }} p
  */
 export function applyInfoLiveSessionMemoryPatch(p) {
-  applySessionMemoryFromActionPlan(p);
+  // Cloud DM confirms focus after WhatsApp outbound delivery. Group Playwright
+  // has no second apply — this pipeline commit is the delivery boundary.
+  // When a plan asks to remember presented focus, persist it here so the next
+  // itemless continuation can bind (mil-jye / elliptical duration price).
+  const wantsPresentedFocus =
+    p?.actionPlan?.persistenceIntent?.rememberPresentedItemFocus === true;
+  const presentedId = String(
+    p?.actionPlan?.persistenceIntent?.presentedItemId ?? ""
+  ).trim();
+  const sourceTurnId =
+    String(p?.sourceTurnId ?? "").trim() ||
+    (wantsPresentedFocus && presentedId
+      ? `assistant:presented:${presentedId}`
+      : "");
+  applySessionMemoryFromActionPlan({
+    ...p,
+    ...(sourceTurnId ? { sourceTurnId } : {}),
+    outboundDelivered:
+      p?.outboundDelivered === true ||
+      (wantsPresentedFocus && Boolean(sourceTurnId)),
+  });
 }
 
 /**

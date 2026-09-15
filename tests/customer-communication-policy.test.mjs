@@ -19,7 +19,7 @@ import {
 import { executeGroupPostExecuteLaneDecision } from "../src/brain/decisions/groupPostExecuteLane.js";
 import { executeWaitingConfirmDmLaneDecision } from "../src/brain/decisions/waitingConfirmDmLane.js";
 import { executePostConfirmPaLaneDecision } from "../src/brain/decisions/decidePostConfirmCustomerDm.js";
-import { composeUnavailableCustomerReplyFromFacts } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import { composeCloudCanonicalCustomerReply } from "../src/brain/openai/composeCloudCanonicalCustomerReply.js";
 import { generatePaMissingInfoCustomerFollowupFromOwnerAnswer } from "../src/services/customerBusinessPaAiReply.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -28,7 +28,11 @@ const ACTIVE_PATH_FILES = [
   "src/brain/decisions/groupPostExecuteLane.js",
   "src/brain/decisions/waitingConfirmDmLane.js",
   "src/brain/decisions/decidePostConfirmCustomerDm.js",
-  "src/brain/workflows/AvailabilityInquiryWorkflow.js",
+  // AvailabilityInquiryWorkflow.js no longer composes wording itself --
+  // normal availability replies are now composed later, through the shared
+  // guarded composer below, which is where policy enforcement now lives for
+  // that lane.
+  "src/brain/openai/composeCloudCanonicalCustomerReply.js",
   "src/services/customerBusinessPaAiReply.js",
 ];
 
@@ -66,7 +70,7 @@ test("policy: group and DM differ only in length guidance", () => {
   const dm = buildCustomerCommunicationPolicy({ channel: "dm" });
   assert.match(group, new RegExp(CUSTOMER_COMMUNICATION_POLICY_MARKER));
   assert.match(dm, new RegExp(CUSTOMER_COMMUNICATION_POLICY_MARKER));
-  assert.match(group, /LENGTH \(group\):.*ONE short/i);
+  assert.match(group, /LENGTH \(group\):.*one or two short/i);
   assert.match(dm, /LENGTH \(DM\):.*one to three short/i);
   assert.doesNotMatch(group, /LENGTH \(DM\)/);
   assert.doesNotMatch(dm, /LENGTH \(group\)/);
@@ -167,7 +171,7 @@ test("1: group_post_execute system prompt includes shared policy; one OpenAI att
   assert.equal(getCalls(), 1);
   assert.match(systems[0], new RegExp(CUSTOMER_COMMUNICATION_POLICY_MARKER));
   assert.match(systems[0], /LENGTH \(group\)/);
-  assert.match(systems[0], /action must be "reply" or "silence" only/);
+  assert.match(systems[0], /action must be "reply"/);
   assert.doesNotMatch(systems[0], /availability checking is in progress/i);
 });
 
@@ -289,18 +293,26 @@ test("4: unavailable compose includes shared group policy; one OpenAI call", asy
       },
     })
   );
-  const reply = await composeUnavailableCustomerReplyFromFacts({
-    conversationalLabel: "Corolla",
-    durationDays: 2,
-    alternatives: [],
+  const reply = await composeCloudCanonicalCustomerReply({
+    kind: "availability_unavailable",
+    channel: "group",
+    semanticIntent: "availability_inquiry",
+    customerMessage: "Corolla available hai?",
+    trustedFacts: {
+      itemLabel: "Corolla",
+      durationDays: 2,
+      availabilityStatus: "unavailable",
+      verifiedAlternatives: [],
+      verifiedAlternativesCount: 0,
+    },
     __chatCompletionsCreateForTests: create,
   });
   assert.equal(getCalls(), 1);
-  assert.ok(String(reply || "").length > 0);
+  assert.ok(String(reply.reply || "").length > 0);
   assert.match(systems[0], new RegExp(CUSTOMER_COMMUNICATION_POLICY_MARKER));
   assert.match(systems[0], /LENGTH \(group\)/);
   assert.match(systems[0], /replySemantics/);
-  assert.match(systems[0], /verifiedAlternatives is empty/);
+  assert.match(systems[0], /verifiedAlternativesCount/);
 });
 
 test("5: PA missing-info follow-up includes shared DM policy; one OpenAI call", async () => {
@@ -339,5 +351,6 @@ test("no fixed customer reply map introduced in shared policy module", () => {
     "utf8"
   );
   assert.doesNotMatch(src, /const\s+FIXED_REPLIES|replyMap|cannedReplies/i);
-  assert.match(src, /NOT a fixed reply/);
+  assert.doesNotMatch(src, /Style demonstration|Corolla|Civic|Stonic/i);
+  assert.match(src, /make conversational progress/i);
 });

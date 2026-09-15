@@ -8,10 +8,13 @@ process.env.OPENAI_API_KEY ||= "test-key";
 process.env.NODE_ENV = "test";
 
 import {
-  buildAvailabilityInquiryActionPlan,
+  buildAvailabilityInquiryActionPlan as buildRawAvailabilityInquiryActionPlan,
   buildUnavailableAvailabilityFailsafeReply,
-  composeUnavailableCustomerReplyFromFacts,
 } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import { composeUnavailableThroughSharedGuard as composeUnavailableCustomerReplyFromFacts, materializeAvailabilityPlanForTest } from "./helpers/availabilityCompositionTestHarness.mjs";
+
+const buildAvailabilityInquiryActionPlan = (args) =>
+  materializeAvailabilityPlanForTest(buildRawAvailabilityInquiryActionPlan(args));
 import {
   buildOfferedAlternativesAssist,
   AVAILABILITY_ASSIST_TTL_MS,

@@ -10,6 +10,11 @@ import {
   normalizeCustomerLanguageStyle,
   normalizeCustomerReplyChannel,
 } from "../contracts/customerReplyContract.js";
+import {
+  GROUP_RESPONSE_ACTS,
+  isRequestCustomerInputAct,
+  replyEchoesCurrentCustomerTurn,
+} from "../contracts/canonicalGroupTurnContract.js";
 import { findConservativeFuzzyCatalogMention } from "../../services/currentTurnAuthority.js";
 
 const TIMING_PROMISE_RE =
@@ -25,8 +30,31 @@ const SYSTEM_STATUS_RE =
 const CONFIRMED_AVAILABLE_RE =
   /\b(available hai|is available|available now)\b/i;
 
-const CHECKING_LANGUAGE_RE =
-  /\bcheck\b|\bdekh\b|\bconfirm hote\b|\bbata deta\b|\bbata dun\b|\bbata det[ae]\b/i;
+/** Generic “confirmed unavailable” claim — not brand/car-specific. */
+const UNAVAILABLE_CLAIM_RE =
+  /\b(available nahi hai|not available|unavailable|available nahi)\b/i;
+
+/**
+ * Literal-text signals for claims a model can express even without
+ * self-declaring them in replySemantics.claims (defense in depth alongside
+ * the self-declared-claims check below). Extend this list, not a new
+ * bespoke if-block, when another claim needs the same generic text-level
+ * check. Each entry's own `reason` is kept stable for backward
+ * compatibility with existing callers/tests.
+ */
+const CLAIM_TEXT_SIGNALS = Object.freeze([
+  {
+    claim: CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_CONFIRMED,
+    pattern: CONFIRMED_AVAILABLE_RE,
+    reason: "unsupported_availability_confirmed_claim",
+  },
+  {
+    claim: CUSTOMER_CLAIMS.RESOURCE_UNAVAILABLE,
+    pattern: UNAVAILABLE_CLAIM_RE,
+    reason: "unsupported_unavailable_claim",
+  },
+]);
+
 
 /**
  * Successful booking/reservation completion wording — blocked unless the
@@ -764,13 +792,22 @@ function validateVerifiedReplyEntities(text, contract, groundedFacts = null) {
  * @param {string} replyText
  * @param {Record<string, unknown>} contract
  * @param {{ claims?: string[], languageStyle?: string, containsTimingPromise?: boolean, exposesInternalProcess?: boolean } | null} semantics
+ * @param {Record<string, unknown> | null} [groundedFacts]
+ * @param {{ customerInputRequested?: boolean, requestedInput?: string | null, availabilityCheckStarted?: boolean | null, referencedItemId?: string | null, referencedItemSurface?: string | null } | null} [executionFields]
+ *   Optional. When provided, the SAME structural execution-contract checks
+ *   applied to a primary candidate (customerInputRequested/requestedInput/
+ *   availabilityCheckStarted vs. the frozen contract) are re-applied here --
+ *   used so a reviewer rewrite can be revalidated exactly like a fresh
+ *   candidate, never with a weaker check. Existing callers that omit this
+ *   param are completely unaffected.
  * @returns {{ ok: boolean, reason?: string }}
  */
 export function validateCustomerReplyAgainstContract(
   replyText,
   contract,
   semantics = null,
-  groundedFacts = null
+  groundedFacts = null,
+  executionFields = null
 ) {
   const text = String(replyText ?? "").trim();
   const channel = normalizeCustomerReplyChannel(contract?.channel);
@@ -782,6 +819,9 @@ export function validateCustomerReplyAgainstContract(
       ? contract.forbiddenClaims.map(String)
       : []
   );
+  const required = Array.isArray(contract?.requiredClaims)
+    ? contract.requiredClaims.map(String)
+    : [];
   const replyRequired = contract?.replyRequired !== false;
   const claims = Array.isArray(semantics?.claims)
     ? semantics.claims.map(String)
@@ -826,12 +866,142 @@ export function validateCustomerReplyAgainstContract(
     }
   }
 
+  // Positive objective fidelity: a required claim is the ONE structured,
+  // semantic (never text-pattern-based) way to verify a candidate actually
+  // fulfills its objective, not merely that it avoids forbidden claims. A
+  // live defect proved negative-only checks insufficient ("no update" for
+  // an owner-check-holding reply violated nothing forbidden, yet failed to
+  // acknowledge the request is being progressed).
+  for (const requiredClaim of required) {
+    if (!claims.includes(requiredClaim)) {
+      return { ok: false, reason: `missing_required_claim:${requiredClaim}` };
+    }
+  }
+
+  // Item-reference provenance: when the contract requires preserving the
+  // customer's own trusted wording for this item (itemReferenceRequirement
+  // === "required", set only when a trusted customerReference actually
+  // exists for this turn -- see itemReferenceRequirementForReplyKind), the
+  // delivered text must literally contain that exact trusted wording, and
+  // -- when the candidate declared referencedItemId/referencedItemSurface --
+  // those declared values must match the trusted item identity/surface
+  // exactly. This is provenance validation against trusted facts, never a
+  // per-item hardcoded phrase check.
+  if (String(contract?.itemReferenceRequirement ?? "optional") === "required") {
+    const trustedItemId = String(contract?.verifiedCustomerFacts?.itemId ?? "").trim();
+    const trustedCustomerReference = String(
+      contract?.verifiedCustomerFacts?.customerReference ?? ""
+    ).trim();
+    if (trustedCustomerReference) {
+      if (!text.includes(trustedCustomerReference)) {
+        return { ok: false, reason: "item_reference_not_present_in_reply" };
+      }
+      if (
+        executionFields &&
+        (executionFields.referencedItemId !== undefined ||
+          executionFields.referencedItemSurface !== undefined)
+      ) {
+        const declaredItemId = String(executionFields.referencedItemId ?? "").trim();
+        const declaredSurface = String(executionFields.referencedItemSurface ?? "").trim();
+        if (
+          declaredItemId !== trustedItemId ||
+          declaredSurface !== trustedCustomerReference
+        ) {
+          return { ok: false, reason: "item_reference_provenance_mismatch" };
+        }
+      }
+    }
+  }
+
+  if (executionFields) {
+    const expectedInputRequired = contract?.customerInputRequired === true;
+    if (expectedInputRequired) {
+      if (
+        executionFields.customerInputRequested !== true ||
+        executionFields.requestedInput !== contract?.requestedInput ||
+        executionFields.availabilityCheckStarted !==
+          contract?.executionState?.availabilityCheckStarted
+      ) {
+        return { ok: false, reason: "duration_input_contract_not_satisfied" };
+      }
+    } else {
+      if (
+        executionFields.customerInputRequested !== false ||
+        executionFields.requestedInput != null
+      ) {
+        return { ok: false, reason: "no_input_response_contract_not_satisfied" };
+      }
+      // Only enforced when the contract itself takes a position (true/false)
+      // on whether the check has started -- kinds where it is genuinely not
+      // applicable (executionState.availabilityCheckStarted === null) impose
+      // no constraint here.
+      if (
+        contract?.executionState?.availabilityCheckStarted != null &&
+        executionFields.availabilityCheckStarted !==
+          contract.executionState.availabilityCheckStarted
+      ) {
+        return { ok: false, reason: "execution_state_not_satisfied" };
+      }
+    }
+  }
+
+  const frozenAct = String(contract?.requiredAct ?? "").trim();
+  if (frozenAct) {
+    if (String(executionFields?.responseAct ?? "").trim() !== frozenAct) {
+      return { ok: false, reason: "required_response_act_not_satisfied" };
+    }
+    const frozenFn = String(contract?.utteranceFunction ?? "").trim();
+    if (
+      frozenFn &&
+      String(executionFields?.utteranceFunction ?? "").trim() !== frozenFn
+    ) {
+      return { ok: false, reason: "required_utterance_function_not_satisfied" };
+    }
+    if (
+      isRequestCustomerInputAct(frozenAct) &&
+      replyEchoesCurrentCustomerTurn(text, contract?.customerMessageText)
+    ) {
+      return { ok: false, reason: "required_response_act_echoes_customer_turn" };
+    }
+    // PRESENT_VERIFIED_PRICE must be a customer-facing price answer, not a
+    // bare verified numeral. Live defect: model returned only the daily rate
+    // digits ("8000") and money-mismatch checks skipped it because those
+    // only fire on currency-marked amounts. Require lexical material plus at
+    // least one explicit currency-marked amount that matches trusted facts.
+    // Act-scoped only — social / asks / browse remain free to be compact.
+    if (frozenAct === GROUP_RESPONSE_ACTS.PRESENT_VERIFIED_PRICE) {
+      const verifiedAmounts = verifiedMoneyValues(
+        contract?.verifiedCustomerFacts &&
+          typeof contract.verifiedCustomerFacts === "object"
+          ? contract.verifiedCustomerFacts
+          : {}
+      );
+      if (verifiedAmounts.length > 0) {
+        if (!/\p{L}/u.test(text)) {
+          return { ok: false, reason: "verified_price_presentation_incomplete" };
+        }
+        const explicitAmounts = extractExplicitMoneyAmounts(text);
+        const matched = explicitAmounts.some((amount) =>
+          verifiedAmounts.some(
+            (verified) => Number.isFinite(verified) && Math.abs(verified - amount) < 0.005
+          )
+        );
+        if (!matched) {
+          return { ok: false, reason: "verified_price_presentation_incomplete" };
+        }
+      }
+    }
+  }
+
   if (semantics?.exposesInternalProcess === true || INTERNAL_PROCESS_RE.test(text)) {
     return { ok: false, reason: "internal_process_disclosure" };
   }
 
   const timingInText = TIMING_PROMISE_RE.test(text);
   const hasVerifiedTime = contract?.verifiedTiming?.hasVerifiedTime === true;
+  if (semantics?.containsTimingPromise === true && !hasVerifiedTime) {
+    return { ok: false, reason: "unsupported_timing_promise" };
+  }
   if (timingInText && !hasVerifiedTime) {
     return { ok: false, reason: "unsupported_timing_promise" };
   }
@@ -840,12 +1010,10 @@ export function validateCustomerReplyAgainstContract(
     return { ok: false, reason: "technical_status_wording" };
   }
 
-  if (
-    forbidden.has(CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_CONFIRMED) &&
-    CONFIRMED_AVAILABLE_RE.test(text) &&
-    !CHECKING_LANGUAGE_RE.test(text)
-  ) {
-    return { ok: false, reason: "unsupported_availability_confirmed_claim" };
+  for (const signal of CLAIM_TEXT_SIGNALS) {
+    if (forbidden.has(signal.claim) && signal.pattern.test(text)) {
+      return { ok: false, reason: signal.reason };
+    }
   }
 
   if (
@@ -956,6 +1124,21 @@ export function validateCustomerReplyAgainstContract(
     }
   }
 
+  // CLASS B -- soft quality signal, never a delivery authority. Language /
+  // register is generation guidance, not business-state truth (customers
+  // code-switch, spell things inconsistently, and mix English/Roman Urdu
+  // freely; an English-worded question can naturally get a Roman Urdu or
+  // mixed reply, e.g. "Corolla available?" -> "Corolla kitne din ke liye
+  // chahiye?"). A live defect proved this check had accidentally been given
+  // CLASS A authority: it lived in this same function, returned the same
+  // {ok:false} shape as the real truth/safety/state checks above, and its
+  // caller (composeGuardedCustomerReply.js) could not tell the difference --
+  // so a factually correct, fully safe duration_ask candidate was discarded
+  // into technical_fallback purely because a keyword heuristic guessed the
+  // customer's message and the reply "disagreed" on language. This signal is
+  // still computed (never silently dropped) so the language-quality reviewer
+  // stage and diagnostics can see it -- it must never again independently
+  // block a candidate that has cleared every CLASS A check above.
   const customerLang = normalizeCustomerLanguageStyle(
     contract?.customerLanguageStyle ??
       inferCustomerLanguageStyle(
@@ -972,17 +1155,19 @@ export function validateCustomerReplyAgainstContract(
     text,
     declaredReplyLang || "mixed"
   );
-  if (isClearLanguageMismatch(customerLang, replyLang)) {
-    return { ok: false, reason: "customer_language_mismatch" };
-  }
-  if (
-    declaredReplyLang &&
-    isClearLanguageMismatch(customerLang, declaredReplyLang)
-  ) {
-    return { ok: false, reason: "customer_language_mismatch" };
-  }
+  const customerLanguageStyleMismatch =
+    isClearLanguageMismatch(customerLang, replyLang) ||
+    (Boolean(declaredReplyLang) &&
+      isClearLanguageMismatch(customerLang, declaredReplyLang));
 
-  return { ok: true };
+  return {
+    ok: true,
+    softSignals: {
+      customerLanguageStyleMismatch,
+      customerLang,
+      replyLang,
+    },
+  };
 }
 
 /**
@@ -997,19 +1182,37 @@ export function isVerifiedCustomerClaimMismatchReason(reason) {
 }
 
 /**
+ * Extract the specific claim a reason string reports a violation for, when
+ * the reason follows one of this guard's claim-violation shapes. Generic
+ * parsing, not a per-claim branch here -- covers any future forbidden claim
+ * without new code in this function.
  * @param {string} reason
+ * @returns {string | null}
+ */
+export function extractViolatedClaimFromReason(reason) {
+  const forbiddenMatch = /^forbidden_claim:(.+)$/.exec(reason);
+  if (forbiddenMatch) return forbiddenMatch[1];
+  const signal = CLAIM_TEXT_SIGNALS.find((entry) => entry.reason === reason);
+  return signal ? signal.claim : null;
+}
+
+/**
+ * @param {string} reason
+ * @param {{ objective?: string | null, requestedInput?: string | null }} [options]
+ *   Canonical reply-policy context (see buildCustomerReplyPolicy) so the
+ *   correction can be derived from the actual violated rule + current
+ *   objective, generically, instead of a fixed sentence per reason.
  * @returns {string}
  */
-export function buildCustomerReplyGuardCorrection(reason) {
+export function buildCustomerReplyGuardCorrection(reason, options = {}) {
   const failureReason = String(reason ?? "").trim() || "validation_failed";
+  const objective = String(options?.objective ?? "").trim() || null;
+  const requestedInput = String(options?.requestedInput ?? "").trim() || null;
   const lines = [
     `CORRECTION: Your previous customer reply failed validation (${failureReason}).`,
     "Use ONLY verified customer-safe facts.",
     "If the failure is dm_reply_too_long or group_reply_too_long, return a materially shorter customerReply within the contract limit.",
-    "Match the customer's language in replySemantics.languageStyle and in customerReply wording:",
-    "- english customer → english reply",
-    "- roman_urdu customer → roman_urdu reply",
-    "- mixed customer → mixed is fine",
+    "Write naturally in whatever language/register genuinely fits this conversation (English, Roman Urdu, or a natural mix) and set replySemantics.languageStyle honestly to match -- code-switching or answering in a different register than the customer's own message is normal and never itself a defect to correct.",
     "Do not claim resource availability is confirmed unless allowedClaims includes resource_availability_confirmed.",
     "Do not claim booking/reservation/appointment/order created or confirmed unless verified post-execution facts allow it.",
     "Before booking execution succeeds, only acknowledge confirmation received / request will proceed — do not paste the customer's message back.",
@@ -1025,6 +1228,38 @@ export function buildCustomerReplyGuardCorrection(reason) {
       "- If the requested detail is absent from verified facts, naturally say it is not confirmed yet OR ask one useful clarification.",
       "- Never invent a substitute date, time, amount, location, status, policy, reference, or item.",
       "- Keep action=reply with a non-empty customerReply. No silence, no mutation, no escalate, no workflow change."
+    );
+  }
+  if (/^CONTINUATION_(?:REPEATS_PREVIOUS_REPLY|CONTAINS_PREVIOUS_REPLY_VERBATIM|MATERIALLY_REPEATS_PREVIOUS_REPLY)$/.test(failureReason)) {
+    lines.push(
+      "The previous draft repeated or lightly rearranged the prior assistant reply.",
+      "Preserve the same trusted facts and required missing input, but make genuine conversational progress.",
+      "Do not repeat the prior sentence, lightly paraphrase it, or simply append text."
+    );
+  }
+  if (failureReason === "DURATION_INPUT_CONTRACT_NOT_SATISFIED") {
+    lines.push(
+      "The previous draft did not satisfy the required structured missing-input fields for this reply.",
+      "customerInputRequested must be true, and availabilityCheckStarted must be false.",
+      "requestedInput must match what THIS reply is missing, not the sibling case: use \"rental_period\" when the missing input is rental duration -- use \"start_date\" only when the missing input is a start date the customer already referenced but did not give clearly.",
+      "If you are asking for the missing rental duration, requestedInput must be exactly \"rental_period\". Do not turn this into a start-date question, and never set requestedInput to \"start_date\" for that case.",
+      "Preserve the same meaning and trusted facts; only the structured fields need correcting."
+    );
+    if (requestedInput) {
+      lines.push(
+        `For the current objective${objective ? ` (${objective})` : ""}, requestedInput must be exactly "${requestedInput}".`
+      );
+    }
+  }
+  const violatedClaim = extractViolatedClaimFromReason(failureReason);
+  if (violatedClaim) {
+    lines.push(
+      `Previous reply asserted a forbidden claim: ${violatedClaim}.`,
+      objective
+        ? `The current objective is only: ${objective}. That objective does not permit this claim.`
+        : "The current reply objective does not permit this claim.",
+      "Remove that claim entirely -- do not state, imply, or hint at it in any form, in any language.",
+      "Preserve the trusted item and context, and generate a materially new natural reply that pursues only the current objective."
     );
   }
   lines.push(

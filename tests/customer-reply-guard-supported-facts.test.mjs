@@ -93,7 +93,11 @@ test("one canonical contract accepts all verified booking details together", () 
     })
   );
 
-  assert.deepEqual(result, { ok: true });
+  // ok:true also carries a non-authoritative softSignals diagnostic (see
+  // validateCustomerReplyAgainstContract's CLASS B comment) -- assert the
+  // outcome, not the full return shape, so this test stays agnostic to
+  // additive diagnostic fields.
+  assert.equal(result.ok, true);
 });
 
 test("a different car is rejected against the selected canonical booking", () => {
@@ -163,7 +167,11 @@ test("browse-scoped reference-text exemption permits ordinary no-option wording"
     semantics({ languageStyle: "english" }),
     grounded()
   );
-  assert.deepEqual(result, { ok: true });
+  // ok:true also carries a non-authoritative softSignals diagnostic (see
+  // validateCustomerReplyAgainstContract's CLASS B comment) -- assert the
+  // outcome, not the full return shape, so this test stays agnostic to
+  // additive diagnostic fields.
+  assert.equal(result.ok, true);
 });
 
 test("wrong dates and pickup or delivery times fail the shared guard", () => {
@@ -229,7 +237,11 @@ test("an explicit verified zero remains a valid fact", () => {
     semantics(),
     grounded({ totalAmount: 0 })
   );
-  assert.deepEqual(result, { ok: true });
+  // ok:true also carries a non-authoritative softSignals diagnostic (see
+  // validateCustomerReplyAgainstContract's CLASS B comment) -- assert the
+  // outcome, not the full return shape, so this test stays agnostic to
+  // additive diagnostic fields.
+  assert.equal(result.ok, true);
 });
 
 test("declared item, duration, amount, date, or time fails when no verified fact exists", () => {
@@ -307,6 +319,39 @@ test("availability claims remain controlled by the same verified claim contract"
   );
   assert.equal(blocked.reason, "unsupported_availability_confirmed_claim");
 
+  const contradictory = validateCustomerReplyAgainstContract(
+    "Corolla abhi available hai, lekin rental duration bata dein taake main check kar sakun.",
+    contract(
+      verifiedFacts({
+        itemId: "item-corolla",
+        itemLabel: "Corolla",
+        catalogItems: [{ id: "item-corolla", name: "Corolla", aliases: [] }],
+      }),
+      { forbiddenClaims: ["resource_availability_confirmed"] }
+    ),
+    semantics({ claims: [] }),
+    grounded({ itemId: "item-corolla" })
+  );
+  assert.equal(
+    contradictory.reason,
+    "unsupported_availability_confirmed_claim"
+  );
+
+  const checkingOnly = validateCustomerReplyAgainstContract(
+    "Corolla ki availability check kar sakun, rental duration bata dein.",
+    contract(
+      verifiedFacts({
+        itemId: "item-corolla",
+        itemLabel: "Corolla",
+        catalogItems: [{ id: "item-corolla", name: "Corolla", aliases: [] }],
+      }),
+      { forbiddenClaims: ["resource_availability_confirmed"] }
+    ),
+    semantics({ claims: [] }),
+    grounded({ itemId: "item-corolla" })
+  );
+  assert.equal(checkingOnly.ok, true);
+
   const allowed = validateCustomerReplyAgainstContract(
     "Kia Stonic available hai.",
     contract(verifiedFacts(), {
@@ -315,5 +360,5 @@ test("availability claims remain controlled by the same verified claim contract"
     semantics({ claims: ["resource_availability_confirmed"] }),
     grounded({ itemId: "item-stonic" })
   );
-  assert.deepEqual(allowed, { ok: true });
+  assert.equal(allowed.ok, true);
 });

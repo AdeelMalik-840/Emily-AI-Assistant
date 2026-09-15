@@ -77,7 +77,7 @@ test("pending availability item, duration and nested price quote use the shared 
       dailyRate: 5500,
     })
   );
-  assert.deepEqual(accepted, { ok: true });
+  assert.equal(accepted.ok, true);
 
   const wrongDuration = validateCustomerReplyAgainstContract(
     "Kia Stonic 5 din ke liye available hai.",

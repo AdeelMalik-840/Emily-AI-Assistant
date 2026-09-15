@@ -23,7 +23,7 @@ import {
   isListenerInboundNoise,
   isPlaywrightGuaranteeFirstAdmissionEnabled,
   logGuaranteeFirstSelection,
-  resolveBaselineTailUserDeferral,
+  resolveBaselineLiveUserDeferral,
 } from "../src/services/playwrightListener/listener.js";
 import { getMessageState, setMessageState } from "../src/services/messageState.js";
 import {
@@ -53,15 +53,115 @@ test.beforeEach(() => {
   globalThis.__messageStateMap = new Map();
 });
 
+test("startup preserves a fresh post-history row when the already-open chat has no sidebar signal", () => {
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+
+  const prior = mkRow({
+    text: "Earlier handled request",
+    dataId: "3EB0_ALREADY_HANDLED",
+    position: 0,
+  });
+  const assistant = mkRow({
+    text: "Earlier assistant response",
+    dataId: "3EB0_ASSISTANT_RESPONSE",
+    position: 1,
+    sender: "me",
+  });
+  const fresh = mkRow({
+    text: "Corolla available?",
+    dataId: "3EB0_FRESH_WHILE_OPEN",
+    position: 2,
+  });
+  const sorted = [prior, assistant, fresh];
+
+  markInboundTurnLedgerDone({
+    chatKey: CHAT,
+    stableId: "wa::3EB0_ALREADY_HANDLED",
+    replySent: true,
+  });
+
+  const freshState = {
+    baselineSeenStableIds: new Set(),
+    baselineEstablishedAtMs: 0,
+    admittedFreshStableIds: new Set(),
+    tickFirstSeenByStableId: new Map(),
+    sessionVisibilityLedger: [],
+  };
+  const baseline = establishFreshDeltaStartupBaseline({
+    freshState,
+    sortedWithPos: sorted,
+    userMessages: [prior, fresh],
+    chatKey: CHAT,
+    liveGroupSignal: false,
+  });
+
+  assert.deepEqual(baseline.deferredLiveUsers?.stableIds, [
+    "wa::3EB0_FRESH_WHILE_OPEN",
+  ]);
+  assert.equal(
+    baseline.baselineSeen.has("wa::3EB0_FRESH_WHILE_OPEN"),
+    false,
+    "the fresh stable ID must not be persisted as startup history"
+  );
+});
+
+test("startup preserves the unanswered suffix after an assistant boundary with no ledger or sidebar signal", () => {
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+
+  const historical = mkRow({
+    text: "Historical request",
+    dataId: "3EB0_HISTORICAL",
+    position: 0,
+  });
+  const assistant = mkRow({
+    text: "Earlier assistant response",
+    dataId: "3EB0_ASSISTANT_BOUNDARY",
+    position: 1,
+    sender: "me",
+  });
+  const unanswered = mkRow({
+    text: "Corolla available?",
+    dataId: "3EB0_UNANSWERED_AFTER_BOUNDARY",
+    position: 2,
+  });
+  const sorted = [historical, assistant, unanswered];
+  const freshState = {
+    baselineSeenStableIds: new Set(),
+    baselineEstablishedAtMs: 0,
+    admittedFreshStableIds: new Set(),
+    tickFirstSeenByStableId: new Map(),
+    sessionVisibilityLedger: [],
+  };
+
+  const baseline = establishFreshDeltaStartupBaseline({
+    freshState,
+    sortedWithPos: sorted,
+    userMessages: [historical, unanswered],
+    chatKey: CHAT,
+    liveGroupSignal: false,
+  });
+
+  assert.deepEqual(baseline.deferredLiveUsers?.stableIds, [
+    "wa::3EB0_UNANSWERED_AFTER_BOUNDARY",
+  ]);
+  assert.equal(
+    baseline.baselineSeen.has("wa::3EB0_UNANSWERED_AFTER_BOUNDARY"),
+    false
+  );
+});
+
 function mkRow({
   text,
   dataId,
   position,
   participantKey = "p1",
   prePlainText = "[1:00 AM] Adeel: ",
+  sender = "user",
 }) {
   return {
-    sender: "user",
+    sender,
     participantKey,
     text,
     prePlainText,
@@ -567,7 +667,7 @@ test("guarantee-first: true startup visible backlog rows remain baseline-blocked
   });
   assert.ok(st.baselineSeenStableIds.has(historyId));
   assert.ok(st.baselineSeenStableIds.has(tailId));
-  assert.equal(st.baselineDeferredTailUser, null);
+  assert.equal(st.baselineDeferredLiveUsers, null);
 
   const { survivors, droppedBaseline, droppedDone } = filterGuaranteeFirstEligibleUserRows({
     userMessages: sorted,
@@ -607,13 +707,13 @@ test("guarantee-first: live newest tail deferral is not baseline-absorbed and ad
     chatKey: CHAT,
     liveGroupSignal: true,
   });
-  const deferral = baseline.deferredTail;
+  const deferral = baseline.deferredLiveUsers;
   assert.equal(deferral?.stableId, tailId);
   assert.ok(st.baselineSeenStableIds.has(historyId));
   assert.ok(!st.baselineSeenStableIds.has(tailId));
   assert.equal(st.acknowledgedAnchorIndex, 0);
 
-  const directDeferral = resolveBaselineTailUserDeferral({
+  const directDeferral = resolveBaselineLiveUserDeferral({
     anchorRow: tail,
     anchorIndex: 1,
     chatKey: CHAT,
@@ -650,13 +750,128 @@ test("guarantee-first: live newest tail deferral is not baseline-absorbed and ad
     resolvedAnchorIndex: 0,
     freshState: {
       ...mkFreshState(),
-      baselineDeferredTailUser: deferral,
+      baselineDeferredLiveUsers: deferral,
     },
     chatKey: CHAT,
     extractedList: sorted,
   });
   assert.equal(replay.survivors.length, 0);
   assert.ok(replay.droppedDone.includes(tailId));
+});
+
+test("guarantee-first: live startup preserves the meaningful unanswered row before trailing punctuation noise", () => {
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+  const priorAssistant = mkRow({
+    sender: "assistant",
+    text: "Aapko Corolla kitne din chahiye?",
+    dataId: "true_assistant@c.us_PRIOR",
+    position: 0,
+  });
+  const freshQuestion = mkRow({
+    text: "Corolla available?",
+    dataId: "3EB0FRESH_BEFORE_NOISE",
+    position: 1,
+  });
+  const trailingNoise = mkRow({
+    text: "???",
+    dataId: "3EB0TRAILING_NOISE",
+    position: 2,
+  });
+  const sorted = [priorAssistant, freshQuestion, trailingNoise].map((row, index) => ({
+    ...row,
+    __position: index,
+  }));
+  const freshId = buildStableMessageKey(sorted[1], sorted).id;
+  const noiseId = buildStableMessageKey(sorted[2], sorted).id;
+  const st = mkFreshState();
+  st.baselineEstablishedAtMs = null;
+
+  const baseline = establishFreshDeltaStartupBaseline({
+    freshState: st,
+    sortedWithPos: sorted,
+    userMessages: [sorted[1], sorted[2]],
+    chatKey: CHAT,
+    liveGroupSignal: true,
+  });
+
+  assert.equal(baseline.deferredLiveUsers?.stableId, freshId);
+  assert.ok(!st.baselineSeenStableIds.has(freshId));
+  assert.ok(st.baselineSeenStableIds.has(noiseId));
+  assert.equal(st.acknowledgedAnchorIndex, 0);
+
+  const { survivors } = filterGuaranteeFirstEligibleUserRows({
+    userMessages: [sorted[1], sorted[2]],
+    acknowledgedAnchorIndex: st.acknowledgedAnchorIndex,
+    resolvedAnchorIndex: st.acknowledgedAnchorIndex,
+    freshState: st,
+    chatKey: CHAT,
+    extractedList: sorted,
+  });
+  assert.deepEqual(survivors.map((row) => row.text), ["Corolla available?"]);
+});
+
+test("guarantee-first: live startup preserves every meaningful unanswered row after the assistant boundary", () => {
+  process.env.PLAYWRIGHT_GROUP_FRESH_DELTA_ONLY = "true";
+  process.env.PLAYWRIGHT_GUARANTEE_FIRST_ADMISSION = "true";
+  const priorAssistant = mkRow({
+    sender: "assistant",
+    text: "How can I help?",
+    dataId: "true_assistant@c.us_BURST_PRIOR",
+    position: 0,
+  });
+  const itemRow = mkRow({
+    text: "Corolla available?",
+    dataId: "3EB0STARTUP_BURST_ITEM",
+    position: 1,
+  });
+  const durationRow = mkRow({
+    text: "4 din k lye",
+    dataId: "3EB0STARTUP_BURST_DURATION",
+    position: 2,
+  });
+  const noiseRow = mkRow({
+    text: "???",
+    dataId: "3EB0STARTUP_BURST_NOISE",
+    position: 3,
+  });
+  const sorted = [priorAssistant, itemRow, durationRow, noiseRow].map((row, index) => ({
+    ...row,
+    __position: index,
+  }));
+  const itemId = buildStableMessageKey(sorted[1], sorted).id;
+  const durationId = buildStableMessageKey(sorted[2], sorted).id;
+  const st = mkFreshState();
+  st.baselineEstablishedAtMs = null;
+
+  establishFreshDeltaStartupBaseline({
+    freshState: st,
+    sortedWithPos: sorted,
+    userMessages: sorted.slice(1),
+    chatKey: CHAT,
+    liveGroupSignal: true,
+  });
+
+  assert.ok(!st.baselineSeenStableIds.has(itemId));
+  assert.ok(!st.baselineSeenStableIds.has(durationId));
+  assert.deepEqual(
+    new Set(st.baselineDeferredLiveUsers?.stableIds),
+    new Set([itemId, durationId])
+  );
+  assert.equal(st.acknowledgedAnchorIndex, 0);
+
+  const { survivors } = filterGuaranteeFirstEligibleUserRows({
+    userMessages: sorted.slice(1),
+    acknowledgedAnchorIndex: 0,
+    resolvedAnchorIndex: 0,
+    freshState: st,
+    chatKey: CHAT,
+    extractedList: sorted,
+  });
+  assert.deepEqual(
+    survivors.map((row) => row.text),
+    ["Corolla available?", "4 din k lye"]
+  );
 });
 
 test("guarantee-first: live tail deferral requires live signal and prior anchor", () => {
@@ -674,7 +889,7 @@ test("guarantee-first: live tail deferral requires live signal and prior anchor"
   });
   const sorted = [history, tail];
   assert.equal(
-    resolveBaselineTailUserDeferral({
+    resolveBaselineLiveUserDeferral({
       anchorRow: tail,
       anchorIndex: 1,
       chatKey: CHAT,
@@ -684,7 +899,7 @@ test("guarantee-first: live tail deferral requires live signal and prior anchor"
     null
   );
   assert.equal(
-    resolveBaselineTailUserDeferral({
+    resolveBaselineLiveUserDeferral({
       anchorRow: tail,
       anchorIndex: 0,
       chatKey: CHAT,
@@ -736,7 +951,7 @@ test("guarantee-first: tail user without deferral stays baseline-blocked", () =>
   const stableId = buildStableMessageKey(tail, sorted).id;
   const st = mkFreshState();
   st.baselineSeenStableIds.add(stableId);
-  st.baselineDeferredTailUser = null;
+  st.baselineDeferredLiveUsers = null;
   st.anchorHoldUserForward = null;
 
   const { survivors, droppedBaseline } = filterGuaranteeFirstEligibleUserRows({

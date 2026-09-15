@@ -127,6 +127,13 @@ export function patchEmilySessionState(sessionKey, patch) {
   return next;
 }
 
+/** @internal Test seam: simulate process-memory loss without touching durable state. */
+export function __clearEmilySessionStateForTests(sessionKey = null) {
+  const key = String(sessionKey ?? "").trim();
+  if (key) stateBySession.delete(key);
+  else stateBySession.clear();
+}
+
 /**
  * User will decide / confirm later — not confusion or a firm booking now.
  * Checked before `booking` so phrases with "confirm" do not mis-route.

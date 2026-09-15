@@ -42,6 +42,68 @@ export function normalizePlaywrightOutboundTrace(trace = null) {
     const text = String(value).trim();
     if (text) out[key] = text;
   }
+  // Persist only an explicit, non-PII allowlist of generation/semantic
+  // diagnostics. These fields explain a terminal surface or semantic outcome
+  // without retaining prompts, customer text, model output, or identifiers.
+  const candidateKeys = new Set(["firstCandidate", "correctiveCandidate"]);
+  const issueListKeys = new Set(["firstReviewIssues", "secondReviewIssues"]);
+  const pickDiagnostics = (value, allowedKeys) => {
+    if (!value || typeof value !== "object") return null;
+    const picked = {};
+    for (const key of allowedKeys) {
+      const raw = value[key];
+      if (typeof raw === "boolean") picked[key] = raw;
+      else if (issueListKeys.has(key) && Array.isArray(raw)) {
+        picked[key] = raw
+          .map((issue) => String(issue ?? "").trim())
+          .filter(Boolean)
+          .slice(0, 12);
+      } else if (typeof raw === "string" && raw.trim()) {
+        picked[key] = raw.trim().slice(0, candidateKeys.has(key) ? 500 : 160);
+      } else if (raw && typeof raw === "object" && key === "reviewerMandatoryDimensions") {
+        const dimensions = {};
+        for (const [dimension, verdict] of Object.entries(raw)) {
+          if (verdict === "pass" || verdict === "rewrite") dimensions[dimension] = verdict;
+        }
+        if (Object.keys(dimensions).length) picked[key] = dimensions;
+      }
+    }
+    return Object.keys(picked).length ? picked : null;
+  };
+  const generationDiagnostics = pickDiagnostics(trace.customerReplyGenerationDiagnostics, [
+    "kind",
+    "channel",
+    "customerReferencePresent",
+    "itemLabelPresent",
+    "primaryOutcome",
+    "guardRejectionReason",
+    "reviewerAction",
+    "reviewerMandatoryDimensions",
+    "rewriteGuardResult",
+    "finalSource",
+    "firstCandidate",
+    "firstReviewIssues",
+    "correctiveCandidate",
+    "secondReviewIssues",
+    "correctiveAccepted",
+  ]);
+  if (generationDiagnostics) out.customerReplyGenerationDiagnostics = generationDiagnostics;
+  const groupSemanticDiagnostics = pickDiagnostics(trace.groupSemanticDiagnostics, [
+    "turnScope",
+    "semanticIntent",
+    "protectedDecisionReason",
+    "groupSemanticOk",
+    "groupSemanticReason",
+    "ownershipCorrectionReason",
+    "trustedFreshItemFocusPresent",
+    "trustedFreshItemFocusIdPresent",
+    "pendingItemIdPresent",
+    "pendingCustomerReferencePresent",
+    "pendingFresh",
+    "canonicalReferentStatus",
+    "firstRejectedValidationBoundary",
+  ]);
+  if (groupSemanticDiagnostics) out.groupSemanticDiagnostics = groupSemanticDiagnostics;
   return Object.keys(out).length ? out : null;
 }
 

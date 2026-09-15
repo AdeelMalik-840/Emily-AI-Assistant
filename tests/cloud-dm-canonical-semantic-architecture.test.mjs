@@ -36,6 +36,9 @@ const { runBrainV2LivePipeline } = await import(
 const { mapFrozenPendingOwnershipToWaitingConfirmDecision } = await import(
   "../src/services/availabilityCustomerConfirmService.js"
 );
+const { availabilityComposerCompletionForTest } = await import(
+  "./helpers/availabilityCompositionTestHarness.mjs"
+);
 
 const STONIC_ID = "kia-stonic";
 const CIVIC_ID = "honda-civic";
@@ -133,6 +136,12 @@ test("1. explicit Civic beats Stonic fresh focus; runtime binds Civic IDs only",
     memorySnapshot: { lastFreshItemFocus: stonicFocus, lastResolvedItemId: STONIC_ID },
     getBookingsForItemFn: async () => [],
     getBusinessProfileFn: async () => ({}),
+    // Availability replies are now composed through the shared guarded
+    // composer rather than authored by the workflow -- wire a synthetic
+    // completion so this Cloud DM turn actually reaches a real reply,
+    // matching production (test mode otherwise skips composition entirely
+    // unless a composer is supplied).
+    __cloudComposeChatCreate: availabilityComposerCompletionForTest(message),
   });
   const actionItemIds = []
     .concat(live.actionPlan?.actions ?? [])
@@ -449,8 +458,10 @@ test("17. composer failure keeps frozen meaning and returns recoverable wording"
     getBusinessProfileFn: async () => ({}),
   });
   assert.equal(live.handled, true);
-  assert.equal(live.reply, POST_CONFIRM_CUSTOMER_DM_TECHNICAL_FALLBACK);
-  assert.equal(live.customerTurnOutcome, "TECHNICAL_RECOVERY");
+  assert.match(String(live.reply ?? ""), /Fortuner/i);
+  assert.doesNotMatch(String(live.reply ?? ""), /\?/);
+  assert.doesNotMatch(String(live.reply ?? ""), /request complete nahi ho saki/i);
+  assert.equal(live.messageMeta?.outboundTrace?.finalReplySource, "BRAIN_V2_SAME_ACT_FALLBACK");
 });
 
 test("canonical Cloud skips availability-assist second Brain", async () => {

@@ -313,10 +313,24 @@ test("9: browse workflow remains deterministic and does not call OpenAI", async 
 });
 
 test("10: booking/owner/DM execution remains disabled in flags", () => {
-  const liveFlags = getEmilyBrainV2LiveFlagSnapshot();
-  assert.equal(liveFlags.bookingExecute, false);
-  assert.equal(liveFlags.ownerExecute, false);
-  assert.equal(liveFlags.dmExecute, false);
+  const previous = {
+    booking: process.env.EMILY_BRAIN_V2_BOOKING_EXECUTE,
+    owner: process.env.EMILY_BRAIN_V2_OWNER_EXECUTE,
+    dm: process.env.EMILY_BRAIN_V2_DM_EXECUTE,
+  };
+  delete process.env.EMILY_BRAIN_V2_BOOKING_EXECUTE;
+  delete process.env.EMILY_BRAIN_V2_OWNER_EXECUTE;
+  delete process.env.EMILY_BRAIN_V2_DM_EXECUTE;
+  try {
+    const liveFlags = getEmilyBrainV2LiveFlagSnapshot();
+    assert.equal(liveFlags.bookingExecute, false);
+    assert.equal(liveFlags.ownerExecute, false);
+    assert.equal(liveFlags.dmExecute, false);
+  } finally {
+    if (previous.booking != null) process.env.EMILY_BRAIN_V2_BOOKING_EXECUTE = previous.booking;
+    if (previous.owner != null) process.env.EMILY_BRAIN_V2_OWNER_EXECUTE = previous.owner;
+    if (previous.dm != null) process.env.EMILY_BRAIN_V2_DM_EXECUTE = previous.dm;
+  }
 });
 
 test("11: canonical zero availability never falls back to raw catalog flags", () => {
@@ -337,7 +351,7 @@ test("11: canonical zero availability never falls back to raw catalog flags", ()
   assert.equal(plan.actions[0]?.payload?.text, "");
 });
 
-test("12: browse composer failure is structured silence in the live path", async () => {
+test("12: browse composer failure keeps the PRESENT_BROWSE_OPTIONS same-act fallback", async () => {
   enableV2LiveEnv();
   const result = await runBrainV2LivePipeline({
     traceId: "phase2b-browse-compose-failure",
@@ -354,8 +368,8 @@ test("12: browse composer failure is structured silence in the live path", async
     },
   });
   assert.equal(result.handled, true);
-  assert.equal(result.reply, "");
-  assert.equal(result.sendVia, "NONE");
-  assert.match(String(result.reason ?? ""), /^BROWSE_COMPOSE_FAIL_CLOSED:/);
+  assert.match(String(result.reply ?? ""), /Civic/i);
+  assert.doesNotMatch(String(result.reply ?? ""), /\?/);
+  assert.equal(result.messageMeta?.outboundTrace?.finalReplySource, "BRAIN_V2_SAME_ACT_FALLBACK");
   assert.equal(result.legacyBypassed, true);
 });

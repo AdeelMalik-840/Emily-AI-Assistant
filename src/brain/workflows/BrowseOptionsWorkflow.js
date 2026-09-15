@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { stampCanonicalGroupResponseAct } from "../contracts/canonicalGroupTurnContract.js";
 
 /** @typedef {import("../contracts/action.js").ActionPlan} ActionPlan */
 
@@ -182,6 +183,11 @@ export function buildBrowseOptionsActionPlan({
     planId: randomUUID(),
     workflowType: "browse_options",
     replyDraft: "",
+    customerResponseComposition: stampCanonicalGroupResponseAct({
+      lane: "catalog_fact",
+      kind: "browse_options",
+      trustedBrowseFacts,
+    }),
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",

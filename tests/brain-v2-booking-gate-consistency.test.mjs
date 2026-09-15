@@ -499,7 +499,12 @@ test("Fix 1 unavailable still REPLY-only when workflowType is booking_request wi
     plan.actions.some((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED"),
     false
   );
-  assert.match(String(plan.replyDraft), /available nahi hai/i);
+  // Wording is composed later through the shared guarded composer, not
+  // authored by the workflow -- the structured marker proves this plan is
+  // routed to the unavailable-availability composition lane.
+  assert.equal(String(plan.replyDraft), "");
+  assert.equal(plan.customerResponseComposition?.lane, "availability");
+  assert.equal(plan.customerResponseComposition?.kind, "availability_unavailable");
 
   const routed = routeLiveActionPlan(plan, liveFlags);
   assert.equal(routed.actions.some((a) => a.type === "CREATE_BOOKING" && a.allowed), false);

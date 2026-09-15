@@ -16,9 +16,12 @@ import {
   conversationHistoryFieldsForOutbound,
   getRecentConversationForPrompt,
   getRecentConversationReferenceContext,
+  getDurableEmilyPending,
+  persistDurableEmilyPending,
 } from "./conversationStore.js";
 import {
   applySessionMemoryFromActionPlan,
+  readSoftPresentedItemFocusContinuation,
   readTrustedFreshItemFocus,
   readVerifiedSinglePresentedItemFromActionPlan,
 } from "./executors/sessionMemoryExecutor.js";
@@ -56,6 +59,7 @@ import {
   notifyPlaywrightGuaranteeDelivered,
   notifyPlaywrightGuaranteeReleased,
 } from "./playwrightGuaranteeBridge.js";
+import { isBurstMergeContinuationText } from "./playwrightListener/burstMergePolicy.js";
 import {
   claimCloudInboundTurn,
   claimOutboundLockedRecovery,
@@ -77,6 +81,9 @@ import {
   persistCloudInboundSemanticDecision,
   releaseOutboundLockedRecoveryClaim,
   resolveInboundTurnAdmissionBlock,
+  recordInboundTurnLifecycleMilestone,
+  recordInboundTurnLifecycleMilestoneForGuarantee,
+  recordInboundTurnLifecycleFailureForGuarantee,
 } from "./inboundTurnLedger.js";
 import { tryRecoverOutboundLockedInboundTurn } from "./outboundLockedRecovery.js";
 import { tryRecoverCloudOutboundLockedTurn } from "./cloudInboundRecovery.js";
@@ -88,6 +95,7 @@ import {
   validatePostConfirmSemanticOwnership,
 } from "../brain/decisions/decidePostConfirmCustomerDm.js";
 import { resolveGroupCanonicalSemanticDecision } from "../brain/decisions/resolveGroupCanonicalSemanticDecision.js";
+import { buildTrustedGroupContinuationContext, compactRequestedDurationDiagnostics } from "../brain/contracts/canonicalGroupTurnContract.js";
 import { readFreshLastAvailabilityAssist } from "../brain/availability/availabilityAssistContext.js";
 import {
   EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
@@ -506,6 +514,8 @@ export async function tryBrainV2InfoLiveBeforeLegacy(params) {
  *   peekSessionState?: (sessionKey: string) => Record<string, unknown> | null,
  *   loadShadowModule?: () => Promise<Record<string, unknown>>,
  *   traceId?: string,
+ *   db?: Record<string, unknown>,
+ *   conversationCustomerNumber?: string | null,
  * }} p
  */
 /**
@@ -544,7 +554,36 @@ export async function loadBrainV2SessionMemorySnapshot(p) {
     const existingState = (p.peekSessionState ?? peekEmilySessionState)(
       emilySessionKey
     );
-    return existingState == null ? null : structuredClone(existingState);
+    let snapshot = existingState == null ? null : structuredClone(existingState);
+    if (
+      p.isGroupInbound === true &&
+      p.db &&
+      String(p.conversationCustomerNumber ?? "").trim() &&
+      String(p.participantKey ?? "").trim()
+    ) {
+      try {
+        const durable = await getDurableEmilyPending(p.db, {
+          ownerUserId: p.ownerUserId ?? p.businessId,
+          customerNumber: p.conversationCustomerNumber,
+          participantKey: p.participantKey,
+          threadKey: p.playwrightChatKey ?? p.sessionKey,
+        });
+        if (durable.initialized) {
+          snapshot = {
+            ...(snapshot ?? {}),
+            emilyPending: durable.pending ? structuredClone(durable.pending) : null,
+            pendingAction: durable.pending ? structuredClone(durable.pending) : null,
+          };
+        }
+      } catch (err) {
+        console.log("[brain_v2_durable_pending_load_failed]", {
+          traceId: p.traceId,
+          businessId: p.businessId,
+          error: String(err?.message ?? err ?? "").slice(0, 160),
+        });
+      }
+    }
+    return snapshot;
   } catch (err) {
     console.log("[brain_v2_memory_prep_failed]", {
       traceId: p.traceId,
@@ -568,11 +607,13 @@ export async function prepareEmilyBrainV2ShadowMemorySnapshot(p) {
 export function resolveCloudDmOwnershipTrustedFocus({
   memorySnapshot,
   participantKey,
+  chatScopeKey = null,
   nowMs = Date.now(),
 } = {}) {
   const pending = readEmilyPendingForParticipant({
     memorySnapshot,
     participantKey,
+    chatScopeKey,
     nowMs,
   });
   if (
@@ -583,12 +624,16 @@ export function resolveCloudDmOwnershipTrustedFocus({
     return {
       itemId: pending.itemId,
       itemLabel: pending.itemLabel ?? null,
+      customerReference: pending.customerReference ?? null,
       sourceTurnId: pending.sourceTurnKey,
       provenance: "availability_duration_pending",
       expiresAt: pending.expiresAt ?? null,
     };
   }
-  return readTrustedFreshItemFocus(memorySnapshot, nowMs);
+  return (
+    readTrustedFreshItemFocus(memorySnapshot, nowMs) ||
+    readSoftPresentedItemFocusContinuation(memorySnapshot, nowMs)
+  );
 }
 
 /** @type {Map<string, BufferEntry>} */
@@ -1111,6 +1156,7 @@ export function shouldOutboundLockPlaywrightGroupSend({
  *   playwrightWebInbound?: boolean,
  *   canonicalGroupBuffer?: boolean,
  *   bufferedMessageIds?: string[],
+ *   admittedStableIds?: readonly string[],
  *   scanGeneration?: number | null,
  *   __executePipelineForTests?: (payload: Record<string, unknown>) => Promise<unknown>,
  *   trackingKey?: string,
@@ -1262,7 +1308,7 @@ function playwrightInboundTurnComplete(outboundReplyDelivered, intentionalSilent
  *   processingSuccess: boolean,
  *   outboundReplyDelivered: boolean,
  *   intentionalSilent: boolean,
- *   burstStableIds?: string[],
+ *   admittedStableIds?: readonly string[],
  *   textPreview?: string,
  *   lastError?: string | null,
  * }} p
@@ -1280,13 +1326,32 @@ function finalizeAdmittedInboundTurnLedger(p) {
     intentionalSilent
   );
   const textPreview = String(p.textPreview ?? "").slice(0, 120);
-  const burstStableIds = p.burstStableIds;
+  const admittedStableIds = Array.isArray(p.admittedStableIds)
+    ? p.admittedStableIds
+    : [];
   if (processingSuccess && (!isPlaywrightWebTab || turnComplete)) {
     setMessageState(guaranteeKey, "done");
+    // intentionalSilent is threaded through so the ledger can distinguish a
+    // TRUSTED "no customer reply was ever required" settlement from
+    // replySent=false meaning a reply was required but delivery was never
+    // confirmed -- resolveInboundTurnAdmissionBlock treats only the former
+    // as a stable terminal state; the latter must stay retryable.
+    console.log("[inbound_turn_settlement]", {
+      guaranteeKey,
+      customerReplyRequired: !intentionalSilent,
+      customerReplyDelivered: outboundReplyDelivered,
+      intentionalSilent,
+      inboundLedgerSettlementReason: outboundReplyDelivered
+        ? "reply_delivered"
+        : intentionalSilent
+          ? "intentional_silent"
+          : "reply_required_not_delivered",
+    });
     markInboundTurnLedgerDoneForGuarantee({
       guaranteeKey,
-      burstStableIds,
+      burstStableIds: admittedStableIds,
       replySent: outboundReplyDelivered,
+      intentionalSilent,
       textPreview,
     });
     return "done";
@@ -1299,7 +1364,7 @@ function finalizeAdmittedInboundTurnLedger(p) {
     setMessageState(guaranteeKey, "failed");
     markInboundTurnLedgerFailedForGuarantee({
       guaranteeKey,
-      burstStableIds,
+      burstStableIds: admittedStableIds,
       textPreview,
       lastError: p.lastError ?? "no_outbound_incomplete",
     });
@@ -2212,7 +2277,10 @@ export async function executeWhatsAppAiPipeline(p) {
           : null;
       markAdmittedInboundTurnTimedOut({
         guaranteeKey,
-        burstStableIds: pendingTimeout?.burstStableIds,
+        burstStableIds:
+          p.canonicalGroupBuffer === true && Array.isArray(p.admittedStableIds)
+            ? p.admittedStableIds
+            : pendingTimeout?.burstStableIds,
         textPreview: canonicalMessage.slice(0, 120),
       });
     }, 120_000);
@@ -2309,6 +2377,8 @@ export async function executeWhatsAppAiPipeline(p) {
     participantKey: participantKeyRaw,
     playwrightChatKey: playwrightChatKeyRaw,
     isGroupInbound,
+    db,
+    conversationCustomerNumber,
   };
   let shadowPreTurnMemorySnapshot =
     v2LiveMemoryNeeded || shadowEligible
@@ -2972,14 +3042,45 @@ export async function executeWhatsAppAiPipeline(p) {
         groupSemanticCatalogItems = [];
       }
     }
+    const groupChatScopeKey =
+      String(playwrightChatKeyRaw ?? "").trim() ||
+      String(groupNameResolved ?? "").trim() ||
+      null;
     const groupTrustedFreshItemFocus = resolveCloudDmOwnershipTrustedFocus({
       memorySnapshot: shadowPreTurnMemorySnapshot,
       participantKey: normalizedParticipantKey,
+      chatScopeKey: groupChatScopeKey,
+    });
+    // Continuation and focus must read the same participant/scope/fresh pending.
+    // Raw shadow emilyPending can still be present after TTL expiry and used to
+    // advertise NEED_DURATION while focus was already null — that hard-blocked
+    // duration-only Group answers.
+    const freshPendingForContinuation = readEmilyPendingForParticipant({
+      memorySnapshot: shadowPreTurnMemorySnapshot,
+      participantKey: normalizedParticipantKey,
+      chatScopeKey: groupChatScopeKey,
+    });
+    const pendingForSemanticDiagnostics = freshPendingForContinuation;
+    const trustedGroupContinuation = buildTrustedGroupContinuationContext({
+      emilyPending: freshPendingForContinuation,
+      pendingTemporalClarification:
+        shadowPreTurnMemorySnapshot?.pendingTemporalClarification ?? null,
+      trustedFreshItemFocus: groupTrustedFreshItemFocus,
+    });
+    const groupLifecycleGuaranteeKey = buildPlaywrightGuaranteeKey(groupNameResolved, messageId);
+    const groupLifecycleBurstStableIds = Array.isArray(p.bufferedMessageIds)
+      ? p.bufferedMessageIds
+      : [];
+    recordInboundTurnLifecycleMilestoneForGuarantee({
+      guaranteeKey: groupLifecycleGuaranteeKey,
+      burstStableIds: groupLifecycleBurstStableIds,
+      stage: "semantic_started",
     });
     const groupSemantic = await resolveGroupCanonicalSemanticDecision({
       business: null,
       catalogItems: groupSemanticCatalogItems,
       trustedFreshItemFocus: groupTrustedFreshItemFocus,
+      trustedGroupContinuation,
       userMessage: canonicalMessage,
       conversationHistory,
       timeoutMs: Number.isFinite(Number(p.__groupSemanticTimeoutMsForTests))
@@ -2995,6 +3096,11 @@ export async function executeWhatsAppAiPipeline(p) {
     });
     if (groupSemantic.ok === true && groupSemantic.decision) {
       validatedGroupCanonicalSemanticDecision = groupSemantic.decision;
+      recordInboundTurnLifecycleMilestoneForGuarantee({
+        guaranteeKey: groupLifecycleGuaranteeKey,
+        burstStableIds: groupLifecycleBurstStableIds,
+        stage: "semantic_decision",
+      });
       console.log("[group_canonical_semantic_decided]", {
         traceId,
         messageId,
@@ -3004,10 +3110,29 @@ export async function executeWhatsAppAiPipeline(p) {
         itemReferenceMode: groupSemantic.decision.itemReferenceMode,
         referentCount: groupSemantic.decision.itemReferents.length,
         ownershipCompletionCount: groupSemantic.ownershipCompletionCount ?? null,
+        trustedGroupContinuation: trustedGroupContinuation
+          ? {
+              activeTransactionType: trustedGroupContinuation.activeTransactionType,
+              activeTransactionState: trustedGroupContinuation.activeTransactionState,
+              expectedMissingField: trustedGroupContinuation.expectedMissingField,
+              trustedActiveItemId: trustedGroupContinuation.trustedActiveItemId,
+            }
+          : null,
+        requestedDuration: compactRequestedDurationDiagnostics(
+          groupSemantic.decision.requestedDuration
+        ),
       });
     } else {
       // Fail closed: no legacy regex/signal takeover, no AVR, no booking,
-      // no owner notification. Technical recovery only.
+      // no owner notification. Technical recovery only. Fixed categorical
+      // code only -- the detailed groupSemantic.reason stays in the existing
+      // messageMeta/console diagnostics below, never duplicated here.
+      recordInboundTurnLifecycleFailureForGuarantee({
+        guaranteeKey: groupLifecycleGuaranteeKey,
+        burstStableIds: groupLifecycleBurstStableIds,
+        stage: "semantic",
+        code: "SEMANTIC_DECISION_REJECTED",
+      });
       skipGeneralBrainForWaitingConfirmOwnership = true;
       skipGeneralBrainReason = "GROUP_CANONICAL_SEMANTIC_UNUSABLE";
       reply = BRAIN_V2_HARD_BLOCKED_CUSTOMER_REPLY;
@@ -3021,6 +3146,35 @@ export async function executeWhatsAppAiPipeline(p) {
           reason: String(
             groupSemantic.reason ?? "GROUP_SEMANTIC_DECISION_UNUSABLE"
           ).slice(0, 160),
+          groupSemanticDiagnostics: {
+            traceId,
+            messageId: String(messageId ?? "").trim() || null,
+            turnScope: String(groupSemantic?.decision?.turnScope ?? "").trim() || null,
+            semanticIntent:
+              String(groupSemantic?.decision?.semanticIntent ?? "").trim() || null,
+            protectedDecisionReason:
+              String(groupSemantic?.protectedDecisionReason ?? "").trim() || null,
+            groupSemanticOk: false,
+            groupSemanticReason: String(
+              groupSemantic.reason ?? "GROUP_SEMANTIC_DECISION_UNUSABLE"
+            ).slice(0, 160),
+            ownershipCorrectionReason:
+              String(groupSemantic?.ownershipCorrectionReason ?? "").trim() || null,
+            trustedFreshItemFocusPresent: Boolean(groupTrustedFreshItemFocus?.itemId),
+            trustedFreshItemFocusIdPresent: Boolean(groupTrustedFreshItemFocus?.itemId),
+            pendingItemIdPresent: Boolean(pendingForSemanticDiagnostics?.itemId),
+            pendingCustomerReferencePresent: Boolean(
+              pendingForSemanticDiagnostics?.customerReference
+            ),
+            pendingFresh: Boolean(groupTrustedFreshItemFocus?.itemId),
+            canonicalReferentStatus:
+              Array.isArray(groupSemantic?.decision?.itemReferents)
+                ? "present"
+                : "unavailable",
+            firstRejectedValidationBoundary: String(
+              groupSemantic.reason ?? "GROUP_SEMANTIC_DECISION_UNUSABLE"
+            ).slice(0, 160),
+          },
         },
       };
       console.warn("[group_canonical_semantic_rejected]", {
@@ -3086,6 +3240,7 @@ export async function executeWhatsAppAiPipeline(p) {
       String(groupNameResolved ?? "").trim() ||
       sessionKey,
     sessionKey: normalizedInbound.sessionKey,
+    conversationCustomerNumber,
     participantKey: normalizedParticipantKey,
     sourceParticipantKey: normalizedSourceParticipantKey,
     participantName: normalizedParticipantName,
@@ -3109,6 +3264,11 @@ export async function executeWhatsAppAiPipeline(p) {
     // local production-path tests supply pure readers to avoid live Firestore.
     getBookingsForItemFn: p.getBookingsForItemFn,
     getBusinessProfileFn: p.getBusinessProfileFn,
+    __cloudComposeChatCreate:
+      process.env.NODE_ENV === "test" &&
+      typeof p.__cloudComposeChatCreate === "function"
+        ? p.__cloudComposeChatCreate
+        : undefined,
     // Same catalog snapshot the Group semantic call (if any) was grounded
     // against -- avoids a second, independent Firestore catalog fetch that
     // could drift from what the semantic decision actually validated, and
@@ -3123,6 +3283,11 @@ export async function executeWhatsAppAiPipeline(p) {
     sourceRowKey: sourceRowKeyRaw,
     sourceMessageIndex: normalizedSourceMessageIndex,
     guaranteeKey: buildPlaywrightGuaranteeKey(groupNameResolved, messageIdRaw),
+    // Diagnostic-only passthrough: lets deeper Brain-pipeline lifecycle
+    // milestones (canonical_decision, execution_started/completed) propagate
+    // to every physical stableId merged into this canonical Group turn, the
+    // same way the Group semantic block above already does.
+    bufferedMessageIds: Array.isArray(p.bufferedMessageIds) ? p.bufferedMessageIds : [],
     groupName: groupNameResolved || null,
     whatsappRecipientType,
     canonicalSemanticDecision: cloudLifecycleIdentity?.guaranteeKey
@@ -3507,6 +3672,13 @@ export async function executeWhatsAppAiPipeline(p) {
     const finalReplySourceForLifecycle = String(
       messageMeta?.outboundTrace?.finalReplySource ?? ""
     ).trim();
+    if (isGroupInbound === true) {
+      recordInboundTurnLifecycleMilestoneForGuarantee({
+        guaranteeKey: buildPlaywrightGuaranteeKey(groupNameResolved, messageId),
+        burstStableIds: Array.isArray(p.bufferedMessageIds) ? p.bufferedMessageIds : [],
+        stage: "reply_prepared",
+      });
+    }
     logOutboundLifecycle("prepared", {
       ...outboundLifecycleBase,
       replyPreview: replyText.slice(0, 120),
@@ -3576,7 +3748,10 @@ export async function executeWhatsAppAiPipeline(p) {
             globalThis.__playwrightPendingByGuarantee?.get(guaranteeKey);
           markInboundTurnLedgerOutboundLockedForGuarantee({
             guaranteeKey,
-            burstStableIds: pendingLock?.burstStableIds,
+            burstStableIds:
+              p.canonicalGroupBuffer === true && Array.isArray(p.admittedStableIds)
+                ? p.admittedStableIds
+                : pendingLock?.burstStableIds,
             textPreview: canonicalMessage.slice(0, 120),
             replyPreview: replyText.slice(0, 160),
             finalReplyText: replyText,
@@ -3633,6 +3808,17 @@ export async function executeWhatsAppAiPipeline(p) {
           finalReplySource: finalReplySourceForLifecycle || null,
         });
         outboundStartedAt = Date.now();
+        if (isGroupInbound === true && guaranteeKey) {
+          // Normal Playwright Group send: the existing markOutboundSendInFlight
+          // path below only covers Cloud. This is the real "provider/UI send
+          // attempt is about to start" boundary for Group, immediately before
+          // sendOutboundMessageFn is invoked.
+          recordInboundTurnLifecycleMilestoneForGuarantee({
+            guaranteeKey,
+            burstStableIds: Array.isArray(p.bufferedMessageIds) ? p.bufferedMessageIds : [],
+            stage: "send_started",
+          });
+        }
         if (cloudLifecycleSend) {
           const { markOutboundSendInFlight } = await import(
             "./inboundTurnLedger.js"
@@ -3768,6 +3954,33 @@ export async function executeWhatsAppAiPipeline(p) {
       });
 
       if (outboundReplyDelivered) {
+        if (isGroupInbound) {
+          try {
+            const persistence = messageMeta?.actionPlan?.persistenceIntent;
+            const remembersPending =
+              persistence?.rememberEmilyPending === true &&
+              persistence?.emilyPending &&
+              typeof persistence.emilyPending === "object" &&
+              persistence.emilyPending.pendingStage ===
+                EMILY_PENDING_STAGE_AVAILABILITY_DURATION;
+            const replacesPendingWithAnotherStage =
+              persistence?.rememberEmilyPending === true && !remembersPending;
+            const clearsPending =
+              persistence?.clearEmilyPending === true ||
+              persistence?.clearPendingAction === true;
+            if (remembersPending || replacesPendingWithAnotherStage || clearsPending) {
+              await persistDurableEmilyPending(db, {
+                ownerUserId,
+                customerNumber: conversationCustomerNumber,
+                participantKey: participantKeyRaw,
+                threadKey: playwrightChatKeyRaw || sessionKey,
+                pending: remembersPending ? persistence.emilyPending : null,
+              });
+            }
+          } catch (e) {
+            console.error("[whatsappInboundBuffer] persist pending state:", e);
+          }
+        }
         try {
           const actionPlan = messageMeta?.actionPlan;
           const presented = readVerifiedSinglePresentedItemFromActionPlan(actionPlan);
@@ -4010,7 +4223,10 @@ export async function executeWhatsAppAiPipeline(p) {
         processingSuccess,
         outboundReplyDelivered,
         intentionalSilent,
-        burstStableIds: pendingDone?.burstStableIds,
+        admittedStableIds:
+          p.canonicalGroupBuffer === true && Array.isArray(p.admittedStableIds)
+            ? p.admittedStableIds
+            : pendingDone?.burstStableIds,
         textPreview: canonicalMessage.slice(0, 120),
         // Preserve catch lastError when already failed; only set for empty no-send.
         ...(processingSuccess ? { lastError: "no_outbound_incomplete" } : {}),
@@ -4137,8 +4353,8 @@ function releasePlaywrightChatLockFromGate(ctx) {
  */
 function bindCanonicalGroupBufferGuarantees(ctx) {
   if (ctx?.canonicalGroupBuffer !== true) return;
-  const ids = Array.isArray(ctx.bufferedMessageIds)
-    ? [...new Set(ctx.bufferedMessageIds.map((id) => String(id ?? "").trim()).filter(Boolean))]
+  const ids = Array.isArray(ctx.admittedStableIds)
+    ? [...ctx.admittedStableIds]
     : [];
   const latestId = String(ctx.messageId ?? "").trim();
   const groupName = String(ctx.groupName ?? ctx.chatName ?? "").trim();
@@ -4148,7 +4364,8 @@ function bindCanonicalGroupBufferGuarantees(ctx) {
   const pendingMap = globalThis.__playwrightPendingByGuarantee;
   const finalPending = pendingMap instanceof Map ? pendingMap.get(finalGuaranteeKey) : null;
   if (!finalPending) return;
-  finalPending.burstStableIds = ids;
+  finalPending.burstStableIds = [...ids];
+  finalPending.admittedStableIds = Object.freeze([...ids]);
 
   for (const id of ids) {
     const guaranteeKey = buildPlaywrightGuaranteeKey(groupName, id);
@@ -4174,7 +4391,9 @@ function canonicalGroupBufferedMessageIds(ctx) {
  */
 function releaseCanonicalGroupGuaranteesForRetry(ctx, error) {
   const groupName = String(ctx?.groupName ?? ctx?.chatName ?? "").trim();
-  const ids = canonicalGroupBufferedMessageIds(ctx);
+  const ids = Array.isArray(ctx?.admittedStableIds)
+    ? [...ctx.admittedStableIds]
+    : canonicalGroupBufferedMessageIds(ctx);
   const lastError = String(error?.message ?? error ?? "canonical_pipeline_failed");
   let chatKey = normalizeTitle(groupName);
   for (const id of ids) {
@@ -4264,6 +4483,9 @@ function freezeCanonicalGroupBuffer(bufferKey, reason) {
   if (!entry || entry.context?.canonicalGroupBuffer !== true) return null;
   if (entry.state === "FROZEN") return null;
   entry.state = "FROZEN";
+  entry.context.admittedStableIds = Object.freeze(
+    canonicalGroupBufferedMessageIds(entry.context)
+  );
   console.log("[whatsappInboundBuffer] canonical Group turn frozen", {
     bufferKey,
     reason,
@@ -4271,6 +4493,22 @@ function freezeCanonicalGroupBuffer(bufferKey, reason) {
     firstAppendedAtScanGen: entry.firstAppendedAtScanGen ?? null,
     lastAppendedAtScanGen: entry.lastAppendedAtScanGen ?? null,
   });
+  // Instrumentation only, at the moment the logical canonical Group turn
+  // actually becomes frozen -- not at pipeline entry. Freeze algorithm
+  // itself (OPEN/FROZEN rules, quiet scans, appendVersion) is untouched.
+  const freezeGroupName = String(
+    entry.context?.groupName ?? entry.context?.chatName ?? ""
+  ).trim();
+  const freezeMessageId = String(entry.context?.messageId ?? "").trim();
+  if (freezeGroupName && freezeMessageId) {
+    recordInboundTurnLifecycleMilestoneForGuarantee({
+      guaranteeKey: buildPlaywrightGuaranteeKey(freezeGroupName, freezeMessageId),
+      burstStableIds: Array.isArray(entry.context?.bufferedMessageIds)
+        ? entry.context.bufferedMessageIds
+        : [],
+      stage: "canonical_frozen",
+    });
+  }
   return flushBufferedWhatsAppInbound(bufferKey);
 }
 
@@ -4561,7 +4799,14 @@ async function flushBufferedWhatsAppInbound(bufferKey) {
   }
 
   const canonicalFrozenTurn = entry.context?.canonicalGroupBuffer === true;
-  if (canonicalFrozenTurn) entry.state = "FROZEN";
+  if (canonicalFrozenTurn) {
+    entry.state = "FROZEN";
+    if (!Array.isArray(entry.context.admittedStableIds)) {
+      entry.context.admittedStableIds = Object.freeze(
+        canonicalGroupBufferedMessageIds(entry.context)
+      );
+    }
+  }
 
   releaseStaleActiveJobIfNeeded();
 
@@ -5026,20 +5271,57 @@ export function scheduleBufferedWhatsAppInbound(payload) {
     });
     return;
   }
-  if (useCanonicalGroupBuffer && incomingMessageId) {
-    if (!(entry.seenMessageIds instanceof Set)) entry.seenMessageIds = new Set();
-    entry.seenMessageIds.add(incomingMessageId);
-  }
 
   if (entry.timer && !useCanonicalGroupBuffer) {
     clearTimeout(entry.timer);
     entry.timer = null;
   }
 
+  const trimmed = String(text ?? "").trim();
+  if (useCanonicalGroupBuffer && entry.messageParts.length > 0 && trimmed) {
+    const existingIds = [
+      String(entry.context?.messageId ?? "").trim(),
+      ...(Array.isArray(entry.context?.bufferedMessageIds)
+        ? entry.context.bufferedMessageIds.map((id) => String(id ?? "").trim())
+        : []),
+    ].filter(Boolean);
+    const distinctFromOpenTurn =
+      Boolean(incomingMessageId) &&
+      existingIds.some((id) => id && id !== incomingMessageId);
+    const missingIdentityOnMeaningfulBody =
+      !incomingMessageId && !isBurstMergeContinuationText(trimmed);
+    if (
+      (distinctFromOpenTurn && !isBurstMergeContinuationText(trimmed)) ||
+      missingIdentityOnMeaningfulBody
+    ) {
+      if (!Array.isArray(entry.deferredCanonicalPayloads)) {
+        entry.deferredCanonicalPayloads = [];
+      }
+      const alreadyDeferred = entry.deferredCanonicalPayloads.some(
+        (pending) =>
+          String(pending?.messageId ?? "").trim() === incomingMessageId &&
+          incomingMessageId
+      );
+      if (!alreadyDeferred) {
+        entry.deferredCanonicalPayloads.push({ ...payload });
+        console.log("[whatsappInboundBuffer] distinct durable id deferred as new turn", {
+          bufferKey: key,
+          openMessageId: existingIds[0] || null,
+          incomingMessageId: incomingMessageId || null,
+        });
+      }
+      return;
+    }
+  }
+
+  if (useCanonicalGroupBuffer && incomingMessageId) {
+    if (!(entry.seenMessageIds instanceof Set)) entry.seenMessageIds = new Set();
+    entry.seenMessageIds.add(incomingMessageId);
+  }
+
   entry.scheduleGen += 1;
   const myGen = entry.scheduleGen;
 
-  const trimmed = String(text ?? "").trim();
   const nowForBurst = Date.now();
   const prevFragmentAt = entry.lastUpdatedAt ?? null;
   if (trimmed) {

@@ -8,8 +8,11 @@
 
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
 import { deriveCloudItemReferenceMode } from "../contracts/cloudCanonicalSemantic.js";
+import { uniqueLiteralRange as locateUniqueLiteralRange } from "../facts/uniqueLiteralRange.js";
+import { alignGroupDecisionToGroundedCurrentTurn } from "../facts/groupCurrentTurnCatalogAuthority.js";
 import { executeCloudDmOwnershipDecision } from "./decidePostConfirmCustomerDm.js";
 import {
+  explicitCurrentItemBeatsContextualFocus,
   listExplicitCatalogItemIds,
   resolveCanonicalItemReferents,
 } from "../../services/currentTurnAuthority.js";
@@ -155,12 +158,17 @@ function protectedDecisionReason(decision) {
 }
 
 function uniqueLiteralRange(message, surfaceText) {
-  const first = message.indexOf(surfaceText);
-  if (first < 0) return { ok: false, reason: "GROUP_CURRENT_ITEM_SURFACE_MISSING" };
-  if (message.indexOf(surfaceText, first + 1) >= 0) {
-    return { ok: false, reason: "GROUP_CURRENT_ITEM_SURFACE_NOT_UNIQUE" };
+  const located = locateUniqueLiteralRange(message, surfaceText);
+  if (!located.ok) {
+    return {
+      ok: false,
+      reason:
+        located.reason === "SURFACE_NOT_UNIQUE"
+          ? "GROUP_CURRENT_ITEM_SURFACE_NOT_UNIQUE"
+          : "GROUP_CURRENT_ITEM_SURFACE_MISSING",
+    };
   }
-  return { ok: true, start: first, end: first + surfaceText.length };
+  return located;
 }
 
 /**
@@ -172,6 +180,7 @@ export function groundGroupCurrentTurnItemReferents({
   decision,
   customerMessage = "",
   trustedFreshItemFocus = null,
+  catalogItems = [],
 } = {}) {
   if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
     return { ok: false, reason: "GROUP_SEMANTIC_DECISION_MISSING" };
@@ -260,7 +269,11 @@ export function groundGroupCurrentTurnItemReferents({
 
   return {
     ok: true,
-    decision: { ...groupDecision, itemReferents: grounded },
+    decision: alignGroupDecisionToGroundedCurrentTurn(
+      { ...groupDecision, itemReferents: grounded },
+      message,
+      catalogItems
+    ),
   };
 }
 
@@ -268,6 +281,7 @@ export function preprocessGroupCanonicalSemanticDecision({
   rawDecision,
   customerMessage = "",
   trustedFreshItemFocus = null,
+  catalogItems = [],
 } = {}) {
   const decision = parseModelDecision(rawDecision);
   if (!decision) {
@@ -277,13 +291,23 @@ export function preprocessGroupCanonicalSemanticDecision({
     decision,
     customerMessage,
     trustedFreshItemFocus,
+    catalogItems,
   });
   return grounded.ok
-    ? { ...grounded, validationCustomerMessage: String(customerMessage ?? "") }
+    ? {
+        ...grounded,
+        validationCustomerMessage: String(customerMessage ?? ""),
+        allowCatalogCurrentTurnAlignment: true,
+      }
     : grounded;
 }
 
-function validateGroupItemReferents(decision, customerMessage, catalogItems) {
+function validateGroupItemReferents(
+  decision,
+  customerMessage,
+  catalogItems,
+  trustedFreshItemFocus = null
+) {
   const refs = Array.isArray(decision?.itemReferents)
     ? decision.itemReferents
     : null;
@@ -351,9 +375,10 @@ function validateGroupItemReferents(decision, customerMessage, catalogItems) {
   for (const ref of refs) {
     if (ref.source === "current_turn") {
       const ids = listExplicitCatalogItemIds(ref.surfaceText, catalogItems);
-      if (ids.length === 0) return "GROUP_ITEM_CATALOG_UNKNOWN";
-      if (ids.length > 1) return "GROUP_ITEM_CATALOG_AMBIGUOUS";
-      resolvedIds.push(ids[0]);
+      // Unique MATCHED ids are tracked for duplicate detection. Zero ids is
+      // NOT_MATCHED and multiple ids is AMBIGUOUS — both are catalog
+      // outcomes owned after CURRENT_TURN grounding, not semantic rejection.
+      if (ids.length === 1) resolvedIds.push(ids[0]);
       continue;
     }
     const [resolution] = resolveCanonicalItemReferents([ref], catalogItems);
@@ -365,12 +390,44 @@ function validateGroupItemReferents(decision, customerMessage, catalogItems) {
   if (new Set(resolvedIds).size !== resolvedIds.length) {
     return "GROUP_DUPLICATE_TRUSTED_ITEM_REFERENT";
   }
-  return null;
+  return explicitCurrentItemBeatsContextualFocus({
+    customerMessage,
+    catalogItems,
+    trustedFreshItemFocus,
+    itemReferents: refs,
+  });
+}
+
+export function assertFrozenGroupCanonicalSemanticDecision(decision) {
+  if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
+    return { ok: false, reason: "GROUP_SEMANTIC_DECISION_MISSING" };
+  }
+  if (
+    decision.semanticDecisionProvenance !==
+    VALIDATED_GROUP_CANONICAL_SEMANTIC_PROVENANCE
+  ) {
+    return { ok: false, reason: "GROUP_SEMANTIC_PROVENANCE_CORRUPT" };
+  }
+  if (String(decision.semanticDecisionStatus ?? "").trim() !== "released") {
+    return { ok: false, reason: "GROUP_SEMANTIC_DECISION_NOT_RELEASED" };
+  }
+  if (!GROUP_RELEASED_SCOPES.has(String(decision.turnScope ?? "").trim())) {
+    return { ok: false, reason: "GROUP_PROTECTED_SEMANTIC_SCOPE_REJECTED" };
+  }
+  if (!cleanCustomerSemanticIntent(decision.semanticIntent)) {
+    return { ok: false, reason: "GROUP_SEMANTIC_INTENT_INVALID" };
+  }
+  if (!Array.isArray(decision.itemReferents) || decision.itemReferents.length > 8) {
+    return { ok: false, reason: "GROUP_ITEM_REFERENTS_INVALID" };
+  }
+  const protectedReason = protectedDecisionReason(decision);
+  if (protectedReason) return { ok: false, reason: protectedReason };
+  return { ok: true, reason: null };
 }
 
 export function validateGroupCanonicalSemanticDecision(
   decision,
-  { customerMessage = "", catalogItems = [] } = {}
+  { customerMessage = "", catalogItems = [], trustedFreshItemFocus = null } = {}
 ) {
   if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
     return { ok: false, reason: "GROUP_SEMANTIC_DECISION_MISSING" };
@@ -398,7 +455,8 @@ export function validateGroupCanonicalSemanticDecision(
   const referentReason = validateGroupItemReferents(
     decision,
     customerMessage,
-    catalogItems
+    catalogItems,
+    trustedFreshItemFocus
   );
   return referentReason
     ? { ok: false, reason: referentReason }
@@ -409,6 +467,7 @@ export async function resolveGroupCanonicalSemanticDecision({
   business = null,
   catalogItems = [],
   trustedFreshItemFocus = null,
+  trustedGroupContinuation = null,
   userMessage = "",
   conversationHistory = null,
   timeoutMs = 8000,
@@ -423,6 +482,10 @@ export async function resolveGroupCanonicalSemanticDecision({
     business: business && typeof business === "object" ? business : {},
     catalogItems: Array.isArray(catalogItems) ? catalogItems : [],
     trustedFreshItemFocus,
+    trustedGroupContinuation:
+      trustedGroupContinuation && typeof trustedGroupContinuation === "object"
+        ? trustedGroupContinuation
+        : null,
     bookingCandidates: [],
     pendingAvailabilityRequests: [],
     pendingOwnerCheckRequests: [],
@@ -446,6 +509,7 @@ export async function resolveGroupCanonicalSemanticDecision({
         rawDecision,
         customerMessage,
         trustedFreshItemFocus,
+        catalogItems,
       }),
   });
   const completionCount = Number(decided?.ownershipCompletionCount ?? 0) || 0;
@@ -460,6 +524,7 @@ export async function resolveGroupCanonicalSemanticDecision({
   const validation = validateGroupCanonicalSemanticDecision(decided.decision, {
     customerMessage: normalizeCanonicalMessageForGrounding(userMessage),
     catalogItems,
+    trustedFreshItemFocus,
   });
   if (!validation.ok) return reject(validation.reason, decided, completionCount);
 
@@ -475,6 +540,25 @@ export async function resolveGroupCanonicalSemanticDecision({
       decided.decision.temporalRequest &&
       typeof decided.decision.temporalRequest === "object"
         ? Object.freeze({ ...decided.decision.temporalRequest })
+        : null,
+    requestedDuration:
+      decided.decision.requestedDuration &&
+      typeof decided.decision.requestedDuration === "object"
+        ? Object.freeze({
+            ...decided.decision.requestedDuration,
+            components: Array.isArray(decided.decision.requestedDuration.components)
+              ? Object.freeze(
+                  decided.decision.requestedDuration.components.map((c) =>
+                    Object.freeze({ ...c })
+                  )
+                )
+              : null,
+          })
+        : null,
+    intentSwitchEvidence:
+      decided.decision.intentSwitchEvidence &&
+      typeof decided.decision.intentSwitchEvidence === "object"
+        ? Object.freeze({ ...decided.decision.intentSwitchEvidence })
         : null,
     targetReference: Object.freeze({ ...decided.decision.targetReference }),
     targetId: decided.decision.targetId,

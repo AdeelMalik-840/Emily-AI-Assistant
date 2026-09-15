@@ -5,7 +5,7 @@
 import { understandTurn } from "../understanding/UnderstandingEngine.js";
 import { extractTurnSignals } from "../../services/intentShapeResolver.js";
 import { CANONICAL_FACTS_SCHEMA_VERSION } from "./constants.js";
-import { resolveCatalogItemFacts } from "./resolveCatalogItemFacts.js";
+import { resolveCatalogItemFacts, findCatalogRowById } from "./resolveCatalogItemFacts.js";
 import { resolvePricingFacts } from "./resolvePricingFacts.js";
 import { resolveAvailabilityFacts } from "./resolveAvailabilityFacts.js";
 import { resolveMediaFacts } from "./resolveMediaFacts.js";
@@ -25,17 +25,38 @@ import { resolveBookingDateWindowFromDuration } from "./resolveBookingDateWindow
 import {
   FALLBACK_BUSINESS_TIMEZONE,
 } from "./resolveCalendarDateWindow.js";
-import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCompletionsCreate.js";
 import { isAvailabilityDurationPendingAction } from "../availability/availabilityPendingActions.js";
 import { decideEmilyPendingFollowUp } from "../availability/decideEmilyPendingFollowUp.js";
-import { readEmilyPendingFromMemory } from "../availability/emilyPendingContext.js";
-import { composeUnavailableCustomerReplyFromFacts } from "../workflows/AvailabilityInquiryWorkflow.js";
+import {
+  EMILY_PENDING_STAGE_AVAILABILITY_DURATION,
+  readEmilyPendingForParticipant,
+  readEmilyPendingFromMemory,
+} from "../availability/emilyPendingContext.js";
 import {
   applyCustomerSemanticIntentToSignals,
+  promotePricingContinuationWithExactDuration,
+  promotePricingInquiryWithExactDuration,
   requestedFieldForCustomerSemanticIntent,
   workflowTypeForCustomerSemanticIntent,
 } from "../decisions/projectSemanticIntentFromBrainDecision.js";
 import { cleanCustomerSemanticIntent } from "../contracts/customerSemanticIntent.js";
+import {
+  getNormalizedDaysFromDurationPreference,
+  parseUserDuration,
+} from "../../duration/parseDuration.js";
+import {
+  exactDurationEvidenceHasNonNumericMaterial,
+  uniqueLiteralRangeCaseInsensitive,
+} from "./uniqueLiteralRange.js";
+import {
+  applyGroupCurrentTurnCatalogResponseAuthority,
+  currentTurnItemReferents,
+  durationMisreadAsOnlyCurrentTurnItem,
+  overrideCatalogItemFactsWhenDurationMisreadAsItem,
+  overrideCatalogItemFactsWhenUngroundedCurrentTurnWithTrustedFocus,
+  realCurrentTurnItemReferents,
+} from "./groupCurrentTurnCatalogAuthority.js";
+import { listExplicitCatalogItemIds } from "../../services/currentTurnAuthority.js";
 
 /**
  * @param {unknown} message
@@ -54,6 +75,56 @@ function normalizeMessage(message) {
  */
 function hasValue(value) {
   return String(value ?? "").trim().length > 0;
+}
+
+/**
+ * After a pricing_* answer, Brain sometimes drops requestedDuration on
+ * "or 3 din ka?" while the literal duration remains in the message. Rescue
+ * only for Group pricing continuation: prior transactional intent was
+ * pricing, item is resolved, message is not availability-like, and the
+ * parsed duration surface is a unique literal span.
+ *
+ * @param {{
+ *   validatedGroupCanonicalAuthority?: boolean,
+ *   lastTransactionalSemanticIntent?: unknown,
+ *   itemId?: string | null,
+ *   activeNeedDurationSameItem?: boolean,
+ *   message?: unknown,
+ *   existingDays?: number | null,
+ * }} p
+ * @returns {number | null}
+ */
+function rescueExactDurationDaysForPricingContinuation(p = {}) {
+  if (p.validatedGroupCanonicalAuthority !== true) return null;
+  if (p.existingDays != null && Number.isFinite(Number(p.existingDays))) return null;
+  if (p.activeNeedDurationSameItem === true) return null;
+  if (!String(p.itemId ?? "").trim()) return null;
+  const message = String(p.message ?? "");
+  const last = cleanCustomerSemanticIntent(p.lastTransactionalSemanticIntent);
+  const signals = extractTurnSignals({ message });
+  if (signals.rentAvailabilityCompound === true || signals.availabilityAsk === true) {
+    return null;
+  }
+  const priorWasPricing =
+    last === "pricing_inquiry" || last === "pricing_with_duration";
+  const explicitPriceAsk = signals.priceAsk === true;
+  if (!priorWasPricing && !explicitPriceAsk) return null;
+  const parsed = parseUserDuration(message);
+  const days = Number(parsed?.normalizedDays);
+  if (!Number.isFinite(days) || days < 1) return null;
+  const value = Number(parsed?.value);
+  const unit = String(parsed?.unit ?? "").trim().toLowerCase();
+  if (!Number.isFinite(value) || value < 1 || !unit) return null;
+  const unitToken =
+    unit === "days" ? "din" : unit === "months" ? "mahina" : unit === "weeks" ? "hafta" : unit;
+  const surface = `${Math.floor(value)} ${unitToken}`;
+  const grounded = uniqueLiteralRangeCaseInsensitive(message, surface);
+  if (!grounded.ok) {
+    // Also accept "3 din" when parser unit display is "days".
+    const alt = uniqueLiteralRangeCaseInsensitive(message, `${Math.floor(value)} din`);
+    if (!alt.ok) return null;
+  }
+  return Math.max(1, Math.floor(days));
 }
 
 /**
@@ -129,6 +200,11 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
  * 5. gated session duration only with trustedContinuation co-signal
  * 6. none
  *
+ * Assist / AVR / gated session are continuation sources only. A fresh
+ * NEW_TRANSACTION whose current-turn duration is none/untrusted must not
+ * inherit them (caller sets allowInheritedDuration=false). Explicit current
+ * days and pending temporal-clarification continuation are unchanged.
+ *
  * @param {{
  *   explicitDurationDays?: number | null,
  *   pendingClarificationDurationDays?: number | null,
@@ -136,6 +212,7 @@ export function resolveOwnerCheckAlignedDurationDays(p = {}) {
  *   activeAvrDurationDays?: number | null,
  *   sessionDurationDays?: number | null,
  *   trustedContinuation?: boolean,
+ *   allowInheritedDuration?: boolean,
  * }} p
  * @returns {{
  *   days: number | null,
@@ -186,8 +263,10 @@ export function resolveCanonicalRentalDuration(p = {}) {
     });
   }
 
+  const allowInheritedDuration = p.allowInheritedDuration !== false;
+
   const assist =
-    p.freshAssist && typeof p.freshAssist === "object"
+    allowInheritedDuration && p.freshAssist && typeof p.freshAssist === "object"
       ? /** @type {Record<string, unknown>} */ (p.freshAssist)
       : null;
   const assistDays = Number(assist?.durationDays);
@@ -202,7 +281,7 @@ export function resolveCanonicalRentalDuration(p = {}) {
     });
   }
 
-  const avrDays = Number(p.activeAvrDurationDays);
+  const avrDays = allowInheritedDuration ? Number(p.activeAvrDurationDays) : NaN;
   if (Number.isFinite(avrDays) && avrDays >= 1) {
     return Object.freeze({
       days: Math.max(1, Math.floor(avrDays)),
@@ -216,6 +295,7 @@ export function resolveCanonicalRentalDuration(p = {}) {
 
   const sessionDays = Number(p.sessionDurationDays);
   if (
+    allowInheritedDuration &&
     p.trustedContinuation === true &&
     Number.isFinite(sessionDays) &&
     sessionDays >= 1
@@ -300,6 +380,126 @@ export function resolveAvailabilityCalendarRelative(p = {}) {
   const weak = collectWeakContextSignals(String(p.normalizedMessage ?? ""));
   if (weak.includes("date_context")) return "tomorrow";
   return null;
+}
+
+/** Canonical duration units the semantic Brain may express a component in. */
+const SEMANTIC_DURATION_UNITS = new Set(["hours", "days", "weeks", "months", "years"]);
+
+function durationDaysResult(status, days, provenanceRejectionReason = null) {
+  return { status, days, provenanceRejectionReason };
+}
+
+/**
+ * Deterministic authority boundary for the model-proposed requestedDuration
+ * field (src/brain/decisions/decidePostConfirmCustomerDm.js schema). The
+ * model owns semantic interpretation only (what the customer meant); this
+ * function owns validation, unit normalization, and grounding -- it never
+ * infers meaning from wording itself.
+ *
+ * Deliberately narrow contract: only status="exact", with every component
+ * structurally valid AND a current-turn-grounded evidence span, may resolve
+ * to a usable day count. Every other case (status="none", status="non_exact",
+ * missing/malformed proposal, ungrounded evidence, an out-of-range value, an
+ * unrecognized unit, or a non-finite/non-positive computed total) resolves
+ * to `days: null` -- the caller must treat that exactly like "no duration
+ * stated," never invent a value, and never fall back to guessing a unit.
+ *
+ * @param {unknown} requestedDuration Raw (already Object.frozen) proposal
+ *   from the canonical semantic decision, or null/undefined when the
+ *   decision carries none (legacy/non-canonical caller).
+ * @param {string} rawMessage The real current-turn message text, for
+ *   evidence-grounding (the same defense already used for temporalRequest).
+ * @returns {{
+ *   status: "not_applicable" | "none" | "exact" | "non_exact" | "invalid_structured_output",
+ *   days: number | null,
+ *   provenanceRejectionReason: string | null,
+ * }}
+ */
+export function resolveSemanticRequestedDurationDays(requestedDuration, rawMessage = "") {
+  if (
+    !requestedDuration ||
+    typeof requestedDuration !== "object" ||
+    Array.isArray(requestedDuration)
+  ) {
+    return durationDaysResult("not_applicable", null);
+  }
+  const proposal = /** @type {Record<string, unknown>} */ (requestedDuration);
+  const status = String(proposal.status ?? "").trim();
+  if (status === "none") return durationDaysResult("none", null);
+  if (status !== "exact") {
+    // Includes "non_exact" and any unrecognized/malformed status string --
+    // the customer attempted to express a duration, but not one this
+    // deterministic layer may safely convert to an exact day count.
+    return durationDaysResult("non_exact", null);
+  }
+
+  const evidence = proposal.evidence;
+  const grounded =
+    evidence &&
+    typeof evidence === "object" &&
+    /** @type {Record<string, unknown>} */ (evidence).source === "current_turn" &&
+    Number.isInteger(/** @type {Record<string, unknown>} */ (evidence).start) &&
+    Number.isInteger(/** @type {Record<string, unknown>} */ (evidence).end) &&
+    /** @type {Record<string, unknown>} */ (evidence).start >= 0 &&
+    /** @type {Record<string, unknown>} */ (evidence).end >
+      /** @type {Record<string, unknown>} */ (evidence).start &&
+    /** @type {Record<string, unknown>} */ (evidence).end <= String(rawMessage ?? "").length &&
+    String(rawMessage ?? "").slice(
+      /** @type {number} */ (/** @type {Record<string, unknown>} */ (evidence).start),
+      /** @type {number} */ (/** @type {Record<string, unknown>} */ (evidence).end)
+    ) === String(/** @type {Record<string, unknown>} */ (evidence).surfaceText ?? "");
+  // A model-emitted duration cannot be trusted merely because the JSON shape
+  // is valid -- an ungrounded "exact" claim (the cited span does not
+  // actually exist in the real message) is a structural failure, not a
+  // customer-stated duration.
+  if (!grounded) {
+    return durationDaysResult("invalid_structured_output", null, "EVIDENCE_UNGROUNDED");
+  }
+
+  const components = Array.isArray(proposal.components) ? proposal.components : null;
+  if (!components || components.length === 0) {
+    return durationDaysResult("invalid_structured_output", null, "COMPONENTS_MISSING");
+  }
+  // Provenance, not language: reject digits-only spans ("2") so a numeral
+  // alone cannot become durationDays. Do not require components[].value to
+  // appear as that same numeral in the span (week→7 days, "one week", etc.).
+  if (
+    !exactDurationEvidenceHasNonNumericMaterial(
+      /** @type {Record<string, unknown>} */ (evidence).surfaceText
+    )
+  ) {
+    return durationDaysResult(
+      "invalid_structured_output",
+      null,
+      "EVIDENCE_SPAN_DIGITS_ONLY"
+    );
+  }
+
+  let totalDays = 0;
+  for (const entry of components) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return durationDaysResult("invalid_structured_output", null, "COMPONENT_INVALID");
+    }
+    const value = Number(/** @type {Record<string, unknown>} */ (entry).value);
+    const unit = String(/** @type {Record<string, unknown>} */ (entry).unit ?? "").trim();
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1 || value > 999) {
+      return durationDaysResult("invalid_structured_output", null, "COMPONENT_VALUE_INVALID");
+    }
+    if (!SEMANTIC_DURATION_UNITS.has(unit)) {
+      return durationDaysResult("invalid_structured_output", null, "COMPONENT_UNIT_UNSUPPORTED");
+    }
+    // Reused unchanged -- deterministic unit -> day conversion is not
+    // reimplemented here (see src/duration/parseDuration.js).
+    const componentDays = getNormalizedDaysFromDurationPreference({ value, unit });
+    if (!Number.isFinite(componentDays) || componentDays == null || componentDays <= 0) {
+      return durationDaysResult("invalid_structured_output", null, "COMPONENT_NORMALIZE_FAILED");
+    }
+    totalDays += componentDays;
+  }
+  if (!Number.isFinite(totalDays) || totalDays <= 0) {
+    return durationDaysResult("invalid_structured_output", null, "DURATION_TOTAL_INVALID");
+  }
+  return durationDaysResult("exact", Math.floor(totalDays));
 }
 
 /**
@@ -452,12 +652,63 @@ function resolveBusinessDecision(p) {
   )
     ? p.authoritativeItemScope
     : null;
+  // Canonical transaction authority (Group only): the raw semantic intent is
+  // only a proposal. When an active, trusted same-item Group transaction
+  // exists and the model did not cite grounded current-turn evidence for
+  // switching away from it (groupTransactionIntentSwitch.accepted === false,
+  // computed by the caller from the same active-transaction/evidence facts
+  // WorkflowEngine's gate uses), the decision must be built from
+  // availability_inquiry, not from the raw drifted intent -- and every
+  // intent-derived field below must agree, never just workflowType, so the
+  // frozen CanonicalTurnDecision the orchestrator trusts directly can never
+  // be internally contradictory (e.g. workflowType=availability_inquiry with
+  // primaryIntent=pricing_with_duration).
+  const canonicalTransactionRetained =
+    p.validatedGroupCanonicalAuthority === true &&
+    p.groupTransactionIntentSwitch?.activeTransaction === true &&
+    p.groupTransactionIntentSwitch?.accepted === false;
   if (authoritativeSemanticIntent) {
+    const retainedOrRawIntent = canonicalTransactionRetained
+      ? "availability_inquiry"
+      : authoritativeSemanticIntent;
+    const messageSignalsForPromotion = extractTurnSignals({
+      message: p.customerMessage,
+    });
+    const availabilityLikeMessage =
+      messageSignalsForPromotion.rentAvailabilityCompound === true ||
+      messageSignalsForPromotion.availabilityAsk === true;
+    const explicitPriceAskMessage = messageSignalsForPromotion.priceAsk === true;
+    // When canonical authority already resolved an item AND a trusted exact
+    // duration, pricing_inquiry is the under-specified label for the same act
+    // as pricing_with_duration. After a prior pricing_* answer, also remap a
+    // flaky availability_inquiry label on non-availability messages (live:
+    // "or 3 din ka?" after Corolla price). Explicit kitna/rate asks after AVR
+    // also remap. Never promotes while an active NEED_DURATION transaction
+    // retained availability above.
+    const effectiveSemanticIntent =
+      hasResolvedItem && !canonicalTransactionRetained
+        ? promotePricingContinuationWithExactDuration({
+            intent: retainedOrRawIntent,
+            durationDays,
+            lastTransactionalSemanticIntent: p.lastTransactionalSemanticIntent,
+            hasResolvedItem,
+            validatedGroupCanonicalAuthority: p.validatedGroupCanonicalAuthority,
+            canonicalTransactionRetained,
+            availabilityLikeMessage,
+            explicitPriceAskMessage,
+          }) || retainedOrRawIntent
+        : retainedOrRawIntent;
+    const pricingInquiryUpgradedWithDuration =
+      (retainedOrRawIntent === "pricing_inquiry" ||
+        retainedOrRawIntent === "availability_inquiry" ||
+        retainedOrRawIntent === "clarification" ||
+        retainedOrRawIntent === "unclear") &&
+      effectiveSemanticIntent === "pricing_with_duration";
     const canonicalWorkflowType = workflowTypeForCustomerSemanticIntent(
-      authoritativeSemanticIntent
+      effectiveSemanticIntent
     );
     const canonicalRequestedField = requestedFieldForCustomerSemanticIntent(
-      authoritativeSemanticIntent,
+      effectiveSemanticIntent,
       requestedField
     );
     const canonicalItemReferents = Array.isArray(understanding?.canonicalItemReferents)
@@ -466,26 +717,63 @@ function resolveBusinessDecision(p) {
     const boundedExplicitItemIds = Array.isArray(understanding?.resolvedItemIds)
       ? understanding.resolvedItemIds.map((id) => String(id ?? "").trim()).filter(Boolean)
       : [];
+    const catalogAuthorityDecision = applyGroupCurrentTurnCatalogResponseAuthority({
+      validatedGroupCanonicalAuthority: p.validatedGroupCanonicalAuthority,
+      understanding,
+      itemFacts: p.itemFacts,
+      authoritativeSemanticIntent,
+      requestedField,
+      secondaryIntents,
+      weakContextSignals,
+      durationDays,
+      resolvedItemId,
+      emilyPending: p.emilyPending,
+      lastAvailabilityAssist: p.lastAvailabilityAssist,
+      lastTransactionalSemanticIntent: p.lastTransactionalSemanticIntent,
+      customerMessage: p.customerMessage,
+      requestedDuration: p.requestedDuration,
+      catalogItems: p.catalogItems,
+      matchedContextToPersist: buildContextToPersist({
+        memoryAllowed,
+        resolvedItemId,
+        durationDays: null,
+      }),
+    });
+    if (catalogAuthorityDecision) {
+      return catalogAuthorityDecision;
+    }
     if (
       p.validatedGroupCanonicalAuthority === true &&
       authoritativeItemScope === "specific" &&
       !hasResolvedItem
     ) {
+      const unmatchedCatalogItem =
+        String(p.itemFacts?.status ?? "") === "not_matched" &&
+        !durationMisreadAsOnlyCurrentTurnItem({
+          referents: understanding?.canonicalItemReferents,
+          message: p.customerMessage,
+          requestedDuration: p.requestedDuration,
+          catalogItems: p.catalogItems,
+        });
       return Object.freeze({
         primaryIntent: authoritativeSemanticIntent,
         secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
-        workflowType: "clarification",
-        replyType: "clarification",
+        workflowType: unmatchedCatalogItem ? "item_not_in_catalog" : "clarification",
+        replyType: unmatchedCatalogItem ? "item_not_in_catalog" : "clarification",
         requestedField: canonicalRequestedField,
         resolvedItemId: null,
         boundedExplicitItemIds: Object.freeze([...boundedExplicitItemIds]),
         durationDays,
-        strongBookingCommand: authoritativeSemanticIntent === "booking_request",
+        strongBookingCommand: unmatchedCatalogItem
+          ? false
+          : authoritativeSemanticIntent === "booking_request",
         weakContextSignals: Object.freeze(weakContextSignals),
         sideEffectsAllowed: Object.freeze([]),
         contextToPersist: Object.freeze({}),
         confidence: "high",
-        reason: "validated_group_item_not_resolved",
+        reason: unmatchedCatalogItem
+          ? "validated_group_item_not_matched"
+          : "validated_group_item_not_resolved",
       });
     }
     if (authoritativeItemScope === "specific" && canonicalItemReferents.length > 1) {
@@ -507,7 +795,15 @@ function resolveBusinessDecision(p) {
       });
     }
     return Object.freeze({
-      primaryIntent: authoritativeSemanticIntent,
+      primaryIntent: effectiveSemanticIntent,
+      // Diagnostics only -- never consulted by workflow/reply-kind selection.
+      // Present only when the raw model intent actually differed from the
+      // effective (canonical-transaction-retained) intent used above.
+      ...(canonicalTransactionRetained && authoritativeSemanticIntent !== effectiveSemanticIntent
+        ? { rawSemanticIntent: authoritativeSemanticIntent }
+        : pricingInquiryUpgradedWithDuration
+          ? { rawSemanticIntent: retainedOrRawIntent }
+          : {}),
       secondaryIntents: Object.freeze([...new Set(secondaryIntents)]),
       workflowType: canonicalWorkflowType ?? "clarification",
       replyType: canonicalWorkflowType === "browse_options"
@@ -525,10 +821,10 @@ function resolveBusinessDecision(p) {
       requestedField: canonicalRequestedField,
       resolvedItemId,
       durationDays,
-      strongBookingCommand: authoritativeSemanticIntent === "booking_request",
+      strongBookingCommand: effectiveSemanticIntent === "booking_request",
       weakContextSignals: Object.freeze(weakContextSignals),
       sideEffectsAllowed: Object.freeze(
-        authoritativeSemanticIntent === "booking_request"
+        effectiveSemanticIntent === "booking_request"
           ? ["booking_request"]
           : []
       ),
@@ -538,7 +834,13 @@ function resolveBusinessDecision(p) {
         durationDays,
       }),
       confidence: "high",
-      reason: "canonical_semantic_intent_authoritative",
+      reason: canonicalTransactionRetained
+        ? "canonical_transaction_retained_over_ungrounded_intent"
+        : pricingInquiryUpgradedWithDuration
+          ? retainedOrRawIntent === "pricing_inquiry"
+            ? "canonical_pricing_inquiry_upgraded_with_exact_duration"
+            : "canonical_pricing_continuation_upgraded_with_exact_duration"
+          : "canonical_semantic_intent_authoritative",
     });
   }
 
@@ -682,6 +984,15 @@ export function resolveBusinessDecisionForPendingContext(p) {
 function shouldResolveCatalogBrowse(rawMessage, signals, understanding) {
   if (Boolean(signals.browseAsk)) return true;
   if (understanding?.intentsRanked?.[0] === "browse_options") return true;
+  const resolutions = Array.isArray(understanding?.canonicalItemResolutions)
+    ? understanding.canonicalItemResolutions
+    : [];
+  if (
+    resolutions.length === 1 &&
+    String(resolutions[0]?.status ?? "").trim() === "NOT_MATCHED"
+  ) {
+    return true;
+  }
   return isGenericBrowseListAsk(rawMessage);
 }
 
@@ -739,6 +1050,9 @@ export async function resolveBusinessTurnContext(params) {
     : null;
   const validatedGroupCanonicalAuthority =
     turnContextInput?.validatedGroupCanonicalAuthority === true;
+  if (validatedGroupCanonicalAuthority && params.turnContext) {
+    params.turnContext.validatedGroupCanonicalAuthority = true;
+  }
   // A frozen canonical semantic decision exists for this turn — Cloud's own
   // ownership decision, or (once validated) Group's canonical decision via
   // the same generic params.turnContext.canonicalSemanticDecision slot.
@@ -756,8 +1070,57 @@ export async function resolveBusinessTurnContext(params) {
     typeof params.turnContext.canonicalSemanticDecision.temporalRequest === "object"
       ? params.turnContext.canonicalSemanticDecision.temporalRequest
       : null;
+  const temporalEvidence = temporalRequest?.evidence;
+  const temporalEvidenceGrounded =
+    temporalEvidence?.source === "current_turn" &&
+    Number.isInteger(temporalEvidence?.start) &&
+    Number.isInteger(temporalEvidence?.end) &&
+    temporalEvidence.start >= 0 &&
+    temporalEvidence.end > temporalEvidence.start &&
+    temporalEvidence.end <= rawMessage.length &&
+    rawMessage.slice(temporalEvidence.start, temporalEvidence.end) ===
+      String(temporalEvidence.surfaceText ?? "");
+  const temporalKind =
+    validatedGroupCanonicalAuthority === true &&
+    temporalRequest?.startDateKind !== "none" &&
+    !temporalEvidenceGrounded
+      ? "none"
+      : temporalRequest?.startDateKind;
+  // AI-proposed structured duration meaning — independent field from
+  // temporalRequest above; a turn may state a start date, a duration, both,
+  // or neither, and neither is ever inferred from the other. Same single-
+  // authority-when-canonical posture as temporalRequest: when a canonical
+  // semantic decision exists, this is the sole duration owner and the
+  // legacy regex parser (parseUserDuration, consumed further down via
+  // `understanding.durationDays`) is never consulted, even when it would
+  // disagree — no dual semantic authority. resolveSemanticRequestedDurationDays
+  // itself owns all validation/normalization/grounding; only its result is
+  // used here.
+  const semanticRequestedDuration =
+    params.turnContext?.canonicalSemanticDecision?.requestedDuration &&
+    typeof params.turnContext.canonicalSemanticDecision.requestedDuration === "object"
+      ? params.turnContext.canonicalSemanticDecision.requestedDuration
+      : null;
+  const semanticRequestedDurationResult = resolveSemanticRequestedDurationDays(
+    semanticRequestedDuration,
+    rawMessage
+  );
+  // Same grounding pattern as temporalEvidence above, for a proposed
+  // mid-transaction intent switch (e.g. a duration reply that also raises
+  // pricing). Deterministic here means only "does this span really exist in
+  // the raw message" -- never what it means; meaning stays the model's job.
+  const intentSwitchEvidence = params.turnContext?.canonicalSemanticDecision?.intentSwitchEvidence;
+  const intentSwitchEvidenceGrounded =
+    intentSwitchEvidence?.source === "current_turn" &&
+    Number.isInteger(intentSwitchEvidence?.start) &&
+    Number.isInteger(intentSwitchEvidence?.end) &&
+    intentSwitchEvidence.start >= 0 &&
+    intentSwitchEvidence.end > intentSwitchEvidence.start &&
+    intentSwitchEvidence.end <= rawMessage.length &&
+    rawMessage.slice(intentSwitchEvidence.start, intentSwitchEvidence.end) ===
+      String(intentSwitchEvidence.surfaceText ?? "");
   const explicitStartDateFromTemporalRequest =
-    temporalRequest?.startDateKind === "explicit_date" &&
+    temporalKind === "explicit_date" &&
     temporalRequest?.startDate &&
     typeof temporalRequest.startDate === "object"
       ? {
@@ -766,15 +1129,16 @@ export async function resolveBusinessTurnContext(params) {
         }
       : null;
   const canonicalRelativeKind =
-    temporalRequest?.startDateKind === "relative_tomorrow"
+    temporalKind === "relative_tomorrow"
       ? "tomorrow"
-      : temporalRequest?.startDateKind === "relative_day_after_tomorrow"
+      : temporalKind === "relative_day_after_tomorrow"
         ? "day_after_tomorrow"
         : null;
-  // A trusted date-bearing reference exists (invalid, or a customer date the
-  // model could not represent) that must never be silently treated as "no
-  // date" — the availability layer fails closed instead of defaulting to now.
-  const temporalUnresolvedRequested = temporalRequest?.startDateKind === "unresolved";
+  // A model may propose that a date constraint is unresolved. Whether that
+  // proposal can change an already-established Group availability transaction
+  // is decided below from trusted transaction state, not from wording rules.
+  const modelTemporalUnresolvedRequested =
+    temporalKind === "unresolved";
   const understanding =
     admittedTurn && params.turnContext
       ? understandTurn({
@@ -822,13 +1186,103 @@ export async function resolveBusinessTurnContext(params) {
     authoritativeSemanticIntent
   );
 
-  const itemFacts = resolveCatalogItemFacts({
+  const itemFactsRaw = resolveCatalogItemFacts({
     understanding,
     turnContextInput,
     catalogItems,
   });
+  const memorySnapshotEarly =
+    (params.turnContext?.memorySnapshot &&
+    typeof params.turnContext.memorySnapshot === "object" &&
+    !Array.isArray(params.turnContext.memorySnapshot)
+      ? /** @type {Record<string, unknown>} */ (params.turnContext.memorySnapshot)
+      : null) ||
+    (turnContextInput?.memorySnapshot &&
+    typeof turnContextInput.memorySnapshot === "object" &&
+    !Array.isArray(turnContextInput.memorySnapshot)
+      ? /** @type {Record<string, unknown>} */ (turnContextInput.memorySnapshot)
+      : null) ||
+    {};
+  const itemFactsFromDurationMisread =
+    overrideCatalogItemFactsWhenDurationMisreadAsItem({
+      itemFacts: itemFactsRaw,
+      validatedGroupCanonicalAuthority,
+      referents: understanding?.canonicalItemReferents,
+      message: rawMessage,
+      requestedDuration: semanticRequestedDuration,
+      catalogItems,
+      memorySnapshot: memorySnapshotEarly,
+    }) ?? itemFactsRaw;
+  const itemFactsFromUngroundedCurrentTurn =
+    overrideCatalogItemFactsWhenUngroundedCurrentTurnWithTrustedFocus({
+      itemFacts: itemFactsFromDurationMisread,
+      validatedGroupCanonicalAuthority,
+      referents: understanding?.canonicalItemReferents,
+      message: rawMessage,
+      requestedDuration: semanticRequestedDuration,
+      catalogItems,
+      memorySnapshot: memorySnapshotEarly,
+    }) ?? itemFactsFromDurationMisread;
+  // Live defect: open NEED_DURATION for item A + message that uniquely names
+  // catalog item B must resolve B (and leave A's transaction). Uses the same
+  // explicit catalog-name authority as CURRENT_TURN alignment — not phrases.
+  const earlyGroupDurationPending =
+    validatedGroupCanonicalAuthority === true
+      ? readEmilyPendingForParticipant({
+          memorySnapshot: memorySnapshotEarly,
+          participantKey: String(turnContextInput?.participantKey ?? "").trim() || null,
+          chatScopeKey: isGroup
+            ? String(turnContextInput?.chatId ?? "").trim() || null
+            : null,
+          nowMs: Number.isFinite(Number(params.nowMs))
+            ? Number(params.nowMs)
+            : Date.now(),
+        })
+      : null;
+  const earlyPendingItemId = String(earlyGroupDurationPending?.itemId ?? "").trim();
+  const explicitCatalogItemIdsThisTurn = listExplicitCatalogItemIds(
+    rawMessage,
+    catalogItems
+  );
+  const soleCatalogNamedOtherThanPending =
+    earlyGroupDurationPending?.pendingStage ===
+      EMILY_PENDING_STAGE_AVAILABILITY_DURATION &&
+    earlyPendingItemId &&
+    explicitCatalogItemIdsThisTurn.length === 1 &&
+    explicitCatalogItemIdsThisTurn[0] !== earlyPendingItemId
+      ? explicitCatalogItemIdsThisTurn[0]
+      : null;
+  let itemFacts = itemFactsFromUngroundedCurrentTurn;
+  if (soleCatalogNamedOtherThanPending) {
+    const namedRow = findCatalogRowById(catalogItems, soleCatalogNamedOtherThanPending);
+    if (namedRow) {
+      const displayLabel =
+        String(namedRow.displayLabel ?? namedRow.name ?? "").trim() || null;
+      itemFacts = {
+        status: "resolved",
+        id: soleCatalogNamedOtherThanPending,
+        name: String(namedRow.name ?? "").trim() || null,
+        displayLabel,
+        customerReference: null,
+        color: String(namedRow.color ?? namedRow.colour ?? "").trim() || null,
+        source: "catalog",
+        confidence: "high",
+        candidates: [],
+        catalogRow: namedRow,
+        sourceEvidence: {
+          itemId: soleCatalogNamedOtherThanPending,
+          itemSource: "catalog_named_other_than_pending_need_duration",
+          authoritativeItemId: soleCatalogNamedOtherThanPending,
+          catalogRowFound: true,
+          canonicalResolutionStatus: "MATCHED",
+        },
+      };
+    }
+  }
 
-  const pricingFacts = resolvePricingFacts({
+  // Initial pass (may lack Group canonical duration — refreshed after
+  // rentalDurationDays is known so price_with_duration quotes resolve).
+  let pricingFacts = resolvePricingFacts({
     catalogRow: itemFacts.catalogRow,
     requestedField: understanding?.askedField ?? turnContextInput?.requestedField ?? null,
     signals,
@@ -886,12 +1340,61 @@ export async function resolveBusinessTurnContext(params) {
     memorySnapshot.lastAvailabilityAssist
   );
 
+  // Critical invariant: no dual semantic authority. Whenever the canonical
+  // semantic decision actually carries an opinion on duration (its
+  // requestedDuration field is present -- true for every real decision from
+  // executeCloudDmOwnershipDecision going forward, since it is a required
+  // schema field), that opinion is the ONLY duration source for this turn --
+  // the legacy regex parser (parseUserDuration, reached here only via
+  // understanding.durationDays) is never consulted as a rescue/override,
+  // even when it would disagree or would have understood something the
+  // model marked non_exact/invalid. A non-exact/invalid/none semantic
+  // proposal correctly yields null here (duration not accepted), not a
+  // silent regex fallback.
+  //
+  // "not_applicable" (the decision object exists but literally carries no
+  // requestedDuration field at all) is deliberately treated as a DIFFERENT
+  // case from the model having decided "none": it means this decision never
+  // had an opinion to protect, not that duration was affirmatively absent --
+  // this is the exact scenario every canonicalSemanticDecision fixture built
+  // before this field existed is in, and it must keep behaving exactly as
+  // it always has (byte-for-byte unchanged legacy chain), never silently
+  // losing duration understanding on decisions this feature does not touch.
+  const explicitDurationDaysFromSemantic =
+    semanticRequestedDurationResult.status !== "not_applicable"
+      ? semanticRequestedDurationResult.days
+      : understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
+        ? Math.max(1, Math.floor(Number(understanding.durationDays)))
+        : turnContextInput?.duration != null && Number.isFinite(Number(turnContextInput.duration))
+          ? Math.max(1, Math.floor(Number(turnContextInput.duration)))
+          : null;
+
+  const nowMsForPendingClarification = Number.isFinite(Number(params.nowMs))
+    ? Number(params.nowMs)
+    : Date.now();
+  const freshEmilyPending = readEmilyPendingForParticipant({
+    memorySnapshot,
+    participantKey: participantFacts?.participant?.key ?? sourceIdentity?.participantKey ?? null,
+    chatScopeKey: isGroup ? sourceIdentity?.chatId ?? null : null,
+    nowMs: nowMsForPendingClarification,
+  });
+
+  const activeNeedDurationSameItemEarly =
+    validatedGroupCanonicalAuthority === true &&
+    freshEmilyPending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION &&
+    String(freshEmilyPending?.itemId ?? "").trim() === String(itemFacts.id ?? "").trim() &&
+    Boolean(itemFacts.id);
+
   const explicitDurationDaysForFacts =
-    understanding?.durationDays != null && Number.isFinite(Number(understanding.durationDays))
-      ? Math.max(1, Math.floor(Number(understanding.durationDays)))
-      : turnContextInput?.duration != null && Number.isFinite(Number(turnContextInput.duration))
-        ? Math.max(1, Math.floor(Number(turnContextInput.duration)))
-        : null;
+    explicitDurationDaysFromSemantic ??
+    rescueExactDurationDaysForPricingContinuation({
+      validatedGroupCanonicalAuthority,
+      lastTransactionalSemanticIntent: memorySnapshot.lastTransactionalSemanticIntent,
+      itemId: itemFacts.id,
+      activeNeedDurationSameItem: activeNeedDurationSameItemEarly,
+      message: rawMessage,
+      existingDays: explicitDurationDaysFromSemantic,
+    });
 
   const activeAvrDurationDays = readActiveAvrDurationDaysFromMemory(memorySnapshot);
   const participantKeyForDuration =
@@ -923,19 +1426,99 @@ export async function resolveBusinessTurnContext(params) {
     !Array.isArray(memorySnapshot.pendingTemporalClarification)
       ? memorySnapshot.pendingTemporalClarification
       : null;
+  const trustedPendingTemporalConstraint = readFreshPendingTemporalClarification(
+    pendingTemporalClarificationRaw,
+    {
+      itemId: itemFacts.id,
+      participantKey: participantFacts?.participant?.key ?? sourceIdentity?.participantKey ?? null,
+      chatScopeKey: isGroup ? sourceIdentity?.chatId ?? null : null,
+      nowMs: nowMsForPendingClarification,
+    }
+  );
+  const activeGroupDurationPendingForSameItem =
+    validatedGroupCanonicalAuthority === true &&
+    freshEmilyPending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION &&
+    String(freshEmilyPending?.itemId ?? "").trim() === String(itemFacts.id ?? "").trim() &&
+    Boolean(itemFacts.id);
+  const currentTurnRefs = realCurrentTurnItemReferents(
+    understanding?.canonicalItemReferents,
+    rawMessage,
+    semanticRequestedDuration,
+    catalogItems
+  );
+  const pendingItemId = String(freshEmilyPending?.itemId ?? "").trim();
+  // Deterministic catalog-name grounding (same surface authority as Group
+  // CURRENT_TURN alignment): if THIS message uniquely names a catalog item
+  // that is not the open NEED_DURATION pending item, the pending transaction
+  // must not own the turn. No phrase/intent dictionaries — catalog identity
+  // only. Bare duration replies name no other item and stay on the pending.
+  const catalogNamedOtherThanPending =
+    validatedGroupCanonicalAuthority === true &&
+    Boolean(pendingItemId) &&
+    explicitCatalogItemIdsThisTurn.some(
+      (id) => String(id ?? "").trim() && String(id).trim() !== pendingItemId
+    );
+  const currentTurnItemSwitch =
+    validatedGroupCanonicalAuthority === true &&
+    (catalogNamedOtherThanPending ||
+      (currentTurnRefs.length > 0 &&
+        (itemFacts.status === "not_matched" ||
+          itemFacts.status === "ambiguous" ||
+          (Boolean(itemFacts.id) &&
+            pendingItemId &&
+            String(itemFacts.id) !== pendingItemId))));
+  // Canonical transaction authority (Group only): an active, trusted
+  // NEED_DURATION transaction for this same item owns the turn by default.
+  // A freshly sampled semantic intent (e.g. pricing_with_duration on a bare
+  // duration reply) is only a proposal -- it may not silently replace the
+  // active transaction unless the model also cited a real, grounded
+  // current-turn span showing the customer raised something beyond just
+  // answering the pending question. A newly grounded CURRENT_TURN item that
+  // is not this pending item is switch evidence: never keep the old item,
+  // duration, or AVR. No active matching transaction means there is nothing
+  // to protect, so the proposal is accepted trivially.
+  const groupTransactionIntentSwitch = Object.freeze({
+    activeTransaction: activeGroupDurationPendingForSameItem && !currentTurnItemSwitch,
+    evidenceGrounded: intentSwitchEvidenceGrounded,
+    accepted:
+      currentTurnItemSwitch ||
+      !activeGroupDurationPendingForSameItem ||
+      intentSwitchEvidenceGrounded,
+    currentTurnItemSwitch,
+    catalogNamedOtherThanPending,
+  });
+  // An established Group NEED_DURATION transaction has already determined
+  // the missing field. Once the customer supplies that duration, a bare
+  // model-only `unresolved` date proposal cannot reclassify the transaction
+  // as NEED_TEMPORAL_CLARIFICATION. Explicit/relative dates and a trusted
+  // existing temporal clarification remain authoritative as before.
+  const durationOnlyGroupContinuation =
+    activeGroupDurationPendingForSameItem &&
+    explicitDurationDaysForFacts != null &&
+    trustedPendingTemporalConstraint == null;
+  const temporalUnresolvedRequested =
+    modelTemporalUnresolvedRequested && !durationOnlyGroupContinuation;
   const isResolvingTemporalClarification =
     explicitStartDateFromTemporalRequest != null ||
     canonicalRelativeKind != null ||
     temporalUnresolvedRequested === true;
-  const nowMsForPendingClarification = Number.isFinite(Number(params.nowMs))
-    ? Number(params.nowMs)
-    : Date.now();
   const pendingTemporalClarification = isResolvingTemporalClarification
-    ? readFreshPendingTemporalClarification(pendingTemporalClarificationRaw, {
-        itemId: itemFacts.id,
-        nowMs: nowMsForPendingClarification,
-      })
+    ? trustedPendingTemporalConstraint
     : null;
+
+  const turnScope = String(
+    params.turnContext?.canonicalSemanticDecision?.turnScope ?? ""
+  ).trim();
+  const currentTurnDurationTrusted =
+    semanticRequestedDurationResult.status === "exact" &&
+    semanticRequestedDurationResult.days != null &&
+    Number.isFinite(Number(semanticRequestedDurationResult.days));
+  // Fresh NEW_TRANSACTION with no trusted current-turn duration must not
+  // reuse a previous assist/AVR/session period. PENDING_AVAILABILITY_REFERENCE
+  // and other continuation scopes keep existing inherit behavior. Explicit
+  // current-turn days and temporal-clarification continuation are not gated.
+  const allowInheritedDuration =
+    currentTurnDurationTrusted || turnScope !== "NEW_TRANSACTION";
 
   const canonicalDuration = resolveCanonicalRentalDuration({
     explicitDurationDays: explicitDurationDaysForFacts,
@@ -944,15 +1527,9 @@ export async function resolveBusinessTurnContext(params) {
     activeAvrDurationDays,
     sessionDurationDays,
     trustedContinuation,
+    allowInheritedDuration,
   });
 
-  // Readiness/metadata duration (may be 1 for date_context). Overlap window is separate.
-  // Rental/booking windows must use canonicalDuration.days — never weak readiness 1 alone.
-  const durationDaysResolved = resolveOwnerCheckAlignedDurationDays({
-    explicitDurationDays: explicitDurationDaysForFacts,
-    assistDurationDays: lastAvailabilityAssist?.durationDays,
-    normalizedMessage,
-  });
   // Single temporal owner for Cloud turns: once a frozen ownership decision
   // exists, its temporalRequest is authoritative (kal/tomorrow included) and
   // the legacy regex signal is never consulted, even when it would disagree.
@@ -973,6 +1550,40 @@ export async function resolveBusinessTurnContext(params) {
     temporalUnresolvedRequested ||
     (hasCanonicalSemanticDecision && calendarRelative != null);
   const rentalDurationDays = canonicalDuration.days;
+  const messageSignalsForPricing = extractTurnSignals({ message: rawMessage });
+  const availabilityLikeForPricing =
+    messageSignalsForPricing.rentAvailabilityCompound === true ||
+    messageSignalsForPricing.availabilityAsk === true;
+  const pricingContinuationPromoted =
+    promotePricingContinuationWithExactDuration({
+      intent: authoritativeSemanticIntent,
+      durationDays: rentalDurationDays,
+      lastTransactionalSemanticIntent: memorySnapshot.lastTransactionalSemanticIntent,
+      hasResolvedItem: Boolean(itemFacts.id),
+      validatedGroupCanonicalAuthority,
+      canonicalTransactionRetained: false,
+      availabilityLikeMessage: availabilityLikeForPricing,
+      explicitPriceAskMessage: messageSignalsForPricing.priceAsk === true,
+    }) === "pricing_with_duration";
+  // Group canonical duration lives on the semantic decision, not early
+  // understanding.durationDays. Re-resolve after days + final catalog row
+  // are known so pricing_with_duration gets a verified total. When pricing
+  // continuation remaps a flaky availability label, force price quote fields
+  // even though early signals still look like availability.
+  pricingFacts = resolvePricingFacts({
+    catalogRow: itemFacts.catalogRow,
+    requestedField: pricingContinuationPromoted
+      ? "price_with_duration"
+      : understanding?.askedField ?? turnContextInput?.requestedField ?? null,
+    signals: pricingContinuationPromoted
+      ? { ...signals, priceAsk: true, availabilityAsk: false }
+      : signals,
+    durationDays:
+      rentalDurationDays ??
+      understanding?.durationDays ??
+      turnContextInput?.duration ??
+      null,
+  });
   const availabilityTimeZone = resolveBusinessTimeZoneForAvailability({
     businessTimeZone: params.businessTimeZone ?? params.timeZone ?? null,
   });
@@ -994,10 +1605,10 @@ export async function resolveBusinessTurnContext(params) {
     // keeps its original fixed single-day window.
     durationDays:
       hasNewTemporalContractWindow
-        ? (rentalDurationDays ?? durationDaysResolved)
+        ? rentalDurationDays
         : calendarRelative
           ? null
-          : rentalDurationDays ?? durationDaysResolved,
+          : rentalDurationDays,
     calendarRelative,
     explicitStartDate: explicitStartDateFromTemporalRequest,
     temporalUnresolved: temporalUnresolvedRequested,
@@ -1097,62 +1708,28 @@ export async function resolveBusinessTurnContext(params) {
     verifiedAlternatives,
   };
 
-  let unavailableCustomerReply = null;
-  let presentedAlternativeItemIds = [];
-  if (
-    isConfidentInventoryUnavailable(availabilityFacts.availability) &&
-    lastAvailabilityAssist == null
-  ) {
-    const conversationalLabel =
-      String(
-        itemFacts.displayLabel ??
-          itemFacts.name ??
-          lastAvailabilityAssist?.unavailableItemLabel ??
-          ""
-      ).trim() || "item";
-    const durationForReply = Math.max(
-      1,
-      Math.floor(
-        Number(
-          rentalDurationDays ??
-            durationDaysResolved ??
-            lastAvailabilityAssist?.durationDays ??
-            understanding?.durationDays ??
-            1
-        ) || 1
-      )
-    );
-    try {
-      const composedUnavailable = await composeUnavailableCustomerReplyFromFacts({
-        conversationalLabel,
-        durationDays: durationForReply,
-        alternatives: verifiedAlternatives,
-        returnPresentationMetadata: true,
-        chatCompletionsCreate:
-          typeof params.__unavailableReplyChatCreate === "function"
-            ? null
-            : resolveOpenAiChatCompletionsCreate(),
-        __chatCompletionsCreateForTests:
-          typeof params.__unavailableReplyChatCreate === "function"
-            ? params.__unavailableReplyChatCreate
-            : null,
-        __replyForTests:
-          typeof params.__unavailableReplyForTests === "string"
-            ? params.__unavailableReplyForTests
-            : null,
-        __presentedItemIdsForTests: Array.isArray(params.__presentedItemIdsForTests)
-          ? params.__presentedItemIdsForTests
-          : null,
-      });
-      unavailableCustomerReply = String(composedUnavailable?.reply ?? "").trim() || null;
-      presentedAlternativeItemIds = Array.isArray(composedUnavailable?.presentedItemIds)
-        ? composedUnavailable.presentedItemIds
-        : [];
-    } catch {
-      unavailableCustomerReply = null;
-      presentedAlternativeItemIds = [];
-    }
-  }
+  // This is the single availability-workflow transition result exposed to
+  // downstream lanes. It is derived only from resolved item/duration facts,
+  // trusted pending state, and the effective temporal contract above.
+  const availabilityConversationTransition = Object.freeze({
+    previousState: activeGroupDurationPendingForSameItem ? "NEED_DURATION" : null,
+    trustedDurationPresent: explicitDurationDaysForFacts != null,
+    trustedTemporalConstraintPresent: trustedPendingTemporalConstraint != null,
+    modelTemporalRequest: String(temporalRequest?.startDateKind ?? "none"),
+    resultingState:
+      !itemFacts.id
+        ? "NEED_ITEM"
+        : availabilityFacts.availability?.dateWindowConfidence === "temporal_unresolved"
+          ? "NEED_TEMPORAL_CLARIFICATION"
+          : rentalDurationDays == null
+            ? "NEED_DURATION"
+            : "READY_FOR_OWNER_CHECK",
+    transitionReason: durationOnlyGroupContinuation
+      ? "group_duration_pending_duration_supplied_ignores_model_only_temporal_unresolved"
+      : temporalUnresolvedRequested
+        ? "temporal_unresolved_effective"
+        : "resolved_availability_facts",
+  });
 
   let availabilityAssistFollowUp = null;
   const canonicalCloudDm =
@@ -1177,7 +1754,7 @@ export async function resolveBusinessTurnContext(params) {
           askedField: understanding?.askedField ?? null,
         },
         verifiedAlternatives,
-        requestedDurationDays: rentalDurationDays ?? durationDaysResolved,
+        requestedDurationDays: rentalDurationDays,
         requestedStartAt: lastAvailabilityAssist.windowStartAt,
         requestedEndAt: lastAvailabilityAssist.windowEndAt,
         pendingQuestion: lastAvailabilityAssist.pendingQuestion ?? null,
@@ -1289,15 +1866,55 @@ export async function resolveBusinessTurnContext(params) {
     // readFreshPendingTemporalClarification.
     pendingTemporalClarification: pendingTemporalClarificationRaw,
     availabilityAssistFollowUp,
-    unavailableCustomerReply,
-    presentedAlternativeItemIds: Object.freeze([...presentedAlternativeItemIds]),
     validatedGroupCanonicalAuthority,
+    availabilityConversationTransition,
+    // Diagnostic only, deliberately a sibling of (not nested inside)
+    // availabilityConversationTransition so existing exact-shape assertions
+    // on that sub-object are unaffected by this new field. Distinguishes WHY
+    // duration is/isn't present: "not_applicable" (no requestedDuration
+    // opinion on this decision -- legacy/pre-feature caller), "none" (model
+    // says no duration stated), "exact" (resolved -- folded into
+    // explicitDurationDaysForFacts/rentalDurationDays above), "non_exact"
+    // (customer referenced a duration concept that isn't one resolved
+    // value), or "invalid_structured_output" (a structurally-broken or
+    // ungrounded model proposal). Only "exact" ever fills NEED_DURATION;
+    // "non_exact" and "invalid_structured_output" leave the transaction in
+    // NEED_DURATION exactly like "none" would -- the difference here is
+    // diagnostic, not behavioral: a non-exact/invalid duration must fail
+    // conversationally via Emily's own natural duration_ask composition,
+    // never as a distinct technical error.
+    durationSemanticStatus: semanticRequestedDurationResult.status,
+    durationProvenanceRejectionReason:
+      semanticRequestedDurationResult.provenanceRejectionReason ?? null,
+    requestedDurationDiagnostics: {
+      status: semanticRequestedDuration?.status ?? semanticRequestedDurationResult.status,
+      components: Array.isArray(semanticRequestedDuration?.components)
+        ? semanticRequestedDuration.components.slice(0, 4).map((entry) => ({
+            value: Number.isInteger(Number(entry?.value)) ? Number(entry.value) : null,
+            unit: String(entry?.unit ?? "").trim() || null,
+          }))
+        : [],
+      evidenceSurfaceText: String(semanticRequestedDuration?.evidence?.surfaceText ?? "")
+        .trim()
+        .slice(0, 80) || null,
+      evidenceStart: Number.isInteger(semanticRequestedDuration?.evidence?.start)
+        ? semanticRequestedDuration.evidence.start
+        : null,
+      evidenceEnd: Number.isInteger(semanticRequestedDuration?.evidence?.end)
+        ? semanticRequestedDuration.evidence.end
+        : null,
+      provenanceRejectionReason:
+        semanticRequestedDurationResult.provenanceRejectionReason ?? null,
+      normalizedDays: semanticRequestedDurationResult.days,
+    },
+    groupTransactionIntentSwitch,
 
     resolvedItem: {
       status: itemFacts.status,
       id: itemFacts.id,
       name: itemFacts.name,
       displayLabel: itemFacts.displayLabel,
+      customerReference: itemFacts.customerReference,
       color: itemFacts.color,
       source: itemFacts.source,
       confidence: itemFacts.confidence,
@@ -1372,10 +1989,35 @@ export async function resolveBusinessTurnContext(params) {
     authoritativeSemanticIntent,
     authoritativeItemScope,
     validatedGroupCanonicalAuthority,
+    groupTransactionIntentSwitch,
+    emilyPending: freshEmilyPending,
+    lastAvailabilityAssist,
+    lastTransactionalSemanticIntent: memorySnapshot.lastTransactionalSemanticIntent,
+    customerMessage: rawMessage,
+    requestedDuration: semanticRequestedDuration,
+    catalogItems,
   });
 
   resolved.emilyPending = readEmilyPendingFromMemory(memorySnapshot);
-  resolved.emilyPendingFollowUp = decideEmilyPendingFollowUp({
+  // Itemless continuation turn (e.g. "3 din k lye" with no fresh item
+  // mention): this turn's own canonical resolution never sees the
+  // customer's original wording, so it cannot derive resolvedItem.
+  // customerReference itself. When the resolved item is exactly the one the
+  // durable pending record is already tracking for this same participant,
+  // reuse the wording captured when that record was created/renewed --
+  // never a different item's, and never invented here.
+  if (
+    !resolved.resolvedItem.customerReference &&
+    resolved.emilyPending &&
+    resolved.resolvedItem.id &&
+    String(resolved.emilyPending.itemId ?? "").trim() === String(resolved.resolvedItem.id).trim()
+  ) {
+    resolved.resolvedItem.customerReference =
+      String(resolved.emilyPending.customerReference ?? "").trim() || null;
+  }
+  resolved.emilyPendingFollowUp = validatedGroupCanonicalAuthority === true
+    ? null
+    : decideEmilyPendingFollowUp({
     memorySnapshot,
     participantKey:
       String(participantFacts?.participant?.key ?? "").trim() ||
@@ -1397,6 +2039,7 @@ export async function resolveBusinessTurnContext(params) {
     .trim()
     .slice(0, 80);
   if (
+    validatedGroupCanonicalAuthority !== true &&
     !authoritativeSemanticIntent &&
     pendingHint &&
     pendingHint !== "unknown_clarification" &&

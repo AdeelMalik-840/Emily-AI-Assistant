@@ -353,6 +353,34 @@ function isStopPhrase(name) {
 }
 
 /**
+ * True when removing `surface` from the customer message still leaves a
+ * non-stop, non-numeric token. Used to tell a newly named item apart from
+ * generic continuations whose extractEntity hit is the whole ask
+ * ("available hai?") rather than a distinct referent.
+ *
+ * @param {unknown} message
+ * @param {unknown} surface
+ * @returns {boolean}
+ */
+export function customerMessageHasNonStopResidueAfterSurface(message, surface) {
+  const hay = String(message ?? "");
+  const needle = String(surface ?? "").trim();
+  if (!hay || !needle) return false;
+  const lowerHay = hay.toLowerCase();
+  const lowerNeedle = needle.toLowerCase();
+  const first = lowerHay.indexOf(lowerNeedle);
+  if (first < 0) return false;
+  const rest = `${hay.slice(0, first)} ${hay.slice(first + needle.length)}`;
+  const tokens = rest
+    .split(/\s+/g)
+    .map((token) => normalizeToken(token))
+    .filter(Boolean);
+  return tokens.some(
+    (token) => token.length > 1 && !STOP_WORDS.has(token) && !/^\d+$/.test(token)
+  );
+}
+
+/**
  * @param {string | null} name
  * @param {number} confidence
  * @returns {{ name: string | null, confidence: number }}

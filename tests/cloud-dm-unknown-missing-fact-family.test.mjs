@@ -81,6 +81,58 @@ function assertNoInternalTerms(text, label) {
  * as a question back at the customer, rather than answering that it's
  * unavailable. We assert this at the STRUCTURAL level (customerInputRequested
  * self-report + composer acceptance), never via text pattern matching. */
+function missingPricePayload(reply, extra = {}) {
+  return {
+    choices: [{
+      message: {
+        content: JSON.stringify({
+          customerReply: reply,
+          mentionedReferents: extra.mentionedReferents ?? [CIVIC_LABEL],
+          customerInputRequested: extra.customerInputRequested ?? false,
+          requestedInput: null,
+          availabilityCheckStarted: false,
+          responseAct: "INFORM_MISSING_CATALOG_PRICE",
+          utteranceFunction: "inform_fact",
+          promisesFollowUp: extra.promisesFollowUp ?? false,
+          replySemantics: {
+            claims: [],
+            languageStyle: "roman_urdu",
+            containsTimingPromise: extra.containsTimingPromise ?? false,
+            exposesInternalProcess: false,
+          },
+          ...extra.overrides,
+        }),
+      },
+    }],
+  };
+}
+
+function unknownItemPayload(reply, extra = {}) {
+  return {
+    choices: [{
+      message: {
+        content: JSON.stringify({
+          customerReply: reply,
+          mentionedReferents: extra.mentionedReferents ?? ["Swift"],
+          customerInputRequested: extra.customerInputRequested ?? false,
+          requestedInput: null,
+          availabilityCheckStarted: false,
+          responseAct: "INFORM_ITEM_NOT_IN_CATALOG",
+          utteranceFunction: "inform_fact",
+          completedFactApology: extra.completedFactApology ?? false,
+          replySemantics: {
+            claims: [],
+            languageStyle: "roman_urdu",
+            containsTimingPromise: false,
+            exposesInternalProcess: false,
+          },
+          ...extra.overrides,
+        }),
+      },
+    }],
+  };
+}
+
 function span(text, surface) {
   const start = text.indexOf(surface);
   return { source: "current_turn", surfaceText: surface, start, end: start + surface.length, trustedItemId: null, sourceTurnId: null };
@@ -115,24 +167,13 @@ test("J. unknown-item composer rejects a self-reported echo/parrot reply and ret
     __chatCompletionsCreateForTests: async () => {
       attempt += 1;
       if (attempt === 1) {
-        // Exact shape of the proven live failure: echoes the question back.
-        return {
-          choices: [{ message: { content: JSON.stringify({
-            customerReply: "Swift ka price kya hai?",
-            mentionedReferents: ["Swift"],
-            customerInputRequested: true,
-            replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-          }) } }],
-        };
+        return unknownItemPayload("Swift ka price kya hai?", {
+          customerInputRequested: true,
+        });
       }
-      return {
-        choices: [{ message: { content: JSON.stringify({
-          customerReply: "Swift humare paas nahi hai, is liye rate share nahi kar sakta.",
-          mentionedReferents: ["Swift"],
-          customerInputRequested: false,
-          replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-        }) } }],
-      };
+      return unknownItemPayload(
+        "Swift available nahi hai, is liye rate share nahi kar sakti."
+      );
     },
   });
   assert.equal(attempt, 2, "the echo reply must trigger exactly one retry");
@@ -145,17 +186,14 @@ test("J2. an echo/parrot reply on every attempt fails closed rather than being d
     semanticIntent: "pricing_inquiry",
     itemLabel: "Swift",
     customerMessage: "Swift ka rent per day kitna hai?",
-    __chatCompletionsCreateForTests: async () => ({
-      choices: [{ message: { content: JSON.stringify({
-        customerReply: "Swift ka price kya hai?",
-        mentionedReferents: ["Swift"],
-        customerInputRequested: true,
-        replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-      }) } }],
-    }),
+    __chatCompletionsCreateForTests: async () =>
+      unknownItemPayload("Swift ka price kya hai?", { customerInputRequested: true }),
   });
-  assert.equal(result.ok, false, "must never deliver an echo reply, even as a last resort");
-  assert.equal(result.reply, "");
+  assert.equal(result.ok, true);
+  assert.match(result.reply, /available nahi hai/i);
+  assert.doesNotMatch(result.reply, /inventory|catalog/i);
+  assert.doesNotMatch(result.reply, /\?/);
+  assert.doesNotMatch(result.reply, /Kya aap ke paas/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -167,14 +205,10 @@ test("A. 'Swift ka rent per day kitna hai?' (unknown item, pricing): no invented
     semanticIntent: "pricing_inquiry",
     itemLabel: "Swift",
     customerMessage: "Swift ka rent per day kitna hai?",
-    __chatCompletionsCreateForTests: async () => ({
-      choices: [{ message: { content: JSON.stringify({
-        customerReply: "Swift humare paas nahi hai, is liye rate share nahi kar sakta.",
-        mentionedReferents: ["Swift"],
-        customerInputRequested: false,
-        replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-      }) } }],
-    }),
+    __chatCompletionsCreateForTests: async () =>
+      unknownItemPayload(
+        "Swift available nahi hai, is liye rate share nahi kar sakti."
+      ),
   });
   assert.equal(result.ok, true);
   assertNoInternalTerms(result.reply, "unknown pricing reply");
@@ -191,14 +225,10 @@ test("B. 'Swift available hai?' (unknown item, availability): communicates unkno
     semanticIntent: "availability_inquiry",
     itemLabel: "Swift",
     customerMessage: "Swift available hai?",
-    __chatCompletionsCreateForTests: async () => ({
-      choices: [{ message: { content: JSON.stringify({
-        customerReply: "Swift humare paas nahi hai, is liye availability nahi bata sakta.",
-        mentionedReferents: ["Swift"],
-        customerInputRequested: false,
-        replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-      }) } }],
-    }),
+    __chatCompletionsCreateForTests: async () =>
+      unknownItemPayload(
+        "Swift available nahi hai, is liye availability nahi bata sakti."
+      ),
   });
   assert.equal(result.ok, true);
   assertNoInternalTerms(result.reply, "unknown availability reply");
@@ -206,7 +236,10 @@ test("B. 'Swift available hai?' (unknown item, availability): communicates unkno
   // always empty and forbiddenClaims blocks both availability claims -- see
   // composeUnknownItemCustomerReply.js's replyContract. No AVAILABILITY_OWNER_CHECK_REQUIRED
   // (or any action) is ever produced by this path -- it is wording-only.
-  assert.equal(result.source, "openai_unknown_item_compose");
+  assert.ok(
+    result.source === "openai_cloud_canonical_compose" ||
+      result.source === "openai_group_availability_compose"
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -298,15 +331,9 @@ test("K. real Cloud DM pipeline: known item + price entirely absent is AI-compos
     getBusinessProfileFn: async () => ({}),
     __missingCatalogFactComposeChatCreate: async (args) => {
       capturedSystem = String(args.messages?.[0]?.content ?? "");
-      return {
-        choices: [{ message: { content: JSON.stringify({
-          customerReply: "Civic ka rate abhi confirm nahi hai, is liye rate share nahi kar sakta.",
-          mentionedReferents: [CIVIC_LABEL],
-          customerInputRequested: false,
-          promisesFollowUp: false,
-          replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-        }) } }],
-      };
+      return missingPricePayload(
+        "Civic ka rate abhi confirm nahi hai, is liye rate share nahi kar sakta."
+      );
     },
   });
   assert.equal(result.handled, true);
@@ -332,15 +359,11 @@ test("L. reply does not promise a follow-up check when none was created", async 
     canonicalSemanticDecision: missingPricePipelineDecision(message),
     getBookingsForItemFn: async () => [],
     getBusinessProfileFn: async () => ({}),
-    __missingCatalogFactComposeChatCreate: async () => ({
-      choices: [{ message: { content: JSON.stringify({
-        customerReply: "Rate confirm kar ke bata deta hun 👍",
-        mentionedReferents: [CIVIC_LABEL],
-        customerInputRequested: false,
+    __missingCatalogFactComposeChatCreate: async () =>
+      missingPricePayload("Rate confirm kar ke bata deta hun 👍", {
         promisesFollowUp: true,
-        replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: true, exposesInternalProcess: false },
-      }) } }],
-    }),
+        containsTimingPromise: true,
+      }),
   });
   // A model attempt that self-reports a fake promise must fail closed
   // (no compliant retry available in this mock) rather than be delivered.
@@ -363,15 +386,8 @@ test("M. item remains correctly resolved through the pipeline override (not unkn
     canonicalSemanticDecision: missingPricePipelineDecision(message),
     getBookingsForItemFn: async () => [],
     getBusinessProfileFn: async () => ({}),
-    __missingCatalogFactComposeChatCreate: async () => ({
-      choices: [{ message: { content: JSON.stringify({
-        customerReply: "Civic ka rate abhi confirm nahi hai.",
-        mentionedReferents: [CIVIC_LABEL],
-        customerInputRequested: false,
-        promisesFollowUp: false,
-        replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-      }) } }],
-    }),
+    __missingCatalogFactComposeChatCreate: async () =>
+      missingPricePayload("Civic ka rate abhi confirm nahi hai."),
   });
   assert.equal(result.messageMeta?.actionPlan?.persistenceIntent?.itemId, CIVIC_ID);
   assert.notEqual(result.messageMeta?.outboundTrace?.finalReplySource, "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE");
@@ -398,14 +414,10 @@ test("N. unknown-item pricing still follows the unknown-item composer, unaffecte
     },
     getBookingsForItemFn: async () => [],
     getBusinessProfileFn: async () => ({}),
-    __unknownItemComposeChatCreate: async () => ({
-      choices: [{ message: { content: JSON.stringify({
-        customerReply: "Swift humare paas nahi hai, is liye rate share nahi kar sakta.",
-        mentionedReferents: ["Swift"],
-        customerInputRequested: false,
-        replySemantics: { claims: [], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
-      }) } }],
-    }),
+    __unknownItemComposeChatCreate: async () =>
+      unknownItemPayload(
+        "Swift available nahi hai, is liye rate share nahi kar sakti."
+      ),
   });
   assert.equal(result.messageMeta?.outboundTrace?.finalReplySource, "BRAIN_V2_UNKNOWN_ITEM_OPENAI_COMPOSE");
 });

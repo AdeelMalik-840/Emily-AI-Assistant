@@ -6,7 +6,7 @@ import {
   buildOfferedAlternativesAssist,
 } from "../availability/availabilityAssistContext.js";
 import {
-  buildUnavailableAvailabilityFailsafeReply,
+  AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION,
   buildOwnerCheckActionPlan,
   resolveOwnerCheckWindowForPlan,
 } from "./AvailabilityInquiryWorkflow.js";
@@ -88,7 +88,8 @@ function readVerifiedAlternatives(availability) {
 
 /**
  * CASE 1 — canonical booking_request but item already confidently unavailable:
- * REPLY only from precomposed canonical unavailable facts. No booking mutation.
+ * REPLY only from deterministic unavailable facts. Wording is composed later
+ * through the shared guarded availability response seam. No booking mutation.
  *
  * @param {{
  *   canonical: Record<string, unknown>,
@@ -113,20 +114,7 @@ function buildConfidentUnavailableBookingReplyPlan(p) {
   const durationN = hasRealDuration
     ? Math.max(1, Math.floor(Number(rawDuration)))
     : 1;
-  const composed = String(p.canonical?.unavailableCustomerReply ?? "").trim();
-  const failsafe = buildUnavailableAvailabilityFailsafeReply(
-    p.itemLabel,
-    durationN,
-    alternatives
-  );
-  // Same sanitization as availability unavailable offer: empty alts must not offer options.
-  const replyDraft =
-    composed &&
-    !(
-      !hasAlternatives && /koi aur option dekhun|other option|aur option/i.test(composed)
-    )
-      ? composed
-      : failsafe;
+  const replyDraft = "";
 
   // Reuse AvailabilityInquiry offered_alternatives contract — no parallel booking context.
   // Only when verified alternatives exist AND original requested duration is known.
@@ -162,7 +150,7 @@ function buildConfidentUnavailableBookingReplyPlan(p) {
           windowStartAt: windowFacts.windowStartAt,
           windowEndAt: windowFacts.windowEndAt,
           requestedDates: windowFacts.requestedDates,
-          pendingQuestion: replyDraft,
+          pendingQuestion: AVAILABILITY_CUSTOMER_REPLY_PENDING_COMPOSITION,
           pendingPromptType: AVAILABILITY_ASSIST_PROMPT_OFFER_TO_LIST,
           assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_OFFER_RESPONSE,
           sourceTurnKey,
@@ -174,6 +162,19 @@ function buildConfidentUnavailableBookingReplyPlan(p) {
     planId: randomUUID(),
     workflowType: "booking_request",
     replyDraft,
+    customerResponseComposition: Object.freeze({
+      lane: "availability",
+      kind: "availability_unavailable",
+      conversationStage: hasAlternatives
+        ? "booking_unavailable_offer_verified_alternatives"
+        : "booking_unavailable_no_verified_alternatives",
+      missingField: null,
+      sourceTurnKey,
+      bindPresentedItemFocus: false,
+      verifiedAlternatives: Object.freeze(
+        alternatives.map((row) => Object.freeze({ ...row }))
+      ),
+    }),
     actions: Object.freeze([
       Object.freeze({
         type: "REPLY",

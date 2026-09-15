@@ -10,13 +10,14 @@ process.env.OPENAI_API_KEY ||= "test-key";
 process.env.NODE_ENV = "test";
 
 import {
-  buildAvailabilityInquiryActionPlan,
+  buildAvailabilityInquiryActionPlan as buildRawAvailabilityInquiryActionPlan,
   buildUnavailableAvailabilityFailsafeReply,
-  composeUnavailableCustomerReplyFromFacts,
-  buildVerifiedAlternativesReply,
-  buildAskDurationAvailabilityReply,
   buildOwnerCheckDeferralReply,
 } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import { composeUnavailableThroughSharedGuard as composeUnavailableCustomerReplyFromFacts, materializeAvailabilityPlanForTest } from "./helpers/availabilityCompositionTestHarness.mjs";
+
+const buildAvailabilityInquiryActionPlan = (args) =>
+  materializeAvailabilityPlanForTest(buildRawAvailabilityInquiryActionPlan(args));
 import {
   buildOfferedAlternativesAssist,
   withAvailabilityAssistPendingQuestion,
@@ -133,7 +134,7 @@ function offerAssist(overrides = {}) {
 }
 
 function listAssist(alts = BOTH_ALTS) {
-  const listReply = buildVerifiedAlternativesReply(alts);
+  const listReply = "Kia Stonic aur Honda Civic available options hain.";
   return withAvailabilityAssistPendingQuestion(offerAssist(), {
     pendingQuestion: listReply,
     pendingPromptType: AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
@@ -321,11 +322,10 @@ test("matrix A4: available but no duration → ask kitne din", () => {
       },
     },
   });
-  // conversational label shortens "Toyota Corolla (Metallic Grey)" → "Corolla"
-  assert.equal(String(p.replyDraft), buildAskDurationAvailabilityReply("Corolla"));
+  assert.equal(p.customerResponseComposition?.lane, "availability");
+  assert.equal(p.customerResponseComposition?.kind, "duration_ask");
   assert.equal(p.actions[0]?.payload?.source, "canonical_owner_check_ask_duration");
   assertNoOwnerCheck(p);
-  assert.match(String(p.replyDraft), /Kitne din/i);
 });
 
 test("matrix A5: inventory error → still owner-check, never false unavailable offer", () => {
@@ -349,25 +349,29 @@ test("matrix A5: inventory error → still owner-check, never false unavailable 
   assert.notEqual(p.actions[0]?.payload?.source, "canonical_unavailable_alternative_offer");
 });
 
-test("matrix A6: precomposed AI reply used when alts non-empty", () => {
-  const ai = "Corolla 2 din ke liye book hai. Koi aur option dekhun?";
+test("matrix A6: unavailable-with-alternatives plan is structured for composition, not a workflow-authored reply", () => {
+  // Wording is no longer precomposed onto the plan by the workflow itself --
+  // it now comes from the shared guarded composer later in the pipeline
+  // (see section F for the composer/guard behavior itself). This test only
+  // proves the plan correctly hands composition the right structured facts.
   const p = plan({
     message: "Corolla 2 din available?",
-    unavailableCustomerReply: ai,
   });
-  assert.equal(p.replyDraft, ai);
   assert.equal(p.actions[0]?.payload?.source, "canonical_unavailable_alternative_offer");
+  assert.equal(p.customerResponseComposition?.lane, "availability");
+  assert.equal(p.customerResponseComposition?.kind, "availability_unavailable");
+  assert.equal(p.customerResponseComposition?.conversationStage, "offer_verified_alternatives");
+  assert.ok(p.customerResponseComposition?.verifiedAlternatives?.length > 0);
   assert.equal(p.persistenceIntent?.lastAvailabilityAssist?.action, "offered_alternatives");
 });
 
-test("matrix A7: precomposed AI offer phrasing rejected when alts empty", () => {
+test("matrix A7: unavailable-with-no-alternatives plan is structured to forbid any offer claim", async () => {
   const p = plan({
     message: "Civic 2 din available?",
     understandingOverrides: {
       resolvedItemId: CIVIC_ID,
       resolvedItemLabel: "Honda Civic",
     },
-    unavailableCustomerReply: "Civic available nahi. Koi aur option dekhun?",
     ctxOverrides: {
       resolvedItem: { id: CIVIC_ID, name: "Honda Civic", displayLabel: "Honda Civic" },
       verified: {
@@ -376,12 +380,22 @@ test("matrix A7: precomposed AI offer phrasing rejected when alts empty", () => 
       },
     },
   });
-  // conversational label shortens "Honda Civic" → "Civic"
-  assert.equal(
-    p.replyDraft,
-    buildUnavailableAvailabilityFailsafeReply("Civic", 2, [])
-  );
-  assert.doesNotMatch(String(p.replyDraft), /Koi aur option dekhun/i);
+  assert.equal(p.customerResponseComposition?.lane, "availability");
+  assert.equal(p.customerResponseComposition?.kind, "availability_unavailable");
+  assert.equal(p.customerResponseComposition?.conversationStage, "no_verified_alternatives");
+  assert.deepEqual(p.customerResponseComposition?.verifiedAlternatives, []);
+  // Proves the shared guard actually rejects an AI reply that ignores this
+  // structural fact and claims an offer anyway (real composer + guard, not
+  // a workflow-local check) -- exercises the exact scenario this test used
+  // to simulate by precomposing the reply directly onto the plan.
+  const rejected = await composeUnavailableCustomerReplyFromFacts({
+    conversationalLabel: "Civic",
+    durationDays: 2,
+    alternatives: [],
+    __replyForTests: "Civic available nahi. Koi aur option dekhun?",
+  });
+  assert.equal(rejected, buildUnavailableAvailabilityFailsafeReply("Civic", 2, []));
+  assert.doesNotMatch(String(rejected), /Koi aur option dekhun/i);
   assert.equal(p.persistenceIntent?.lastAvailabilityAssist, null);
 });
 
@@ -441,8 +455,11 @@ test("matrix B-accept-single-alt: yes → single-item list copy", () => {
     { decision: "accept_alternative_offer", confidence: 0.95, ok: true },
     { alts: [{ itemId: STONIC_ID, itemLabel: "Kia Stonic" }] }
   );
-  assert.equal(String(p.replyDraft), "Abhi Kia Stonic available hai. Ye dekhna hai?");
+  assert.match(String(p.replyDraft), /Stonic/i);
   assert.equal(p.actions[0]?.payload?.source, "canonical_verified_alternatives_list");
+  assert.deepEqual(p.customerResponseComposition?.verifiedAlternatives, [
+    { itemId: STONIC_ID, itemLabel: "Kia Stonic" },
+  ]);
 });
 
 // ─── C. After offer / list — select item ────────────────────────────────────

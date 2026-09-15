@@ -5,9 +5,13 @@
  * only runs OpenAI → parse → guard → retry → fail-closed fallback.
  */
 
+import { createHash } from "node:crypto";
 import { resolveOpenAiChatModel } from "../../config/aiRuntime.js";
 import { resolveOpenAiChatCompletionsCreate } from "../../services/openaiChatCompletionsCreate.js";
-import { normalizeReplySemantics } from "../contracts/customerReplyContract.js";
+import {
+  normalizeReplySemantics,
+  CUSTOMER_REPLY_COMPOSE_OUTCOMES,
+} from "../contracts/customerReplyContract.js";
 import {
   buildCustomerReplyGuardCorrection,
   validateCustomerReplyAgainstContract,
@@ -74,6 +78,8 @@ export function parseCustomerReplyComposeJson(raw) {
  *   timeoutErrorMessage?: string,
  *   temperature?: number,
  *   maxTokens?: number,
+ *   onAttemptResult?: (result: { attempt: number, rejectionReason: string | null }) => void,
+ *   correctionContext?: { objective?: string | null, requestedInput?: string | null } | null,
  *   __chatCompletionsCreateForTests?: Function | null,
  * }} p
  * @returns {Promise<{ ok: boolean, reply: string, source: string, reason: string | null, attemptCount: number }>}
@@ -93,8 +99,42 @@ export async function composeGuardedCustomerReply({
   timeoutErrorMessage = "COMPOSE_OPENAI_TIMEOUT",
   temperature = 0.35,
   maxTokens = 220,
+  onAttemptResult = null,
+  correctionContext = null,
   __chatCompletionsCreateForTests = null,
 } = {}) {
+  // Content-free diagnostic fingerprint -- an existing, deliberate privacy
+  // contract on this composer's diagnostics (proven by a pre-existing test:
+  // "Group compose logs privacy-safe per-attempt diagnostics") forbids any
+  // literal customer/candidate/item text in these attempt-level logs, so
+  // this never returns the text itself -- only its length and a short
+  // one-way hash, enough to tell "same candidate repeated" from "a
+  // genuinely different candidate" across attempts, and to correlate with
+  // other logs, without exposing content. A live incident showed rejection
+  // logs with only a reason code and nothing else to distinguish attempts --
+  // this closes that gap without weakening the existing privacy guarantee.
+  const candidateFingerprint = (text) => {
+    const trimmed = String(text ?? "").trim();
+    if (!trimmed) return { length: 0, fingerprint: null };
+    return {
+      length: trimmed.length,
+      fingerprint: createHash("sha256").update(trimmed, "utf8").digest("hex").slice(0, 12),
+    };
+  };
+  const reportAttempt = (attempt, rejectionReason, candidateReply, guardResult) => {
+    if (typeof onAttemptResult !== "function") return;
+    try {
+      onAttemptResult({
+        attempt,
+        rejectionReason,
+        ...candidateFingerprint(candidateReply),
+        hardGuardPassed: rejectionReason == null,
+        softSignals: guardResult?.softSignals ?? null,
+      });
+    } catch {
+      // Diagnostics must never affect composition behavior.
+    }
+  };
   const completionFn =
     typeof __chatCompletionsCreateForTests === "function"
       ? __chatCompletionsCreateForTests
@@ -107,6 +147,9 @@ export async function composeGuardedCustomerReply({
       source: "technical_fallback",
       reason: "MISSING_OPENAI_API_KEY_OR_INJECTOR",
       attemptCount: 0,
+      outcome: fallbackReply
+        ? CUSTOMER_REPLY_COMPOSE_OUTCOMES.FALLBACK
+        : CUSTOMER_REPLY_COMPOSE_OUTCOMES.FAILED,
     };
   }
 
@@ -124,7 +167,7 @@ export async function composeGuardedCustomerReply({
       const userContent =
         attempt === 1
           ? `${userBase}\n\n${firstAttemptReminder}`
-          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason)}`;
+          : `${userBase}\n\n${buildCustomerReplyGuardCorrection(lastReason, correctionContext || {})}`;
 
       const createPromise = Promise.resolve(
         completionFn({
@@ -158,6 +201,7 @@ export async function composeGuardedCustomerReply({
 
       if (!customerReply) {
         lastReason = "EMPTY_OR_INVALID_OPENAI_REPLY";
+        reportAttempt(attempt, lastReason, customerReply);
         if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
         break;
       }
@@ -166,6 +210,7 @@ export async function composeGuardedCustomerReply({
         const rejected = extraReject(customerReply, parsed);
         if (rejected) {
           lastReason = rejected;
+          reportAttempt(attempt, lastReason, customerReply);
           if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
           break;
         }
@@ -182,23 +227,45 @@ export async function composeGuardedCustomerReply({
           ? resolveSemantics(semantics)
           : semantics;
 
+      const shouldValidateExecutionFields =
+        Boolean(String(contractForGuard.requiredAct ?? "").trim()) ||
+        contractForGuard.customerInputRequired === true ||
+        contractForGuard.executionState?.availabilityCheckStarted != null;
+      const executionFields =
+        shouldValidateExecutionFields && parsed
+          ? {
+              customerInputRequested: parsed.customerInputRequested,
+              requestedInput: parsed.requestedInput ?? null,
+              availabilityCheckStarted: parsed.availabilityCheckStarted,
+              referencedItemId: parsed.referencedItemId,
+              referencedItemSurface: parsed.referencedItemSurface,
+              responseAct: parsed.responseAct,
+              utteranceFunction: parsed.utteranceFunction,
+            }
+          : null;
+
       const guard = validateCustomerReplyAgainstContract(
         customerReply,
         contractForGuard,
-        semanticsForGuard
+        semanticsForGuard,
+        null,
+        executionFields
       );
       if (!guard.ok) {
         lastReason = guard.reason || "customer_reply_guard_failed";
+        reportAttempt(attempt, lastReason, customerReply, guard);
         if (attempt < MAX_CUSTOMER_REPLY_ATTEMPTS) continue;
         break;
       }
 
+      reportAttempt(attempt, null, customerReply, guard);
       return {
         ok: true,
         reply: customerReply.slice(0, 500),
         source: "openai",
         reason: null,
         attemptCount,
+        outcome: CUSTOMER_REPLY_COMPOSE_OUTCOMES.AI_SUCCESS,
       };
     }
 
@@ -208,14 +275,23 @@ export async function composeGuardedCustomerReply({
       source: "technical_fallback",
       reason: lastReason,
       attemptCount,
+      outcome: fallback
+        ? CUSTOMER_REPLY_COMPOSE_OUTCOMES.FALLBACK
+        : CUSTOMER_REPLY_COMPOSE_OUTCOMES.FAILED,
     };
   } catch (err) {
+    const reason =
+      String(err?.message ?? err ?? "COMPOSE_FAILED").slice(0, 160) || null;
+    if (attemptCount > 0) reportAttempt(attemptCount, reason);
     return {
       ok: false,
       reply: fallback,
       source: "technical_fallback",
-      reason: String(err?.message ?? err ?? "COMPOSE_FAILED").slice(0, 160) || null,
+      reason,
       attemptCount,
+      outcome: fallback
+        ? CUSTOMER_REPLY_COMPOSE_OUTCOMES.FALLBACK
+        : CUSTOMER_REPLY_COMPOSE_OUTCOMES.FAILED,
     };
   }
 }

@@ -3,16 +3,9 @@
  * This module composes wording only; it does not decide meaning or availability.
  */
 
-import { buildCustomerCommunicationPolicy } from "../policies/customerCommunicationPolicy.js";
-import {
-  CUSTOMER_CLAIMS,
-  buildCustomerReplyContract,
-} from "../contracts/customerReplyContract.js";
-import { composeGuardedCustomerReply } from "./composeGuardedCustomerReply.js";
-import {
-  buildStrictJsonSchemaResponseFormat,
-  REPLY_SEMANTICS_SCHEMA,
-} from "./strictJsonSchema.js";
+import { composeCloudCanonicalCustomerReply } from "./composeCloudCanonicalCustomerReply.js";
+import { buildCanonicalGroupResponseContract } from "../contracts/canonicalGroupTurnContract.js";
+import { sameActFallbackReply } from "../contracts/customerReplyContract.js";
 
 function clean(value, max = 200) {
   const text = String(value ?? "").trim();
@@ -124,27 +117,6 @@ export function validateBrowseOptionsCustomerReply(
   return null;
 }
 
-function buildBrowseResponseFormat(availableItemIds) {
-  const itemSchema = availableItemIds.length > 0
-    ? { type: "string", enum: availableItemIds }
-    : { type: "string" };
-  return buildStrictJsonSchemaResponseFormat("browse_options_customer_reply", {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      customerReply: { type: "string" },
-      mentionedAvailableItemIds: {
-        type: "array",
-        items: itemSchema,
-        minItems: availableItemIds.length > 0 ? 1 : 0,
-        maxItems: availableItemIds.length,
-      },
-      replySemantics: REPLY_SEMANTICS_SCHEMA,
-    },
-    required: ["customerReply", "mentionedAvailableItemIds", "replySemantics"],
-  });
-}
-
 /**
  * @param {{
  *   trustedBrowseFacts?: Record<string, unknown>,
@@ -157,106 +129,43 @@ function buildBrowseResponseFormat(availableItemIds) {
 export async function composeBrowseOptionsCustomerReply(p = {}) {
   const facts = normalizeFacts(p.trustedBrowseFacts);
   const channel = String(p.channel ?? "dm").trim() === "group" ? "group" : "dm";
-  const verifiedRows = facts.availableItems.map((row) => ({
-    itemId: row.itemId,
-    itemLabel: row.displayLabel,
-    dailyRate: row.dailyRate,
-    monthlyRate: row.monthlyRate,
-  }));
-  const hasVerifiedPrice = verifiedRows.some(
-    (row) => row.dailyRate != null || row.monthlyRate != null
-  );
-  const allowedClaims =
-    facts.availableItems.length > 0
-      ? [
-          CUSTOMER_CLAIMS.RESOURCE_AVAILABILITY_CONFIRMED,
-          ...(hasVerifiedPrice ? [CUSTOMER_CLAIMS.QUOTATION_VERIFIED] : []),
-        ]
-      : [CUSTOMER_CLAIMS.RESOURCE_UNAVAILABLE];
-  const replyContract = buildCustomerReplyContract({
-    channel,
-    conversationalGoal:
-      "Naturally answer the browse request from the given option count and item facts, as ordinary business facts. With one option, do not ask the customer to choose between options.",
-    verifiedCustomerFacts: {
-      availableCount: facts.availableCount,
-      catalogItems: facts.catalogItems,
-      activeBookings: verifiedRows,
-      availabilityResolved: true,
-      source: facts.source,
-      skipGenericBookingReferenceTextValidation: true,
-    },
-    allowedClaims,
-    forbiddenClaims: [
-      CUSTOMER_CLAIMS.RESERVATION_CREATED,
-      CUSTOMER_CLAIMS.PAYMENT_RECEIVED,
-      CUSTOMER_CLAIMS.INTERNAL_PROCESS_DISCLOSED,
-    ],
-    customerMessageText: clean(p.customerMessage, 300) || null,
-    styleKey: facts.styleKey,
-  });
-  const policy = buildCustomerCommunicationPolicy({
-    channel,
-    styleKey: facts.styleKey,
-    businessCommunicationProfile: facts.businessCommunicationProfile,
-  });
-  const promptFacts = {
+  const trustedFacts = {
     availableCount: facts.availableCount,
-    availableItems: facts.availableItems.map((row) => ({
-      itemId: row.itemId,
-      displayLabel: row.displayLabel,
-      dailyRate: row.dailyRate,
-      monthlyRate: row.monthlyRate,
-      currency: row.currency,
-      isAvailable: true,
-    })),
+    availableItems: facts.availableItems,
   };
-  let mentionedAvailableItemIds = [];
-  const system = `${policy}
-
-WORDING-ONLY BROWSE COMPOSER:
-- Use only VERIFIED_BROWSE_FACTS_JSON.
-- Do not add, rename, substitute, or infer catalog options or prices.
-- mentionedAvailableItemIds must exhaustively identify every option named in customerReply and may contain only IDs from VERIFIED_BROWSE_FACTS_JSON.
-- availableCount=0: naturally say that nothing is available right now, as an ordinary business fact.
-- availableCount=1: present the single available option; do not ask a choice-style “which option” question.
-- availableCount>=2: present the available choices and optionally ask preference.
-- Never claim booking, payment, owner contact, approval, or completion.
-- Never say "catalog", "verify"/"verified", "trusted", "match", or any other internal/system word.
-- Return only the strict customerReply JSON schema.`;
-  const composed = await composeGuardedCustomerReply({
-    system,
-    userBase: `VERIFIED_BROWSE_FACTS_JSON: ${JSON.stringify(promptFacts)}\nCUSTOMER_MESSAGE: ${clean(p.customerMessage, 300) || "(browse request)"}`,
-    firstAttemptReminder: "Use only the verified browse facts; no invented item or price.",
-    responseFormatName: "browse_options_customer_reply",
-    responseFormat: buildBrowseResponseFormat(
-      facts.availableItems.map((row) => row.itemId)
-    ),
-    replyContract,
-    extraReject: (reply, parsed) => {
-      const rejected = validateBrowseOptionsCustomerReply(
+  const composed = await composeCloudCanonicalCustomerReply({
+    kind: "browse_options",
+    channel,
+    semanticIntent: "browse_options",
+    customerMessage: p.customerMessage,
+    trustedFacts,
+    responseContract: buildCanonicalGroupResponseContract({
+      replyKind: "browse_options",
+      trustedCustomerFacts: trustedFacts,
+      customerMessageText: p.customerMessage,
+    }),
+    fallbackReply: sameActFallbackReply("browse_options", trustedFacts),
+    extraReject: (reply, parsed) =>
+      validateBrowseOptionsCustomerReply(
         reply,
         facts,
-        parsed?.mentionedAvailableItemIds
-      );
-      if (!rejected) {
-        mentionedAvailableItemIds = Array.isArray(parsed?.mentionedAvailableItemIds)
-          ? parsed.mentionedAvailableItemIds.map((id) => clean(id, 120)).filter(Boolean)
-          : [];
-      }
-      return rejected;
-    },
-    fallbackReply: "",
+        parsed?.mentionedAvailableItemIds ?? parsed?.presentedItemIds
+      ),
     timeoutMs: p.timeoutMs ?? 8000,
-    timeoutErrorMessage: "BROWSE_OPTIONS_COMPOSE_TIMEOUT",
-    temperature: 0.3,
-    maxTokens: 220,
     __chatCompletionsCreateForTests: p.__chatCompletionsCreateForTests ?? null,
+    __languageQualityReviewChatCreateForTests:
+      p.__languageQualityReviewChatCreateForTests ?? null,
   });
+  const mentionedAvailableItemIds = Array.isArray(composed.presentedItemIds)
+    ? composed.presentedItemIds
+    : [];
   if (!composed.ok || !clean(composed.reply, 500)) {
     return {
       ok: false,
-      reply: "",
-      source: "browse_options_compose_fail_closed",
+      reply: composed.reply || "",
+      source: composed.reply
+        ? composed.source
+        : "browse_options_compose_fail_closed",
       reason: composed.reason || "compose_failed",
       mentionedAvailableItemIds: [],
     };
@@ -269,3 +178,4 @@ WORDING-ONLY BROWSE COMPOSER:
     mentionedAvailableItemIds: Object.freeze([...mentionedAvailableItemIds]),
   };
 }
+

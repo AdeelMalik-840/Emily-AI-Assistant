@@ -179,6 +179,26 @@ function persistLedger(force = false) {
   }
 }
 
+/**
+ * Persists the current ledger map to disk WITHOUT pruning. Used exclusively
+ * by lifecycle-only writes (see patchLifecycleForExistingEntry) so a purely
+ * observational instrumentation call can never indirectly delete an
+ * unrelated stale authoritative entry as a side effect. Real authoritative
+ * ledger operations continue to prune via persistLedger() above, unchanged.
+ */
+function persistLedgerWithoutPruning() {
+  try {
+    const dir = path.dirname(ledgerPath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const out = Object.fromEntries(ledgerByKey.entries());
+    writeFileSync(ledgerPath, JSON.stringify(out), "utf8");
+  } catch (err) {
+    console.warn("[inbound_turn_ledger_persist_failed]", {
+      error: String(err?.message ?? err ?? "").slice(0, 160),
+    });
+  }
+}
+
 export function initInboundTurnLedger(force = false) {
   if (!force && !isInboundTurnLedgerEnabled()) return;
   if (persistLoaded) return;
@@ -263,6 +283,359 @@ function upsertEntry(key, patch, force = false) {
 }
 
 /**
+ * Fixed forward-only stage order for the purely observational lifecycle
+ * diagnostic below. Not every stage has a wired call site yet (see Phase 1
+ * completion notes) -- an unwired stage simply never appears on an entry.
+ */
+const LIFECYCLE_STAGE_ORDER = Object.freeze([
+  "admitted",
+  "canonical_frozen",
+  "semantic_started",
+  "semantic_decision",
+  "canonical_decision",
+  "execution_started",
+  "execution_completed",
+  "reply_prepared",
+  "outbound_locked",
+  "send_started",
+  "delivery_confirmed",
+  "settled",
+]);
+
+const LIFECYCLE_MILESTONE_FIELD = Object.freeze({
+  admitted: "admittedAt",
+  canonical_frozen: "canonicalFrozenAt",
+  semantic_started: "semanticStartedAt",
+  semantic_decision: "semanticDecisionAt",
+  canonical_decision: "canonicalDecisionAt",
+  execution_started: "executionStartedAt",
+  execution_completed: "executionCompletedAt",
+  reply_prepared: "replyPreparedAt",
+  outbound_locked: "outboundLockedAt",
+  send_started: "sendStartedAt",
+  delivery_confirmed: "deliveryConfirmedAt",
+  settled: "settledAt",
+});
+
+/**
+ * A strictly positive, finite timestamp, or null if the input is malformed
+ * (NaN, Infinity, negative, zero, or not numeric at all). Malformed
+ * instrumentation input must never corrupt lifecycle ordering.
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+function cleanLifecycleTimestamp(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * Fixed set of safe categorical lifecycle failure codes. Lifecycle
+ * diagnostics must never carry raw exception messages, provider errors,
+ * model output, prompts, or customer text -- detailed/raw error information
+ * belongs only in the existing authoritative diagnostic/log fields
+ * (lastError, console warnings) where it already lives. Any code not in
+ * this set is dropped rather than stored.
+ */
+const LIFECYCLE_FAILURE_CODES = Object.freeze([
+  "SEMANTIC_DECISION_FAILED",
+  "SEMANTIC_DECISION_REJECTED",
+  "CANONICAL_DECISION_FAILED",
+  "EXECUTION_FAILED",
+  "OUTBOUND_FAILED",
+]);
+
+/** @param {unknown} value @returns {string | null} */
+function cleanLifecycleFailureCode(value) {
+  const code = String(value ?? "").trim();
+  return LIFECYCLE_FAILURE_CODES.includes(code) ? code : null;
+}
+
+/** Fixed set of internal (never customer/model-derived) lifecycle failure stage names. */
+const LIFECYCLE_FAILURE_STAGES = Object.freeze([
+  "semantic",
+  "canonical_decision",
+  "execution",
+  "outbound",
+]);
+
+/** @param {unknown} value @returns {string | null} */
+function cleanLifecycleFailureStage(value) {
+  const stage = String(value ?? "").trim();
+  return LIFECYCLE_FAILURE_STAGES.includes(stage) ? stage : null;
+}
+
+/**
+ * Writes ONLY `entry.lifecycle`, preserving every other field on the entry
+ * byte-for-byte -- including the authoritative `updatedAt`, which must never
+ * be touched by an observational write (it participates in existing ledger
+ * recovery/staleness semantics). Requires the entry to already exist; never
+ * fabricates one. Bypasses `upsertEntry` deliberately, since that helper
+ * always stamps a fresh `updatedAt`.
+ * @param {string} key
+ * @param {Record<string, unknown>} lifecycle
+ * @returns {{ recorded: boolean, reason?: string, entry?: InboundTurnLedgerEntry }}
+ */
+function patchLifecycleForExistingEntry(key, lifecycle) {
+  const prev = ledgerByKey.get(key);
+  if (!prev) return { recorded: false, reason: "missing_entry" };
+  const next = { ...prev, lifecycle };
+  ledgerByKey.set(key, /** @type {InboundTurnLedgerEntry} */ (next));
+  persistLedgerWithoutPruning();
+  return { recorded: true, entry: next };
+}
+
+/**
+ * Purely additive, observational lifecycle diagnostic. Never read by
+ * admission/dedupe/retry/routing/send decisions -- existing authoritative
+ * fields (state, replySent, intentionalSilent, outboundLockedAt, autoRetryAllowed,
+ * etc.) remain the sole source of truth for all of those, and this function
+ * never mutates any of them, never touches `updatedAt`, and never creates a
+ * ledger entry that does not already exist. First-write-wins per milestone
+ * (a stage already recorded is never overwritten by a later or duplicate
+ * call), and `lastStage` only ever advances forward per LIFECYCLE_STAGE_ORDER,
+ * so a late/duplicate/out-of-order event can never move it backwards. No
+ * prompts, raw completions, phone numbers, JIDs, raw conversation text, or
+ * full reply copies are stored here.
+ * @param {{
+ *   chatKey: string,
+ *   stableId: string,
+ *   guaranteeKey?: string,
+ *   stage: string,
+ *   atMs?: number,
+ *   canonicalPrimaryStableId?: string | null,
+ *   canonicalGuaranteeKey?: string | null,
+ * }} p
+ * @returns {{ recorded: boolean, reason?: string }}
+ */
+export function recordInboundTurnLifecycleMilestone(p) {
+  if (!isInboundTurnLedgerEnabled()) return { recorded: false, reason: "ledger_disabled" };
+  const stage = String(p?.stage ?? "").trim();
+  if (!Object.prototype.hasOwnProperty.call(LIFECYCLE_MILESTONE_FIELD, stage)) {
+    return { recorded: false, reason: "unknown_stage" };
+  }
+  const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
+  const stableId = String(p.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return { recorded: false, reason: "invalid_key" };
+  const existing = ledgerByKey.get(key);
+  if (!existing) return { recorded: false, reason: "missing_entry" };
+  // Omitted atMs uses the real current time. An EXPLICITLY supplied atMs
+  // must be a finite positive timestamp -- it is rejected outright (never
+  // silently substituted with Date.now()), so a malformed instrumentation
+  // call can never masquerade as a valid instant and corrupt ordering.
+  let atMs;
+  if (p.atMs === undefined) {
+    atMs = Date.now();
+  } else {
+    const cleaned = cleanLifecycleTimestamp(p.atMs);
+    if (cleaned == null) return { recorded: false, reason: "invalid_timestamp" };
+    atMs = cleaned;
+  }
+  const priorLifecycle =
+    existing.lifecycle && typeof existing.lifecycle === "object" ? existing.lifecycle : null;
+  const priorMilestones =
+    priorLifecycle?.milestones && typeof priorLifecycle.milestones === "object"
+      ? priorLifecycle.milestones
+      : {};
+  const milestoneField = LIFECYCLE_MILESTONE_FIELD[stage];
+  if (priorMilestones[milestoneField] != null) {
+    return { recorded: false, reason: "already_recorded" };
+  }
+  const priorStageIndex = LIFECYCLE_STAGE_ORDER.indexOf(String(priorLifecycle?.lastStage ?? ""));
+  const thisStageIndex = LIFECYCLE_STAGE_ORDER.indexOf(stage);
+  const advances = priorStageIndex < 0 || thisStageIndex > priorStageIndex;
+  // Diagnostic-only linkage from a secondary physical message to the
+  // canonical (primary) turn it was merged into -- never authoritative,
+  // never consulted by dedupe/execution. Once set for a given physical
+  // entry it never changes (a physical id merges into exactly one turn).
+  const canonicalPrimaryStableId =
+    priorLifecycle?.canonicalPrimaryStableId ??
+    (p.canonicalPrimaryStableId != null ? String(p.canonicalPrimaryStableId).trim() || null : null);
+  const canonicalGuaranteeKey =
+    priorLifecycle?.canonicalGuaranteeKey ??
+    (p.canonicalGuaranteeKey != null ? String(p.canonicalGuaranteeKey).trim() || null : null);
+  const result = patchLifecycleForExistingEntry(key, {
+    lastStage: advances ? stage : priorLifecycle?.lastStage ?? stage,
+    lastStageAt: advances ? atMs : priorLifecycle?.lastStageAt ?? atMs,
+    milestones: { ...priorMilestones, [milestoneField]: atMs },
+    failureStage: priorLifecycle?.failureStage ?? null,
+    failureCode: priorLifecycle?.failureCode ?? null,
+    canonicalPrimaryStableId,
+    canonicalGuaranteeKey,
+  });
+  return { recorded: result.recorded, reason: result.reason };
+}
+
+/**
+ * Propagates one lifecycle milestone across every physical stable id merged
+ * into a single canonical (Group burst) turn, reusing the same
+ * guaranteeKey/burstStableIds convention the existing
+ * mark*LedgerXForGuarantee functions already use for terminal states. Each
+ * secondary physical id's lifecycle records `canonicalPrimaryStableId` /
+ * `canonicalGuaranteeKey` pointing at the primary id, so investigating any
+ * one physical id in the burst reveals which canonical turn it belongs to.
+ * Authoritative guaranteeKey/stableId/chatKey/state on each physical entry
+ * are untouched -- only `lifecycle` is written, and only for entries that
+ * already exist (see recordInboundTurnLifecycleMilestone).
+ * @param {{ guaranteeKey: string, burstStableIds?: string[], stage: string, atMs?: number }} p
+ * @returns {{ recorded: number, skipped: number }}
+ */
+export function recordInboundTurnLifecycleMilestoneForGuarantee(p) {
+  if (!isInboundTurnLedgerEnabled()) return { recorded: 0, skipped: 0 };
+  const { chatKey, stableId: primaryStableId } = parseGuaranteeKeyParts(p.guaranteeKey);
+  if (!chatKey || !primaryStableId) return { recorded: 0, skipped: 0 };
+  const burst = Array.isArray(p.burstStableIds)
+    ? p.burstStableIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+    : [];
+  const ids = new Set([primaryStableId, ...burst]);
+  let recorded = 0;
+  let skipped = 0;
+  for (const sid of ids) {
+    const isSecondary = sid !== primaryStableId;
+    const result = recordInboundTurnLifecycleMilestone({
+      chatKey,
+      stableId: sid,
+      guaranteeKey: buildInboundTurnLedgerKey(chatKey, sid),
+      stage: p.stage,
+      atMs: p.atMs,
+      ...(isSecondary
+        ? {
+            canonicalPrimaryStableId: primaryStableId,
+            canonicalGuaranteeKey: String(p.guaranteeKey ?? "").trim() || null,
+          }
+        : {}),
+    });
+    if (result.recorded) recorded += 1;
+    else skipped += 1;
+  }
+  return { recorded, skipped };
+}
+
+/**
+ * Purely observational failure marker on the diagnostic lifecycle object.
+ * Never read by retry/admission/routing decisions -- existing authoritative
+ * `state`/`lastError`/`manualReviewAlert` fields remain the sole source of
+ * truth for those. Requires the entry to already exist; never fabricates
+ * one, never touches any authoritative field or `updatedAt`.
+ * @param {{ chatKey: string, stableId: string, stage?: string, code?: string }} p
+ * @returns {{ recorded: boolean, reason?: string }}
+ */
+export function recordInboundTurnLifecycleFailure(p) {
+  if (!isInboundTurnLedgerEnabled()) return { recorded: false, reason: "ledger_disabled" };
+  const chatKey = normalizeTitle(String(p.chatKey ?? "").trim());
+  const stableId = String(p.stableId ?? "").trim();
+  const key = buildInboundTurnLedgerKey(chatKey, stableId);
+  if (!key) return { recorded: false, reason: "invalid_key" };
+  const existing = ledgerByKey.get(key);
+  if (!existing) return { recorded: false, reason: "missing_entry" };
+  const priorLifecycle =
+    existing.lifecycle && typeof existing.lifecycle === "object" ? existing.lifecycle : null;
+  // Only a fixed, safe categorical stage/code may ever land in lifecycle
+  // diagnostics -- an unrecognized value (e.g. a caller mistakenly passing
+  // raw exception text) is dropped rather than stored, never truncated-and-kept.
+  const failureStage = cleanLifecycleFailureStage(p.stage) ?? (priorLifecycle?.failureStage ?? null);
+  const failureCode = cleanLifecycleFailureCode(p.code) ?? (priorLifecycle?.failureCode ?? null);
+  const result = patchLifecycleForExistingEntry(key, {
+    lastStage: priorLifecycle?.lastStage ?? null,
+    lastStageAt: priorLifecycle?.lastStageAt ?? null,
+    milestones: priorLifecycle?.milestones ?? {},
+    failureStage,
+    failureCode,
+    canonicalPrimaryStableId: priorLifecycle?.canonicalPrimaryStableId ?? null,
+    canonicalGuaranteeKey: priorLifecycle?.canonicalGuaranteeKey ?? null,
+  });
+  return { recorded: result.recorded, reason: result.reason };
+}
+
+/**
+ * Propagates one lifecycle failure marker across every physical stable id
+ * merged into a single canonical (Group burst) turn -- same
+ * guaranteeKey/burstStableIds convention as
+ * recordInboundTurnLifecycleMilestoneForGuarantee.
+ * @param {{ guaranteeKey: string, burstStableIds?: string[], stage?: string, code?: string }} p
+ * @returns {{ recorded: number, skipped: number }}
+ */
+export function recordInboundTurnLifecycleFailureForGuarantee(p) {
+  if (!isInboundTurnLedgerEnabled()) return { recorded: 0, skipped: 0 };
+  const { chatKey, stableId: primaryStableId } = parseGuaranteeKeyParts(p.guaranteeKey);
+  if (!chatKey || !primaryStableId) return { recorded: 0, skipped: 0 };
+  const burst = Array.isArray(p.burstStableIds)
+    ? p.burstStableIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+    : [];
+  const ids = new Set([primaryStableId, ...burst]);
+  let recorded = 0;
+  let skipped = 0;
+  for (const sid of ids) {
+    const result = recordInboundTurnLifecycleFailure({
+      chatKey,
+      stableId: sid,
+      stage: p.stage,
+      code: p.code,
+    });
+    if (result.recorded) recorded += 1;
+    else skipped += 1;
+  }
+  return { recorded, skipped };
+}
+
+/**
+ * Derives one diagnostic outcome label purely from EXISTING authoritative
+ * ledger truth (never from the observational `lifecycle` object above, and
+ * never persisted as a second authoritative status). Never mutates `entry`.
+ * Reuses the same PROCESSING_STALE_MS threshold the ledger's own
+ * admission/recovery logic already uses -- no new timeout is invented.
+ * @param {InboundTurnLedgerEntry | null | undefined} entry
+ * @param {number} [nowMs]
+ * @returns {"REPLIED"|"INTENTIONAL_SILENCE"|"BASELINE_IGNORED"|"RETRY_PENDING"|"FAILED_VISIBLE"|"IN_PROGRESS"}
+ */
+export function deriveInboundTurnLifecycleOutcome(entry, nowMs = Date.now()) {
+  if (!entry || typeof entry !== "object") return "IN_PROGRESS";
+  const state = String(entry.state ?? "");
+  const manualReviewOpen =
+    entry.manualReviewAlert &&
+    typeof entry.manualReviewAlert === "object" &&
+    String(entry.manualReviewAlert.status ?? "") === "open";
+  // The ledger's own authoritative signal that automatic retry is not
+  // currently safe (set unconditionally by markInboundTurnLedgerOutboundLocked
+  // and ensureOutboundManualReviewAlert) -- reused here rather than invented.
+  const unsafeToAutoRetry = manualReviewOpen || entry.autoRetryAllowed === false;
+
+  if (state === "done") {
+    if (entry.replySent === true) return "REPLIED";
+    if (entry.intentionalSilent === true) return "INTENTIONAL_SILENCE";
+    // Reply was required but never confirmed delivered.
+    return unsafeToAutoRetry ? "FAILED_VISIBLE" : "RETRY_PENDING";
+  }
+  if (state === "outbound_locked") {
+    // outbound_locked always carries autoRetryAllowed=false and
+    // deliveryStatus="manual_review_required" from the moment it is set
+    // (see markInboundTurnLedgerOutboundLocked) -- an unconfirmed send is
+    // definitionally not a safe REPLIED/auto-retry candidate.
+    return "FAILED_VISIBLE";
+  }
+  if (state === "baseline_absorbed") {
+    // Historical/startup content intentionally never processed -- distinct
+    // from a live runtime turn that was intentionally answered with silence.
+    return "BASELINE_IGNORED";
+  }
+  if (state === "failed") {
+    return unsafeToAutoRetry ? "FAILED_VISIBLE" : "RETRY_PENDING";
+  }
+  if (state === "processing") {
+    const startedAt = Number(entry.processingAt ?? NaN);
+    if (Number.isFinite(startedAt) && nowMs - startedAt > PROCESSING_STALE_MS) {
+      // Stale enough that resolveInboundTurnAdmissionBlock's own recovery
+      // path would already treat this as processing_stale_recovered.
+      return unsafeToAutoRetry ? "FAILED_VISIBLE" : "RETRY_PENDING";
+    }
+    return "IN_PROGRESS";
+  }
+  if (unsafeToAutoRetry) return "FAILED_VISIBLE";
+  return "IN_PROGRESS";
+}
+
+/**
  * @param {{ chatKey: string, stableId: string, guaranteeKey?: string, textPreview?: string }} p
  */
 export function markInboundTurnLedgerProcessing(p) {
@@ -276,7 +649,19 @@ export function markInboundTurnLedgerProcessing(p) {
     String(p.guaranteeKey ?? "").trim() || key;
   const textPreview = String(p.textPreview ?? "").slice(0, 120);
   const existing = ledgerByKey.get(key);
-  if (existing?.state === "outbound_locked" || existing?.state === "done") {
+  // A done entry blocks re-admission to processing UNLESS it is the
+  // retryable "customer reply required but never confirmed delivered" case
+  // (see resolveInboundTurnAdmissionBlock) -- that case must be allowed
+  // back into processing so the missing reply can actually be retried,
+  // rather than the ledger silently refusing to track the retry attempt.
+  const doneButReplyRetryable =
+    existing?.state === "done" &&
+    !existing.replySent &&
+    existing.intentionalSilent !== true;
+  if (
+    existing?.state === "outbound_locked" ||
+    (existing?.state === "done" && !doneButReplyRetryable)
+  ) {
     console.log("[inbound_turn_ledger_processing_existing_preserved]", {
       chatKey,
       stableId,
@@ -312,6 +697,7 @@ export function markInboundTurnLedgerProcessing(p) {
     textPreview,
     processingAt: Date.now(),
   });
+  recordInboundTurnLifecycleMilestone({ chatKey, stableId, guaranteeKey, stage: "admitted" });
   console.log("[inbound_turn_ledger_mark_processing]", {
     chatKey,
     stableId,
@@ -334,6 +720,15 @@ export function markInboundTurnLedgerDone(p) {
     String(p.guaranteeKey ?? "").trim() || key;
   const textPreview = String(p.textPreview ?? "").slice(0, 120);
   const replySent = p.replySent !== false;
+  // Explicitly TRUSTED reason a turn settled done without replySent -- set
+  // only by the caller that actually decided this turn needed no
+  // customer-facing reply at all (never inferred here). Distinct from
+  // replySent=false with intentionalSilent left unset/false, which means a
+  // customer reply WAS required but not confirmed delivered -- see
+  // resolveInboundTurnAdmissionBlock, which is the only place this
+  // distinction is acted on (retryable vs. a legitimate, stable terminal
+  // state).
+  const intentionalSilent = p.intentionalSilent === true;
   const now = Date.now();
   upsertEntry(key, {
     chatKey,
@@ -342,14 +737,34 @@ export function markInboundTurnLedgerDone(p) {
     state: "done",
     textPreview,
     replySent,
-    replySentAt: now,
+    intentionalSilent,
+    replySentAt: replySent ? now : null,
     processingAt: null,
+  });
+  if (replySent) {
+    recordInboundTurnLifecycleMilestone({
+      chatKey,
+      stableId,
+      guaranteeKey,
+      stage: "delivery_confirmed",
+      atMs: now,
+    });
+  }
+  recordInboundTurnLifecycleMilestone({
+    chatKey,
+    stableId,
+    guaranteeKey,
+    stage: "settled",
+    atMs: now,
   });
   console.log("[inbound_turn_ledger_mark_done]", {
     chatKey,
     stableId,
     guaranteeKey,
     replySent,
+    intentionalSilent,
+    customerReplyRequired: !intentionalSilent,
+    customerReplyDelivered: replySent,
     textPreview,
   });
 }
@@ -391,6 +806,15 @@ export function markInboundTurnLedgerFailed(p) {
     ),
     processingAt: null,
     lastError: lastErrorPatch,
+  });
+  // Fixed categorical code only -- lastErrorPatch (arbitrary caller-supplied
+  // text) stays in the authoritative `lastError` field above where it
+  // already belongs; it is never duplicated into lifecycle diagnostics.
+  recordInboundTurnLifecycleFailure({
+    chatKey,
+    stableId,
+    stage: "execution",
+    code: "EXECUTION_FAILED",
   });
 }
 
@@ -542,6 +966,13 @@ export function markInboundTurnLedgerOutboundLocked(p) {
     lastError: String(p.lastError ?? existing?.lastError ?? "").slice(0, 160) || null,
     processingAt: null,
   }, force);
+  recordInboundTurnLifecycleMilestone({
+    chatKey,
+    stableId,
+    guaranteeKey,
+    stage: "outbound_locked",
+    atMs: now,
+  });
   console.log("[inbound_turn_ledger_outbound_locked]", {
     chatKey,
     stableId,
@@ -587,13 +1018,45 @@ export function resolveInboundTurnAdmissionBlock(p) {
         previousReplyAt: entry.replySentAt ?? entry.updatedAt ?? null,
       };
     }
-    console.log("[inbound_replay_blocked_done]", {
+    if (entry.intentionalSilent === true) {
+      // A TRUSTED, explicit decision that this turn genuinely required no
+      // customer-facing reply -- stable terminal state, same as
+      // already_answered: nothing is missing, so replay stays blocked.
+      console.log("[inbound_replay_blocked_done]", {
+        chatKey,
+        stableId,
+        reason: "intentional_silent_done",
+        textPreview,
+      });
+      return {
+        blocked: true,
+        reason: "intentional_silent_done",
+        logEvent: "inbound_replay_blocked_done",
+      };
+    }
+    // done + replySent=false + intentionalSilent not explicitly true: a
+    // customer reply WAS required for this turn but delivery was never
+    // confirmed (compose/send failure, or an untrusted/incorrect silence
+    // classification upstream). This must NOT be a dead end -- the
+    // architectural invariant is that ledger_done alone (without a
+    // delivered reply or a trusted intentional-silence decision) can never
+    // permanently block the missing customer reply from being retried.
+    // Existing AVR/owner-notification idempotency already prevents any
+    // side effect from firing twice on this retry -- only the missing
+    // customer-facing reply is (re)attempted.
+    console.log("[inbound_turn_ledger_reply_retry_allowed]", {
       chatKey,
       stableId,
-      reason: "ledger_done",
+      reason: "customer_reply_not_delivered",
+      customerReplyRequired: true,
+      customerReplyDelivered: false,
       textPreview,
     });
-    return { blocked: true, reason: "ledger_done", logEvent: "inbound_replay_blocked_done" };
+    return {
+      blocked: false,
+      reason: "customer_reply_retry_required",
+      logEvent: "inbound_turn_ledger_reply_retry_allowed",
+    };
   }
 
   if (entry.state === "baseline_absorbed") {
@@ -691,7 +1154,7 @@ export function resolveInboundTurnAdmissionBlock(p) {
 
 /**
  * Mark done for all burst stable ids attached to a guarantee key.
- * @param {{ guaranteeKey: string, burstStableIds?: string[], replySent?: boolean, textPreview?: string }} p
+ * @param {{ guaranteeKey: string, burstStableIds?: string[], replySent?: boolean, intentionalSilent?: boolean, textPreview?: string }} p
  */
 export function markInboundTurnLedgerDoneForGuarantee(p) {
   if (!isInboundTurnLedgerEnabled()) return;
@@ -707,6 +1170,7 @@ export function markInboundTurnLedgerDoneForGuarantee(p) {
       stableId: sid,
       guaranteeKey: buildInboundTurnLedgerKey(chatKey, sid),
       replySent: p.replySent,
+      intentionalSilent: p.intentionalSilent,
       textPreview: p.textPreview,
     });
   }
@@ -1018,7 +1482,7 @@ export function markOutboundSendInFlight(p) {
   ) {
     return null;
   }
-  return upsertEntry(
+  const next = upsertEntry(
     key,
     {
       ...existing,
@@ -1029,6 +1493,13 @@ export function markOutboundSendInFlight(p) {
     },
     force
   );
+  recordInboundTurnLifecycleMilestone({
+    chatKey,
+    stableId,
+    guaranteeKey: String(existing.guaranteeKey ?? "").trim() || key,
+    stage: "send_started",
+  });
+  return next;
 }
 
 /**

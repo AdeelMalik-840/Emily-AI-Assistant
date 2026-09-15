@@ -10,6 +10,8 @@ process.env.NODE_ENV = "test";
 process.env.OPENAI_API_KEY ||= "test-key";
 
 import { buildBookingRequestActionPlan } from "../src/brain/workflows/BookingRequestWorkflow.js";
+import { applyAvailabilityCustomerResponse } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import { composeCloudCanonicalCustomerReply } from "../src/brain/openai/composeCloudCanonicalCustomerReply.js";
 import { routeAndExecuteLiveActionPlan } from "../src/brain/live/actionRouter.js";
 
 const COROLLA_ID = "toyota_corolla_metallic_grey_0e2cd610";
@@ -136,8 +138,9 @@ test("CASE A: unavailable + Civic/Stonic alts → REPLY only from trusted unavai
   assertNoBookingMutation(plan);
   assert.equal(plan.actions.length, 1);
   assert.equal(plan.actions[0].type, "REPLY");
-  assert.equal(plan.replyDraft, reply);
-  assert.equal(plan.actions[0].payload?.text, reply);
+  assert.equal(plan.replyDraft, "");
+  assert.equal(plan.actions[0].payload?.text, "");
+  assert.equal(plan.customerResponseComposition?.kind, "availability_unavailable");
   assert.equal(
     plan.actions[0].payload?.source,
     "booking_request_canonical_unavailable_alternative_offer"
@@ -179,9 +182,10 @@ test("CASE B: Swift-only alts → no invented Civic/Stonic", () => {
   );
 
   assertNoBookingMutation(plan);
-  assert.equal(plan.replyDraft, reply);
-  assert.match(plan.replyDraft, /Swift/i);
-  assert.doesNotMatch(plan.replyDraft, /Civic|Stonic/i);
+  assert.equal(plan.replyDraft, "");
+  assert.deepEqual(plan.customerResponseComposition?.verifiedAlternatives, [
+    { itemId: SWIFT_ID, itemLabel: "Suzuki Swift" },
+  ]);
   assert.deepEqual(plan.actions[0].payload?.verifiedAlternatives, [
     { itemId: SWIFT_ID, itemLabel: "Suzuki Swift" },
   ]);
@@ -199,16 +203,16 @@ test("CASE C: empty alts → no-option reply, no invented cars", () => {
   );
 
   assertNoBookingMutation(plan);
-  assert.equal(plan.replyDraft, reply);
+  assert.equal(plan.replyDraft, "");
   assert.equal(
     plan.actions[0].payload?.source,
     "booking_request_canonical_unavailable_no_alternatives"
   );
   assert.deepEqual(plan.actions[0].payload?.verifiedAlternatives, []);
-  assert.doesNotMatch(plan.replyDraft, /Civic|Stonic|Swift/i);
+  assert.deepEqual(plan.customerResponseComposition?.verifiedAlternatives, []);
 });
 
-test("CASE C failsafe: empty composed + empty alts uses no-option failsafe", () => {
+test("CASE C composition: empty alternatives remain structured and uncanned", () => {
   const plan = planFor(
     unavailableCanonical({
       alternatives: [],
@@ -217,9 +221,48 @@ test("CASE C failsafe: empty composed + empty alts uses no-option failsafe", () 
   );
 
   assertNoBookingMutation(plan);
-  assert.match(String(plan.replyDraft), /available nahi hai/i);
-  assert.match(String(plan.replyDraft), /koi aur option available nahi hai/i);
-  assert.doesNotMatch(String(plan.replyDraft), /Civic|Stonic/i);
+  assert.equal(plan.replyDraft, "");
+  assert.equal(plan.customerResponseComposition?.conversationStage, "booking_unavailable_no_verified_alternatives");
+});
+
+test("CASE C2: unavailable booking wording uses shared guarded composition without changing mutations", async () => {
+  for (const alternatives of [
+    [{ itemId: SWIFT_ID, itemLabel: "Suzuki Swift" }],
+    [],
+  ]) {
+    const plan = planFor(unavailableCanonical({ alternatives, unavailableCustomerReply: "ignored" }));
+    let calls = 0;
+    const composed = await composeCloudCanonicalCustomerReply({
+      kind: plan.customerResponseComposition.kind,
+      channel: "group",
+      semanticIntent: "booking_request",
+      customerMessage: "Corolla 5 din ke liye book kar do",
+      trustedFacts: {
+        itemId: COROLLA_ID,
+        itemLabel: "Toyota Corolla (Metallic Grey)",
+        durationDays: 5,
+        availabilityStatus: "unavailable",
+        verifiedAlternatives: alternatives,
+        verifiedAlternativesCount: alternatives.length,
+      },
+      __chatCompletionsCreateForTests: async () => {
+        calls += 1;
+        return { choices: [{ message: { content: JSON.stringify({
+          customerReply: alternatives.length
+            ? "Corolla available nahi hai. Suzuki Swift dekh sakte hain."
+            : "Corolla available nahi hai.",
+          presentedItemIds: alternatives.length ? [SWIFT_ID] : [],
+          offersAlternatives: alternatives.length > 0,
+          replySemantics: { claims: ["resource_unavailable"], languageStyle: "roman_urdu", containsTimingPromise: false, exposesInternalProcess: false },
+        }) } }] };
+      },
+    });
+    const finalPlan = applyAvailabilityCustomerResponse(plan, composed);
+    assert.equal(calls, 1);
+    assertNoBookingMutation(finalPlan);
+    assert.equal(finalPlan.actions[0].payload.text, composed.reply);
+    assert.equal(finalPlan.customerResponseComposition.bindPresentedItemFocus, false);
+  }
 });
 
 test("CASE D: not confidently unavailable → owner-check plan (no CREATE_BOOKING)", () => {

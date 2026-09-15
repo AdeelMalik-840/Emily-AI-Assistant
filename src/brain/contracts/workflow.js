@@ -43,7 +43,7 @@
  */
 
 /**
- * @typedef {"availability_inquiry" | "pricing_inquiry" | "pricing_with_duration" | "booking_request" | "owner_approval" | "owner_rejection" | "customer_detail_collection" | "group_to_dm_continuation" | "unlisted_item" | "browse_options" | "clarification" | "general_business_question" | "image_catalog_request" | "noop"} WorkflowType
+ * @typedef {"availability_inquiry" | "pricing_inquiry" | "pricing_with_duration" | "booking_request" | "owner_approval" | "owner_rejection" | "customer_detail_collection" | "group_to_dm_continuation" | "unlisted_item" | "item_not_in_catalog" | "browse_options" | "clarification" | "general_business_question" | "image_catalog_request" | "noop"} WorkflowType
  */
 
 /**

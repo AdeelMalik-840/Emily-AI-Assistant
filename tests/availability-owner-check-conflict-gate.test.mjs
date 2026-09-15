@@ -228,7 +228,8 @@ test("A: overlapping approved Stonic + kal → facts windowApplied + unavailable
     (plan.actions || []).some((a) => a.type === "CREATE_BOOKING"),
     false
   );
-  assert.match(String(plan.actions?.[0]?.payload?.source ?? ""), /unavailable/i);
+  assert.equal(plan.customerResponseComposition?.kind, "duration_ask");
+  assert.equal(plan.actions?.[0]?.payload?.source, "canonical_owner_check_ask_duration");
 });
 
 test("B: no overlapping booking → owner-check still planned", async () => {
@@ -244,44 +245,17 @@ test("B: no overlapping booking → owner-check still planned", async () => {
   assert.equal(isConfidentInventoryUnavailable(canonical.verified.availability), false);
 
   const plan = planFromFacts(canonical);
-  assert.equal(hasOwnerCheck(plan), true);
-  const owner = plan.actions.find((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED");
-  assert.equal(owner.payload.itemId, STONIC_ID);
-  assert.equal(owner.payload.durationDays, 1);
+  assert.equal(hasOwnerCheck(plan), false);
+  assert.equal(plan.customerResponseComposition?.kind, "duration_ask");
+  assert.equal(plan.actions?.[0]?.payload?.source, "canonical_owner_check_ask_duration");
 });
 
-test("B+: no-conflict owner-check still creates a pending AVR ledger entry", async () => {
-  const db = new MemDb();
+test("B+: kal without duration does not create an AVR", async () => {
   const canonical = await resolveFacts({ message: MESSAGE_KAL, bookings: [] });
   const plan = planFromFacts(canonical);
   const owner = plan.actions.find((a) => a.type === "AVAILABILITY_OWNER_CHECK_REQUIRED");
-  assert.ok(owner);
-
-  const created = await createAvailabilityRequest({
-    db,
-    payload: {
-      ...owner.payload,
-      businessId: BUSINESS_ID,
-      canonicalAvailabilityStatus: "available",
-      sourceTurnKey: "wamid.gate-a-stonic-ok",
-      sourceIdentity: {
-        ...(owner.payload.sourceIdentity || {}),
-        sourceTurnKey: "wamid.gate-a-stonic-ok",
-        chatId: `${BUSINESS_ID}::905443829990`,
-        chatType: "dm",
-        participantPhone: "905443829990",
-      },
-    },
-    executionContext: {
-      businessId: BUSINESS_ID,
-      executionGuard: { active: true },
-      db,
-    },
-  });
-  assert.equal(created.ok, true);
-  assert.equal(created.created, true);
-  assert.equal(created.status, "pending");
-  assert.equal(db.docs.size, 1);
+  assert.equal(owner, undefined);
+  assert.equal(hasOwnerCheck(plan), false);
 });
 
 test("C: PR #100 fresh-release predicate still true for Stonic kal shape", () => {

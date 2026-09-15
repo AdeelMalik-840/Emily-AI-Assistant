@@ -13,10 +13,7 @@ import assert from "node:assert/strict";
 process.env.OPENAI_API_KEY ||= "test-key";
 process.env.NODE_ENV = "test";
 
-import {
-  buildAvailabilityInquiryActionPlan,
-  buildVerifiedAlternativesReply,
-} from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
+import { buildAvailabilityInquiryActionPlan } from "../src/brain/workflows/AvailabilityInquiryWorkflow.js";
 import {
   AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
   AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION,
@@ -80,7 +77,7 @@ function civicAssistDuration3(overrides = {}) {
     ...overrides,
   });
   return withAvailabilityAssistPendingQuestion(base, {
-    pendingQuestion: buildVerifiedAlternativesReply(BOTH_ALTS),
+    pendingQuestion: "Kia Stonic aur Toyota Corolla available options hain.",
     pendingPromptType: AVAILABILITY_ASSIST_PROMPT_LIST_AWAITING_ITEM,
     assistStage: AVAILABILITY_ASSIST_STAGE_AWAITING_ITEM_SELECTION,
   });

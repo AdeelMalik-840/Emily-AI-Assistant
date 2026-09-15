@@ -143,7 +143,8 @@ test("soft mode (legacy fallback true) still selects v2_live and never allows le
 test("hard blocked pipeline result uses customer-safe copy", () => {
   const blocked = buildHardBlockedPipelineResult(true);
   assert.equal(blocked.reply, BRAIN_V2_HARD_BLOCKED_CUSTOMER_REPLY);
-  assert.match(String(blocked.reply), /Sorry, system abhi update ho raha hai/i);
+  assert.match(String(blocked.reply), /request complete nahi ho saki/i);
+  assert.doesNotMatch(String(blocked.reply), /system|\bAI\b|model|database|technical/i);
   assert.equal(blocked.legacyBypassed, true);
 });
 

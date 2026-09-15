@@ -11,7 +11,11 @@ import {
   resolveOpenAiChatModel,
   resolveOpenAiOwnershipModel,
 } from "../../config/aiRuntime.js";
-import { listExplicitCatalogItemIds, resolveCanonicalItemReferents } from "../../services/currentTurnAuthority.js";
+import {
+  explicitCurrentItemBeatsContextualFocus,
+  listExplicitCatalogItemIds,
+  resolveCanonicalItemReferents,
+} from "../../services/currentTurnAuthority.js";
 import {
   isAllowedPaMissingInfoType,
   PA_MISSING_INFO_TYPES,
@@ -22,6 +26,9 @@ import {
   normalizeReplySemantics,
   stripInternalReplySemantics,
 } from "../contracts/customerReplyContract.js";
+import { compactTrustedGroupContinuationForPrompt } from "../contracts/canonicalGroupTurnContract.js";
+import { uniqueLiteralRange } from "../facts/uniqueLiteralRange.js";
+import { extractTurnSignals } from "../../services/intentShapeResolver.js";
 import {
   buildCustomerReplyGuardCorrection,
   isVerifiedCustomerClaimMismatchReason,
@@ -2042,21 +2049,40 @@ function knownCatalogSpanLacksCurrentTurnReferent(
     (row) => row?.source === "current_turn"
   );
   if (currentTurn.length === 0) return true;
+  const resolved = resolveCanonicalItemReferents(currentTurn, items);
+  if (resolved.some((row) => row?.status === "AMBIGUOUS")) return false;
   const matched = new Set(
-    resolveCanonicalItemReferents(currentTurn, items)
+    resolved
       .filter((row) => row?.status === "MATCHED" && row?.itemId)
       .map((row) => row.itemId)
   );
   return !knownIds.some((id) => matched.has(id));
 }
 
-function namedCatalogSpanConsistencyRejection(turnScope, customerMessage, catalogItems, itemReferents) {
+function namedCatalogSpanConsistencyRejection(
+  turnScope,
+  customerMessage,
+  catalogItems,
+  itemReferents,
+  trustedFreshItemFocus = null
+) {
   if (
     turnScope !== "NEW_TRANSACTION" &&
     turnScope !== "SOCIAL_GENERAL" &&
     turnScope !== "UNCLEAR"
   ) {
     return null;
+  }
+  const usesContextual = (Array.isArray(itemReferents) ? itemReferents : []).some(
+    (row) => row?.source === "trusted_fresh_focus"
+  );
+  if (usesContextual) {
+    return explicitCurrentItemBeatsContextualFocus({
+      customerMessage,
+      catalogItems,
+      trustedFreshItemFocus,
+      itemReferents,
+    });
   }
   if (
     !knownCatalogSpanLacksCurrentTurnReferent(
@@ -2237,6 +2263,9 @@ export function buildNeutralCloudDmOwnershipFacts(
     ownershipReferenceContext,
     currentOwnershipTurnId: clean(facts.currentOwnershipTurnId, 320) || null,
     trustedFreshItemFocus,
+    trustedGroupContinuation: compactTrustedGroupContinuationForPrompt(
+      facts.trustedGroupContinuation
+    ),
     lastAvailabilityAssist:
       facts.lastAvailabilityAssist && typeof facts.lastAvailabilityAssist === "object"
         ? {
@@ -2301,6 +2330,7 @@ export function buildCloudDmOwnershipPromptFacts(facts) {
     ownershipReferenceContext: f.ownershipReferenceContext,
     currentOwnershipTurnId: f.currentOwnershipTurnId,
     trustedFreshItemFocus: f.trustedFreshItemFocus,
+    trustedGroupContinuation: f.trustedGroupContinuation ?? null,
     lastAvailabilityAssist: f.lastAvailabilityAssist,
     policy: f.policy,
   };
@@ -3065,8 +3095,209 @@ function defaultDecision(overrides = {}) {
     candidateGroundings: [],
     pendingAvailabilitySelectionIndex: null,
     temporalRequest: { startDateKind: "none", startDate: null },
+    requestedDuration: { status: "none", components: null, evidence: null },
+    intentSwitchEvidence: null,
     ...overrides,
   };
+}
+
+/**
+ * Canonical duration units the model may express a stated rental period in.
+ * Deterministic conversion to days lives in src/duration/parseDuration.js
+ * (getNormalizedDaysFromDurationPreference) and is reused unchanged -- this
+ * enum only constrains what the MODEL may output.
+ */
+const REQUESTED_DURATION_UNITS = Object.freeze([
+  "hours",
+  "days",
+  "weeks",
+  "months",
+  "years",
+]);
+
+const REQUESTED_DURATION_STATUSES = Object.freeze(["none", "exact", "non_exact"]);
+
+/**
+ * Fail-closed normalization for the model-proposed requestedDuration field.
+ *
+ * A genuinely ABSENT field (raw == null -- the raw model JSON never mentions
+ * requestedDuration at all) is distinct from the model EXPLICITLY reporting
+ * "none": the former means this decision carries no opinion on duration
+ * whatsoever (returns null), which resolveBusinessTurnContext.js treats as
+ * "not_applicable" and safely falls back to its pre-existing legacy
+ * duration handling -- never silently swallowing a customer's stated
+ * duration just because this decision predates/omits the field (every real
+ * decision from executeCloudDmOwnershipDecision going forward always
+ * includes it, since it is a required schema field; only hand-built/legacy
+ * decision shapes can hit this path). The latter (explicitly "none") is a
+ * real verdict and is trusted as such -- same posture as cleanTemporalRequest
+ * below for its own "none"/"unresolved" distinction, but one level earlier
+ * since duration additionally needs to tell "no opinion" apart from "no
+ * duration."
+ *
+ * Beyond that: a malformed-but-PRESENT proposal must never silently become
+ * "none" either (that would let the caller treat a customer-stated-but-
+ * garbled duration as if nothing were said) -- it degrades to "non_exact"
+ * instead, which downstream treats as "duration not resolved, keep asking,"
+ * never as "duration accepted."
+ *
+ * This function shapes the raw model JSON only. It never converts units to
+ * days and never judges whether a specific value is currently in range --
+ * that is resolveBusinessTurnContext.js's job, after re-validating evidence
+ * grounding against the real raw message.
+ *
+ * Character offsets are never taken from the model. When the model supplies
+ * literal current-turn surfaceText, runtime locates that unique substring
+ * in CUSTOMER_MESSAGE and attaches start/end. Missing or unlocatable
+ * evidence for status=exact does not reject the ownership object: the
+ * duration slot is left ungrounded (evidence=null) so
+ * resolveSemanticRequestedDurationDays fails closed to
+ * invalid_structured_output / NEED_DURATION. Independently valid intent and
+ * item survive. Never synthesize a 0..message.length span.
+ *
+ * @param {unknown} raw
+ * @param {unknown} [customerMessage]
+ * @returns {{ status: "none" | "exact" | "non_exact", components: Array<{ value: number, unit: string }> | null, evidence: Record<string, unknown> | null } | null}
+ */
+function locateRequestedDurationEvidence(evidenceRaw, customerMessage) {
+  if (!evidenceRaw || typeof evidenceRaw !== "object" || Array.isArray(evidenceRaw)) {
+    return { evidence: null, rejectionCode: "REQUESTED_DURATION_EVIDENCE_REQUIRED" };
+  }
+  const row = /** @type {Record<string, unknown>} */ (evidenceRaw);
+  const source = String(row.source ?? "").trim();
+  const surfaceText = String(row.surfaceText ?? "");
+  if (source !== "current_turn" || !surfaceText) {
+    return { evidence: null, rejectionCode: "REQUESTED_DURATION_EVIDENCE_REQUIRED" };
+  }
+  const located = uniqueLiteralRange(customerMessage, surfaceText);
+  if (!located.ok) {
+    return { evidence: null, rejectionCode: "REQUESTED_DURATION_EVIDENCE_UNGROUNDED" };
+  }
+  return {
+    evidence: {
+      source: "current_turn",
+      surfaceText,
+      start: located.start,
+      end: located.end,
+    },
+    rejectionCode: null,
+  };
+}
+
+function cleanRequestedDuration(raw, customerMessage = "") {
+  if (raw == null) return null; // genuinely no opinion -- see doc comment above
+  const evidenceRaw = typeof raw === "object" && !Array.isArray(raw)
+    ? /** @type {Record<string, unknown>} */ (raw).evidence
+    : null;
+  const none = { status: /** @type {const} */ ("none"), components: null, evidence: null };
+  if (typeof raw !== "object" || Array.isArray(raw)) return none;
+
+  const statusRaw = String(/** @type {Record<string, unknown>} */ (raw).status ?? "").trim();
+  if (statusRaw === "") return none; // no attempt to express a status at all
+  if (statusRaw === "none") return none;
+
+  const grounded = locateRequestedDurationEvidence(evidenceRaw, customerMessage);
+  const evidence = grounded.evidence;
+  const nonExact = { status: /** @type {const} */ ("non_exact"), components: null, evidence };
+  if (!REQUESTED_DURATION_STATUSES.includes(statusRaw)) return nonExact; // unrecognized-but-present is a duration-bearing attempt
+  if (statusRaw === "non_exact") return nonExact;
+
+  // statusRaw === "exact": every component must be structurally valid, or
+  // this degrades to non_exact -- never silently drop one bad component and
+  // keep the rest (that would silently lose part of a compound duration).
+  const componentsRaw = /** @type {Record<string, unknown>} */ (raw).components;
+  if (!Array.isArray(componentsRaw) || componentsRaw.length === 0) return nonExact;
+  const components = [];
+  for (const entry of componentsRaw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return nonExact;
+    const value = Number(/** @type {Record<string, unknown>} */ (entry).value);
+    const unit = String(/** @type {Record<string, unknown>} */ (entry).unit ?? "").trim();
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1 || value > 999) {
+      return nonExact;
+    }
+    if (!REQUESTED_DURATION_UNITS.includes(unit)) return nonExact;
+    components.push({ value, unit });
+  }
+  return { status: /** @type {const} */ ("exact"), components, evidence };
+}
+
+function inspectRequestedDuration(raw, customerMessage = "") {
+  const value = cleanRequestedDuration(raw, customerMessage);
+  return { value, rejectionCode: null };
+}
+
+function intentSwitchEvidenceIsGrounded(raw, customerMessage) {
+  const cleaned = cleanIntentSwitchEvidence(raw);
+  if (!cleaned || cleaned.source !== "current_turn") return false;
+  const message = String(customerMessage ?? "");
+  if (
+    !cleaned.surfaceText ||
+    !Number.isInteger(cleaned.start) ||
+    !Number.isInteger(cleaned.end) ||
+    cleaned.start < 0 ||
+    cleaned.end <= cleaned.start ||
+    cleaned.end > message.length
+  ) {
+    return false;
+  }
+  return message.slice(cleaned.start, cleaned.end) === cleaned.surfaceText;
+}
+
+function applyAvailabilityDurationContinuationIntent({
+  semanticIntent,
+  requestedDuration,
+  intentSwitchEvidence,
+  trustedGroupContinuation,
+  customerMessage,
+}) {
+  const continuation = compactTrustedGroupContinuationForPrompt(trustedGroupContinuation);
+  if (!continuation) return semanticIntent;
+  if (continuation.expectedMissingField !== "duration") return semanticIntent;
+  if (continuation.activeTransactionState !== "NEED_DURATION") return semanticIntent;
+  if (continuation.activeTransactionType !== "availability") return semanticIntent;
+  if (requestedDuration?.status !== "exact" || !requestedDuration.evidence) {
+    return semanticIntent;
+  }
+  if (
+    semanticIntent !== "pricing_with_duration" &&
+    semanticIntent !== "pricing_inquiry"
+  ) {
+    return semanticIntent;
+  }
+  if (intentSwitchEvidenceIsGrounded(intentSwitchEvidence, customerMessage)) {
+    return semanticIntent;
+  }
+  return "availability_inquiry";
+}
+
+/**
+ * Deterministic veto: when the ownership model labels a rental-availability
+ * compound (rent + availability verb) as pricing_with_duration without an
+ * explicit monetary amount ask, keep availability_inquiry.
+ *
+ * Live defect: "civic 3 maheeny k lye mil jye ge rent p ?" was priced as a
+ * daily-rate answer. Prompt already forbids rent-mode-as-pricing; this gate
+ * enforces that contract using the shared turn-signal detectors (not
+ * item/duration special cases). Explicit kitna/rate/cost/quote asks keep
+ * pricing_with_duration because extractTurnSignals.priceAsk is true.
+ *
+ * @param {{
+ *   semanticIntent: string | null,
+ *   customerMessage?: unknown,
+ * }} p
+ * @returns {string | null}
+ */
+export function applyRentAvailabilityPricingWithDurationVeto({
+  semanticIntent,
+  customerMessage,
+}) {
+  if (semanticIntent !== "pricing_with_duration") return semanticIntent;
+  const signals = extractTurnSignals({ message: customerMessage });
+  if (signals.priceAsk === true) return semanticIntent;
+  if (signals.rentAvailabilityCompound === true || signals.availabilityAsk === true) {
+    return "availability_inquiry";
+  }
+  return semanticIntent;
 }
 
 const TEMPORAL_REQUEST_START_DATE_KINDS = Object.freeze([
@@ -3091,11 +3322,23 @@ const TEMPORAL_REQUEST_START_DATE_KINDS = Object.freeze([
  * which the workflow safety gate must treat as "do not default to now."
  *
  * @param {unknown} raw
- * @returns {{ startDateKind: "none" | "explicit_date" | "relative_tomorrow" | "relative_day_after_tomorrow" | "unresolved", startDate: { day: number, month: number } | null }}
+ * @returns {{ startDateKind: "none" | "explicit_date" | "relative_tomorrow" | "relative_day_after_tomorrow" | "unresolved", startDate: { day: number, month: number } | null, evidence: Record<string, unknown> | null }}
  */
 function cleanTemporalRequest(raw) {
+  const evidenceRaw = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? /** @type {Record<string, unknown>} */ (raw).evidence
+    : null;
+  const evidence = evidenceRaw && typeof evidenceRaw === "object" && !Array.isArray(evidenceRaw)
+    ? {
+        source: String(/** @type {Record<string, unknown>} */ (evidenceRaw).source ?? "").trim(),
+        surfaceText: String(/** @type {Record<string, unknown>} */ (evidenceRaw).surfaceText ?? "").trim(),
+        start: Number(/** @type {Record<string, unknown>} */ (evidenceRaw).start),
+        end: Number(/** @type {Record<string, unknown>} */ (evidenceRaw).end),
+      }
+    : null;
+  const withEvidence = (value) => (evidence ? { ...value, evidence } : value);
   const none = { startDateKind: /** @type {const} */ ("none"), startDate: null };
-  const unresolved = { startDateKind: /** @type {const} */ ("unresolved"), startDate: null };
+  const unresolved = withEvidence({ startDateKind: /** @type {const} */ ("unresolved"), startDate: null });
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return none;
 
   const kindRaw = /** @type {Record<string, unknown>} */ (raw).startDateKind;
@@ -3103,7 +3346,7 @@ function cleanTemporalRequest(raw) {
   if (kind === "") return none; // no attempt to express a startDateKind at all
   if (kind === "none") return none;
   if (kind === "relative_tomorrow" || kind === "relative_day_after_tomorrow") {
-    return { startDateKind: /** @type {const} */ (kind), startDate: null };
+    return withEvidence({ startDateKind: /** @type {const} */ (kind), startDate: null });
   }
   if (kind === "unresolved") return unresolved;
   if (kind !== "explicit_date") return unresolved; // an unrecognized-but-present kind is a date-bearing attempt
@@ -3116,7 +3359,31 @@ function cleanTemporalRequest(raw) {
   const month = Number(/** @type {Record<string, unknown>} */ (startDateRaw).month);
   if (!Number.isInteger(day) || day < 1 || day > 31) return unresolved;
   if (!Number.isInteger(month) || month < 1 || month > 12) return unresolved;
-  return { startDateKind: /** @type {const} */ ("explicit_date"), startDate: { day, month } };
+  return withEvidence({ startDateKind: /** @type {const} */ ("explicit_date"), startDate: { day, month } });
+}
+
+/**
+ * Clean the model's optional intent-switch evidence span. Identity/meaning
+ * are never decided here -- only that the model attempted to cite a span at
+ * all, and what it claims. Deterministic grounding (does the span actually
+ * exist in the real raw message, at those offsets, with that exact text)
+ * happens downstream in resolveBusinessTurnContext.js, exactly like
+ * temporalRequest.evidence -- this function only shapes/trims the raw model
+ * fields so a malformed or missing payload degrades to null rather than
+ * throwing or passing through garbage.
+ *
+ * @param {unknown} raw
+ * @returns {{ source: string, surfaceText: string, start: number, end: number } | null}
+ */
+function cleanIntentSwitchEvidence(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const row = /** @type {Record<string, unknown>} */ (raw);
+  return {
+    source: String(row.source ?? "").trim(),
+    surfaceText: String(row.surfaceText ?? "").trim(),
+    start: Number(row.start),
+    end: Number(row.end),
+  };
 }
 
 /**
@@ -4012,7 +4279,8 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
       scope,
       facts?.currentCustomerMessage,
       facts?.catalogItems,
-      itemReferents
+      itemReferents,
+      facts?.trustedFreshItemFocus
     );
     if (namedSpanReason) return invalid(namedSpanReason);
     return { ok: true, scope, context, targetId: null };
@@ -4043,7 +4311,8 @@ export function validatePostConfirmSemanticOwnership(decision, facts) {
       scope,
       facts?.currentCustomerMessage,
       facts?.catalogItems,
-      itemReferents
+      itemReferents,
+      facts?.trustedFreshItemFocus
     );
     if (namedSpanReason) return invalid(namedSpanReason);
     return { ok: true, scope, context, targetId: null };
@@ -4230,16 +4499,51 @@ function isAllowedGroupRuntimeOwnedCanonicalization(key, groundedValue) {
   return false;
 }
 
+function isAllowedGroupCatalogCurrentTurnAlignmentKey(key) {
+  return (
+    key === "itemReferents" ||
+    key === "itemScope" ||
+    key === "itemReferenceMode" ||
+    key === "turnScope"
+  );
+}
+
+function groundedCurrentTurnSurfacesAreLiteral(groundedCandidate, customerMessage) {
+  const refs = Array.isArray(groundedCandidate?.itemReferents)
+    ? groundedCandidate.itemReferents
+    : [];
+  const message = String(customerMessage ?? "");
+  for (const ref of refs) {
+    if (String(ref?.source ?? "").trim() !== "current_turn") continue;
+    const surfaceText = String(ref?.surfaceText ?? "");
+    const start = Number(ref?.start);
+    const end = Number(ref?.end);
+    if (
+      !surfaceText ||
+      !Number.isInteger(start) ||
+      !Number.isInteger(end) ||
+      start < 0 ||
+      end <= start ||
+      end > message.length ||
+      message.slice(start, end) !== surfaceText
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Enforce: a Group preprocessor may normalize the Group lane's fixed runtime
  * policy fields, repair current-turn offsets, and clear contextual runtime
  * IDs when a real trusted focus exists. Referent count/order, semantic
- * source/mode, and every model-owned semantic field remain byte-identical.
+ * source/mode, and every model-owned semantic field remain byte-identical
+ * unless catalog CURRENT_TURN alignment is explicitly enabled.
  */
 function assertGroupGroundingOnlyChangedOffsets(
   originalCandidate,
   groundedCandidate,
-  { allowContextualRuntimeIdClearing = false } = {}
+  { allowContextualRuntimeIdClearing = false, allowCatalogCurrentTurnAlignment = false, customerMessage = "" } = {}
 ) {
   if (
     !isOwnershipPlainObject(originalCandidate) ||
@@ -4252,6 +4556,12 @@ function assertGroupGroundingOnlyChangedOffsets(
   }
   for (const key of Object.keys(originalCandidate)) {
     if (key === "itemReferents") continue;
+    if (
+      allowCatalogCurrentTurnAlignment &&
+      isAllowedGroupCatalogCurrentTurnAlignmentKey(key)
+    ) {
+      continue;
+    }
     if (
       isAllowedGroupRuntimeOwnedCanonicalization(key, groundedCandidate[key])
     ) {
@@ -4266,6 +4576,11 @@ function assertGroupGroundingOnlyChangedOffsets(
   const groundedRefs = groundedCandidate.itemReferents;
   if (!Array.isArray(originalRefs) || !Array.isArray(groundedRefs)) {
     return ownershipValuesDeepEqual(originalRefs, groundedRefs)
+      ? { ok: true }
+      : { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
+  }
+  if (allowCatalogCurrentTurnAlignment) {
+    return groundedCurrentTurnSurfacesAreLiteral(groundedCandidate, customerMessage)
       ? { ok: true }
       : { ok: false, reason: "GROUP_GROUNDING_INVARIANT_VIOLATED" };
   }
@@ -4451,7 +4766,8 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
     turnScope,
     opts.customerMessage,
     opts.catalogItems,
-    itemReferents
+    itemReferents,
+    opts.trustedFreshItemFocus
   );
   if (namedSpanReason) {
     return rejectCloudDmOwnershipParse(
@@ -4477,9 +4793,26 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
       itemReferentInspection.metadata
     );
   }
+  const durationInspection = inspectRequestedDuration(
+    parsed.requestedDuration,
+    opts.customerMessage
+  );
+  const requestedDuration = durationInspection.value;
+  const semanticIntentAfterContinuation = applyAvailabilityDurationContinuationIntent({
+    semanticIntent,
+    requestedDuration,
+    intentSwitchEvidence: parsed.intentSwitchEvidence,
+    trustedGroupContinuation: opts.trustedGroupContinuation,
+    customerMessage: opts.customerMessage,
+  });
+  const semanticIntentAfterRentAvailabilityVeto =
+    applyRentAvailabilityPricingWithDurationVeto({
+      semanticIntent: semanticIntentAfterContinuation,
+      customerMessage: opts.customerMessage,
+    });
   return defaultDecision({
     turnScope,
-    semanticIntent,
+    semanticIntent: semanticIntentAfterRentAvailabilityVeto,
     itemScope,
     itemReferents,
     itemReferenceMode:
@@ -4494,6 +4827,8 @@ export function parseCloudDmOwnershipDecision(raw, opts = {}) {
     capability,
     evidenceNeeds,
     temporalRequest: cleanTemporalRequest(parsed.temporalRequest),
+    requestedDuration,
+    intentSwitchEvidence: cleanIntentSwitchEvidence(parsed.intentSwitchEvidence),
     customerReply: "",
     shouldReply: action !== "silence",
     semanticDecisionVersion: CLOUD_DM_OWNERSHIP_SEMANTIC_VERSION,
@@ -4705,8 +5040,104 @@ export async function executeCloudDmOwnershipDecision({
               description:
                 "The stated day-of-month and month-number (1=January .. 12=December) when startDateKind=explicit_date — the literal digits the customer stated, even if they do not form a real calendar date. Never invent a year. Null for every other startDateKind.",
             },
+            evidence: {
+              anyOf: [
+                {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    source: { type: "string", enum: ["current_turn"] },
+                    surfaceText: { type: "string", minLength: 1, maxLength: 160 },
+                    start: { type: "integer", minimum: 0 },
+                    end: { type: "integer", minimum: 1 },
+                  },
+                  required: ["source", "surfaceText", "start", "end"],
+                },
+                { type: "null" },
+              ],
+              description: "For every non-none temporal classification, cite an exact customer-originated span from CUSTOMER_MESSAGE. Use null only for startDateKind=none.",
+            },
           },
-          required: ["startDateKind", "startDate"],
+          required: ["startDateKind", "startDate", "evidence"],
+        },
+        requestedDuration: {
+          type: "object",
+          additionalProperties: false,
+          description:
+            "Structured proposal of the rental PERIOD/DURATION (independent of any start date) the customer currently wants for THEIR OWN request in THIS message, for NEW_TRANSACTION/PENDING_AVAILABILITY_REFERENCE availability/booking asks only. Never a computed day count — runtime performs all unit conversion and validation deterministically. Independent of temporalRequest: a message can state a start date, a duration, both, or neither, and neither field may be inferred from the other.",
+          properties: {
+            status: {
+              type: "string",
+              enum: ["none", "exact", "non_exact"],
+              description:
+                "none = the customer's own current request in THIS message states no rental period at all. Also use none when a duration word appears only as: a question about policy/limits (not a stated request), a reference to a past/previous rental, a hypothetical or quoted example, or a period requested for someone other than the current customer — none of these are the customer's own current requested duration. exact = the customer states one single, fully-determined rental period for their own current request — any language, spelling, transliteration, or number word is acceptable; resolve by meaning, not wording. A duration stated in more than one unit together (e.g. one unit plus a smaller remainder) is still exact — express every stated part as a separate entry in components, in the units the customer actually used; do not compute or convert here. If the customer revises or negates an earlier number within the same message, resolve to only their final intended value. non_exact = the customer references some rental-period concept but it is not one single fully-determined amount — including a vague/indefinite quantity, an approximate or 'about/around' quantity, a range or a set of alternative amounts, a lower-bound-only or upper-bound-only amount, an open-ended comparison (more than / less than X), a fractional or decimal quantity, a colloquial period whose length depends on context (e.g. a weekend), or a unit that cannot be expressed in one of components' supported units. Never resolve non_exact down to a specific exact value — that is a defect, not a simplification.",
+            },
+            components: {
+              anyOf: [
+                {
+                  type: "array",
+                  minItems: 1,
+                  maxItems: 4,
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      value: {
+                        type: "integer",
+                        minimum: 1,
+                        maximum: 999,
+                        description:
+                          "Stated quantity in this unit. Number words map to this integer. Never a converted day count.",
+                      },
+                      unit: {
+                        type: "string",
+                        enum: [...REQUESTED_DURATION_UNITS],
+                      },
+                    },
+                    required: ["value", "unit"],
+                  },
+                },
+                { type: "null" },
+              ],
+              description:
+                "Required non-null (one entry per stated part) only when status=exact. Null for every other status. value is the stated whole-number quantity in that unit, including when the customer wrote it as a number word rather than digits. Never invent a value the customer did not state, never convert to another unit or to a day count, and never approximate a non_exact quantity into one of these.",
+            },
+            evidence: {
+              anyOf: [
+                {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    source: { type: "string", enum: ["current_turn"] },
+                    surfaceText: { type: "string", minLength: 1, maxLength: 160 },
+                  },
+                  required: ["source", "surfaceText"],
+                },
+                { type: "null" },
+              ],
+              description:
+                "For every non-none status, copy a unique literal substring of CUSTOMER_MESSAGE covering the duration reference as surfaceText with source=current_turn. That span is the customer's own duration wording (digits or number words plus unit wording). Do not require components[].value to appear as Arabic digits in the span. A unique unrelated token is not duration evidence. Do not emit character offsets — runtime locates the unique substring and computes start/end. Use null only for status=none. Never invent surfaceText that is not copied from CUSTOMER_MESSAGE.",
+            },
+          },
+          required: ["status", "components", "evidence"],
+        },
+        intentSwitchEvidence: {
+          anyOf: [
+            {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                source: { type: "string", enum: ["current_turn"] },
+                surfaceText: { type: "string", minLength: 1, maxLength: 160 },
+                start: { type: "integer", minimum: 0 },
+                end: { type: "integer", minimum: 1 },
+              },
+              required: ["source", "surfaceText", "start", "end"],
+            },
+            { type: "null" },
+          ],
+          description:
+            "Only when this semanticIntent proposes moving the conversation away from an active pending transaction the customer was already inside (e.g. the customer was just asked for the missing rental period, and this message both answers that AND separately asks something else, like price) — cite the exact customer-originated span in CUSTOMER_MESSAGE that shows the additional ask. Null whenever there is no active pending transaction to move away from, or when this semanticIntent is simply continuing/answering the pending question with nothing else added. This does not decide what the cited text means — only that it exists verbatim in CUSTOMER_MESSAGE.",
         },
       },
       required: [
@@ -4723,13 +5154,15 @@ export async function executeCloudDmOwnershipDecision({
         "capability",
         "evidenceNeeds",
         "temporalRequest",
+        "requestedDuration",
+        "intentSwitchEvidence",
       ],
     }
   );
 
   const system = [
     "You classify Cloud DM transaction ownership only.",
-    "Return JSON with turnScope, semanticIntent, itemScope, itemReferents, itemReferenceMode, targetReference, targetId, mutationIntent, action, factKind, capability, evidenceNeeds, temporalRequest.",
+    "Return JSON with turnScope, semanticIntent, itemScope, itemReferents, itemReferenceMode, targetReference, targetId, mutationIntent, action, factKind, capability, evidenceNeeds, temporalRequest, requestedDuration, intentSwitchEvidence.",
     "Do not write customer wording. customerReply is not part of this schema.",
     "Do not treat any listed candidate as current, active, trusted, selected, preferred, primary, or already owned.",
     `Candidate lists are ordered ${CLOUD_DM_OWNERSHIP_CANDIDATE_ORDER} for reproducibility only. Order is identity, not preference, recency, or selection.`,
@@ -4745,19 +5178,21 @@ export async function executeCloudDmOwnershipDecision({
     "current_turn surfaceText is the named item/service token in CUSTOMER_MESSAGE, copied exactly. Do not span asked attributes, accessories, or other phrases as the item referent.",
     "A contextual continuation (available hai? / iska / ye) uses source=trusted_fresh_focus, surfaceText/start/end=null, trustedItemId=null, sourceTurnId=null. Runtime binds TRUSTED_FRESH_ITEM_FOCUS. Never copy or invent IDs.",
     "If TRUSTED_FRESH_ITEM_FOCUS provenance is availability_duration_pending, it is the trusted item from an open rental-period question. A customer duration/date answer continues that availability_inquiry with itemScope=specific and a CONTEXTUAL referent; do not reinterpret it as a business fact question.",
-    "If the customer explicitly names an item in THIS message, that is CURRENT_TURN even when TRUSTED_FRESH_ITEM_FOCUS exists. Never use trusted_fresh_focus for a named current item.",
+    "If the customer explicitly names an item in THIS message, that is CURRENT_TURN even when TRUSTED_FRESH_ITEM_FOCUS exists, including names that are not in the catalog. Never use trusted_fresh_focus for a named current item.",
     "For broad or none itemScope, itemReferents must be empty. For protected/non-NEW scopes itemReferents must be empty in this slice.",
     "For NEW_TRANSACTION: browse_options requires itemScope=broad. availability_inquiry, pricing_inquiry, pricing_with_duration, booking_request, details_inquiry, and image_catalog_request require itemScope=specific. general_business_question, clarification, and unclear use the truthful specific, broad, or none scope of the turn.",
     "SOCIAL_GENERAL and UNCLEAR turn scopes require itemScope=none. For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE, preserve the truthful item scope without changing their protected ownership semantics.",
     "semanticIntent families are mutually exclusive:",
-    "pricing_inquiry: a price/rate ask without a requested-duration total.",
-    "pricing_with_duration: an explicit price/rent/cost ask for a stated duration/total.",
+    "pricing_inquiry: an explicit monetary price/rate/cost/amount/quote ask without a requested-duration total.",
+    "pricing_with_duration: an explicit monetary price/rate/cost/amount/quote ask for a stated duration/total.",
+    "Rental transaction mode or a customer's desire/need to rent an item is not itself a pricing request. The words rent/rental may describe how the customer wants the item, not a request for money. Require an explicit monetary question before choosing pricing_inquiry or pricing_with_duration.",
+    "A compound rental-availability ask (wanting/checking whether an item is available for rent, including with a stated duration) is availability_inquiry, never pricing_with_duration, unless the customer also asks an explicit monetary amount/rate/cost/quote question in the same message.",
     "availability_inquiry: an availability ask OR a weak need/want/chahiye for a specific item/date/duration when the customer is not explicitly asking price and is not giving a final book/reserve/confirm command. Asking to discover, list, or enumerate which options are available is browse_options, not availability_inquiry.",
     "booking_request: only an explicit final booking/reserve/confirm commitment. Weak need/want/chahiye is never booking_request.",
     "browse_options: broad option discovery. image_catalog_request: photos/images. details_inquiry: item/service details. general_business_question: other business facts. clarification: underspecified transaction meaning.",
     "SOCIAL_GENERAL should use semanticIntent=social. UNCLEAR should use semanticIntent=unclear.",
     "Do not emit UNCLEAR when CUSTOMER_MESSAGE contains an explicit named catalog item unless the named item is an ambiguous candidate collision. Unknown asked facts still use details_inquiry or general_business_question with that CURRENT_TURN referent.",
-    "ELLIPTICAL SAME-QUESTION ITEM SWITCH: when CUSTOMER_MESSAGE is only a bare item/service name (or a short naming phrase) with no verb, question wording, or other new request content of its own, look at RECENT_CONVERSATION. If the customer's own immediately preceding message was itself a specific-item request (e.g. availability, pricing, details), this turn continues that SAME semanticIntent, now for the freshly named item — itemReferenceMode=CURRENT_TURN for the new item (a fresh named item always wins over any trusted focus). Do not default to browse_options, clarification, unclear, or booking_request merely because this message has no verb of its own.",
+    "ELLIPTICAL SAME-QUESTION ITEM SWITCH: when CUSTOMER_MESSAGE is only a bare item/service name (or a short naming phrase) with no verb, question wording, or other new request content of its own, look at RECENT_CONVERSATION. If the customer's own immediately preceding message was itself a specific-item request (e.g. availability, pricing, details), this turn continues that SAME semanticIntent, now for the freshly named item — itemReferenceMode=CURRENT_TURN for the new item (a fresh named item always wins over any trusted focus). The newly named item does not have to appear in the catalog; still emit a current_turn referent whose surfaceText is the customer's literal name span. Do not default to browse_options, clarification, unclear, or booking_request merely because this message has no verb of its own.",
     "For PENDING_AVAILABILITY_REFERENCE and OLD_BOOKING_REFERENCE semanticIntent may be null in this shadow migration; turnScope/action/factKind remain the existing protected semantics.",
     "targetId rules:",
     "- NEW_TRANSACTION, SOCIAL_GENERAL, UNCLEAR → targetId must be null.",
@@ -4789,7 +5224,14 @@ export async function executeCloudDmOwnershipDecision({
     "startDateKind=relative_tomorrow whenever CUSTOMER_MESSAGE means tomorrow (e.g. 'kal'). startDateKind=relative_day_after_tomorrow whenever it means the day after tomorrow (e.g. 'parson'). startDate must be null for both.",
     "startDateKind=unresolved whenever CUSTOMER_MESSAGE clearly references a rental start date/day that is not tomorrow, day-after-tomorrow, or a stated day-of-month(1-31)+month pair — e.g. a weekday name ('next Friday'), 'next week', a day-of-month number outside the 1-31 range (e.g. '33333 February'), or another vague/ambiguous date expression with no identifiable day-of-month number at all. Do NOT use unresolved merely because the stated day+month does not form a real calendar date (e.g. '31 February' is still explicit_date, not unresolved) — only the deterministic layer judges real-world calendar validity, never you. Do not guess a date and do not use explicit_date/relative_tomorrow/relative_day_after_tomorrow for these. startDate must be null.",
     "startDateKind=none ONLY when the customer genuinely expresses no start-date/day reference at all: duration-only requests, or any non-availability/non-booking turn. Never use none merely because a stated date reference does not fit explicit_date/relative_tomorrow/relative_day_after_tomorrow — use unresolved instead. startDate must be null whenever startDateKind is not explicit_date.",
-    "temporalRequest is about the rental start date only. It never represents duration, an end date, or a booking's existing/confirmed dates.",
+    "requestedDuration: propose structured rental PERIOD/DURATION meaning only (how long, independent of when it starts) — never a computed day count, and never inferred from or merged with temporalRequest. You are the single duration understanding owner for this decision: resolve by meaning regardless of language, spelling, transliteration, or number word (e.g. a number word, a transliterated unit, or an unusual spelling all still resolve if the meaning is clear). A message may state a start date, a duration, both, or neither — each field reflects only what THIS message actually states for that one meaning.",
+    "requestedDuration.status=exact whenever the customer's own current request in THIS message states one single, fully-determined rental period, stated as one or more whole-number amounts in supported units (hours, days, weeks, months, years) — emit one entry per stated amount in components (e.g. an amount stated as a larger unit plus a smaller remainder is still exact: emit both amounts, each in the unit the customer actually used, and let the runtime add them — never combine or convert units yourself). If the customer revises or negates an earlier number within the same message, components must reflect only their final intended amount, not the earlier one.",
+    "requestedDuration.status=non_exact whenever the customer references some rental-period concept that is NOT one single fully-determined whole-number amount in a supported unit — including (not limited to) a vague/indefinite amount, an approximate or 'about/around' amount, a range or a set of alternative amounts, a lower-bound-only or upper-bound-only amount, an open-ended comparison, a fractional/decimal amount, a colloquial period whose length is not fixed (e.g. a weekend), or a unit that does not map to hours/days/weeks/months/years. Never resolve any of these down to one specific exact amount — components must be null.",
+    "requestedDuration.status=none whenever the customer's own current request in THIS message states no rental period at all — including when a duration word appears only in a question about policy/limits, a reference to a past/previous rental, a hypothetical or quoted example, or a period requested for someone other than the current customer. None of those are the customer's own current requested duration.",
+    "requestedDuration.evidence: when status is exact or non_exact, copy a unique literal substring of CUSTOMER_MESSAGE covering that duration as evidence.surfaceText with source=current_turn. Do not emit start or end. Runtime locates the unique substring. Copy the customer's duration wording as written (digits or number words plus unit wording). Do not convert units, do not rewrite number words as digits in the span, and do not require components[].value as Arabic digits inside the span. Never copy an unrelated unique token that does not itself state the period. Null evidence is valid only for status=none. An exact duration without that copied surfaceText is invalid — do not invent a span and do not omit evidence merely because components are already exact.",
+    "intentSwitchEvidence: set this to null for almost every turn. It exists only for the narrow case where the customer was already mid-transaction (e.g. already asked for a missing rental period) and THIS message both answers that AND separately raises something new (e.g. also asks the price) — cite the exact substring of CUSTOMER_MESSAGE showing that additional ask. A turn that simply answers what was asked (e.g. a bare duration reply) is a continuation, not a switch, even if you also classify its semanticIntent as something else — leave intentSwitchEvidence null in that case; the runtime, not this field, decides whether to honor a proposed switch. Stating a requested duration is never by itself grounds for intentSwitchEvidence.",
+    "TRUSTED_GROUP_CONTINUATION in CLOUD_DM_OWNERSHIP_CANDIDATE_JSON, when non-null, is runtime-owned frozen transaction state (activeTransactionType, activeTransactionState, expectedMissingField, trustedActiveItemId). It is not a candidate to rank. Interpret THIS customer message inside that envelope. When expectedMissingField is duration and THIS message supplies a rental period, requestedDuration must reflect that period and the turn is a continuation of the active availability transaction — not a new pricing_with_duration transaction — unless the customer independently raises a separate ask with grounded intentSwitchEvidence.",
+    "temporalRequest is about the rental start date only. It never represents duration, an end date, or a booking's existing/confirmed dates. requestedDuration is about the rental period/duration only, never a start date, end date, or booking's existing/confirmed dates.",
   ].join("\n");
 
   const userPayload = [
@@ -4846,11 +5288,13 @@ export async function executeCloudDmOwnershipDecision({
           `PREVIOUS_OUTPUT_REJECTED: ${feedbackCode.slice(0, 200)}`,
           "Return corrected ownership JSON for the SAME customer message.",
           "Do not copy trusted IDs. Do not invent IDs.",
-          "Named items in CUSTOMER_MESSAGE use source=current_turn spans with null IDs.",
+          "Named items in CUSTOMER_MESSAGE use source=current_turn spans with null IDs, including names that are not in the catalog.",
           "Contextual continuation uses source=trusted_fresh_focus with null IDs.",
           "NEW_TRANSACTION targetReference must be source=none.",
-          "UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN, NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN, and OLD_BOOKING_EXPLICIT_CURRENT_CATALOG_SPAN mean CUSTOMER_MESSAGE names a catalog item for a new informational ask: emit NEW_TRANSACTION with a current_turn span of that named item. Do not keep OLD_BOOKING_REFERENCE unless the customer refers to an existing booking's booking facts (conversation_turn historical provenance or booking_fact). Do not use trusted_fresh_focus and do not span a non-catalog phrase. Runtime will not pick the intent.",
+          "EXPLICIT_CURRENT_OVERRIDES_FRESH_FOCUS, UNCLEAR_DESPITE_KNOWN_CATALOG_SPAN, NAMED_CATALOG_SPAN_REQUIRES_CURRENT_TURN, and OLD_BOOKING_EXPLICIT_CURRENT_CATALOG_SPAN mean CUSTOMER_MESSAGE names an item in this turn: emit NEW_TRANSACTION with a current_turn span of that named item even when it is absent from the catalog. Do not keep trusted_fresh_focus / CONTEXTUAL. Do not keep OLD_BOOKING_REFERENCE unless the customer refers to an existing booking's booking facts (conversation_turn historical provenance or booking_fact). Runtime will not pick the intent.",
           "ITEM_REFERENT_SURFACE_MISMATCH means start/end must be the exact end-exclusive offsets of surfaceText in CUSTOMER_MESSAGE.",
+          "REQUESTED_DURATION_EVIDENCE_REQUIRED means an exact requested duration requires literal evidence copied from CUSTOMER_MESSAGE. Emit evidence.source=current_turn and evidence.surfaceText only. Do not emit start or end. Runtime locates the unique substring. Digits or number words in that copied wording are both valid; do not rewrite the span as digits.",
+          "REQUESTED_DURATION_EVIDENCE_UNGROUNDED means evidence.surfaceText is not a unique literal substring of CUSTOMER_MESSAGE. Copy the duration phrase exactly as written in CUSTOMER_MESSAGE.",
           "CONTEXTUAL_FRESH_FOCUS_MISSING means no trusted presented item and no unique pending owner-check request. CONTEXTUAL_PENDING_AVR_AMBIGUOUS means more than one pending owner-check could bind: do not guess; use UNCLEAR unless CUSTOMER_MESSAGE names a catalog item (then NEW_TRANSACTION current_turn).",
           surfaceMissingWithTrustedFocus
             ? "GROUP_CURRENT_ITEM_SURFACE_MISSING means a current_turn surfaceText you proposed is not a literal substring of CUSTOMER_MESSAGE. TRUSTED_FRESH_ITEM_FOCUS is present: if CUSTOMER_MESSAGE does not itself name any item, this is a contextual continuation of that trusted item -- use source=trusted_fresh_focus with surfaceText/start/end/trustedItemId/sourceTurnId all null, itemScope=specific, itemReferenceMode=CONTEXTUAL. Never span a remembered item's name as current_turn merely because you recall it from context."
@@ -4933,6 +5377,9 @@ export async function executeCloudDmOwnershipDecision({
             clean(facts?.trustedFreshItemFocus?.itemId, 160) &&
               clean(facts?.trustedFreshItemFocus?.sourceTurnId, 320)
           ),
+          allowCatalogCurrentTurnAlignment:
+            preprocessed.allowCatalogCurrentTurnAlignment === true,
+          customerMessage: userLine,
         }
       );
       if (!invariant.ok) {
@@ -4951,6 +5398,7 @@ export async function executeCloudDmOwnershipDecision({
       trustedFreshItemFocus: facts?.trustedFreshItemFocus,
       catalogItems: facts?.catalogItems,
       pendingOwnerCheckRequests: facts?.pendingOwnerCheckRequests,
+      trustedGroupContinuation: facts?.trustedGroupContinuation,
       onStructuralRejection: (details) => {
         parseRejection = details;
       },
@@ -5058,6 +5506,36 @@ export async function executeCloudDmOwnershipDecision({
             : decision.temporalRequest?.startDateKind === "relative_day_after_tomorrow"
               ? "day_after_tomorrow"
               : null,
+      },
+      // Diagnostic only, same posture as temporalRequest above -- never
+      // consumed downstream. componentsCount/units let a live occurrence be
+      // distinguished (e.g. exact single-unit vs. compound vs. non_exact)
+      // without ever logging the customer's raw message text here.
+      requestedDuration: {
+        status: decision.requestedDuration?.status ?? null,
+        componentsCount: Array.isArray(decision.requestedDuration?.components)
+          ? decision.requestedDuration.components.length
+          : 0,
+        components: Array.isArray(decision.requestedDuration?.components)
+          ? decision.requestedDuration.components.slice(0, 4).map((c) => ({
+              value: Number.isInteger(Number(c?.value)) ? Number(c.value) : null,
+              unit: String(c?.unit ?? "").trim() || null,
+            }))
+          : [],
+        units: Array.isArray(decision.requestedDuration?.components)
+          ? decision.requestedDuration.components.map((c) => c.unit)
+          : [],
+        evidenceSurfaceText: String(
+          decision.requestedDuration?.evidence?.surfaceText ?? ""
+        )
+          .trim()
+          .slice(0, 80) || null,
+        evidenceStart: Number.isInteger(decision.requestedDuration?.evidence?.start)
+          ? decision.requestedDuration.evidence.start
+          : null,
+        evidenceEnd: Number.isInteger(decision.requestedDuration?.evidence?.end)
+          ? decision.requestedDuration.evidence.end
+          : null,
       },
     });
     return {

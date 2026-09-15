@@ -12,7 +12,10 @@ const {
 } = await import("../src/brain/decisions/decidePostConfirmCustomerDm.js");
 const { understandTurn } = await import("../src/brain/understanding/UnderstandingEngine.js");
 const { resolveCanonicalItemReferents } = await import("../src/services/currentTurnAuthority.js");
-const { composeUnavailableCustomerReplyFromFacts } = await import(
+const { composeUnavailableThroughSharedGuard: composeUnavailableCustomerReplyFromFacts } = await import(
+  "./helpers/availabilityCompositionTestHarness.mjs"
+);
+const { buildUnavailableAvailabilityFailsafeReply } = await import(
   "../src/brain/workflows/AvailabilityInquiryWorkflow.js"
 );
 const { resolveBusinessTurnContext } = await import(
@@ -260,7 +263,14 @@ test("composer returns only trusted structured presentation metadata", async () 
       },
     }),
   });
-  assert.equal(rejected.reply, "");
+  // Rejecting an untrusted presented item ID no longer means silence -- the
+  // shared guarded composer always falls back to the deterministic
+  // customer-safe failsafe rather than sending nothing.
+  assert.equal(
+    rejected.reply,
+    buildUnavailableAvailabilityFailsafeReply(base.conversationalLabel, base.durationDays, base.alternatives)
+  );
+  assert.doesNotMatch(rejected.reply, /Spaceship/i);
   assert.deepEqual(rejected.presentedItemIds, []);
 });
 

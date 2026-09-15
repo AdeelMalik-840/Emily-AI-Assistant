@@ -5,6 +5,7 @@ export { buildAvailabilityInquiryActionPlan } from "./AvailabilityInquiryWorkflo
 export {
   buildBrowseOptionsActionPlan,
 } from "./BrowseOptionsWorkflow.js";
+export { buildItemNotInCatalogActionPlan } from "./ItemNotInCatalogWorkflow.js";
 export { buildUnlistedItemActionPlan } from "./UnlistedItemWorkflow.js";
 export { buildGreetingActionPlan } from "./GreetingWorkflow.js";
 export {

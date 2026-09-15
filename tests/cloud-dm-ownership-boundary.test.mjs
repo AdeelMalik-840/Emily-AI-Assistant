@@ -196,6 +196,8 @@ test("production-rich Civic same-item/new-duration is NEW_TRANSACTION with one o
     "capability",
     "evidenceNeeds",
     "temporalRequest",
+    "requestedDuration",
+    "intentSwitchEvidence",
   ]);
 });
 

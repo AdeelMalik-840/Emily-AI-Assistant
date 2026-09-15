@@ -411,9 +411,17 @@ test("9. duration ask structurally collects the rental period before availabilit
   assert.equal(composed.attemptCount, 1);
   assert.match(composed.reply, /kitne din|kin dates/i);
   const schema = captured.response_format.json_schema.schema;
-  assert.deepEqual(schema.properties.requestedInput.enum, ["rental_period", "start_date"]);
+  // requestedInput is a nullable enum (anyOf: [{enum:[...]}, {type:"null"}])
+  // so customerInputRequested=false kinds (e.g. owner_check_holding) can
+  // validly emit requestedInput=null instead of being forced into one of
+  // these two values.
+  assert.deepEqual(
+    schema.properties.requestedInput.anyOf[0].enum,
+    ["rental_period", "start_date"]
+  );
+  assert.equal(schema.properties.requestedInput.anyOf[1].type, "null");
   assert.ok(schema.required.includes("availabilityCheckStarted"));
-  assert.match(captured.messages[0].content, /before any availability check/i);
+  assert.match(captured.messages[0].content, /availability check has not started/i);
 });
 
 test("10. duration ask rejects check-started semantics and retries structurally", async () => {

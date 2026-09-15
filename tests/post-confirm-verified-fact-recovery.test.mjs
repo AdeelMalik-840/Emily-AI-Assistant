@@ -602,12 +602,12 @@ test("claim-level guard still blocks unsupported visible clocks (no weaken)", ()
     ).reason,
     "verified_booking_time_mismatch"
   );
-  assert.deepEqual(
+  assert.equal(
     validateCustomerReplyAgainstContract(
       "Pickup location abhi confirm nahi hai.",
       contract,
       semantics
-    ),
-    { ok: true }
+    ).ok,
+    true
   );
 });

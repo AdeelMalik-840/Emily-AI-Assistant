@@ -331,26 +331,26 @@ test("D: missing WhatsApp data-id defers; later stableId admits (no text ledger 
   assert.equal(admitted.admittedTurns[0].stableId, "wa::DEFERRED_NOW_STABLE");
 });
 
-test("E: missing anchor in DOM waits/rescans; restores only from last-admitted evidence", () => {
+test("E: in-range missing identity waits; does not jump to visible tail", () => {
   const admitted = mkRow({
     text: "last admitted",
     dataId: "LAST_ADM",
-    position: 10,
+    position: 0,
   });
   const fresh = mkRow({
     text: COROLLA_TEXT,
     dataId: "FRESH_E",
-    position: 11,
+    position: 1,
   });
   const sorted = [admitted, fresh];
 
   const stWait = mkFreshState({
-    acknowledgedAnchorIndex: 10,
+    acknowledgedAnchorIndex: 0,
     currentTailAnchor: {
       stableId: "wa::MISSING",
       rowKey: "gone",
       textFingerprint: "gone",
-      __position: 10,
+      __position: 0,
     },
     lastAdmittedStableId: "wa::MISSING",
   });
@@ -358,6 +358,7 @@ test("E: missing anchor in DOM waits/rescans; restores only from last-admitted e
   assert.equal(wait.forwardAllowed, false);
   assert.equal(wait.reanchored, false);
   assert.equal(wait.waitForRescan, true);
+  assert.equal(wait.restoredFromWindowShift, false);
   assert.notEqual(stWait.acknowledgedAnchorIndex, sorted.length - 1);
 
   const stRestore = mkFreshState({
@@ -375,6 +376,150 @@ test("E: missing anchor in DOM waits/rescans; restores only from last-admitted e
   assert.equal(restored.reanchored, false);
   assert.equal(stRestore.acknowledgedAnchorIndex, 0);
   assert.equal(stRestore.currentTailAnchor?.stableId, "wa::LAST_ADM");
+});
+
+test("E2: startup anchor disappearance before any admission restores from visible baseline identity and admits both fresh rows", () => {
+  const baselineRow = mkRow({
+    text: "startup history",
+    dataId: "STARTUP_BASELINE",
+    position: 0,
+  });
+  const freshA = mkRow({
+    text: "Corolla available hai?",
+    dataId: "FRESH_A",
+    position: 1,
+  });
+  const freshB = mkRow({
+    text: "Corolla available hai????",
+    dataId: "FRESH_B",
+    position: 2,
+  });
+  const sorted = [baselineRow, freshA, freshB];
+  const st = mkFreshState({
+    acknowledgedAnchorIndex: 12,
+    currentTailAnchor: {
+      stableId: "wa::VIRTUALIZED_STARTUP_TAIL",
+      rowKey: "gone",
+      textFingerprint: "gone",
+      __position: 12,
+    },
+    lastAdmittedStableId: null,
+    baselineSeenStableIds: new Set(["wa::STARTUP_BASELINE"]),
+  });
+
+  const restored = __freshDeltaAnchorMissingForTests(sorted, st, CHAT);
+  assert.equal(restored.waitForRescan, false);
+  assert.equal(restored.restoredFromBaseline, true);
+  assert.equal(st.currentTailAnchor?.stableId, "wa::STARTUP_BASELINE");
+  assert.equal(st.acknowledgedAnchorIndex, 0);
+
+  const admitted = resolveFreshAdmittedTurns({
+    userMessages: sorted,
+    freshState: st,
+    chatKey: CHAT,
+    extractedList: sorted,
+    acknowledgedAnchorIndex: 0,
+    resolvedAnchorIndex: 0,
+  });
+  assert.deepEqual(
+    admitted.admittedTurns.map((turn) => turn.stableId),
+    ["wa::FRESH_A", "wa::FRESH_B"]
+  );
+});
+
+test("E3: impossible bookmark window-shift admits unknown live rows without treating tail as already read", () => {
+  const liveA = mkRow({
+    text: "Stonic rent p chyh th kal se",
+    dataId: "LIVE_A",
+    position: 0,
+  });
+  const liveB = mkRow({
+    text: "Civic available hai?",
+    dataId: "LIVE_B",
+    position: 1,
+  });
+  const sorted = [liveA, liveB];
+  const st = mkFreshState({
+    acknowledgedAnchorIndex: 15,
+    currentTailAnchor: {
+      stableId: "wa::VANISHED_TAIL",
+      rowKey: "gone",
+      textFingerprint: "gone",
+      __position: 15,
+    },
+    lastAdmittedStableId: null,
+    baselineSeenStableIds: new Set(["wa::OLD_BASELINE_NOT_IN_WINDOW"]),
+  });
+
+  const shifted = __freshDeltaAnchorMissingForTests(sorted, st, CHAT);
+  assert.equal(shifted.waitForRescan, false);
+  assert.equal(shifted.restoredFromWindowShift, true);
+  assert.equal(shifted.forwardAllowed, true);
+  assert.equal(st.acknowledgedAnchorIndex, -1);
+  assert.notEqual(st.acknowledgedAnchorIndex, sorted.length - 1);
+
+  const admitted = resolveFreshAdmittedTurns({
+    userMessages: sorted,
+    freshState: st,
+    chatKey: CHAT,
+    extractedList: sorted,
+    acknowledgedAnchorIndex: st.acknowledgedAnchorIndex,
+    resolvedAnchorIndex: 0,
+  });
+  assert.deepEqual(
+    admitted.admittedTurns.map((turn) => turn.stableId),
+    ["wa::LIVE_A", "wa::LIVE_B"]
+  );
+});
+
+test("E4: window-shift parks on ledger history and only admits unknown rows after it", () => {
+  const history = mkRow({
+    text: "old processed",
+    dataId: "HIST_DONE",
+    position: 0,
+  });
+  const live = mkRow({
+    text: "Civic available hai?",
+    dataId: "LIVE_AFTER",
+    position: 1,
+  });
+  const sorted = [history, live];
+  const historyId = buildStableMessageKey(history, sorted).id;
+  markInboundTurnLedgerDone({
+    chatKey: CHAT,
+    stableId: historyId,
+    textPreview: history.text,
+  });
+  const st = mkFreshState({
+    acknowledgedAnchorIndex: 20,
+    currentTailAnchor: {
+      stableId: "wa::GONE",
+      rowKey: "gone",
+      textFingerprint: "gone",
+      __position: 20,
+    },
+    lastAdmittedStableId: null,
+    baselineSeenStableIds: new Set(["wa::UNRELATED"]),
+  });
+
+  const shifted = __freshDeltaAnchorMissingForTests(sorted, st, CHAT);
+  assert.equal(shifted.waitForRescan, false);
+  assert.equal(shifted.restoredFromWindowShift, true);
+  assert.equal(st.acknowledgedAnchorIndex, 0);
+  assert.equal(st.currentTailAnchor?.stableId, historyId);
+
+  const admitted = resolveFreshAdmittedTurns({
+    userMessages: sorted,
+    freshState: st,
+    chatKey: CHAT,
+    extractedList: sorted,
+    acknowledgedAnchorIndex: 0,
+    resolvedAnchorIndex: 0,
+  });
+  assert.deepEqual(
+    admitted.admittedTurns.map((turn) => turn.stableId),
+    ["wa::LIVE_AFTER"]
+  );
 });
 
 test("F: ledger_done / already_answered / processing still block same stableId", () => {

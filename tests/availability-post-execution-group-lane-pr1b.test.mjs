@@ -664,10 +664,11 @@ test("fresh_conflict_suppress disposition → fail closed", async () => {
 });
 
 // ═══════════════════════════════════════════
-// Brain returns silent action
+// Brain returns silent action while trusted runtime requires a reply
 // ═══════════════════════════════════════════
 
-test("Brain returns silence action — empty reply, no throw", async () => {
+test("Brain returns silence action for a required reply — bounded correction fails closed", async () => {
+  let calls = 0;
   const result = await executeGroupPostExecuteLaneDecision({
     turnContext: {
       messageText: "Theek hai",
@@ -676,10 +677,16 @@ test("Brain returns silence action — empty reply, no throw", async () => {
       responseDisposition: "owner_check_created",
       actionsAllowed: false,
     },
-    __chatCompletionsCreateForTests: makeStubBrain("", "silence"),
+    __chatCompletionsCreateForTests: async (...args) => {
+      calls += 1;
+      return makeStubBrain("", "silence")(...args);
+    },
   });
 
-  assert.strictEqual(result.ok, true);
+  assert.strictEqual(calls, 2);
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.source, "content_safety_fail_closed");
+  assert.strictEqual(result.reason, "customer_reply_required_but_empty");
   assert.strictEqual(result.decision.action, "silence");
   assert.strictEqual(result.decision.customerReply, "");
   assert.strictEqual(result.decision.shouldReply, false);
@@ -781,8 +788,20 @@ test("no-hardcoding audit — brainV2LivePipeline post-execute integration has n
   const pipelineSection = src.slice(src.indexOf("awaitsPostExecuteBrainReply"));
   assert.doesNotMatch(pipelineSection, /mai confirm kar leta hun/i);
   assert.doesNotMatch(pipelineSection, /Book kar du\?/i);
-  // Must delegate to decideCustomerTurn, not openai directly
-  assert.ok(pipelineSection.includes("decideCustomerTurn"), "delegates to Brain");
+  // Generation-simplification Stage 4: the Group holding reply now
+  // delegates to the SAME shared composer Cloud DM's owner_check_holding
+  // path already uses (composeCloudCanonicalCustomerReply), instead of a
+  // second, separate lane/schema (decideCustomerTurn/groupPostExecuteLane's
+  // own OpenAI call -- retained in groupPostExecuteLane.js, unreferenced,
+  // for rollback, but no longer this integration point's call path).
+  assert.ok(
+    pipelineSection.includes("composeCloudCanonicalCustomerReply"),
+    "delegates to the shared composer"
+  );
+  assert.ok(
+    pipelineSection.includes("deriveGroupPostExecuteCustomerReplyRequired"),
+    "reply-required authority stays deterministic, computed before any model call"
+  );
   assert.doesNotMatch(pipelineSection, /chat\.completions\.create/i);
   assert.doesNotMatch(pipelineSection, /new OpenAI/i);
 });

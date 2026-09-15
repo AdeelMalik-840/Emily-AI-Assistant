@@ -292,6 +292,12 @@ function makeInboundRow({ messageId, text = "Corolla" }) {
   };
 }
 
+// Stage 4 (generation-simplification): the Group holding reply now routes
+// through the same shared composer Cloud DM uses
+// (composeCloudCanonicalCustomerReply, kind=owner_check_holding), not a
+// separate lane/schema -- this stub's shape matches that composer's real
+// response contract (customerReply + replySemantics) instead of the old
+// lane's retired action/shouldReply schema.
 function makeGroupBrainStub(replyText, callLog) {
   return async (args) => {
     callLog.push(args);
@@ -301,11 +307,30 @@ function makeGroupBrainStub(replyText, callLog) {
           message: {
             content: JSON.stringify({
               customerReply: replyText,
-              action: "reply",
-              shouldReply: true,
-              confidence: 0.94,
-              safetyNotes: null,
-              reason: "test_post_execute_reply",
+              // owner_check_holding requires customerInputRequested=false with
+              // requestedInput=null on the FIRST completion to satisfy the
+              // structured no-input contract (RESPONSE_CONTRACT_NO_INPUT_NULLABILITY_GAP
+              // fix), availabilityCheckStarted=true (the request IS already
+              // being progressed), and resource_availability_unconfirmed in
+              // claims (positive objective-fidelity requirement) -- a real
+              // compliant model response always includes all of these.
+              customerInputRequested: false,
+              requestedInput: null,
+              availabilityCheckStarted: true,
+              responseAct: "INFORM_AVAILABILITY_CHECK_STARTED",
+              utteranceFunction: "inform_status",
+              surfaceContract: {
+                personaActor: "EMILY",
+                agencyActor: "EMILY",
+                firstPersonSelfReference: "feminine",
+                timingReference: "none",
+              },
+              replySemantics: {
+                claims: ["resource_availability_unconfirmed"],
+                languageStyle: "roman_urdu",
+                containsTimingPromise: false,
+                exposesInternalProcess: false,
+              },
             }),
           },
         },
@@ -409,8 +434,12 @@ async function runPostExecutePipeline({
         return { ok: true, providerMessageId: `owner-${sourceMessageId}` };
       },
       getBookingsForItemFn,
-      __groupPostExecuteChatCreate: makeGroupBrainStub(brainReply, brainCalls),
     },
+    // Top-level, not nested under executionContext -- this is the same
+    // __cloudComposeChatCreate hook composeCloudCanonicalCustomerReply
+    // already reads for Cloud DM's owner_check_holding path (Stage 4 routes
+    // Group through the identical composer call).
+    __cloudComposeChatCreate: makeGroupBrainStub(brainReply, brainCalls),
     getBookingsForItemFn,
     __testOrchestratorFn: () => ({
       workflowDecision: { workflowType: "availability_inquiry", reason: "test_pr1b" },

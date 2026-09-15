@@ -42,6 +42,7 @@ process.env.FIREBASE_KEY = JSON.stringify({
 const {
   executeWhatsAppAiPipeline,
   __clearWhatsAppInboundBufferForTests,
+  tryBrainV2LiveBeforeLegacy,
 } = await import("../src/services/whatsappInboundBuffer.js");
 const { peekEmilySessionState } = await import(
   "../src/services/conversationIntelligence.js"
@@ -107,6 +108,23 @@ function groupPayload(participantKey, overrides = {}) {
     catalogItems: CATALOG,
     messageSender: "user",
     __sendOutboundMessageFn: async () => ({ ok: true, providerMessageId: "test-msg" }),
+    __tryBrainV2LiveBeforeLegacyFn: async (params) =>
+      tryBrainV2LiveBeforeLegacy({
+        ...params,
+        __cloudComposeChatCreate: async () =>
+          completionOf(JSON.stringify({
+            customerReply: "Corolla ke liye duration ya dates bata dein.",
+            customerInputRequested: true,
+            requestedInput: "rental_period",
+            availabilityCheckStarted: false,
+            replySemantics: {
+              claims: [],
+              languageStyle: "roman_urdu",
+              containsTimingPromise: false,
+              exposesInternalProcess: false,
+            },
+          })),
+      }),
     getBookingsForItemFn: async () => [],
     getBusinessProfileFn: async () => ({}),
     ...overrides,
@@ -301,21 +319,20 @@ test("production-path: retry correction feedback now tells the model to use trus
   );
   assert.notEqual(
     sink.reply,
-    "Sorry, system abhi update ho raha hai. Please thori dair baad try kar dein.",
+    "Maazrat, abhi aapki request complete nahi ho saki. Please thori dair baad dobara try karein.",
     "must not fall back to the technical-recovery canned reply once the model self-corrects"
   );
   // Recovering Corolla through the trusted pending item re-enters the same
-  // ask-duration branch (a fresh pending record for THIS turn) -- proving
-  // the continuation actually bound to the remembered item, not just that
-  // some reply was sent.
+  // ask-duration workflow while preserving the existing trusted pending
+  // provenance instead of pretending Emily never asked.
   assert.equal(
     peekEmilySessionState(key)?.emilyPending?.itemId,
     "toyota_corolla_metallic_grey_0e2cd610"
   );
   assert.equal(
     peekEmilySessionState(key)?.emilyPending?.sourceTurnKey,
-    "retry correction group::wa::CORRECTS-2",
-    "the pending record must now be sourced from turn 2, proving the recovered focus actually drove this turn's workflow"
+    "retry correction group::wa::CORRECTS-1",
+    "the already-waiting continuation must preserve the original pending provenance"
   );
 });
 
@@ -368,12 +385,12 @@ test("production-path: contextual referent with copied trusted IDs is canonicali
   assert.notEqual(sink.messageMeta?.groupCanonicalSemanticFailure, true);
   assert.notEqual(
     sink.reply,
-    "Sorry, system abhi update ho raha hai. Please thori dair baad try kar dein."
+    "Maazrat, abhi aapki request complete nahi ho saki. Please thori dair baad dobara try karein."
   );
   assert.equal(peekEmilySessionState(key)?.emilyPending?.itemId, trustedItemId);
   assert.equal(
     peekEmilySessionState(key)?.emilyPending?.sourceTurnKey,
-    "retry correction group::wa::CONTEXTUAL-ID-2",
+    "retry correction group::wa::CONTEXTUAL-ID-1",
     "accepted contextual output must be runtime-bound to the pending Corolla focus"
   );
 });
@@ -428,12 +445,12 @@ test("production-path: valid contextual meaning survives arbitrary model target/
   assert.notEqual(sink.messageMeta?.groupCanonicalSemanticFailure, true);
   assert.notEqual(
     sink.reply,
-    "Sorry, system abhi update ho raha hai. Please thori dair baad try kar dein."
+    "Maazrat, abhi aapki request complete nahi ho saki. Please thori dair baad dobara try karein."
   );
   assert.equal(peekEmilySessionState(key)?.emilyPending?.itemId, trustedItemId);
   assert.equal(
     peekEmilySessionState(key)?.emilyPending?.sourceTurnKey,
-    "retry correction group::wa::CONTEXTUAL-ARBITRARY-2",
+    "retry correction group::wa::CONTEXTUAL-ARBITRARY-1",
     "invented item, target, booking, and source-turn IDs must not influence the runtime-bound continuation"
   );
 });

@@ -21,7 +21,7 @@ test.after(() => {
   else process.env.PLAYWRIGHT_OWNER_USER_ID = previousOwner;
 });
 
-async function captureGroupPayload(overrides = {}) {
+async function tryCaptureGroupPayload(overrides = {}) {
   let captured = null;
   const ok = await forwardPlaywrightGroupToPipeline({
     text: "Civic available?",
@@ -40,6 +40,11 @@ async function captureGroupPayload(overrides = {}) {
     },
     ...overrides,
   });
+  return { ok, captured };
+}
+
+async function captureGroupPayload(overrides = {}) {
+  const { ok, captured } = await tryCaptureGroupPayload(overrides);
   assert.equal(ok, true);
   assert.ok(captured);
   return captured;
@@ -94,29 +99,33 @@ test("different group participants never share final participant memory", async 
   assert.notEqual(userA.conversationCustomerNumber, userB.conversationCustomerNumber);
 });
 
-test("missing sender scope does not preserve first-seen keys; name-only rows stay unresolved", async () => {
-  const first = await captureGroupPayload({
+test("transient missing sender scope stays provisional and creates no durable identity", async () => {
+  const first = await tryCaptureGroupPayload({
     messageId: "unresolved-1",
     sourceRowKey: "unresolved-row-1",
     senderAnchor: "",
     participantKey: "adeel::first-seen-1",
     senderName: "Adeel",
   });
-  const second = await captureGroupPayload({
-    messageId: "unresolved-2",
-    sourceRowKey: "unresolved-row-2",
-    sourceMessageIndex: 2,
-    senderAnchor: "",
+  assert.equal(first.ok, false);
+  assert.equal(first.captured, null);
+
+  const resolved = await captureGroupPayload({
+    messageId: "resolved-after-transient-failure",
+    sourceRowKey: "resolved-row",
+    senderAnchor: "participant:923001112233@c.us",
     participantKey: "adeel::first-seen-1",
     senderName: "Adeel",
   });
-
-  assert.equal(first.participantKey, "");
-  assert.equal(second.participantKey, "");
-  assert.match(first.sessionKey, /::participant::unresolved::/);
-  assert.match(second.sessionKey, /::participant::unresolved::/);
-  assert.notEqual(first.sessionKey, second.sessionKey);
-  assert.notEqual(first.conversationCustomerNumber, second.conversationCustomerNumber);
+  const next = await captureGroupPayload({
+    messageId: "resolved-next",
+    sourceRowKey: "resolved-next-row",
+    sourceMessageIndex: 2,
+    senderAnchor: "participant:923001112233@c.us",
+    senderName: "Adeel renamed",
+  });
+  assert.equal(resolved.sessionKey, next.sessionKey);
+  assert.equal(resolved.conversationCustomerNumber, next.conversationCustomerNumber);
 });
 
 test("name-only row cannot inherit another participant's pending item memory", async () => {
@@ -130,18 +139,15 @@ test("name-only row cannot inherit another participant's pending item memory", a
     lastItem: { id: civic.itemId, name: civic.itemLabel },
     pendingAvailabilitySelectionIndex: 1,
   });
-  const nameOnly = await captureGroupPayload({
+  const nameOnly = await tryCaptureGroupPayload({
     messageId: "name-only-follow",
     sourceRowKey: "name-only-follow-row",
     sourceMessageIndex: 2,
     senderAnchor: "",
     senderName: "Adeel k",
   });
-  assert.notEqual(nameOnly.sessionKey, identified.sessionKey);
-  assert.match(nameOnly.sessionKey, /::participant::unresolved::/);
-  const nameOnlyState = getEmilySessionState(nameOnly.sessionKey);
-  assert.equal(Boolean(nameOnlyState?.lastItem), false);
-  assert.equal(Boolean(nameOnlyState?.pendingAvailabilitySelectionIndex), false);
+  assert.equal(nameOnly.ok, false);
+  assert.equal(nameOnly.captured, null);
   const identifiedState = getEmilySessionState(identified.sessionKey);
   assert.equal(identifiedState?.lastItem?.id, civic.itemId);
 });

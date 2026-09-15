@@ -498,7 +498,8 @@ test("8. Group unchanged", () => {
   );
   assert.doesNotMatch(groupLane, /conversationHistoryFieldsForOutbound/);
   assert.doesNotMatch(groupLane, /excludeFromSemanticHistory/);
-  assert.match(pipeline, /lane: GROUP_POST_EXECUTE_LANE/);
+  assert.match(pipeline, /deriveGroupPostExecuteCustomerReplyRequired/);
+  assert.doesNotMatch(pipeline, /lane: GROUP_POST_EXECUTE_LANE/);
   const ownership = readFileSync(
     join(ROOT, "../src/brain/contracts/cloudCanonicalSemantic.js"),
     "utf8"

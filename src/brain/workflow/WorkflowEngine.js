@@ -59,9 +59,13 @@ export function hasOpenCollectDurationPending(turnContext) {
 
 /**
  * @param {TurnContext} turnContext
+ * @param {Record<string, unknown> | null | undefined} [resolvedBusinessTurnContext]
  * @returns {boolean}
  */
-export function hasOpenAvailabilityDurationPending(turnContext) {
+export function hasOpenAvailabilityDurationPending(
+  turnContext,
+  resolvedBusinessTurnContext = null
+) {
   if (turnContext?.activeWorkflowType === PENDING_ACTION_COLLECT_AVAILABILITY_DURATION) {
     return true;
   }
@@ -71,6 +75,20 @@ export function hasOpenAvailabilityDurationPending(turnContext) {
       : null;
   const emilyPending = readEmilyPendingFromMemory(memory);
   if (emilyPending?.pendingStage === EMILY_PENDING_STAGE_AVAILABILITY_DURATION) {
+    // Group canonical: a NEED_DURATION pending for item A must not force
+    // availability continuation / block pricing when THIS turn already
+    // resolved a different item B. Same-item pending is unchanged.
+    if (resolvedBusinessTurnContext?.validatedGroupCanonicalAuthority === true) {
+      const pendingId = String(emilyPending.itemId ?? "").trim();
+      const resolvedId = String(
+        resolvedBusinessTurnContext?.decision?.resolvedItemId ??
+          resolvedBusinessTurnContext?.resolvedItem?.id ??
+          ""
+      ).trim();
+      if (pendingId && resolvedId && pendingId !== resolvedId) {
+        return false;
+      }
+    }
     return true;
   }
   return isAvailabilityDurationPendingAction(readMemoryPendingAction(turnContext));
@@ -86,6 +104,26 @@ function isPricingWithDurationInterrupt(understanding) {
   if (understanding.askedField === "price_with_duration") return true;
   if (signals.priceAsk && understanding.durationDays != null) return true;
   return false;
+}
+
+/**
+ * Canonical transaction authority gate (Group only): a stochastic semantic
+ * label (askedField/signals.priceAsk above) is only a proposal. When
+ * resolvedBusinessTurnContext reports an active, trusted Group transaction
+ * for this same item (groupTransactionIntentSwitch.activeTransaction), that
+ * proposal may only be honored if the model also cited a real, grounded
+ * current-turn span for it (groupTransactionIntentSwitch.accepted). Turns
+ * with no active matching transaction to protect, and every non-Group /
+ * legacy caller (no resolvedBusinessTurnContext.validatedGroupCanonicalAuthority),
+ * are completely unaffected -- this never changes behavior for anything
+ * that isn't the exact live-proven failure mode it targets.
+ * @param {Record<string, unknown> | null | undefined} resolvedBusinessTurnContext
+ * @returns {boolean}
+ */
+function isPricingWithDurationInterruptGroundedForActiveTransaction(resolvedBusinessTurnContext) {
+  if (resolvedBusinessTurnContext?.validatedGroupCanonicalAuthority !== true) return true;
+  const intentSwitch = resolvedBusinessTurnContext?.groupTransactionIntentSwitch;
+  return intentSwitch?.accepted !== false;
 }
 
 /**
@@ -137,6 +175,32 @@ function isExplicitBookingRequest(understanding, message) {
 }
 
 /**
+ * Validated Group V2: resolveBusinessDecision.workflowType is final.
+ * Never inspect understanding/message — regex pricing/availability/booking
+ * arbitration must not run on this path.
+ *
+ * @param {Record<string, unknown> | null | undefined} resolvedBusinessTurnContext
+ * @returns {WorkflowDecision | null}
+ */
+export function canonicalGroupWorkflowFromResolvedContext(
+  resolvedBusinessTurnContext
+) {
+  if (resolvedBusinessTurnContext?.validatedGroupCanonicalAuthority !== true) {
+    return null;
+  }
+  const workflowType = String(
+    resolvedBusinessTurnContext?.decision?.workflowType ?? ""
+  ).trim();
+  return {
+    workflowType: workflowType || "clarification",
+    reason: workflowType
+      ? "validated_group_canonical_turn_decision"
+      : "validated_group_missing_workflow_type",
+    priority: 100,
+  };
+}
+
+/**
  * @param {{
  *   understanding: TurnUnderstanding,
  *   turnContext: TurnContext,
@@ -146,6 +210,10 @@ function isExplicitBookingRequest(understanding, message) {
  * @returns {WorkflowDecision}
  */
 export function selectWorkflow({ understanding, turnContext, message = "", resolvedBusinessTurnContext = null }) {
+  const canonicalGroupWorkflow = canonicalGroupWorkflowFromResolvedContext(
+    resolvedBusinessTurnContext
+  );
+  if (canonicalGroupWorkflow) return canonicalGroupWorkflow;
   const inboundText = String(message ?? "").trim();
   const normalized = normalizeText(inboundText);
   const decision =
@@ -186,10 +254,13 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
   }
 
   if (
-    hasOpenAvailabilityDurationPending(turnContext) &&
+    hasOpenAvailabilityDurationPending(turnContext, resolvedBusinessTurnContext) &&
     (!canonicalSemanticAuthorityActive || decisionWorkflowType === "availability_inquiry")
   ) {
-    if (isPricingWithDurationInterrupt(understanding)) {
+    if (
+      isPricingWithDurationInterrupt(understanding) &&
+      isPricingWithDurationInterruptGroundedForActiveTransaction(resolvedBusinessTurnContext)
+    ) {
       return {
         workflowType: "pricing_with_duration",
         reason: "explicit_rent_question_interrupts_availability_duration_pending",
@@ -212,12 +283,33 @@ export function selectWorkflow({ understanding, turnContext, message = "", resol
     // Pending availability duration beats a booking decision from weak/signal shortcuts.
     const bookingBlockedByAvailabilityDuration =
       decisionWorkflowType === "booking_request" &&
-      hasOpenAvailabilityDurationPending(turnContext);
-    if (!bookingBlockedByAvailabilityDuration) {
+      hasOpenAvailabilityDurationPending(turnContext, resolvedBusinessTurnContext);
+    // Canonical transaction authority: this is the exact live-proven bypass --
+    // a fresh model classification of pricing_with_duration was trusted here
+    // unconditionally, silently overriding an active, trusted Group
+    // NEED_DURATION transaction for the same item (e.g. a bare "9 din"
+    // duration reply sampled as pricing_with_duration). It may now only win
+    // when the model also cited a real, grounded current-turn span for the
+    // switch (groupTransactionIntentSwitch.accepted, computed in
+    // resolveBusinessTurnContext.js) -- every non-Group / legacy caller, and
+    // every turn with no active matching transaction, is unaffected.
+    const pricingBlockedByUngroundedActiveTransaction =
+      decisionWorkflowType === "pricing_with_duration" &&
+      hasOpenAvailabilityDurationPending(turnContext, resolvedBusinessTurnContext) &&
+      !isPricingWithDurationInterruptGroundedForActiveTransaction(resolvedBusinessTurnContext);
+    if (!bookingBlockedByAvailabilityDuration && !pricingBlockedByUngroundedActiveTransaction) {
       return {
         workflowType: decisionWorkflowType,
         reason: String(decision?.reason ?? "resolved_business_turn_context_decision"),
         priority: 100,
+      };
+    }
+    if (pricingBlockedByUngroundedActiveTransaction) {
+      return {
+        workflowType: "availability_inquiry",
+        reason: "canonical_transaction_retained_over_ungrounded_pricing_intent",
+        interruptsPendingWorkflow: false,
+        priority: 89,
       };
     }
   }
