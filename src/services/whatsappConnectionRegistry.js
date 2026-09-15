@@ -19,6 +19,10 @@ export const DM_CONNECTION_STATUSES = new Set([
   "degraded",
 ]);
 
+export const MAX_ALLOWED_GROUP_TITLES = 32;
+export const MAX_GROUP_TITLE_LENGTH = 120;
+export const GROUP_SCOPE_NOT_CONFIGURED = "GROUP_SCOPE_NOT_CONFIGURED";
+
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
@@ -30,6 +34,43 @@ export function requireBusinessId(value) {
     throw new Error("INVALID_BUSINESS_ID");
   }
   return businessId;
+}
+
+/**
+ * Server-authoritative WhatsApp group titles for a tenant listen worker.
+ * Rejects commas so child env round-trip (PLAYWRIGHT_GROUPS) stays unambiguous.
+ */
+export function normalizeAllowedGroupTitles(input) {
+  if (input == null) return [];
+  const list = Array.isArray(input) ? input : [input];
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const title = String(raw ?? "").trim();
+    if (!title) continue;
+    if (title.includes(",") || title.length > MAX_GROUP_TITLE_LENGTH) {
+      throw new Error("INVALID_GROUP_TITLE");
+    }
+    const key = title.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(title);
+    if (out.length > MAX_ALLOWED_GROUP_TITLES) throw new Error("INVALID_GROUP_TITLE_COUNT");
+  }
+  return out;
+}
+
+/** Empty when missing, invalid, or not configured — callers must fail closed. */
+export function configuredAllowedGroupTitles(connection) {
+  try {
+    return normalizeAllowedGroupTitles(connection?.group?.allowedGroupTitles);
+  } catch {
+    return [];
+  }
+}
+
+export function hasConfiguredGroupScope(connection) {
+  return configuredAllowedGroupTitles(connection).length > 0;
 }
 
 export function deriveWhatsAppOverallStatus(connection = {}) {
@@ -118,15 +159,47 @@ export async function updateGroupConnection(db, businessId, patch = {}) {
     if (!snap.exists) throw new Error("CONNECTION_NOT_FOUND");
     const current = snap.data() || {};
     if (clean(current.businessId) !== uid) throw new Error("CONNECTION_IDENTITY_MISMATCH");
+    const statusPatch = { ...patch };
+    delete statusPatch.status;
+    delete statusPatch.allowedGroupTitles;
     const group = {
       ...(current.group || {}),
-      ...patch,
+      ...statusPatch,
       transport: "playwright",
       status,
     };
+    if (Object.prototype.hasOwnProperty.call(current.group || {}, "allowedGroupTitles")) {
+      group.allowedGroupTitles = current.group.allowedGroupTitles;
+    } else {
+      delete group.allowedGroupTitles;
+    }
     const overallStatus = deriveWhatsAppOverallStatus({ ...current, group });
     tx.set(ref, { group, overallStatus, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
     return { ...current, group, overallStatus };
+  });
+}
+
+export async function updateGroupAllowedTitles(db, businessId, titles, { overwrite = true } = {}) {
+  const uid = requireBusinessId(businessId);
+  const normalized = normalizeAllowedGroupTitles(titles);
+  if (!normalized.length) throw new Error(GROUP_SCOPE_NOT_CONFIGURED);
+  const ref = db.collection(WHATSAPP_CONNECTIONS_COLLECTION).doc(uid);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new Error("CONNECTION_NOT_FOUND");
+    const current = snap.data() || {};
+    if (clean(current.businessId) !== uid) throw new Error("CONNECTION_IDENTITY_MISMATCH");
+    const existing = configuredAllowedGroupTitles(current);
+    if (!overwrite && existing.length) {
+      return { ...current, alreadyApplied: true };
+    }
+    const group = {
+      ...(current.group || {}),
+      transport: "playwright",
+      allowedGroupTitles: normalized,
+    };
+    tx.set(ref, { group, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    return { ...current, group, overallStatus: deriveWhatsAppOverallStatus({ ...current, group }), alreadyApplied: false };
   });
 }
 

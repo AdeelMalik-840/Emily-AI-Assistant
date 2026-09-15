@@ -4,7 +4,19 @@ import { fileURLToPath } from "node:url";
 import admin from "firebase-admin";
 import { cancelOwnedLinkAttempt, createLinkAttempt, getOwnedLinkAttempt, sanitizeLinkAttempt, WHATSAPP_LINK_ATTEMPTS_COLLECTION } from "./whatsappLinkAttemptService.js";
 import { ensurePlaywrightStorageDirectory, playwrightWorkerPathEnv, resolvePlaywrightStoragePaths } from "./playwrightStoragePaths.js";
-import { requireBusinessId, updateGroupConnection } from "./whatsappConnectionRegistry.js";
+import {
+  configuredAllowedGroupTitles,
+  getWhatsAppConnection,
+  GROUP_SCOPE_NOT_CONFIGURED,
+  requireBusinessId,
+  updateGroupConnection,
+} from "./whatsappConnectionRegistry.js";
+
+const INHERITED_GROUP_SCOPE_ENV_KEYS = [
+  "PLAYWRIGHT_GROUP_NAME",
+  "PLAYWRIGHT_GROUPS",
+  "PLAYWRIGHT_ALLOWED_CHAT_TITLES",
+];
 
 const FieldValue = admin.firestore.FieldValue;
 const WORKER_ENTRY = fileURLToPath(new URL("../workers/playwrightBusinessWorker.js", import.meta.url));
@@ -17,7 +29,16 @@ function curatedEnv(source = process.env) {
   delete out.LEGACY_BUSINESS_FIREBASE_UID;
   delete out.WHATSAPP_GROUP_FALLBACK_OWNER_UID;
   delete out.WHATSAPP_ACCESS_TOKEN;
+  for (const key of INHERITED_GROUP_SCOPE_ENV_KEYS) delete out[key];
   return out;
+}
+
+function tenantGroupScopeEnv(titles) {
+  const joined = titles.join(",");
+  return {
+    PLAYWRIGHT_GROUPS: joined,
+    PLAYWRIGHT_ALLOWED_CHAT_TITLES: joined,
+  };
 }
 
 export class PlaywrightWorkerManager {
@@ -45,9 +66,30 @@ export class PlaywrightWorkerManager {
     return sanitizeLinkAttempt({ ...attempt, status: "preparing", attemptId: attempt.attemptId });
   }
 
+  async #markGroupScopeNotConfigured(businessId) {
+    await updateGroupConnection(this.db, businessId, {
+      status: "degraded",
+      lastErrorCode: GROUP_SCOPE_NOT_CONFIGURED,
+      reconnectRequired: false,
+    }).catch(() => {});
+  }
+
+  async #resolveListenGroupTitles(businessId) {
+    const connection = await getWhatsAppConnection(this.db, businessId);
+    return configuredAllowedGroupTitles(connection);
+  }
+
   async #start(businessId, purpose, attempt = null, restartCount = 0) {
     const existing = this.workers.get(businessId);
     if (existing?.child && !existing.exited) throw new Error("WORKER_ALREADY_RUNNING");
+    let listenTitles = [];
+    if (purpose === "listen") {
+      listenTitles = await this.#resolveListenGroupTitles(businessId);
+      if (!listenTitles.length) {
+        await this.#markGroupScopeNotConfigured(businessId);
+        throw new Error(GROUP_SCOPE_NOT_CONFIGURED);
+      }
+    }
     const paths = ensurePlaywrightStorageDirectory(resolvePlaywrightStoragePaths(businessId, { root: this.storageRoot }));
     const generation = attempt?.workerGeneration || crypto.randomUUID();
     const env = {
@@ -58,6 +100,7 @@ export class PlaywrightWorkerManager {
       PLAYWRIGHT_WORKER_PURPOSE: purpose,
       PLAYWRIGHT_STRICT_BUSINESS_WORKER: "true",
       PLAYWRIGHT_ENABLED: "true",
+      ...(purpose === "listen" ? tenantGroupScopeEnv(listenTitles) : {}),
       ...(attempt ? { PLAYWRIGHT_LINK_PHONE_E164: attempt.requestedPhoneE164 } : {}),
     };
     const child = this.childFactory(WORKER_ENTRY, [], { cwd: process.cwd(), env, stdio: ["ignore", "inherit", "inherit", "ipc"], shell: false });
@@ -83,7 +126,20 @@ export class PlaywrightWorkerManager {
       runtime.linked = true;
       this.linkCodes.delete(runtime.attemptId);
       await this.db.collection(WHATSAPP_LINK_ATTEMPTS_COLLECTION).doc(runtime.attemptId).set({ status: "connected", completedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
-      await updateGroupConnection(this.db, businessId, { status: "connected", sessionId: runtime.generation, storageKey: runtime.paths.storageKey, activeLinkAttemptId: null, connectedAt: FieldValue.serverTimestamp(), lastHealthyAt: FieldValue.serverTimestamp(), reconnectRequired: false, lastErrorCode: null });
+      const titles = await this.#resolveListenGroupTitles(businessId);
+      if (!titles.length) {
+        await updateGroupConnection(this.db, businessId, {
+          status: "degraded",
+          sessionId: runtime.generation,
+          storageKey: runtime.paths.storageKey,
+          activeLinkAttemptId: null,
+          connectedAt: FieldValue.serverTimestamp(),
+          lastErrorCode: GROUP_SCOPE_NOT_CONFIGURED,
+          reconnectRequired: false,
+        });
+      } else {
+        await updateGroupConnection(this.db, businessId, { status: "connected", sessionId: runtime.generation, storageKey: runtime.paths.storageKey, activeLinkAttemptId: null, connectedAt: FieldValue.serverTimestamp(), lastHealthyAt: FieldValue.serverTimestamp(), reconnectRequired: false, lastErrorCode: null });
+      }
     } else if (message.type === "started") {
       await updateGroupConnection(this.db, businessId, { status: "connected", sessionId: runtime.generation, storageKey: runtime.paths.storageKey, lastHealthyAt: FieldValue.serverTimestamp(), reconnectRequired: false, lastErrorCode: null }).catch(() => {});
     } else if (message.type === "failed" && runtime.attemptId) {
@@ -112,8 +168,13 @@ export class PlaywrightWorkerManager {
     if (this.workers.get(businessId) === runtime) this.workers.delete(businessId);
     if (runtime.attemptId) this.linkCodes.delete(runtime.attemptId);
     if (runtime.linked && code === 0) {
-      await this.startBusiness(businessId).catch(async () => {
-        await updateGroupConnection(this.db, businessId, { status: "reconnect_required", reconnectRequired: true, lastErrorCode: "LISTENER_START_FAILED" }).catch(() => {});
+      await this.startBusiness(businessId).catch(async (error) => {
+        const missingScope = String(error?.message ?? "") === GROUP_SCOPE_NOT_CONFIGURED;
+        await updateGroupConnection(this.db, businessId, {
+          status: missingScope ? "degraded" : "reconnect_required",
+          reconnectRequired: !missingScope,
+          lastErrorCode: missingScope ? GROUP_SCOPE_NOT_CONFIGURED : "LISTENER_START_FAILED",
+        }).catch(() => {});
       });
       return;
     }
@@ -182,8 +243,12 @@ export class PlaywrightWorkerManager {
     for (const doc of snap.docs || []) {
       const value = doc.data() || {};
       if (value.businessId === doc.id && ["connected", "degraded"].includes(value?.group?.status)) {
-        await this.startBusiness(doc.id);
-        restored.push(doc.id);
+        try {
+          await this.startBusiness(doc.id);
+          restored.push(doc.id);
+        } catch (error) {
+          if (String(error?.message ?? "") !== GROUP_SCOPE_NOT_CONFIGURED) throw error;
+        }
       }
     }
     return restored;

@@ -13,6 +13,37 @@ test("Firebase UID remains the only accepted business identity shape", () => {
   assert.throws(() => requireBusinessId("phone:+923001234567"), /INVALID_BUSINESS_ID/);
 });
 
+test("allowedGroupTitles are normalized, bounded, and omitted from sanitized client payloads", async () => {
+  const { configuredAllowedGroupTitles, normalizeAllowedGroupTitles, updateGroupAllowedTitles, updateGroupConnection } = await import("../src/services/whatsappConnectionRegistry.js");
+  assert.deepEqual(normalizeAllowedGroupTitles(["  Rental Leads  ", "Rental Leads", "", "Hotel Reservations"]), ["Rental Leads", "Hotel Reservations"]);
+  assert.throws(() => normalizeAllowedGroupTitles(["bad,comma"]), /INVALID_GROUP_TITLE/);
+  assert.deepEqual(configuredAllowedGroupTitles({ group: {} }), []);
+
+  const rows = new Map([["whatsapp_connections/A", { businessId: "A", group: { status: "connected", allowedGroupTitles: ["Keep Me"], sessionId: "s1" } }]]);
+  const ref = (name, id) => ({
+    key: `${name}/${id}`,
+    async get() { const value = rows.get(this.key); return { exists: value != null, data: () => structuredClone(value) }; },
+  });
+  const db = {
+    collection(name) { return { doc(id) { return ref(name, id); } }; },
+    async runTransaction(fn) {
+      return fn({
+        get: (documentRef) => documentRef.get(),
+        set(documentRef, value, options) {
+          const prior = rows.get(documentRef.key) || {};
+          rows.set(documentRef.key, structuredClone(options?.merge ? { ...prior, ...value } : value));
+        },
+      });
+    },
+  };
+  await updateGroupConnection(db, "A", { status: "degraded", lastErrorCode: "WORKER_EXITED", allowedGroupTitles: ["Should Not Apply"] });
+  assert.deepEqual(rows.get("whatsapp_connections/A").group.allowedGroupTitles, ["Keep Me"]);
+  await updateGroupAllowedTitles(db, "A", ["Group Two"]);
+  assert.deepEqual(rows.get("whatsapp_connections/A").group.allowedGroupTitles, ["Group Two"]);
+  const publicValue = sanitizeWhatsAppConnection(rows.get("whatsapp_connections/A"));
+  assert.equal(publicValue.group.allowedGroupTitles, undefined);
+});
+
 test("businesses receive deterministic, isolated and contained Playwright paths", () => {
   const a = resolvePlaywrightStoragePaths("business_A", { root: "/tmp/emily-test-root" });
   const b = resolvePlaywrightStoragePaths("business_B", { root: "/tmp/emily-test-root" });

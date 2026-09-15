@@ -176,6 +176,17 @@ let _cachedPlaywrightAllowedChatTitles = null;
  * @returns {string[] | null} Lowercased titles, or null when no restriction
  */
 export function resolvePlaywrightAllowedChatTitles() {
+  // Strict per-business workers must never use repo defaults or a "no allowlist" null.
+  // Empty env → empty list (no chats), not the bundled playwrightAllowedChats.txt.
+  if (String(process.env.PLAYWRIGHT_STRICT_BUSINESS_WORKER ?? "").toLowerCase() === "true") {
+    const raw = String(process.env.PLAYWRIGHT_ALLOWED_CHAT_TITLES ?? "").trim();
+    if (!raw) return [];
+    return raw
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
   if (_cachedPlaywrightAllowedChatTitles !== null) {
     return _cachedPlaywrightAllowedChatTitles;
   }

@@ -11,8 +11,8 @@ import { createInMemoryCredentialProvider, resolveBusinessCloudCredentials } fro
 
 function isolationDb() {
   const documents = new Map([
-    ["whatsapp_connections/A", { businessId: "A", dm: { status: "connected", phoneNumberId: "11111", connectionVersion: "v1", credentialRef: "secret-a" } }],
-    ["whatsapp_connections/B", { businessId: "B", dm: { status: "connected", phoneNumberId: "22222", connectionVersion: "v1", credentialRef: "secret-b" } }],
+    ["whatsapp_connections/A", { businessId: "A", group: { status: "connected", allowedGroupTitles: ["Rental Leads"] }, dm: { status: "connected", phoneNumberId: "11111", connectionVersion: "v1", credentialRef: "secret-a" } }],
+    ["whatsapp_connections/B", { businessId: "B", group: { status: "connected", allowedGroupTitles: ["Hotel Reservations"] }, dm: { status: "connected", phoneNumberId: "22222", connectionVersion: "v1", credentialRef: "secret-b" } }],
     ["whatsapp_cloud_routes/11111", { businessId: "A", status: "active", connectionVersion: "v1" }],
     ["whatsapp_cloud_routes/22222", { businessId: "B", status: "active", connectionVersion: "v1" }],
   ]);
@@ -68,6 +68,10 @@ test("businesses A and B isolate workers, storage, routes, credentials and the s
     assert.notEqual(workerA.storageKey, workerB.storageKey);
     assert.equal(children[0].options.env.PLAYWRIGHT_OWNER_USER_ID, "A");
     assert.equal(children[1].options.env.PLAYWRIGHT_OWNER_USER_ID, "B");
+    assert.equal(children[0].options.env.PLAYWRIGHT_GROUPS, "Rental Leads");
+    assert.equal(children[1].options.env.PLAYWRIGHT_GROUPS, "Hotel Reservations");
+    assert.equal(children[0].options.env.PLAYWRIGHT_ALLOWED_CHAT_TITLES, "Rental Leads");
+    assert.equal(children[1].options.env.PLAYWRIGHT_ALLOWED_CHAT_TITLES, "Hotel Reservations");
     assert.equal(credentialA.accessToken, "token-a");
     assert.equal(credentialB.accessToken, "token-b");
 

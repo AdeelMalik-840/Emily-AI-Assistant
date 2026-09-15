@@ -6,6 +6,36 @@ import path from "node:path";
 import test from "node:test";
 import { PlaywrightWorkerManager } from "../src/services/playwrightWorkerManager.js";
 
+function scopedConnectionDb(titlesByBusiness) {
+  const documents = new Map(
+    Object.entries(titlesByBusiness).map(([businessId, titles]) => [
+      `whatsapp_connections/${businessId}`,
+      { businessId, group: { status: "connected", allowedGroupTitles: titles } },
+    ])
+  );
+  const ref = (collection, id) => ({
+    key: `${collection}/${id}`,
+    async get() {
+      const value = documents.get(this.key);
+      return { exists: value != null, data: () => structuredClone(value) };
+    },
+  });
+  return {
+    collection(collection) {
+      return { doc: (id) => ref(collection, id) };
+    },
+    async runTransaction(fn) {
+      return fn({
+        get: (documentRef) => documentRef.get(),
+        set(documentRef, value, options) {
+          const prior = documents.get(documentRef.key) || {};
+          documents.set(documentRef.key, structuredClone(options?.merge ? { ...prior, ...value } : value));
+        },
+      });
+    },
+  };
+}
+
 test("manager refuses an unproven multi-manager deployment", () => {
   assert.throws(() => new PlaywrightWorkerManager({ db: {} }), /SINGLE_MANAGER_GUARANTEE_REQUIRED/);
 });
@@ -21,7 +51,12 @@ test("manager creates isolated strict workers and prevents duplicate business st
     children.push({ child, options });
     return child;
   };
-  const manager = new PlaywrightWorkerManager({ db: {}, childFactory, storageRoot: root, singleManager: true });
+  const manager = new PlaywrightWorkerManager({
+    db: scopedConnectionDb({ A: ["Leads A"], B: ["Leads B"] }),
+    childFactory,
+    storageRoot: root,
+    singleManager: true,
+  });
   try {
     const a = await manager.startBusiness("A");
     const b = await manager.startBusiness("B");
@@ -55,7 +90,12 @@ test("legacy Cloud credential IPC is exact-UID only and never placed in child en
     children.push({ child, options });
     return child;
   };
-  const manager = new PlaywrightWorkerManager({ db: {}, childFactory, storageRoot: root, singleManager: true });
+  const manager = new PlaywrightWorkerManager({
+    db: scopedConnectionDb({ A: ["Leads"], B: ["Leads"] }),
+    childFactory,
+    storageRoot: root,
+    singleManager: true,
+  });
   try {
     const a = await manager.startBusiness("A");
     const b = await manager.startBusiness("B");

@@ -33,6 +33,39 @@ node scripts/import-legacy-playwright-session.mjs <firebase-uid> <session-json-p
 
 The importer refuses to overwrite an existing tenant session. Do not place session files in Firestore, logs, API responses, or source control.
 
+## Tenant WhatsApp group scope
+
+Listen workers never inherit host `PLAYWRIGHT_GROUPS` / `PLAYWRIGHT_GROUP_NAME` / `PLAYWRIGHT_ALLOWED_CHAT_TITLES` and never use `src/config/defaults/playwrightAllowedChats.txt`.
+
+Group scope is server-only:
+
+```text
+whatsapp_connections/{businessId}.group.allowedGroupTitles
+```
+
+Firestore rules keep this collection client-unwritable. Missing titles fail closed (`GROUP_SCOPE_NOT_CONFIGURED`): the account may still be phone-linked, but the listen worker does not start and `overallStatus` is not `ready`.
+
+### Legacy group-scope migration
+
+The same bootstrap command also copies **legacy env** into that field when it is empty:
+
+1. `PLAYWRIGHT_GROUPS`
+2. else `PLAYWRIGHT_GROUP_NAME`
+3. else `PLAYWRIGHT_ALLOWED_CHAT_TITLES` (explicit env only)
+
+Bundled default chat titles are **not** migrated. If none of the env keys are set, bootstrap reports `LEGACY_GROUP_SCOPE_REQUIRES_OPERATOR_INPUT` and does not guess.
+
+```text
+node scripts/bootstrap-legacy-whatsapp-connection.mjs --dry-run
+node scripts/bootstrap-legacy-whatsapp-connection.mjs --apply
+```
+
+`--apply` is idempotent and will not overwrite a non-empty `allowedGroupTitles`. There is no runtime fallback from global env for new tenants.
+
+### New businesses (product gap)
+
+Phone-link onboarding does not yet let a business choose WhatsApp groups. A later trusted flow should persist `allowedGroupTitles` after the account is linked. Until then, new tenants must be configured server-side or listen stays disabled.
+
 ## Live WhatsApp Web compatibility checklist
 
 Use a nonproduction WhatsApp account only with explicit authorization. Confirm:

@@ -2606,7 +2606,8 @@ function computeSnapshotHash(messages) {
 function isAllowedChat(title) {
   if (!title) return false;
   const list = resolvePlaywrightAllowedChatTitles();
-  if (!list || list.length === 0) return true;
+  if (list == null) return true;
+  if (list.length === 0) return false;
   return list.includes(normalize(title));
 }
 
@@ -7341,6 +7342,10 @@ async function extractIncomingMessages(page, opts = {}) {
   });
 }
 
+function isStrictBusinessWorker() {
+  return String(process.env.PLAYWRIGHT_STRICT_BUSINESS_WORKER ?? "").toLowerCase() === "true";
+}
+
 function resolveTargetGroups() {
   const singleGroup = String(process.env.PLAYWRIGHT_GROUP_NAME ?? "").trim();
   const multiGroupsEnv = String(process.env.PLAYWRIGHT_GROUPS ?? "").trim();
@@ -7368,7 +7373,15 @@ function resolveTargetGroups() {
     targetGroups = null;
   }
 
+  if (isStrictBusinessWorker()) {
+    return Array.isArray(targetGroups) && targetGroups.length > 0 ? targetGroups : [];
+  }
+
   return targetGroups;
+}
+
+export function __resolveTargetGroupsForTests() {
+  return resolveTargetGroups();
 }
 
 /**
@@ -9991,6 +10004,12 @@ export async function runPlaywrightForwardPass(p = {}) {
 export async function startPlaywrightListener() {
   if (String(process.env.PLAYWRIGHT_ENABLED ?? "").toLowerCase() !== "true") {
     return;
+  }
+  if (isStrictBusinessWorker()) {
+    const scoped = resolveTargetGroups();
+    if (!Array.isArray(scoped) || scoped.length === 0) {
+      throw new Error("GROUP_SCOPE_NOT_CONFIGURED");
+    }
   }
   logPlaywrightGroupFreshDeltaMode();
   if (listenerStarted && !isStopping) {
