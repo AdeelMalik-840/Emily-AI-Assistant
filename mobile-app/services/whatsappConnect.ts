@@ -1,8 +1,56 @@
 /**
- * WhatsApp ↔ Emily API (no Meta OAuth in app; manual phone registration on server).
+ * WhatsApp ↔ Emily API for backend 6c0f46d (manual-connect / disconnect).
+ * Connected/ready is observed from businesses/{uid} after server writes —
+ * never from a tap, and never via /api/whatsapp/manual-connect/confirm.
  */
 import { auth } from "@/firebase";
 import { parseAndValidateManualWhatsAppPhone } from "@/utils/validateManualWhatsAppPhone";
+
+export type DemoWhatsAppStatus = "disconnected" | "pending" | "connected";
+
+export type DemoWhatsAppState = {
+  status: DemoWhatsAppStatus;
+  phone: string | null;
+};
+
+/**
+ * Trusted demo connection state from businesses/{uid}.
+ * Ready only after backend confirm sets whatsappConnected / whatsapp.connected.
+ */
+export function parseBusinessWhatsAppDoc(
+  data: Record<string, unknown> | undefined | null
+): DemoWhatsAppState {
+  if (!data || typeof data !== "object") {
+    return { status: "disconnected", phone: null };
+  }
+  const nested =
+    data.whatsapp != null &&
+    typeof data.whatsapp === "object" &&
+    !Array.isArray(data.whatsapp)
+      ? (data.whatsapp as Record<string, unknown>)
+      : null;
+  const connected = Boolean(
+    data.whatsappConnected === true || nested?.connected === true
+  );
+  const phone =
+    (typeof data.whatsappPhone === "string" && data.whatsappPhone.trim()) ||
+    (typeof nested?.displayPhoneNumber === "string" &&
+      nested.displayPhoneNumber.trim()) ||
+    (typeof data.phone === "string" && data.phone.trim()) ||
+    null;
+  if (connected) {
+    return { status: "connected", phone };
+  }
+  // Pending is written by POST /api/whatsapp/manual-connect, not by a local tap.
+  const pending = Boolean(
+    nested?.manual === true ||
+      (typeof data.phoneDigits === "string" && data.phoneDigits.trim())
+  );
+  if (pending) {
+    return { status: "pending", phone };
+  }
+  return { status: "disconnected", phone: null };
+}
 
 // Public env — set in mobile-app/.env (e.g. https://your-tunnel.trycloudflare.com or LAN IP).
 const API_BASE_URL = process.env.EXPO_PUBLIC_EMILY_API_URL;

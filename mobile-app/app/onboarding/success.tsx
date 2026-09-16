@@ -1,26 +1,12 @@
 import { router } from "expo-router";
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import { StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { GradientButton } from "@/components/ui/GradientButton";
 import { Brand } from "@/constants/brand";
-import { auth, db } from "@/firebase";
 
 export default function OnboardingSuccessScreen() {
   const goDashboard = async () => {
-    const u = auth.currentUser;
-    if (u?.uid) {
-      try {
-        await setDoc(
-          doc(db, "businesses", u.uid),
-          { whatsappConnected: true, updatedAt: serverTimestamp() },
-          { merge: true }
-        );
-      } catch (e) {
-        console.warn("[onboarding/success] could not persist whatsappConnected:", e);
-      }
-    }
     router.replace("/(tabs)");
   };
 
@@ -31,9 +17,9 @@ export default function OnboardingSuccessScreen() {
           <Text style={styles.emoji} accessibilityLabel="Success">
             🎉
           </Text>
-          <Text style={styles.heading}>WhatsApp Connected</Text>
+          <Text style={styles.heading}>You're in</Text>
           <Text style={styles.subtext}>
-            Emily is now active on your number
+            Connect WhatsApp from Home so Emily can reply to customers
           </Text>
         </View>
 

@@ -13,8 +13,7 @@ import {
 import PhoneInput from "react-native-phone-number-input";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { useWhatsAppConnection } from "@/hooks/useWhatsAppConnection";
-import type { WhatsAppConnection } from "@/services/whatsappConnection";
+import { useManualWhatsAppConnection } from "@/hooks/useManualWhatsAppConnection";
 
 const BG = "#FFFFFF";
 
@@ -24,7 +23,6 @@ type Props = {
   businessId: string | null;
   /** Prefill only -- the user must confirm/edit before it is used. */
   suggestedPhone?: string | null;
-  onConnectionChange?: (connection: WhatsAppConnection | null) => void;
   /** Opens straight into the manage/disconnect view instead of the connect flow. */
   manageOnly?: boolean;
 };
@@ -32,12 +30,6 @@ type Props = {
 function friendlyError(message: string | undefined): string {
   const m = String(message ?? "").trim();
   return m !== "" ? m : "Something went wrong. Please try again.";
-}
-
-function formatLinkingCode(code: string): string {
-  const digits = code.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-  if (digits.length !== 8) return code;
-  return `${digits.slice(0, 4)}-${digits.slice(4)}`;
 }
 
 /** ISO 3166-1 alpha-2 -> regional-indicator flag emoji. */
@@ -58,28 +50,28 @@ export function WhatsAppConnectModal({
   onClose,
   businessId,
   suggestedPhone,
-  onConnectionChange,
   manageOnly = false,
 }: Props) {
   const insets = useSafeAreaInsets();
   const actionsBottomPad = Math.max(20, insets.bottom);
 
   const {
-    phase,
-    connection,
+    status,
+    phone: connectedPhone,
+    loading: statusLoading,
+    submitting: hookSubmitting,
     submitPhone,
-    cancelLinking,
-    retryAfterError,
-    reconnect,
     disconnect,
-  } = useWhatsAppConnection(businessId);
+  } = useManualWhatsAppConnection(businessId);
 
   const [phoneInput, setPhoneInput] = useState(suggestedPhone ?? "");
   const [phoneInputMountKey, setPhoneInputMountKey] = useState(0);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+  const [localSubmitting, setLocalSubmitting] = useState(false);
   const [confirmingDisconnect, setConfirmingDisconnect] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
+
+  const submitting = localSubmitting || hookSubmitting;
 
   useEffect(() => {
     if (visible) {
@@ -91,14 +83,10 @@ export function WhatsAppConnectModal({
     }
   }, [visible, suggestedPhone]);
 
-  useEffect(() => {
-    onConnectionChange?.(connection);
-  }, [connection, onConnectionChange]);
-
   const blockingBackdrop =
-    phase.kind === "preparing" ||
-    phase.kind === "code_ready" ||
-    phase.kind === "setting_up" ||
+    submitting ||
+    statusLoading ||
+    status === "pending" ||
     disconnecting ||
     confirmingDisconnect;
 
@@ -109,27 +97,15 @@ export function WhatsAppConnectModal({
 
   const handleSubmit = useCallback(async () => {
     setSubmitError(null);
-    setSubmitting(true);
+    setLocalSubmitting(true);
     try {
       await submitPhone(phoneInput);
     } catch (err) {
       setSubmitError(friendlyError(err instanceof Error ? err.message : undefined));
     } finally {
-      setSubmitting(false);
+      setLocalSubmitting(false);
     }
   }, [phoneInput, submitPhone]);
-
-  const handleReconnect = useCallback(async () => {
-    setSubmitError(null);
-    setSubmitting(true);
-    try {
-      await reconnect(phoneInput);
-    } catch (err) {
-      setSubmitError(friendlyError(err instanceof Error ? err.message : undefined));
-    } finally {
-      setSubmitting(false);
-    }
-  }, [phoneInput, reconnect]);
 
   const handleDisconnect = useCallback(async () => {
     setSubmitError(null);
@@ -202,8 +178,7 @@ export function WhatsAppConnectModal({
       );
     }
 
-    const displayPhone =
-      connection?.dm.displayPhoneNumber ?? connection?.group.linkedPhoneE164 ?? null;
+    const displayPhone = connectedPhone;
 
     return (
       <>
@@ -238,220 +213,117 @@ export function WhatsAppConnectModal({
   };
 
   const renderConnectFlow = () => {
-    switch (phase.kind) {
-      case "loading":
-        return (
-          <View style={styles.sheetContent}>
-            <View style={styles.centerBlock} pointerEvents="none">
-              <ActivityIndicator size="large" color="#3A3A3C" />
-            </View>
+    if (statusLoading) {
+      return (
+        <View style={styles.sheetContent}>
+          <View style={styles.centerBlock} pointerEvents="none">
+            <ActivityIndicator size="large" color="#3A3A3C" />
           </View>
-        );
-
-      case "reconnect_required":
-        return (
-          <>
-            <View style={styles.sheetContent}>
-              <Text style={styles.title}>WhatsApp needs to be reconnected</Text>
-              <Text style={styles.subtitle}>
-                Your connection was interrupted. Reconnect to keep Emily
-                responding to customers.
-              </Text>
-              {submitError ? <Text style={styles.errorInline}>{submitError}</Text> : null}
-              <PhoneInput
-                key={phoneInputMountKey}
-                defaultCode="PK"
-                defaultValue={suggestedPhone ?? undefined}
-                layout="first"
-                placeholder="Enter your WhatsApp number"
-                onChangeFormattedText={setPhoneInput}
-                containerStyle={styles.phoneInputContainer}
-                textContainerStyle={styles.phoneInputTextContainer}
-                textInputStyle={styles.phoneInputText}
-                flagButtonStyle={styles.phoneInputFlagButton}
-                countryPickerProps={{ renderFlagButton: renderPhonePickerFlag }}
-                textInputProps={{
-                  placeholderTextColor: "#8E8E93",
-                  keyboardType: "phone-pad",
-                  autoComplete: "tel",
-                  textContentType: "telephoneNumber",
-                  accessibilityLabel: "WhatsApp phone number",
-                }}
-              />
-            </View>
-            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
-              <Pressable
-                onPress={() => void handleReconnect()}
-                disabled={submitting}
-                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
-                accessibilityRole="button"
-                accessibilityLabel="Reconnect"
-              >
-                <Text style={styles.ctaText}>Reconnect</Text>
-              </Pressable>
-            </View>
-          </>
-        );
-
-      case "phone_entry":
-        return (
-          <>
-            <View style={styles.sheetContent}>
-              <Text style={styles.title}>Connect WhatsApp</Text>
-              <Text style={styles.subtitle}>
-                Connect the WhatsApp number you use for your business.
-              </Text>
-              {submitError ? <Text style={styles.errorInline}>{submitError}</Text> : null}
-              <PhoneInput
-                key={phoneInputMountKey}
-                defaultCode="PK"
-                defaultValue={suggestedPhone ?? undefined}
-                layout="first"
-                placeholder="Enter your WhatsApp number"
-                onChangeFormattedText={setPhoneInput}
-                containerStyle={styles.phoneInputContainer}
-                textContainerStyle={styles.phoneInputTextContainer}
-                textInputStyle={styles.phoneInputText}
-                flagButtonStyle={styles.phoneInputFlagButton}
-                countryPickerProps={{ renderFlagButton: renderPhonePickerFlag }}
-                textInputProps={{
-                  placeholderTextColor: "#8E8E93",
-                  keyboardType: "phone-pad",
-                  autoComplete: "tel",
-                  textContentType: "telephoneNumber",
-                  accessibilityLabel: "WhatsApp phone number",
-                }}
-              />
-              {suggestedPhone ? (
-                <Text style={styles.suggestionHint}>
-                  We prefilled the number from your business profile -- confirm
-                  or edit it above.
-                </Text>
-              ) : null}
-            </View>
-            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
-              <Pressable
-                onPress={() => void handleSubmit()}
-                disabled={submitting}
-                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
-                accessibilityRole="button"
-                accessibilityLabel="Continue"
-              >
-                <Text style={styles.ctaText}>Continue</Text>
-              </Pressable>
-            </View>
-          </>
-        );
-
-      case "preparing":
-        return (
-          <View style={styles.sheetContent}>
-            <View style={styles.centerBlock} pointerEvents="none">
-              <ActivityIndicator size="large" color="#3A3A3C" />
-              <Text style={styles.loadingTitle}>Preparing your connection…</Text>
-            </View>
-          </View>
-        );
-
-      case "code_ready":
-        return (
-          <>
-            <View style={styles.sheetContent}>
-              <Text style={styles.title}>Connect your WhatsApp</Text>
-              <View style={styles.codeBlock}>
-                <Text style={styles.codeText} selectable>
-                  {formatLinkingCode(phase.linkingCode)}
-                </Text>
-              </View>
-              <Text style={styles.codeInstructions}>
-                WhatsApp{"\n"}
-                → Linked Devices{"\n"}
-                → Link a Device{"\n"}
-                → Link with phone number instead
-              </Text>
-              <View style={styles.waitingRow}>
-                <ActivityIndicator size="small" color="#8E8E93" />
-                <Text style={styles.waitingText}>Waiting for connection…</Text>
-              </View>
-            </View>
-            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
-              <Pressable
-                onPress={() => void cancelLinking()}
-                style={({ pressed }) => [styles.secondaryCtaFull, pressed && styles.secondaryCtaPressed]}
-                accessibilityRole="button"
-                accessibilityLabel="Cancel"
-              >
-                <Text style={styles.secondaryCtaText}>Cancel</Text>
-              </Pressable>
-            </View>
-          </>
-        );
-
-      case "setting_up":
-        return (
-          <View style={styles.sheetContent}>
-            <View style={styles.centerBlock} pointerEvents="none">
-              <ActivityIndicator size="large" color="#3A3A3C" />
-              <Text style={styles.loadingTitle}>Setting up Emily…</Text>
-            </View>
-          </View>
-        );
-
-      case "ready":
-        return (
-          <>
-            <View style={styles.sheetContent}>
-              <Text style={styles.successHeadline}>{"✓ WhatsApp connected"}</Text>
-              <Text style={styles.subtitle}>
-                Emily is ready to handle your customer conversations.
-              </Text>
-            </View>
-            <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
-              <Pressable
-                onPress={onClose}
-                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
-                accessibilityRole="button"
-                accessibilityLabel="Continue"
-              >
-                <Text style={styles.ctaText}>Continue</Text>
-              </Pressable>
-            </View>
-          </>
-        );
-
-      case "error":
-        return (
-          <>
-            <View style={styles.sheetContent}>
-              <Text style={styles.title}>We couldn’t finish the connection</Text>
-              <Text style={styles.subtitle}>
-                Something interrupted the connection. Please try again.
-              </Text>
-            </View>
-            <View style={[styles.sheetActions, styles.sheetActionsColumn, { paddingBottom: actionsBottomPad }]}>
-              <Pressable
-                onPress={retryAfterError}
-                style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
-                accessibilityRole="button"
-                accessibilityLabel="Try again"
-              >
-                <Text style={styles.ctaText}>Try again</Text>
-              </Pressable>
-              <Pressable
-                onPress={onClose}
-                style={({ pressed }) => [styles.secondaryCtaFull, pressed && styles.secondaryCtaPressed]}
-                accessibilityRole="button"
-                accessibilityLabel="Close"
-              >
-                <Text style={styles.secondaryCtaText}>Close</Text>
-              </Pressable>
-            </View>
-          </>
-        );
-
-      default:
-        return null;
+        </View>
+      );
     }
+
+    if (submitting) {
+      return (
+        <View style={styles.sheetContent}>
+          <View style={styles.centerBlock} pointerEvents="none">
+            <ActivityIndicator size="large" color="#3A3A3C" />
+            <Text style={styles.loadingTitle}>Saving your number…</Text>
+          </View>
+        </View>
+      );
+    }
+
+    if (status === "pending") {
+      return (
+        <View style={styles.sheetContent}>
+          <Text style={styles.title}>Connecting WhatsApp</Text>
+          <Text style={styles.subtitle}>
+            Your number is registered. Emily will show as ready once this
+            connection is confirmed.
+          </Text>
+          {connectedPhone ? (
+            <Text style={styles.phoneDisplay}>{connectedPhone}</Text>
+          ) : null}
+          <View style={styles.waitingRow}>
+            <ActivityIndicator size="small" color="#8E8E93" />
+            <Text style={styles.waitingText}>Waiting for confirmation…</Text>
+          </View>
+        </View>
+      );
+    }
+
+    if (status === "connected") {
+      return (
+        <>
+          <View style={styles.sheetContent}>
+            <Text style={styles.successHeadline}>{"✓ WhatsApp connected"}</Text>
+            <Text style={styles.subtitle}>
+              Emily is ready to handle your customer conversations.
+            </Text>
+          </View>
+          <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
+            <Pressable
+              onPress={onClose}
+              style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
+              accessibilityRole="button"
+              accessibilityLabel="Continue"
+            >
+              <Text style={styles.ctaText}>Continue</Text>
+            </Pressable>
+          </View>
+        </>
+      );
+    }
+
+    return (
+      <>
+        <View style={styles.sheetContent}>
+          <Text style={styles.title}>Connect WhatsApp</Text>
+          <Text style={styles.subtitle}>
+            Connect the WhatsApp number you use for your business.
+          </Text>
+          {submitError ? <Text style={styles.errorInline}>{submitError}</Text> : null}
+          <PhoneInput
+            key={phoneInputMountKey}
+            defaultCode="PK"
+            defaultValue={suggestedPhone ?? undefined}
+            layout="first"
+            placeholder="Enter your WhatsApp number"
+            onChangeFormattedText={setPhoneInput}
+            containerStyle={styles.phoneInputContainer}
+            textContainerStyle={styles.phoneInputTextContainer}
+            textInputStyle={styles.phoneInputText}
+            flagButtonStyle={styles.phoneInputFlagButton}
+            countryPickerProps={{ renderFlagButton: renderPhonePickerFlag }}
+            textInputProps={{
+              placeholderTextColor: "#8E8E93",
+              keyboardType: "phone-pad",
+              autoComplete: "tel",
+              textContentType: "telephoneNumber",
+              accessibilityLabel: "WhatsApp phone number",
+            }}
+          />
+          {suggestedPhone ? (
+            <Text style={styles.suggestionHint}>
+              We prefilled the number from your business profile -- confirm
+              or edit it above.
+            </Text>
+          ) : null}
+        </View>
+        <View style={[styles.sheetActions, { paddingBottom: actionsBottomPad }]}>
+          <Pressable
+            onPress={() => void handleSubmit()}
+            disabled={submitting}
+            style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
+            accessibilityRole="button"
+            accessibilityLabel="Continue"
+          >
+            <Text style={styles.ctaText}>Continue</Text>
+          </Pressable>
+        </View>
+      </>
+    );
   };
 
   return (

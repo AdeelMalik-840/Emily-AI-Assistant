@@ -16,24 +16,25 @@ import { WhatsAppConnectModal } from "@/components/WhatsAppConnectModal";
 import { DS } from "@/constants/designSystem";
 import { useAuth } from "@/contexts/AuthContext";
 import { db } from "@/firebase";
-import type { WhatsAppConnection } from "@/services/whatsappConnection";
+import { useManualWhatsAppConnection } from "@/hooks/useManualWhatsAppConnection";
 
 export default function HomeScreen() {
   const { user, loading: authLoading } = useAuth();
   const userId = user?.uid ?? null;
+  const {
+    status: waStatus,
+    phone: displayPhone,
+    loading: waStatusLoading,
+  } = useManualWhatsAppConnection(userId);
 
   const [profileLoading, setProfileLoading] = useState(true);
   const [suggestedPhone, setSuggestedPhone] = useState<string | null>(null);
-  const [connection, setConnection] = useState<WhatsAppConnection | null>(
-    null
-  );
   const [waModal, setWaModal] = useState<"closed" | "connect" | "manage">(
     "closed"
   );
 
-  // Business-profile prefill only -- never treated as connection truth. The
-  // backend (whatsapp_connections.overallStatus) is the only source of
-  // "connected" state; see WhatsAppConnectModal / useWhatsAppConnection.
+  // Business-profile prefill only -- never treated as connection truth.
+  // Connected/ready comes from businesses/{uid} after backend confirm.
   const loadProfileSuggestion = useCallback(async () => {
     if (!userId) {
       setSuggestedPhone(null);
@@ -67,13 +68,10 @@ export default function HomeScreen() {
     }, [loadProfileSuggestion])
   );
 
-  const overallStatus = connection?.overallStatus ?? "not_connected";
-  const whatsappConnected = overallStatus === "ready";
-  const reconnectRequired = overallStatus === "reconnect_required";
-  const displayPhone =
-    connection?.dm.displayPhoneNumber ?? connection?.group.linkedPhoneE164 ?? null;
+  const whatsappConnected = waStatus === "connected";
+  const whatsappPending = waStatus === "pending";
 
-  const loading = authLoading || profileLoading;
+  const loading = authLoading || profileLoading || waStatusLoading;
 
   return (
     <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
@@ -84,7 +82,6 @@ export default function HomeScreen() {
         suggestedPhone={suggestedPhone}
         manageOnly={waModal === "manage"}
         onClose={() => setWaModal("closed")}
-        onConnectionChange={setConnection}
       />
       <ScrollView
         contentContainerStyle={styles.scroll}
@@ -93,7 +90,13 @@ export default function HomeScreen() {
       >
         <View style={styles.header}>
           <Text style={styles.pageTitle}>Home</Text>
-          <Text style={styles.pageSubtitle}>Emily is ready</Text>
+          <Text style={styles.pageSubtitle}>
+            {whatsappConnected
+              ? "Emily is ready"
+              : whatsappPending
+                ? "WhatsApp is connecting"
+                : "Connect WhatsApp to get Emily ready"}
+          </Text>
         </View>
 
         {!loading ? (
@@ -102,7 +105,9 @@ export default function HomeScreen() {
               <Text style={styles.instruction}>
                 {whatsappConnected
                   ? "Your channel is active."
-                  : "Connect your first channel to get started"}
+                  : whatsappPending
+                    ? "Your number is registered. Emily will be ready after confirmation."
+                    : "Connect your first channel to get started"}
               </Text>
             </View>
 
@@ -124,6 +129,10 @@ export default function HomeScreen() {
                       <View style={styles.statusBadge}>
                         <Text style={styles.statusBadgeText}>Connected</Text>
                       </View>
+                    ) : whatsappPending ? (
+                      <View style={styles.statusBadge}>
+                        <Text style={styles.statusBadgeText}>Connecting</Text>
+                      </View>
                     ) : null}
                   </View>
                   <Text style={styles.cardDesc}>
@@ -133,10 +142,10 @@ export default function HomeScreen() {
                 </View>
               </View>
 
-              {reconnectRequired ? (
+              {whatsappPending ? (
                 <>
-                  <Text style={styles.reconnectNotice}>
-                    WhatsApp needs to be reconnected.
+                  <Text style={styles.cardFooterLine}>
+                    Waiting for confirmation…
                   </Text>
                   <Pressable
                     onPress={() => setWaModal("connect")}
@@ -145,9 +154,9 @@ export default function HomeScreen() {
                       pressed && styles.pressed,
                     ]}
                     accessibilityRole="button"
-                    accessibilityLabel="Reconnect WhatsApp"
+                    accessibilityLabel="View WhatsApp connection status"
                   >
-                    <Text style={styles.btnPrimaryText}>Reconnect</Text>
+                    <Text style={styles.btnPrimaryText}>View status</Text>
                   </Pressable>
                 </>
               ) : !whatsappConnected ? (
